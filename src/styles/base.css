@@ -1,0 +1,174 @@
+/**
+ * Reset and global element styling. Everything here keys off semantic tokens, and the font
+ * stacks come from `--font-sans` / `--font-mono` so Latin and CJK glyphs resolve per platform
+ * (docs/ui-refactor-plan.md §5.11 rule 3).
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  /* Exactly one element in the app scrolls: the page body inside PageShell (§5.3). */
+  overflow: hidden;
+}
+
+html {
+  /*
+   * CJK text needs at least 1.5 here: the glyphs fill the em box, so the 1.4 "tight" step is
+   * reserved for known-Latin contexts (§5.5).
+   */
+  line-height: var(--line-height-normal);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-14);
+  font-weight: var(--font-weight-regular);
+  color: var(--text-primary);
+  background: var(--bg-app);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Interactive chrome is not text: dragging a label must not start a selection. */
+  user-select: none;
+}
+
+/* Text the user is meant to read or copy opts back in. */
+input,
+textarea,
+[data-selectable] {
+  user-select: text;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+a {
+  color: var(--text-link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+}
+
+/* -- focus ---------------------------------------------------------------------------------- */
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}
+
+/* -- selection ------------------------------------------------------------------------------- */
+
+::selection {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+}
+
+/* -- scrollbars ------------------------------------------------------------------------------
+ * Kept thin and themed; all three WebView runtimes (WebView2, WKWebView, WebKitGTK) honour
+ * ::-webkit-scrollbar, and macOS overlay scrollbars simply stay native.
+ */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* -- platform chrome --------------------------------------------------------------------------
+ * Going frameless on Windows also drops the native drop shadow, which is what separated the
+ * window from a same-coloured desktop. A hairline restores the edge. gated on the platform flag
+ * rather than applied everywhere because macOS keeps its own shadow and Linux keeps its
+ * decorations (§5.1).
+ */
+
+:root[data-platform='windows'] body {
+  border: 1px solid var(--border-default);
+}
+
+/* -- page transition ------------------------------------------------------------------------- */
+
+.page-enter-active,
+.page-leave-active {
+  transition:
+    opacity var(--duration-normal) var(--ease-out),
+    transform var(--duration-normal) var(--ease-out);
+}
+
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

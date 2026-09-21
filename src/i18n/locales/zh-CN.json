@@ -1,0 +1,141 @@
+{
+  "app": {
+    "name": "nexa",
+    "windowTitle": "nexa"
+  },
+  "nav": {
+    "primaryNavigation": "主导航",
+    "connect": "连接",
+    "config": "配置",
+    "settings": "设置",
+    "logs": "日志",
+    "collapseSidebar": "收起侧边栏",
+    "expandSidebar": "展开侧边栏",
+    "autoCollapsedHint": "窗口宽度不足，侧边栏已自动收起"
+  },
+  "window": {
+    "minimize": "最小化",
+    "maximize": "最大化",
+    "restore": "还原",
+    "close": "关闭"
+  },
+  "common": {
+    "save": "保存",
+    "cancel": "取消",
+    "confirm": "确定",
+    "close": "关闭",
+    "retry": "重试",
+    "copy": "复制",
+    "copied": "已复制到剪贴板",
+    "copyFailed": "复制到剪贴板失败",
+    "refresh": "刷新",
+    "loading": "加载中…",
+    "empty": "暂无内容",
+    "add": "添加",
+    "edit": "编辑",
+    "remove": "移除",
+    "delete": "删除",
+    "clear": "清空",
+    "search": "搜索",
+    "back": "返回",
+    "uninstall": "卸载",
+    "install": "安装",
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "unknown": "未知",
+    "details": "技术详情",
+    "version": "版本"
+  },
+  "status": {
+    "running": "运行中",
+    "stopped": "已停止",
+    "starting": "启动中…"
+  },
+  "mode": {
+    "tun": "TUN 模式",
+    "local_proxy": "本地代理"
+  },
+  "connect": {
+    "title": "连接",
+    "started": "代理已启动",
+    "stopped": "代理已停止",
+    "tunToggle": "TUN 模式",
+    "tunRequiresService": "TUN 模式需要系统服务，请先安装服务。",
+    "tunUnavailableServiceGone": "系统服务已不可用，TUN 模式已自动关闭。",
+    "modeMismatch": "代理当前以 {mode} 运行，与你选择的模式不一致。"
+  },
+  "appearance": {
+    "title": "外观",
+    "theme": "主题",
+    "themeHint": "跟随系统，或手动指定主题",
+    "themeSystem": "跟随系统",
+    "themeLight": "浅色",
+    "themeDark": "深色",
+    "language": "语言",
+    "languageHint": "切换后立即生效"
+  },
+  "service": {
+    "title": "服务管理",
+    "status": "服务状态",
+    "stateNotInstalled": "未安装",
+    "stateStopped": "已停止",
+    "stateRunning": "运行中",
+    "install": "安装服务",
+    "installing": "正在安装…",
+    "uninstall": "卸载服务",
+    "uninstalling": "正在卸载…",
+    "start": "启动",
+    "starting": "正在启动…",
+    "stop": "停止",
+    "stopping": "正在停止…",
+    "installed": "服务已安装并启动。",
+    "uninstalled": "服务已卸载。",
+    "started": "服务已启动。",
+    "stopped": "服务已停止。",
+    "hintElevation": "安装或卸载服务会请求管理员授权（UAC / sudo）",
+    "hintAutostart": "服务会在系统启动时自动运行",
+    "hintProduction": "生产环境建议使用服务模式"
+  },
+  "error": {
+    "unknown": "出错了，请重试。",
+    "proxy": {
+      "no_nodes": "请先添加至少一个节点再启动代理。",
+      "invalid_load_balancing": "无法识别该负载均衡策略。",
+      "start_failed": "代理启动失败，详情请查看日志。",
+      "no_reachable_backend": "无法连接到任何已配置的节点。请检查节点 ID（或票据）与网络后重试。",
+      "two_factor_required": "服务端要求两步验证，但此处未配置 2FA 凭据。请填写服务端 [auth.clients] 中对应的客户端 ID 与密钥。",
+      "stop_failed": "代理停止失败，详情请查看日志。",
+      "not_running": "代理当前未运行。",
+      "node_id_unavailable": "节点 ID 暂不可用。",
+      "tun_unavailable": "TUN 模式需要系统服务，请先安装服务再开启 TUN。"
+    },
+    "service": {
+      "unavailable": "系统服务无响应，可能尚未安装。",
+      "io_error": "与系统服务的连接中断。",
+      "malformed_response": "系统服务返回了异常响应。",
+      "legacy_failure": "已安装的服务为旧版本，并返回了错误。",
+      "failed": "系统服务报告失败。",
+      "command_failed": "无法执行系统服务管理命令。",
+      "install_failed": "安装系统服务失败。",
+      "uninstall_failed": "卸载系统服务失败。",
+      "start_failed": "启动系统服务失败。",
+      "stop_failed": "停止系统服务失败。",
+      "definition_failed": "写入服务定义失败。",
+      "unsupported_platform": "当前系统不支持服务模式。",
+      "exe_path": "无法解析应用路径。",
+      "elevation_denied": "管理员授权被拒绝。",
+      "elevation_incomplete": "管理员授权未完成。",
+      "elevation_unavailable": "当前系统没有可用的提权方式。",
+      "elevation_failed": "请求管理员授权失败。",
+      "unauthorized": "系统服务已拒绝该请求：调用方无法证明它是 NexaPipe 本体。",
+      "ipc_token": "无法读取服务凭据，请重启 NexaPipe 以重新签发。",
+      "malformed_request": "系统服务收到了无法解析的请求。",
+      "local_addr_not_loopback": "本地代理只能监听本机地址（127.0.0.1）。",
+      "dns_addr_outside_tun": "DNS 服务只能监听在 TUN 网段内。"
+    },
+    "logs": {
+      "dir_unreadable": "无法读取日志目录。",
+      "read_failed": "无法读取日志文件。"
+    }
+  }
+}

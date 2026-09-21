@@ -1,0 +1,141 @@
+{
+  "app": {
+    "name": "nexa",
+    "windowTitle": "nexa"
+  },
+  "nav": {
+    "primaryNavigation": "Primary navigation",
+    "connect": "Connect",
+    "config": "Config",
+    "settings": "Settings",
+    "logs": "Logs",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
+    "autoCollapsedHint": "The window is too narrow for the sidebar"
+  },
+  "window": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "close": "Close"
+  },
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close",
+    "retry": "Retry",
+    "copy": "Copy",
+    "copied": "Copied to clipboard",
+    "copyFailed": "Could not copy to clipboard",
+    "refresh": "Refresh",
+    "loading": "Loading…",
+    "empty": "Nothing here yet",
+    "add": "Add",
+    "edit": "Edit",
+    "remove": "Remove",
+    "delete": "Delete",
+    "clear": "Clear",
+    "search": "Search",
+    "back": "Back",
+    "uninstall": "Uninstall",
+    "install": "Install",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "unknown": "Unknown",
+    "details": "Technical details",
+    "version": "Version"
+  },
+  "status": {
+    "running": "Running",
+    "stopped": "Stopped",
+    "starting": "Starting…"
+  },
+  "mode": {
+    "tun": "TUN",
+    "local_proxy": "Local Proxy"
+  },
+  "connect": {
+    "title": "Connect",
+    "started": "Proxy started",
+    "stopped": "Proxy stopped",
+    "tunToggle": "TUN mode",
+    "tunRequiresService": "TUN mode needs the system service. Install it first.",
+    "tunUnavailableServiceGone": "The system service is no longer available, so TUN mode was turned off.",
+    "modeMismatch": "The proxy is running in {mode} mode, which is not what you selected."
+  },
+  "appearance": {
+    "title": "Appearance",
+    "theme": "Theme",
+    "themeHint": "Follow the system, or pick a theme explicitly",
+    "themeSystem": "System",
+    "themeLight": "Light",
+    "themeDark": "Dark",
+    "language": "Language",
+    "languageHint": "Changes take effect immediately"
+  },
+  "service": {
+    "title": "Service Management",
+    "status": "Service Status",
+    "stateNotInstalled": "Not installed",
+    "stateStopped": "Stopped",
+    "stateRunning": "Running",
+    "install": "Install Service",
+    "installing": "Installing...",
+    "uninstall": "Uninstall Service",
+    "uninstalling": "Uninstalling...",
+    "start": "Start",
+    "starting": "Starting...",
+    "stop": "Stop",
+    "stopping": "Stopping...",
+    "installed": "The service was installed and started.",
+    "uninstalled": "The service was uninstalled.",
+    "started": "The service is running.",
+    "stopped": "The service was stopped.",
+    "hintElevation": "Installing or removing the service asks for administrator approval (UAC / sudo)",
+    "hintAutostart": "The service starts automatically at system boot",
+    "hintProduction": "Service mode is recommended for production"
+  },
+  "error": {
+    "unknown": "Something went wrong. Please try again.",
+    "proxy": {
+      "no_nodes": "Add at least one node before starting the proxy.",
+      "invalid_load_balancing": "The load-balancing strategy is not recognised.",
+      "start_failed": "The proxy failed to start. See the logs for details.",
+      "no_reachable_backend": "No configured node could be reached. Check the node ID (or ticket) and your network, then try again.",
+      "two_factor_required": "The server requires two-factor authentication, but no 2FA credentials are configured here. Add the client ID and secret the server lists under [auth.clients].",
+      "stop_failed": "The proxy failed to stop. See the logs for details.",
+      "not_running": "The proxy is not running.",
+      "node_id_unavailable": "The node ID is not available yet.",
+      "tun_unavailable": "TUN mode needs the system service. Install it first, then enable TUN."
+    },
+    "service": {
+      "unavailable": "The system service is not responding. It may not be installed.",
+      "io_error": "The connection to the system service was interrupted.",
+      "malformed_response": "The system service sent an unexpected response.",
+      "legacy_failure": "The installed service is an older version and reported an error.",
+      "failed": "The system service reported a failure.",
+      "command_failed": "The system service manager could not be run.",
+      "install_failed": "Installing the system service failed.",
+      "uninstall_failed": "Uninstalling the system service failed.",
+      "start_failed": "Starting the system service failed.",
+      "stop_failed": "Stopping the system service failed.",
+      "definition_failed": "The service definition could not be written.",
+      "unsupported_platform": "Service mode is not supported on this system.",
+      "exe_path": "The application path could not be resolved.",
+      "elevation_denied": "Administrator permission was declined.",
+      "elevation_incomplete": "The administrator prompt was not completed.",
+      "elevation_unavailable": "No way to ask for administrator permission on this system.",
+      "elevation_failed": "Requesting administrator permission failed.",
+      "unauthorized": "The system service refused the request: the caller could not prove it is the NexaPipe app.",
+      "ipc_token": "The service credential could not be read. Restart NexaPipe so it issues a new one.",
+      "malformed_request": "The system service received a request it could not read.",
+      "local_addr_not_loopback": "The local proxy can only listen on this computer (127.0.0.1).",
+      "dns_addr_outside_tun": "The DNS server can only listen inside the TUN network."
+    },
+    "logs": {
+      "dir_unreadable": "The log directory could not be read.",
+      "read_failed": "The log file could not be read."
+    }
+  }
+}
