@@ -1,0 +1,453 @@
+name: Release APK
+
+# Triggers
+#   1. Push a v* tag (e.g. v1.0.0) -> build, sign and publish a GitHub Release
+#   2. Manual "Run workflow" from the Actions page (the upstream Rust ref and
+#      the version can be specified)
+#
+# When triggered manually you can tick "signing_only" to run only the signing
+# secrets validation (without compiling Rust), which makes it quick to locate
+# signing problems such as KeytoolException / toDerInputStream rejects tag type.
+# Local pre-flight check:
+#   powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
+#
+# Required secrets (Settings -> Secrets and variables -> Actions)
+#   RELEASE_KEYSTORE_BASE64    base64 of the *.jks keystore itself (one line)
+#   RELEASE_KEYSTORE_PASSWORD  keystore password
+#   RELEASE_KEY_ALIAS          key alias
+#   RELEASE_KEY_PASSWORD       key password
+#
+# Where the native library comes from: the ui-android repo does not keep
+# libnexapipe_client.so (app/.gitignore excludes app/src/main/jniLibs/). This
+# workflow checks out the public upstream repo open-nexa/nexapipe, cross-compiles
+# the arm64-v8a .so with cargo-ndk and hands it to Gradle.
+#
+# Pre-release rule: a tag / version whose name contains a hyphen (v0.2.0-rc.1,
+# v0.2.0-beta.1, v0.2.0-alpha.3) is published as a GitHub pre-release, so a
+# release-candidate tag cannot take over "latest". A plain version (v1.0.0) is
+# published as a normal release. Same rule as ui-desktop's release workflow.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      signing_only:
+        description: 'Verify the signing secrets only (skips the Rust build, about 1 minute)'
+        type: boolean
+        default: false
+      rust_ref:
+        description: 'Branch / tag / commit of the upstream Rust repo (open-nexa/nexapipe)'
+        required: false
+        default: 'main'
+      version_name:
+        description: 'Override for versionName (leave empty to auto-generate 0.0.<run_number>)'
+        required: false
+        default: ''
+      rust_features:
+        description: 'Cargo features for nexapipe-client (must include tun-proxy, otherwise the APK misses the TUN JNI symbols)'
+        required: false
+        default: 'jni local-proxy tun-proxy'
+
+permissions:
+  contents: write
+
+env:
+  RUST_REPO: open-nexa/nexapipe
+  NDK_VERSION: 29.0.14206865
+  MIN_SDK: 26
+  TARGET_ABI: arm64-v8a
+  TARGET_TRIPLE: aarch64-linux-android
+  ANDROID_PLATFORM: '36'
+  BUILD_TOOLS: 36.0.0
+
+jobs:
+  release:
+    name: Build signed release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Android repo
+        uses: actions/checkout@v4
+
+      - name: Resolve build inputs
+        id: opts
+        env:
+          INPUT_RUST_REF: ${{ inputs.rust_ref }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_RUST_FEATURES: ${{ inputs.rust_features }}
+          INPUT_SIGNING_ONLY: ${{ inputs.signing_only }}
+        run: |
+          set -euo pipefail
+          RUST_REF="${INPUT_RUST_REF:-main}"
+          RUST_FEATURES="${INPUT_RUST_FEATURES:-jni local-proxy tun-proxy}"
+
+          # Inputs are empty on push / non-dispatch runs, so the full flow runs
+          # by default.
+          if [ "${INPUT_SIGNING_ONLY:-false}" = "true" ]; then
+            SKIP_RUST=true
+          else
+            SKIP_RUST=false
+          fi
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          else
+            VERSION_NAME="${INPUT_VERSION_NAME}"
+          fi
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME="0.0.${GITHUB_RUN_NUMBER}"
+          fi
+
+          # A version with a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
+          # pre-release; a plain version (v1.0.0) is not. Same rule as
+          # ui-desktop, so a release-candidate tag never replaces "latest".
+          if [[ "$VERSION_NAME" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+
+          {
+            echo "rust_ref=$RUST_REF"
+            echo "rust_features=$RUST_FEATURES"
+            echo "version_name=$VERSION_NAME"
+            echo "version_code=${GITHUB_RUN_NUMBER}"
+            echo "prerelease=$PRERELEASE"
+            echo "skip_rust=$SKIP_RUST"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### nexapipe $VERSION_NAME (versionCode ${GITHUB_RUN_NUMBER})"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Rust repo | \`${RUST_REPO}\` @ \`${RUST_REF}\` |"
+            echo "| cargo features | \`${RUST_FEATURES}\` |"
+            echo "| ABI | \`${TARGET_ABI}\` |"
+            echo "| Pre-release | \`${PRERELEASE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # android-actions/setup-android is deliberately NOT used here. Its
+      # `packages` input defaults to "tools platform-tools" and the legacy
+      # "tools" package has been removed from the SDK repository, so the action
+      # dies with "Failed to find package 'tools'" on current runner images
+      # (cmdline-tools 16.0). The GitHub-hosted Ubuntu image already ships a
+      # working SDK + cmdline-tools, so the handful of packages this build
+      # needs are installed explicitly below -- and never "tools".
+      - name: Set up Android SDK
+        id: sdk
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK"
+          export ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "Android SDK root: $SDK"
+
+          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)
+          fi
+          if [ -z "${SM:-}" ] || [ ! -x "$SM" ]; then
+            echo "::error::sdkmanager not found under $SDK/cmdline-tools"
+            ls -1 "$SDK/cmdline-tools" || true
+            exit 1
+          fi
+          echo "sdkmanager: $SM"
+
+          # Accept the licenses before installing anything.
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+
+          "$SM" --install \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${BUILD_TOOLS}"
+
+          # Install the pinned NDK. If that exact build is no longer in the
+          # channel, take the newest available one instead of failing the whole
+          # release -- any NDK >= r26 works for arm64-v8a / minSdk 26.
+          if ! "$SM" --install "ndk;${NDK_VERSION}"; then
+            LATEST_NDK=$("$SM" --list 2>/dev/null \
+              | awk -v skip="ndk;${NDK_VERSION}" \
+                    '/^[[:space:]]*ndk;/{ if ($1 != skip) { v=$1 } } END{ print v }')
+            if [ -n "${LATEST_NDK:-}" ]; then
+              echo "::warning::ndk;${NDK_VERSION} is unavailable, falling back to ${LATEST_NDK}"
+              "$SM" --install "$LATEST_NDK" \
+                || echo "::warning::${LATEST_NDK} could not be installed either"
+            else
+              echo "::warning::ndk;${NDK_VERSION} is unavailable and no alternative NDK is listed by the SDK channel"
+            fi
+          fi
+
+          NDK_DIR="$SDK/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
+          fi
+          if [ -z "${NDK_DIR:-}" ] || [ ! -d "$NDK_DIR" ]; then
+            echo "::error::No NDK directory under $SDK/ndk"
+            ls -1 "$SDK/ndk" || true
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ndk_version=$(basename "$NDK_DIR")" >> "$GITHUB_OUTPUT"
+          echo "NDK: $NDK_DIR"
+
+      - name: Checkout upstream Rust repo
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUST_REPO }}
+          ref: ${{ steps.opts.outputs.rust_ref }}
+          path: rust-src
+
+      - name: Set up Rust toolchain
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET_TRIPLE }}
+
+      - name: Install cargo-ndk
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Cache cargo artifacts
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust-src/target
+          key: ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-${{ hashFiles('rust-src/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-
+
+      - name: Build libnexapipe_client.so
+        if: steps.opts.outputs.skip_rust != 'true'
+        env:
+          RUST_FEATURES: ${{ steps.opts.outputs.rust_features }}
+        run: |
+          set -euo pipefail
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="${NDK_BIN}/${TARGET_TRIPLE}${MIN_SDK}-clang"
+          if [ ! -x "$LINKER" ]; then
+            echo "::error::NDK linker not found: $LINKER"
+            ls -1 "$NDK_BIN" | grep -E 'clang$' || true
+            exit 1
+          fi
+
+          # The upstream .cargo/config.toml hardcodes a Windows NDK linker path.
+          # Override it on the command line with --config (which takes
+          # precedence over both environment variables and the config file) so
+          # the Linux runner uses the right clang.
+          cd rust-src
+          cargo ndk \
+            --target "${TARGET_ABI}" \
+            --platform "${MIN_SDK}" \
+            build --release \
+            -p nexapipe-client \
+            --features "${RUST_FEATURES}" \
+            --config "target.${TARGET_TRIPLE}.linker='${LINKER}'"
+
+          mkdir -p "../app/src/main/jniLibs/${TARGET_ABI}"
+          cp "target/${TARGET_TRIPLE}/release/libnexapipe_client.so" \
+             "../app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+          ls -lh "../app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+
+      - name: Verify native library exports
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+          SO="app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+          test -f "$SO" || { echo "::error file=$SO::Native library not found"; exit 1; }
+
+          NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          SYMS=$("$NM" -D --defined-only "$SO" \
+                 | grep -o 'Java_com_nexa_pipe_IrohProxy_[A-Za-z0-9_]*' | sort -u || true)
+          echo "$SYMS"
+
+          MISSING=0
+          for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
+                    nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
+                    nativeStartProxyLegacy nativeStopProxy nativeAddNode nativeStartTunProxy \
+                    nativeStopTunProxy nativeDestroy; do
+            if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
+              echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+
+      # Restore RELEASE_KEYSTORE_BASE64 into a .jks file and surface every
+      # problem (wrong secret content / wrong password / wrong alias) right
+      # here. Otherwise the failure is deferred to the Gradle packaging step and
+      # reported as KeytoolException / toDerInputStream rejects tag type NNN,
+      # which is very hard to trace back.
+      - name: Prepare signing keystore
+        id: keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+
+          [ -n "${RELEASE_KEYSTORE_BASE64:-}" ] \
+            || die "Missing secret RELEASE_KEYSTORE_BASE64 (base64 of the *.jks keystore itself)"
+
+          # Tolerate whitespace, newlines, quotes, backticks and a data URI
+          # prefix that may have been picked up while pasting.
+          B64=$(printf '%s' "$RELEASE_KEYSTORE_BASE64" \
+                | tr -d "[:space:]" \
+                | tr -d "\"\`'" \
+                | sed 's/^data:[^,]*;base64,//')
+          [ -n "$B64" ] || die "Secret RELEASE_KEYSTORE_BASE64 is empty after stripping whitespace"
+          echo "Secret character count: ${#RELEASE_KEYSTORE_BASE64} (${#B64} after stripping whitespace)"
+
+          mkdir -p "$RUNNER_TEMP/signing"
+          KS="$RUNNER_TEMP/signing/release.jks"
+
+          # If plain decoding fails, retry once while tolerating stray invalid
+          # characters and let the file-header check below be the final guard.
+          if ! printf '%s' "$B64" | base64 -d > "$KS" 2>/dev/null; then
+            printf '%s' "$B64" | base64 -d -i > "$KS" 2>/dev/null \
+              || die "RELEASE_KEYSTORE_BASE64 is not valid base64 (length after cleanup: ${#B64})"
+          fi
+
+          SIZE=$(stat -c %s "$KS")
+          MAGIC=$(od -A n -t x1 -N 4 "$KS" | tr -d ' \n')
+          SHA=$(sha256sum "$KS" | cut -d' ' -f1)
+          echo "Decoded ${SIZE} bytes, file header 0x${MAGIC}, sha256 ${SHA}"
+
+          case "$MAGIC" in
+            3082*|30*) ;;      # PKCS12 (DER SEQUENCE)
+            feedfeed) ;;       # legacy JKS
+            *)
+              echo "::error::RELEASE_KEYSTORE_BASE64 does not decode to a keystore (file header 0x${MAGIC}, expected 0x3082... or 0xfeedfeed)"
+              echo "---------- First 32 decoded bytes ----------"
+              od -A d -t x1z -N 32 "$KS" || true
+              echo "--------------------------------------"
+              echo "This secret must be the base64 of the *.jks file ITSELF: a single line, a few thousand characters, starting with MII."
+              echo "Common mistakes: a file path / the password / the path of the base64 file / the base64 of some other file."
+              echo "If the character/byte count above looks far too small (this project's keystore is about 4.3 KB, i.e. about 5776 base64 characters),"
+              echo "it was almost certainly truncated while copying the single long line. Copy the whole thing with this command instead of selecting it by hand:"
+              echo "  Get-Content <base64-file> -Raw | Set-Clipboard"
+              exit 1
+              ;;
+          esac
+          [ "$SIZE" -gt 1000 ] || die "The decoded keystore is only ${SIZE} bytes, obviously incomplete"
+
+          # Validate the password and the alias with keytool up front; that is
+          # far quicker than waiting for the Gradle packaging step to fail.
+          if [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ]; then
+            ALIAS_ARGS=""
+            if [ -n "${RELEASE_KEY_ALIAS:-}" ]; then
+              ALIAS_ARGS="-alias ${RELEASE_KEY_ALIAS}"
+            fi
+            if ! keytool -list -keystore "$KS" \
+                   -storepass "$RELEASE_KEYSTORE_PASSWORD" $ALIAS_ARGS \
+                   > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
+              cat "$RUNNER_TEMP/keytool.err"
+              die "keytool cannot read the keystore: check RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
+            fi
+            echo "keytool check passed: password and alias ${RELEASE_KEY_ALIAS:-<unset>} are both correct"
+          else
+            echo "::warning::RELEASE_KEYSTORE_PASSWORD is not set, skipping the keytool pre-check"
+          fi
+
+          {
+            echo ""
+            echo "### Signing keystore verification"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Size | ${SIZE} bytes |"
+            echo "| File header | \`0x${MAGIC}\` |"
+            echo "| sha256 | \`${SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "keystore_sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Signing check only
+        if: steps.opts.outputs.skip_rust == 'true'
+        run: |
+          set -euo pipefail
+          echo "signing_only=true: the signing secrets check passed; the Rust build / packaging / publishing steps were skipped."
+          echo "keystore sha256: ${{ steps.keystore.outputs.keystore_sha256 }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assemble signed release APK
+        if: steps.opts.outputs.skip_rust != 'true'
+        env:
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease \
+            -PversionName="${{ steps.opts.outputs.version_name }}" \
+            -PversionCode="${{ steps.opts.outputs.version_code }}"
+
+      - name: Verify APK signature and stage artifact
+        id: apk
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort | head -n 1)
+          test -n "$APK" || { echo "::error::Release APK not found"; exit 1; }
+
+          BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
+          "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
+
+          OUT="nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
+
+          {
+            echo "### Artifacts"
+            echo '```'
+            "${BUILD_TOOLS_DIR}/aapt2" dump badging "$OUT" | head -n 4
+            cat "${OUT}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexapipe-release-apk-${{ steps.opts.outputs.version_name }}
+          path: |
+            nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
+            nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' && steps.opts.outputs.skip_rust != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
+            nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Set by the "Resolve build inputs" step: versions containing a hyphen
+          # (v0.2.0-rc.1) are published as a pre-release and never become
+          # "latest".
+          prerelease: ${{ steps.opts.outputs.prerelease == 'true' }}
