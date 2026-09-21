@@ -1,0 +1,327 @@
+name: Release
+
+# Build multi-platform artifacts and create a GitHub Release when a v* tag is pushed.
+# Can also be triggered manually (workflow_dispatch); an existing tag must be provided.
+#
+# Pre-release rule: a tag whose name contains a hyphen (v0.2.0-rc.1, v0.2.0-beta.1)
+# is published as a GitHub pre-release, so a release-candidate tag cannot take over
+# "latest". A plain tag (v1.0.0) is published as a normal release. Same rule as
+# ui-desktop's and ui-android's release workflows.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag, e.g. v0.1.0"
+        required: true
+        type: string
+
+# The build stage only needs read access; the release stage elevates separately (see the release job)
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  BIN_NAME: nexapipe
+  # Client crate; its cdylib is built as well (crate-type includes cdylib)
+  LIB_NAME: nexapipe-client
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      # Keep building the remaining platforms if one fails, to make issues easier to locate
+      fail-fast: false
+      matrix:
+        include:
+          # ---------- Linux (glibc) ----------
+          # x86_64 is built natively on the runner; aarch64 is cross-compiled via cross (Docker)
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+
+          # ---------- Linux (musl, statically linked) ----------
+          # musl defaults to crt-static, and rustc then decides the target cannot produce a
+          # cdylib: cargo only warns ("dropping unsupported crate type `cdylib`") and exits 0,
+          # so the .so simply does not exist when packaging runs. -C target-feature=-crt-static
+          # brings it back. It is applied to the cdylib step only (see "Build client cdylib"),
+          # so the nexapipe binary itself stays statically linked. Never put it in
+          # .cargo/config.toml — that would make every musl binary dynamic.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+            lib_rustflags: -C target-feature=-crt-static
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+            lib_rustflags: -C target-feature=-crt-static
+
+          # ---------- macOS (cross-compile the Intel build on an arm64 runner) ----------
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            cross: false
+
+          # ---------- Windows (cross-compile the arm64 build on an x64 runner) ----------
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building tag: $TAG (version=$VERSION)"
+
+      # Warning only, does not block the release: the tag does not match the version in Cargo.toml
+      - name: Warn on version mismatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -n "$CARGO_VERSION" ] && [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::warning::tag ${TAG_NAME} does not match workspace version ${CARGO_VERSION} in Cargo.toml"
+          fi
+
+      - name: Install Rust target
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # cross ships the target's gcc/musl-gcc and the C toolchain required by ring inside the container
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: cross build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      # Client cdylib. Note: every #[no_mangle] export lives in jni.rs (only compiled with the
+      # jni feature), and jni.rs depends on LocalProxy, so local-proxy must be enabled too;
+      # otherwise the build produces no exported symbols at all.
+      - name: Build client cdylib (cross)
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per-target rustc flags must go through CARGO_TARGET_<TRIPLE>_RUSTFLAGS under cross;
+          # a plain RUSTFLAGS would be dropped inside the container.
+          if [ -n "${{ matrix.lib_rustflags }}" ]; then
+            var="CARGO_TARGET_$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            export "$var=${{ matrix.lib_rustflags }}"
+            echo "Using $var=${{ matrix.lib_rustflags }}"
+          fi
+          cross build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+
+      - name: Build client cdylib (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.lib_rustflags }}" ]; then
+            var="CARGO_TARGET_$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+            export "$var=${{ matrix.lib_rustflags }}"
+            echo "Using $var=${{ matrix.lib_rustflags }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.LIB_NAME }} --features jni,local-proxy
+
+      # config.toml is gitignored (it is the operator's live config), so the archive ships the
+      # example instead; README.md is included so an unpacked release still documents the format.
+      - name: Resolve artifact file names
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Windows)
+              echo "BIN_FILE=${BIN_NAME}.exe" >> "$GITHUB_ENV"
+              echo "LIB_FILE=nexapipe_client.dll" >> "$GITHUB_ENV"
+              # MSVC also emits an import library, which is convenient for linking from C/C++
+              echo "LIB_FILE_EXTRA=nexapipe_client.dll.lib" >> "$GITHUB_ENV"
+              ;;
+            macOS)
+              echo "BIN_FILE=${BIN_NAME}" >> "$GITHUB_ENV"
+              echo "LIB_FILE=libnexapipe_client.dylib" >> "$GITHUB_ENV"
+              echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "BIN_FILE=${BIN_NAME}" >> "$GITHUB_ENV"
+              echo "LIB_FILE=libnexapipe_client.so" >> "$GITHUB_ENV"
+              echo "LIB_FILE_EXTRA=" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      # Fail here, with the release directory listed, instead of letting the packaging step
+      # die on an opaque `cp: cannot stat ...`.
+      - name: Verify built artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="target/${{ matrix.target }}/release"
+          missing=0
+          for f in "$BIN_FILE" "$LIB_FILE"; do
+            if [ ! -f "$dir/$f" ]; then
+              echo "::error::expected artifact is missing: $dir/$f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "--- $dir ---"
+            ls -l "$dir" || true
+            exit 1
+          fi
+          ls -lh "$dir/$BIN_FILE" "$dir/$LIB_FILE"
+
+      - name: Smoke test
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/${BIN_FILE} --version
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="${BIN_NAME}-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$PKG"
+          cp "target/${{ matrix.target }}/release/${BIN_FILE}" "dist/$PKG/"
+          cp "target/${{ matrix.target }}/release/${LIB_FILE}" "dist/$PKG/"
+          cp config.toml.2fa.example README.md LICENSE "dist/$PKG/"
+          tar -czf "dist/$PKG.tar.gz" -C dist "$PKG"
+          rm -rf "dist/$PKG"
+          ls -lh dist
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "$env:BIN_NAME-$env:VERSION-${{ matrix.target }}"
+          $stage = "dist/$pkg"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_FILE" $stage
+          Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE" $stage
+          if ($env:LIB_FILE_EXTRA -and (Test-Path "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA")) {
+            Copy-Item "target/${{ matrix.target }}/release/$env:LIB_FILE_EXTRA" $stage
+          }
+          Copy-Item config.toml.2fa.example, README.md, LICENSE $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$pkg.zip" -Force
+          Remove-Item -Recurse -Force $stage
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # gh release needs write permission
+    permissions:
+      contents: write
+    steps:
+      # gh requires the working directory to be a git repo; fetch-depth: 0 lets
+      # --generate-notes diff against the previous tag
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ${BIN_NAME}-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A version containing a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
+          # pre-release; a plain version (v1.0.0) is not. Same rule as
+          # ui-desktop / ui-android, so a release-candidate tag never replaces
+          # "latest".
+          case "$VERSION" in
+            *-*) PRERELEASE_FLAG="--prerelease=true" ;;
+            *)   PRERELEASE_FLAG="--prerelease=false" ;;
+          esac
+          echo "TAG_NAME=$TAG_NAME VERSION=$VERSION PRERELEASE_FLAG=$PRERELEASE_FLAG"
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists, overwriting the uploaded artifacts"
+            gh release upload "$TAG_NAME" dist/* --clobber
+            # `gh release upload` cannot flip the flag, so keep an already
+            # published release (e.g. a re-run) in sync with the rule as well.
+            gh release edit "$TAG_NAME" "$PRERELEASE_FLAG"
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --title "$TAG_NAME" \
+              --generate-notes \
+              --verify-tag \
+              "$PRERELEASE_FLAG"
+          fi

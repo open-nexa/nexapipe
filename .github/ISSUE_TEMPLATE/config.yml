@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/open-nexa/nexapipe/security/advisories/new
+    about: >
+      Report exploitable problems privately through a security advisory, not as a
+      public issue. Known gaps are listed under "Security boundary" in the README.
+  - name: Question or idea
+    url: https://github.com/open-nexa/nexapipe/discussions
+    about: >
+      Ask usage questions and float half-formed ideas here. Issues are for work
+      that has a defined outcome.

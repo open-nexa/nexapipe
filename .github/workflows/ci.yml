@@ -1,0 +1,60 @@
+name: CI
+
+# Fast checks for regular commits/PRs (Linux only): formatting, lint, tests.
+# Multi-platform builds are verified by release.yml when a tag is pushed.
+# Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test on Windows.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure rustfmt
+        run: rustup component add rustfmt
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure clippy
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: cargo test
+        run: cargo test --workspace --locked

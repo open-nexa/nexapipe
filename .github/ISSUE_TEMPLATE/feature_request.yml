@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest a capability, or ask for something to work differently.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this is a question about how to do something, or an idea you have not
+        thought through yet, use
+        [Discussions](https://github.com/open-nexa/nexapipe/discussions) instead.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Server (`crates/nexapipe`)
+        - Client library (`crates/nexapipe-client`)
+        - Wire format (`crates/nexapipe-proto`)
+        - Website or documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you trying to do that you cannot today? Describe the situation,
+        not the solution — the solution goes in the next box.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: |
+        Including doing nothing, or solving it outside NexaPipe — for example in
+        Caddy, which sees the decrypted request and can do things this proxy
+        deliberately cannot.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Would you work on it?
+      options:
+        - label: I would be willing to open a pull request for this
+          required: false

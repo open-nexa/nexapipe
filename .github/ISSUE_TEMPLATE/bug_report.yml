@@ -1,0 +1,107 @@
+name: Bug report
+description: Something does not behave the way the README says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Please search existing issues first — including
+        closed ones — before opening a new one.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part is misbehaving?
+      options:
+        - Server (`crates/nexapipe`)
+        - Client library (`crates/nexapipe-client`)
+        - Wire format (`crates/nexapipe-proto`)
+        - Website or documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        The Android and desktop apps live in their own repositories
+        ([nexa-android](https://github.com/open-nexa/nexa-android),
+        [nexa-desktop](https://github.com/open-nexa/nexa-desktop)).
+        App-specific bugs belong there.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag, or the commit hash if you built from source.
+      placeholder: v0.1.0 / 96c9971
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and architecture of the machine running the server.
+      placeholder: Ubuntu 24.04 x86_64 / Windows 11 x86_64 / Docker on arm64
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Numbered, and short enough that someone else can follow it.
+      placeholder: |
+        1. Start the server with this config
+        2. Open a stream with ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: |
+        Only the section that matters. Remove every 2FA secret, relay URL and
+        Node ID first — this issue is public.
+      render: toml
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Run with `debug = true` if you can. Query strings are redacted in the
+        access log, but check the output anyway before pasting it.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues
+          required: true
+        - label: I checked my config against the README section for this feature
+          required: false
