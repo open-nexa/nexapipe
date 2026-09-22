@@ -7,6 +7,7 @@ use nexapipe::config::{
 use nexapipe::proxy::{run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
+use nexapipe_client::relay::RelayModeSpec;
 use std::sync::Arc;
 
 /// How the 2FA enrollment QR code is drawn.
@@ -523,12 +524,23 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     };
 
     let (domains, domains_source) = invite_domains(&cli.invite_domains, proxy_config.as_ref());
+    // Only a relay this endpoint is actually pinned to is worth advertising: with `default`
+    // the home relay is chosen at runtime and can move, and with `disabled` there is none.
+    // Read off the resolved spec rather than the raw strings, so a `"custom"` that is really
+    // unusable (no URL, n0-operated URL) does not end up in the invite.
     let relay = cli.invite_relay.clone().or_else(|| {
-        proxy_config
-            .as_ref()
-            .and_then(|config| config.iroh.as_ref())
-            .filter(|iroh| !matches!(iroh.relay_mode.as_deref(), Some("disabled")))
-            .and_then(|iroh| iroh.relay_url.clone())
+        let iroh = proxy_config.as_ref().and_then(|config| config.iroh.as_ref())?;
+        let spec = RelayModeSpec::parse(
+            iroh.relay_mode.as_deref(),
+            iroh.relay_url.as_deref(),
+            iroh.relay_auth_token.as_deref(),
+        )
+        .ok()
+        .flatten()?;
+        match spec {
+            RelayModeSpec::Custom { .. } => iroh.relay_url.clone(),
+            _ => None,
+        }
     });
 
     let mut invite = EndpointInvite::new(target, &domains)?

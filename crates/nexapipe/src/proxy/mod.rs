@@ -10,14 +10,16 @@ use crate::log;
 use crate::passthrough;
 use crate::routes::RouteConfig;
 use crate::shutdown::ShutdownSignal;
+use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
+use iroh::{Endpoint, SecretKey};
 use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
+use nexapipe_client::relay::RelayModeSpec;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -125,6 +127,29 @@ pub async fn run_proxy(
 
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
+    // Which relay we use, resolved by the same code the clients use, so the two cannot drift
+    // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).
+    // Everything else either resolves or fails startup: `relay_mode` used to be ignored
+    // entirely unless `relay_url` was also set, and a `relay_url` on its own was logged and
+    // then dropped — both of which let a broken configuration run unchanged.
+    let relay = RelayModeSpec::parse(
+        iroh_config.as_ref().and_then(|c| c.relay_mode.as_deref()),
+        iroh_config.as_ref().and_then(|c| c.relay_url.as_deref()),
+        iroh_config
+            .as_ref()
+            .and_then(|c| c.relay_auth_token.as_deref()),
+    )
+    .context("invalid [iroh] relay configuration")?;
+    if let Some(relay) = &relay {
+        tracing::info!("Relay: {}", relay.describe());
+        if !relay.uses_url()
+            && let Some(url) = iroh_config.as_ref().and_then(|c| c.relay_url.as_deref())
+        {
+            tracing::warn!("[iroh] relay_url {url:?} is set but this mode does not use one; ignoring it");
+        }
+        builder = builder.relay_mode(relay.relay_mode());
+    }
+
     if let Some(iroh_cfg) = iroh_config {
         // Use configured secret key for stable endpoint identity
         if let Some(secret_key_str) = &iroh_cfg.secret_key {
@@ -147,30 +172,6 @@ pub async fn run_proxy(
                 .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;
             builder = builder.bind_addr(addr)?;
             tracing::info!("Iroh bind port: {}", port);
-        }
-
-        if let Some(relay_url) = iroh_cfg.relay_url {
-            if let Some(mode) = iroh_cfg.relay_mode {
-                match mode.as_str() {
-                    "disabled" | "Disabled" => {
-                        tracing::warn!("Relay mode is disabled but relay URL is set, ignoring URL");
-                    }
-                    "default" | "Default" | "native" | "Native" => {
-                        tracing::warn!("Relay mode is default/native but custom URL is set");
-                    }
-                    "custom" | "Custom" => {
-                        tracing::info!("Configuring custom relay: {}", relay_url);
-                        let relay_url = RelayUrl::from_str(&relay_url)?;
-                        let relay_urls = RelayMap::from_iter(vec![relay_url]);
-                        builder = builder.relay_mode(iroh::RelayMode::Custom(relay_urls));
-                    }
-                    _ => {
-                        tracing::warn!("Unknown relay mode: {}", mode);
-                    }
-                }
-            } else {
-                tracing::info!("Configuring custom relay: {}", relay_url);
-            }
         }
     }
 

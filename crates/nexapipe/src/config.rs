@@ -39,6 +39,10 @@ pub struct ServerConfig {
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
+    /// Bearer token sent to the relay. Only meaningful with `relay_mode = "custom"`;
+    /// a relay that requires one has to be configured on both sides, because the
+    /// client's relay map is the only place its token is read from.
+    pub relay_auth_token: Option<String>,
     pub bind_port: Option<u16>,
     /// Secret key for stable endpoint identity.
     /// If provided, the endpoint will have the same Node ID across restarts.

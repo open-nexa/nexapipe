@@ -290,8 +290,34 @@ them and see [TLS](#tls).
 | --- | --- |
 | `secret_key` | Hex secret key from `--generate-secret`; keeps the Node ID stable. |
 | `bind_port` | Fixed UDP port instead of an ephemeral one. |
-| `relay_mode` | `disabled` / `default` / `custom`. |
-| `relay_url` | Required when `relay_mode = "custom"`. |
+| `relay_mode` | `pinned` / `default` / `disabled` / `custom`. Absent means `default`. |
+| `relay_url` | The relay to use with `relay_mode = "custom"`; setting it without a `relay_mode` means `custom`. |
+| `relay_auth_token` | Optional bearer token for a `custom` relay that requires one. |
+
+Relay modes:
+
+- **`default`** — every N0 relay, home relay chosen by latency. It can migrate
+  between relays, which drops the connections routed through it.
+- **`pinned`** — one fixed N0 relay (`aps1-1`, Singapore). Use this when relay
+  migration is worse than a slightly slower relay.
+- **`disabled`** — no relay transport at all. Stronger than it sounds: with no
+  relay transport the endpoint cannot dial through a *peer's* relay either, so a
+  client with `relay_mode = "disabled"` cannot reach a server that is only
+  reachable via relay.
+- **`custom`** — one relay you run, and **only** that one: no N0 relay is used,
+  neither as a home relay nor as a net_report probe target. Pointing it at an
+  `*.relay.n0.iroh.link` URL is rejected; use `pinned` or `default` for those.
+
+A `relay_mode` that is present but unusable — `custom` with no URL, or an
+unrecognised spelling — stops startup rather than quietly falling back to
+another mode. A `relay_url` next to a mode that does not take one is ignored and
+logged; it is usually left over from an earlier mode.
+
+`custom` constrains **this** endpoint: its home relay and its probe traffic. It
+does not isolate the process from n0 entirely — a peer that advertises an N0
+relay is still dialled through it, and Endpoint ID discovery still queries
+`dns.iroh.link`. Both are properties of how iroh resolves and connects peers,
+and neither has a switch in iroh 1.0.1.
 
 ### `[[routes]]` — routing
 

@@ -255,6 +255,12 @@ impl IrohConnectionPool {
         *self.inner.two_factor.lock().await = auth;
     }
 
+    /// Test-only: whether this pool has credentials configured.
+    #[cfg(test)]
+    pub(crate) async fn has_two_factor(&self) -> bool {
+        self.inner.two_factor.lock().await.is_some()
+    }
+
     /// Takes the reason the backend last refused a connection for missing 2FA,
     /// and clears it.
     ///
