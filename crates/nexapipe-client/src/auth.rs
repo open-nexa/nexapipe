@@ -6,7 +6,20 @@ use crate::ClientError;
 use hmac::{Hmac, Mac};
 use iroh::endpoint::Connection;
 use sha2::Sha256;
+use std::fmt;
 use totp_rs::{Algorithm, Secret, TOTP};
+
+/// Application error codes the server closes a connection with during the 2FA
+/// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`.
+mod auth_close_code {
+    /// No AUTH_START arrived within the handshake deadline, or the server does
+    /// not run the handshake on that first stream at all.
+    pub const REQUIRED: u32 = 2;
+    /// The handshake ran and the credentials were refused.
+    pub const REJECTED: u32 = 3;
+    /// The peer already holds as many connections as it is allowed.
+    pub const TOO_MANY: u32 = 4;
+}
 
 /// HMAC-SHA256 keyed by the TOTP secret, used to sign auth challenges.
 type HmacSha256 = Hmac<Sha256>;
@@ -146,6 +159,53 @@ impl TwoFactorAuth {
         mac.finalize().into_bytes().to_vec()
     }
 
+    /// Turn a failed handshake read into an error that says what happened.
+    ///
+    /// A refusal races its own connection close: the server writes AUTH_FAILED
+    /// and then immediately closes, and whichever the client sees first decides
+    /// between "your credentials were refused" and a bare transport error —
+    /// "connection lost", which reads like the server died. The close frame
+    /// carries the verdict independently of those bytes, so read it back.
+    fn read_failure(
+        &self,
+        conn: &Connection,
+        step: &str,
+        source: impl fmt::Display,
+    ) -> ClientError {
+        let detail = format!("{}: {}", step, source);
+
+        let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = conn.close_reason()
+        else {
+            // Nothing to learn from a connection that is still up, or that died
+            // a transport death with no application verdict attached.
+            return ClientError::ConnectionFailed(detail);
+        };
+
+        match u32::try_from(close.error_code.into_inner()) {
+            Ok(auth_close_code::REJECTED) => {
+                let subject = if self.client_id.is_empty() {
+                    "these credentials".to_string()
+                } else {
+                    format!("the credentials of client '{}'", self.client_id)
+                };
+                ClientError::AuthenticationFailed(format!(
+                    "the server rejected {subject} — the client_id/secret pair does not match \
+                     its [auth].clients (the reason itself never arrived, the close did)"
+                ))
+            }
+            Ok(auth_close_code::REQUIRED) => ClientError::ConnectionFailed(format!(
+                "{}: the server closed the connection mid-handshake without ever accepting AUTH_START — \
+                 either it does not have 2FA enabled at all, or the two sides run different handshake versions",
+                detail
+            )),
+            Ok(auth_close_code::TOO_MANY) => ClientError::ConnectionFailed(format!(
+                "{}: the server refused this connection because this peer already holds too many",
+                detail
+            )),
+            _ => ClientError::ConnectionFailed(detail),
+        }
+    }
+
     /// Authenticate with the server over a connection
     pub async fn authenticate(&self, conn: &Connection) -> Result<(), ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
@@ -183,13 +243,13 @@ impl TwoFactorAuth {
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf)
             .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read length: {}", e)))?;
+            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE length", e))?;
         let msg_len = u32::from_le_bytes(len_buf) as usize;
 
         let mut msg_buf = vec![0u8; msg_len];
         recv.read_exact(&mut msg_buf)
             .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {}", e)))?;
+            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE body", e))?;
 
         let challenge_msg = AuthMessage::from_bytes(&msg_buf)
             .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
@@ -235,15 +295,15 @@ impl TwoFactorAuth {
 
         // Step 4: Receive AUTH_OK or AUTH_FAILED
         let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read length: {}", e)))?;
+        recv.read_exact(&mut len_buf).await.map_err(|e| {
+            self.read_failure(conn, "failed to read the authentication result length", e)
+        })?;
         let msg_len = u32::from_le_bytes(len_buf) as usize;
 
         let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf)
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {}", e)))?;
+        recv.read_exact(&mut msg_buf).await.map_err(|e| {
+            self.read_failure(conn, "failed to read the authentication result body", e)
+        })?;
 
         let result_msg = AuthMessage::from_bytes(&msg_buf)
             .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;

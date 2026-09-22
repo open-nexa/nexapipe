@@ -28,6 +28,20 @@ type HttpClient = legacy::Client<
 /// and the task serving it alive until the peer itself goes away.
 const AUTH_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(2);
 
+/// How long the server holds a connection open after refusing it, so the
+/// AUTH_FAILED it just wrote can reach the client.
+///
+/// `Rejected` closes the connection the moment this returns, and that close
+/// races the bytes carrying the verdict: when the close wins, the client sees
+/// "connection lost" instead of "Invalid TOTP code", and cannot tell a wrong
+/// client_id from a server that went away. Waiting for the peer — which closes
+/// the connection itself once it has read the refusal — removes that guesswork.
+///
+/// It is deliberately small: this wait happens inside
+/// [`AUTH_HANDSHAKE_TIMEOUT`], which still has to cover the three earlier round
+/// trips on a slow link.
+const AUTH_RESULT_GRACE: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
 /// The largest AUTH_* message the server accepts.
 ///
 /// The length prefix is the first four bytes of whatever stream arrives first,
@@ -596,6 +610,26 @@ async fn perform_authentication(
         .map_err(|e| AuthFailure::NotStarted(format!("failed to send auth result: {}", e)))?;
     send.finish()
         .map_err(|e| AuthFailure::NotStarted(format!("failed to finish auth stream: {}", e)))?;
+
+    // Let a refused client read its verdict before the caller pulls the
+    // connection out from under it. A client that has read AUTH_FAILED closes
+    // the connection itself, which ends this wait immediately; one that has
+    // vanished simply costs the grace period. Whatever the peer sends is
+    // discarded — it has already been refused, nothing further is read for
+    // meaning.
+    if !is_valid {
+        let mut buf = [0u8; 256];
+        let drain = async {
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(AUTH_RESULT_GRACE, drain).await;
+    }
 
     if is_valid {
         Ok(client_id)
