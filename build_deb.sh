@@ -204,8 +204,15 @@ declare -A APT_FOR_MODULE=(
     [webkit2gtk-4.1]="libwebkit2gtk-4.1-dev"
     [ayatana-appindicator3-0.1]="libayatana-appindicator3-dev"
     [librsvg-2.0]="librsvg2-dev"
-    [xdo]="libxdo-dev"
     [openssl]="libssl-dev"
+)
+# libxdo-dev is deliberately not in APT_FOR_MODULE: Debian/Ubuntu ship no pkg-config file
+# for it (the file list on packages.ubuntu.com for noble/amd64 is exactly /usr/include/xdo.h,
+# libxdo.so and documentation), so `pkg-config --exists xdo` keeps failing on a machine where
+# the package is installed. Tauri asks for the package because it needs the header and the
+# -lxdo symlink at link time, which is what APT_FOR_HEADER probes instead.
+declare -A APT_FOR_HEADER=(
+    [xdo.h]="libxdo-dev"
 )
 declare -A APT_FOR_TOOL=(
     [patchelf]="patchelf"
@@ -215,11 +222,40 @@ declare -A APT_FOR_TOOL=(
     [xdg-open]="xdg-utils"
 )
 
+# Debian multiarch triple, used to look in /usr/include/<triple> when a header lives there.
+MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+if [[ -z "$MULTIARCH" ]] && command -v gcc >/dev/null 2>&1; then
+    MULTIARCH="$(gcc -print-multiarch 2>/dev/null || true)"
+fi
+if [[ -z "$MULTIARCH" ]]; then
+    case "$HOST_ARCH" in
+        amd64) MULTIARCH="x86_64-linux-gnu" ;;
+        arm64) MULTIARCH="aarch64-linux-gnu" ;;
+    esac
+fi
+
+# Why each pkg-config probe failed, printed after the missing list; check_system_deps itself
+# must stay silent because the caller captures its stdout with mapfile.
+declare -a MISSING_REASONS=()
+
+have_header() {
+    local hdr="$1"
+    [[ -e "/usr/include/$hdr" ]] && return 0
+    [[ -n "$MULTIARCH" && -e "/usr/include/$MULTIARCH/$hdr" ]] && return 0
+    return 1
+}
+
 check_system_deps() {
     local -a missing=()
-    local mod tool
+    local mod tool hdr reason
     for mod in "${!APT_FOR_MODULE[@]}"; do
-        pkg-config --exists "$mod" 2>/dev/null || missing+=("${APT_FOR_MODULE[$mod]}")
+        if pkg-config --exists "$mod" 2>/dev/null; then continue; fi
+        missing+=("${APT_FOR_MODULE[$mod]}")
+        reason="$(pkg-config --exists --print-errors "$mod" 2>&1 | head -n1)"
+        [[ -n "$reason" ]] && MISSING_REASONS+=("$reason")
+    done
+    for hdr in "${!APT_FOR_HEADER[@]}"; do
+        have_header "$hdr" || missing+=("${APT_FOR_HEADER[$hdr]}")
     done
     for tool in patchelf file dpkg-deb; do
         command -v "$tool" >/dev/null 2>&1 || missing+=("${APT_FOR_TOOL[$tool]}")
@@ -252,6 +288,9 @@ else
             sudo apt-get install -y --no-install-recommends "${MISSING[@]}"
         else
             bad "missing system packages: ${MISSING[*]}"
+            for reason in "${MISSING_REASONS[@]:-}"; do
+                [[ -n "$reason" ]] && info "  pkg-config: $reason"
+            done
             info "install them with:"
             info "  sudo apt-get update && sudo apt-get install -y --no-install-recommends ${MISSING[*]}"
             info "or rerun this script with --install-deps (uses sudo), or --skip-deps to ignore"
@@ -279,7 +318,10 @@ fi
 
 if [[ "$ARCH" != "$HOST_ARCH" ]]; then
     warn "cross-building $ARCH on a $HOST_ARCH host: you also need a cross toolchain"
-    warn "(for arm64: gcc-aarch64-linux-gnu plus a linker setting in .cargo/config.toml)"
+    warn "(for arm64: gcc-aarch64-linux-gnu plus a linker setting in .cargo/config.toml,"
+    warn "and the arm64 variants of the dev packages above: libwebkit2gtk-4.1-dev:arm64,"
+    warn "libayatana-appindicator3-dev:arm64, libxdo-dev:arm64, libssl-dev:arm64)"
+    warn "note that the preflight above only proved the HEADERS PRESENT: on a cross build it cannot tell host headers from target ones"
 fi
 
 # ---------------------------------------------------------------------------
