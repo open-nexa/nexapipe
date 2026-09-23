@@ -2661,7 +2661,6 @@ dependencies = [
  "totp-rs",
  "tracing",
  "uniffi",
- "uniffi_bindgen",
  "url",
  "webpki-roots",
 ]

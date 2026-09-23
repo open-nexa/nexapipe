@@ -57,6 +57,3 @@ tun-proxy = ["local-proxy", "dep:netstack-smoltcp", "dep:libc"]
 
 [target.'cfg(target_os = "ios")'.dependencies]
 webpki-roots = "1.0.8"
-
-[build-dependencies]
-uniffi_bindgen = { version = "0.25", optional = true }

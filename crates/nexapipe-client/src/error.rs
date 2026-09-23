@@ -1,6 +1,10 @@
 ﻿use std::fmt;
 
 #[derive(Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
+// `flat_error`: only `Display` crosses the boundary. `IoError(std::io::Error)` is
+// not a uniffi type, so the variants cannot be lowered structurally.
+#[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum ClientError {
     ConnectionError(String),
     ConnectionFailed(String),

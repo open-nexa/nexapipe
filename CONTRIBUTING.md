@@ -67,7 +67,9 @@ Other house rules:
 - One logical change per commit, with a descriptive subject —
   `fix(local-proxy): handle CONNECT tunnel close`, not `update`.
 - Platform code stays behind cargo features (`jni`, `local-proxy`, `tun-proxy`,
-  `uniffi`). `--all-features` does not build (uniffi 0.25).
+  `uniffi`). The `uniffi` bindings are proc-macro based, so there is no UDL file
+  to regenerate; the module is `uniffi_bindings.rs` (a module named `uniffi`
+  would shadow the crate of the same name at the crate root).
 - `third_party/smoltcp` is vendored with a patch and wired through
   `[patch.crates-io]`. Do not edit it.
 - Inline comments are in English.

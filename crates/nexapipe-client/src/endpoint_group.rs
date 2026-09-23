@@ -431,11 +431,21 @@ impl EndpointGroup {
                     Ok(true) => true,
                     Ok(false) => {
                         jni_log!("[preconnect] Node unreachable (preconnect returned false)");
+                        // `jni_log` only reaches logcat; the desktop and the service need
+                        // this in their own log — the pool's warning says why.
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("preconnect: node {} is unreachable", backend_id);
                         false
                     }
                     Err(_) => {
                         jni_log!(
                             "[preconnect] Node timed out after {}s",
+                            PRECONNECT_TIMEOUT.as_secs()
+                        );
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "preconnect: node {} gave no answer within {}s",
+                            backend_id,
                             PRECONNECT_TIMEOUT.as_secs()
                         );
                         false
@@ -510,6 +520,20 @@ impl EndpointGroup {
             kinds.push((backend_id, pool.link_kind().await));
         }
         kinds
+    }
+
+    /// Closes and forgets every cached connection to every backend, keeping the endpoints.
+    ///
+    /// Called when the device switched networks: the tunnel itself stays up, but the
+    /// connections inside it were opened on the old network and are dead while still looking
+    /// open. See [`IrohConnectionPool::drop_connections`] for why they have to be closed
+    /// explicitly instead of waiting for QUIC to notice.
+    pub async fn drop_connections(&self) {
+        let pools = self.unique_pools();
+        for (backend_id, pool) in pools {
+            pool.drop_connections().await;
+            jni_log!("[drop-connections] dropped cached connections to {}", backend_id);
+        }
     }
 
     /// Every distinct backend in this group, with its pool.

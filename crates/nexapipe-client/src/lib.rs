@@ -1,3 +1,6 @@
+// `setup_scaffolding!` (uniffi 0.25) expands to a comparison of two `extern "C"` fn
+// pointers, which rustc warns about and no item-level `allow` can reach.
+#![cfg_attr(feature = "uniffi", allow(unpredictable_function_pointer_comparisons))]
 pub mod auth;
 pub mod client;
 pub mod connection_pool;
@@ -31,7 +34,9 @@ pub mod virtual_ip;
 pub mod tun_proxy;
 
 #[cfg(feature = "uniffi")]
-pub mod uniffi;
+// Named `uniffi_bindings` on purpose: a module called `uniffi` would shadow the external
+// crate at the crate root, and `setup_scaffolding!` expands to `uniffi::ffi::...`.
+pub mod uniffi_bindings;
 
 #[cfg(feature = "jni")]
 pub mod jni;
@@ -52,4 +57,4 @@ pub use transport::{TransportTuning, transport_config, transport_config_with_tun
 pub use local_proxy::LocalProxy;
 
 #[cfg(feature = "uniffi")]
-uniffi::include_scaffolding!("nexapipe_client");
+::uniffi::setup_scaffolding!();

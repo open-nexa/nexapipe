@@ -1442,6 +1442,71 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeLinkKinds(
     }
 }
 
+/// Closes and forgets every cached backend connection, keeping the iroh endpoint.
+///
+/// This is the Android network-switch recovery step. A connection opened on the previous
+/// network is not closed as far as QUIC is concerned — its `close_reason()` is still `None`
+/// while its path is dead — so the pool keeps handing it out and every proxied request fails
+/// or hangs, even though the tunnel itself was rebuilt correctly. Dropping them makes the next
+/// request dial on the current network; `nativePreconnect` then fills the pool again.
+///
+/// The endpoint is deliberately left alone: it is shared with the running TUN proxy, and
+/// rebinding it would pull a working tunnel apart.
+///
+/// Returns 0 when the connections were dropped, -1 when nothing has been started yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let runtime = match get_runtime() {
+        Some(r) => r,
+        None => {
+            jni_log!("[DEBUG:jni] nativeDropConnections: runtime not initialized");
+            return -1;
+        }
+    };
+
+    let endpoint_group = {
+        let state = match get_state() {
+            Some(s) => s,
+            None => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: state not initialized");
+                return -1;
+            }
+        };
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: failed to lock state");
+                return -1;
+            }
+        };
+        match guard.endpoint_group.clone() {
+            Some(eg) => eg,
+            None => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: no endpoint group yet");
+                return -1;
+            }
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        runtime.block_on(async move { endpoint_group.drop_connections().await })
+    }));
+
+    match result {
+        Ok(()) => {
+            jni_log!("[DEBUG:jni] nativeDropConnections: dropped every cached connection");
+            0
+        }
+        Err(_) => {
+            jni_log!("[DEBUG:jni] Panic occurred during nativeDropConnections");
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
     mut env: JNIEnv,
