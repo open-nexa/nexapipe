@@ -26,7 +26,9 @@
 #                     with "no private key")
 #                   * build.beforeBuildCommand       - always npm, never yarn
 #   4. Build      - npx tauri build --target <triple> --bundles <bundles> --config <override>
-#   5. Summary    - path and size of every .deb / .rpm / .AppImage / .sig produced, plus
+#   5. Verify     - run .github/scripts/verify-deb.sh, the same Debian service-lifecycle
+#                   check the Linux CI job runs after its build.
+#   6. Summary    - path and size of every .deb / .rpm / .AppImage / .sig produced, plus
 #                   dpkg-deb metadata for each .deb.
 #
 # Difference from CI: the default bundle is deb only (CI builds deb rpm appimage) and
@@ -47,6 +49,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ARCH=""
 BUNDLES="deb"
+VERSION=""
 NO_BUNDLE=false
 DEBUG_BUILD=false
 SKIP_TYPE_CHECK=false
@@ -84,6 +87,10 @@ Options:
   --arch <amd64|arm64>   Target architecture (default: the host architecture).
   --bundles <list>       Comma-separated bundle types, default "deb"
                          (also available: rpm, appimage).
+  --version <x.y.z>      Package version. CI derives it from the v* tag and syncs it
+                         into tauri.conf.json; locally it is injected through the
+                         override config instead, so the working tree stays clean.
+                         Without this flag the version from tauri.conf.json is used.
   --no-bundle            Build the binary only, skip packaging.
   --debug                Use the debug cargo profile (much faster Rust build).
   --skip-type-check      Frontend build runs "npx vite build", skipping vue-tsc.
@@ -119,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)           ARCH="${2:-}"; shift 2 ;;
         --bundles)        BUNDLES="${2:-}"; shift 2 ;;
+        --version)        VERSION="${2:-}"; shift 2 ;;
         --no-bundle)      NO_BUNDLE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         --skip-type-check) SKIP_TYPE_CHECK=true; shift ;;
@@ -151,6 +159,11 @@ case "$ARCH" in
 esac
 CARGO_PROFILE="release"
 if $DEBUG_BUILD; then CARGO_PROFILE="debug"; fi
+
+# Same version grammar CI enforces when it derives the version from the v* tag.
+if [[ -n "$VERSION" ]] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid --version '$VERSION' (expected <major>.<minor>.<patch>, optionally with a -rc.1 style suffix)"
+fi
 
 # ---------------------------------------------------------------------------
 # Paths (all derived from the script location, so any cwd works)
@@ -381,6 +394,7 @@ TAURI_ARGS+=(--config "$OVERRIDE_FILE")
 
 step "Build plan"
 printf '  %-18s %s\n' "working dir:"  "$DESKTOP_DIR"
+printf '  %-18s %s\n' "version:"      "${VERSION:-(from tauri.conf.json)}"
 printf '  %-18s %s\n' "frontend cmd:" "${BEFORE_BUILD:-(frontend build skipped)}"
 printf '  %-18s %s\n' "override:"     "$OVERRIDE_FILE"
 printf '  %-18s %s\n' "bundles:"      "$($NO_BUNDLE && echo '(none, --no-bundle)' || echo "$BUNDLES")"
@@ -434,8 +448,14 @@ step "Writing the override config"
 mkdir -p "$OVERRIDE_DIR"
 # Arrays are replaced wholesale by --config, so the Windows-only wintun.dll resource is
 # dropped here; keeping it would abort the bundle step on a missing path.
+# "version" mirrors what CI syncs into tauri.conf.json before building (release.yml,
+# "Sync version into tauri.conf.json"): --config deep-merges, so the packaged version
+# can be overridden without touching the tracked file.
+VERSION_LINE=""
+[[ -n "$VERSION" ]] && VERSION_LINE="\"version\": \"$VERSION\","
 cat > "$OVERRIDE_FILE" <<EOF
 {
+  $VERSION_LINE
   "build": {
     "beforeBuildCommand": "$BEFORE_BUILD"
   },
@@ -458,7 +478,25 @@ END=$(date +%s)
 ok "build finished in $(( (END - START) / 60 ))m $(( (END - START) % 60 ))s"
 
 # ---------------------------------------------------------------------------
-# 6. Summary
+# 6. Verify the Debian service lifecycle (the same check the Linux CI job runs)
+# ---------------------------------------------------------------------------
+VERIFY_DEB="$DESKTOP_DIR/.github/scripts/verify-deb.sh"
+if $NO_BUNDLE || [[ ",$BUNDLES," != *",deb,"* ]]; then
+    info "skipping verify-deb.sh (no deb bundle requested)"
+elif [[ ! -f "$VERIFY_DEB" ]]; then
+    warn "verify-deb.sh not found at $VERIFY_DEB - skipping the CI Debian lifecycle check"
+elif ! command -v dpkg-deb >/dev/null 2>&1; then
+    warn "dpkg-deb not available - skipping the CI Debian lifecycle check"
+else
+    step "Verifying the Debian service lifecycle (same check as CI)"
+    # Invoked through bash so the submodule's executable bit cannot matter; TARGET_DIR
+    # matches the script's CI default (it scans for */bundle/deb/*.deb underneath).
+    TARGET_DIR="$SRC_TAURI_DIR/target" bash "$VERIFY_DEB"
+    ok "Debian service lifecycle verification passed"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Summary
 # ---------------------------------------------------------------------------
 step "Artefacts"
 FOUND=0

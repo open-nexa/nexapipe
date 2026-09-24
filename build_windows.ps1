@@ -46,6 +46,11 @@
     Bundle types passed to `tauri build --bundles`, default nsis. Several are allowed:
     -Bundles nsis,msi.
 
+.PARAMETER Version
+    Package version, e.g. 0.2.0 or 0.2.0-rc.1. CI derives it from the v* tag and syncs
+    it into tauri.conf.json; locally it is injected through the override config instead,
+    so the working tree stays clean. Without it the version from tauri.conf.json is used.
+
 .PARAMETER NoBundle
     Build the exe only, skip packaging (--no-bundle). Fastest way to check a Rust change.
 
@@ -104,6 +109,8 @@ param(
     [ValidateSet('amd64', 'arm64')]
     [string]   $Arch = 'amd64',
     [string[]] $Bundles = @('nsis'),
+    [ValidatePattern('^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$')]
+    [string]   $Version,
     [switch]   $NoBundle,
     [switch]   $DebugBuild,
     [switch]   $SkipTypeCheck,
@@ -241,7 +248,7 @@ if (-not $car)  { Stop-Script 'cargo not found on PATH (install rustup first)' }
 $nodeVer = (Invoke-NativeCapture -Exe $node -Arguments @('--version')).Lines[0]
 if ($nodeVer -match 'v(\d+)') {
     $major = [int]$Matches[1]
-    if ($major -lt 18) { Stop-Script "node $nodeVer is too old; CI uses 22 and 18 is the minimum" }
+    if ($major -lt 18) { Stop-Script "node $nodeVer is too old; CI uses 24 and 18 is the minimum" }
 }
 $npmVer = (Invoke-NativeCapture -Exe $npm -Arguments @('--version')).Lines[0]
 $carVer = (Invoke-NativeCapture -Exe $car -Arguments @('--version')).Lines[0]
@@ -305,7 +312,7 @@ if ($NoBundle) {
 if ($DebugBuild) { $tauriArgs += '--debug' }
 $tauriArgs += @('--config', $OverrideFile)
 
-$overrideJson = @{
+$override = @{
     build  = @{ beforeBuildCommand = $beforeBuild }
     bundle = @{
         createUpdaterArtifacts = $signingEnabled
@@ -313,10 +320,18 @@ $overrideJson = @{
         # listed.
         resources             = @("wintun/bin/$Arch/wintun.dll")
     }
-} | ConvertTo-Json -Depth 4
+}
+# Mirrors what CI syncs into tauri.conf.json before building (release.yml,
+# "Sync version into tauri.conf.json"): --config deep-merges, so the packaged
+# version can be overridden without touching the tracked file. The key is only
+# added when set - ConvertTo-Json would otherwise emit "version": null and the
+# merge would blank out the version from tauri.conf.json.
+if ($Version) { $override['version'] = $Version }
+$overrideJson = $override | ConvertTo-Json -Depth 4
 
 Write-Step 'Build plan'
 Write-Host "  working dir : $DesktopDir"
+Write-Host "  version     : $(if ($Version) { $Version } else { '(from tauri.conf.json)' })"
 Write-Host "  frontend    : $(if ($beforeBuild) { $beforeBuild } else { '(frontend build skipped)' })"
 Write-Host "  override    : $OverrideFile"
 Write-Host "  updater sign: $signingEnabled"

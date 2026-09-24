@@ -23,6 +23,7 @@
 #   ./build_dmg.sh                     # host native arch, release profile
 #   ./build_dmg.sh --debug             # debug profile — quicker, not distributable
 #   ./build_dmg.sh --arch arm64        # explicit target triple suffix
+#   ./build_dmg.sh --version 0.2.0     # package version (CI takes it from the v* tag)
 #   ./build_dmg.sh --bundles app,dmg   # Tauri bundle targets (default app,dmg)
 #   ./build_dmg.sh --check             # environment check only, prints plan
 #   ./build_dmg.sh --open              # open the artefact dir in Finder
@@ -35,6 +36,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ARCH=""
 BUNDLES="app,dmg"
+VERSION=""
 RELEASE=false
 NO_BUNDLE=false
 DEBUG_BUILD=false
@@ -71,6 +73,10 @@ build_dmg.sh - build the nexa desktop macOS DMG (Tauri 2)
 Options:
   --arch <amd64|arm64>  Target macOS architecture (default: host).
   --bundles <list>       Comma-separated Tauri bundle targets, default "app,dmg".
+  --version <x.y.z>      Package version. CI derives it from the v* tag and syncs it
+                         into tauri.conf.json; locally it is injected through the
+                         override config instead, so the working tree stays clean.
+                         Without this flag the version from tauri.conf.json is used.
   --release              Build the Rust code in release mode (already the default).
   --debug                Build the Rust code in debug mode: much faster, bigger binary.
   --no-bundle            Build the binary only, skip packaging.
@@ -90,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)       ARCH="$2"; shift 2 ;;
         --bundles)    BUNDLES="$2"; shift 2 ;;
+        --version)    VERSION="$2"; shift 2 ;;
         --release)    RELEASE=true; shift ;;
         --no-bundle)  NO_BUNDLE=true; shift ;;
         --debug)      DEBUG_BUILD=true; shift ;;
@@ -201,6 +208,11 @@ fi
 PROFILE="release"
 $DEBUG_BUILD && PROFILE="debug"
 
+# Same version grammar CI enforces when it derives the version from the v* tag.
+if [[ -n "$VERSION" ]] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid --version '$VERSION' (expected <major>.<minor>.<patch>, optionally with a -rc.1 style suffix)"
+fi
+
 SIGNING_ENABLED="false"
 if [[ "$NO_SIGN" != "true" ]] && [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] && [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
     SIGNING_ENABLED="true"
@@ -228,6 +240,7 @@ step "Build plan"
 printf '  %-18s %s\n' "working dir:"  "$DESKTOP_DIR"
 printf '  %-18s %s\n' "target triple:" "$TARGET_TRIPLE"
 printf '  %-18s %s\n' "profile:"       "$PROFILE"
+printf '  %-18s %s\n' "version:"       "${VERSION:-(from tauri.conf.json)}"
 printf '  %-18s %s\n' "frontend cmd:"  "${BEFORE_BUILD:-(frontend build skipped)}"
 printf '  %-18s %s\n' "override:"      "$OVERRIDE_FILE"
 printf '  %-18s %s\n' "bundles:"       "$($NO_BUNDLE && echo '(none, --no-bundle)' || echo "$BUNDLES")"
@@ -281,8 +294,14 @@ fi
 # ---------------------------------------------------------------------------
 step "Writing the override config"
 mkdir -p "$OVERRIDE_DIR"
+# "version" mirrors what CI syncs into tauri.conf.json before building (release.yml,
+# "Sync version into tauri.conf.json"): --config deep-merges, so the packaged version
+# can be overridden without touching the tracked file.
+VERSION_LINE=""
+[[ -n "$VERSION" ]] && VERSION_LINE="\"version\": \"$VERSION\","
 cat > "$OVERRIDE_FILE" <<EOF
 {
+  $VERSION_LINE
   "build": {
     "beforeBuildCommand": "$BEFORE_BUILD"
   },

@@ -32,9 +32,10 @@
     adb device serial. Only needed when more than one device is attached.
 
 .PARAMETER Features
-    cargo features for nexapipe-client. Default: jni,tun-proxy. tun-proxy implies
-    local-proxy and is what compiles the TUN entry points. Override with a single
-    feature only for experiments.
+    cargo features for nexapipe-client. Default: jni,local-proxy,tun-proxy — the exact
+    set ui-android's release-apk.yml and this repo's ci.yml (android job) build with.
+    tun-proxy already implies local-proxy through the crate's feature graph, but the
+    list stays literal so a local .so cannot silently diverge from the CI one.
 
 .PARAMETER LogFile
     Where the logcat capture is written; overwritten on every run. Defaults to
@@ -83,7 +84,7 @@
 [CmdletBinding()]
 param(
     [string]   $Serial,
-    [string[]] $Features = @('jni', 'tun-proxy'),
+    [string[]] $Features = @('jni', 'local-proxy', 'tun-proxy'),
     [string]   $LogFile,
     [switch]   $SkipRust,
     [switch]   $SkipInstall,
@@ -102,6 +103,10 @@ $ErrorActionPreference = 'Stop'
 $RustTarget = 'aarch64-linux-android'   # only ABI the app ships (build.gradle.kts abiFilters)
 $Abi        = 'arm64-v8a'               # jniLibs subdirectory for that triple
 $SoFileName = 'libnexapipe_client.so'   # IrohProxy.kt: System.loadLibrary("nexapipe_client")
+# Same minSdk as ui-android's build.gradle.kts and release-apk.yml (MIN_SDK). cargo-ndk
+# needs it explicitly: its own default is 21, which would produce a .so built against an
+# older API level than the one CI ships.
+$MinSdk     = 26
 $AppId      = 'com.nexa.pipe'
 $Activity   = 'com.nexa.pipe/.MainActivity'
 
@@ -109,14 +114,26 @@ $Activity   = 'com.nexa.pipe/.MainActivity'
 # with the tag "NexaVpnService" in jni.rs.
 $LogTags = @('NexaVpnService', 'IrohProxy', 'VpnViewModel', 'PermissionManager')
 
-# JNI entry points the app needs. nativeStartTunProxy/nativeStopTunProxy only exist when
-# the crate is compiled with the tun-proxy feature.
+# JNI entry points the app needs. This is the exact list release-apk.yml verifies with
+# llvm-nm after building the .so; keeping it identical here means a local build that
+# passes this check cannot be missing a symbol the release build is checked for.
+# nativeStartTunProxy/nativeStopTunProxy only exist when the crate is compiled with the
+# tun-proxy feature.
 $RequiredSymbols = @(
     'Java_com_nexa_pipe_IrohProxy_nativeInit',
+    'Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers',
+    'Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride',
+    'Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig',
+    'Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor',
     'Java_com_nexa_pipe_IrohProxy_nativeStartIroh',
     'Java_com_nexa_pipe_IrohProxy_nativeStartProxy',
+    'Java_com_nexa_pipe_IrohProxy_nativePreconnect',
+    'Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy',
+    'Java_com_nexa_pipe_IrohProxy_nativeStopProxy',
+    'Java_com_nexa_pipe_IrohProxy_nativeAddNode',
     'Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy',
-    'Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy'
+    'Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy',
+    'Java_com_nexa_pipe_IrohProxy_nativeDestroy'
 )
 
 # ---------------------------------------------------------------------------
@@ -440,7 +457,7 @@ if ($Check) {
         $missing = @(Get-MissingExports -Path $SoSource -Symbols $RequiredSymbols)
         if ($missing.Count) {
             Write-Warn "missing exports: $($missing -join ', ')"
-            Write-Warn "rebuild with -Features jni,tun-proxy"
+            Write-Warn "rebuild with -Features jni,local-proxy,tun-proxy"
         } else {
             Write-Ok "all required JNI entry points present"
         }
@@ -466,8 +483,10 @@ if (-not $SkipRust) {
     try {
         # --package, not -p: after "build" every argument is forwarded to cargo, but the
         # short -p would be ambiguous with cargo-ndk's own --platform option.
+        # --platform $MinSdk matches CI (release-apk.yml builds with --platform 26).
         Invoke-Native -Label 'cargo ndk build' -Exe $cargo -Arguments @(
-            'ndk', '--target', $RustTarget, 'build', '--release',
+            'ndk', '--target', $RustTarget, '--platform', "$MinSdk",
+            'build', '--release',
             '--package', 'nexapipe-client', '--features', ($Features -join ',')
         )
     } finally {
@@ -495,7 +514,7 @@ $missing = @(Get-MissingExports -Path $SoSource -Symbols $RequiredSymbols)
 if ($missing.Count) {
     Write-Bad "Missing JNI entry points: $($missing -join ', ')"
     Write-Host "         The app would fail with UnsatisfiedLinkError at runtime." -ForegroundColor DarkGray
-    Write-Host "         Rebuild with the default features (jni,tun-proxy); tun-proxy is what" -ForegroundColor DarkGray
+    Write-Host "         Rebuild with the default features (jni,local-proxy,tun-proxy); tun-proxy is what" -ForegroundColor DarkGray
     Write-Host "         compiles the TUN entry points." -ForegroundColor DarkGray
     exit 1
 }
