@@ -183,11 +183,31 @@ step "Preflight"
     || die "$SRC_TAURI_DIR/Cargo.toml not found - same cause, initialise the submodules first"
 ok "ui-desktop is in place"
 
+for script in preinst postinst prerm postrm; do
+    [[ -f "$SRC_TAURI_DIR/debian/$script" ]] \
+        || die "missing Debian maintainer script: $SRC_TAURI_DIR/debian/$script"
+    [[ -x "$SRC_TAURI_DIR/debian/$script" ]] \
+        || die "Debian maintainer script is not executable: $SRC_TAURI_DIR/debian/$script (chmod +x it)"
+done
+ok "Debian maintainer scripts present"
+
 [[ -f "$CLIENT_CRATE" ]] \
     || die "path dependency $CLIENT_CRATE is missing - src-tauri/Cargo.toml refers to ../../crates/nexapipe-client; put crates/ under $REPO_ROOT"
 ok "path dependency crates/nexapipe-client present"
 
-command -v node  >/dev/null 2>&1 || die "node not found on PATH"
+# Node is commonly installed through nvm, which only exports its PATH from interactive
+# shells. Load it explicitly so GUI terminals and scripts can run this build as well.
+if ! command -v node >/dev/null 2>&1; then
+    NVM_SH="${NVM_DIR:-${HOME:-}/.nvm}/nvm.sh"
+    if [[ -s "$NVM_SH" ]]; then
+        set +u
+        # shellcheck disable=SC1090
+        source "$NVM_SH" || true
+        set -u
+        command -v nvm >/dev/null 2>&1 && nvm use --silent default >/dev/null 2>&1 || true
+    fi
+fi
+command -v node  >/dev/null 2>&1 || die "node not found on PATH (if it is installed through nvm, run: source ~/.nvm/nvm.sh && nvm use default)"
 command -v npm   >/dev/null 2>&1 || die "npm not found on PATH"
 command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH (install rustup first)"
 
