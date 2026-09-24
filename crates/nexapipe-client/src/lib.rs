@@ -27,10 +27,10 @@ pub mod local_proxy;
 #[cfg(feature = "tun-proxy")]
 pub mod virtual_ip;
 
-// TUN proxy: implements a userspace TCP/IP stack in Rust with smoltcp, replacing the
-// hand-written Kotlin TCP stack.
-// Android only (relies on tokio::io::unix::AsyncFd, which is Unix-only).
-#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+// TUN proxy: implements a userspace TCP/IP stack in Rust with smoltcp. Shared by
+// the Android client (fd-based entry point) and the desktop app (IP-packet
+// reader/writer entry point); the fd plumbing itself is Android-gated inside.
+#[cfg(feature = "tun-proxy")]
 pub mod tun_proxy;
 
 #[cfg(feature = "uniffi")]

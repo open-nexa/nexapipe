@@ -879,9 +879,10 @@ cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
-The Android TUN module is `cfg(target_os = "android")`, so the host build never
-compiles it — that `cargo ndk` line is the only thing that type-checks it, and it
-is easy to forget. `ui-desktop/src-tauri` is a separate cargo project, so the
+The TUN stack (`crates/nexapipe-client/src/tun_proxy.rs`) is shared by Android
+and the desktop; only its fd-based entry point is `cfg(target_os = "android")`,
+so that `cargo ndk` line is still the only thing that type-checks the Android
+half — easy to forget. `ui-desktop/src-tauri` is a separate cargo project, so the
 workspace lint gate does not cover it either.
 
 Tests worth running on their own:
@@ -901,8 +902,8 @@ Notes:
   `uniffi`) — keep it that way. The `uniffi` bindings are proc-macro based
   (`setup_scaffolding!` at the crate root); there is no UDL file to keep in sync.
 - `cargo test --workspace` runs on Windows too, because the Unix-only parts are
-  gated: `cfg(unix)` for signal handling, `cfg(target_os = "android")` for the
-  TUN module. CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
+  gated (`cfg(unix)` for signal handling). The TUN stack itself is
+  platform-independent; its Android fd entry point is gated inside the module. CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
   multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is
   published as a GitHub **pre-release** so it never takes over "latest"; a plain
   tag (`v1.0.0`) is a normal release — the same rule as `ui-desktop` and

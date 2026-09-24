@@ -64,6 +64,10 @@ struct Inner {
     domain_to_ip: HashMap<String, u32>,
     /// Next address to hand out; wraps around the pool.
     next: u32,
+    /// First address of the pool (wrap-around lower bound).
+    first: u32,
+    /// Last address of the pool (wrap-around upper bound).
+    last: u32,
 }
 
 impl Default for IpMapping {
@@ -73,12 +77,24 @@ impl Default for IpMapping {
 }
 
 impl IpMapping {
+    /// The Android layout: `10.0.1.16` … `10.0.1.254` (see the module docs).
     pub fn new() -> Self {
+        Self::with_range(VIRTUAL_IP_FIRST, VIRTUAL_IP_LAST)
+    }
+
+    /// A pool between `first` and `last` (inclusive).
+    ///
+    /// The desktop TUN lives on a block that is only known once the interface is
+    /// up (`…254` is the interface/DNS address there), so it builds its pool from
+    /// that block — `…2` … `…253` — instead of the Android fixed one.
+    pub fn with_range(first: Ipv4Addr, last: Ipv4Addr) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 ip_to_domain: HashMap::new(),
                 domain_to_ip: HashMap::new(),
-                next: u32::from(VIRTUAL_IP_FIRST),
+                next: u32::from(first),
+                first: u32::from(first),
+                last: u32::from(last),
             }),
         }
     }
@@ -97,8 +113,8 @@ impl IpMapping {
         }
 
         let ip = inner.next;
-        inner.next = if ip >= u32::from(VIRTUAL_IP_LAST) {
-            u32::from(VIRTUAL_IP_FIRST)
+        inner.next = if ip >= inner.last {
+            inner.first
         } else {
             ip + 1
         };
@@ -221,6 +237,27 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_pool_stays_inside_its_own_bounds() {
+        // The desktop layout: …2 … …253 inside whatever block the TUN got.
+        let first = Ipv4Addr::new(10, 44, 0, 2);
+        let last = Ipv4Addr::new(10, 44, 0, 253);
+        let mapping = IpMapping::with_range(first, last);
+
+        let a = mapping.allocate("a.test");
+        let b = mapping.allocate("b.test");
+        assert_eq!(a, first);
+        assert_eq!(b, Ipv4Addr::new(10, 44, 0, 3));
+
+        // The wrap-around respects the custom bounds, not the Android ones:
+        // the pool holds 252 addresses, so filling the remaining 250 brings the
+        // cursor back to the first one.
+        for i in 0..250 {
+            mapping.allocate(&format!("host{i}.test"));
+        }
+        assert_eq!(mapping.allocate("late.test"), first);
+    }
+
+    #[test]
     fn running_out_of_addresses_recycles_instead_of_breaking_the_lookup() {
         let mapping = IpMapping::new();
         let first = mapping.allocate("first.test");
@@ -235,7 +272,10 @@ mod tests {
 
         // The address now belongs to exactly one name. `first.test` was evicted
         // rather than left pointing at an address it no longer owns.
-        assert_eq!(mapping.lookup_domain(&recycled).as_deref(), Some("late.test"));
+        assert_eq!(
+            mapping.lookup_domain(&recycled).as_deref(),
+            Some("late.test")
+        );
         assert_eq!(mapping.len(), VIRTUAL_IP_COUNT);
         assert_ne!(mapping.allocate("first.test"), recycled);
     }

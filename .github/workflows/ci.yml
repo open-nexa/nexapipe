@@ -5,13 +5,14 @@ name: CI
 # Multi-platform builds are verified by release.yml when a tag is pushed.
 # Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test on Windows.
 #
-# Two jobs exist purely because the host toolchain cannot see the code they cover:
-#   - android:  crates/nexapipe-client/src/tun_proxy.rs is cfg(target_os = "android"),
-#               so a host `cargo check` never compiles it. Without this job a break
-#               there only surfaces when the release APK is built from a tag.
-#   - features: `local-proxy` / `webpki-roots` change which optional dependencies are
-#               compiled. --all-features is known NOT to build (uniffi 0.25), so the
-#               combinations that matter are listed explicitly instead.
+# Two jobs exist purely because the default feature set cannot see the code they cover:
+#   - android:  the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
+#               cfg(target_os = "android"); a host check covers the shared stack but not
+#               the Android half. Without this job a break there only surfaces when the
+#               release APK is built from a tag.
+#   - features: `local-proxy` / `webpki-roots` / `uniffi` change which optional
+#               dependencies are compiled, so the combinations that matter are listed
+#               explicitly instead of relying on --all-features.
 on:
   push:
     branches: [main, master]
@@ -81,6 +82,7 @@ jobs:
       matrix:
         features:
           - "local-proxy"
+          - "tun-proxy" # the shared smoltcp stack (host entry point)
           - "webpki-roots"
           - "uniffi"
     steps:

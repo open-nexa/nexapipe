@@ -21,7 +21,7 @@ Nexapipe is a Rust workspace: an iroh/QUIC-based proxy server forwarding HTTP/We
 - Android: `build_android.bat` (NDK build), `ui-android\gradlew.bat :app:compileDebugKotlin`, `run_android.ps1` (install/run on a device).
 - Desktop: `cd ui-desktop && npm run tauri:dev` (dev) / `npm run tauri:build` (release).
 
-Host `cargo check` never sees `crates/nexapipe-client/src/tun_proxy.rs` (it is `cfg(target_os = "android")`), so type-check it explicitly after touching the TUN or the L4 client:
+`crates/nexapipe-client/src/tun_proxy.rs` is shared by Android (fd entry, `TunProxy::new`) and the desktop (`TunProxy::with_io`); only the fd plumbing is android-gated inside. Host `cargo check -p nexapipe-client --features tun-proxy` covers the shared code, but the Android half still needs an explicit cross-check after touching the TUN or the L4 client:
 
 ```bash
 cargo ndk -t arm64-v8a check -p nexapipe-client --features jni,tun-proxy
