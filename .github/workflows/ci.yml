@@ -200,6 +200,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
+        with:
+          # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
+          # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
+          # advisory is only patched in glib >= 0.20, so there is no version to
+          # move to until upstream tauri migrates. Nothing in this workspace
+          # touches glib::VariantStrIter, the unsound iterator it describes.
+          #
+          # Drop this once ui-desktop/src-tauri/Cargo.lock pins glib >= 0.20.
+          allow-ghsas: GHSA-wrw7-89jp-8q8g
 
   # ------------------------------------------------------------------
   # Desktop app (migrated from open-nexa/nexa-desktop; src-tauri depends on
