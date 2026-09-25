@@ -1,0 +1,17 @@
+#!/bin/sh
+# Clean up the app-created systemd unit after removal or purge.
+set -e
+
+SERVICE=nexa-service.service
+
+case "${1:-}" in
+    remove|purge)
+        rm -f "/etc/systemd/system/$SERVICE"
+        rm -f /run/nexa-service.was-active
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

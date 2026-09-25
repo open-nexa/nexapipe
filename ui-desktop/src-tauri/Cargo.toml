@@ -1,0 +1,64 @@
+[package]
+name = "nexa"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+default-run = "nexa"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "nexa_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+# Gives the UI the OS name (macOS drives traffic-light padding, Linux hides the custom window
+# buttons). The alternative would be sniffing the user agent, which is exactly what the refactor
+# plan rules out; this is the official, typed route and adds no command surface.
+tauri-plugin-os = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "1"
+url = "2"
+http = "1"
+bytes = "1"
+lazy_static = "1.4"
+parking_lot = "0.12"
+fastrand = "2"
+tun = { version = "0.7", features = ["async"] }
+libc = "0.2"
+nexapipe-client = { path = "../../crates/nexapipe-client", features = [
+    "local-proxy",
+    "tun-proxy",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.5"
+# Only for the TUN address: `netsh` silently does nothing when this runs as a service
+# (LocalSystem), which is the same class of failure as `net session` — see proxy/routing.rs.
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+] }
+
+[[bin]]
+name = "nexa-service"
+path = "src/bin/nexa-service.rs"

@@ -1,0 +1,174 @@
+/**
+ * Design tokens — raw values only, theme-agnostic.
+ *
+ * `themes.css` maps these onto semantic names for the light and dark themes; components read
+ * semantic names, never the raw ones. Anything a component needs that is not in the semantic
+ * table means the table is incomplete: extend it instead of inlining a value here or in a
+ * component (docs/ui-refactor-plan.md §4.3).
+ *
+ * The accent scale is Tailwind blue-500 based, which is the shade the app has always used; see
+ * §9.2 of the plan for the still-open brand question. Swapping the brand colour is a change to
+ * the `--accent-*` block plus the two semantic mappings in `themes.css`.
+ */
+
+:root {
+  /* -- palette: neutral (slate) ------------------------------------------------------------ */
+  --neutral-0: #ffffff;
+  --neutral-25: #fcfdfe;
+  --neutral-50: #f8fafc;
+  --neutral-100: #f1f5f9;
+  --neutral-200: #e2e8f0;
+  --neutral-300: #cbd5e1;
+  --neutral-400: #94a3b8;
+  --neutral-500: #64748b;
+  --neutral-600: #475569;
+  --neutral-700: #334155;
+  --neutral-800: #1e293b;
+  --neutral-900: #0f172a;
+  --neutral-950: #020617;
+
+  /*
+   * Neutral surface ramp for dark mode. Kept separate from the slate ramp above: a dark UI wants
+   * a slightly violet-grey surface, which is also what the reference layout uses for its content
+   * area (#1e1f27).
+   */
+  --dark-950: #101116;
+  --dark-900: #14151b;
+  --dark-850: #1a1b22;
+  --dark-800: #1e1f27;
+  --dark-750: #23252e;
+  --dark-700: #262833;
+  --dark-600: #333644;
+  --dark-500: #454a5c;
+  --dark-400: #5c6275;
+
+  /* -- palette: accent --------------------------------------------------------------------- */
+  --accent-50: #eff6ff;
+  --accent-100: #dbeafe;
+  --accent-200: #bfdbfe;
+  --accent-300: #93c5fd;
+  --accent-400: #60a5fa;
+  --accent-500: #3b82f6;
+  --accent-600: #2563eb;
+  --accent-700: #1d4ed8;
+  --accent-800: #1e40af;
+  --accent-900: #1e3a8a;
+
+  /* -- palette: success -------------------------------------------------------------------- */
+  --green-50: #f0fdf4;
+  --green-100: #dcfce7;
+  --green-200: #bbf7d0;
+  --green-300: #86efac;
+  --green-400: #4ade80;
+  --green-500: #22c55e;
+  --green-600: #16a34a;
+  --green-700: #15803d;
+  --green-800: #166534;
+
+  /* -- palette: warning -------------------------------------------------------------------- */
+  --amber-50: #fffbeb;
+  --amber-100: #fef3c7;
+  --amber-200: #fde68a;
+  --amber-300: #fcd34d;
+  --amber-400: #fbbf24;
+  --amber-500: #f59e0b;
+  --amber-600: #d97706;
+  --amber-700: #b45309;
+  --amber-800: #92400e;
+
+  /* -- palette: error ---------------------------------------------------------------------- */
+  --red-50: #fef2f2;
+  --red-100: #fee2e2;
+  --red-200: #fecaca;
+  --red-300: #fca5a5;
+  --red-400: #f87171;
+  --red-500: #ef4444;
+  --red-600: #dc2626;
+  --red-700: #b91c1c;
+  --red-800: #991b1b;
+
+  /* -- palette: info ----------------------------------------------------------------------- */
+  --cyan-50: #ecfeff;
+  --cyan-100: #cffafe;
+  --cyan-200: #a5f3fc;
+  --cyan-300: #67e8f9;
+  --cyan-400: #22d3ee;
+  --cyan-500: #06b6d4;
+  --cyan-600: #0891b2;
+  --cyan-700: #0e7490;
+  --cyan-800: #155e75;
+
+  /* -- radius ------------------------------------------------------------------------------ */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* -- space (4px base, no arbitrary values) ----------------------------------------------- */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* -- typography -------------------------------------------------------------------------- */
+  --font-size-11: 11px;
+  --font-size-12: 12px;
+  --font-size-13: 13px;
+  --font-size-14: 14px;
+  --font-size-16: 16px;
+  --font-size-18: 18px;
+  --font-size-20: 20px;
+  --font-size-24: 24px;
+  --font-size-28: 28px;
+
+  --line-height-tight: 1.4;
+  --line-height-normal: 1.6;
+  --line-height-mono: 1.5;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /*
+   * Font stacks — the only `font-family` declarations in the project (§4.3, §5.11 rule 3).
+   *
+   * Latin UI faces come first so Latin glyphs render with the platform's UI font, and CJK text
+   * falls through to the platform's Chinese family: Microsoft YaHei on Windows (including
+   * ARM64), PingFang SC on macOS, Noto/WenQuanYi on Linux. Without the CJK entries each WebView
+   * picked its own fallback, which put a *serif* face (SimSun) inside monospace log lines on
+   * Windows.
+   *
+   * No webfont is bundled: system faces keep the native look, keep the bundle small on all six
+   * build targets, and carry no font licence payload.
+   */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei", Arial, sans-serif;
+  --font-mono: "Cascadia Code", "SF Mono", Menlo, Consolas, "Liberation Mono", "Noto Sans Mono",
+    "Microsoft YaHei", monospace;
+
+  /* -- motion ------------------------------------------------------------------------------ */
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --duration-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+
+  /* -- layout constants (the shell depends on these) ---------------------------------------- */
+  --layout-titlebar-h: 38px;
+  --layout-sidebar-w: 200px;
+  --layout-sidebar-w-collapsed: 60px;
+  --layout-page-pad-x: 24px;
+  --layout-page-pad-y: 20px;
+  --layout-content-max-w: 1080px;
+  /** macOS keeps its native traffic lights over our title bar; reserve room for them. */
+  --layout-macos-traffic-lights-w: 78px;
+}

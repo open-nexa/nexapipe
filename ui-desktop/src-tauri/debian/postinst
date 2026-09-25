@@ -1,0 +1,23 @@
+#!/bin/sh
+# Restore the service state after a package install or upgrade.
+set -e
+
+SERVICE=nexa-service.service
+STATE_FILE=/run/nexa-service.was-active
+
+case "${1:-}" in
+    configure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+            if [ -f "$STATE_FILE" ]; then
+                rm -f "$STATE_FILE"
+                systemctl restart "$SERVICE" || true
+            else
+                # Handles upgrades from packages without preinst as well.
+                systemctl try-restart "$SERVICE" || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

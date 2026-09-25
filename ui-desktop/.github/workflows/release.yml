@@ -1,0 +1,384 @@
+name: Release
+
+# Triggered when a v* tag is pushed. The matrix covers 6 platform/arch combinations:
+#   windows  amd64 / arm64
+#   macos    amd64 / arm64
+#   linux    amd64 / arm64
+# Each combination is built on a native runner (no cross-compilation); the Tauri
+# updater private key signs the update bundles, and finally the manifests are merged
+# into a single latest.json and a GitHub Release is created.
+on:
+  push:
+    tags:
+      - "v*"
+
+# softprops/action-gh-release needs write access to contents to create a Release.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# src-tauri depends on crates/nexapipe-client, which lives outside this repo in
+# open-nexa/nexapipe.
+# The ref is pinned explicitly here:
+# main once contained only a LICENSE while all the code lived on feat-proxy, so
+# omitting ref meant crates/ was never checked out
+# (that is the pitfall behind cp: cannot stat '.../nexapipe-deps/crates');
+# main now contains the code, but we still pin it so that another branch switch can
+# not silently hit the same problem again.
+# To switch branch/SHA without touching this workflow: Settings -> Secrets and
+# variables -> Actions -> Variables, and add NEXAPIPE_REF to override the default
+# below. NEXAPIPE_REPO does the same for the repository: on a fork, point it at your
+# own server repo (e.g. <your-org>/nexapipe) so the desktop branch picks up the
+# matching server-side crates -- otherwise the clone lands on open-nexa/nexapipe@main,
+# which has none of the branch's client changes and CI dies on unresolved imports.
+env:
+  NEXAPIPE_REPO: ${{ vars.NEXAPIPE_REPO || 'open-nexa/nexapipe' }}
+  NEXAPIPE_REF: ${{ vars.NEXAPIPE_REF || 'main' }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows ----
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: windows
+            arch: arm64
+            # GitHub-hosted native arm64 Windows runner: avoids cross-compiling on x64,
+            # which would require an extra ARM64 MSVC toolchain.
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+
+          # ---- macOS ----
+          # macos-13 (the last x64 image) is retired; x64 now uses macos-15-intel.
+          - os: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app dmg
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            bundles: app dmg
+
+          # ---- Linux ----
+          # Use 22.04 rather than 24.04: Tauri v2 needs webkit2gtk-4.1, which is
+          # available from 22.04 with a more stable ABI, so the resulting binaries run
+          # on more systems.
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb rpm appimage
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb rpm appimage
+
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        # The sources are checked out into the ui-desktop subdirectory of the workspace
+        # rather than into its root, because src-tauri/Cargo.toml depends on
+        # `../../crates/nexapipe-client` outside this repo:
+        #   <workspace>/ui-desktop/src-tauri  ->  ../../  ->  <workspace>/crates/nexapipe-client
+        # That crates directory is filled in by the "Checkout path dependency" step
+        # below.
+        working-directory: ui-desktop
+
+    env:
+      MATRIX_OS: ${{ matrix.os }}
+      MATRIX_ARCH: ${{ matrix.arch }}
+      # Both tauri build and tauri signer read these two environment variables directly.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout nexapipe-desktop
+        uses: actions/checkout@v5
+        with:
+          path: ui-desktop
+
+      - name: Fetch path dependency (${{ vars.NEXAPIPE_REPO || 'open-nexa/nexapipe' }})
+        # src-tauri depends on ../../crates/nexapipe-client, which is not part of this
+        # repo (see the note at the top of this file).
+        #
+        # Cloned anonymously on purpose instead of via actions/checkout: GITHUB_TOKEN is
+        # scoped to the repository that triggered the workflow and cannot fetch a second
+        # one — that combination fails with
+        # "The process '/usr/bin/git' failed with exit code 1".
+        # open-nexa/nexapipe is public, so no credential is needed; if it ever becomes
+        # private, set NEXAPIPE_REPO_TOKEN (a PAT with read access) and the clone below
+        # switches to an authenticated request. The credential goes into
+        # http.extraheader rather than the URL so a failure cannot print the PAT.
+        #
+        # No sparse-checkout either: it makes checkout use a --filter=blob:none partial
+        # clone, an extra moving part for no gain — the whole repo is a few MB.
+        shell: bash
+        env:
+          # NEXAPIPE_REF comes from the workflow-level env above.
+          DEP_TOKEN: ${{ secrets.NEXAPIPE_REPO_TOKEN }}
+        run: |
+          set -eo pipefail
+          if [[ ! "$NEXAPIPE_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::NEXAPIPE_REPO must be owner/repo (got: $NEXAPIPE_REPO)"
+            exit 1
+          fi
+          git_args=()
+          if [ -n "$DEP_TOKEN" ]; then
+            auth=$(printf 'x-access-token:%s' "$DEP_TOKEN" | base64 | tr -d '\n')
+            git_args=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth")
+          fi
+          git "${git_args[@]}" clone --depth 1 --branch "$NEXAPIPE_REF" \
+            "https://github.com/$NEXAPIPE_REPO" "$GITHUB_WORKSPACE/nexapipe-deps"
+
+      - name: Stage crates at workspace root
+        shell: bash
+        run: |
+          set -eo pipefail
+          src="$GITHUB_WORKSPACE/nexapipe-deps/crates"
+          dst="$GITHUB_WORKSPACE/crates"
+          # Guard against an empty GITHUB_WORKSPACE resolving the cp target to the root.
+          case "$dst" in
+            */crates) ;;
+            *) echo "::error::unexpected destination path: $dst"; exit 1 ;;
+          esac
+          if [ ! -d "$src" ]; then
+            echo "::error::crates/ not found in $NEXAPIPE_REPO@$NEXAPIPE_REF."
+            echo "Hint: if this repo is a fork, set the NEXAPIPE_REPO variable to your own server repo."
+            echo "--- $GITHUB_WORKSPACE ---"; ls -la "$GITHUB_WORKSPACE" || true
+            echo "--- nexapipe-deps ---"; ls -la "$GITHUB_WORKSPACE/nexapipe-deps" || true
+            echo "Hint: make sure the branch NEXAPIPE_REF points at really contains crates/ (currently $NEXAPIPE_REF)."
+            exit 1
+          fi
+          rm -rf "$dst"
+          cp -r "$src" "$dst"
+          test -f "$dst/nexapipe-client/Cargo.toml"
+          echo "nexapipe-client staged at: $dst/nexapipe-client"
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        # xdg-utils provides /usr/bin/xdg-open: the AppImage bundler copies it into
+        # the image because tauri-plugin-opener enables the shell-open API, and it
+        # hard-fails when /usr/bin/xdg-open does not exist ("xdg-open binary not
+        # found"). The x64 runner image ships it, the arm64 image does not.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file \
+            rpm \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The Rust workspace is under src-tauri/ (its target dir is src-tauri/target).
+          cache-on-failure: true
+          workspaces: ui-desktop/src-tauri -> target
+
+      - name: Install frontend dependencies
+        # npm install is used instead of npm ci: the committed package-lock.json was
+        # generated on Windows x64 and only records that platform's native binaries
+        # (@tauri-apps/cli-* / @esbuild/* / @rollup/rollup-*).
+        # npm ci installs strictly from the lockfile, so on other platforms those
+        # optional native packages would be missing and the tauri CLI would throw
+        # "Cannot find native binding" (npm/cli#4828).
+        # npm install adds the missing native packages for the current platform without
+        # changing the locked versions.
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          # Probe up front instead of blowing up at build time; if it really did not
+          # install, wipe everything, reinstall once, then verify again.
+          if ! npx tauri --version >/dev/null 2>&1; then
+            echo "::warning::missing @tauri-apps/cli native binary for this platform, wiping node_modules and reinstalling"
+            rm -rf node_modules package-lock.json
+            npm install --no-audit --no-fund
+          fi
+          npx tauri --version
+
+      - name: Check updater signing configuration
+        shell: bash
+        run: |
+          key_set=false; [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] && key_set=true
+          pass_set=false; [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] && pass_set=true
+          echo "TAURI_SIGNING_PRIVATE_KEY set: $key_set"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD set: $pass_set"
+          if [ "$key_set" != "$pass_set" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD must be set together or left empty together."
+            exit 1
+          fi
+
+      - name: Derive version from git tag
+        id: meta
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not a valid v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+
+      - name: Sync version into tauri.conf.json
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node -e "const fs=require('node:fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n');"
+          node -e "console.log('tauri.conf.json version =', JSON.parse(require('node:fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)"
+
+      - name: Generate Tauri CI config override
+        # Generates ci-override.json, which overrides tauri.conf.json per platform/arch:
+        #   - bundle.resources: on Windows pick wintun.dll by target arch (arm64 must
+        #     not ship the amd64 DLL)
+        #   - bundle.createUpdaterArtifacts: enabled only when a signing key exists,
+        #     otherwise the build fails for lack of a signature
+        #   - build.beforeBuildCommand: always npm, so we do not depend on yarn being
+        #     present on the runner
+        shell: bash
+        env:
+          SIGNING_ENABLED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: node .github/scripts/ci-config.mjs
+
+      - name: Build bundle
+        shell: bash
+        run: |
+          npx tauri build \
+            --bundles ${{ matrix.bundles }} \
+            --target ${{ matrix.target }} \
+            --config ci-override.json
+
+      - name: Verify Debian service upgrade packaging
+        if: matrix.os == 'linux'
+        shell: bash
+        run: .github/scripts/verify-deb.sh
+
+      - name: Stage build artifacts
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET_DIR: src-tauri/target
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: node .github/scripts/stage-artifact.mjs
+
+      - name: Re-sign renamed macOS updater payload
+        # Tauri names the macOS updater bundle `<productName>.app.tar.gz`, without the
+        # arch, so the two macOS jobs would collide. stage-artifact.mjs renames it to
+        # include the arch; since the minisign signature is bound to the file metadata,
+        # the renamed file has to be signed again.
+        if: matrix.os == 'macos' && steps.stage.outputs.renamed == 'true' && steps.stage.outputs.updater_file != ''
+        shell: bash
+        env:
+          UPDATER: ${{ steps.stage.outputs.updater_file }}
+        run: |
+          rm -f "release-artifact/$UPDATER.sig"
+          npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release-artifact/$UPDATER"
+          test -f "release-artifact/$UPDATER.sig"
+          echo "re-signed: $UPDATER"
+
+      - name: Generate updater manifest
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          UPDATER_FILE: ${{ steps.stage.outputs.updater_file }}
+        run: node .github/scripts/latest-json.mjs
+
+      - name: Show staged release files
+        shell: bash
+        run: |
+          find release-artifact -type f | sort
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          # upload-artifact paths are relative to the workspace root and ignore defaults.run.
+          path: ui-desktop/release-artifact/**
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Retry upload on transient blob-storage failure
+        # The initial upload can fail with "Unable to make request: ETIMEDOUT" against
+        # Azure blob storage (hit macos-15-intel once, mid-upload, other 5 jobs fine).
+        # overwrite: true lets this second attempt replace any partially created artifact.
+        # Guarded with hashFiles so it stays a no-op when the failure happened before
+        # anything was staged (e.g. the build itself failed).
+        if: failure() && hashFiles('ui-desktop/release-artifact/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: ui-desktop/release-artifact/**
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          path: ui-desktop
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble release files
+        env:
+          DIST_DIR: dist
+          OUT_DIR: release-artifacts
+        run: node ui-desktop/.github/scripts/assemble-release.mjs
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          # Pre-release versions containing a hyphen (e.g. v0.2.0-rc.1) are marked as
+          # prerelease automatically, so a test tag can exercise the whole pipeline
+          # without replacing latest.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # latest.json is the updater entry manifest; it must be uploaded as a Release
+          # asset and matches the URL in tauri.conf.json -> plugins.updater.endpoints.
+          files: release-artifacts/**
