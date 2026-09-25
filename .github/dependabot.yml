@@ -11,6 +11,33 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
+  # ui-desktop/src-tauri 有自己的 Cargo.lock（被根 workspace exclude），需要单独一条。
+  # nexapipe-client 是 path 依赖（../../crates/nexapipe-client，同仓库），dependabot
+  # 不会去动它，只更新 Cargo.lock 里的直接外部依赖。
+  - package-ecosystem: cargo
+    directory: "/ui-desktop/src-tauri"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    allow:
+      - dependency-type: direct
+
+  - package-ecosystem: npm
+    directory: "/ui-desktop"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-dev:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: gradle
+    directory: "/ui-android"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

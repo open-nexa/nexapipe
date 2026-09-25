@@ -19,7 +19,10 @@ const arch = process.env.MATRIX_ARCH ?? "";
 const version = process.env.VERSION ?? "";
 const updaterFile = process.env.UPDATER_FILE ?? "";
 const repository = process.env.GITHUB_REPOSITORY ?? "";
-const tag = process.env.GITHUB_REF_NAME ?? "";
+// TAG_NAME (set by the release workflow) takes precedence over GITHUB_REF_NAME so
+// a workflow_dispatch re-run of an existing tag still builds asset URLs pointing
+// at the tag instead of at the branch the dispatch ran on.
+const tag = process.env.TAG_NAME ?? process.env.GITHUB_REF_NAME ?? "";
 const outDir = "release-artifact";
 
 if (!updaterFile) {
