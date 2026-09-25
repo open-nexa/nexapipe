@@ -27,7 +27,7 @@ hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring
 http-body-util = "0.1"
 rustls-native-certs = { version = "0.8.4", optional = true }
 webpki-roots = { version = "1.0.8", optional = true }
-uniffi = { version = "0.25", optional = true }
+uniffi = { version = "0.32", optional = true }
 tracing = { version = "0.1.44", optional = true }
 jni = { version = "0.21", features = ["invocation"], optional = true }
 log = { version = "0.4", optional = true }
