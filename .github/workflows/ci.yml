@@ -177,7 +177,7 @@ jobs:
       # already committed (a stray keystore.properties, a 2FA seed in a test
       # fixture) would turn every future PR red. Run it once, clean up whatever
       # it reports, then drop continue-on-error.
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
