@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure rustfmt
         run: rustup component add rustfmt
       - name: cargo fmt --check
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure clippy
         run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
@@ -96,7 +96,7 @@ jobs:
           - "webpki-roots"
           - "uniffi"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.features }}
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve Android NDK
         id: ndk
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:
@@ -177,7 +177,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # Free for public repositories. If a repo ever becomes private, add
@@ -187,7 +187,7 @@ jobs:
       # already committed (a stray keystore.properties, a 2FA seed in a test
       # fixture) would turn every future PR red. Run it once, clean up whatever
       # it reports, then drop continue-on-error.
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -198,8 +198,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
         with:
           # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
           # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
@@ -225,7 +225,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -265,7 +265,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # 尽早发现跨平台编译问题：本地只在一台机器上开发，#[cfg(target_os =
       # "linux"/"macos"/"windows")] 里的代码本地永远编不到（platform.rs 的
@@ -310,7 +310,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Linux dependencies
         run: |
@@ -354,7 +354,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -396,11 +396,13 @@ jobs:
         working-directory: ui-android
 
     env:
-      ANDROID_PLATFORM: '36'
-      BUILD_TOOLS: 36.0.0
+      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
+      # named android-37.0 — plain "android-37" no longer exists upstream.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -436,7 +438,7 @@ jobs:
 
       - name: Upload test report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-unit-test-report
           # upload-artifact paths are relative to the workspace root and ignore defaults.run.
@@ -447,7 +449,7 @@ jobs:
         run: ./gradlew --no-daemon --stacktrace assembleDebug
 
       - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-app-debug-apk
           path: ui-android/app/build/outputs/apk/debug/*.apk
@@ -463,11 +465,13 @@ jobs:
         working-directory: ui-android
 
     env:
-      ANDROID_PLATFORM: '36'
-      BUILD_TOOLS: 36.0.0
+      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
+      # named android-37.0 — plain "android-37" no longer exists upstream.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -503,7 +507,7 @@ jobs:
 
       - name: Upload lint report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-lint-report
           path: |
@@ -528,7 +532,7 @@ jobs:
   #     contents: read
   #     pull-requests: write
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v7
   #       with:
   #         fetch-depth: 0
   #     - uses: anthropics/claude-code-action@v1

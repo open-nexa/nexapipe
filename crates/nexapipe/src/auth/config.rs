@@ -183,7 +183,7 @@ impl ClientAuth {
 
     /// Decode the Base32 secret into bytes
     pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        base32::decode(base32::Alphabet::RFC4648 { padding: false }, &self.secret)
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret)
             .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
     }
 

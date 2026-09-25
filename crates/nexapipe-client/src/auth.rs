@@ -3,7 +3,7 @@
 // Provides TOTP code generation and authentication handshake.
 
 use crate::ClientError;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
 use sha2::Sha256;
 use std::fmt;
@@ -97,7 +97,7 @@ impl TwoFactorAuth {
         secret_base32: &str,
         algorithm: TotpAlgorithm,
     ) -> Result<Self, ClientError> {
-        let secret = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_base32)
+        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
             .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))?;
 
         Ok(Self {
@@ -117,7 +117,7 @@ impl TwoFactorAuth {
         time_step: u32,
         digits: u32,
     ) -> Result<Self, ClientError> {
-        let secret = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_base32)
+        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
             .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))?;
 
         Ok(Self {
@@ -335,7 +335,7 @@ impl TwoFactorAuth {
     /// that cannot read it back cannot persist it — which would leave every
     /// restart trying to spend a token that has already been burned.
     pub fn secret_base32(&self) -> String {
-        base32::encode(base32::Alphabet::RFC4648 { padding: false }, &self.secret)
+        base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret)
     }
 
     /// The algorithm name, for the same reason as [`Self::secret_base32`].

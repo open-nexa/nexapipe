@@ -289,6 +289,36 @@ if $CLEAN; then
 fi
 
 # ---------------------------------------------------------------------------
+# Leftover DMG state — a bundle_dmg.sh run that dies halfway leaves two things
+# behind, and both break the *next* build in ways whose only symptom is
+# "failed to run bundle_dmg.sh":
+#   1. bundle/macos/rw.<pid>.<name>.dmg — create-dmg's read-write scratch image.
+#      The DMG is built from that whole folder, so the scratch image gets baked
+#      into the installer as well.
+#   2. a volume still mounted from a previous build's .dmg — hdiutil then refuses
+#      to write the new image over the mounted file ("Resource busy").
+# Only volumes whose backing image lives inside our own target/ are touched.
+# ---------------------------------------------------------------------------
+step "Clearing leftover DMG state"
+MACOS_BUNDLE_DIR="$BUNDLE_DIR/$TARGET_TRIPLE/$PROFILE/bundle/macos"
+
+while IFS= read -r leftover; do
+    info "removing scratch image $leftover"
+    rm -f "$leftover"
+done < <(find "$MACOS_BUNDLE_DIR" -maxdepth 1 -name 'rw.*.dmg' 2>/dev/null)
+
+while IFS= read -r mountpoint; do
+    [[ -n "$mountpoint" ]] || continue
+    warn "ejecting stale volume mounted from our own bundle output: $mountpoint"
+    hdiutil detach "$mountpoint" >/dev/null 2>&1 \
+        || warn "could not eject $mountpoint — detach it manually if the build fails"
+done < <(hdiutil info 2>/dev/null | awk -F'\t' -v root="$BUNDLE_DIR" '
+    /^image-path/ { img = $0; sub(/^image-path[[:space:]]*:[[:space:]]*/, "", img); next }
+    /^\/dev\/disk[0-9]+s/ && $3 != "" { if (index(img, root) == 1) print $3 }
+')
+ok "no leftover dmg state"
+
+# ---------------------------------------------------------------------------
 # Override config — macOS-only: drop Windows wintun resource and updater signing
 # unless the user exported signing env vars.
 # ---------------------------------------------------------------------------

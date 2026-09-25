@@ -41,7 +41,7 @@ bytes = "1"
 lazy_static = "1.4"
 parking_lot = "0.12"
 fastrand = "2"
-tun = { version = "0.7", features = ["async"] }
+tun = { version = "0.8", features = ["async"] }
 libc = "0.2"
 nexapipe-client = { path = "../../crates/nexapipe-client", features = [
     "local-proxy",

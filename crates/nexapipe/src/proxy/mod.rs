@@ -106,13 +106,19 @@ pub async fn run_proxy(
     let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     spawn_health_checks(&config, &http_client, &health_seen).await;
 
+    // 2FA state: the shared config plus the file its lockout counters persist to.
+    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
+
     // The watcher needs both to apply a reload: it rebuilds the routes and
-    // restarts whatever health checks the new routes need.
+    // restarts whatever health checks the new routes need — and, when 2FA is
+    // configured, swaps in the `[auth.clients]` table the file now carries, so
+    // an invite generated while the server runs works without a restart.
     let config_watcher = Arc::new(ConfigWatcher::new(
         config_path.to_string(),
         config.clone(),
         http_client.clone(),
         health_seen,
+        auth_state.clone(),
     ));
     tokio::spawn({
         let config_watcher_clone = config_watcher.clone();
@@ -121,9 +127,6 @@ pub async fn run_proxy(
         }
     });
     tracing::info!("Config watcher started, monitoring: {}", config_path);
-
-    // 2FA state: the shared config plus the file its lockout counters persist to.
-    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
 
     // Whether 2FA actually gates the iroh listener at startup. `enabled` is
     // restart-only, so this is the value the whole run uses, and it decides

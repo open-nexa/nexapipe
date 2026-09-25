@@ -1,4 +1,4 @@
-FROM rust:1.85-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 RUN apk add --no-cache musl-dev gcc make cmake ninja perl coreutils aarch64-linux-musl-gcc
 RUN rustup target add aarch64-unknown-linux-musl
@@ -16,7 +16,7 @@ COPY third_party ./third_party
 
 RUN cargo build --release --target=aarch64-unknown-linux-musl -p nexapipe
 
-FROM registry.it.iakl.top/alpine:3.22
+FROM registry.it.iakl.top/alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata
 

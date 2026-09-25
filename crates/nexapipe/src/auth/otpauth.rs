@@ -77,7 +77,7 @@ impl OtpAuthUri {
 
         let secret = normalize_secret(secret)
             .ok_or_else(|| anyhow::anyhow!("the secret is not a Base32 string"))?;
-        if base32::decode(base32::Alphabet::RFC4648 { padding: false }, &secret).is_none() {
+        if base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret).is_none() {
             bail!("the secret is not a Base32 string");
         }
 
