@@ -68,6 +68,14 @@ issuer = "NexaPipe"
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"
+# Optional per-client host authorization. Patterns use the same spelling as a
+# route's host_pattern — an exact name or a "*.suffix" wildcard,
+# case-insensitively. Left unset, the client may reach every route (the
+# default). An empty list means "may connect, may reach nothing".
+# A restricted client also never falls back to default_backend, and its
+# refusals look exactly like "no route" (404 / NoRoute / hang-up), so the
+# restriction cannot be used to probe which hosts exist.
+# allow_hosts = ["api.example.com", "*.db.example.com"]
 
 [auth.clients.client-002]
 secret = "KBSWY3DPEHPK3PXQ"

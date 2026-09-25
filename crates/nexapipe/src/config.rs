@@ -553,6 +553,10 @@ pub struct AuthTomlConfig {
 pub struct ClientAuthToml {
     pub secret: String,
     pub created_at: Option<String>,
+    /// Host patterns this client may reach; `None` means every route. Folded
+    /// into the client's [`crate::auth::ClientAcl`] when a connection
+    /// authenticates.
+    pub allow_hosts: Option<Vec<String>>,
     /// Runtime counters written back by the server (see
     /// `config_watcher::save_auth_state`); read here so a lockout survives a
     /// restart.
@@ -622,6 +626,7 @@ impl ProxyConfig {
                                             .map(|d| d.as_secs().to_string())
                                             .unwrap_or_else(|_| "0".to_string())
                                     }),
+                                    allow_hosts: client_toml.allow_hosts,
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,

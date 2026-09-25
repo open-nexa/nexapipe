@@ -7,7 +7,7 @@ pub mod otpauth;
 pub mod protocol;
 pub mod totp;
 
-pub use config::{AuthConfig, ClientAuth, TotpAlgorithm};
+pub use config::{AuthConfig, ClientAcl, ClientAuth, TotpAlgorithm};
 pub use otpauth::{DEFAULT_ISSUER, OtpAuthUri};
 pub use protocol::AuthMessage;
 pub use totp::{AuthError, TotpValidator};

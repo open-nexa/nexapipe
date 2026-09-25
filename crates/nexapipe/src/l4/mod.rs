@@ -28,6 +28,7 @@
 //! The status byte is sent before any payload, so a client can tell "no route" from
 //! "backend down" from "connection full" without heuristics.
 
+use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
 use nexapipe_proto::{
@@ -132,6 +133,7 @@ impl Drop for FlowGuard {
 /// Serve an L4 connection that arrived over an iroh bi-stream.
 ///
 /// `initial` holds the bytes already read from `recv` (at least the first).
+/// `acl` is the authenticated client's host authorization, if any.
 pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
@@ -139,8 +141,9 @@ pub async fn handle_iroh_stream(
     config: &RouteConfig,
     limiter: &Arc<FlowLimiter>,
     peer: &str,
+    acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
-    serve_stream(DuplexIroh::new(send, recv), initial, config, limiter, peer).await
+    serve_stream(DuplexIroh::new(send, recv), initial, config, limiter, peer, acl).await
 }
 
 /// The protocol itself, over any duplex stream.
@@ -154,6 +157,7 @@ pub async fn serve_stream<S>(
     config: &RouteConfig,
     limiter: &Arc<FlowLimiter>,
     peer: &str,
+    acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -171,6 +175,21 @@ where
         }
         Err(PrefaceFailure::Io(e)) => return Err(e.into()),
     };
+
+    // A client whose allowlist does not name this host is refused exactly the
+    // way an unconfigured one is — `NoRoute`, not a distinct status, so the
+    // answer cannot be used to probe which hosts exist behind the tunnel.
+    if let Some(acl) = acl
+        && !acl.allows(&preface.host)
+    {
+        let _ = write_status(&mut stream, Status::NoRoute).await;
+        tracing::warn!(
+            "L4 {}: host {} is not allowed for this client, closing",
+            preface.proto.name(),
+            preface.host
+        );
+        return Ok(());
+    }
 
     let mode = crate::config::RouteMode::from_l4_proto(preface.proto);
     let started = std::time::Instant::now();
@@ -603,7 +622,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -636,7 +655,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -649,6 +668,72 @@ mod tests {
         assert!(task.await.unwrap().is_ok());
     }
 
+    /// A restricted client asking for a host its allowlist never named gets the
+    /// same `NoRoute` an unconfigured host gets — a distinct status would let a
+    /// compromised client probe which hosts exist behind the tunnel.
+    #[tokio::test]
+    async fn a_host_off_the_clients_allowlist_answers_no_route() {
+        use crate::auth::ClientAcl;
+
+        // The route exists and its backend would answer; only the ACL refuses.
+        let config = config_with("127.0.0.1:1", "127.0.0.1:1");
+        let acl = ClientAcl::from_hosts(Some(&["elsewhere.test".to_string()]));
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", Some(&acl)).await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Tcp, "db.test", 5432))
+            .await
+            .unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::NoRoute);
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    /// The allowlist check happens before the flow limiter too, so a client
+    /// probing off-list hosts cannot spend flow slots doing it. An on-list
+    /// host is unaffected and reaches its backend as usual.
+    #[tokio::test]
+    async fn an_allowed_host_reaches_its_backend_under_an_acl() {
+        use crate::auth::ClientAcl;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = socket.read(&mut buf).await.unwrap();
+            socket.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let config = config_with(&backend_addr.to_string(), "127.0.0.1:1");
+        let acl = ClientAcl::from_hosts(Some(&["db.test".to_string()]));
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", Some(&acl)).await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Tcp, "db.test", 5432))
+            .await
+            .unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::Ok);
+        client_write.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client_read.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        drop(client_write);
+        drop(client_read);
+        task.await.unwrap().unwrap();
+        echo.await.unwrap();
+    }
+
     #[tokio::test]
     async fn the_two_l4_modes_never_see_each_other() {
         // The same host name served by a `tcp` route must not answer a UDP flow: the
@@ -657,7 +742,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -677,7 +762,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -699,7 +784,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -737,7 +822,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -783,7 +868,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let task =
             tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test").await },
+                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
             );
 
         client
@@ -811,7 +896,7 @@ mod tests {
         let full = Arc::new(FlowLimiter::new(0));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &full, "test").await
+            serve_stream(server, Vec::new(), &config, &full, "test", None).await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);

@@ -52,6 +52,12 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 - The only exception is an explicit instruction in the current task, e.g. the user says "推上去/请推送". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
+## Working Files & Plan Documents (MANDATORY)
+
+- **Temporary plan / fix / patch documents written by the agent go to `.workbuddy/` (git-ignored), never into the repository tree** (no `PLAN.md`, `TODO.md`, `docs/*plan*`, `docs/*fix*`, `docs/*patch*`, etc. in tracked paths).
+- Only durable, curated docs belong in the repo (e.g. `AGENTS.md`, `CONTRIBUTING.md`, architecture decision records). One-off reasoning and step-by-step plans live in the conversation or `.workbuddy/` and expire with the task.
+- Put "why this change" explanations in the commit message or PR description, not in a sidecar plan file.
+
 ## Commit & Pull Request Guidelines
 
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.

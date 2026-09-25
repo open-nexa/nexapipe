@@ -103,6 +103,15 @@ pub struct ClientAuth {
     /// When this client was created
     #[serde(default = "default_created_at")]
     pub created_at: String,
+    /// Host patterns this client may reach; `None` means every route.
+    ///
+    /// The patterns use the same spelling as a route's `host_pattern` — an
+    /// exact name or a `*.suffix` wildcard, case-insensitively — and are
+    /// folded into a [`ClientAcl`] when a connection authenticates. An empty
+    /// list denies every host: `allow_hosts = []` is "this client may
+    /// connect and nothing else", not "no restriction".
+    #[serde(default)]
+    pub allow_hosts: Option<Vec<String>>,
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
@@ -170,6 +179,67 @@ impl ClientAuth {
         base32::decode(base32::Alphabet::RFC4648 { padding: false }, &self.secret)
             .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
     }
+
+    /// The host authorization for a connection authenticated as this client.
+    ///
+    /// Built once per connection, not consulted per stream, so a reload that
+    /// removes the client — or its `allow_hosts` — does not change what a
+    /// connection already holding its credentials may reach.
+    pub fn acl(&self) -> ClientAcl {
+        ClientAcl::from_hosts(self.allow_hosts.as_deref())
+    }
+}
+
+/// Which hosts one authenticated client may reach.
+///
+/// 2FA answers *who* may connect; this answers *what they may touch once they
+/// have*. Without it, one client's secret is a key to every route and every
+/// backend, so a single leaked enrollment is a full-backend compromise. A
+/// client with no `allow_hosts` is [`ClientAcl::Unrestricted`] — the historical
+/// behaviour, kept as the default so existing configs mean what they meant.
+///
+/// The patterns are folded and matched by the same rules a route's
+/// `host_pattern` uses ([`crate::routes::host_matches`]), so an entry here
+/// authorizes exactly the hosts the corresponding route entry would serve.
+///
+/// A denial is always reported to the client the way "no route" is — 404,
+/// `Status::NoRoute`, or a hang-up — never a 403, which would confirm to a
+/// compromised client that the host it asked for exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAcl {
+    /// No `allow_hosts` configured: every route is fair game.
+    Unrestricted,
+    /// Only hosts matching one of these folded patterns.
+    Restricted(Vec<String>),
+}
+
+impl ClientAcl {
+    /// Folds `hosts` into an ACL. `None` is unrestricted; an empty list
+    /// restricts to nothing.
+    pub fn from_hosts(hosts: Option<&[String]>) -> Self {
+        match hosts {
+            None => ClientAcl::Unrestricted,
+            Some(hosts) => ClientAcl::Restricted(
+                hosts
+                    .iter()
+                    .map(|h| crate::routes::normalize_host(h))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Whether `host` may be reached by a client governed by this ACL.
+    pub fn allows(&self, host: &str) -> bool {
+        match self {
+            ClientAcl::Unrestricted => true,
+            ClientAcl::Restricted(patterns) => {
+                let host = crate::routes::normalize_host(host);
+                patterns
+                    .iter()
+                    .any(|pattern| crate::routes::host_matches(pattern, &host))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +250,7 @@ mod tests {
         ClientAuth {
             secret: String::new(),
             created_at: "0".to_string(),
+            allow_hosts: None,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
@@ -222,5 +293,50 @@ mod tests {
 
         assert_eq!(c.failed_attempts, 2, "a partial counter is not a lockout");
         assert!(!c.is_locked_out());
+    }
+
+    /// A client with no `allow_hosts` keeps the historical reach: every host.
+    #[test]
+    fn an_absent_allow_hosts_leaves_a_client_unrestricted() {
+        let acl = ClientAcl::from_hosts(None);
+        assert_eq!(acl, ClientAcl::Unrestricted);
+        assert!(acl.allows("anything.test"));
+        assert_eq!(client().acl(), ClientAcl::Unrestricted);
+    }
+
+    /// The patterns mean what a route's `host_pattern` means: exact or
+    /// `*.suffix`, case-insensitively, ignoring a fully-qualified trailing dot.
+    #[test]
+    fn restricted_patterns_match_the_way_routes_do() {
+        let acl = ClientAcl::from_hosts(Some(&[
+            "api.example.com".to_string(),
+            "*.db.example.com".to_string(),
+        ]));
+
+        assert!(acl.allows("api.example.com"));
+        assert!(acl.allows("API.Example.Com"), "hosts fold like route hosts");
+        assert!(acl.allows("api.example.com."), "a trailing FQDN dot is not a different host");
+        assert!(acl.allows("pg.db.example.com"));
+        assert!(!acl.allows("db.example.com"), "the wildcard needs the *. prefix, like a route");
+        assert!(!acl.allows("db.example.com.evil.test"));
+        assert!(!acl.allows("admin.example.com"));
+    }
+
+    /// `allow_hosts = []` is "may connect, may touch nothing", not "no
+    /// restriction" — otherwise a typo in the list would silently publish a
+    /// client's reach to every backend.
+    #[test]
+    fn an_empty_allow_hosts_denies_every_host() {
+        let acl = ClientAcl::from_hosts(Some(&[]));
+        assert!(!acl.allows("api.example.com"));
+        assert!(!acl.allows("anything.test"));
+    }
+
+    /// The patterns themselves are folded, so a config written with uppercase
+    /// letters answers the lowercase request.
+    #[test]
+    fn patterns_are_folded_when_the_acl_is_built() {
+        let acl = ClientAcl::from_hosts(Some(&["API.Example.Com.".to_string()]));
+        assert!(acl.allows("api.example.com"));
     }
 }

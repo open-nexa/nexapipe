@@ -13,3 +13,5 @@ config.toml
 docs/*plan*
 docs/*fix*
 docs/*patch*
+docs/*review*
+docs/*research*

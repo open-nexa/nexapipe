@@ -1,8 +1,36 @@
+use crate::auth::ClientAcl;
 use crate::config::RouteMode;
 use crate::lb::{BackendPool, LoadBalancingStrategy};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+/// Compares host names the way DNS does: case-insensitively, without a
+/// trailing dot.
+///
+/// A `Host` header may arrive in any case (`API.example.com`) and may carry a
+/// fully-qualified trailing dot (`api.example.com.`) — both name the same host
+/// the route was written for. Matching them raw would let such a request slip
+/// past its route and fall through to `default_backend`, a different service
+/// entirely. Both the pattern and every input go through here, so a config
+/// written with uppercase letters keeps working too.
+pub(crate) fn normalize_host(host: &str) -> String {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.to_ascii_lowercase()
+}
+
+/// Whether a (already folded) host matches a (already folded) pattern.
+///
+/// The one host-matching rule, shared by route patterns and
+/// [`ClientAcl`] allowlists so the two can never drift apart: an exact
+/// name, or a `*.suffix` wildcard.
+pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        host.ends_with(suffix)
+    } else {
+        pattern == host
+    }
+}
 
 /// The extra knobs only `tcp` / `udp` routes have.
 ///
@@ -49,7 +77,7 @@ impl Route {
         path_rewrite: Option<String>,
     ) -> Self {
         Route {
-            host_pattern: host_pattern.to_string(),
+            host_pattern: normalize_host(host_pattern),
             path_pattern: path_pattern.to_string(),
             path_is_prefix,
             modes: vec![mode],
@@ -86,16 +114,12 @@ impl Route {
         self
     }
 
-    /// Host-only match.
+    /// Host-only match, after [`normalize_host`] has folded both sides.
     ///
     /// The TLS passthrough path selects on SNI, i.e. before a request line
     /// exists, so there is no path to match against.
     pub fn matches_host(&self, host: &str) -> bool {
-        if let Some(suffix) = self.host_pattern.strip_prefix('*') {
-            host.ends_with(suffix)
-        } else {
-            host == self.host_pattern
-        }
+        host_matches(&self.host_pattern, &normalize_host(host))
     }
 
     /// Match for an L4 flow: the host, plus the optional client-port allow list.
@@ -233,6 +257,32 @@ impl RouteConfig {
     /// `default_backend` meant a mistyped host silently reached an unrelated
     /// service; with it optional, the honest answer is "no route".
     pub async fn get_backend(&self, host: &str, path: &str) -> Option<BackendInfo> {
+        self.get_backend_with_acl(host, path, None).await
+    }
+
+    /// [`Self::get_backend`] under a client's host authorization.
+    ///
+    /// Two rules beyond the plain lookup:
+    ///
+    /// * A host the ACL does not list is refused before any route is
+    ///   consulted, and the refusal is indistinguishable from "no route" —
+    ///   a 404, not a 403, so a client cannot use the difference to probe
+    ///   which hosts exist behind the proxy.
+    /// * A restricted client never falls back to `default_backend`. The
+    ///   fallback serves whatever host arrived, including hosts the ACL never
+    ///   heard of, so honouring it would be the one hole in the allowlist.
+    ///   Unrestricted clients (the default) keep the fallback.
+    pub async fn get_backend_with_acl(
+        &self,
+        host: &str,
+        path: &str,
+        acl: Option<&ClientAcl>,
+    ) -> Option<BackendInfo> {
+        if acl.is_some_and(|acl| !acl.allows(host)) {
+            tracing::debug!("Host {host} is not allowed for this client, answering 404");
+            return None;
+        }
+
         tracing::debug!("Looking up backend for host={}, path={}", host, path);
 
         // Only `http` routes take requests. A passthrough route exists so its
@@ -258,6 +308,12 @@ impl RouteConfig {
                 path_pattern: route.path_pattern().to_string(),
                 path_is_prefix: route.path_is_prefix(),
             });
+        }
+
+        // A restricted client stops here: the fallback would serve a host the
+        // allowlist never authorized. See the method docs.
+        if acl.is_some() {
+            return None;
         }
 
         let default_backend = self.default_backend.read().await.clone();
@@ -829,6 +885,68 @@ mod tests {
         );
     }
 
+    /// A restricted client reaches the hosts its allowlist names, and nothing
+    /// else — the refusal for a host not on the list is the same 404 an
+    /// unrouted host gets, so the difference cannot be used as a probe.
+    #[tokio::test]
+    async fn a_restricted_client_reaches_only_its_allowed_hosts() {
+        use crate::auth::ClientAcl;
+
+        let config = RouteConfig::new(
+            vec![
+                http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
+                http_route("admin.iakl.top", &["http://10.0.0.9:9090"]),
+            ],
+            Some("http://default:80".to_string()),
+        );
+        let acl = ClientAcl::from_hosts(Some(&["api.iakl.top".to_string()]));
+
+        // The allowed host reaches its own route.
+        assert_eq!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", Some(&acl))
+                .await
+                .expect("an allowed host reaches its route")
+                .url,
+            "http://10.0.0.5:8080"
+        );
+        // A routed host the allowlist never named is refused, not served.
+        assert!(config.get_backend_with_acl("admin.iakl.top", "/", Some(&acl)).await.is_none());
+        // So is an unrouted one, with or without a default backend configured.
+        assert!(config.get_backend_with_acl("typo.iakl.top", "/", Some(&acl)).await.is_none());
+    }
+
+    /// The default backend is not a hole in the allowlist: a restricted client
+    /// whose host matches no route gets 404 rather than the fallback, because
+    /// the fallback serves hosts the allowlist never authorized.
+    #[tokio::test]
+    async fn a_restricted_client_never_falls_back_to_the_default_backend() {
+        use crate::auth::ClientAcl;
+
+        let config = RouteConfig::new(
+            vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])],
+            Some("http://default:80".to_string()),
+        );
+
+        // `other.iakl.top` is on the allowlist but has no route of its own:
+        // the fallback would happily serve it, and must not.
+        let acl = ClientAcl::from_hosts(Some(&[
+            "api.iakl.top".to_string(),
+            "other.iakl.top".to_string(),
+        ]));
+        assert!(
+            config
+                .get_backend_with_acl("other.iakl.top", "/", Some(&acl))
+                .await
+                .is_none(),
+            "the default backend must not serve a restricted client"
+        );
+
+        // An unrestricted client keeps the fallback, whatever host it sends.
+        assert!(config.get_backend("other.iakl.top", "/").await.is_some());
+        assert!(config.get_backend_with_acl("other.iakl.top", "/", None).await.is_some());
+    }
+
     #[test]
     fn host_matching_handles_wildcards() {
         let route = passthrough_route("*.iroh.iakl.top", &["caddy:443"]);
@@ -839,5 +957,70 @@ mod tests {
         let exact = passthrough_route("fn.iroh.iakl.top", &["caddy:443"]);
         assert!(exact.matches_host("fn.iroh.iakl.top"));
         assert!(!exact.matches_host("comfyui.iroh.iakl.top"));
+    }
+
+    /// A `Host` header is case-insensitive and may carry a fully-qualified
+    /// trailing dot. Both spellings name the host the route was written for, so
+    /// neither may slip past it and land on `default_backend` — a different
+    /// service entirely.
+    #[tokio::test]
+    async fn a_differently_spelled_host_still_reaches_its_route() {
+        let config = RouteConfig::new(
+            vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])],
+            Some("http://default:80".to_string()),
+        );
+
+        for host in ["API.IAKL.TOP", "Api.Iakl.Top", "api.iakl.top."] {
+            assert_eq!(
+                config
+                    .get_backend(host, "/")
+                    .await
+                    .unwrap_or_else(|| panic!("host {host} must reach its route"))
+                    .url,
+                "http://10.0.0.5:8080",
+                "host {host} fell through to the default backend"
+            );
+        }
+
+        // The pattern side is folded the same way, so a config written with
+        // uppercase letters answers the lowercase request.
+        let uppercase = RouteConfig::new(
+            vec![http_route("API.Iakl.Top", &["http://10.0.0.7:8080"])],
+            None,
+        );
+        assert_eq!(
+            uppercase
+                .get_backend("api.iakl.top", "/")
+                .await
+                .expect("the folded pattern matches the lowercase host")
+                .url,
+            "http://10.0.0.7:8080"
+        );
+    }
+
+    /// The lookup-level view of the same rule for SNI and L4 hosts: both feed
+    /// `matches_host`, so both are folded.
+    #[tokio::test]
+    async fn sni_and_l4_hosts_are_folded_the_same_way() {
+        let config = RouteConfig::new(
+            vec![
+                passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
+                l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            config.get_passthrough_backend("FN.IROH.IAKL.TOP.").await,
+            Some("caddy:443".to_string())
+        );
+        assert_eq!(
+            config
+                .get_l4_backend("DB.Iroh.Iakl.Top.", 5432, RouteMode::Tcp)
+                .await
+                .expect("the folded host reaches the L4 route")
+                .backend,
+            "10.0.0.50:5432"
+        );
     }
 }

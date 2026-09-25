@@ -125,6 +125,31 @@ pub async fn run_proxy(
     // 2FA state: the shared config plus the file its lockout counters persist to.
     let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
 
+    // Whether 2FA actually gates the iroh listener at startup. `enabled` is
+    // restart-only, so this is the value the whole run uses, and it decides
+    // both warnings below.
+    let auth_enabled = match &auth_state {
+        Some(state) => state.config().read().await.enabled,
+        None => false,
+    };
+
+    // A connection ticket or node id is a *reachability* credential, not an
+    // authentication one: without 2FA, anyone who obtains either reaches every
+    // route and every backend. That is easy to miss when the config simply has
+    // no `[auth]` section yet, so it is said out loud rather than left to the
+    // reader of the docs.
+    if !auth_enabled {
+        tracing::warn!(
+            "2FA is not enabled: the endpoint's node id and ticket alone reach every route"
+        );
+        eprintln!(
+            "\n*** WARNING: 2FA authentication is NOT enabled. ***\n\
+             Anyone who obtains this endpoint's Node ID or ticket can connect and\n\
+             reach every route and every backend. Add an [auth] section with\n\
+             enabled = true (see config.toml.2fa.example) to require credentials.\n"
+        );
+    }
+
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
@@ -246,12 +271,8 @@ pub async fn run_proxy(
                      when something else gates the port"
                 );
             }
-            if exposed && auth_state.is_some() {
-                tracing::error!(
-                    "[server] expose = true leaves {bound} unauthenticated even though [auth] is \
-                     enabled: 2FA only runs on the iroh listener, so this address reaches every \
-                     route and every passthrough backend without credentials"
-                );
+            if let Some(refusal) = plaintext_auth_conflict(bound, exposed, auth_enabled) {
+                anyhow::bail!(refusal);
             }
             tracing::info!("HTTP server listening on: {}", bound);
             Some(listener)
@@ -396,6 +417,29 @@ fn may_bind_plaintext(bound: SocketAddr, exposed: bool) -> bool {
     exposed || bound.ip().is_loopback()
 }
 
+/// The refusal for an exposed plaintext listener that 2FA cannot protect, if
+/// there is one.
+///
+/// `expose = true` publishes every route and every passthrough backend on an
+/// address where no credential is ever asked for — 2FA lives in the iroh accept
+/// loop only — so enabling both is refused rather than logged: an error that
+/// only turns up in a rotated log is how a firewall nobody remembers configuring
+/// becomes the sole thing standing between the network and the backends.
+///
+/// Split out from [`run_proxy`] for the same reason as
+/// [`may_bind_plaintext`]: the decision is three booleans' worth of input and
+/// deserves its own tests.
+fn plaintext_auth_conflict(bound: SocketAddr, exposed: bool, auth_enabled: bool) -> Option<String> {
+    (exposed && auth_enabled).then(|| {
+        format!(
+            "[server] expose = true leaves {bound} unauthenticated even though [auth] is \
+             enabled: 2FA only runs on the iroh listener, so this address would reach every \
+             route and every passthrough backend without credentials. Gate the port with \
+             something else, or disable [auth]"
+        )
+    })
+}
+
 /// True when the peer opened a TLS session rather than sending a request.
 async fn is_tls_connection(stream: &tokio::net::TcpStream) -> bool {
     let mut first = [0u8; 1];
@@ -480,7 +524,7 @@ const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
-    use super::may_bind_plaintext;
+    use super::{may_bind_plaintext, plaintext_auth_conflict};
     use std::net::SocketAddr;
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
@@ -503,5 +547,30 @@ mod tests {
         assert!(!may_bind_plaintext(addr("192.168.1.10", 8080), false));
         assert!(may_bind_plaintext(addr("0.0.0.0", 8080), true));
         assert!(may_bind_plaintext(addr("192.168.1.10", 8080), true));
+    }
+
+    /// An exposed listener alongside enabled 2FA is a configuration that only
+    /// *looks* guarded: the iroh path asks for credentials, this one never does.
+    /// It has to be refused, not served with a log entry nobody reads.
+    #[test]
+    fn an_exposed_listener_conflicts_with_enabled_2fa() {
+        let bound = addr("0.0.0.0", 8080);
+        let refusal =
+            plaintext_auth_conflict(bound, true, true).expect("the combination is refused");
+        assert!(
+            refusal.contains("expose = true"),
+            "the refusal has to name the setting: {refusal}"
+        );
+    }
+
+    #[test]
+    fn no_conflict_when_2fa_is_off_or_the_listener_is_not_exposed() {
+        let bound = addr("0.0.0.0", 8080);
+        // No 2FA at all: the iroh listener is unauthenticated too, so the
+        // plaintext one adds no new exposure beyond what startup already
+        // warns about.
+        assert_eq!(plaintext_auth_conflict(bound, true, false), None);
+        // 2FA on, but the listener is loopback-only.
+        assert_eq!(plaintext_auth_conflict(addr("127.0.0.1", 8080), false, true), None);
     }
 }
