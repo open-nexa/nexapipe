@@ -36,7 +36,8 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 - Rust edition 2024, default `rustfmt` (4-space indent).
 - Rust naming: `snake_case` items, `CamelCase` types, `SCREAMING_SNAKE_CASE` constants; use `anyhow` for errors and gate logging behind `#[cfg(feature = "tracing")]` or the `jni_log!` macro.
 - Kotlin: 4-space indent, `camelCase`, follow Android lint.
-- Inline comments are mixed Chinese/English; match the file you touch.
+- **English only.** Comments, doc comments, log and error messages, docs, config examples, commit messages and PR descriptions are written in English, even when the conversation with the user is in Chinese.
+- The **only** exception is real i18n: `ui-android/app/src/main/res/values-zh-rCN/strings.xml`, `ui-desktop/src/i18n/locales/zh-CN.json`, a language's own name in its own script (the `zh-CN` entry in `ui-desktop/src/i18n/index.ts`, the "Bilingual UI" line in `ui-desktop/README.md`), and code or tests whose point is handling non-ASCII text (the percent-encoding test in `crates/nexapipe/src/auth/otpauth.rs`). Do not add Chinese anywhere else — not in a Rust, Kotlin or Vue comment, not in `README.md` or a CI workflow, not in a log line, not in a `config.toml*` example.
 - Keep platform code behind features: `jni`, `local-proxy`, `tun-proxy`, `uniffi`.
 
 ## Testing Guidelines
@@ -49,7 +50,7 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 ## Git Safety Rules (MANDATORY)
 
 - **Never run `git push` (or any remote-writing command: push, force-push, remote-add-then-push, branch delete on remote, `gh release ...`).** Create local commits only; the owner pushes themselves.
-- The only exception is an explicit instruction in the current task, e.g. the user says "推上去/请推送". "Tests pass, so push it" style inference is NOT authorization.
+- The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
 ## Working Files & Plan Documents (MANDATORY)

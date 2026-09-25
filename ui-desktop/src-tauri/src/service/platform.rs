@@ -148,7 +148,7 @@ mod windows_impl {
     ///
     /// Not a failure: running is the state the command asked for. Reported as it is, the exit
     /// code turns a successful install into `service.install_failed` carrying
-    /// "StartService 失败 1056" — an install that worked, described as one that did not.
+        /// "StartService failed 1056" — an install that worked, described as one that did not.
     const ALREADY_RUNNING: &str = "1056";
 
     /// `sc stop` on a service that is not started (or not installed).

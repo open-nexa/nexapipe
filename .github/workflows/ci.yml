@@ -233,7 +233,7 @@ jobs:
           cache: npm
           cache-dependency-path: ui-desktop/package-lock.json
 
-      # npm ci（不是 npm install）：package-lock.json 与 package.json 不一致时直接失败。
+      # npm ci, not npm install: it fails outright when package-lock.json and package.json disagree.
       - name: npm ci
         run: npm ci
 
@@ -267,10 +267,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # 尽早发现跨平台编译问题：本地只在一台机器上开发，#[cfg(target_os =
-      # "linux"/"macos"/"windows")] 里的代码本地永远编不到（platform.rs 的
-      # `?` on bool / PathBuf not in scope 就是这么漏出去的）。架构变体不影响
-      # cfg 走向，所以每个 OS 用 amd64 runner 即可覆盖全部 cfg 分支。
+      # Catch cross-platform compile breakage early: development happens on one machine, so anything inside
+      # #[cfg(target_os = "linux"/"macos"/"windows")] is never compiled locally (the `?` on bool / PathBuf
+      # not in scope bug in platform.rs slipped out exactly that way). Architecture variants do not change
+      # which cfg branch runs, so one amd64 runner per OS covers every cfg branch.
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -293,8 +293,8 @@ jobs:
           cache-on-failure: true
           workspaces: ui-desktop/src-tauri -> target
 
-      # --all-targets 很重要：src/bin/nexa-service.rs 里的 daemonize（#[cfg(unix)]）
-      # 只在 bin target 里，不带上 --all-targets 就检查不到。
+      # --all-targets matters: daemonize in src/bin/nexa-service.rs (#[cfg(unix)]) lives only in the bin
+      # target and is not checked without it.
       - name: cargo check --all-targets
         shell: bash
         working-directory: ui-desktop/src-tauri
@@ -335,7 +335,7 @@ jobs:
           cache-on-failure: true
           workspaces: ui-desktop/src-tauri -> target
 
-      # clippy 已经带 -D warnings：新代码不能靠 #[allow] 绕过，告警必须是零。
+      # clippy already runs with -D warnings: new code may not paper over a lint with #[allow]; warnings must be zero.
       - name: cargo clippy --all-targets
         working-directory: ui-desktop/src-tauri
         run: cargo clippy --all-targets -- -D warnings
@@ -364,8 +364,8 @@ jobs:
         with:
           tool: cargo-audit
 
-      # src-tauri 有自己的 Cargo.lock（被根 workspace exclude），根仓库的
-      # audit job 扫不到它。
+      # src-tauri has its own Cargo.lock (excluded from the root workspace), so the audit job at the repo
+      # root never sees it.
       - name: cargo audit
         working-directory: ui-desktop/src-tauri
         run: cargo audit
@@ -378,8 +378,8 @@ jobs:
 
       - name: npm audit
         working-directory: ui-desktop
-        # 只看运行时依赖（--omit=dev），只拦 high/critical：构建链上的 moderate
-        # 告警升级成本远高于收益，交给 dependabot 慢慢跟。
+        # Runtime dependencies only (--omit=dev), and only high/critical fail the build: upgrading a moderate
+        # advisory deep in the build chain costs far more than it is worth; dependabot can follow those slowly.
         run: npm audit --omit=dev --audit-level=high
 
   # ------------------------------------------------------------------
@@ -412,8 +412,8 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        # 不用 android-actions/setup-android：它默认装 "tools"，这个包早已从
-        # SDK 仓库下架，在新镜像上直接失败。
+        # Not android-actions/setup-android: it installs "tools" by default, a package that has been pulled
+        # from the SDK repository and fails outright on current images.
         run: |
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
@@ -496,8 +496,8 @@ jobs:
           yes | "$SM" --licenses > /dev/null 2>&1 || true
           "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
 
-      # 先观察：存量告警（缺翻译、lint 默认规则）很多，等基线干净后去掉
-      # continue-on-error 让它真正拦 PR。
+      # Observing for now: there are many pre-existing warnings (missing translations, default lint rules).
+      # Drop continue-on-error once the baseline is clean so it actually gates PRs.
       - name: lintDebug
         continue-on-error: true
         id: lint
