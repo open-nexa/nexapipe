@@ -2,6 +2,10 @@
 #
 # This file shows how to enable 2FA authentication for Nexapipe.
 # Copy the relevant sections into your config.toml.
+#
+# The secrets below are the only credential gating the iroh listener, so keep
+# the file private: with `enabled = true` the server refuses to start when
+# config.toml is readable or writable by another account — `chmod 600` it.
 
 # ===== Server Configuration =====
 default_backend = "http://localhost:3000"

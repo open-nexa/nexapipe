@@ -240,10 +240,18 @@ async fn run_server_mode(
     let auth_config = match ProxyConfig::load_with_auth(config_path) {
         Ok((_, auth_cfg)) => {
             if let Some(ref cfg) = auth_cfg {
+                // The secrets in here are the whole credential, so a
+                // permissive mode is fatal while they are live: every account
+                // on the host could authenticate as every client. With `[auth]`
+                // off they authenticate nobody, and a 0644 config is a fixture
+                // of Docker deployments — those only get the warning.
+                if let Err(e) =
+                    nexapipe::config::check_config_permissions(config_path, cfg.enabled)
+                {
+                    tracing::error!("{}", e);
+                    std::process::exit(1);
+                }
                 if cfg.enabled {
-                    // The secrets in here are the whole credential, so say so
-                    // loudly when the file holding them is not private.
-                    nexapipe::config::warn_world_readable_config(config_path);
                     tracing::info!(
                         "2FA authentication enabled with {} clients",
                         cfg.clients.len()

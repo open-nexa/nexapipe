@@ -142,7 +142,14 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
     }
 
     std::fs::write(path, doc.to_string())
-        .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+        .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))?;
+
+    // The startup check only runs once, and this write recreates the file under
+    // some editors and bind mounts — so a mode that was private when the proxy
+    // started can be permissive by now. Refusing here would take a running
+    // proxy down over a file it has already rewritten, so this reports only.
+    crate::config::warn_world_readable_config(path);
+    Ok(())
 }
 
 /// Writes `value` under `key`, or removes the key when the counter is back at

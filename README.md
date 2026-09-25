@@ -661,6 +661,14 @@ handshake before any traffic is proxied.
 Auth settings are read once at startup, so restart the server after adding a
 client. See `config.toml.2fa.example`.
 
+Those secrets are the *only* credential gating the iroh listener, so the file
+holding them has to stay private: with `[auth] enabled = true` the server
+**refuses to start** when `config.toml` is readable or writable by any account
+other than its owner (`chmod 600 config.toml`). With `[auth]` off — a 0644
+config is how a Docker bind mount arrives — it logs the same warning and starts.
+The file is also re-checked after it is rewritten to persist a lockout, since an
+editor or a mount can widen a mode that was private at startup.
+
 A client that has no credentials against a server that requires them is refused
 too: the QUIC handshake succeeds, and the server closes the connection once the
 handshake deadline (5 s) passes with no `AUTH_START`. The client watches for that
