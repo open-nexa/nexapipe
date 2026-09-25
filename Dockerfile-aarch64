@@ -1,4 +1,4 @@
-FROM rust:1.85-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 RUN apk add --no-cache musl-dev gcc make cmake ninja perl coreutils aarch64-linux-musl-gcc
 RUN rustup target add aarch64-unknown-linux-musl
