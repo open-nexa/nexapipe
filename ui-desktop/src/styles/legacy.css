@@ -1,0 +1,97 @@
+/**
+ * TEMPORARY legacy token bridge — delete with the last un-migrated file (§7, Phase 4).
+ *
+ * The four pages and the three components that outlive this phase were written against the old
+ * `:root` block that used to live inside `App.vue`. Removing that block wholesale would not have
+ * failed loudly: `color: var(--text-primary)` with no definition silently inherits, and
+ * `background: var(--surface-1)` with no definition is simply transparent. The pages would have
+ * rendered as unreadable text on a see-through panel rather than as an error.
+ *
+ * So every name the old block defined is re-declared here, mapped onto the new semantic layer
+ * instead of onto raw shades. Mapping to semantic names is what makes the shim theme-aware for
+ * free: `--surface-1` becomes whatever a card is in the *current* theme, so the un-migrated
+ * markup is readable in dark mode without being touched.
+ *
+ * This is a shim, not a design decision. Nothing new may reference these names, `lint:tokens`
+ * treats them as defined (they are), and this file disappears in the same commit as the last
+ * legacy component. The palette steps that the old code used as "selected" or "focused" borders
+ * map onto `--border-focus` for exactly that reason.
+ */
+
+:root {
+  /* -- palette aliases: the old names were `primary`, the new ones are `accent` --------------- */
+  --primary-50: var(--accent-subtle);
+  --primary-100: var(--accent-subtle);
+  --primary-200: var(--border-focus);
+  --primary-300: var(--border-focus);
+  --primary-400: var(--border-focus);
+  --primary-500: var(--accent);
+  --primary-600: var(--accent-text);
+  --primary-700: var(--accent-text);
+  --primary-800: var(--accent-text);
+  --primary-900: var(--accent-text);
+
+  --success-50: var(--success-subtle);
+  --success-100: var(--success-subtle);
+  --success-200: var(--success-subtle);
+  --success-300: var(--success);
+  --success-400: var(--success);
+  --success-500: var(--success);
+  --success-600: var(--success-text);
+  --success-700: var(--success-text);
+  --success-800: var(--success-text);
+
+  --warning-50: var(--warning-subtle);
+  --warning-100: var(--warning-subtle);
+  --warning-200: var(--warning-subtle);
+  --warning-300: var(--warning);
+  --warning-400: var(--warning);
+  --warning-500: var(--warning);
+  --warning-600: var(--warning-text);
+  --warning-700: var(--warning-text);
+  --warning-800: var(--warning-text);
+
+  --error-50: var(--error-subtle);
+  --error-100: var(--error-subtle);
+  --error-200: var(--error-subtle);
+  --error-300: var(--error);
+  --error-400: var(--error);
+  --error-500: var(--error);
+  --error-600: var(--error-text);
+  --error-700: var(--error-text);
+  --error-800: var(--error-text);
+
+  /* -- surfaces: the old ramp was a monotonic light scale; the new one is semantic ------------- */
+  --surface-1: var(--bg-card);
+  --surface-2: var(--bg-inset);
+  --surface-3: var(--bg-hover);
+  --surface-4: var(--bg-active);
+  --surface-sidebar: var(--bg-sidebar);
+  --surface-sidebar-hover: var(--bg-sidebar-hover);
+
+  /* -- borders ------------------------------------------------------------------------------- */
+  --border-color: var(--border-default);
+  --border-light: var(--border-subtle);
+  --border-sidebar: var(--border-subtle);
+
+  /* -- sidebar text: the sidebar is themed now, so these resolve per theme ------------------- */
+  --text-sidebar: var(--nav-text);
+  --text-sidebar-active: var(--nav-text-active);
+
+  /* -- elevation ----------------------------------------------------------------------------- */
+  --shadow-card: var(--shadow-sm);
+
+  /* -- motion -------------------------------------------------------------------------------- */
+  --transition-fast: 150ms var(--ease-standard);
+  --transition-normal: 250ms var(--ease-standard);
+  --transition-slow: 350ms var(--ease-standard);
+
+  /* -- the old tri-colour brand gradient ------------------------------------------------------
+   * Flattened to the accent colour rather than reproduced: removing decorative gradients is a
+   * stated goal (D7), and the legacy surfaces that used it as a fill (logo tiles, primary
+   * buttons, the active nav marker) all read as a solid accent with no layout consequence.
+   */
+  --gradient-primary: var(--accent);
+  --gradient-secondary: var(--bg-sidebar);
+  --gradient-surface: var(--bg-app);
+}

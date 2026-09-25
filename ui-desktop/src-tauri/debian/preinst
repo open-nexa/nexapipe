@@ -1,0 +1,19 @@
+#!/bin/sh
+# Keep an already-running nexa-service on the old binary until the new one is unpacked.
+set -e
+
+SERVICE=nexa-service.service
+STATE_FILE=/run/nexa-service.was-active
+
+rm -f "$STATE_FILE"
+if command -v systemctl >/dev/null 2>&1; then
+    # Capture the previous state for postinst, but stop the unit even when it is restarting or
+    # activating: otherwise the unpack below races with Restart=always and leaves systemd trying
+    # to execute a half-replaced binary.
+    if systemctl is-active --quiet "$SERVICE" 2>/dev/null || systemctl is-activating --quiet "$SERVICE" 2>/dev/null; then
+        : > "$STATE_FILE"
+    fi
+    systemctl stop "$SERVICE" || true
+fi
+
+exit 0

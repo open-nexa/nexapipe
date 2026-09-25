@@ -9,7 +9,7 @@
     crates/ at the workspace root are all missing. This script fills those gaps, so a
     single `./build_windows.ps1` produces the same installer here. Flow:
 
-      1. Preflight      - confirm the ui-desktop submodule is initialised and that the
+      1. Preflight      - confirm that ui-desktop is present and that the
                           ../../crates/nexapipe-client path dependency exists
                           (src-tauri/Cargo.toml depends on it; without it cargo fails
                           with a baffling "failed to load manifest"), then check
@@ -139,8 +139,7 @@ $RepoRoot    = $PSScriptRoot
 $DesktopDir  = [IO.Path]::Combine($RepoRoot, 'ui-desktop')
 $SrcTauriDir = [IO.Path]::Combine($DesktopDir, 'src-tauri')
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
-# src-tauri is exactly the repository root. CI puts crates/ there with a
-# sparse-checkout, locally it comes from the submodule layout.
+# src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 $ClientCrate = [IO.Path]::Combine($RepoRoot, 'crates', 'nexapipe-client', 'Cargo.toml')
 # The generated override goes under ui-desktop/.workbuddy: that directory is already
 # ignored by ui-desktop/.gitignore, so it never pollutes git status.
@@ -219,15 +218,15 @@ function Test-TauriNativeBinding {
 Write-Step "Preflight (arch=$Arch, target=$Triple, profile=$CargoProfile)"
 
 if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($DesktopDir, 'package.json')))) {
-    Stop-Script "$DesktopDir\package.json not found - the ui-desktop submodule is probably not initialised: git submodule update --init --recursive"
+    Stop-Script "$DesktopDir\package.json not found - run from the repository root (ui-desktop is part of this repo)"
 }
 if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($SrcTauriDir, 'Cargo.toml')))) {
-    Stop-Script "$SrcTauriDir\Cargo.toml not found - same cause, initialise the submodules first"
+    Stop-Script "$SrcTauriDir\Cargo.toml not found - same cause, check the repository checkout"
 }
 Write-Ok "ui-desktop is in place"
 
 if (-not (Test-Path -LiteralPath $ClientCrate)) {
-    $hint = "src-tauri/Cargo.toml refers to it through ../../crates/nexapipe-client; CI sparse-checks it out from open-nexa/nexapipe, locally put crates/ under $RepoRoot\crates"
+    $hint = "src-tauri/Cargo.toml refers to it through ../../crates/nexapipe-client; crates/ is part of this repository - check the checkout at $RepoRoot"
     Stop-Script "path dependency $ClientCrate is missing - $hint"
 }
 Write-Ok "path dependency crates/nexapipe-client present"

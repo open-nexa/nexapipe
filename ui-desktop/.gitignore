@@ -1,0 +1,32 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.workbuddy
+
+# 防止误提交签名密钥。
+# 注意：在 Git Bash 里 `npx tauri signer generate -w ~/.tauri/x.key` 不会展开 ~，
+# 会在当前目录建一个字面量 "~" 文件夹。这里兜住，别让它进版本库。
+~
+.tauri
+*.key

@@ -1,4 +1,4 @@
-use crate::auth::{AuthConfig, AuthError, AuthMessage, TotpValidator};
+use crate::auth::{AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator};
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
@@ -22,11 +22,16 @@ type HttpClient = legacy::Client<
 /// How long the server waits for the client to open the 2FA handshake stream.
 ///
 /// A client that has credentials sends AUTH_START right after the QUIC
-/// handshake finishes, so this only has to cover one round trip. Without it a
-/// client that never authenticates — one with no 2FA configured, which happily
-/// completes the QUIC handshake and then sends nothing — keeps the connection
-/// and the task serving it alive until the peer itself goes away.
-const AUTH_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+/// handshake finishes, so in principle this only has to cover one round trip.
+/// In practice the deadline also has to absorb the handshake itself: on a slow
+/// or relayed link the QUIC handshake plus the client's first stream can take
+/// several round trips, and a client that loses this race is closed with
+/// `auth_close_code::REQUIRED` — indistinguishable from a client that never had
+/// a credential — so it is deliberately generous. Five seconds is still short
+/// enough that a peer which completes the QUIC handshake and then sends
+/// nothing — one with no 2FA configured — does not keep its connection and the
+/// task serving it alive indefinitely.
+const AUTH_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
 /// How long the server holds a connection open after refusing it, so the
 /// AUTH_FAILED it just wrote can reach the client.
@@ -110,6 +115,7 @@ pub async fn handle_bidi_stream(
     client: &HttpClient,
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
+    acl: Option<Arc<ClientAcl>>,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
     let mut buf = Vec::with_capacity(8192);
@@ -128,14 +134,16 @@ pub async fn handle_bidi_stream(
                 // send its first payload in the same segment, which `buf` already
                 // holds and must hand over intact.
                 if buf.first().is_some_and(|b| l4::is_l4_stream(*b)) {
-                    return l4::handle_iroh_stream(send, recv, buf, config, limiter, peer).await;
+                    return l4::handle_iroh_stream(send, recv, buf, config, limiter, peer, acl.as_deref())
+                        .await;
                 }
 
                 // TLS is terminated by the backend, so a ClientHello is not a
                 // request: hand the raw bytes (and both halves of the stream)
                 // to the passthrough path, which routes on SNI.
                 if buf.first().is_some_and(|b| passthrough::is_tls_handshake(*b)) {
-                    return passthrough::handle_iroh_stream(send, recv, buf, config).await;
+                    return passthrough::handle_iroh_stream(send, recv, buf, config, acl.as_deref())
+                        .await;
                 }
 
                 if let Some(pos) = find_headers_end(&buf) {
@@ -176,7 +184,11 @@ pub async fn handle_bidi_stream(
         .unwrap_or(request.uri().path());
 
     let backend_info: Option<BackendInfo> = match host {
-        Some(h) => config.get_backend(h, path).await,
+        Some(h) => config.get_backend_with_acl(h, path, acl.as_deref()).await,
+        // A restricted client cannot be authorized against a host it never
+        // named, and the default backend serves exactly those; an
+        // unrestricted context keeps the historical fallback.
+        None if acl.is_some() => None,
         None => config.default_backend().await.map(|url| BackendInfo {
             url,
             path_rewrite: None,
@@ -409,6 +421,11 @@ enum AuthFailure {
 /// 3. Receive AUTH_RESPONSE with TOTP code and an HMAC over the nonce
 /// 4. Validate and send AUTH_OK or AUTH_FAILED
 ///
+/// Returns the client id together with its host authorization
+/// ([`ClientAcl`]), snapshotted under the same lock that verified the
+/// credentials — a reload landing between the two could otherwise turn a
+/// client whose entry was just removed into an unrestricted one.
+///
 /// The caller bounds this with a deadline, so every read in here has to be
 /// cancel-safe: [`read_auth_message`] loops over `RecvStream::read` instead of
 /// using `read_exact`.
@@ -416,7 +433,7 @@ async fn perform_authentication(
     conn: &Connection,
     auth: &AuthState,
     peer: &str,
-) -> Result<String, AuthFailure> {
+) -> Result<(String, ClientAcl), AuthFailure> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -524,6 +541,7 @@ async fn perform_authentication(
     // client" would make the reason an oracle: anyone could walk a client's
     // counter up to the lockout and, from the change in the reply, learn that
     // the id they guessed exists. The real reason goes to the log instead.
+    let mut verified_acl = ClientAcl::Unrestricted;
     let is_valid = match outcome {
         Ok(true) => {
             // Clear the counters only when there is something to clear, so a
@@ -544,6 +562,13 @@ async fn perform_authentication(
                         e
                     );
                 }
+            }
+            // Snapshot the host authorization while the same lock that verified
+            // the credentials still holds: the entry cannot vanish between the
+            // two reads, and a connection keeps the ACL it authenticated with
+            // even if a reload changes it right after.
+            if let Some(client) = cfg.clients.get(&client_id) {
+                verified_acl = client.acl();
             }
             true
         }
@@ -632,7 +657,7 @@ async fn perform_authentication(
     }
 
     if is_valid {
-        Ok(client_id)
+        Ok((client_id, verified_acl))
     } else {
         Err(AuthFailure::Rejected(format!(
             "authentication failed for client '{client_id}': {fail_reason}"
@@ -719,6 +744,11 @@ pub async fn handle_connection(
         }
         None => None,
     };
+    // The authenticated client's host authorization, snapshotted at the
+    // handshake and carried by every stream this connection opens. `None`
+    // means no 2FA ran, which is the unrestricted case anyway.
+    let mut client_acl: Option<Arc<ClientAcl>> = None;
+
     if let Some(auth) = auth {
         let outcome = tokio::time::timeout(
             AUTH_HANDSHAKE_TIMEOUT,
@@ -726,12 +756,13 @@ pub async fn handle_connection(
         )
         .await;
         match outcome {
-            Ok(Ok(client_id)) => {
+            Ok(Ok((client_id, acl))) => {
                 tracing::info!(
                     "Client '{}' authenticated successfully from {}",
                     client_id,
                     peer_id
                 );
+                client_acl = Some(Arc::new(acl));
             }
             Ok(Err(AuthFailure::Rejected(reason))) => {
                 tracing::warn!("Authentication failed for {}: {}", peer_id, reason);
@@ -773,6 +804,7 @@ pub async fn handle_connection(
                 let client_clone = client.clone();
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
+                let acl_clone = client_acl.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_bidi_stream(
                         send,
@@ -781,6 +813,7 @@ pub async fn handle_connection(
                         &client_clone,
                         &limiter_clone,
                         &peer_clone,
+                        acl_clone,
                     )
                     .await
                     {

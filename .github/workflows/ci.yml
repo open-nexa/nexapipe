@@ -1,18 +1,28 @@
 name: CI
 
-# Fast checks for regular commits/PRs (Linux only): formatting, lint, tests,
-# dependency audit, secret scan.
+# Fast checks for regular commits/PRs: rust formatting/lint/tests/feature
+# combinations, the Android NDK cfg check, plus the desktop and Android app
+# jobs that used to live in the open-nexa/nexa-desktop / nexa-android repos.
 # Multi-platform builds are verified by release.yml when a tag is pushed.
-# Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test on Windows.
+# Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test
+# on Windows (the desktop check job only runs cargo check there).
 #
-# Two jobs exist purely because the default feature set cannot see the code they cover:
-#   - android:  the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
+# Jobs that exist purely because the default feature set cannot see the code they cover:
+#   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
 #               cfg(target_os = "android"); a host check covers the shared stack but not
 #               the Android half. Without this job a break there only surfaces when the
 #               release APK is built from a tag.
 #   - features: `local-proxy` / `webpki-roots` / `uniffi` change which optional
 #               dependencies are compiled, so the combinations that matter are listed
 #               explicitly instead of relying on --all-features.
+#
+# Desktop jobs (desktop-*): ui-desktop/src-tauri is excluded from the root cargo
+# workspace and has its own Cargo.lock, so it needs its own check/clippy/test/audit
+# jobs. The frontend job runs vue-tsc + vite + the i18n/token linters.
+#
+# Android app jobs (android-app / android-lint): gradle unit tests, debug build and
+# lint. The Rust .so is deliberately NOT built here — JNI is loaded at runtime, and
+# the Rust side is covered by the android-ndk job and by release.yml.
 on:
   push:
     branches: [main, master]
@@ -93,8 +103,8 @@ jobs:
       - name: cargo check
         run: cargo check -p nexapipe-client --all-targets --features "${{ matrix.features }}" --locked
 
-  android:
-    name: android (tun-proxy / jni)
+  android-ndk:
+    name: android ndk (tun-proxy / jni)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -190,6 +200,316 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
+        with:
+          # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
+          # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
+          # advisory is only patched in glib >= 0.20, so there is no version to
+          # move to until upstream tauri migrates. Nothing in this workspace
+          # touches glib::VariantStrIter, the unsound iterator it describes.
+          #
+          # Drop this once ui-desktop/src-tauri/Cargo.lock pins glib >= 0.20.
+          allow-ghsas: GHSA-wrw7-89jp-8q8g
+
+  # ------------------------------------------------------------------
+  # Desktop app (migrated from open-nexa/nexa-desktop; src-tauri depends on
+  # ../../crates/nexapipe-client of this same repository).
+  # ------------------------------------------------------------------
+
+  desktop-frontend:
+    name: desktop frontend (typecheck + build + linters)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ui-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      # npm ci（不是 npm install）：package-lock.json 与 package.json 不一致时直接失败。
+      - name: npm ci
+        run: npm ci
+
+      # vue-tsc --noEmit && vite build
+      - name: typecheck + build
+        run: npm run build
+
+      - name: lint i18n
+        run: npm run lint:i18n
+
+      - name: lint design tokens
+        run: npm run lint:tokens
+
+  desktop-check:
+    name: desktop cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-14
+          - os: windows-latest
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # 尽早发现跨平台编译问题：本地只在一台机器上开发，#[cfg(target_os =
+      # "linux"/"macos"/"windows")] 里的代码本地永远编不到（platform.rs 的
+      # `?` on bool / PathBuf not in scope 就是这么漏出去的）。架构变体不影响
+      # cfg 走向，所以每个 OS 用 amd64 runner 即可覆盖全部 cfg 分支。
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: ui-desktop/src-tauri -> target
+
+      # --all-targets 很重要：src/bin/nexa-service.rs 里的 daemonize（#[cfg(unix)]）
+      # 只在 bin target 里，不带上 --all-targets 就检查不到。
+      - name: cargo check --all-targets
+        shell: bash
+        working-directory: ui-desktop/src-tauri
+        run: cargo check --all-targets
+
+  desktop-rust:
+    name: desktop rust (clippy + tests)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: ui-desktop/src-tauri -> target
+
+      # clippy 已经带 -D warnings：新代码不能靠 #[allow] 绕过，告警必须是零。
+      - name: cargo clippy --all-targets
+        working-directory: ui-desktop/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --lib
+        working-directory: ui-desktop/src-tauri
+        run: cargo test --lib
+
+  desktop-audit:
+    name: desktop dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # src-tauri 有自己的 Cargo.lock（被根 workspace exclude），根仓库的
+      # audit job 扫不到它。
+      - name: cargo audit
+        working-directory: ui-desktop/src-tauri
+        run: cargo audit
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ui-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      - name: npm audit
+        working-directory: ui-desktop
+        # 只看运行时依赖（--omit=dev），只拦 high/critical：构建链上的 moderate
+        # 告警升级成本远高于收益，交给 dependabot 慢慢跟。
+        run: npm audit --omit=dev --audit-level=high
+
+  # ------------------------------------------------------------------
+  # Android app (migrated from open-nexa/nexa-android).
+  # ------------------------------------------------------------------
+
+  android-app:
+    name: android app (unit tests + debug build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ui-android
+
+    env:
+      ANDROID_PLATFORM: '36'
+      BUILD_TOOLS: 36.0.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        # 不用 android-actions/setup-android：它默认装 "tools"，这个包早已从
+        # SDK 仓库下架，在新镜像上直接失败。
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
+          fi
+          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found under $SDK/cmdline-tools"; exit 1; }
+
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
+
+      - name: Unit tests
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unit-test-report
+          # upload-artifact paths are relative to the workspace root and ignore defaults.run.
+          path: ui-android/app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+
+      - name: assembleDebug
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-debug-apk
+          path: ui-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  android-lint:
+    name: android lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ui-android
+
+    env:
+      ANDROID_PLATFORM: '36'
+      BUILD_TOOLS: 36.0.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
+          fi
+          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found"; exit 1; }
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
+
+      # 先观察：存量告警（缺翻译、lint 默认规则）很多，等基线干净后去掉
+      # continue-on-error 让它真正拦 PR。
+      - name: lintDebug
+        continue-on-error: true
+        id: lint
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace lintDebug
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lint-report
+          path: |
+            ui-android/app/build/reports/lint-results-debug.html
+            ui-android/app/build/reports/lint-results-debug.xml
+          if-no-files-found: ignore
 
   # Optional: AI review. Nothing here runs until a key is configured.
   #

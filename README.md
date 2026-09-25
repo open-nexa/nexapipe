@@ -30,8 +30,8 @@ NexaPipe is a Rust workspace with four parts:
   the status byte, and UDP framing. Dependency-free, used by both sides so they
   cannot disagree about it.
 - **Apps** — an Android client (`ui-android`, TUN/VpnService) and a desktop
-  client (`ui-desktop`, Tauri 2 + Vue 3), both living in their own repositories
-  and wired in as git submodules.
+  client (`ui-desktop`, Tauri 2 + Vue 3), both part of this repository
+  (imported with their full git history from their former standalone repos).
 
 [How it works](#how-it-works) · [Why NexaPipe](#why-nexapipe) ·
 [Embed it](#embed-it-in-your-app) · [Layout](#repository-layout) ·
@@ -172,8 +172,8 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 | `crates/nexapipe-client/` | Client library (`lib` + `cdylib`). Pool in `connection_pool.rs`, domain→node mapping in `endpoint_group.rs`, local proxy in `local_proxy.rs`, L4 tunnel client in `l4.rs`, smoltcp TUN proxy in `tun_proxy.rs`, TUN virtual-IP mapping in `virtual_ip.rs`, QUIC tuning in `transport.rs`, JNI in `jni.rs`, UniFFI in `uniffi_bindings.rs`. |
 | `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` (magic, version, host, port, status byte) and `udp.rs` (`u16`-length framing). No dependencies, so the server and the client can both link it. |
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
-| `ui-android/` | Android app (submodule → `open-nexa/nexa-android`). |
-| `ui-desktop/` | Tauri 2 desktop app (submodule → `open-nexa/nexa-desktop`). |
+| `ui-android/` | Android app (Kotlin + Compose). |
+| `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.2fa.example` | Example server + local-proxy configuration (2FA enabled). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
@@ -269,7 +269,7 @@ debug = true
 | Key | Default | Notes |
 | --- | --- | --- |
 | `listen_addr` | *unset — not bound* | Plain HTTP listener. A TLS session opened against it is passed through, not terminated. |
-| `expose` | `false` | Required for `listen_addr` to name anything but loopback. |
+| `expose` | `false` | Required for `listen_addr` to name anything but loopback. Refused at startup while `[auth] enabled = true` — see below. |
 
 Leave `listen_addr` unset and the listener is never bound, which is the
 default: **nothing on this listener is authenticated**. The 2FA handshake runs
@@ -278,6 +278,14 @@ ever being asked for a credential. Configure it only for something on the same
 host, and keep it on `127.0.0.1`; binding `0.0.0.0` additionally requires
 `expose = true`, which publishes every `http` route and every `passthrough`
 backend to whoever can reach the port.
+
+`expose = true` together with `[auth] enabled = true` is **refused at startup**:
+with 2FA on, the combination reads as a protected proxy but is not one, since
+the handshake lives in the iroh accept loop and this listener never runs it.
+Either gate the port with a firewall or a reverse proxy and leave `[auth]`
+disabled, or drop `expose` and keep the listener on loopback. (Older versions
+logged a warning and started anyway; if a deployment that used both stops
+starting, this is why.)
 
 `tls_enabled`, `tls_listen_addr`, `cert_path` and `key_path` used to configure
 in-process TLS termination. They are still accepted so an existing
@@ -355,12 +363,16 @@ modes = ["http", "tcp"]
 backends = ["http://host.docker.internal:18080"]
 ```
 
-| Mode | What it does |
-| --- | --- |
-| `http` (default) | Parses the request, applies `path_pattern` / `path_rewrite`, and re-issues it with the shared HTTP client. Backends must be `http://` — an `https://` backend is rejected at startup. |
-| `passthrough` | Copies bytes. The route is selected by SNI, so `path_pattern` and `path_rewrite` do not apply and the backend may be a bare `host:port`. |
-| `tcp` | Carries a raw TCP flow to `backends`, selected by the host name in the L4 preface. No HTTP parsing, no `path_pattern`, no health check. See [TCP & UDP](#tcp--udp). |
-| `udp` | Carries UDP flows — one QUIC bi-stream per flow, one datagram per frame. Same selection as `tcp`, plus `idle_timeout_secs`. |
+| Mode | What it does | Transport security |
+| --- | --- | --- |
+| `http` (default) | Parses the request, applies `path_pattern` / `path_rewrite`, and re-issues it with the shared HTTP client. Backends must be `http://` — an `https://` backend is rejected at startup. | Encrypted on the way in (QUIC; plain HTTP when it arrives on `listen_addr`) but **plain HTTP from the server to the backend**. Anything sensitive belongs on a `passthrough` route, or on a `tcp` route whose payload carries its own TLS. |
+| `passthrough` | Copies bytes. The route is selected by SNI, so `path_pattern` and `path_rewrite` do not apply and the backend may be a bare `host:port`. | End to end: the bytes are TLS and the server never terminates them, so the client validates the backend's own certificate. See [TLS](#tls). |
+| `tcp` | Carries a raw TCP flow to `backends`, selected by the host name in the L4 preface. No HTTP parsing, no `path_pattern`, no health check. See [TCP & UDP](#tcp--udp). | QUIC-encrypted up to the server; from there it is the tunnelled protocol verbatim — TLS, SSH or anything else is yours to bring. |
+| `udp` | Carries UDP flows — one QUIC bi-stream per flow, one datagram per frame. Same selection as `tcp`, plus `idle_timeout_secs`. | QUIC-encrypted up to the server; payload security is the tunnelled protocol's job (DTLS, WireGuard, …). |
+
+No mode terminates TLS for a backend: the hop from the server to `backends` is as
+encrypted as what you put on the wire, and only `passthrough` keeps the client's
+TLS session intact all the way there.
 
 A route serves **one** mode with `mode = "..."` and **several** with
 `modes = [...]`, sharing one `backends` list:
@@ -649,9 +661,17 @@ handshake before any traffic is proxied.
 Auth settings are read once at startup, so restart the server after adding a
 client. See `config.toml.2fa.example`.
 
+Those secrets are the *only* credential gating the iroh listener, so the file
+holding them has to stay private: with `[auth] enabled = true` the server
+**refuses to start** when `config.toml` is readable or writable by any account
+other than its owner (`chmod 600 config.toml`). With `[auth]` off — a 0644
+config is how a Docker bind mount arrives — it logs the same warning and starts.
+The file is also re-checked after it is rewritten to persist a lockout, since an
+editor or a mount can widen a mode that was private at startup.
+
 A client that has no credentials against a server that requires them is refused
 too: the QUIC handshake succeeds, and the server closes the connection once the
-handshake deadline (2 s) passes with no `AUTH_START`. The client watches for that
+handshake deadline (5 s) passes with no `AUTH_START`. The client watches for that
 close and reports a failed start naming the cause, instead of a green
 "connected" over a tunnel the server will not serve.
 
@@ -843,17 +863,18 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 
 ## Client apps
 
-| App | Repository | What it does |
+| App | Directory | What it does |
 | --- | --- | --- |
-| Android | [`ui-android`](ui-android/README.md) → `open-nexa/nexa-android` | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
-| Desktop | [`ui-desktop`](ui-desktop/README.md) → `open-nexa/nexa-desktop` | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
+| Android | [`ui-android`](ui-android/README.md) | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
+| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
 
-Both are git submodules with their own history — commit inside them separately.
-Clone with `--recurse-submodules`, otherwise those two directories come down
-empty:
+Both are regular directories of this repository (their git history was
+preserved when they were imported from the former standalone repos
+`open-nexa/nexa-android` / `open-nexa/nexa-desktop`), and they ship from the
+same tags as the server:
 
 ```bash
-git clone --recurse-submodules https://github.com/open-nexa/nexapipe.git
+git clone https://github.com/open-nexa/nexapipe.git
 ```
 
 ---

@@ -43,8 +43,10 @@ const PRECONNECT_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration:
 /// nothing else happens, so the server is the only party that knows the
 /// connection is unusable — it says so by closing once its own handshake
 /// deadline (`AUTH_HANDSHAKE_TIMEOUT` in `crates/nexapipe/src/conn/mod.rs`)
-/// passes. This wait covers that deadline plus a round trip.
-const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+/// passes. This wait covers that deadline plus a round trip, so it has to stay
+/// above the server's constant — raising one without the other silently turns
+/// "the server requires 2FA" back into "the backend looks unreachable".
+const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(6);
 
 /// The application error code the server closes a connection with when it
 /// requires 2FA the client never performed. Must match `auth_close_code::REQUIRED`

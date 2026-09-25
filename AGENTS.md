@@ -11,6 +11,8 @@ Nexapipe is a Rust workspace: an iroh/QUIC-based proxy server forwarding HTTP/We
 - `ui-desktop/` — Tauri 2 desktop app (Vue 3 + TypeScript, Rust backend in `src-tauri/`).
 - Root — workspace `Cargo.toml`, `config.toml`, Dockerfiles, and the per-platform local build scripts (`build_dmg.sh` macOS, `build_deb.sh` Linux, `build_windows.ps1` Windows, `run_android.ps1` Android debug loop). Each mirrors the matching CI job: `--version` reproduces the tag-derived version, and `build_deb.sh` runs the same `verify-deb.sh` check as the Linux CI job.
 
+This is a monorepo: `ui-android/` and `ui-desktop/` are plain directories (their git histories were preserved via `git subtree` when they were imported from the former standalone repos `open-nexa/nexa-android` / `open-nexa/nexa-desktop`), not submodules — commit app changes directly here, alongside the server crates. One tag (e.g. `v0.2.0`) releases the server archives, the desktop bundles and the signed APK together from `.github/workflows/release.yml`.
+
 ## Build, Test, and Development Commands
 
 - `cargo build` — build the workspace.
@@ -43,6 +45,18 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 - Name tests descriptively, e.g. `handles_ws_upgrade()`.
 - The L4 tests drive `l4::serve_stream` over a `tokio::io::duplex` pair and the client's `l4::open_*` against the same, so a TCP or UDP flow can be tested end to end without an iroh endpoint.
 - Run `cargo test --workspace`; for Android changes, compile-verify with `gradlew :app:compileDebugKotlin`.
+
+## Git Safety Rules (MANDATORY)
+
+- **Never run `git push` (or any remote-writing command: push, force-push, remote-add-then-push, branch delete on remote, `gh release ...`).** Create local commits only; the owner pushes themselves.
+- The only exception is an explicit instruction in the current task, e.g. the user says "推上去/请推送". "Tests pass, so push it" style inference is NOT authorization.
+- Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
+
+## Working Files & Plan Documents (MANDATORY)
+
+- **Temporary plan / fix / patch documents written by the agent go to `.workbuddy/` (git-ignored), never into the repository tree** (no `PLAN.md`, `TODO.md`, `docs/*plan*`, `docs/*fix*`, `docs/*patch*`, etc. in tracked paths).
+- Only durable, curated docs belong in the repo (e.g. `AGENTS.md`, `CONTRIBUTING.md`, architecture decision records). One-off reasoning and step-by-step plans live in the conversation or `.workbuddy/` and expire with the task.
+- Put "why this change" explanations in the commit message or PR description, not in a sidecar plan file.
 
 ## Commit & Pull Request Guidelines
 

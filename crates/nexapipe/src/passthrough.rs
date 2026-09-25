@@ -11,6 +11,7 @@
 //! Either way the first byte is `0x16`, which is what the dispatchers key on —
 //! an HTTP request can never start with it.
 
+use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
 use std::io;
@@ -47,14 +48,16 @@ pub fn is_tls_handshake(first_byte: u8) -> bool {
 /// Serve a TLS connection that arrived over an iroh bi-stream.
 ///
 /// `initial` holds the bytes already read from `recv` (at least the first).
+/// `acl` is the authenticated client's host authorization, if any.
 pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     initial: Vec<u8>,
     config: &RouteConfig,
+    acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
     let handshake = read_tls_record(&mut recv, initial, HANDSHAKE_TIMEOUT).await?;
-    let Some((host, port)) = resolve_backend(config, &handshake).await else {
+    let Some((host, port)) = resolve_backend(config, &handshake, acl).await else {
         return Ok(());
     };
 
@@ -68,14 +71,17 @@ pub async fn handle_iroh_stream(
 
 /// Serve a TLS connection that arrived on a plain TCP listener.
 ///
-/// `initial` holds the bytes the dispatcher already peeked, if any.
+/// `initial` holds the bytes the dispatcher already peeked, if any. The
+/// plaintext listener has no authenticated client behind it, so no ACL
+/// applies — see the module docs of `crate::proxy` for why that listener is
+/// loopback-only unless explicitly exposed.
 pub async fn handle_tcp_stream(
     mut client: tokio::net::TcpStream,
     initial: Vec<u8>,
     config: &RouteConfig,
 ) -> anyhow::Result<()> {
     let handshake = read_tls_record(&mut client, initial, HANDSHAKE_TIMEOUT).await?;
-    let Some((host, port)) = resolve_backend(config, &handshake).await else {
+    let Some((host, port)) = resolve_backend(config, &handshake, None).await else {
         return Ok(());
     };
 
@@ -150,13 +156,30 @@ fn first_record_end(buf: &[u8]) -> Option<usize> {
 
 /// Maps a `ClientHello` to the backend that should terminate it.
 ///
-/// `None` means "nothing to do": no SNI, no passthrough route for it, or an
-/// address that cannot be parsed. Every case is logged.
-async fn resolve_backend(config: &RouteConfig, handshake: &[u8]) -> Option<(String, u16)> {
+/// `None` means "nothing to do": no SNI, no passthrough route for it, an SNI
+/// the client's allowlist does not name, or an address that cannot be parsed.
+/// Every case is logged, and every case hangs up the same way — a client
+/// cannot tell "not configured" from "not allowed", so it cannot probe which
+/// names exist behind the proxy.
+async fn resolve_backend(
+    config: &RouteConfig,
+    handshake: &[u8],
+    acl: Option<&ClientAcl>,
+) -> Option<(String, u16)> {
     let Some(sni) = extract_sni(handshake) else {
         tracing::debug!("TLS passthrough: no SNI in ClientHello, closing");
         return None;
     };
+
+    if let Some(acl) = acl
+        && !acl.allows(&sni)
+    {
+        tracing::warn!(
+            "TLS passthrough: SNI '{}' is not allowed for this client, closing",
+            sni
+        );
+        return None;
+    }
 
     let Some(backend) = config.get_passthrough_backend(&sni).await else {
         tracing::warn!(
@@ -406,6 +429,49 @@ mod tests {
         );
         assert_eq!(parse_backend_addr(""), None);
         assert_eq!(parse_backend_addr("caddy:notaport"), None);
+    }
+
+    /// A restricted client gets nothing for an SNI its allowlist never named —
+    /// the same `None` an unconfigured SNI gets, so the refusal cannot be
+    /// told apart from "no route" and used as a probe. An on-list SNI reaches
+    /// its backend as usual.
+    #[tokio::test]
+    async fn an_sni_off_the_clients_allowlist_resolves_to_nothing() {
+        use crate::auth::ClientAcl;
+        use crate::routes::{Route, RouteConfig};
+        use crate::lb::LoadBalancingStrategy;
+        use crate::config::RouteMode;
+
+        let config = RouteConfig::new(
+            vec![Route::new(
+                "fn.iroh.iakl.top",
+                "/",
+                true,
+                vec!["caddy:443".to_string()],
+                LoadBalancingStrategy::RoundRobin,
+                RouteMode::Passthrough,
+                None,
+            )],
+            None,
+        );
+
+        // Off-list: refused, even though a passthrough route exists.
+        let acl = ClientAcl::from_hosts(Some(&["other.iakl.top".to_string()]));
+        let hello = client_hello_with_sni("fn.iroh.iakl.top", true);
+        assert!(resolve_backend(&config, &hello, Some(&acl)).await.is_none());
+
+        // On-list: reaches the route's backend.
+        let acl = ClientAcl::from_hosts(Some(&["*.iroh.iakl.top".to_string()]));
+        assert_eq!(
+            resolve_backend(&config, &hello, Some(&acl)).await,
+            Some(("caddy".to_string(), 443))
+        );
+
+        // No ACL (no 2FA behind the connection): the historical behaviour.
+        assert_eq!(
+            resolve_backend(&config, &hello, None).await,
+            Some(("caddy".to_string(), 443))
+        );
     }
 
     #[test]

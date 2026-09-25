@@ -553,6 +553,10 @@ pub struct AuthTomlConfig {
 pub struct ClientAuthToml {
     pub secret: String,
     pub created_at: Option<String>,
+    /// Host patterns this client may reach; `None` means every route. Folded
+    /// into the client's [`crate::auth::ClientAcl`] when a connection
+    /// authenticates.
+    pub allow_hosts: Option<Vec<String>>,
     /// Runtime counters written back by the server (see
     /// `config_watcher::save_auth_state`); read here so a lockout survives a
     /// restart.
@@ -561,14 +565,11 @@ pub struct ClientAuthToml {
     pub last_used: Option<u64>,
 }
 
-/// Warns when the config file can be read by accounts other than its owner.
+/// Warns when the config file is reachable by accounts other than its owner.
 ///
-/// `[auth.clients]` holds the TOTP secrets, and those secrets are the *only*
-/// credential gating the iroh listener: the HMAC in every AUTH_RESPONSE is keyed
-/// with one, so anybody who can read this file can authenticate as that client
-/// for as long as the secret lives. `save_auth_state` rewrites the file on every
-/// failed attempt, which means a permissive mode is not a one-off leak but a
-/// standing one.
+/// Refusing is not always an option — the caller may be rewriting the file long
+/// after startup, where failing would take a running proxy down — so this is the
+/// report-only half. [`check_config_permissions`] is the one that gates a start.
 #[cfg(unix)]
 pub fn warn_world_readable_config(path: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -579,8 +580,8 @@ pub fn warn_world_readable_config(path: &str) {
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
         tracing::error!(
-            "{path} is readable by other accounts (mode {mode:o}) and holds the 2FA secrets; \
-             run `chmod 600 {path}`"
+            "{path} is readable or writable by other accounts (mode {mode:o}) and holds the 2FA \
+             secrets; run `chmod 600 {path}`"
         );
     }
 }
@@ -588,6 +589,67 @@ pub fn warn_world_readable_config(path: &str) {
 /// No file modes to inspect outside Unix, so there is nothing to warn about.
 #[cfg(not(unix))]
 pub fn warn_world_readable_config(_path: &str) {}
+
+/// The refusal for a config file other accounts can reach, if there should be
+/// one.
+///
+/// `[auth.clients]` holds the TOTP secrets, and those secrets are the *only*
+/// credential gating the iroh listener: the HMAC in every AUTH_RESPONSE is keyed
+/// with one, so anybody who can read this file can authenticate as that client
+/// for as long as the secret lives — and `save_auth_state` rewrites the file on
+/// every failed attempt, so a permissive mode is not a one-off leak but a
+/// standing one. Where the secrets are the live credential that is worth
+/// refusing a start over; the IPC token check (`reject_world_readable`) already
+/// refuses for the same reason, and a warning that only turns up in a rotated
+/// log is how a permissive mode survives for years.
+///
+/// With `[auth]` disabled none of it authenticates anybody, and a 0644 config is
+/// a fixture of Docker deployments: those keep the warning.
+///
+/// `mode` is passed in rather than read from the file so the rule can be tested
+/// everywhere, including on the platforms with no file modes to inspect.
+pub(crate) fn world_readable_refusal(path: &str, mode: u32, auth_enabled: bool) -> Option<String> {
+    (mode & 0o077 != 0 && auth_enabled).then(|| {
+        format!(
+            "{path} is readable or writable by other accounts (mode {mode:o}) and holds the 2FA \
+             secrets: with [auth] enabled those secrets are the only credential gating the iroh \
+             listener, so every account on this host can authenticate as every client. Run \
+             `chmod 600 {path}`, or disable [auth]"
+        )
+    })
+}
+
+/// Checks the config file's permissions before its secrets become live.
+///
+/// Refuses when `[auth]` is enabled and the file is not private, warns
+/// otherwise. A file that cannot be stat'ed is not this function's problem: the
+/// caller has already read it to get here.
+#[cfg(unix)]
+pub fn check_config_permissions(path: &str, auth_enabled: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = metadata.permissions().mode();
+    if let Some(refusal) = world_readable_refusal(path, mode, auth_enabled) {
+        anyhow::bail!(refusal);
+    }
+    if mode & 0o077 != 0 {
+        tracing::error!(
+            "{path} is readable or writable by other accounts (mode {mode:o}); [auth] is not \
+             enabled, so nothing in it authenticates anybody yet — run `chmod 600 {path}` before \
+             enabling it"
+        );
+    }
+    Ok(())
+}
+
+/// No file modes to inspect outside Unix, so there is nothing to refuse.
+#[cfg(not(unix))]
+pub fn check_config_permissions(_path: &str, _auth_enabled: bool) -> anyhow::Result<()> {
+    Ok(())
+}
 
 impl ProxyConfig {
     /// Load config and extract auth settings from TOML
@@ -622,6 +684,7 @@ impl ProxyConfig {
                                             .map(|d| d.as_secs().to_string())
                                             .unwrap_or_else(|_| "0".to_string())
                                     }),
+                                    allow_hosts: client_toml.allow_hosts,
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
@@ -1195,5 +1258,65 @@ domains = ["fn.iroh.iakl.top"]
             secret_of(&path, "client.001").as_deref(),
             Some("JBSWY3DPEHPK3PXP")
         );
+    }
+
+    /// A mode only the owner can reach is never a reason to refuse; anything
+    /// group- or world-reachable is, even without the read bit — one write is
+    /// enough to swap a secret.
+    #[test]
+    fn only_a_private_config_passes_with_2fa_on() {
+        assert_eq!(world_readable_refusal("config.toml", 0o600, true), None);
+        assert!(world_readable_refusal("config.toml", 0o644, true).is_some());
+        assert!(world_readable_refusal("config.toml", 0o640, true).is_some());
+        assert!(world_readable_refusal("config.toml", 0o602, true).is_some());
+    }
+
+    /// With `[auth]` off nothing in the file authenticates anybody, and 0644 is
+    /// how a Docker bind mount arrives: warn, do not refuse.
+    #[test]
+    fn a_permissive_config_is_only_warned_about_with_2fa_off() {
+        assert_eq!(world_readable_refusal("config.toml", 0o644, false), None);
+    }
+
+    /// A refusal that does not say how to fix it is a support ticket.
+    #[test]
+    fn the_refusal_names_the_fix() {
+        let refusal = world_readable_refusal("/etc/nexapipe/config.toml", 0o644, true)
+            .expect("0644 with 2FA on is refused");
+        assert!(
+            refusal.contains("chmod 600 /etc/nexapipe/config.toml"),
+            "{refusal}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// The check the startup path runs, against a real file: the same mode has
+    /// to be fatal once the secrets are live and survivable before they are.
+    #[cfg(unix)]
+    #[test]
+    fn startup_check_refuses_only_while_the_secrets_are_live() {
+        let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
+
+        chmod(&path, 0o600);
+        check_config_permissions(&path, true).expect("0600 starts with 2FA on");
+
+        chmod(&path, 0o644);
+        let err = check_config_permissions(&path, true).expect_err("0644 is fatal with 2FA on");
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+        check_config_permissions(&path, false).expect("0644 still starts with 2FA off");
+    }
+
+    /// A file the caller could not even stat has already failed to be read; the
+    /// permission check is not the place to report that.
+    #[cfg(unix)]
+    #[test]
+    fn startup_check_passes_a_file_it_cannot_stat() {
+        check_config_permissions("/nonexistent/config.toml", true)
+            .expect("a missing config is reported by the loader, not here");
     }
 }

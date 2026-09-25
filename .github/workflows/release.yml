@@ -1,12 +1,20 @@
 name: Release
 
-# Build multi-platform artifacts and create a GitHub Release when a v* tag is pushed.
-# Can also be triggered manually (workflow_dispatch); an existing tag must be provided.
+# One tag, one release, three products:
+#   build          - the nexapipe server binary + client cdylib, 8-platform matrix
+#   build-desktop  - the Tauri desktop app, 6-platform matrix (nsis / dmg / deb /
+#                    rpm / appimage + the updater manifests merged into latest.json)
+#   build-apk      - the signed Android APK (cargo-ndk .so + gradle assembleRelease)
+#   release        - assembles every artifact into a single GitHub Release with one
+#                    SHA256SUMS.txt
+#
+# Can also be triggered manually (workflow_dispatch); an existing tag must be
+# provided. Tick "signing_only" to run just the Android keystore-secrets check.
 #
 # Pre-release rule: a tag whose name contains a hyphen (v0.2.0-rc.1, v0.2.0-beta.1)
 # is published as a GitHub pre-release, so a release-candidate tag cannot take over
-# "latest". A plain tag (v1.0.0) is published as a normal release. Same rule as
-# ui-desktop's and ui-android's release workflows.
+# "latest". A plain tag (v1.0.0) is published as a normal release. The same rule in
+# every job.
 on:
   push:
     tags:
@@ -17,6 +25,11 @@ on:
         description: "Existing tag, e.g. v0.1.0"
         required: true
         type: string
+      signing_only:
+        description: "Android signing-secrets check only (skips all builds and publishing)"
+        required: false
+        type: boolean
+        default: false
 
 # The build stage only needs read access; the release stage elevates separately (see the release job)
 permissions:
@@ -36,6 +49,7 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
+    if: ${{ inputs.signing_only != true }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -256,17 +270,655 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ----------------------------------------------------------------------
+  # Desktop app (migrated from open-nexa/nexa-desktop). src-tauri depends on
+  # ../../crates/nexapipe-client — the same checkout provides both, no more
+  # floating-main clone.
+  # ----------------------------------------------------------------------
+  build-desktop:
+    name: desktop ${{ matrix.os }}-${{ matrix.arch }}
+    if: ${{ inputs.signing_only != true }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows ----
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: windows
+            arch: arm64
+            # GitHub-hosted native arm64 Windows runner: avoids cross-compiling on x64,
+            # which would require an extra ARM64 MSVC toolchain.
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+
+          # ---- macOS ----
+          # macos-13 (the last x64 image) is retired; x64 now uses macos-15-intel.
+          - os: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app dmg
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            bundles: app dmg
+
+          # ---- Linux ----
+          # Use 22.04 rather than 24.04: Tauri v2 needs webkit2gtk-4.1, which is
+          # available from 22.04 with a more stable ABI, so the resulting binaries run
+          # on more systems.
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb rpm appimage
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb rpm appimage
+
+    defaults:
+      run:
+        # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client, i.e. the
+        # crates/ directory of this same repository — one checkout provides both.
+        working-directory: ui-desktop
+
+    env:
+      MATRIX_OS: ${{ matrix.os }}
+      MATRIX_ARCH: ${{ matrix.arch }}
+      # Both tauri build and tauri signer read these two environment variables directly.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        # xdg-utils provides /usr/bin/xdg-open: the AppImage bundler copies it into
+        # the image because tauri-plugin-opener enables the shell-open API, and it
+        # hard-fails when /usr/bin/xdg-open does not exist ("xdg-open binary not
+        # found"). The x64 runner image ships it, the arm64 image does not.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file \
+            rpm \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The Rust workspace is under src-tauri/ (its target dir is src-tauri/target).
+          cache-on-failure: true
+          workspaces: ui-desktop/src-tauri -> target
+
+      - name: Install frontend dependencies
+        # npm install is used instead of npm ci: the committed package-lock.json was
+        # generated on Windows x64 and only records that platform's native binaries
+        # (@tauri-apps/cli-* / @esbuild/* / @rollup/rollup-*).
+        # npm ci installs strictly from the lockfile, so on other platforms those
+        # optional native packages would be missing and the tauri CLI would throw
+        # "Cannot find native binding" (npm/cli#4828).
+        # npm install adds the missing native packages for the current platform without
+        # changing the locked versions.
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          # Probe up front instead of blowing up at build time; if it really did not
+          # install, wipe everything, reinstall once, then verify again.
+          if ! npx tauri --version >/dev/null 2>&1; then
+            echo "::warning::missing @tauri-apps/cli native binary for this platform, wiping node_modules and reinstalling"
+            rm -rf node_modules package-lock.json
+            npm install --no-audit --no-fund
+          fi
+          npx tauri --version
+
+      - name: Check updater signing configuration
+        shell: bash
+        run: |
+          key_set=false; [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] && key_set=true
+          pass_set=false; [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] && pass_set=true
+          echo "TAURI_SIGNING_PRIVATE_KEY set: $key_set"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD set: $pass_set"
+          if [ "$key_set" != "$pass_set" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD must be set together or left empty together."
+            exit 1
+          fi
+
+      - name: Resolve version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          version="${TAG#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+
+      - name: Sync version into tauri.conf.json
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node -e "const fs=require('node:fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n');"
+          node -e "console.log('tauri.conf.json version =', JSON.parse(require('node:fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)"
+
+      - name: Generate Tauri CI config override
+        # Generates ci-override.json, which overrides tauri.conf.json per platform/arch:
+        #   - bundle.resources: on Windows pick wintun.dll by target arch (arm64 must
+        #     not ship the amd64 DLL)
+        #   - bundle.createUpdaterArtifacts: enabled only when a signing key exists,
+        #     otherwise the build fails for lack of a signature
+        #   - build.beforeBuildCommand: always npm, so we do not depend on yarn being
+        #     present on the runner
+        shell: bash
+        env:
+          SIGNING_ENABLED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: node .github/scripts/ci-config.mjs
+
+      - name: Build bundle
+        shell: bash
+        run: |
+          npx tauri build \
+            --bundles ${{ matrix.bundles }} \
+            --target ${{ matrix.target }} \
+            --config ci-override.json
+
+      - name: Verify Debian service upgrade packaging
+        if: matrix.os == 'linux'
+        shell: bash
+        run: .github/scripts/verify-deb.sh
+
+      - name: Stage build artifacts
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGET_DIR: src-tauri/target
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: node .github/scripts/stage-artifact.mjs
+
+      - name: Re-sign renamed macOS updater payload
+        # Tauri names the macOS updater bundle `<productName>.app.tar.gz`, without the
+        # arch, so the two macOS jobs would collide. stage-artifact.mjs renames it to
+        # include the arch; since the minisign signature is bound to the file metadata,
+        # the renamed file has to be signed again.
+        if: matrix.os == 'macos' && steps.stage.outputs.renamed == 'true' && steps.stage.outputs.updater_file != ''
+        shell: bash
+        env:
+          UPDATER: ${{ steps.stage.outputs.updater_file }}
+        run: |
+          rm -f "release-artifact/$UPDATER.sig"
+          npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release-artifact/$UPDATER"
+          test -f "release-artifact/$UPDATER.sig"
+          echo "re-signed: $UPDATER"
+
+      - name: Generate updater manifest
+        # TAG_NAME overrides GITHUB_REF_NAME so a workflow_dispatch re-run of an
+        # existing tag still builds asset URLs pointing at the tag, not the branch.
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          UPDATER_FILE: ${{ steps.stage.outputs.updater_file }}
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: node .github/scripts/latest-json.mjs
+
+      - name: Show staged release files
+        shell: bash
+        run: |
+          find release-artifact -type f | sort
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
+          # upload-artifact paths are relative to the workspace root and ignore defaults.run.
+          path: ui-desktop/release-artifact/**
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Retry upload on transient blob-storage failure
+        # The initial upload can fail with "Unable to make request: ETIMEDOUT" against
+        # Azure blob storage (hit macos-15-intel once, mid-upload, other 5 jobs fine).
+        # overwrite: true lets this second attempt replace any partially created artifact.
+        # Guarded with hashFiles so it stays a no-op when the failure happened before
+        # anything was staged (e.g. the build itself failed).
+        if: failure() && hashFiles('ui-desktop/release-artifact/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
+          path: ui-desktop/release-artifact/**
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  # ----------------------------------------------------------------------
+  # Android APK (migrated from open-nexa/nexa-android). The .so is built from
+  # this same checkout (crates/nexapipe-client) with cargo-ndk — no more
+  # floating-main clone of the server repo.
+  #
+  # Required secrets (Settings -> Secrets and variables -> Actions)
+  #   RELEASE_KEYSTORE_BASE64    base64 of the *.jks keystore itself (one line)
+  #   RELEASE_KEYSTORE_PASSWORD  keystore password
+  #   RELEASE_KEY_ALIAS          key alias
+  #   RELEASE_KEY_PASSWORD       key password
+  # ----------------------------------------------------------------------
+  build-apk:
+    name: android apk
+    if: ${{ inputs.signing_only != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      skip_rust: ${{ steps.opts.outputs.skip_rust }}
+
+    env:
+      NDK_VERSION: 29.0.14206865
+      MIN_SDK: 26
+      TARGET_ABI: arm64-v8a
+      TARGET_TRIPLE: aarch64-linux-android
+      ANDROID_PLATFORM: '36'
+      BUILD_TOOLS: 36.0.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve build inputs
+        id: opts
+        env:
+          INPUT_SIGNING_ONLY: ${{ inputs.signing_only }}
+        run: |
+          set -euo pipefail
+          # Inputs are empty on tag-push runs, so the full flow runs by default.
+          if [ "${INPUT_SIGNING_ONLY:-false}" = "true" ]; then
+            SKIP_RUST=true
+          else
+            SKIP_RUST=false
+          fi
+
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION_NAME="${TAG#v}"
+
+          # A version with a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
+          # pre-release; a plain version (v1.0.0) is not. Same rule everywhere,
+          # so a release-candidate tag never replaces "latest".
+          if [[ "$VERSION_NAME" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+
+          {
+            echo "version_name=$VERSION_NAME"
+            echo "version_code=${GITHUB_RUN_NUMBER}"
+            echo "prerelease=$PRERELEASE"
+            echo "skip_rust=$SKIP_RUST"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### nexapipe $VERSION_NAME (versionCode ${GITHUB_RUN_NUMBER})"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| ABI | \`${TARGET_ABI}\` |"
+            echo "| Pre-release | \`${PRERELEASE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # android-actions/setup-android is deliberately NOT used here. Its
+      # `packages` input defaults to "tools platform-tools" and the legacy
+      # "tools" package has been removed from the SDK repository, so the action
+      # dies with "Failed to find package 'tools'" on current runner images
+      # (cmdline-tools 16.0). The GitHub-hosted Ubuntu image already ships a
+      # working SDK + cmdline-tools, so the handful of packages this build
+      # needs are installed explicitly below -- and never "tools".
+      - name: Set up Android SDK
+        id: sdk
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK"
+          export ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "Android SDK root: $SDK"
+
+          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)
+          fi
+          if [ -z "${SM:-}" ] || [ ! -x "$SM" ]; then
+            echo "::error::sdkmanager not found under $SDK/cmdline-tools"
+            ls -1 "$SDK/cmdline-tools" || true
+            exit 1
+          fi
+          echo "sdkmanager: $SM"
+
+          # Accept the licenses before installing anything.
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+
+          "$SM" --install \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${BUILD_TOOLS}"
+
+          # Install the pinned NDK. If that exact build is no longer in the
+          # channel, take the newest available one instead of failing the whole
+          # release -- any NDK >= r26 works for arm64-v8a / minSdk 26.
+          if ! "$SM" --install "ndk;${NDK_VERSION}"; then
+            LATEST_NDK=$("$SM" --list 2>/dev/null \
+              | awk -v skip="ndk;${NDK_VERSION}" \
+                    '/^[[:space:]]*ndk;/{ if ($1 != skip) { v=$1 } } END{ print v }')
+            if [ -n "${LATEST_NDK:-}" ]; then
+              echo "::warning::ndk;${NDK_VERSION} is unavailable, falling back to ${LATEST_NDK}"
+              "$SM" --install "$LATEST_NDK" \
+                || echo "::warning::${LATEST_NDK} could not be installed either"
+            else
+              echo "::warning::ndk;${NDK_VERSION} is unavailable and no alternative NDK is listed by the SDK channel"
+            fi
+          fi
+
+          NDK_DIR="$SDK/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
+          fi
+          if [ -z "${NDK_DIR:-}" ] || [ ! -d "$NDK_DIR" ]; then
+            echo "::error::No NDK directory under $SDK/ndk"
+            ls -1 "$SDK/ndk" || true
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ndk_version=$(basename "$NDK_DIR")" >> "$GITHUB_OUTPUT"
+          echo "NDK: $NDK_DIR"
+
+      - name: Set up Rust toolchain
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET_TRIPLE }}
+
+      - name: Install cargo-ndk
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Cache cargo artifacts
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-
+
+      # The .so is built straight from this repository's crates/nexapipe-client
+      # and copied into the app's jniLibs (which app/.gitignore excludes).
+      - name: Build libnexapipe_client.so
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="${NDK_BIN}/${TARGET_TRIPLE}${MIN_SDK}-clang"
+          if [ ! -x "$LINKER" ]; then
+            echo "::error::NDK linker not found: $LINKER"
+            ls -1 "$NDK_BIN" | grep -E 'clang$' || true
+            exit 1
+          fi
+
+          # The repo .cargo/config.toml hardcodes a Windows NDK linker path.
+          # Override it on the command line with --config (which takes
+          # precedence over both environment variables and the config file) so
+          # the Linux runner uses the right clang.
+          cargo ndk \
+            --target "${TARGET_ABI}" \
+            --platform "${MIN_SDK}" \
+            build --release \
+            -p nexapipe-client \
+            --features "jni local-proxy tun-proxy" \
+            --config "target.${TARGET_TRIPLE}.linker='${LINKER}'"
+
+          mkdir -p "ui-android/app/src/main/jniLibs/${TARGET_ABI}"
+          cp "target/${TARGET_TRIPLE}/release/libnexapipe_client.so" \
+             "ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+          ls -lh "ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+
+      - name: Verify native library exports
+        if: steps.opts.outputs.skip_rust != 'true'
+        run: |
+          set -euo pipefail
+          SO="ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+          test -f "$SO" || { echo "::error file=$SO::Native library not found"; exit 1; }
+
+          NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          SYMS=$("$NM" -D --defined-only "$SO" \
+                 | grep -o 'Java_com_nexa_pipe_IrohProxy_[A-Za-z0-9_]*' | sort -u || true)
+          echo "$SYMS"
+
+          MISSING=0
+          for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
+                    nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
+                    nativeStartProxyLegacy nativeStopProxy nativeAddNode nativeStartTunProxy \
+                    nativeStopTunProxy nativeDestroy; do
+            if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
+              echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+
+      # Restore RELEASE_KEYSTORE_BASE64 into a .jks file and surface every
+      # problem (wrong secret content / wrong password / wrong alias) right
+      # here. Otherwise the failure is deferred to the Gradle packaging step and
+      # reported as KeytoolException / toDerInputStream rejects tag type NNN,
+      # which is very hard to trace back.
+      - name: Prepare signing keystore
+        id: keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+
+          [ -n "${RELEASE_KEYSTORE_BASE64:-}" ] \
+            || die "Missing secret RELEASE_KEYSTORE_BASE64 (base64 of the *.jks keystore itself)"
+
+          # Tolerate whitespace, newlines, quotes, backticks and a data URI
+          # prefix that may have been picked up while pasting.
+          B64=$(printf '%s' "$RELEASE_KEYSTORE_BASE64" \
+                | tr -d "[:space:]" \
+                | tr -d "\"\`'" \
+                | sed 's/^data:[^,]*;base64,//')
+          [ -n "$B64" ] || die "Secret RELEASE_KEYSTORE_BASE64 is empty after stripping whitespace"
+          echo "Secret character count: ${#RELEASE_KEYSTORE_BASE64} (${#B64} after stripping whitespace)"
+
+          mkdir -p "$RUNNER_TEMP/signing"
+          KS="$RUNNER_TEMP/signing/release.jks"
+
+          # If plain decoding fails, retry once while tolerating stray invalid
+          # characters and let the file-header check below be the final guard.
+          if ! printf '%s' "$B64" | base64 -d > "$KS" 2>/dev/null; then
+            printf '%s' "$B64" | base64 -d -i > "$KS" 2>/dev/null \
+              || die "RELEASE_KEYSTORE_BASE64 is not valid base64 (length after cleanup: ${#B64})"
+          fi
+
+          SIZE=$(stat -c %s "$KS")
+          MAGIC=$(od -A n -t x1 -N 4 "$KS" | tr -d ' \n')
+          SHA=$(sha256sum "$KS" | cut -d ' ' -f1)
+          echo "Decoded ${SIZE} bytes, file header 0x${MAGIC}, sha256 ${SHA}"
+
+          case "$MAGIC" in
+            3082*|30*) ;;      # PKCS12 (DER SEQUENCE)
+            feedfeed) ;;       # legacy JKS
+            *)
+              echo "::error::RELEASE_KEYSTORE_BASE64 does not decode to a keystore (file header 0x${MAGIC}, expected 0x3082... or 0xfeedfeed)"
+              echo "---------- First 32 decoded bytes ----------"
+              od -A d -t x1z -N 32 "$KS" || true
+              echo "--------------------------------------"
+              echo "This secret must be the base64 of the *.jks file ITSELF: a single line, a few thousand characters, starting with MII."
+              echo "Common mistakes: a file path / the password / the path of the base64 file / the base64 of some other file."
+              echo "If the character/byte count above looks far too small (this project's keystore is about 4.3 KB, i.e. about 5776 base64 characters),"
+              echo "it was almost certainly truncated while copying the single long line. Copy the whole thing with this command instead of selecting it by hand:"
+              echo "  Get-Content <base64-file> -Raw | Set-Clipboard"
+              exit 1
+              ;;
+          esac
+          [ "$SIZE" -gt 1000 ] || die "The decoded keystore is only ${SIZE} bytes, obviously incomplete"
+
+          # Validate the password and the alias with keytool up front; that is
+          # far quicker than waiting for the Gradle packaging step to fail.
+          if [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ]; then
+            ALIAS_ARGS=""
+            if [ -n "${RELEASE_KEY_ALIAS:-}" ]; then
+              ALIAS_ARGS="-alias ${RELEASE_KEY_ALIAS}"
+            fi
+            if ! keytool -list -keystore "$KS" \
+                   -storepass "$RELEASE_KEYSTORE_PASSWORD" $ALIAS_ARGS \
+                   > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
+              cat "$RUNNER_TEMP/keytool.err"
+              die "keytool cannot read the keystore: check RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
+            fi
+            echo "keytool check passed: password and alias ${RELEASE_KEY_ALIAS:-<unset>} are both correct"
+          else
+            echo "::warning::RELEASE_KEYSTORE_PASSWORD is not set, skipping the keytool pre-check"
+          fi
+
+          {
+            echo ""
+            echo "### Signing keystore verification"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Size | ${SIZE} bytes |"
+            echo "| File header | \`0x${MAGIC}\` |"
+            echo "| sha256 | \`${SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "keystore_sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Signing check only
+        if: steps.opts.outputs.skip_rust == 'true'
+        run: |
+          set -euo pipefail
+          echo "signing_only=true: the signing secrets check passed; the builds and the publishing steps were skipped."
+          echo "keystore sha256: ${{ steps.keystore.outputs.keystore_sha256 }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assemble signed release APK
+        if: steps.opts.outputs.skip_rust != 'true'
+        working-directory: ui-android
+        env:
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease \
+            -PversionName="${{ steps.opts.outputs.version_name }}" \
+            -PversionCode="${{ steps.opts.outputs.version_code }}"
+
+      - name: Verify APK signature and stage artifact
+        id: apk
+        if: steps.opts.outputs.skip_rust != 'true'
+        working-directory: ui-android
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort | head -n 1)
+          test -n "$APK" || { echo "::error::Release APK not found"; exit 1; }
+
+          BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
+          "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
+
+          OUT="nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
+
+          {
+            echo "### Artifacts"
+            echo '```'
+            "${BUILD_TOOLS_DIR}/aapt2" dump badging "$OUT" | head -n 4
+            cat "${OUT}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-apk
+          path: |
+            ui-android/nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
+            ui-android/nexapipe-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: publish release
-    needs: build
+    needs: [build, build-desktop, build-apk]
+    # A signing_only dispatch run uploads nothing to publish.
+    if: ${{ inputs.signing_only != true && needs.build-apk.outputs.skip_rust != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # gh release needs write permission
     permissions:
       contents: write
     steps:
-      # gh requires the working directory to be a git repo; fetch-depth: 0 lets
-      # --generate-notes diff against the previous tag
+      # gh requires the working directory to be a git repo; fetch-depth: 0 keeps
+      # --generate-notes able to diff against the previous tag
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -281,18 +933,56 @@ jobs:
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
-      - name: Download all artifacts
+      - name: Download server artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          pattern: ${{ env.BIN_NAME }}-*
           merge-multiple: true
+          path: dist-server
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-desktop-*
+          merge-multiple: true
+          path: dist-desktop
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-apk
+          merge-multiple: true
+          path: dist-apk
+
+      # Merge the per-platform updater manifests (latest-*.json) into a single
+      # latest.json and collect the desktop bundles into dist/.
+      - name: Assemble desktop release files
+        env:
+          DIST_DIR: dist-desktop
+          OUT_DIR: dist
+        run: node ui-desktop/.github/scripts/assemble-release.mjs
+
+      - name: Stage every artifact into one directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The desktop SHA256SUMS.txt covers desktop files only and would clash
+          # with the global one generated below.
+          rm -f dist/SHA256SUMS.txt
+          cp dist-server/* dist/
+          cp dist-apk/* dist/
+          echo "--- release contents ---"
+          ls -lh dist
 
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ${BIN_NAME}-* > SHA256SUMS.txt
+          # One SHA256SUMS.txt over every asset: server archives, desktop
+          # bundles + latest.json, and the APK (which keeps its own .sha256
+          # sidecar too, for direct downloads on a phone).
+          sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish release
@@ -303,9 +993,8 @@ jobs:
           set -euo pipefail
 
           # A version containing a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
-          # pre-release; a plain version (v1.0.0) is not. Same rule as
-          # ui-desktop / ui-android, so a release-candidate tag never replaces
-          # "latest".
+          # pre-release; a plain version (v1.0.0) is not. Same rule in every job,
+          # so a release-candidate tag never replaces "latest".
           case "$VERSION" in
             *-*) PRERELEASE_FLAG="--prerelease=true" ;;
             *)   PRERELEASE_FLAG="--prerelease=false" ;;

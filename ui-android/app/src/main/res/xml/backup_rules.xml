@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   Backup rules for devices older than API 31.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+-->
+<full-backup-content>
+    <!-- TOTP seeds must never leave the device, not even in a backup. -->
+    <exclude domain="sharedpref" path="NexaPipeSecrets.xml" />
+</full-backup-content>
