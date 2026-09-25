@@ -413,6 +413,162 @@ enum AuthFailure {
     Rejected(String),
 }
 
+/// Exchanges a one-time enrollment token for a freshly generated secret.
+///
+/// This is what makes an enrollment invite worth handing out: the link carries
+/// a token, and the first client to present it gets a secret the link never
+/// contained while the token is dropped in the same write. A link copied in
+/// transit is therefore a credential only until it is used once, instead of
+/// until somebody remembers to rotate it.
+///
+/// The secret is rotated rather than handed out as-is, so enrolling is also how
+/// a client recovers from a secret that leaked — at the cost of every device
+/// already using that client id, which has to scan again.
+async fn enroll_client(
+    auth: &AuthState,
+    client_id: &str,
+    token: &str,
+    send: &mut iroh::endpoint::SendStream,
+) -> Result<(), AuthFailure> {
+    // One reply for every way this can fail, for the same reason AUTH_FAILED
+    // has one: whether the token was unknown, already spent or never issued is
+    // not information a stranger is owed.
+    const REFUSED: &str = "the enrollment token was not accepted";
+
+    let mut cfg = auth.config().write().await;
+
+    // Is there a client at all, and does it have this token outstanding? Asked
+    // before anything is mutated so the refusal paths stay a single read.
+    let accepted = cfg
+        .clients
+        .get(client_id)
+        .is_some_and(|client| {
+            client
+                .pending_enrollment
+                .as_deref()
+                .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
+        });
+    if !accepted {
+        drop(cfg);
+        write_auth_message(send, &AuthMessage::EnrollFailed { reason: REFUSED.to_string() })
+            .await
+            .map_err(AuthFailure::NotStarted)?;
+        return Err(AuthFailure::Rejected(format!(
+            "enrollment refused for client '{client_id}': {REFUSED}"
+        )));
+    }
+
+    // Read off the config before the client is borrowed again: the credential
+    // issued here has to be generated with what the server will verify against.
+    let (algorithm, digits, period) = (
+        cfg.algorithm.name().to_string(),
+        cfg.digits,
+        cfg.time_step as u64,
+    );
+    let previous_secret = cfg
+        .clients
+        .get(client_id)
+        .map(|client| client.secret.clone())
+        .unwrap_or_default();
+    let secret = crate::auth::TotpValidator::generate_secret();
+    if let Some(client) = cfg.clients.get_mut(client_id) {
+        client.secret = secret.clone();
+        client.pending_enrollment = None;
+    }
+
+    // Persisted before anything is promised to the client: a secret that is
+    // live in memory but missing from disk is a secret that silently reverts
+    // on the next restart, which would put the old one back in service.
+    if let Err(e) = crate::config::ProxyConfig::complete_enrollment(
+        auth.path(),
+        client_id,
+        &secret,
+    ) {
+        // Roll the in-memory client back, or this process would keep accepting
+        // a secret that no longer exists anywhere else.
+        if let Some(client) = cfg.clients.get_mut(client_id) {
+            client.secret = previous_secret;
+            client.pending_enrollment = Some(token.to_string());
+        }
+        drop(cfg);
+        let reason = format!("enrollment could not be saved: {e}");
+        write_auth_message(send, &AuthMessage::EnrollFailed { reason: reason.clone() })
+            .await
+            .map_err(AuthFailure::NotStarted)?;
+        return Err(AuthFailure::Rejected(reason));
+    }
+    drop(cfg);
+
+    // The write above recreated the file, so a mode that was private at startup
+    // can have been widened by an editor or a mount since — and the startup
+    // check is not going to run again until a restart.
+    crate::config::warn_world_readable_config(auth.path());
+    tracing::info!(
+        "2FA: client '{client_id}' enrolled; its secret was rotated, so every device \
+         holding the old one has to scan again"
+    );
+
+    write_auth_message(
+        send,
+        &AuthMessage::EnrollIssue {
+            client_id: client_id.to_string(),
+            secret,
+            algorithm,
+            digits,
+            period,
+        },
+    )
+    .await
+    .map_err(AuthFailure::NotStarted)
+}
+
+/// Compares two byte strings in time that does not depend on where they differ.
+///
+/// A token is guessed the same way a password is, and an early exit on the
+/// first differing byte turns "how long did that take" into "how many
+/// characters did I get right".
+fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
+    if expected.len() != given.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(given.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Writes one length-prefixed AUTH_* message.
+async fn write_auth_message(
+    send: &mut iroh::endpoint::SendStream,
+    message: &AuthMessage,
+) -> Result<(), String> {
+    let bytes = message
+        .to_bytes()
+        .map_err(|e| format!("failed to serialize {}: {}", message_kind(message), e))?;
+    let len = bytes.len() as u32;
+    send.write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| format!("failed to send {}: {}", message_kind(message), e))?;
+    send.write_all(&bytes)
+        .await
+        .map_err(|e| format!("failed to send {}: {}", message_kind(message), e))
+}
+
+/// The wire name of a message, for errors that name what was being sent.
+fn message_kind(message: &AuthMessage) -> &'static str {
+    match message {
+        AuthMessage::Start { .. } => "AUTH_START",
+        AuthMessage::Challenge { .. } => "AUTH_CHALLENGE",
+        AuthMessage::Response { .. } => "AUTH_RESPONSE",
+        AuthMessage::Ok => "AUTH_OK",
+        AuthMessage::Failed { .. } => "AUTH_FAILED",
+        AuthMessage::EnrollStart { .. } => "ENROLL_START",
+        AuthMessage::EnrollIssue { .. } => "ENROLL_ISSUE",
+        AuthMessage::EnrollFailed { .. } => "ENROLL_FAILED",
+    }
+}
+
 /// Perform 2FA authentication handshake with a client.
 ///
 /// Protocol:
@@ -450,8 +606,32 @@ async fn perform_authentication(
         AuthFailure::NotStarted("the first stream is not an AUTH_START".to_string())
     })?;
 
+    // Enrollment, when the client asked for it: the token is exchanged for a
+    // freshly generated secret ahead of the ordinary handshake, on the same
+    // stream — the two messages are read in order here, so a client that
+    // enrolled cannot have its AUTH_START mistaken for a data stream.
     let client_id = match start_msg {
         AuthMessage::Start { client_id, .. } => client_id,
+        AuthMessage::EnrollStart { client_id, token } => {
+            enroll_client(auth, &client_id, &token, &mut send).await?;
+
+            let start_after_enroll = read_auth_message(&mut recv)
+                .await
+                .map_err(AuthFailure::NotStarted)?;
+            match AuthMessage::from_bytes(&start_after_enroll) {
+                Ok(AuthMessage::Start { client_id: id, .. }) if id == client_id => client_id,
+                Ok(AuthMessage::Start { client_id: id, .. }) => {
+                    return Err(AuthFailure::Rejected(format!(
+                        "AUTH_START names client '{id}' but the enrollment was for '{client_id}'"
+                    )));
+                }
+                _ => {
+                    return Err(AuthFailure::NotStarted(
+                        "expected AUTH_START after ENROLL_START".to_string(),
+                    ));
+                }
+            }
+        }
         _ => {
             return Err(AuthFailure::NotStarted(
                 "expected AUTH_START message".to_string(),
@@ -873,5 +1053,26 @@ pub async fn handle_incoming(
         Err(e) => {
             tracing::error!("Failed to accept incoming connection: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    /// The comparison is what stands between a token and whoever copied the
+    /// link, so it has to be right at the boundaries: equal, wrong at the first
+    /// byte, wrong at the last, and the wrong length.
+    #[test]
+    fn token_comparison_only_accepts_an_exact_match() {
+        let token = "0123456789abcdef";
+        assert!(constant_time_eq(token.as_bytes(), token.as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), "1123456789abcdef".as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), "0123456789abcdeF".as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), "0123456789abcdef0".as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), b""));
+        // Two empty tokens compare equal, which is why a client with no token
+        // outstanding must not be enrolled at all rather than compared here.
+        assert!(constant_time_eq(b"", b""));
     }
 }

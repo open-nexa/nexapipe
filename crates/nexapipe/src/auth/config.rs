@@ -112,6 +112,13 @@ pub struct ClientAuth {
     /// connect and nothing else", not "no restriction".
     #[serde(default)]
     pub allow_hosts: Option<Vec<String>>,
+    /// A one-time enrollment token waiting to be exchanged for a new secret.
+    ///
+    /// `None` means no enrollment is outstanding, so a client with no token
+    /// cannot talk the server into issuing one: enrollment is only ever opened
+    /// by `--generate-invite --registration`, which writes it here.
+    #[serde(default)]
+    pub pending_enrollment: Option<String>,
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
@@ -190,6 +197,18 @@ impl ClientAuth {
     }
 }
 
+/// A fresh one-time enrollment token: 32 random bytes, hex-encoded.
+///
+/// Wide enough that guessing one is not a strategy, and opaque — it is
+/// compared, never parsed, so its spelling is free to change.
+pub fn generate_enrollment_token() -> String {
+    let mut bytes = [0u8; 32];
+    for byte in bytes.iter_mut() {
+        *byte = rand::random();
+    }
+    hex::encode(bytes)
+}
+
 /// Which hosts one authenticated client may reach.
 ///
 /// 2FA answers *who* may connect; this answers *what they may touch once they
@@ -251,6 +270,7 @@ mod tests {
             secret: String::new(),
             created_at: "0".to_string(),
             allow_hosts: None,
+            pending_enrollment: None,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,

@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 use tracing;
 
 use crate::ClientError;
-use crate::auth::TwoFactorAuth;
+use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_CONNECTIONS: usize = 10;
@@ -158,6 +158,17 @@ struct IrohConnectionPoolInner {
     /// Optional client 2FA credentials. When set, every freshly established
     /// connection is authenticated with the server before it is pooled/used.
     two_factor: Mutex<Option<TwoFactorAuth>>,
+    /// A one-time enrollment token to spend on the next connection instead of
+    /// presenting credentials — what a `v=2` invite carries. Cleared once it
+    /// has bought a secret, which lands in [`Self::two_factor`].
+    enrollment: Mutex<Option<Enrollment>>,
+    /// The credential the server issued for that token.
+    ///
+    /// The process can use it for as long as it lives, but the token it came
+    /// from is spent: an app that restarts without persisting this has nothing
+    /// left to authenticate with. [`IrohConnectionPool::take_issued_credential`]
+    /// hands it to whoever stores such things.
+    issued: Mutex<Option<TwoFactorAuth>>,
     /// Why the last preconnect failed with "2FA required", when the server said
     /// so: a client without credentials cannot fail the handshake on its own, so
     /// the refusal is only visible as a close, and this hands the reason to
@@ -201,6 +212,8 @@ impl IrohConnectionPool {
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
+            enrollment: Mutex::new(None),
+            issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: true,
             link_kind: Mutex::new(LinkKind::Unknown),
@@ -215,6 +228,8 @@ impl IrohConnectionPool {
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
+            enrollment: Mutex::new(None),
+            issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: false,
             link_kind: Mutex::new(LinkKind::Unknown),
@@ -262,6 +277,37 @@ impl IrohConnectionPool {
     /// (including preconnect warm-ups) will run the 2FA handshake first.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
         *self.inner.two_factor.lock().await = auth;
+    }
+
+    /// Configure a one-time enrollment token instead of credentials: the next
+    /// connection spends it and comes back with the real secret in
+    /// [`Self::two_factor`].
+    ///
+    /// What the server issues has to be persisted by the caller — see
+    /// [`Self::take_issued_credential`] — because a token can only be spent
+    /// once, so a process that forgets the secret cannot enroll again from the
+    /// same invite.
+    pub async fn set_enrollment(&self, enrollment: Option<Enrollment>) {
+        *self.inner.enrollment.lock().await = enrollment;
+    }
+
+    /// Takes the credential the server issued when an enrollment token was
+    /// spent, and clears it.
+    ///
+    /// `None` when nothing has been enrolled yet — or when it has already been
+    /// taken, which is the normal case: this is read once, after the first
+    /// successful connection, by whatever keeps the app's settings.
+    pub async fn take_issued_credential(&self) -> Option<IssuedCredential> {
+        self.inner
+            .issued
+            .lock()
+            .await
+            .take()
+            .map(|auth| IssuedCredential {
+                client_id: auth.client_id().to_string(),
+                secret: auth.secret_base32(),
+                algorithm: auth.algorithm_name().to_string(),
+            })
     }
 
     /// Test-only: whether this pool has credentials configured.
@@ -315,6 +361,35 @@ impl IrohConnectionPool {
             let _ = started;
             anyhow::anyhow!(e)
         })?;
+
+        // Enrollment first: a token is spent once and buys the credentials the
+        // block below then uses, so it only runs while there are none.
+        let enrollment = self.inner.enrollment.lock().await.clone();
+        if let Some(enrollment) = enrollment {
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                "Enrolling with a one-time token as client '{}'",
+                enrollment.client_id()
+            );
+            match enrollment.exchange(&conn).await {
+                Ok(issued) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        "Enrollment succeeded for client '{}'; the token is spent",
+                        issued.client_id()
+                    );
+                    *self.inner.two_factor.lock().await = Some(issued.clone());
+                    *self.inner.enrollment.lock().await = None;
+                    *self.inner.issued.lock().await = Some(issued);
+                }
+                Err(e) => {
+                    conn.close(0u32.into(), b"2FA enrollment failed");
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("2FA enrollment failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
 
         let two_factor = self.inner.two_factor.lock().await.clone();
         if let Some(auth) = two_factor {

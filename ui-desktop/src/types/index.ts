@@ -34,6 +34,28 @@ export interface NodeTwoFactor {
   algorithm: TwoFactorAlgorithm;
 }
 
+/**
+ * A one-time enrollment token, which is what a `--registration` invite carries instead of a
+ * secret.
+ *
+ * It is spent by the first connection that uses it — the server answers with the real
+ * credential and rotates the client's secret in the same step — so a node holding a token is
+ * a node that has not been issued credentials yet. Whatever comes back has to be written into
+ * `twoFactor`: the token cannot be spent twice, so a restart that still only holds the invite
+ * has nothing left to authenticate with.
+ */
+export interface EnrollmentToken {
+  clientId: string;
+  token: string;
+}
+
+/** What the server issued for a spent token: the credentials to keep from here on. */
+export interface IssuedCredential {
+  clientId: string;
+  secret: string;
+  algorithm: TwoFactorAlgorithm;
+}
+
 export interface NodeConfig {
   id: string;
   connectionType: ConnectionType;
@@ -47,6 +69,11 @@ export interface NodeConfig {
   name?: string;
   /** Credentials for this endpoint alone. Absent means no handshake for this server. */
   twoFactor?: NodeTwoFactor;
+  /**
+   * A token to spend instead of presenting credentials. Cleared once the issued secret has
+   * landed in `twoFactor`, so a node is never left holding both.
+   */
+  enrollment?: EnrollmentToken;
 }
 
 export interface ProxyConfig {
@@ -127,6 +154,11 @@ export interface InvitePayload {
   domains: string[];
   relay?: string;
   totp?: InviteTotp;
+  /**
+   * A one-time enrollment token (`--registration` invites). Mutually exclusive with `totp`:
+   * the parser refuses a code carrying both, so the UI never has to pick a winner.
+   */
+  enrollment?: EnrollmentToken;
 }
 
 /**

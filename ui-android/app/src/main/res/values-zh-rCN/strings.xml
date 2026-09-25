@@ -66,6 +66,7 @@
     <string name="invite_summary_domains">域名：%1$s</string>
     <string name="invite_summary_2fa_none">两步验证：无</string>
     <string name="invite_summary_2fa">两步验证：%1$s（%2$s）</string>
+    <string name="invite_summary_enrollment">注册：%1$s（一次性令牌，首次连接时下发凭证）</string>
     <string name="invite_summary_relay">中继：%1$s</string>
     <string name="invite_value_none">无</string>
     <string name="invite_ticket_unsupported">该邀请携带的是端点票据，无法保存在这里。请改用节点 ID 形式的邀请。</string>
@@ -116,6 +117,7 @@
     <string name="two_factor_on">开</string>
     <string name="two_factor_off">关</string>
     <string name="two_factor_off_body">连接该端点时不做身份验证；要求两步验证的服务器会拒绝建立隧道。</string>
+    <string name="two_factor_enrollment_pending">等待以 %1$s 完成注册：下次连接时服务端会下发该端点的凭证。</string>
     <string name="two_factor_client_id">客户端 ID</string>
     <string name="two_factor_client_id_placeholder">client-001</string>
     <string name="two_factor_secret">TOTP 密钥</string>

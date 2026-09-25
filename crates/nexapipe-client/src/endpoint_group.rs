@@ -1,5 +1,5 @@
 use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
-use crate::auth::TwoFactorAuth;
+use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use crate::lb::{LoadBalancingStrategy, RoundRobinBalancer, RandomBalancer, LoadBalancer};
 use crate::ClientError;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -321,6 +321,64 @@ impl EndpointGroup {
                 pool.set_two_factor(auth.clone()).await;
             }
         }
+    }
+
+    /// Configure a one-time enrollment token on every pool, and on one backend
+    /// only — see [`Self::set_two_factor_for`] for why a group talking to
+    /// several servers needs the per-backend form.
+    pub async fn set_enrollment_for(&self, node_id: &str, enrollment: Option<Enrollment>) {
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                if pool.backend_id().to_string() == node_id {
+                    pool.set_enrollment(enrollment.clone()).await;
+                }
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                if pool.backend_id().to_string() == node_id {
+                    pool.set_enrollment(enrollment.clone()).await;
+                }
+            }
+        }
+    }
+
+    /// Configure a one-time enrollment token on every pool in this group.
+    pub async fn set_enrollment(&self, enrollment: Option<Enrollment>) {
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                pool.set_enrollment(enrollment.clone()).await;
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                pool.set_enrollment(enrollment.clone()).await;
+            }
+        }
+    }
+
+    /// The credential the server issued for an enrollment token, from whichever
+    /// pool has one, cleared once read.
+    ///
+    /// A group usually holds one backend per server and only one of them will
+    /// have enrolled, so this returns the first it finds rather than a list —
+    /// the caller knows which server it just enrolled against.
+    pub async fn take_issued_credential(&self) -> Option<IssuedCredential> {
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                if let Some(issued) = pool.take_issued_credential().await {
+                    return Some(issued);
+                }
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                if let Some(issued) = pool.take_issued_credential().await {
+                    return Some(issued);
+                }
+            }
+        }
+        None
     }
 
     pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {

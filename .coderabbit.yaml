@@ -1,0 +1,272 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit configuration for NexaPipe.
+# Repository layout, build commands and conventions live in AGENTS.md / CONTRIBUTING.md.
+
+language: "en-US"
+early_access: false
+
+# Keep comments short, specific and anchored to file:line. Skip praise and restating the diff.
+tone_instructions: >
+  Be direct and concrete: cite the file and line, say what breaks and why, and skip
+  praise, summaries of the diff itself, and style-only nitpicks.
+
+reviews:
+  # ---------------------------------------------------------------------------
+  # CodeRabbit is advisory here, never a merge gate. Nothing in this file submits
+  # a blocking review or a failing commit/check status on purpose:
+  #   * request_changes_workflow is off  -> no "request changes" review
+  #   * fail_commit_status is off        -> the status never turns red
+  #   * no pre_merge_check uses "error"  -> checks can warn, not block
+  # merge requirements live in the repository branch protection / rulesets,
+  # which this file cannot configure - keep CodeRabbit out of required checks.
+  # ---------------------------------------------------------------------------
+  profile: "chill"                  # low-noise passes; use "assertive" for a deeper (and chattier) run
+  request_changes_workflow: false
+  review_status: true
+  review_progress: true
+  commit_status: true               # mirrors review progress for visibility only
+  fail_commit_status: false         # never fails the PR, even on a review error
+  high_level_summary: true
+  collapse_walkthrough: true        # long monorepo diffs otherwise bury the PR body
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    drafts: false                   # draft PRs are still being cooked
+    auto_incremental_review: true
+    base_branches:
+      - main
+
+  path_filters:
+    # Vendored code (local smoltcp fork) and generated / build output
+    - "!third_party/**"
+    - "!**/target/**"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!ui-desktop/src-tauri/gen/**"       # written by `tauri build`
+    - "!ui-android/**/build/**"
+    - "!ui-android/.gradle/**"
+    # Lockfiles
+    - "!**/*.lock"
+    - "!**/Cargo.lock"
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/pnpm-lock.yaml"
+    # Minified bundles, source maps and snapshot fixtures
+    - "!**/*.min.js"
+    - "!**/*.map"
+    - "!**/*.snap"
+    # Binary assets: app icons and the bundled Wintun runtime
+    - "!**/*.png"
+    - "!**/*.icns"
+    - "!**/*.ico"
+    - "!**/*.webp"
+    - "!**/*.dll"
+    # Editor / OS noise
+    - "!**/.DS_Store"
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        Rust, edition 2024 with default rustfmt. Ignore pure formatting churn: the
+        baseline predates the current rustfmt version, so import-order and line-width
+        drift is expected and should not be flagged unless the change is touching those
+        lines anyway. Several files intentionally start with a UTF-8 BOM - flag any change
+        that rewrites a whole file without preserving it. Use `anyhow` for errors and keep
+        logging behind the existing cfg/macro gates.
+
+    - path: "crates/nexapipe-proto/**"
+      instructions: |
+        This is the dependency-free L4 wire format shared by the server and the client.
+        Flag any magic, version, status-byte or framing change that is not mirrored on
+        BOTH sides: the server half in `crates/nexapipe/src/l4/` and the client half in
+        `crates/nexapipe-client/src/l4.rs`. New fields need explicit byte widths and
+        endianness; a breaking layout change needs a VERSION bump plus an explicit
+        rejection path for older peers. Reject any dependency that would make this crate
+        non-leaf.
+
+    - path: "crates/nexapipe/**/*.rs"
+      instructions: |
+        Server side: iroh endpoints, HTTP/WebSocket proxying, TLS passthrough, the L4
+        tunnel, routing and health checks, and the 2FA layer in `src/auth/`. Focus on
+        real defects: blocking calls or locks held across `.await`, missing timeouts,
+        unbounded channels, shared-state races, unwraps on the request path, and any
+        route/SNI selection that could be steered to a backend it should not reach.
+        Credentials and tokens must never reach a log line or an error payload.
+
+    - path: "crates/nexapipe-client/**/*.rs"
+      instructions: |
+        Client library shipped as `rlib` + `cdylib` and consumed through JNI (Android)
+        and UniFFI (desktop) under the `jni`, `local-proxy`, `tun-proxy` and `uniffi`
+        features. A panic must never cross an FFI boundary - check `catch_unwind` and
+        result conversion at entry points. Flag code added outside the correct
+        `cfg(feature = ...)` gate, since a host-only API silently breaks another
+        platform's build. Changes must keep compiling for every feature combination,
+        including `--features jni,local-proxy,tun-proxy`.
+
+    - path: "ui-desktop/src-tauri/**/*.rs"
+      instructions: |
+        Tauri 2 backend. Commands must not block the async runtime, must validate
+        arguments coming from the webview, and every new command needs its permission
+        declared in `capabilities/`. Flag command payload changes that are not mirrored
+        in the TypeScript caller under `ui-desktop/src/api/`.
+
+    - path: "ui-desktop/src/**"
+      instructions: |
+        Vue 3 + TypeScript frontend. Watch for lost reactivity: store state must be read
+        live, never snapshotted into a local Map or plain object during setup, especially
+        for fields that are both displayed and edited (a stale snapshot silently overwrites
+        real data on input). New user-visible strings must be added to every locale under
+        `ui-desktop/src/i18n/`. Keep API calls in `src/api/`, not inline in components.
+
+    - path: "ui-android/**/*.kt"
+      instructions: |
+        Kotlin + Compose, with VPN/TUN orchestration in `NexaVpnService.kt` calling the
+        Rust client over JNI. Flag blocking I/O or JNI calls on the main thread, work that
+        survives a service lifecycle event, and any mismatch between a new native function
+        and its `external` declaration or argument types. Check that UI state stays on the
+        main dispatcher.
+
+    - path: "**/*.sh"
+      instructions: |
+        Shell build scripts (`build_dmg.sh`, `build_deb.sh`). Require `set -euo pipefail`,
+        quoted path variables, and no reliance on tools that only exist on one platform in
+        the cross-platform paths. Release and CI scripts must agree: a change to how the
+        artefact is located, named or verified here usually needs the same change in the
+        matching CI job, and vice versa.
+
+    - path: "**/*.ps1"
+      instructions: |
+        PowerShell scripts (`build_windows.ps1`, `run_android.ps1`). Check quoting of paths
+        that may contain spaces, non-interactive behaviour, explicit exit codes, and
+        Windows-only assumptions leaking into anything CI runs elsewhere.
+
+    - path: "**/*.toml"
+      instructions: |
+        Workspace manifests. Flag feature combinations that would break the client's
+        platform matrix, dependencies added to `crates/nexapipe-proto` (it must stay
+        dependency-free), and version fields that the release workflow reads.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        CI and release workflows. Check that action versions are pinned, secrets are never
+        echoed, every matrix entry builds what the matching root build script builds, and
+        any change to Windows, Linux or macOS packaging steps is mirrored in that script.
+        Inline shell is reviewed like the scripts above.
+
+    - path: "crates/**/tests/**/*.rs"
+      instructions: |
+        Integration tests. Assertions must actually assert, async work must be awaited,
+        and both the success and the failure path should be covered. Prefer driving
+        `l4::serve_stream` / the client's `l4::open_*` over a `tokio::io::duplex` pair
+        instead of real sockets, and prefer `duct` + `tempfile` over anything that leaves
+        state behind.
+
+    - path: "**/*.md"
+      instructions: |
+        Only flag factual drift: commands that no longer exist, paths that moved, version
+        numbers and flag names that disagree with the code. Ignore prose style, line
+        wrapping and wording.
+
+  tools:
+    clippy:
+      enabled: true
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    hadolint:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+
+  pre_merge_checks:
+    # Advisory only: every mode below is "off" or "warning". Nothing here can fail
+    # or block a merge - that is decided by branch protection, not by CodeRabbit.
+    override_requested_reviewers_only: false
+    docstrings:
+      mode: "off"                   # coverage is uneven here; the check only adds noise
+    issue_assessment:
+      mode: "off"
+    # `description` only takes a mode in this schema version; the expectations are
+    # encoded as custom checks below so they can reference what the diff touches.
+    description:
+      mode: "warning"
+    title:
+      mode: "warning"
+      requirements: >
+        Imperative mood, descriptive, ideally under 72 characters. A scope prefix
+        matching the area is encouraged, e.g. "fix(l4): ...", "feat(desktop): ...",
+        "docs: ...".
+    # `description` only takes a mode in this schema version; the expectations are
+    # encoded as custom checks below so they can reference what the diff touches.
+    description:
+      mode: "warning"
+    custom_checks:
+      - name: "Wire format parity"
+        mode: "warning"
+        instructions: >
+          If `crates/nexapipe-proto/` changes - including the magic, VERSION, status byte,
+          field widths or datagram framing - verify that both consumers were updated in the
+          same change: the server side under `crates/nexapipe/src/l4/` and the client side
+          under `crates/nexapipe-client/src/l4.rs`. Fail if only one side was touched, or if
+          a breaking layout change ships without a VERSION bump and a rejection path for
+          peers speaking the old version.
+      - name: "Build script and CI parity"
+        mode: "warning"
+        instructions: >
+          Packaging steps exist twice: once in the root scripts (`build_dmg.sh`,
+          `build_deb.sh`, `build_windows.ps1`) and once in `.github/workflows/`. If either
+          side changes how the artefact is produced, named, located or verified, the other
+          side must change with it. Flag edits to one without the other.
+      - name: "UI changes need visuals"
+        mode: "warning"
+        instructions: >
+          Only applies when the diff touches `ui-desktop/src/`, `ui-desktop/src-tauri/src/`
+          or the Android UI (`ui-android/app/src/main/java/**/ui/**`): the PR body must
+          contain a screenshot, a screen recording or an explicit note saying there is no
+          visible behaviour change. Large visual changes also need updated i18n strings and
+          consistent behaviour across every supported locale.
+      - name: "No secrets in the tree"
+        mode: "warning"
+        instructions: >
+          Fail if the change adds a private key, signing key, keystore, `.env` file, bearer
+          token, endpoint secret or any hardcoded credential. Tauri signing keys live outside
+          the repository (`~/.tauri/`) and must never be committed.
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/AGENTS.md"
+      - "**/CONTRIBUTING.md"
+      - "**/.github/CONTRIBUTING.md"
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+
+code_generation:
+  docstrings:
+    language: "en-US"
+    path_instructions:
+      - path: "crates/**/*.rs"
+        instructions: >
+          Public items only, one summary line first. Match the comment language already
+          used in the file: several modules mix English and Chinese inline comments, so do
+          not translate existing comments and do not introduce a second language into a
+          file that already has one.
+      - path: "ui-desktop/src/**"
+        instructions: >
+          JSDoc only for exported functions with non-obvious parameters or return shapes;
+          do not annotate every composable or every component prop.
+
+chat:
+  auto_reply: true
+  art: false

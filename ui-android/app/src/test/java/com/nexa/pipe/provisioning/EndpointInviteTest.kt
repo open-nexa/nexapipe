@@ -129,7 +129,59 @@ class EndpointInviteTest {
 
     @Test
     fun rejects_a_future_version() {
-        assertTrue(failure("nexapipe://endpoint/$nodeId?v=2").contains("Unsupported invite version 2"))
+        // v=2 became real — enrollment — so the version nobody can read is the
+        // next one along.
+        assertTrue(failure("nexapipe://endpoint/$nodeId?v=3").contains("Unsupported invite version 3"))
+    }
+
+    @Test
+    fun round_trips_an_enrollment_invite_as_version_two() {
+        val invite = EndpointInvite(
+            target = InviteTarget.NodeId(nodeId),
+            name = "Home",
+            domains = listOf("a.example"),
+            relay = null,
+            totp = null,
+            enrollment = InviteEnrollment(clientId = "client-001", token = "tok")
+        )
+
+        val uri = invite.toUri()
+        assertTrue(uri, uri.contains("v=2"))
+        assertTrue(uri, uri.contains("enroll=tok"))
+        assertTrue(uri, !uri.contains("secret="))
+        assertTrue(invite.isEnrollment())
+
+        assertEquals(invite, success(uri))
+        assertEquals("client-001", success(uri).enrollment?.clientId)
+        assertNull(success(uri).totp)
+    }
+
+    /**
+     * A v=1 app ignores parameters it does not know, so a token in a v=1 code
+     * would be dropped and the scan would import an endpoint with no
+     * credentials — which looks like it worked until it tries to connect.
+     */
+    @Test
+    fun refuses_an_enrollment_token_in_a_version_one_code() {
+        val uri = "nexapipe://endpoint/$nodeId?v=1&client=client-001&enroll=tok"
+        assertTrue(failure(uri).contains("enrollment"))
+    }
+
+    @Test
+    fun refuses_a_code_that_hands_out_both_a_token_and_a_secret() {
+        val uri = "nexapipe://endpoint/$nodeId?v=2&client=client-001&enroll=tok" +
+            "&secret=JBSWY3DPEHPK3PXP"
+        assertTrue(failure(uri).contains("both"))
+    }
+
+    @Test
+    fun needs_a_client_id_next_to_the_token() {
+        assertTrue(failure("nexapipe://endpoint/$nodeId?v=2&enroll=tok").contains("no client id"))
+    }
+
+    @Test
+    fun needs_a_non_empty_token() {
+        assertTrue(failure("nexapipe://endpoint/$nodeId?v=2&client=client-001&enroll=%20").contains("empty"))
     }
 
     @Test

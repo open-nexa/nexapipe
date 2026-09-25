@@ -361,7 +361,20 @@ fun EndpointDetailScreen(
                             )
                         }
 
-                        if (!twoFactor.enabled) {
+                        if (node.enrollment != null) {
+                            // A token is waiting to be spent, so there are no credentials to
+                            // edit yet: the first connect trades it for the secret this page
+                            // then shows.
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = stringResource(
+                                    R.string.two_factor_enrollment_pending,
+                                    node.enrollment!!.clientId
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else if (!twoFactor.enabled) {
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = stringResource(R.string.two_factor_off_body),

@@ -189,14 +189,27 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     algorithm = otp.algorithm
                 )
             )
+            // A token is not a credential, so an invite that hands one over
+            // leaves this endpoint with none until it has been spent.
+            viewModel.updateNodeEnrollment(nodeId, null)
             invite.warnings().forEach { viewModel.addLog("Invite import: $it") }
             invite.warnings().firstOrNull()?.let {
                 Toast.makeText(context, it, Toast.LENGTH_LONG).show()
             }
         }
+        // An enrollment invite spends its token on the next connect, which is
+        // also when the credentials arrive — so nothing is written here but the
+        // token itself.
+        invite.enrollment?.let { enrollment ->
+            viewModel.updateNodeEnrollment(
+                nodeId,
+                NodeEnrollment(clientId = enrollment.clientId, token = enrollment.token)
+            )
+            viewModel.updateNodeTwoFactor(nodeId, null)
+        }
         viewModel.addLog(
             "Imported invite: node=$nodeId domains=${invite.domains.size} " +
-                "2FA=${invite.totp?.clientId ?: "none"}"
+                "2FA=${invite.totp?.clientId ?: invite.enrollment?.clientId ?: "none"}"
         )
         Toast.makeText(
             context,
@@ -247,14 +260,17 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         )
         val otp = invite.totp
         add(
-            if (otp == null) {
-                context.getString(R.string.invite_summary_2fa_none)
-            } else {
-                context.getString(
+            when {
+                otp != null -> context.getString(
                     R.string.invite_summary_2fa,
                     otp.clientId,
                     otp.algorithm.uppercase(Locale.ROOT)
                 )
+                invite.enrollment != null -> context.getString(
+                    R.string.invite_summary_enrollment,
+                    invite.enrollment!!.clientId
+                )
+                else -> context.getString(R.string.invite_summary_2fa_none)
             }
         )
         invite.relay?.let { add(context.getString(R.string.invite_summary_relay, it)) }

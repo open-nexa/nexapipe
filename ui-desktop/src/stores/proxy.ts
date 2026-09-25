@@ -17,6 +17,7 @@ import { computed, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import type { AppError, EndpointLink, LinkKind, NodeConfig, ProxyMode, ProxyStatus } from '../types';
 import { useConfigStore } from './config';
+import { takeIssuedCredential } from '../api/invite';
 import { translate } from '../i18n';
 import { useToast } from '../composables/useToast';
 
@@ -71,7 +72,7 @@ const stale = ref(false);
 /** What the last start asked for, so the mode that comes back can be checked against it. */
 const requestedMode = ref<ProxyMode | null>(null);
 
-const { config, updateConfig } = useConfigStore();
+const { config, updateConfig, completeEnrollment } = useConfigStore();
 const toast = useToast();
 
 function sleep(ms: number): Promise<void> {
@@ -199,6 +200,9 @@ async function start(): Promise<void> {
       two_factor_client_id: node.twoFactor?.clientId ?? null,
       two_factor_secret: node.twoFactor?.secret ?? null,
       two_factor_algorithm: node.twoFactor?.algorithm ?? null,
+      // A registration invite's token, spent on the first connection of this run.
+      enrollment_client_id: node.enrollment?.clientId ?? null,
+      enrollment_token: node.enrollment?.token ?? null,
     }));
 
   const wantTun = config.useTun;
@@ -234,6 +238,10 @@ async function start(): Promise<void> {
       return;
     }
 
+    // Read before anything else can fail the start: a spent token is gone, and the credential
+    // it bought is the only copy this process will ever see.
+    await collectIssuedCredential();
+
     // The mode that actually came up must match what was asked for (§5.12 rule 4). A mismatch
     // means something downgraded the request — surface it instead of showing a green light.
     if (status.value.mode !== requestedMode.value) {
@@ -251,6 +259,30 @@ async function start(): Promise<void> {
     toast.error(error, 'error.proxy.start_failed');
   } finally {
     busy.value = false;
+  }
+}
+
+/**
+ * Stores the credential the server issued for an enrollment token, if one was spent.
+ *
+ * A token is spent by the first connection that presents it, so this has to run right after a
+ * successful start: without it the secret exists only in the backend process's memory, and the
+ * next launch falls back to an invite the server has already forgotten.
+ */
+async function collectIssuedCredential(): Promise<void> {
+  try {
+    const credential = await takeIssuedCredential(config.useService);
+    if (!credential) return;
+    const node = completeEnrollment(credential);
+    if (node) {
+      toast.success(translate('invite.enrolled', { client: credential.clientId }));
+    } else {
+      // Nothing was waiting for it: dropping the credential is the safe outcome, but losing a
+      // secret silently is not, so it is said out loud.
+      console.warn('[proxy] a credential was issued but no node was enrolling');
+    }
+  } catch (error) {
+    console.error('[proxy] failed to read the enrolled credential:', error);
   }
 }
 

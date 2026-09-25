@@ -12,7 +12,9 @@
 import { reactive, watch } from 'vue';
 import type {
   ConnectionType,
+  EnrollmentToken,
   InvitePayload,
+  IssuedCredential,
   LoadBalancingStrategy,
   NodeConfig,
   NodeTwoFactor,
@@ -84,10 +86,24 @@ function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
   return { clientId: asString(raw.clientId, ''), secret, algorithm };
 }
 
+/**
+ * A node's pending enrollment token, if it has one.
+ *
+ * A token with nothing in it is treated as no token at all: the server would refuse it, and a
+ * node carrying an empty one would enroll instead of using the credentials it already has.
+ */
+function normalizeEnrollment(raw: unknown): EnrollmentToken | undefined {
+  if (!isRecord(raw)) return undefined;
+  const token = asString(raw.token, '').trim();
+  if (!token) return undefined;
+  return { clientId: asString(raw.clientId, ''), token };
+}
+
 function normalizeNode(raw: unknown): NodeConfig | null {
   if (!isRecord(raw)) return null;
   const connectionType = raw.connectionType === 'endpoint_id' ? 'endpoint_id' : 'ticket';
   const twoFactor = normalizeTwoFactor(raw.twoFactor);
+  const enrollment = normalizeEnrollment(raw.enrollment);
   // `name` is cosmetic but it is the label an invite gave itself; dropping it here would blank
   // every imported node's name on the next reload.
   const name = asString(raw.name, '').trim();
@@ -99,6 +115,7 @@ function normalizeNode(raw: unknown): NodeConfig | null {
     domains: Array.isArray(raw.domains) ? raw.domains.filter((d) => typeof d === 'string') : [],
     ...(name ? { name } : {}),
     ...(twoFactor ? { twoFactor } : {}),
+    ...(enrollment ? { enrollment } : {}),
   };
 }
 
@@ -347,9 +364,47 @@ export function useConfigStore() {
         secret: invite.totp.secret,
         algorithm: invite.totp.algorithm,
       };
+      delete node.enrollment;
+    }
+
+    // A registration invite carries a token instead: it is spent on the next connection, which
+    // answers with the secret this node is to keep. Stored on the node rather than applied to
+    // `twoFactor` because a token is not a credential — writing it there would make the node
+    // present the token as its TOTP secret and be refused.
+    if (invite.enrollment) {
+      node.enrollment = {
+        clientId: invite.enrollment.clientId,
+        token: invite.enrollment.token,
+      };
+      delete node.twoFactor;
     }
 
     return outcome;
+  }
+
+  /**
+   * Writes the credential a server issued for an enrollment token onto the node that spent it,
+   * and clears the token.
+   *
+   * A token can only be spent once, so this is the only moment the secret exists on this side:
+   * without it a restart falls back to the invite, which the server has already forgotten.
+   * Returns the node it landed on, or `null` when no node was waiting for one — the credential
+   * is then dropped rather than attached somewhere it does not belong.
+   */
+  function completeEnrollment(credential: IssuedCredential): NodeConfig | null {
+    const node =
+      config.nodes.find(
+        (candidate) => candidate.enrollment?.clientId === credential.clientId,
+      ) ?? config.nodes.find((candidate) => candidate.enrollment);
+    if (!node) return null;
+
+    node.twoFactor = {
+      clientId: credential.clientId,
+      secret: credential.secret,
+      algorithm: credential.algorithm,
+    };
+    delete node.enrollment;
+    return node;
   }
 
   /** Sets or replaces one node's 2FA credentials, leaving every other node alone. */
@@ -411,6 +466,7 @@ export function useConfigStore() {
     updateNode,
     updateNodeDomains,
     applyInvite,
+    completeEnrollment,
     setNodeTwoFactor,
     clearNodeTwoFactor,
     hasTwoFactor,

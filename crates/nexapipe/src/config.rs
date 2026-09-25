@@ -557,6 +557,11 @@ pub struct ClientAuthToml {
     /// into the client's [`crate::auth::ClientAcl`] when a connection
     /// authenticates.
     pub allow_hosts: Option<Vec<String>>,
+    /// A one-time enrollment token outstanding for this client, written by
+    /// `--generate-invite --registration` and cleared by whoever spends it. Not
+    /// written back by `save_auth_state`: it belongs to the operator, not to
+    /// the runtime.
+    pub pending_enrollment: Option<String>,
     /// Runtime counters written back by the server (see
     /// `config_watcher::save_auth_state`); read here so a lockout survives a
     /// restart.
@@ -685,6 +690,7 @@ impl ProxyConfig {
                                             .unwrap_or_else(|_| "0".to_string())
                                     }),
                                     allow_hosts: client_toml.allow_hosts,
+                                    pending_enrollment: client_toml.pending_enrollment,
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
@@ -764,6 +770,64 @@ impl ProxyConfig {
         } else {
             ClientSecretWrite::Added
         })
+    }
+
+    /// Records a one-time enrollment token for `client_id`.
+    ///
+    /// Any token already outstanding is replaced, which is how an invitation
+    /// that never arrived gets revoked: generate another one and the old link
+    /// stops working. The client's secret is left alone — enrollment does not
+    /// touch it until a token is actually spent.
+    ///
+    /// The client has to exist: a `[auth.clients.<id>]` section with a token and
+    /// no secret would fail to load.
+    pub fn write_pending_enrollment(
+        path: &str,
+        client_id: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, token not written ({e})"))?;
+
+        let auth = sub_table(doc.as_table_mut(), "auth", path)?;
+        let clients = sub_table(auth, "clients", path)?;
+        let client = sub_table(clients, client_id, path)?;
+        if !client.contains_key("secret") {
+            anyhow::bail!(
+                "client \"{client_id}\" has no [auth.clients.{client_id}] secret in {path}; \
+                 run --generate-2fa {client_id} first"
+            );
+        }
+
+        client.insert("pending_enrollment", toml_edit::value(token));
+
+        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+    }
+
+    /// Spends the token: writes the issued `secret` and drops
+    /// `pending_enrollment`, so the same link cannot enroll twice.
+    ///
+    /// Both keys are written in one pass on purpose. A secret on disk with the
+    /// token still beside it would leave the window open for a second device to
+    /// trade the same link for the same credential.
+    pub fn complete_enrollment(path: &str, client_id: &str, secret: &str) -> anyhow::Result<()> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, enrollment not saved ({e})"))?;
+
+        let auth = sub_table(doc.as_table_mut(), "auth", path)?;
+        let clients = sub_table(auth, "clients", path)?;
+        let client = sub_table(clients, client_id, path)?;
+
+        client.insert("secret", toml_edit::value(secret));
+        client.remove("pending_enrollment");
+
+        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
     }
 }
 
@@ -1318,5 +1382,63 @@ domains = ["fn.iroh.iakl.top"]
     fn startup_check_passes_a_file_it_cannot_stat() {
         check_config_permissions("/nonexistent/config.toml", true)
             .expect("a missing config is reported by the loader, not here");
+    }
+
+    /// An enrollment is two writes to the same file: a token that an invitation
+    /// carries, and the secret that replaces it when the token is spent. Both
+    /// have to survive a reload, because the server that writes the token is
+    /// usually a different process from the one that spends it.
+    #[test]
+    fn an_enrollment_token_is_recorded_then_spent() {
+        let (_dir, path) = scratch_config(
+            "# my proxy\n\
+             default_backend = \"http://127.0.0.1:15666\"\n\
+             \n\
+             [auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.client-001]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+
+        ProxyConfig::write_pending_enrollment(&path, "client-001", "deadbeef")
+            .expect("token should be written");
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+        let auth = auth.expect("auth section");
+        assert_eq!(
+            auth.clients["client-001"].pending_enrollment.as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(auth.clients["client-001"].secret, "JBSWY3DPEHPK3PXP");
+
+        // Issuing a second token replaces the first: that is how a link that
+        // never arrived gets revoked.
+        ProxyConfig::write_pending_enrollment(&path, "client-001", "cafebabe")
+            .expect("token should be replaced");
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+        assert_eq!(
+            auth.unwrap().clients["client-001"]
+                .pending_enrollment
+                .as_deref(),
+            Some("cafebabe")
+        );
+
+        ProxyConfig::complete_enrollment(&path, "client-001", "NEWSECRETVALUE")
+            .expect("enrollment should be saved");
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+        let client = &auth.unwrap().clients["client-001"];
+        assert_eq!(client.secret, "NEWSECRETVALUE");
+        // The token has to go with it, or the same link enrolls a second device.
+        assert_eq!(client.pending_enrollment, None);
+    }
+
+    /// A token for a client that does not exist would leave a section with no
+    /// secret behind, which stops the config loading at all.
+    #[test]
+    fn an_enrollment_token_needs_a_client() {
+        let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
+        let err = ProxyConfig::write_pending_enrollment(&path, "ghost", "deadbeef")
+            .expect_err("a missing client must not be silently created");
+        assert!(err.to_string().contains("ghost"), "{err}");
     }
 }

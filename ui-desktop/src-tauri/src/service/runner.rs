@@ -4,7 +4,9 @@ use crate::proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
     StartError,
 };
-use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, IPC_SOCKET_PATH, MAX_IPC_LINE};
+use crate::service::ipc::{
+    IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, IPC_SOCKET_PATH, MAX_IPC_LINE,
+};
 use crate::status::ProxyStatus;
 use anyhow::{Context, Result};
 use std::fmt;
@@ -219,6 +221,9 @@ impl ServiceRunner {
                 IpcMessage::GetEndpointLinks => {
                     Self::handle_get_endpoint_links(&proxy_manager).await
                 }
+                IpcMessage::GetIssuedCredential => {
+                    Self::handle_get_issued_credential(&proxy_manager).await
+                }
                 IpcMessage::GetStartupError => {
                     IpcResponse::StartupError(startup_error_slot().read().await.clone())
                 }
@@ -333,6 +338,7 @@ impl ServiceRunner {
             .map(|n| {
                 // Read before the connection string is moved out of `n`.
                 let two_factor = n.two_factor();
+                let enrollment = n.enrollment();
                 let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
                     ConnectionConfig::Ticket(n.ticket)
                 } else {
@@ -348,6 +354,7 @@ impl ServiceRunner {
                     connection,
                     domains: merged,
                     two_factor,
+                    enrollment,
                 }
             })
             .collect();
@@ -483,6 +490,25 @@ impl ServiceRunner {
         } else {
             IpcResponse::Error(AppError::new(codes::PROXY_NOT_RUNNING))
         }
+    }
+
+    /// The credential the server issued for an enrollment token, if one was spent.
+    ///
+    /// Not an error when nothing enrolled: the desktop asks after every start, and a start
+    /// that simply had no token to spend is the common case.
+    async fn handle_get_issued_credential(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
+        let pm = proxy_manager.read().await;
+        let issued = match pm.as_ref() {
+            Some(manager) => manager.take_issued_credential().await,
+            None => None,
+        };
+        IpcResponse::IssuedCredential(issued.map(|credential| IssuedCredentialPayload {
+            client_id: credential.client_id,
+            secret: credential.secret,
+            algorithm: credential.algorithm,
+        }))
     }
 
     /// How each configured node currently reaches its backend.

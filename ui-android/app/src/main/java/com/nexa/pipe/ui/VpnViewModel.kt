@@ -47,11 +47,29 @@ data class NodeTwoFactor(
     val algorithm: String = "sha1" // "sha1", "sha256", "sha512"
 )
 
+/**
+ * A one-time enrollment token, in place of credentials.
+ *
+ * The token is spent by the first connection, which answers with the secret this
+ * device then keeps — and rotates the one the server held, so a code that leaked
+ * on its way here stops working the moment it is used.
+ */
+@Serializable
+data class NodeEnrollment(
+    val clientId: String = "",
+    val token: String = ""
+)
+
 @Serializable
 data class NodeConfig(
     val nodeId: String,
     val domains: List<String> = emptyList(),
-    val twoFactor: NodeTwoFactor? = null
+    val twoFactor: NodeTwoFactor? = null,
+    /**
+     * A token to spend instead of presenting credentials. Cleared once the
+     * issued secret has landed in [twoFactor], so an endpoint never holds both.
+     */
+    val enrollment: NodeEnrollment? = null
 )
 
 class VpnViewModel : ViewModel() {
@@ -285,6 +303,57 @@ class VpnViewModel : ViewModel() {
         relayAuthToken.value = if (mode == "custom") authToken else ""
         saveSettings()
         addLog("Relay config updated: mode=${mode}, url=${relayUrl.value}")
+    }
+
+    /**
+     * Sets or clears the enrollment token of one endpoint.
+     *
+     * A token replaces the credentials rather than sitting beside them: an
+     * endpoint holding a token has not been issued any yet. Cleared as soon as
+     * the issued secret lands in [twoFactor].
+     */
+    fun updateNodeEnrollment(nodeId: String, enrollment: NodeEnrollment?) {
+        val index = nodes.value.indexOfFirst { it.nodeId == nodeId }
+        if (index < 0) return
+        val updated = nodes.value.toMutableList()
+        updated[index] = nodes.value[index].copy(enrollment = enrollment)
+        nodes.value = updated
+        settingsManager?.saveNodes(nodes.value)
+        addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
+    }
+
+    /**
+     * Stores the credential the server issued for an enrollment token, if the
+     * connect that just happened spent one.
+     *
+     * This is the only moment the secret exists on this device: the token is
+     * gone, so without this the endpoint is left with an invite the server has
+     * already forgotten and cannot enroll a second time.
+     */
+    private fun collectIssuedCredential() {
+        val encoded = IrohProxy.nativeTakeIssuedCredential() ?: return
+        val parts = encoded.split("\n")
+        if (parts.size < 3) {
+            addLog("Enrollment answered with a credential this app cannot read")
+            return
+        }
+        val clientId = parts[0]
+        val secret = parts[1]
+        val algorithm = parts[2]
+        val node = nodes.value.firstOrNull { it.enrollment?.clientId == clientId }
+            ?: nodes.value.firstOrNull { it.enrollment != null }
+        if (node == null) {
+            // Dropping a secret is the safe outcome, but doing it silently is
+            // not: the endpoint will never connect and nothing will say why.
+            addLog("A credential was issued but no endpoint is enrolling")
+            return
+        }
+        updateNodeTwoFactor(
+            node.nodeId,
+            NodeTwoFactor(enabled = true, clientId = clientId, secret = secret, algorithm = algorithm)
+        )
+        updateNodeEnrollment(node.nodeId, null)
+        addLog("Enrolled: the token is spent and the issued secret is saved")
     }
 
     /**
@@ -726,6 +795,21 @@ class VpnViewModel : ViewModel() {
                                     otp.algorithm
                                 )
                             }
+                            // A token instead of credentials, for an endpoint that was
+                            // invited with one. Only where no secret exists: enrolling
+                            // rotates the secret, so an endpoint that already has one
+                            // must not spend a token again.
+                            for (node in nodes.value) {
+                                val enrollment = node.enrollment ?: continue
+                                val hasSecret = node.twoFactor?.takeIf { it.enabled }
+                                    ?.secret?.isNotBlank() == true
+                                if (hasSecret) continue
+                                IrohProxy.nativeSetEnrollmentForNode(
+                                    node.nodeId,
+                                    enrollment.clientId,
+                                    enrollment.token
+                                )
+                            }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()
                             startProxyWithRetries(basePort)
@@ -750,6 +834,9 @@ class VpnViewModel : ViewModel() {
                                 throw Exception(preconnectFailureReason(preConnectedCount))
                             }
                             addLog("Pre-connect completed: $preConnectedCount backend(s) warmed")
+                            // The pre-connect is what spent the token: read the secret it
+                            // bought now, because a second connect has nothing left to spend.
+                            collectIssuedCredential()
                             delay(1000)
                         }
 
