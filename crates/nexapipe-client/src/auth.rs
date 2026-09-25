@@ -206,14 +206,28 @@ impl TwoFactorAuth {
         }
     }
 
-    /// Authenticate with the server over a connection
+    /// Authenticate with the server over a connection.
     pub async fn authenticate(&self, conn: &Connection) -> Result<(), ClientError> {
-        use crate::auth::auth_protocol::AuthMessage;
-
         let (mut send, mut recv) = conn
             .open_bi()
             .await
             .map_err(|e| ClientError::ConnectionFailed(format!("Failed to open stream: {}", e)))?;
+        self.authenticate_on(conn, &mut send, &mut recv).await
+    }
+
+    /// The handshake itself, over a stream the caller opened.
+    ///
+    /// Split out so an enrollment can run ahead of it on the same stream: the
+    /// server reads ENROLL_START and AUTH_START in order off one bi-stream, and
+    /// a second stream would arrive looking like data sent before any
+    /// credential.
+    pub async fn authenticate_on(
+        &self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<(), ClientError> {
+        use crate::auth::auth_protocol::AuthMessage;
 
         // Step 1: Send AUTH_START
         let timestamp = std::time::SystemTime::now()
@@ -314,7 +328,188 @@ impl TwoFactorAuth {
             _ => Err(ClientError::Other("Unexpected response".to_string())),
         }
     }
+
+    /// The secret, back in the Base32 form it was configured with.
+    ///
+    /// An enrollment hands out a credential the app has never seen, and an app
+    /// that cannot read it back cannot persist it — which would leave every
+    /// restart trying to spend a token that has already been burned.
+    pub fn secret_base32(&self) -> String {
+        base32::encode(base32::Alphabet::RFC4648 { padding: false }, &self.secret)
+    }
+
+    /// The algorithm name, for the same reason as [`Self::secret_base32`].
+    pub fn algorithm_name(&self) -> &'static str {
+        self.algorithm.name()
+    }
 }
+
+/// A credential the server issued during enrollment, in the form an app can
+/// store it.
+///
+/// Handed out once by
+/// [`crate::connection_pool::IrohConnectionPool::take_issued_credential`],
+/// right after a token has been spent. An app that keeps its settings somewhere
+/// durable has to write these three fields down: the token is gone, so a
+/// restart that still holds the invite cannot enroll a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedCredential {
+    pub client_id: String,
+    /// Base32, exactly as it goes into [`TwoFactorAuth::new`] next time.
+    pub secret: String,
+    pub algorithm: String,
+}
+
+/// A credential that has not been issued yet.
+///
+/// A `v=2` invitation carries one of these instead of the client's secret: the
+/// link stops being a credential the moment it has been used, because what it
+/// holds is a token the server exchanges for a freshly generated secret and
+/// then discards. The trade is that the app has to keep what comes back — see
+/// [`Enrollment::exchange`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrollment {
+    client_id: String,
+    token: String,
+}
+
+impl Enrollment {
+    pub fn new(client_id: &str, token: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Trades the token for the real credential and authenticates with it, in
+    /// one stream: ENROLL_START/ENROLL_ISSUE, then the ordinary handshake.
+    ///
+    /// The issued [`TwoFactorAuth`] is returned rather than kept, because what
+    /// happens to it is the caller's decision — the process can use it for as
+    /// long as it lives, but an app that wants to survive a restart has to
+    /// persist [`TwoFactorAuth::secret_base32`] and drop the token.
+    pub async fn exchange(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
+        use crate::auth::auth_protocol::AuthMessage;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to open stream: {}", e)))?;
+
+        write_message(
+            &mut send,
+            &AuthMessage::EnrollStart {
+                client_id: self.client_id.clone(),
+                token: self.token.clone(),
+            },
+        )
+        .await?;
+
+        let issued = match read_message(&mut recv).await? {
+            AuthMessage::EnrollIssue {
+                client_id,
+                secret,
+                algorithm,
+                digits,
+                period,
+            } => {
+                if client_id != self.client_id {
+                    return Err(ClientError::AuthenticationFailed(
+                        "the server issued a credential for a different client id".to_string(),
+                    ));
+                }
+                TwoFactorAuth::with_params(
+                    &client_id,
+                    &secret,
+                    TotpAlgorithm::from_name(&algorithm),
+                    period as u32,
+                    digits,
+                )?
+            }
+            // One reply for every way this can fail: an enrollment token is
+            // either right or it is not, and saying which would only help
+            // someone who is guessing.
+            AuthMessage::EnrollFailed { reason } => {
+                return Err(ClientError::AuthenticationFailed(reason))
+            }
+            other => {
+                return Err(ClientError::Other(format!(
+                    "expected ENROLL_ISSUE, the server sent {}",
+                    message_name(&other)
+                )))
+            }
+        };
+
+        issued.authenticate_on(conn, &mut send, &mut recv).await?;
+        Ok(issued)
+    }
+}
+
+/// Writes one length-prefixed message.
+async fn write_message(
+    send: &mut iroh::endpoint::SendStream,
+    message: &auth_protocol::AuthMessage,
+) -> Result<(), ClientError> {
+    let bytes = message
+        .to_bytes()
+        .map_err(|e| ClientError::Other(format!("Serialization error: {}", e)))?;
+    let len = bytes.len() as u32;
+    send.write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send length: {}", e)))?;
+    send.write_all(&bytes)
+        .await
+        .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send message: {}", e)))
+}
+
+/// Reads one length-prefixed message.
+async fn read_message(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<auth_protocol::AuthMessage, ClientError> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message length: {e}")))?;
+    let msg_len = u32::from_le_bytes(len_buf) as usize;
+    // The server caps what it will read at 64 KiB; anything longer is a peer
+    // that is not speaking this protocol, not a message worth allocating for.
+    if msg_len > MAX_AUTH_MESSAGE {
+        return Err(ClientError::ConnectionFailed(format!(
+            "auth message length {msg_len} is out of range"
+        )));
+    }
+    let mut msg_buf = vec![0u8; msg_len];
+    recv.read_exact(&mut msg_buf)
+        .await
+        .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {e}")))?;
+    auth_protocol::AuthMessage::from_bytes(&msg_buf)
+        .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))
+}
+
+/// The `type` tag of a message, for errors that name what arrived.
+fn message_name(message: &auth_protocol::AuthMessage) -> &'static str {
+    match message {
+        auth_protocol::AuthMessage::Start { .. } => "AUTH_START",
+        auth_protocol::AuthMessage::Challenge { .. } => "AUTH_CHALLENGE",
+        auth_protocol::AuthMessage::Response { .. } => "AUTH_RESPONSE",
+        auth_protocol::AuthMessage::Ok => "AUTH_OK",
+        auth_protocol::AuthMessage::Failed { .. } => "AUTH_FAILED",
+        auth_protocol::AuthMessage::EnrollStart { .. } => "ENROLL_START",
+        auth_protocol::AuthMessage::EnrollIssue { .. } => "ENROLL_ISSUE",
+        auth_protocol::AuthMessage::EnrollFailed { .. } => "ENROLL_FAILED",
+    }
+}
+
+/// The largest AUTH_* message the client accepts.
+///
+/// Mirrors `MAX_AUTH_MESSAGE` in `crates/nexapipe/src/conn/mod.rs`: the length
+/// prefix is read before anything is known about the peer, so it is not
+/// trusted until it is in range.
+const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 
 /// Generate a new secret for client setup
 pub fn generate_secret() -> String {
@@ -344,6 +539,24 @@ pub mod auth_protocol {
         Ok,
         #[serde(rename = "AUTH_FAILED")]
         Failed { reason: String },
+        /// Offer a one-time enrollment token instead of a secret.
+        ///
+        /// Keep in sync with `AuthMessage::EnrollStart` in
+        /// `crates/nexapipe/src/auth/protocol.rs`.
+        #[serde(rename = "ENROLL_START")]
+        EnrollStart { client_id: String, token: String },
+        /// The credential the token stood in for, issued and the token burned.
+        #[serde(rename = "ENROLL_ISSUE")]
+        EnrollIssue {
+            client_id: String,
+            secret: String,
+            algorithm: String,
+            digits: u32,
+            period: u64,
+        },
+        /// The token was not accepted.
+        #[serde(rename = "ENROLL_FAILED")]
+        EnrollFailed { reason: String },
     }
 
     impl AuthMessage {
@@ -354,5 +567,55 @@ pub mod auth_protocol {
         pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
             serde_json::from_slice(bytes)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TotpAlgorithm, TwoFactorAuth, auth_protocol::AuthMessage};
+
+    /// The mirror of the test in `crates/nexapipe/src/auth/protocol.rs`: the
+    /// two sides define these messages separately, and the tag is all that
+    /// decides which one a peer is looking at.
+    #[test]
+    fn enrollment_messages_keep_their_wire_names() {
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: "tok".to_string(),
+        };
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
+
+        let issue = AuthMessage::EnrollIssue {
+            client_id: "client-001".to_string(),
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            algorithm: "SHA1".to_string(),
+            digits: 6,
+            period: 30,
+        };
+        let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""type":"ENROLL_ISSUE""#), "{json}");
+
+        let failed = AuthMessage::EnrollFailed {
+            reason: "no".to_string(),
+        };
+        let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
+    }
+
+    /// An enrollment that succeeds has to hand back something the app can
+    /// write down, or a restart has nothing left to authenticate with.
+    #[test]
+    fn an_issued_credential_comes_back_in_the_form_it_was_configured_with() {
+        let auth = TwoFactorAuth::with_params(
+            "client-001",
+            "JBSWY3DPEHPK3PXP",
+            TotpAlgorithm::SHA256,
+            30,
+            6,
+        )
+        .unwrap();
+        assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXP");
+        assert_eq!(auth.algorithm_name(), "sha256");
     }
 }

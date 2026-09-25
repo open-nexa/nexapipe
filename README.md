@@ -753,7 +753,14 @@ Two details worth knowing before you build on the format:
   when it is longer.
 - An invite that carries `secret=` is a **password in the clear**, and so is the
   QR code rendering of it. Anyone who scans it holds the client's credentials —
-  hand it to one device over one channel, and don't publish it.
+  hand it to one device over one channel, and don't publish it. `--generate-invite`
+  says the same thing in a banner above the URI, and names the client it hands out.
+- **Revoking one is rotating.** There is no per-device revocation: a device that
+  scanned the code holds the secret, and the only way to take it back is to give
+  the client a new one — `cargo run -p nexapipe -- --generate-2fa client-001 --force`
+  rewrites `config.toml` in place and every device enrolled with the old secret has
+  to scan again. Deleting the `[auth.clients.client-001]` section revokes everyone
+  at once. Treat an invite you cannot account for as rotated.
 
 Scanning is implemented in the Android app (the "Scan Invite" button beside "Add
 Node"), which accepts the `endpoint/` form only — its stored nodes hold a Node ID

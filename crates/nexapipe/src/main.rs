@@ -95,6 +95,16 @@ struct Cli {
     generate_invite: Option<String>,
 
     #[arg(
+        long,
+        requires = "generate_invite",
+        help = "With --generate-invite CLIENT_ID: put a one-time enrollment token in the \
+                invite instead of the client's TOTP secret. The first device to scan it \
+                trades the token for a freshly generated secret, and the link stops being \
+                a credential — the secret in it is never one"
+    )]
+    registration: bool,
+
+    #[arg(
         long = "invite-domains",
         value_delimiter = ',',
         value_name = "DOMAINS",
@@ -502,7 +512,7 @@ fn render_qr(link: &str, cli: &Cli, header: &str) -> anyhow::Result<()> {
 fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     use nexapipe_client::auth::TotpAlgorithm;
     use nexapipe_client::provisioning::{
-        EndpointInvite, EndpointTarget, InviteTotp, RECOMMENDED_URI_LIMIT,
+        EndpointInvite, EndpointTarget, InviteEnrollment, InviteTotp, RECOMMENDED_URI_LIMIT,
     };
 
     let (proxy_config, auth_config, config_loaded) = load_config_pair(&cli.config);
@@ -556,6 +566,9 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         .with_name(cli.invite_name.as_deref().unwrap_or_default());
 
     let mut two_factor_enabled = false;
+    // Kept past the block below: the banner has to name the client whose
+    // credential it is handing out.
+    let mut enrolled_client: Option<String> = None;
     // `--generate-invite` without a value is a valid request for an endpoint
     // share with no 2FA in it, so an empty client id skips the lookup instead
     // of looking up a client literally named "".
@@ -582,21 +595,42 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             )
         })?;
 
-        let issuer = if auth_config.issuer.is_empty() {
-            nexapipe::auth::DEFAULT_ISSUER
+        if cli.registration {
+            // An enrollment invite has to be written down before it is printed:
+            // the token is only worth anything if the server knows to accept it,
+            // and generating a second one is how a link that went astray is
+            // revoked — the old token is replaced, not added to.
+            let token = nexapipe::auth::generate_enrollment_token();
+            ProxyConfig::write_pending_enrollment(&cli.config, client_id, &token).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not record the enrollment token in {} ({e}); without it the \
+                     invite would be refused on first connect",
+                    cli.config
+                )
+            })?;
+            let enrollment = InviteEnrollment::new(client_id, &token)?;
+            enrolled_client = Some(client_id.to_string());
+            invite = invite.with_enrollment(Some(enrollment));
         } else {
-            auth_config.issuer.as_str()
-        };
-        let totp = InviteTotp::with_params(
-            issuer,
-            client_id,
-            &client.secret,
-            TotpAlgorithm::from_name(auth_config.algorithm.name()),
-            auth_config.digits,
-            auth_config.time_step,
-        )?;
-        two_factor_enabled = true;
-        invite = invite.with_totp(Some(totp));
+            let issuer = if auth_config.issuer.is_empty() {
+                nexapipe::auth::DEFAULT_ISSUER
+            } else {
+                auth_config.issuer.as_str()
+            };
+            let totp = InviteTotp::with_params(
+                issuer,
+                client_id,
+                &client.secret,
+                TotpAlgorithm::from_name(auth_config.algorithm.name()),
+                auth_config.digits,
+                auth_config.time_step,
+            )?;
+            two_factor_enabled = true;
+            enrolled_client = Some(client_id.to_string());
+            invite = invite.with_totp(Some(totp));
+        }
+    } else if cli.registration {
+        anyhow::bail!("--registration needs a CLIENT_ID: --generate-invite <CLIENT_ID> --registration");
     }
 
     let link = invite.to_uri();
@@ -659,6 +693,42 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         );
     }
 
+    // Printed between the summary and the URI, because the usual fate of a link
+    // is a chat window: by the time it is pasted, "this is a password" has to
+    // already have been said, and the one-line note at the end of the output is
+    // easy to scroll past when all the reader wants is the code.
+    if let Some(client) = &enrolled_client
+        && two_factor_enabled
+    {
+        println!("*******************************************************************");
+        println!("* THIS LINK IS A CREDENTIAL, NOT JUST AN ADDRESS.");
+        println!("*");
+        println!("* It carries the TOTP secret in the clear, so anyone who scans or");
+        println!("* copies it can authenticate as \"{client}\" until that secret is");
+        println!("* rotated. Hand it to one device over one channel, then let it go.");
+        println!("*");
+        println!("* To revoke it: nexapipe --generate-2fa {client} --force");
+        println!("* That rotates the secret, and every device enrolled with the old");
+        println!("* one has to scan again — there is no per-device revocation.");
+        println!("*******************************************************************");
+        println!();
+    }
+    if let Some(enrollment) = &invite.enrollment {
+        println!("-------------------------------------------------------------------");
+        println!(" THIS LINK CARRIES AN ENROLLMENT TOKEN, NOT THE SECRET.");
+        println!();
+        println!(" The first device to scan it trades the token for a freshly");
+        println!(" generated secret for client \"{}\", and the token is spent: a", enrollment.client_id);
+        println!(" copy of this link stops being a credential the moment it is used.");
+        println!(" Enrolling also rotates that client's secret, so every device");
+        println!(" already using it has to scan again.");
+        println!();
+        println!(" A link you did not deliver is revoked by generating another one");
+        println!(" -- this command again -- which replaces the outstanding token.");
+        println!("-------------------------------------------------------------------");
+        println!();
+    }
+
     println!("Invite URI, to paste into the app:");
     println!("  {link}");
     println!();
@@ -669,9 +739,12 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         "Scan this with the NexaPipe app (add endpoint -> scan):",
     )?;
 
-    if two_factor_enabled {
+    if invite.is_enrollment() {
+        println!("Scanning imports the endpoint, the domains and a one-time enrollment");
+        println!("token; the first connect turns it into the real credential.");
+    } else if two_factor_enabled {
         println!("Scanning imports the endpoint, the domains and the 2FA credentials in one");
-        println!("step. The code carries the TOTP secret in the clear: treat it like a password.");
+        println!("step.");
     } else {
         println!("Scanning imports the endpoint and its domains. Pass a client id to");
         println!("--generate-invite to put that client's 2FA credentials in the code too.");

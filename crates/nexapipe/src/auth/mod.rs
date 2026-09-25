@@ -7,7 +7,9 @@ pub mod otpauth;
 pub mod protocol;
 pub mod totp;
 
-pub use config::{AuthConfig, ClientAcl, ClientAuth, TotpAlgorithm};
+pub use config::{
+    AuthConfig, ClientAcl, ClientAuth, TotpAlgorithm, generate_enrollment_token,
+};
 pub use otpauth::{DEFAULT_ISSUER, OtpAuthUri};
 pub use protocol::AuthMessage;
 pub use totp::{AuthError, TotpValidator};
