@@ -38,7 +38,7 @@ nexapipe-proto = { version = "0.1.0", path = "../nexapipe-proto" }
 netstack-smoltcp = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support
-totp-rs = { version = "5.6", features = ["gen_secret"] }
+totp-rs = { version = "6.0", features = ["gen_secret"] }
 base32 = "0.5"
 hmac = "0.13"
 sha2 = "0.11"
