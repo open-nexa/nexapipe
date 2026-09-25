@@ -9,7 +9,7 @@ use proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
     StartError,
 };
-use service::ipc::{NodeInput, StartProxyRequest};
+use service::ipc::{IssuedCredentialPayload, NodeInput, StartProxyRequest};
 use service::platform::ServiceState;
 use service::IpcClient;
 use status::{EndpointLink, ProxyStatus};
@@ -226,6 +226,7 @@ async fn start_proxy(
         .map(|n| {
             // Read before the connection string is moved out of `n`.
             let two_factor = n.two_factor();
+            let enrollment = n.enrollment();
             let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
                 ConnectionConfig::Ticket(n.ticket)
             } else {
@@ -242,6 +243,7 @@ async fn start_proxy(
                 connection,
                 domains: merged,
                 two_factor,
+                enrollment,
             }
         })
         .collect();
@@ -448,6 +450,19 @@ pub struct InvitePayload {
     pub domains: Vec<String>,
     pub relay: Option<String>,
     pub totp: Option<InviteTotpPayload>,
+    /// A one-time enrollment token, which is what a `v=2` invite carries instead of a
+    /// secret. Mutually exclusive with `totp` — the parser refuses a code that carries
+    /// both — so the UI can branch on this without deciding a precedence of its own.
+    pub enrollment: Option<InviteEnrollmentPayload>,
+}
+
+/// The enrollment half of an invite: a token to spend, not a secret to keep.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteEnrollmentPayload {
+    /// Which `[auth.clients]` entry the token is pending for.
+    pub client_id: String,
+    pub token: String,
 }
 
 /// The 2FA half of an invite, in the form the config store keeps it.
@@ -492,6 +507,52 @@ fn parse_invite(uri: String) -> Result<InvitePayload, AppError> {
             algorithm: totp.algorithm.name().to_string(),
             issuer: totp.issuer.clone(),
         }),
+        enrollment: invite
+            .enrollment
+            .as_ref()
+            .map(|enrollment| InviteEnrollmentPayload {
+                client_id: enrollment.client_id.clone(),
+                token: enrollment.token.clone(),
+            }),
+    })
+}
+
+/// Hands back the credential a server issued for an enrollment token, and clears it.
+///
+/// `None` when nothing enrolled on this run — no node carried a token, or the credential
+/// has already been taken. A token is spent by the first connection that uses it, so the
+/// caller gets exactly one chance to read this; the frontend stores it as that node's 2FA
+/// credentials, because without it a restart has nothing left to authenticate with.
+#[tauri::command]
+async fn take_issued_credential(
+    use_service: Option<bool>,
+) -> Result<Option<IssuedCredentialPayload>, AppError> {
+    let use_service = use_service.unwrap_or(false);
+
+    if use_service {
+        match IpcClient::take_issued_credential().await {
+            Ok(credential) => return Ok(credential),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the enrolled credential via service, falling back to process mode: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Cloned out of the lock first: the guard must not be held across the await below.
+    let manager = PROXY_MANAGER.read().await.as_ref().cloned();
+    Ok(match manager {
+        Some(manager) => manager
+            .take_issued_credential()
+            .await
+            .map(|credential| IssuedCredentialPayload {
+                client_id: credential.client_id,
+                secret: credential.secret,
+                algorithm: credential.algorithm,
+            }),
+        None => None,
     })
 }
 
@@ -761,6 +822,7 @@ pub fn run() {
             get_node_id,
             get_endpoint_links,
             parse_invite,
+            take_issued_credential,
             install_service,
             uninstall_service,
             start_service,
@@ -778,7 +840,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexapipe_client::provisioning::InviteTotp;
+    use nexapipe_client::provisioning::{InviteEnrollment, InviteTotp};
 
     /// A Node ID nobody is listening on, derived from a fixed seed so the expected strings in
     /// these tests stay stable — parsing checks that the point is valid, not just that it is
@@ -855,6 +917,27 @@ mod tests {
         let totp = json["totp"].as_object().expect("the 2FA block travels whole");
         assert_eq!(totp["clientId"], "client-001");
         assert!(totp.get("client_id").is_none(), "keys must reach the UI as camelCase");
+    }
+
+    /// A registration invite carries a token instead of a secret, and the UI has to be able
+    /// to tell the two apart without guessing: it enrolls for one and stores credentials for
+    /// the other.
+    #[test]
+    fn hands_a_registration_token_to_the_frontend_instead_of_a_secret() {
+        let invite = endpoint_invite()
+            .with_enrollment(Some(InviteEnrollment::new("client-001", "tok").unwrap()));
+
+        let payload = parse_invite(invite.to_uri()).unwrap();
+        let enrollment = payload
+            .enrollment
+            .clone()
+            .expect("the invite carries a token");
+        assert_eq!(enrollment.client_id, "client-001");
+        assert_eq!(enrollment.token, "tok");
+        assert!(payload.totp.is_none(), "a code cannot carry both");
+
+        let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["enrollment"]["clientId"], "client-001");
     }
 
     #[test]

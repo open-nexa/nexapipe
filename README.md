@@ -792,10 +792,12 @@ Two consequences worth knowing:
   code rather than reading it as an endpoint share whose credentials went missing.
 - The device that enrolled has to **persist the secret it was issued** — the
   token is spent, so an app that restarts holding the invite cannot enroll twice.
-  The Rust client hands it back through
-  `IrohConnectionPool::take_issued_credential()`; an app that stores its settings
-  somewhere durable must write `client_id`, `secret` and `algorithm` down there.
-  (The Android app's scanner still understands `v=1` only.)
+  Both apps do this: the desktop asks `take_issued_credential` after a start and
+  writes the answer onto the node's 2FA credentials, and Android reads the same
+  thing out of `IrohProxy.nativeTakeIssuedCredential()` after its pre-connect
+  warm-up. The token itself is kept where each app keeps secrets — the desktop
+  stores it on the node, Android keeps it out of the backed-up preferences and
+  clears it once the secret has landed.
 
 Scanning is implemented in the Android app (the "Scan Invite" button beside "Add
 Node"), which accepts the `endpoint/` form only — its stored nodes hold a Node ID

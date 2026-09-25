@@ -1,6 +1,6 @@
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
-use crate::auth::{TotpAlgorithm, TwoFactorAuth};
+use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::{
     DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, LocalProxy, NodeConfig,
 };
@@ -36,6 +36,12 @@ static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 // client talk to several servers with different secrets — the single global
 // TWO_FACTOR above cannot express it.
 static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, (String, String, String)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+// One-time enrollment tokens per backend, keyed by endpoint ID. An entry here means the
+// endpoint has no credentials yet: the token is spent by the first connection, which comes
+// back with the secret Kotlin then persists. Kept apart from NODE_TWO_FACTOR because a node
+// holding a token must not present it as its TOTP secret.
+static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, String)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Generation counter: incremented each time nativeStopProxy releases the endpoint.
@@ -719,6 +725,26 @@ fn node_two_factor_for(node_id: &str) -> Option<(String, String, String)> {
         .and_then(|map| map.get(node_id).cloned())
 }
 
+/// A snapshot of the per-endpoint enrollment tokens, so the mutex is not held across the
+/// async calls that apply them.
+fn node_enrollment_snapshot() -> Vec<(String, (String, String))> {
+    match NODE_ENROLLMENT.lock() {
+        Ok(map) => map
+            .iter()
+            .map(|(id, cfg)| (id.clone(), cfg.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The enrollment token registered for one endpoint, if any.
+fn node_enrollment_for(node_id: &str) -> Option<(String, String)> {
+    NODE_ENROLLMENT
+        .lock()
+        .ok()
+        .and_then(|map| map.get(node_id).cloned())
+}
+
 /// Configure the client's 2FA credentials. Must be called before nativeStartProxy /
 /// nativeStartProxyLegacy. algorithm: "sha1" / "sha256" / "sha512".
 #[unsafe(no_mangle)]
@@ -829,6 +855,71 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
 /// clear, an endpoint whose 2FA the user just turned off would keep the old
 /// credentials for the lifetime of the process and keep opening auth streams
 /// the server no longer expects.
+/// Registers a one-time enrollment token for a single endpoint.
+///
+/// node_id:   endpoint ID the token belongs to.
+/// client_id: which `[auth.clients]` entry the token is pending for.
+/// token:     the token itself, as carried by a `v=2` invite.
+///
+/// The first connection to that endpoint spends it and answers with the real secret; see
+/// `nativeTakeIssuedCredential` for what Kotlin has to do with the answer. A node that
+/// already has credentials keeps them and never enrolls, so a token is only ever set for
+/// an endpoint that has none.
+///
+/// Must be called before nativeStartProxy / nativeStartProxyLegacy.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetEnrollmentForNode(
+    mut env: JNIEnv,
+    _class: JClass,
+    node_id: JString,
+    client_id: JString,
+    token: JString,
+) -> jint {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeSetEnrollmentForNode");
+        env.exception_clear().unwrap();
+        return -1;
+    }
+
+    let node_id = match read_jstring(&mut env, &node_id) {
+        Some(v) => v.trim().to_string(),
+        None => {
+            jni_log!("Failed to read node_id in nativeSetEnrollmentForNode");
+            return -1;
+        }
+    };
+    let client_id = match read_jstring(&mut env, &client_id) {
+        Some(v) => v,
+        None => {
+            jni_log!("Failed to read client_id in nativeSetEnrollmentForNode");
+            return -1;
+        }
+    };
+    let token = read_jstring(&mut env, &token).unwrap_or_default();
+
+    if node_id.is_empty() {
+        jni_log!("nativeSetEnrollmentForNode: empty node_id");
+        return -1;
+    }
+
+    jni_log!(
+        "[DEBUG:jni] nativeSetEnrollmentForNode: node='{}', client_id='{}', token={} chars",
+        node_id,
+        client_id,
+        token.len()
+    );
+
+    if let Ok(mut map) = NODE_ENROLLMENT.lock() {
+        map.insert(node_id, (client_id, token));
+    }
+    0
+}
+
+/// Drops every credential — and every enrollment token — registered per endpoint.
+///
+/// The token table rides along on purpose: the two are the same question ("how does this
+/// endpoint authenticate?"), and reading the configuration back through one call is what
+/// keeps a stale entry from applying to a node that no longer has one.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
     _env: JNIEnv,
@@ -837,7 +928,69 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
     if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
         map.clear();
     }
+    if let Ok(mut map) = NODE_ENROLLMENT.lock() {
+        map.clear();
+    }
     0
+}
+
+/// The credential the server issued for an enrollment token, cleared on read.
+///
+/// `client_id`, `secret` and `algorithm`, newline separated, or null when this run enrolled
+/// nothing. Spending a token rotates that client's secret server-side, so this is the only
+/// chance to read what it bought: without it the device holds an invite the server has
+/// already forgotten and cannot enroll again.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeIssuedCredential(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let runtime = match get_runtime() {
+        Some(r) => r,
+        None => return std::ptr::null_mut(),
+    };
+
+    let issued = runtime.block_on(async {
+        // The endpoint group is where a start with several nodes keeps its pools; the
+        // single-pool legacy path keeps the same answer one level down.
+        if let Some(state) = get_state() {
+            let group = {
+                let guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => return None,
+                };
+                guard.endpoint_group.clone()
+            };
+            if let Some(group) = group {
+                if let Some(issued) = group.take_issued_credential().await {
+                    return Some(issued);
+                }
+            }
+            let pool = {
+                let guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => return None,
+                };
+                guard.conn_pool.clone()
+            };
+            if let Some(pool) = pool {
+                return pool.take_issued_credential().await;
+            }
+        }
+        None
+    });
+
+    let Some(issued) = issued else {
+        return std::ptr::null_mut();
+    };
+    let encoded = format!(
+        "{}\n{}\n{}",
+        issued.client_id, issued.secret, issued.algorithm
+    );
+    match env.new_string(encoded) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1148,6 +1301,19 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
                 endpoint_group
                     .set_two_factor_for(&node_id, two_factor_auth(&cfg))
                     .await;
+            }
+            // Enrollment last, and only where no credentials were registered: enrolling
+            // rotates that client's secret, so a node that already has one must not spend a
+            // token again — every other device enrolled from the same code would be locked
+            // out by it.
+            for (node_id, (client_id, token)) in node_enrollment_snapshot() {
+                if node_two_factor_for(&node_id).is_some() {
+                    continue;
+                }
+                endpoint_group
+                    .set_enrollment_for(&node_id, Some(Enrollment::new(&client_id, &token)))
+                    .await;
+                jni_log!("[DEBUG:jni] enrollment armed for node '{}'", node_id);
             }
 
             jni_log!("[DEBUG:jni] Creating LocalProxy on {}", listen_addr);
@@ -1588,9 +1754,19 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
                 if let Some(auth) = current_two_factor_auth() {
                     pool.set_two_factor(Some(auth)).await;
                 }
-                // Per-endpoint credentials win over the global pair.
-                if let Some(cfg) = node_two_factor_for(&target_id) {
-                    pool.set_two_factor(two_factor_auth(&cfg)).await;
+                // Per-endpoint credentials win over the global pair, and a node that has
+                // them never enrolls: enrolling rotates the secret out from under every
+                // other device that scanned the same code.
+                let credentials = node_two_factor_for(&target_id);
+                if let Some(cfg) = &credentials {
+                    pool.set_two_factor(two_factor_auth(cfg)).await;
+                }
+                if credentials.is_none() {
+                    if let Some((client_id, token)) = node_enrollment_for(&target_id) {
+                        pool.set_enrollment(Some(Enrollment::new(&client_id, &token)))
+                            .await;
+                        jni_log!("[DEBUG:jni] enrollment armed for node '{}'", target_id);
+                    }
                 }
 
                 match LocalProxy::new_with_single_pool(&listen_addr, domains, pool.clone()).await {

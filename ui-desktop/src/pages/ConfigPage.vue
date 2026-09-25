@@ -359,6 +359,11 @@ function clearConfig() {
               </div>
               <p class="node-2fa-hint">{{ t('node.twoFactorHint') }}</p>
             </div>
+            <!-- A token is not a credential yet, so there is nothing to edit here: it is spent
+                 on the next connect, which writes the real secret into this node. -->
+            <p v-else-if="node.enrollment" class="node-2fa-hint">
+              {{ t('node.enrollmentPending', { id: node.enrollment.clientId }) }}
+            </p>
           </div>
         </div>
       </div>

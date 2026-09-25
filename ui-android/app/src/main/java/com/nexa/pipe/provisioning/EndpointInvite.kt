@@ -40,14 +40,37 @@ data class InviteTotp(
     val period: Int
 )
 
+/**
+ * A one-time enrollment token, in place of [InviteTotp].
+ *
+ * The token is not a credential: it is spent on the first connection, which
+ * answers with the TOTP secret this device is to keep and rotates the one the
+ * server held. So a code carrying a token is a code that stops working the
+ * moment it has been used — and what it buys has to be written down, because a
+ * token cannot be spent twice and an app that forgets the secret cannot enroll
+ * again from the same code.
+ */
+data class InviteEnrollment(
+    val clientId: String,
+    val token: String
+)
+
 /** A complete endpoint invitation. */
 data class EndpointInvite(
     val target: InviteTarget,
     val name: String?,
     val domains: List<String>,
     val relay: String?,
-    val totp: InviteTotp?
+    val totp: InviteTotp?,
+    /**
+     * A one-time token to spend instead of presenting credentials. Never set
+     * together with [totp]: an invite hands out one or the other.
+     */
+    val enrollment: InviteEnrollment? = null
 ) {
+
+    /** Whether this invite enrolls rather than handing out a secret. */
+    fun isEnrollment(): Boolean = enrollment != null
     /** Non-fatal issues to surface right after an import. */
     fun warnings(): List<String> {
         val otp = totp ?: return emptyList()
@@ -89,12 +112,25 @@ sealed interface InviteParseResult {
  * parameters are ignored so newer servers can extend the format, and a repeated
  * parameter keeps its first occurrence.
  *
+ * `v=2` is the enrollment form: it carries `enroll=<token>` instead of the
+ * `secret=` block, and is a version of its own so that a v=1 reader refuses it
+ * rather than importing it as an endpoint with no credentials.
+ *
  * This mirrors `nexapipe_client::provisioning` in the Rust client library; both
  * must accept and reject the same codes.
  */
 object EndpointInviteCodec {
     const val SCHEME = "nexapipe"
     const val VERSION = 1
+    /**
+     * The version an invite carrying an enrollment token is written as.
+     *
+     * Its own version rather than a new parameter in `v=1`, because an app that
+     * only knows v=1 ignores parameters it does not recognise: it would read a
+     * registration code as an ordinary endpoint share whose credentials simply
+     * went missing, which looks like a successful import that cannot connect.
+     */
+    const val ENROLLMENT_VERSION = 2
     const val NODE_ID_HOST = "endpoint"
     const val TICKET_HOST = "ticket"
     const val DEFAULT_ISSUER = "NexaPipe"
@@ -148,15 +184,13 @@ object EndpointInviteCodec {
         }
 
         val params = parseQuery(query)
-        val version = params["v"]
-        if (version != null) {
-            val parsed = version.trim().toIntOrNull()
-            if (parsed == null) {
-                return failure("Invite version \"$version\" is not a number")
-            }
-            if (parsed != VERSION) {
-                return failure("Unsupported invite version $parsed (this app understands $VERSION)")
-            }
+        val version = params["v"]?.trim()?.toIntOrNull()
+        if (params["v"] != null && version == null) {
+            return failure("Invite version \"${params["v"]}\" is not a number")
+        }
+        val isEnrollmentVersion = version == ENROLLMENT_VERSION
+        if (version != null && version != VERSION && !isEnrollmentVersion) {
+            return failure("Unsupported invite version $version (this app understands $VERSION and $ENROLLMENT_VERSION)")
         }
 
         val domains = splitDomains(params["domains"] ?: "")?.let(::normalizeDomains)
@@ -172,23 +206,31 @@ object EndpointInviteCodec {
         val name = params["name"]?.trim()?.takeIf { it.isNotEmpty() }
 
         val otp = parseTotp(params).getOrElse { return failure(it.message.orEmpty()) }
+        val enrollment = parseEnrollment(params, version)
+            .getOrElse { return failure(it.message.orEmpty()) }
         return InviteParseResult.Success(
             EndpointInvite(
                 target = target,
                 name = name,
                 domains = domains,
                 relay = relay,
-                totp = otp
+                totp = otp,
+                enrollment = enrollment
             )
         )
     }
 
     /** Builds an invite link; [parse] reads it back unchanged. */
     fun build(invite: EndpointInvite): String {
-        val params = mutableListOf("v" to VERSION.toString())
+        val version = if (invite.enrollment != null) ENROLLMENT_VERSION else VERSION
+        val params = mutableListOf("v" to version.toString())
         invite.name?.takeIf { it.isNotBlank() }?.let { params += "name" to it }
         if (invite.domains.isNotEmpty()) params += "domains" to invite.domains.joinToString(",")
         invite.relay?.let { params += "relay" to it }
+        invite.enrollment?.let { enrollment ->
+            params += "client" to enrollment.clientId
+            params += "enroll" to enrollment.token
+        }
         invite.totp?.let { otp ->
             params += "client" to otp.clientId
             params += "issuer" to otp.issuer
@@ -218,7 +260,11 @@ object EndpointInviteCodec {
             // A nested otpauth:// URI is the interop form: it carries the same
             // fields under their standard names.
             val embedded = params["otpauth"]
-                ?: return if (listOf("client", "issuer", "algorithm", "digits", "period").any { it in params }) {
+                ?: return if (params["enroll"] == null &&
+                    listOf("client", "issuer", "algorithm", "digits", "period").any { it in params }
+                ) {
+                    // An enrollment is the one shape that legitimately carries a
+                    // client id without a secret.
                     Result.failure(invalid("The invite carries 2FA parameters but no secret"))
                 } else {
                     Result.success(null)
@@ -257,6 +303,41 @@ object EndpointInviteCodec {
                 period = period
             )
         )
+    }
+
+    /**
+     * Reads the enrollment block, if the invite has one.
+     *
+     * `enroll` in a v=1 code is refused rather than ignored: the rule that
+     * unknown parameters are dropped would otherwise turn a registration code
+     * into an endpoint share with no credentials, which imports successfully and
+     * then never connects.
+     */
+    private fun parseEnrollment(
+        params: Map<String, String>,
+        version: Int?
+    ): Result<InviteEnrollment?> {
+        val token = params["enroll"] ?: return Result.success(null)
+        if (version != null && version < ENROLLMENT_VERSION) {
+            return Result.failure(
+                invalid("The invite carries an enrollment token but is version $version")
+            )
+        }
+        if (params["secret"] != null) {
+            return Result.failure(
+                invalid("The invite carries both an enrollment token and a 2FA secret")
+            )
+        }
+        val clientId = params["client"]?.trim().orEmpty()
+        if (clientId.isEmpty()) {
+            return Result.failure(
+                invalid("The invite carries an enrollment token but no client id")
+            )
+        }
+        if (token.trim().isEmpty()) {
+            return Result.failure(invalid("The enrollment token is empty"))
+        }
+        return Result.success(InviteEnrollment(clientId, token.trim()))
     }
 
     private fun invalid(message: String) = IllegalArgumentException(message)

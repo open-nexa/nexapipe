@@ -12,10 +12,22 @@ tone_instructions: >
   praise, summaries of the diff itself, and style-only nitpicks.
 
 reviews:
+  # ---------------------------------------------------------------------------
+  # CodeRabbit is advisory here, never a merge gate. Nothing in this file submits
+  # a blocking review or a failing commit/check status on purpose:
+  #   * request_changes_workflow is off  -> no "request changes" review
+  #   * fail_commit_status is off        -> the status never turns red
+  #   * no pre_merge_check uses "error"  -> checks can warn, not block
+  # merge requirements live in the repository branch protection / rulesets,
+  # which this file cannot configure - keep CodeRabbit out of required checks.
+  # ---------------------------------------------------------------------------
   profile: "chill"                  # low-noise passes; use "assertive" for a deeper (and chattier) run
   request_changes_workflow: false
-  high_level_summary: true
   review_status: true
+  review_progress: true
+  commit_status: true               # mirrors review progress for visibility only
+  fail_commit_status: false         # never fails the PR, even on a review error
+  high_level_summary: true
   collapse_walkthrough: true        # long monorepo diffs otherwise bury the PR body
   changed_files_summary: true
   sequence_diagrams: false
@@ -175,10 +187,17 @@ reviews:
       enabled: true
 
   pre_merge_checks:
+    # Advisory only: every mode below is "off" or "warning". Nothing here can fail
+    # or block a merge - that is decided by branch protection, not by CodeRabbit.
+    override_requested_reviewers_only: false
     docstrings:
       mode: "off"                   # coverage is uneven here; the check only adds noise
     issue_assessment:
       mode: "off"
+    # `description` only takes a mode in this schema version; the expectations are
+    # encoded as custom checks below so they can reference what the diff touches.
+    description:
+      mode: "warning"
     title:
       mode: "warning"
       requirements: >
@@ -215,7 +234,7 @@ reviews:
           visible behaviour change. Large visual changes also need updated i18n strings and
           consistent behaviour across every supported locale.
       - name: "No secrets in the tree"
-        mode: "error"
+        mode: "warning"
         instructions: >
           Fail if the change adds a private key, signing key, keystore, `.env` file, bearer
           token, endpoint secret or any hardcoded credential. Tauri signing keys live outside

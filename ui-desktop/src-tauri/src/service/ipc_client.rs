@@ -2,7 +2,9 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{codes, AppError};
-use crate::service::ipc::{IpcMessage, IpcResponse, StartProxyRequest, IPC_SOCKET_PATH};
+use crate::service::ipc::{
+    IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
+};
 use crate::status::{EndpointLink, ProxyStatus};
 
 pub struct IpcClient;
@@ -133,6 +135,18 @@ impl IpcClient {
     /// The failure the service's last start recorded after it had already answered `Ok`.
     ///
     /// `None` is a legitimate answer, not an error: it means the start settled.
+    /// The credential the server issued for an enrollment token, if one was spent.
+    ///
+    /// Read once and gone: the token cannot be spent twice, so the caller gets one chance
+    /// to persist it. `None` means nothing enrolled on this run.
+    pub async fn take_issued_credential() -> Result<Option<IssuedCredentialPayload>, AppError> {
+        match Self::send_message(IpcMessage::GetIssuedCredential).await? {
+            IpcResponse::IssuedCredential(credential) => Ok(credential),
+            IpcResponse::Error(e) => Err(e),
+            _ => Err(AppError::new(codes::SERVICE_UNAVAILABLE)),
+        }
+    }
+
     pub async fn get_startup_error() -> Result<Option<AppError>, AppError> {
         match Self::send_message(IpcMessage::GetStartupError).await? {
             IpcResponse::StartupError(e) => Ok(e),

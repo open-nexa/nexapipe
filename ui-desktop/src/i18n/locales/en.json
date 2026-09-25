@@ -227,10 +227,14 @@
     "twoFactor": "Two-factor authentication",
     "twoFactorClient": "Client {id}",
     "twoFactorHint": "Fills in the client ID and secret for this endpoint only",
+    "enrollment": "Registration",
+    "enrollmentClient": "Client {id}",
+    "enrollmentHint": "A one-time token: the server issues this endpoint's credentials when it first connects, and the token stops working",
     "alreadyPresent": "Already in the list — importing merges its domains into that node.",
     "add": "Add node",
     "added": "Added the node from the invite.",
-    "merged": "Merged the invite into the existing node."
+    "merged": "Merged the invite into the existing node.",
+    "enrolled": "Enrolled as {client} and saved the credentials it was issued."
   },
   "node": {
     "connectionHint": "Nodes come from invites, so the target cannot be changed here.",
@@ -240,7 +244,8 @@
     "twoFactorClientId": "Client ID",
     "twoFactorSecret": "TOTP secret",
     "twoFactorAlgorithm": "Algorithm",
-    "twoFactorHint": "Must match this server's [auth.clients] entry. Leave it off for a server that has no 2FA."
+    "twoFactorHint": "Must match this server's [auth.clients] entry. Leave it off for a server that has no 2FA.",
+    "enrollmentPending": "Waiting to enroll as {id}: the server issues this node's credentials on the next connect."
   },
   "error": {
     "unknown": "Something went wrong. Please try again.",

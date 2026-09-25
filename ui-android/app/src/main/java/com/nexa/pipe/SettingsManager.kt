@@ -31,6 +31,10 @@ class SettingsManager(context: Context) {
         const val KEY_RELAY_AUTH_TOKEN = "relay_auth_token"
         // Prefix of the per-endpoint secret entries in `secretPrefs`.
         const val SECRET_PREFIX = "two_factor_secret_"
+        // Prefix of the per-endpoint enrollment tokens. A token is a credential
+        // too — it is what a registration invite hands out — so it is kept out
+        // of the backed-up list alongside the secrets.
+        const val ENROLLMENT_PREFIX = "enrollment_token_"
         // Read once by `migrateLegacyTwoFactor` and then deleted: 2FA used to
         // be one app-wide setting, it now belongs to an endpoint.
         const val KEY_2FA_ENABLED = "two_factor_enabled"
@@ -132,9 +136,10 @@ class SettingsManager(context: Context) {
     )
 
     /**
-     * Persists the endpoints. The 2FA secret of each endpoint is written to
-     * [secretPrefs] and stripped from the list saved in [prefs], so the backed
-     * up copy carries the configuration but never a seed.
+     * Persists the endpoints. The 2FA secret — and any enrollment token — of
+     * each endpoint is written to [secretPrefs] and stripped from the list
+     * saved in [prefs], so the backed up copy carries the configuration but
+     * never a credential.
      */
     fun saveNodes(nodes: List<NodeConfig>) {
         val editor = secretPrefs.edit()
@@ -142,35 +147,55 @@ class SettingsManager(context: Context) {
         // would leave the seed behind, and the next endpoint to reuse that ID
         // would inherit it.
         for (key in secretPrefs.all.keys) {
-            if (!key.startsWith(SECRET_PREFIX)) continue
-            val nodeId = key.removePrefix(SECRET_PREFIX)
-            val otp = nodes.firstOrNull { it.nodeId == nodeId }?.twoFactor
-            if (otp == null || otp.secret.isBlank()) {
-                editor.remove(key)
+            if (key.startsWith(SECRET_PREFIX)) {
+                val nodeId = key.removePrefix(SECRET_PREFIX)
+                val otp = nodes.firstOrNull { it.nodeId == nodeId }?.twoFactor
+                if (otp == null || otp.secret.isBlank()) {
+                    editor.remove(key)
+                }
+            }
+            if (key.startsWith(ENROLLMENT_PREFIX)) {
+                val nodeId = key.removePrefix(ENROLLMENT_PREFIX)
+                val enrollment = nodes.firstOrNull { it.nodeId == nodeId }?.enrollment
+                if (enrollment == null || enrollment.token.isBlank()) {
+                    editor.remove(key)
+                }
             }
         }
 
         val persisted = nodes.map { node ->
-            val otp = node.twoFactor
+            val stripped = node.enrollment?.let { enrollment ->
+                if (enrollment.token.isBlank()) {
+                    null
+                } else {
+                    editor.putString(ENROLLMENT_PREFIX + node.nodeId, enrollment.token)
+                    node.copy(enrollment = enrollment.copy(token = ""))
+                }
+            } ?: node
+            val otp = stripped.twoFactor
             if (otp == null || otp.secret.isBlank()) {
-                node
+                stripped
             } else {
                 editor.putString(SECRET_PREFIX + node.nodeId, otp.secret)
-                node.copy(twoFactor = otp.copy(secret = ""))
+                stripped.copy(twoFactor = otp.copy(secret = ""))
             }
         }
         editor.apply()
         prefs.edit().putString(KEY_NODES, json.encodeToString(persisted)).apply()
     }
 
-    /** Loads the endpoints, re-attaching each 2FA secret from [secretPrefs]. */
+    /** Loads the endpoints, re-attaching each secret and token from [secretPrefs]. */
     fun loadNodes(): List<NodeConfig> {
         val stored = decodeNodes()
         if (stored.isEmpty()) return stored
         return stored.map { node ->
-            val otp = node.twoFactor ?: return@map node
+            val withToken = node.enrollment?.let { enrollment ->
+                val token = secretPrefs.getString(ENROLLMENT_PREFIX + node.nodeId, "") ?: ""
+                node.copy(enrollment = enrollment.copy(token = token))
+            } ?: node
+            val otp = withToken.twoFactor ?: return@map withToken
             val secret = secretPrefs.getString(SECRET_PREFIX + node.nodeId, "") ?: ""
-            node.copy(twoFactor = otp.copy(secret = secret))
+            withToken.copy(twoFactor = otp.copy(secret = secret))
         }
     }
 

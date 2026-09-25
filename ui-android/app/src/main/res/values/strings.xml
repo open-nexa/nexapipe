@@ -75,6 +75,7 @@
     <string name="invite_summary_domains">Domains: %1$s</string>
     <string name="invite_summary_2fa_none">2FA: none</string>
     <string name="invite_summary_2fa">2FA: %1$s (%2$s)</string>
+    <string name="invite_summary_enrollment">Enrollment: %1$s (a one-time token; the credentials arrive on the first connect)</string>
     <string name="invite_summary_relay">Relay: %1$s</string>
     <string name="invite_value_none">none</string>
     <string name="invite_ticket_unsupported">This invite carries an endpoint ticket, which cannot be stored here. Ask for a Node ID invite.</string>
@@ -125,6 +126,7 @@
     <string name="two_factor_on">On</string>
     <string name="two_factor_off">Off</string>
     <string name="two_factor_off_body">Connections to this endpoint are not authenticated. A server that requires 2FA will refuse the tunnel.</string>
+    <string name="two_factor_enrollment_pending">Waiting to enroll as %1$s: the server issues this endpoint's credentials on the next connect.</string>
     <string name="two_factor_client_id">Client ID</string>
     <string name="two_factor_client_id_placeholder">client-001</string>
     <string name="two_factor_secret">TOTP Secret</string>

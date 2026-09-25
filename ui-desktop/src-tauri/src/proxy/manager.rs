@@ -4,7 +4,7 @@ use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
+use nexapipe_client::auth::{Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth};
 use nexapipe_client::connection_pool::parse_endpoint_addr;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig};
 use nexapipe_client::lb::LoadBalancingStrategy;
@@ -107,6 +107,14 @@ pub struct ProxyNodeConfig {
     /// given the first one's secret. `None` performs no handshake at all, which is also what
     /// lets one client mix servers that require 2FA with ones that do not.
     pub two_factor: Option<NodeTwoFactor>,
+    /// A one-time enrollment token this node was invited with, instead of a secret.
+    ///
+    /// It is spent on the first connection, which answers with the real credential and
+    /// rotates the server-side secret; see [`NodeEnrollment`]. Only nodes carrying a token
+    /// enroll — a node that already has a secret authenticates with it and never enrolls,
+    /// so re-importing the same invite after the credential landed is a no-op.
+    #[allow(dead_code)]
+    pub enrollment: Option<NodeEnrollment>,
 }
 
 /// The 2FA credentials one node is configured with.
@@ -116,6 +124,20 @@ pub struct NodeTwoFactor {
     pub secret: String,
     /// Lowercase algorithm name, as `TotpAlgorithm::from_name` expects it.
     pub algorithm: String,
+}
+
+/// A one-time enrollment token, which is what a `--registration` invite carries.
+///
+/// A token is a credential in transit but not one at rest: the server replaces the
+/// client's secret when it is spent and forgets the token in the same write, so a link
+/// copied on its way to this machine stops being usable the moment it is used. What comes
+/// back has to be persisted by whoever holds the configuration — see
+/// [`ProxyManager::take_issued_credential`] — because a token cannot be spent twice and an
+/// app that restarts holding only the invite has nothing left to authenticate with.
+#[derive(Debug, Clone)]
+pub struct NodeEnrollment {
+    pub client_id: String,
+    pub token: String,
 }
 
 /// The address a configured node resolves to.
@@ -333,11 +355,11 @@ impl ProxyManager {
         // been resolved to the backend ID its pool is keyed by. A node with no credentials keeps
         // none, so it opens no auth stream.
         for node in &self.config.nodes {
-            let two_factor = match &node.two_factor {
-                Some(two_factor) => two_factor,
-                None => continue,
-            };
-            if two_factor.secret.trim().is_empty() {
+            let has_secret = node
+                .two_factor
+                .as_ref()
+                .is_some_and(|tf| !tf.secret.trim().is_empty());
+            if !has_secret && node.enrollment.is_none() {
                 continue;
             }
 
@@ -349,6 +371,42 @@ impl ProxyManager {
                     );
                     continue;
                 }
+            };
+
+            // A node holding a secret authenticates with it and never enrolls: enrolling
+            // rotates the server-side secret, so doing it on every start would invalidate
+            // every other device that already scanned the same invite.
+            if let Some(enrollment) = node
+                .enrollment
+                .as_ref()
+                .filter(|_| !has_secret)
+            {
+                // The server looks an enrollment up by client_id too, so a token with no
+                // id can never match any pending entry there.
+                if enrollment.client_id.trim().is_empty() {
+                    tracing::warn!(
+                        "Enrollment for {} has a token but an empty client_id — the server will refuse it",
+                        addr.id
+                    );
+                }
+                // No algorithm to agree on: the server sends the parameters it generated
+                // the secret with in ENROLL_ISSUE, and the exchange builds its TOTP from
+                // those rather than from anything configured here.
+                let enrollment = Enrollment::new(&enrollment.client_id, &enrollment.token);
+                endpoint_group
+                    .set_enrollment_for(&addr.id.to_string(), Some(enrollment))
+                    .await;
+                tracing::info!(
+                    "Enrolling {} with a one-time token as client '{}'",
+                    addr.id,
+                    node.enrollment.as_ref().unwrap().client_id
+                );
+                continue;
+            }
+
+            let two_factor = match &node.two_factor {
+                Some(two_factor) => two_factor,
+                None => continue,
             };
 
             // The server looks a handshake up by client_id (`clients.get(client_id)`),
@@ -533,6 +591,21 @@ impl ProxyManager {
         // The local proxy is now running in a background task, so start() returns immediately;
         // shutdown is handled by ProxyManager::stop(). Do not tear down the instance here.
         Ok(())
+    }
+
+    /// The credential the server issued for an enrollment token, if one was spent since
+    /// the proxy was started.
+    ///
+    /// Read once, right after a start: the token cannot be spent twice, so this is the only
+    /// chance to persist what it bought. `None` means nothing enrolled — either no node
+    /// carried a token, or the credential has already been taken.
+    pub async fn take_issued_credential(&self) -> Option<IssuedCredential> {
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone())?;
+        group.take_issued_credential().await
     }
 
     /// Our own endpoint id, or `None` when nothing is running.

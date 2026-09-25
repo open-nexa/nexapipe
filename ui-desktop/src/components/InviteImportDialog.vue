@@ -264,6 +264,13 @@ function confirmImport(): void {
                 <span class="hint">{{ t('invite.twoFactorHint') }}</span>
               </dd>
             </div>
+            <div v-if="invite.enrollment" class="row">
+              <dt>{{ t('invite.enrollment') }}</dt>
+              <dd>
+                <span>{{ t('invite.enrollmentClient', { id: invite.enrollment.clientId }) }}</span>
+                <span class="hint">{{ t('invite.enrollmentHint') }}</span>
+              </dd>
+            </div>
           </dl>
         </div>
 

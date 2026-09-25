@@ -94,11 +94,49 @@ object IrohProxy {
     ): Int
 
     /**
-     * Drops every credential set with [nativeSetTwoFactorForNode].
+     * Registers a one-time enrollment token for one endpoint, in place of
+     * credentials.
+     *
+     * nodeId:   endpoint ID the token belongs to.
+     * clientId: which `[auth.clients]` entry the token is pending for.
+     * token:    the token a `v=2` invite carried.
+     *
+     * The first connection to that endpoint spends it and the server answers
+     * with the real secret — which [nativeTakeIssuedCredential] then hands
+     * over to be persisted, because a token cannot be spent twice. An endpoint
+     * that already has credentials keeps them and never enrolls: enrolling
+     * rotates the secret, so every other device enrolled from the same code
+     * would be locked out by it.
+     *
+     * Must be called before nativeStartProxy / nativeStartProxyLegacy.
+     */
+    external fun nativeSetEnrollmentForNode(
+        nodeId: String,
+        clientId: String,
+        token: String
+    ): Int
+
+    /**
+     * The credential the server issued for an enrollment token, cleared on
+     * read.
+     *
+     * `clientId`, `secret` and `algorithm` on three lines, or null when this
+     * run enrolled nothing. Only the first call after a successful connect ever
+     * returns anything, and what it returns is the sole copy: without it the
+     * device is left holding an invite the server has already forgotten.
+     */
+    external fun nativeTakeIssuedCredential(): String?
+
+    /**
+     * Drops every credential set with [nativeSetTwoFactorForNode], and every
+     * token set with [nativeSetEnrollmentForNode].
+     *
+     * Both tables answer the same question — how this endpoint authenticates —
+     * so one call clears both; a stale entry in either would otherwise keep
+     * applying to an endpoint that no longer has one.
      *
      * Read the configuration back through this pair on every connect: the
-     * native table outlives a single session, so stale entries would otherwise
-     * keep authenticating endpoints that no longer have 2FA.
+     * native tables outlive a single session.
      */
     external fun nativeClearNodeTwoFactor(): Int
 

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::AppError,
-    proxy::NodeTwoFactor,
+    proxy::{NodeEnrollment, NodeTwoFactor},
     status::{EndpointLink, ProxyStatus},
 };
 
@@ -22,6 +22,13 @@ pub struct NodeInput {
     pub two_factor_secret: Option<String>,
     #[serde(default)]
     pub two_factor_algorithm: Option<String>,
+    /// A one-time enrollment token instead of a secret: the service spends it on the first
+    /// connection and answers with the credential the server issued. Optional for the same
+    /// reason the 2FA fields are — an older UI has nothing to say about enrollment.
+    #[serde(default)]
+    pub enrollment_client_id: Option<String>,
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
 }
 
 impl NodeInput {
@@ -31,6 +38,21 @@ impl NodeInput {
     /// shared pair is what made a second server either refuse the handshake or be given the first
     /// one's secret. A node with no secret performs no handshake, which is also how one client
     /// mixes servers that require 2FA with ones that do not.
+    /// The enrollment token this node carries, if any.
+    ///
+    /// A token with no client id is useless: the server looks the pending enrollment up by
+    /// that id, so it would be refused — but it is still handed over, because the refusal
+    /// then names the real cause instead of looking like a network failure.
+    pub fn enrollment(&self) -> Option<NodeEnrollment> {
+        let token = self.enrollment_token.as_deref().unwrap_or_default().trim();
+        if token.is_empty() {
+            return None;
+        }
+        Some(NodeEnrollment {
+            client_id: self.enrollment_client_id.clone().unwrap_or_default(),
+            token: token.to_string(),
+        })
+    }
     pub fn two_factor(&self) -> Option<NodeTwoFactor> {
         let secret = self.two_factor_secret.as_deref().unwrap_or_default().trim();
         if secret.is_empty() {
@@ -76,6 +98,20 @@ pub struct StartProxyRequest {
 /// are a few kilobytes; this leaves an order of magnitude of headroom.
 pub const MAX_IPC_LINE: usize = 64 * 1024;
 
+/// The credential a server issued for an enrollment token, as it crosses a boundary.
+///
+/// Separate from `nexapipe_client::auth::IssuedCredential` because that one is not
+/// serializable, and because the IPC channel — like the Tauri command surface, which
+/// reuses this type — speaks camelCase to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedCredentialPayload {
+    pub client_id: String,
+    pub secret: String,
+    /// Lowercase algorithm name, which is what `twoFactorAlgorithm` holds.
+    pub algorithm: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcMessage {
     /// First message on every connection: hands over the token written by the
@@ -93,6 +129,11 @@ pub enum IpcMessage {
     GetNodeId,
     /// How each configured node currently reaches its backend (direct / relay).
     GetEndpointLinks,
+    /// The credential the server issued for an enrollment token, if one was spent.
+    ///
+    /// Read once and gone: a token can only be spent once, so this is the service's only
+    /// chance to hand what it bought to the caller that owns the configuration.
+    GetIssuedCredential,
     /// The failure the last [`IpcMessage::StartProxy`] recorded after it had already answered
     /// `Ok`, if any.
     ///
@@ -120,6 +161,8 @@ pub enum IpcResponse {
     EndpointLinks(Vec<EndpointLink>),
     /// `None` means the last start settled without a failure.
     StartupError(Option<AppError>),
+    /// `None` means nothing has enrolled, or the credential was already taken.
+    IssuedCredential(Option<IssuedCredentialPayload>),
 }
 
 #[cfg(test)]
@@ -135,6 +178,8 @@ mod tests {
             two_factor_client_id: None,
             two_factor_secret: None,
             two_factor_algorithm: None,
+            enrollment_client_id: None,
+            enrollment_token: None,
         }
     }
 

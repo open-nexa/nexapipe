@@ -227,10 +227,14 @@
     "twoFactor": "两步验证",
     "twoFactorClient": "客户端 {id}",
     "twoFactorHint": "仅填写该节点的客户端 ID 与密钥",
+    "enrollment": "注册",
+    "enrollmentClient": "客户端 {id}",
+    "enrollmentHint": "一次性令牌：首次连接时由服务端下发该节点的凭证，之后令牌即失效",
     "alreadyPresent": "该节点已在列表中，导入会把域名合并进去。",
     "add": "添加节点",
     "added": "已从邀请添加节点。",
-    "merged": "已把邀请合并到现有节点。"
+    "merged": "已把邀请合并到现有节点。",
+    "enrolled": "已作为 {client} 完成注册，并保存下发的凭证。"
   },
   "node": {
     "connectionHint": "节点来自邀请，因此无法在这里修改连接目标。",
@@ -240,7 +244,8 @@
     "twoFactorClientId": "客户端 ID",
     "twoFactorSecret": "TOTP 密钥",
     "twoFactorAlgorithm": "算法",
-    "twoFactorHint": "需与该服务端 [auth.clients] 中的条目一致；服务端未开启 2FA 时保持关闭即可。"
+    "twoFactorHint": "需与该服务端 [auth.clients] 中的条目一致；服务端未开启 2FA 时保持关闭即可。",
+    "enrollmentPending": "等待以 {id} 完成注册：下次连接时服务端会下发该节点的凭证。"
   },
   "error": {
     "unknown": "出错了，请重试。",

@@ -10,7 +10,7 @@
  * carries before the user accepts it.
  */
 import { invoke } from '@tauri-apps/api/core';
-import type { InvitePayload } from '../types';
+import type { InvitePayload, IssuedCredential } from '../types';
 
 /** Whether a pasted string looks like an invite rather than a bare ticket or Node ID. */
 export function isInviteLink(value: string): boolean {
@@ -25,4 +25,15 @@ export function isInviteLink(value: string): boolean {
  */
 export async function parseInvite(uri: string): Promise<InvitePayload> {
   return await invoke<InvitePayload>('parse_invite', { uri });
+}
+
+/**
+ * Reads back the credential a server issued for a one-time enrollment token, and clears it.
+ *
+ * `null` when this run enrolled nothing. A token is spent by the first connection that presents
+ * it, so this is a read-once: the caller that owns the configuration has to persist the answer,
+ * because a second call — or a second launch — gets nothing.
+ */
+export async function takeIssuedCredential(useService: boolean): Promise<IssuedCredential | null> {
+  return await invoke<IssuedCredential | null>('take_issued_credential', { useService });
 }
