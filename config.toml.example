@@ -1,0 +1,209 @@
+# Nexapipe 配置示例
+#
+# 用法：
+#   cp config.toml.example config.toml     # config.toml 已被 .gitignore 忽略，是运行时的活配置
+#   cargo run -p nexapipe -- --config config.toml
+#
+# 本文件是"通用"示例，不含 2FA；需要 TOTP 双因素认证的请看 config.toml.2fa.example。
+#
+# 热重载：文件每 5 秒重新读取一次。`default_backend` 和 `[[routes]]` 改完即时生效，
+# 解析或校验失败会报错并保留当前配置（半截的编辑不会把代理搞挂）。
+# 其余字段只在启动时读一次，改动需要重启：[server]、[iroh]、[auth]、[log]。
+#
+# 所有字段都是可选的，下面写的是"用得上时的样子"，不是最小配置。
+
+# ============================================================
+# 顶层
+# ============================================================
+
+# HTTP 请求的 Host 没匹配到任何 mode = "http" 路由时的兜底后端。
+# 可选：不写的话，未匹配的域名直接返回 404，而不是被悄悄转发到某个服务上。
+# passthrough / tcp / udp 三种查找从不看它，它们匹配不到就直接拒绝。
+default_backend = "http://127.0.0.1:18080"
+
+# 调试日志开关。
+debug = false
+
+# ============================================================
+# [server] —— 明文直连入口（默认不监听）
+# ============================================================
+
+[server]
+# 不写 = 完全不绑定这个监听器，这也是默认值。
+#
+# 这个监听器上的任何连接都不做认证：2FA 握手跑在 iroh 的 accept 循环里，
+# 从这里进来的请求不经过它就直接打到路由上。只给同主机的进程用（sidecar、
+# 共享网络命名空间的容器），并保持 127.0.0.1。
+# listen_addr = "127.0.0.1:8080"
+
+# 允许 listen_addr 填非回环地址（如 0.0.0.0:8080）。
+# 打开等于把每个 http 路由和每个 passthrough 后端暴露给所有能连到该端口的人，
+# 中间没有任何认证环节。只有在下游另有一层把关（反向代理、防火墙、私有网络）
+# 时才打开。与 [auth] enabled = true 同时存在会在启动时被拒绝。
+expose = false
+
+# 已移除、仅为了兼容旧配置仍可解析的键：tls_enabled / tls_listen_addr /
+# cert_path / key_path。TLS 现在由后端（Caddy 等）终结，本进程不持有证书。
+
+# ============================================================
+# [iroh] —— QUIC 隧道端点
+# ============================================================
+
+[iroh]
+# 固定端点身份：填了它，重启后 Node ID 不变。用 `nexapipe --generate-secret` 生成。
+# 客户端填 server_node_id 时尤其需要它，否则服务端一重启客户端就找不到人。
+# secret_key = "你的十六进制密钥"
+
+# 固定 UDP 端口，不填则用临时端口。
+bind_port = 0
+
+# 中继模式：pinned / default / disabled / custom，不填为 default。
+#   default  —— 全部 N0 中继，按延迟选 home 中继；可能在中继之间迁移，会断连接
+#   pinned   —— 固定一个 N0 中继（新加坡）。中继迁移比慢一点更难受时用这个
+#   disabled —— 完全不用中继。注意：这样也无法通过对方的中继去连对方
+#   custom   —— 只用自己的中继，完全不走 N0
+relay_mode = "default"
+
+# 仅当 relay_mode = "custom" 时生效；写了 relay_url 而没写 relay_mode 即视为 custom。
+# 指向 *.relay.n0.iroh.link 会被拒绝（那种用 pinned / default）。
+# relay_url = "https://relay.example.com"
+
+# 自建中继需要 bearer token 时填；只有 custom 模式有意义，且两端都要配。
+# relay_auth_token = ""
+
+# ============================================================
+# [log] —— 日志与轮转
+# ============================================================
+
+[log]
+# 写日志文件。默认 true。
+file = true
+# 日志目录，默认 ./logs；也可用环境变量 NEXAPIPE_LOG_DIR 覆盖。
+dir = "./logs"
+# 当前日志文件名，默认 nexapipe.log；轮转副本写成 nexapipe.<时间戳>.log。
+file_name = "nexapipe.log"
+# 每个代理请求打一行访问日志。默认 true。
+access_log = true
+access_log_file_name = "access.log"
+# 轮转周期：daily（默认）/ hourly / never
+rotation = "daily"
+# 超过该体积（MiB）也轮转一次，0 = 关闭。默认 0。
+max_size_mb = 0
+# 每个日志文件保留的轮转份数，0 = 全留。默认 14。
+max_files = 14
+# 同时输出到 stdout。默认 true。
+console = true
+# 访问日志里把查询参数的值替换成 <redacted>，只留参数名。默认 true。
+#   /api/items?token=hunter2&page=2 -> /api/items?token=<redacted>&page=<redacted>
+# token、签名、一次性验证码都走查询值，而日志是要轮转、归档、转手的，所以值丢掉、
+# 名字留下。设为 false 则原样记录（只在没人能读到的日志文件上这么做）。
+redact_query = true
+
+# ============================================================
+# [[routes]] —— 路由
+# ============================================================
+
+# 1) 普通 HTTP：解析请求、套用 path_pattern / path_rewrite，再用共享客户端重发。
+#    后端必须是 http:// —— https:// 后端会在启动时被拒（TLS 由后端终结，
+#    本进程对后端只说明文）。
+[[routes]]
+host_pattern = "app.example.com"
+path_pattern = "/"
+path_is_prefix = true
+strategy = "round_robin"          # 或 "random"
+backends = ["http://127.0.0.1:18080", "http://127.0.0.2:18080"]
+mode = "http"                     # 默认值，可省略
+# path_rewrite = "/api"           # 转发前改写路径前缀
+
+# 2) passthrough：按 SNI 选路由，原样搬运字节，TLS 由后端终结。
+#    后端可以写成裸 host:port，path_pattern / path_rewrite 对它无意义。
+[[routes]]
+host_pattern = "web.example.com"
+mode = "passthrough"
+backends = ["127.0.0.1:443"]
+
+# 3) tcp：把原始 TCP 流送到后端，按 L4 preface 里的主机名选路由。
+#    client_ports 只是选择器（决定这条路由是否匹配），从不决定连接去哪；
+#    不写则所有端口都匹配。后端必须显式写出端口。
+[[routes]]
+host_pattern = "db.example.com"
+mode = "tcp"
+backends = ["127.0.0.1:5432"]
+client_ports = [5432, 6432]
+
+# 4) udp：UDP 流，一条 QUIC 双向流承载一个 flow。
+#    idle_timeout_secs = 静默多少秒后关闭 flow，不填用服务端默认值。
+[[routes]]
+host_pattern = "turn.example.com"
+mode = "udp"
+backends = ["127.0.0.1:3478"]
+idle_timeout_secs = 60
+
+# 5) 一个域名同时要响应请求和承载隧道（Android TUN 客户端的常见形态）：
+#    用 modes 写多个，共用一份 backends。mode 与 modes 可以一起写，取并集，重复去重。
+#    代价是地址必须满足所有模式，而 L4 的规则更严：端口必须写出来。
+#    想给不同模式配不同后端，就写两条 [[routes]]（一条路由只有一个后端池）。
+[[routes]]
+host_pattern = "vpn.example.com"
+modes = ["passthrough", "tcp"]
+backends = ["127.0.0.1:443"]
+
+# ============================================================
+# [local_proxy] —— 客户端模式（服务端不需要时可整段删除）
+# ============================================================
+
+[local_proxy]
+enabled = false
+listen_addr = "127.0.0.1:8081"
+# 走隧道的域名；--generate-invite 不带 --invite-domains 时也从这里取域名。
+proxy_domains = ["app.example.com", "web.example.com"]
+strategy = "round_robin"
+
+# 推荐写法：多个服务端节点。同一个域名可以出现在多个节点上，这就是跨服务端负载均衡。
+# 把 Node ID 换成服务端 `nexapipe --generate-secret` 后打印的那个（64 位十六进制）。
+[[local_proxy.nodes]]
+server_node_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+domains = ["app.example.com"]
+
+# 完整 ticket（含 Node ID + 地址）也可以：地址一变 ticket 就变，但连接信息完整。
+# [[local_proxy.nodes]]
+# server_ticket = "nodeabc...#地址"
+# domains = ["web.example.com"]
+
+# 已废弃的单节点写法，仍在用：server_ticket / server_node_id。优先用 [[local_proxy.nodes]]。
+# server_node_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# server_ticket  = "完整 ticket"
+
+# 客户端 2FA 凭据：必须与服务端 [auth.clients] 里的某个 client 一致，否则连接全被拒。
+# 完整示例见 config.toml.2fa.example。
+# [local_proxy.two_factor]
+# enabled = true
+# client_id = "client-001"
+# secret = "JBSWY3DPEHPK3PXP"
+# algorithm = "sha1"
+
+# ============================================================
+# [auth] —— 服务端 2FA（默认关闭）
+# ============================================================
+# 打开后每个客户端连接都要先完成 TOTP 握手才允许代理。
+# 这里的 secret 是把守 iroh 监听器的唯一凭据，所以文件必须私有：
+# enabled = true 时，config.toml 若能被其他账号读写，服务端拒绝启动（chmod 600）。
+#
+# 生成密钥与二维码：
+#   nexapipe --generate-2fa client-001 --config config.toml
+#   nexapipe --generate-invite client-001 --config config.toml   # 端点 + 域名 + 2FA 一次扫码
+#
+# [auth]
+# enabled = true
+# issuer = "NexaPipe"
+# algorithm = "sha1"      # sha1 / sha256 / sha512
+# time_step = 30
+# digits = 6
+# window = 1
+# max_attempts = 5
+# lockout_duration = 300
+#
+# [auth.clients.client-001]
+# secret = "JBSWY3DPEHPK3PXP"
+# created_at = "1723756800"
+# allow_hosts = ["app.example.com", "*.db.example.com"]   # 不填 = 可访问所有路由

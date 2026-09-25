@@ -1,7 +1,13 @@
 # Nexapipe 2FA Configuration Example
 #
-# This file shows how to enable 2FA authentication for Nexapipe.
-# Copy the relevant sections into your config.toml.
+# Start from this file and edit your own copy:
+#
+#   cp config.toml.2fa.example config.toml    # config.toml is gitignored
+#
+# Every command in the comments below takes `--config config.toml` rather than
+# `--config config.toml.2fa.example` on purpose: `--generate-2fa` and
+# `--generate-invite --registration` **write back into the file they are pointed
+# at**, so aiming them at this example would rotate the secrets in git.
 #
 # The secrets below are the only credential gating the iroh listener, so keep
 # the file private: with `enabled = true` the server refuses to start when
@@ -9,22 +15,48 @@
 
 # ===== Server Configuration =====
 default_backend = "http://localhost:3000"
+# Optional: without it a host that matches no route is answered 404 instead of
+# being forwarded somewhere arbitrary. `passthrough` and `tcp`/`udp` routes
+# never consult it.
 debug = true
 
 [server]
 # Left unset, i.e. the plaintext listener stays closed. It is the one entry
 # point 2FA does not cover — the handshake runs on the iroh listener — so with
-# 2FA enabled there is no reason to have anything else open.
+# 2FA enabled there is no reason to have anything else open. Enable it only for
+# a client on this host (a sidecar, another container sharing the network
+# namespace); anything beyond that needs a reverse proxy or a firewall in front.
 # listen_addr = "127.0.0.1:8080"
-# TLS is terminated by the backend (Caddy), not here. See README.md, "TLS".
+# Required whenever listen_addr is not loopback: without it the server refuses
+# to start, because a non-loopback bind publishes every http route and every
+# passthrough backend to whoever can reach the port.
+# expose = false
+# TLS is terminated by the backend (Caddy &co), not here. See README.md, "TLS".
+# `tls_enabled` / `tls_listen_addr` / `cert_path` / `key_path` still parse, are
+# logged as ignored, and can be deleted.
 
 [iroh]
+# Stable endpoint identity — the same Node ID across restarts, which is what
+# makes a printed invite QR code stay valid. Generate one with:
+#
+#   nexapipe --generate-secret
+#
+# `--generate-invite` reads this too, and refuses without either it or
+# `--endpoint-id`, so set it before printing an invite (or pass --endpoint-id).
 # secret_key = "your-hex-encoded-secret-key"
 bind_port = 0
+# Which relay to use. One of: default (all N0 relays; the default when unset),
+# pinned (the single built-in relay this project pins), custom (relay_url below),
+# disabled (no relay transport at all — a peer's relay becomes unusable too).
+# relay_mode = "default"
+# Only read with relay_mode = "custom", and then required.
+# relay_url = "https://relay.example.com"
+# Bearer token for that relay; it has to be configured on both sides.
+# relay_auth_token = ""
 
 # ===== 2FA Authentication Configuration (server side) =====
-# When enabled, every client connection must complete a TOTP handshake
-# before proxying is allowed.
+# When enabled, every client connection must complete a TOTP handshake before
+# proxying is allowed. Read once at startup — restart after changing any of it.
 [auth]
 enabled = true
 algorithm = "sha1"      # sha1, sha256, sha512
@@ -42,29 +74,51 @@ issuer = "NexaPipe"
 
 # Client configurations.
 #
-# Generate a secret and its enrollment QR code with:
+# Generate a secret and its enrollment QR code; the secret is written into this
+# file as `[auth.clients.client-001] secret`, keeping comments and formatting:
 #
-#   nexapipe --generate-2fa client-001
+#   nexapipe --generate-2fa client-001 --config config.toml
 #   nexapipe --generate-2fa client-001 --qr-format svg --qr-out client-001.svg
-#   nexapipe --generate-2fa client-001 --config config.toml.2fa.example
+#                                       # --qr-out writes the file 0600 on Unix
+#   nexapipe --generate-2fa client-001 --force --config config.toml
+#                                       # rotate: every enrolled device rescans
+#
+# A client that already has a secret prints that one instead of a new one, so a
+# second run cannot hand out credentials the server rejects — that is what
+# `--force` is for.
 #
 # Scanning is standard otpauth://, so any authenticator app works, not just the
 # NexaPipe app. A client already configured here can be shown again with:
 #
-#   nexapipe --show-2fa client-001 --config config.toml.2fa.example
+#   nexapipe --show-2fa client-001 --config config.toml
 #
 # That only carries the 2FA half. To hand a client everything at once — the
-# endpoint, the domains and the 2FA credentials in a single scan — print an
-# endpoint invite instead:
+# endpoint, the domains and its credentials in a single scan — print an endpoint
+# invite instead:
 #
-#   nexapipe --generate-invite client-001 --config config.toml.2fa.example
+#   nexapipe --generate-invite client-001 --config config.toml
 #   nexapipe --generate-invite client-001 --invite-name Home --qr-out invite.svg
 #
-# The identity comes from [iroh] secret_key below (so the code stays valid
-# across restarts) unless --endpoint-id is passed, and the domains come from
-# [local_proxy] proxy_domains unless --invite-domains is passed. Dropping the
-# client id prints the same invite without the 2FA block. The code carries the
-# TOTP secret in the clear, so treat it like a password.
+# The identity comes from [iroh] secret_key above unless --endpoint-id is
+# passed; the domains come from [local_proxy] proxy_domains unless
+# --invite-domains is passed; the relay comes from [iroh] relay_url when that
+# one is `custom`. Dropping the client id prints the same invite without the 2FA
+# block, for people who already have their own credentials.
+#
+# That code carries the TOTP secret in the clear — it is a password that happens
+# to be shaped like an address. Prefer the enrollment form below, which is not:
+#
+#   nexapipe --generate-invite client-001 --registration --config config.toml
+#
+# It writes a one-time enrollment token into this file as
+# `[auth.clients.client-001] pending_enrollment` and puts the token in the link
+# instead of the secret. The first device to connect trades it for a freshly
+# generated secret, and the server burns the token and stores that secret in the
+# same write, so a copy of the link stops being a credential the moment it is
+# used. Two consequences: enrollment rotates this client's secret, so devices
+# already using it have to scan again; and generating another `--registration`
+# invite replaces the outstanding token, which is how a link that never arrived
+# gets revoked. Never write the key by hand — let the command own it.
 #
 # Warning: changing algorithm, time_step or digits here does NOT change what the
 # app does once it has scanned the code. Those values are only read when the
@@ -72,6 +126,10 @@ issuer = "NexaPipe"
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"
+# Written by `--generate-invite --registration`, cleared again when it is spent.
+# Not touched when a lockout is saved: it belongs to the operator, not the
+# runtime, so leave it alone.
+# pending_enrollment = ""
 # Optional per-client host authorization. Patterns use the same spelling as a
 # route's host_pattern — an exact name or a "*.suffix" wildcard,
 # case-insensitively. Left unset, the client may reach every route (the
@@ -80,29 +138,62 @@ created_at = "1723756800"
 # refusals look exactly like "no route" (404 / NoRoute / hang-up), so the
 # restriction cannot be used to probe which hosts exist.
 # allow_hosts = ["api.example.com", "*.db.example.com"]
+# `failed_attempts`, `locked_until` and `last_used` may turn up here too: the
+# server writes them back so a lockout survives a restart. Nothing to configure.
 
 [auth.clients.client-002]
 secret = "KBSWY3DPEHPK3PXQ"
 created_at = "1723756800"
 
 # ===== Routes =====
+# Which mode applies is decided before any matching happens, by the first byte
+# of the stream, so the modes never see each other's traffic:
+#   http (default)   re-issues a parsed request to an http:// backend
+#   passthrough      copies raw bytes; TLS stays with the backend (Caddy)
+#   tcp / udp        L4 tunnel, one QUIC bi-stream per flow
 [[routes]]
 host_pattern = "*"
-path_pattern = "/"
+path_pattern = "/"          # ignored by passthrough and L4 routes
 backends = ["http://localhost:3000"]
 strategy = "round_robin"
+# mode = "tcp"             # backends then have to be host:port, e.g. "10.0.0.5:5432"
+# modes = ["http", "tcp"]  # one backend pool serving several modes
+# client_ports = [5432]    # tcp/udp only: which client ports this route matches
+# idle_timeout_secs = 60   # udp only: seconds of silence before a flow is closed
 
 # ===== Client Local Proxy Configuration (client side) =====
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8080"
-server_node_id = "your-server-node-id"
 proxy_domains = ["example.com", "api.example.com"]
 
-# Client 2FA credentials: must match a client configured in [auth.clients]
-# on the server, otherwise every connection will be rejected.
+# One entry per endpoint this client proxies to; `domains` steers those hosts
+# here. Use `server_ticket` instead when the endpoint's addresses move.
+[[local_proxy.nodes]]
+server_node_id = "your-server-node-id"
+domains = ["example.com", "api.example.com"]
+
+# The single-endpoint spelling still parses but is deprecated: adding a second
+# server means rewriting it, where `nodes` only takes another entry.
+# server_node_id = "your-server-node-id"
+
+# Client 2FA credentials: must match a client configured in [auth.clients] on
+# the server, otherwise every connection will be rejected — the QUIC handshake
+# succeeds and the server closes the stream once the handshake deadline passes.
+# Scanning an invite QR code fills in exactly these fields.
 [local_proxy.two_factor]
 enabled = true
 client_id = "client-001"
 secret = "JBSWY3DPEHPK3PXP"
 algorithm = "sha1"
+
+# Rotating log files next to the console output. Every key is optional and
+# defaults to the value shown; see README.md, "Logging".
+# [log]
+# file = true
+# dir = "./logs"                  # NEXAPIPE_LOG_DIR overrides it
+# rotation = "daily"              # daily | hourly | never
+# max_size_mb = 0                 # also rotate past this size (MiB), 0 = off
+# max_files = 14                  # rotated copies kept per file, 0 = keep all
+# access_log = true
+# redact_query = true             # ?token=<redacted> in the access log

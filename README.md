@@ -174,7 +174,8 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
-| `config.toml.2fa.example` | Example server + local-proxy configuration (2FA enabled). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
+| `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
+| `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
