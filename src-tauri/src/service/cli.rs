@@ -47,7 +47,17 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             true
         }
         "--daemon" => {
-            run_daemon();
+            if let Err(error) = run_daemon() {
+                eprintln!("Service failed: {error:#}");
+                std::process::exit(1);
+            }
+            true
+        }
+        "--foreground" => {
+            if let Err(error) = run_foreground() {
+                eprintln!("Service failed: {error:#}");
+                std::process::exit(1);
+            }
             true
         }
         "--service" => run_native_service(),
@@ -55,30 +65,41 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
     }
 }
 
-/// Runs the IPC server that the UI talks to.
-pub fn run_daemon() {
-    let _guard = crate::init_tracing("nexa-service.log");
+/// Runs the IPC server in the traditional daemonized mode.
+pub fn run_daemon() -> anyhow::Result<()> {
+    let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
     tracing::info!("Starting as daemon");
 
     #[cfg(unix)]
     daemonize();
 
+    run_service()
+}
+
+/// Runs the IPC server in the foreground for service managers.
+///
+/// systemd and launchd both need the main process to stay attached to the service; --daemon
+/// exists only for manual use and must not be used from a service unit.
+pub fn run_foreground() -> anyhow::Result<()> {
+    let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
+    tracing::info!("Starting as foreground service");
+
+    run_service()
+}
+
+fn run_service() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
 
-    runtime.block_on(async {
-        if let Err(e) = ServiceRunner::new().run().await {
-            tracing::error!("Service runner error: {}", e);
-        }
-    });
+    runtime.block_on(ServiceRunner::new().run())
 }
 
 /// Entry point used by the Windows service control manager (`--service`).
 #[cfg(windows)]
 fn run_native_service() -> bool {
-    let _guard = crate::init_tracing("nexa-service.log");
+    let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
     tracing::info!("Starting as Windows service");
 
     if let Err(e) = crate::service::windows_service::run() {

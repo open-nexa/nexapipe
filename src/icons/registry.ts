@@ -97,6 +97,10 @@ const icons = {
     { t: 'rect', x: 9, y: 9, width: 13, height: 13, rx: 2 },
     { t: 'path', d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' },
   ],
+  clipboard: [
+    { t: 'rect', x: 8, y: 3, width: 8, height: 4, rx: 1 },
+    { t: 'path', d: 'M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2' },
+  ],
   check: [{ t: 'polyline', points: '20 6 9 17 4 12' }],
   plus: [
     { t: 'line', x1: 12, y1: 5, x2: 12, y2: 19 },

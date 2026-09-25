@@ -1,7 +1,8 @@
 ﻿use crate::error::{codes, AppError};
-use crate::proxy::tun_proxy::{TUN_NETWORK, TunProxy};
+use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 use crate::proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
+    StartError,
 };
 use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, IPC_SOCKET_PATH, MAX_IPC_LINE};
 use crate::status::ProxyStatus;
@@ -12,8 +13,27 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+/// The failure the last start recorded after it had already answered `Ok`.
+///
+/// Kept beside the manager because the two are set together: a start is dispatched on a spawned
+/// task (a TUN run loop only returns when the tunnel goes down, so the service cannot wait for
+/// it), and anything that fails there would otherwise be visible only in this process's log —
+/// which is written under LocalSystem's profile and nobody can read. The desktop asks for it and
+/// shows it, exactly like it does for a process-mode start.
+fn startup_error_slot() -> &'static Arc<tokio::sync::RwLock<Option<AppError>>> {
+    static SLOT: std::sync::OnceLock<Arc<tokio::sync::RwLock<Option<AppError>>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(tokio::sync::RwLock::new(None)))
+}
+
 pub struct ServiceRunner {
     proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+}
+
+impl Default for ServiceRunner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServiceRunner {
@@ -26,11 +46,27 @@ impl ServiceRunner {
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Service runner starting");
 
+        // A hijack whose process died mid-run (killed, or a machine shutdown that reached
+        // the service before its teardown finished) leaves static DNS entries that survive
+        // the reboot: the machine comes back with no working name resolution — including
+        // for this service itself, whose iroh endpoint cannot even publish to pkarr.
+        // Clean that up before anything here needs DNS.
+        crate::proxy::dns_config::cleanup_stale_hijack();
+
         let listener = TcpListener::bind(IPC_SOCKET_PATH)
             .await
             .context("Failed to bind IPC socket")?;
 
         tracing::info!("IPC server listening on: {}", IPC_SOCKET_PATH);
+
+        // Where this process will look for the token, printed once. A service that refuses every
+        // call because it cannot find one is otherwise indistinguishable from a service that is
+        // not there at all: the refusal names no path, and the desktop can only report that the
+        // connection closed. One line here turns that dead end into a diffable list.
+        tracing::info!(
+            "IPC token candidates: {:?}",
+            crate::service::ipc_token::service_token_paths()
+        );
 
         loop {
             let (mut stream, _) = listener
@@ -45,6 +81,20 @@ impl ServiceRunner {
                     tracing::error!("Client handler error: {}", e);
                 }
             });
+        }
+    }
+
+    /// Winds the proxy down because the process itself is exiting.
+    ///
+    /// Not the same thing as answering [`IpcMessage::StopProxy`]: that leaves the service up and
+    /// the caller free to start again, whereas here nothing is served any more, so the instance is
+    /// *taken* out — the tunnel has to be torn down (the TUN adapter outlives this process) and no
+    /// late status request may be answered with "running".
+    pub async fn shutdown(&self) {
+        let manager = self.proxy_manager.write().await.take();
+        if let Some(manager) = manager {
+            tracing::info!("Stopping the proxy before exiting");
+            manager.stop().await;
         }
     }
 
@@ -115,30 +165,28 @@ impl ServiceRunner {
                     }
                 };
 
-                match (crate::service::ipc_token::read_token()?, presented) {
-                    (Some(expected), presented)
-                        if crate::service::ipc_token::token_matches(&expected, &presented) =>
-                    {
-                        authenticated = true;
-                        tracing::debug!("IPC client authenticated");
-                    }
-                    (Some(_), _) => {
-                        tracing::warn!("Refusing an IPC client that presented a wrong token");
-                        let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
-                        Self::write_response(reader.get_mut(), &response).await?;
-                        break;
-                    }
-                    // No token published yet means no desktop session has asked
-                    // for the service, so there is nobody to answer.
-                    (None, _) => {
-                        tracing::warn!("Refusing an IPC call with no token on file");
-                        let response = IpcResponse::Error(AppError::with_detail(
-                            codes::SERVICE_IPC_TOKEN,
-                            "no desktop session has published an IPC token",
-                        ));
-                        Self::write_response(reader.get_mut(), &response).await?;
-                        break;
-                    }
+                // Every published token is a candidate: the service cannot tell which account
+                // dialled it, so which one happens to be found first says nothing about which
+                // one the caller holds.
+                let known = crate::service::ipc_token::read_tokens()?;
+                if crate::service::ipc_token::token_matches_any(&known, &presented) {
+                    authenticated = true;
+                    tracing::debug!("IPC client authenticated");
+                } else if known.is_empty() {
+                    // No token published yet means no desktop session has asked for the
+                    // service, so there is nobody to answer.
+                    tracing::warn!("Refusing an IPC call with no token on file");
+                    let response = IpcResponse::Error(AppError::with_detail(
+                        codes::SERVICE_IPC_TOKEN,
+                        "no desktop session has published an IPC token",
+                    ));
+                    Self::write_response(reader.get_mut(), &response).await?;
+                    break;
+                } else {
+                    tracing::warn!("Refusing an IPC client that presented a wrong token");
+                    let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
+                    Self::write_response(reader.get_mut(), &response).await?;
+                    break;
                 }
 
                 Self::write_response(reader.get_mut(), &IpcResponse::Ok).await?;
@@ -160,11 +208,7 @@ impl ServiceRunner {
                         req.use_tun,
                         req.relay_mode,
                         req.relay_url,
-                        req.force_relay,
-                        req.two_factor_enabled,
-                        req.two_factor_client_id,
-                        req.two_factor_secret,
-                        req.two_factor_algorithm,
+                        req.relay_auth_token,
                         &proxy_manager,
                     )
                     .await
@@ -174,6 +218,9 @@ impl ServiceRunner {
                 IpcMessage::GetNodeId => Self::handle_get_node_id(&proxy_manager).await,
                 IpcMessage::GetEndpointLinks => {
                     Self::handle_get_endpoint_links(&proxy_manager).await
+                }
+                IpcMessage::GetStartupError => {
+                    IpcResponse::StartupError(startup_error_slot().read().await.clone())
                 }
                 // Handled above, when the caller introduced itself.
                 IpcMessage::Auth(_) => IpcResponse::Ok,
@@ -234,10 +281,20 @@ impl ServiceRunner {
         stream: &mut tokio::net::TcpStream,
         response: &IpcResponse,
     ) -> Result<()> {
+        // The channel is newline-delimited in both directions, so the terminator belongs to the
+        // response as much as it does to a request. Without it `IpcClient::exchange` — which
+        // reads a line — waits for a byte that never comes: the answer is already in its socket
+        // buffer but `read_line` only returns at end of stream, and this connection stays open
+        // for the next message. Every service call then hung until the connection died, which
+        // the caller saw as `service.io_error` (10053) rather than an answer.
         let response_str =
             serde_json::to_string(response).context("Failed to serialize response")?;
         stream
             .write_all(response_str.as_bytes())
+            .await
+            .context("Failed to write response")?;
+        stream
+            .write_all(b"\n")
             .await
             .context("Failed to write response")?;
         stream.flush().await.context("Failed to flush response")?;
@@ -256,13 +313,13 @@ impl ServiceRunner {
         use_tun: Option<bool>,
         relay_mode: Option<String>,
         relay_url: Option<String>,
-        force_relay: Option<bool>,
-        two_factor_enabled: Option<bool>,
-        two_factor_client_id: Option<String>,
-        two_factor_secret: Option<String>,
-        two_factor_algorithm: Option<String>,
+        relay_auth_token: Option<String>,
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
+        // A new start owns the slot: whatever the previous one recorded is history, and a caller
+        // that polls the status before the spawn has finished must not read a stale failure.
+        *startup_error_slot().write().await = None;
+
         // Merge the global domains into every node — same logic as process mode (lib.rs) —
         // so that domains added through the text box in service mode are also handled
         // correctly by DNS hijacking and routing.
@@ -274,6 +331,8 @@ impl ServiceRunner {
             .into_iter()
             .filter(|n| !n.ticket.is_empty() || !n.endpoint_id.is_empty())
             .map(|n| {
+                // Read before the connection string is moved out of `n`.
+                let two_factor = n.two_factor();
                 let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
                     ConnectionConfig::Ticket(n.ticket)
                 } else {
@@ -288,6 +347,7 @@ impl ServiceRunner {
                 ProxyNodeConfig {
                     connection,
                     domains: merged,
+                    two_factor,
                 }
             })
             .collect();
@@ -316,7 +376,7 @@ impl ServiceRunner {
             return IpcResponse::Error(e);
         }
 
-        let dns_addr = dns_addr.unwrap_or_else(|| "10.0.0.254:53".to_string());
+        let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
         if let Err(e) = require_tun_subnet(&dns_addr) {
             return IpcResponse::Error(e);
         }
@@ -326,12 +386,13 @@ impl ServiceRunner {
         let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
 
         // Explicit forwarding mode, same contract as process mode: requested TUN is honoured or
-        // refused, never silently replaced by a local proxy. The service runs elevated, so this
-        // only fires when the request could not be satisfied at all.
+        // refused, never silently replaced by a local proxy.
+        //
+        // Deliberately no `TunProxy::is_available()` gate here: the probe is a bare `is_admin()`
+        // (`net session`), and under LocalSystem it answers false regardless of what the process
+        // can actually do, so it refused tunnels this service could create. Creating the device
+        // is the check that means something, and it reports the real reason when it fails.
         let use_tun = use_tun.unwrap_or(false);
-        if use_tun && !TunProxy::is_available().await {
-            return IpcResponse::Error(AppError::new(codes::PROXY_TUN_UNAVAILABLE));
-        }
 
         let config = ProxyManagerConfig {
             nodes: parsed_nodes,
@@ -343,11 +404,7 @@ impl ServiceRunner {
             use_tun,
             relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
             relay_url: relay_url.unwrap_or_default(),
-            force_relay: force_relay.unwrap_or(false),
-            two_factor_enabled: two_factor_enabled.unwrap_or(false),
-            two_factor_client_id: two_factor_client_id.unwrap_or_default(),
-            two_factor_secret: two_factor_secret.unwrap_or_default(),
-            two_factor_algorithm: two_factor_algorithm.unwrap_or_else(|| "sha1".to_string()),
+            relay_auth_token: relay_auth_token.unwrap_or_default(),
         };
 
         let manager = Arc::new(ProxyManager::new(config));
@@ -361,6 +418,15 @@ impl ServiceRunner {
         tokio::spawn(async move {
             if let Err(e) = manager.start().await {
                 tracing::error!("Proxy manager failed: {}", e);
+                // Same mapping as the desktop's own start path, so the same code reaches the UI
+                // whichever process ran the proxy.
+                let code = match &e {
+                    StartError::NoReachableBackend { .. } => codes::PROXY_NO_REACHABLE_BACKEND,
+                    StartError::TwoFactorRequired { .. } => codes::PROXY_TWO_FACTOR_REQUIRED,
+                    StartError::Other(_) => codes::PROXY_START_FAILED,
+                };
+                *startup_error_slot().write().await =
+                    Some(AppError::with_detail(code, e.to_string()));
                 let mut pm = proxy_manager_clone.write().await;
                 *pm = None;
             }
@@ -372,10 +438,20 @@ impl ServiceRunner {
     async fn handle_stop_proxy(
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
-        let pm = proxy_manager.write().await;
+        // A deliberate stop is not a failure: leaving one on file would have the caller explain
+        // the next start with it.
+        *startup_error_slot().write().await = None;
+
+        let mut pm = proxy_manager.write().await;
         if let Some(manager) = pm.as_ref() {
             manager.stop().await;
         }
+        // Clear the registration as well as stopping the instance. `stop()` sets the mode back
+        // to `None`, and a manager that is still registered with no mode reads as "starting" —
+        // after a deliberate stop nothing is starting. Same rationale as the desktop's own stop
+        // path; without this, a stop followed by a UI restart left every status poll answering
+        // `starting` forever.
+        *pm = None;
         IpcResponse::Ok
     }
 
@@ -473,15 +549,14 @@ fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
     }
 }
 
-/// Refuses `addr` unless it is inside the TUN network the DNS server answers on.
+/// Refuses `addr` unless it is inside one of the candidate TUN blocks the DNS server can
+/// answer on.
+///
+/// The block actually in use is only decided when the TUN interface comes up
+/// (`routing::configure_interface` walks [`TUN_BASE_CANDIDATES`]), which is *after* this
+/// validation runs — so an address inside any candidate block is accepted, and `retarget`
+/// later moves it into the block that took. See `proxy::tun_proxy` for the block policy.
 fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
-    let (network, mask) = tun_network().ok_or_else(|| {
-        AppError::with_detail(
-            codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
-            format!("cannot interpret {TUN_NETWORK:?} as a network"),
-        )
-    })?;
-
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
@@ -489,34 +564,29 @@ fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
         )
     })?;
 
+    // Every candidate is a /24, so the network part is everything but the last octet.
+    let in_candidate = |ip: &Ipv4Addr| {
+        TUN_BASE_CANDIDATES
+            .iter()
+            .any(|base| u32::from(*ip) & 0xFFFF_FF00 == u32::from(*base))
+    };
+
     match parsed.ip() {
-        IpAddr::V4(ip) if u32::from(ip) & mask == network => Ok(()),
+        IpAddr::V4(ip) if in_candidate(&ip) => Ok(()),
         other => Err(AppError::with_detail(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
-            format!("{other} is outside {TUN_NETWORK}, where the TUN DNS server answers"),
+            format!(
+                "{other} is outside every candidate TUN block ({TUN_BASE_CANDIDATES:?}), \
+                 where the TUN DNS server answers"
+            ),
         )),
     }
 }
 
-/// The TUN network as `(network address, netmask)`, or `None` if
-/// [`TUN_NETWORK`] is not a plain IPv4 CIDR block.
-fn tun_network() -> Option<(u32, u32)> {
-    let (network, bits) = TUN_NETWORK.split_once('/')?;
-    let network: Ipv4Addr = network.parse().ok()?;
-    let bits: u32 = bits.parse().ok()?;
-    if bits > 32 {
-        return None;
-    }
-    // Shifting by the full width overflows, hence the explicit zero case.
-    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-    Some((u32::from(network) & mask, mask))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{IpcReadError, ServiceRunner, MAX_IPC_LINE, require_loopback, require_tun_subnet, tun_network};
+    use super::{IpcReadError, ServiceRunner, MAX_IPC_LINE, require_loopback, require_tun_subnet};
     use crate::error::codes;
-    use std::net::Ipv4Addr;
 
     /// A caller that has not authenticated yet must not be able to make this
     /// buffer grow, which is the whole reason the reader is capped.
@@ -534,6 +604,38 @@ mod tests {
             buf.len() <= MAX_IPC_LINE,
             "the oversized line must never be buffered"
         );
+    }
+
+    /// The reply has to end the line it is written on: `IpcClient::exchange` reads a *line*, so
+    /// a response sent without its terminator is one the caller never receives — it sits in the
+    /// socket buffer while `read_line` waits for a byte that never comes, until the connection
+    /// dies and the call is reported as `service.io_error` instead of an answer.
+    #[tokio::test]
+    async fn a_response_ends_the_line_the_client_is_reading() {
+        use crate::service::ipc::IpcResponse;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("the client connects");
+        let (mut server, _) = listener.accept().await.expect("the service accepts");
+
+        ServiceRunner::write_response(&mut server, &IpcResponse::Ok)
+            .await
+            .expect("the response is written");
+
+        let mut line = String::new();
+        let read = tokio::io::AsyncBufReadExt::read_line(
+            &mut tokio::io::BufReader::new(client),
+            &mut line,
+        )
+        .await
+        .expect("the caller reads the reply");
+
+        assert!(read > 0, "the reply must arrive without waiting for a close");
+        assert_eq!(line.trim(), "\"Ok\"");
     }
 
     #[tokio::test]
@@ -572,18 +674,16 @@ mod tests {
 
     #[test]
     fn the_dns_server_stays_inside_the_tun_network() {
+        // The default block (198.18.0.0/24) and the legacy one (10.0.0.0/24) are both
+        // candidates — a config saved against the old default keeps working.
+        assert!(require_tun_subnet("198.18.0.254:53").is_ok());
         assert!(require_tun_subnet("10.0.0.254:53").is_ok());
         assert!(require_tun_subnet("10.0.0.1:53").is_ok());
+        assert!(require_tun_subnet("100.100.0.254:53").is_ok());
         assert!(require_tun_subnet("8.8.8.8:53").is_err());
         assert!(require_tun_subnet("127.0.0.1:53").is_err());
         assert!(require_tun_subnet("10.0.1.1:53").is_err());
+        assert!(require_tun_subnet("198.19.1.1:53").is_err());
         assert!(require_tun_subnet("[::1]:53").is_err());
-    }
-
-    #[test]
-    fn the_tun_network_parses_into_a_maskable_prefix() {
-        let (network, mask) = tun_network().expect("TUN_NETWORK is an IPv4 CIDR");
-        assert_eq!(mask, 0xFFFF_FF00);
-        assert_eq!(network, u32::from(Ipv4Addr::new(10, 0, 0, 0)));
     }
 }

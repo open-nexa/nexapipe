@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-dev:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # src-tauri 依赖 ../../crates/nexapipe-client，crates 不在这个仓库里，
+    # 所以 dependabot 只能更新 Cargo.lock 里它自己那部分。
+    allow:
+      - dependency-type: direct
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

@@ -83,7 +83,13 @@ impl ProxyStatus {
 /// `link` is the **runtime** answer read off the path iroh actually selected, not the
 /// configured relay mode: a node may be allowed to use a relay and still connect directly,
 /// which is exactly what the user wants to see.
+///
+/// These fields reach TypeScript, where `EndpointLink` in `src/types/index.ts` spells every
+/// multi-word key camelCase. Tauri does not rewrite a command result's keys, so this struct has
+/// to ask for the conversion explicitly or `endpointId` arrives as `endpoint_id` and the frontend
+/// reads `undefined`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EndpointLink {
     /// The ticket or endpoint ID exactly as the node was configured, so the UI can match a link
     /// to the node it came from. A ticket is opaque to the frontend, so the resolved endpoint
@@ -134,7 +140,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&link).unwrap(),
-            r#"{"connection":"node1ticket","endpoint_id":"0123456789abcdef","link":"relay"}"#
+            r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay"}"#
         );
     }
 }

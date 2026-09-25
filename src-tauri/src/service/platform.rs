@@ -144,6 +144,28 @@ mod windows_impl {
     /// Argument that hands control to the service control manager.
     const SERVICE_ARGUMENT: &str = "--service";
 
+    /// `sc start` on a service that is already running.
+    ///
+    /// Not a failure: running is the state the command asked for. Reported as it is, the exit
+    /// code turns a successful install into `service.install_failed` carrying
+    /// "StartService 失败 1056" — an install that worked, described as one that did not.
+    const ALREADY_RUNNING: &str = "1056";
+
+    /// `sc stop` on a service that is not started (or not installed).
+    ///
+    /// Same shape: the state asked for is already the state, so refusing to call it a success
+    /// only stops a perfectly good stop from ever being reported as done.
+    const NOT_STARTED: &str = "1062";
+    const NOT_INSTALLED: &str = "1060";
+
+    /// Accepts a nonzero exit code from the previous command as success.
+    ///
+    /// `errorlevel` is compared literally rather than with `if errorlevel N` because that form
+    /// means "N or higher" and would swallow real failures with larger codes.
+    fn tolerate(code: &str) -> String {
+        format!("if %errorlevel%=={code} exit /b 0")
+    }
+
     /// Whether an operation can succeed without asking for elevation.
     enum Escalation {
         /// It always needs administrative rights (`sc create`).
@@ -172,6 +194,11 @@ mod windows_impl {
                     format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
                     "if errorlevel 1 exit /b %errorlevel%".to_string(),
                     format!("sc.exe start {SERVICE_NAME}"),
+                    // Already running is the state the install asked for. Note that the service
+                    // keeps running the binary it was launched from: a re-pointed `binPath`
+                    // only takes effect on the next start, which an uninstall/start or a reboot
+                    // provides.
+                    tolerate(ALREADY_RUNNING),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -212,6 +239,7 @@ mod windows_impl {
             |_| {
                 vec![
                     format!("sc.exe start {SERVICE_NAME}"),
+                    tolerate(ALREADY_RUNNING),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -227,6 +255,8 @@ mod windows_impl {
             |_| {
                 vec![
                     format!("sc.exe stop {SERVICE_NAME}"),
+                    tolerate(NOT_STARTED),
+                    tolerate(NOT_INSTALLED),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -653,9 +683,7 @@ fn stop_elevated() -> Result<(), AppError> {
 /// Absolute path of the running executable, which is what the service manager is pointed at.
 #[cfg(not(windows))]
 fn current_exe_string() -> Result<String, AppError> {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))
+    elevate::current_executable().map(|p| p.to_string_lossy().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -725,23 +753,7 @@ fn install_service_linux(exe_path: &str) -> Result<(), AppError> {
     use std::path::Path;
     use std::process::Command;
 
-    let unit_content = format!(
-        r#"[Unit]
-Description={}
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={} --daemon
-Restart=always
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-"#,
-        SERVICE_DISPLAY_NAME, exe_path
-    );
+    let unit_content = linux_unit_content(exe_path);
 
     let unit_path = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
 
@@ -771,14 +783,62 @@ WantedBy=multi-user.target
         .output()
         .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(AppError::with_detail(
+    if !output.status.success() {
+        return Err(AppError::with_detail(
             codes::SERVICE_INSTALL_FAILED,
             String::from_utf8_lossy(&output.stderr),
-        ))
+        ));
     }
+
+    // Registration is not startup: a unit that is only enabled stays stopped until the next
+    // boot, while the UI promises install and start as one action.
+    start_service_linux()?;
+    wait_for_service_state_linux(ServiceState::Running, codes::SERVICE_START_FAILED)
+}
+
+/// The command systemd should run in the foreground.
+///
+/// A packaged install has a dedicated nexa-service binary beside the desktop executable. A
+/// development build may not, in which case the desktop binary understands --foreground and
+/// can host the same service without daemonizing.
+#[cfg(target_os = "linux")]
+fn linux_service_exec(exe_path: &str) -> String {
+    let service = std::path::Path::new(exe_path).with_file_name("nexa-service");
+    linux_service_exec_with(exe_path, service.is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_exec_with(exe_path: &str, has_service_binary: bool) -> String {
+    if has_service_binary {
+        std::path::Path::new(exe_path)
+            .with_file_name("nexa-service")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!("{exe_path} --foreground")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unit_content(exe_path: &str) -> String {
+    format!(
+        r#"[Unit]
+Description={}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={}
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        SERVICE_DISPLAY_NAME,
+        linux_service_exec(exe_path)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -869,6 +929,42 @@ fn stop_service_linux() -> Result<(), AppError> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn wait_for_service_state_linux(expected: ServiceState, failure: &str) -> Result<(), AppError> {
+    use std::time::{Duration, Instant};
+
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let current = state_linux();
+        if current == expected {
+            return Ok(());
+        }
+        if current == ServiceState::NotInstalled {
+            return Err(AppError::with_detail(
+                failure,
+                "the service is no longer registered",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::with_detail(
+                failure,
+                format!(
+                    "the service is still {} after {}s",
+                    match current {
+                        ServiceState::Running => "running",
+                        ServiceState::Stopped => "stopped",
+                        ServiceState::NotInstalled => "missing",
+                    },
+                    SETTLE_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     use std::fs::{self, File};
@@ -886,7 +982,7 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
-        <string>--daemon</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -950,14 +1046,21 @@ fn uninstall_service_macos() -> Result<(), AppError> {
 fn is_service_running_macos() -> bool {
     use std::process::Command;
 
-    Command::new("launchctl")
-        .args(["list", format!("com.nexa.{}", SERVICE_NAME).as_str()])
+    // The daemon lives in the *system* domain, but a plain `launchctl list <label>` from a user
+    // session queries the user's GUI domain and answers "Could not find service" (exit 1) even
+    // while the daemon is running — which had the service panel show "stopped" forever.
+    // `launchctl print system/<label>` is readable without root and names the state outright.
+    let label = format!("com.nexa.{}", SERVICE_NAME);
+    let Ok(output) = Command::new("launchctl")
+        .args(["print", format!("system/{label}").as_str()])
         .output()
-        .map(|output| {
-            output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).contains("Could not find service")
-        })
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "state = running")
 }
 
 /// The plist is the registration: no file means the service was never installed.

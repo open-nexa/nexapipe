@@ -101,6 +101,13 @@ pub mod codes {
     /// `dns_addr` outside the TUN network the built-in DNS server answers on.
     pub const SERVICE_DNS_ADDR_OUTSIDE_TUN: &str = "service.dns_addr_outside_tun";
 
+    // -- invite -----------------------------------------------------------------------------
+    /// A `nexapipe://` invite could not be read.
+    ///
+    /// The parser's message says exactly which part is wrong ("unsupported version", "no such
+    /// host", ...), so it travels as `detail`; the headline stays a single localized line.
+    pub const INVITE_PARSE_FAILED: &str = "invite.parse_failed";
+
     // -- logs -------------------------------------------------------------------------------
     /// The log directory could not be listed.
     pub const LOGS_DIR_UNREADABLE: &str = "logs.dir_unreadable";

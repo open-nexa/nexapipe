@@ -2,7 +2,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{codes, AppError};
-use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, StartProxyRequest, IPC_SOCKET_PATH};
+use crate::service::ipc::{IpcMessage, IpcResponse, StartProxyRequest, IPC_SOCKET_PATH};
 use crate::status::{EndpointLink, ProxyStatus};
 
 pub struct IpcClient;
@@ -29,7 +29,18 @@ impl IpcClient {
         // The token is generated and owned by this side, so it — and only it —
         // can drive the service; see `service::ipc_token`.
         let token = crate::service::ipc_token::ensure_token()?;
-        Self::exchange(&mut stream, IpcMessage::Auth(token)).await?;
+
+        // The handshake's answer has to be read, not discarded. The service refuses it for
+        // exactly one reason it can name — nothing is published, or what was presented does not
+        // match — and closes the connection right after. Dropping that answer leaves the *next*
+        // write to fail on a socket the peer has already closed, which surfaces as "the service
+        // closed the connection without answering": the one message that says nothing about why,
+        // and the reason a missing token looked like a broken service.
+        match Self::exchange(&mut stream, IpcMessage::Auth(token)).await? {
+            IpcResponse::Ok => {}
+            IpcResponse::Error(e) => return Err(e),
+            other => return Err(unexpected(&other)),
+        }
 
         tracing::debug!("Authenticated, sending message");
         Self::exchange(&mut stream, msg).await
@@ -73,41 +84,8 @@ impl IpcClient {
         Ok(response)
     }
 
-    pub async fn start_proxy(
-        nodes: Vec<NodeInput>,
-        domains: Vec<String>,
-        local_addr: Option<String>,
-        dns_addr: Option<String>,
-        upstream_dns: Option<String>,
-        load_balancing: Option<String>,
-        tun_name: Option<String>,
-        use_tun: bool,
-        relay_mode: Option<String>,
-        relay_url: Option<String>,
-        force_relay: Option<bool>,
-        two_factor_enabled: Option<bool>,
-        two_factor_client_id: Option<String>,
-        two_factor_secret: Option<String>,
-        two_factor_algorithm: Option<String>,
-    ) -> Result<(), AppError> {
-        let response = Self::send_message(IpcMessage::StartProxy(StartProxyRequest {
-            nodes,
-            domains,
-            local_addr,
-            dns_addr,
-            upstream_dns,
-            load_balancing,
-            tun_name,
-            use_tun: Some(use_tun),
-            relay_mode,
-            relay_url,
-            force_relay,
-            two_factor_enabled,
-            two_factor_client_id,
-            two_factor_secret,
-            two_factor_algorithm,
-        }))
-        .await?;
+    pub async fn start_proxy(request: StartProxyRequest) -> Result<(), AppError> {
+        let response = Self::send_message(IpcMessage::StartProxy(Box::new(request))).await?;
 
         match response {
             IpcResponse::Ok => Ok(()),
@@ -147,6 +125,17 @@ impl IpcClient {
     pub async fn get_endpoint_links() -> Result<Vec<EndpointLink>, AppError> {
         match Self::send_message(IpcMessage::GetEndpointLinks).await? {
             IpcResponse::EndpointLinks(links) => Ok(links),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The failure the service's last start recorded after it had already answered `Ok`.
+    ///
+    /// `None` is a legitimate answer, not an error: it means the start settled.
+    pub async fn get_startup_error() -> Result<Option<AppError>, AppError> {
+        match Self::send_message(IpcMessage::GetStartupError).await? {
+            IpcResponse::StartupError(e) => Ok(e),
             IpcResponse::Error(e) => Err(e),
             other => Err(unexpected(&other)),
         }

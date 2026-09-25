@@ -46,6 +46,8 @@ export const ERROR_CODES = [
   'service.malformed_request',
   'service.local_addr_not_loopback',
   'service.dns_addr_outside_tun',
+  // invite
+  'invite.parse_failed',
   // logs
   'logs.dir_unreadable',
   'logs.read_failed',

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Remove the optional service when the package is removed. Do not touch it on upgrades.
+set -e
+
+SERVICE=nexa-service.service
+
+case "${1:-}" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop "$SERVICE" || true
+            systemctl disable "$SERVICE" || true
+            rm -f "/etc/systemd/system/$SERVICE"
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,6 +1,12 @@
 ﻿<script setup lang="ts">
 import { ref, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { useI18n } from "vue-i18n";
+import { useToast } from "../composables/useToast";
+import { writeClipboardText } from "../utils/clipboard";
+
+const { t } = useI18n();
+const toast = useToast();
 
 interface LogEntry {
   id: number;
@@ -9,12 +15,21 @@ interface LogEntry {
   message: string;
 }
 
+/**
+ * One `get_logs` answer. `fresh` marks a full tail read (first load, day roll-over, anything
+ * that invalidates the backend's incremental cursor) and means the view must be *replaced*;
+ * otherwise the lines are a continuation of what was already delivered.
+ */
+interface LogsPage {
+  lines: string[];
+  fresh: boolean;
+}
+
 const logs = ref<LogEntry[]>([]);
 const filterLevel = ref<string>("all");
 const autoScroll = ref(true);
 const logContainer = ref<HTMLElement | null>(null);
 let logId = 0;
-let loadedLineCount = 0; // Number of log lines loaded so far, used for incremental appends
 const MAX_LOGS = 300; // Maximum number of log entries kept on the frontend
 
 // Parse a Rust tracing log line:"2026-08-09T13:10:12.363812Z  INFO proxy::dns: msg"
@@ -37,21 +52,20 @@ function parseLogLine(line: string): LogEntry | null {
   return { id: ++logId, timestamp, level: level.toLowerCase() as LogEntry["level"], message };
 }
 
-async function loadLogs(appendOnly: boolean) {
+async function loadLogs(append: boolean) {
   try {
-    const lines = await invoke<string[]>("get_logs", { limit: MAX_LOGS });
-    if (appendOnly && lines.length <= loadedLineCount) return;
-
-    const start = appendOnly ? loadedLineCount : 0;
-    const entries = lines
-      .slice(start)
+    const page = await invoke<LogsPage>("get_logs", { limit: MAX_LOGS, append });
+    const entries = page.lines
       .map(parseLogLine)
       .filter((l): l is LogEntry => l !== null);
-    logs.value.push(...entries);
-    if (logs.value.length > MAX_LOGS) {
-      logs.value = logs.value.slice(-MAX_LOGS);
+    if (page.fresh) {
+      logs.value = entries;
+    } else {
+      logs.value.push(...entries);
+      if (logs.value.length > MAX_LOGS) {
+        logs.value = logs.value.slice(-MAX_LOGS);
+      }
     }
-    loadedLineCount = lines.length;
     scrollToBottom();
   } catch (e) {
     console.error("Failed to load logs:", e);
@@ -75,20 +89,25 @@ function getLevelColor(level: string) {
   }
 }
 
+/**
+ * Log levels are technical tokens in the file, but they are also UI labels here (the filter and
+ * the badge), so they go through i18n like any other label — uppercasing them would be a
+ * `text-transform` by another name and does nothing in zh-CN.
+ */
 function getLevelLabel(level: string) {
   switch (level) {
     case "trace":
-      return "TRACE";
+      return t("logs.levelTrace");
     case "debug":
-      return "DEBUG";
+      return t("logs.levelDebug");
     case "info":
-      return "INFO";
+      return t("logs.levelInfo");
     case "warn":
-      return "WARN";
+      return t("logs.levelWarn");
     case "error":
-      return "ERROR";
+      return t("logs.levelError");
     default:
-      return level.toUpperCase();
+      return level;
   }
 }
 
@@ -103,16 +122,28 @@ function scrollToBottom() {
   }
 }
 
-function clearLogs() {
-  logs.value = [];
-  loadedLineCount = 0; // The next poll reloads the current file contents
+async function clearLogs() {
+  try {
+    // Tell the backend first: it marks the current file content as seen, so the next poll
+    // delivers only lines written *after* the clear instead of replaying everything.
+    await invoke("clear_logs");
+    logs.value = [];
+    toast.success(t("logs.cleared"));
+  } catch (e) {
+    toast.error(e);
+  }
 }
 
-function copyLogs() {
+async function copyLogs() {
+  if (logs.value.length === 0) return;
   const text = logs.value
     .map(log => `${log.timestamp} [${log.level.toUpperCase()}] ${log.message}`)
     .join("\n");
-  navigator.clipboard.writeText(text);
+  if (await writeClipboardText(text)) {
+    toast.success(t("common.copied"));
+  } else {
+    toast.error(t("common.copyFailed"));
+  }
 }
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -138,12 +169,12 @@ onUnmounted(() => {
     <div class="logs-header">
       <div class="logs-filters">
         <select v-model="filterLevel" class="filter-select">
-          <option value="all">All Levels</option>
-          <option value="trace">Trace</option>
-          <option value="debug">Debug</option>
-          <option value="info">Info</option>
-          <option value="warn">Warn</option>
-          <option value="error">Error</option>
+          <option value="all">{{ t('logs.levelAll') }}</option>
+          <option value="trace">{{ t('logs.levelTrace') }}</option>
+          <option value="debug">{{ t('logs.levelDebug') }}</option>
+          <option value="info">{{ t('logs.levelInfo') }}</option>
+          <option value="warn">{{ t('logs.levelWarn') }}</option>
+          <option value="error">{{ t('logs.levelError') }}</option>
         </select>
         
         <label class="checkbox-label">
@@ -151,7 +182,7 @@ onUnmounted(() => {
           <svg v-if="autoScroll" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="20 6 9 17 4 12"/>
           </svg>
-          <span>Auto Scroll</span>
+          <span>{{ t('logs.autoScroll') }}</span>
         </label>
       </div>
       
@@ -161,7 +192,7 @@ onUnmounted(() => {
             <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
             <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
           </svg>
-          Copy Logs
+          {{ t('logs.copy') }}
         </button>
         <button class="btn btn-outline" @click="clearLogs">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -169,7 +200,7 @@ onUnmounted(() => {
             <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/>
             <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
           </svg>
-          Clear Logs
+          {{ t('logs.clear') }}
         </button>
       </div>
     </div>
@@ -183,7 +214,7 @@ onUnmounted(() => {
           <line x1="16" y1="17" x2="8" y2="17"/>
           <polyline points="10 9 9 9 8 9"/>
         </svg>
-        <span>No logs yet</span>
+        <span>{{ t('logs.empty') }}</span>
       </div>
       
       <TransitionGroup name="log" tag="div" class="logs-list">
@@ -203,7 +234,7 @@ onUnmounted(() => {
     </div>
     
     <div class="logs-footer">
-      <span class="logs-count">{{ logs.length }} log entries</span>
+      <span class="logs-count">{{ t('logs.entryCount', { count: logs.length }) }}</span>
     </div>
   </div>
 </template>

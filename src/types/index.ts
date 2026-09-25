@@ -20,12 +20,33 @@ export type ProxyMode = 'tun' | 'local_proxy' | 'starting' | 'stopped';
  */
 export type ServiceState = 'not_installed' | 'stopped' | 'running';
 
+/**
+ * The 2FA credentials one endpoint is reached with.
+ *
+ * Kept per node rather than once per client because every server has its own `[auth].clients`
+ * entry: a single shared pair is what forced a second server to be given the first one's secret.
+ * A node without credentials performs no handshake, which is also how one client mixes servers
+ * that demand 2FA with ones that do not.
+ */
+export interface NodeTwoFactor {
+  clientId: string;
+  secret: string;
+  algorithm: TwoFactorAlgorithm;
+}
+
 export interface NodeConfig {
   id: string;
   connectionType: ConnectionType;
   ticket: string;
   endpointId: string;
   domains: string[];
+  /**
+   * Cosmetic label, set only when the node came from an invite that named itself. Nothing routes
+   * on it and it is never sent to the backend: the UI falls back to "Node N" when it is absent.
+   */
+  name?: string;
+  /** Credentials for this endpoint alone. Absent means no handshake for this server. */
+  twoFactor?: NodeTwoFactor;
 }
 
 export interface ProxyConfig {
@@ -45,11 +66,8 @@ export interface ProxyConfig {
   useService: boolean;
   relayMode: RelayMode;
   relayUrl: string;
-  forceRelay: boolean;
-  twoFactorEnabled: boolean;
-  twoFactorClientId: string;
-  twoFactorSecret: string;
-  twoFactorAlgorithm: TwoFactorAlgorithm;
+  /** Bearer token for a custom relay that requires one. */
+  relayAuthToken: string;
 }
 
 /** The persisted shape: user config plus the schema version the migration chain walks. */
@@ -81,6 +99,34 @@ export interface EndpointLink {
   /** The backend's endpoint ID; a ticket resolves to the node it names. */
   endpointId: string;
   link: LinkKind;
+}
+
+/**
+ * The 2FA credentials an invite can carry. Mirrors `InviteTotpPayload` in
+ * `src-tauri/src/lib.rs`; `algorithm` is already lowercase, which is what a node's
+ * `twoFactor.algorithm` holds.
+ */
+export interface InviteTotp {
+  clientId: string;
+  secret: string;
+  algorithm: TwoFactorAlgorithm;
+  issuer: string;
+}
+
+/**
+ * A parsed `nexapipe://` invite. Mirrors `InvitePayload` in `src-tauri/src/lib.rs`, which gets it
+ * from the one parser in `crates/nexapipe-client/src/provisioning.rs` — the UI never parses an
+ * invite itself, so a code printed by the server reads the same here as it does on Android.
+ */
+export interface InvitePayload {
+  /** `endpoint` for a bare Node ID, `ticket` for an address-bearing ticket. */
+  kind: 'endpoint' | 'ticket';
+  /** The Node ID, or the ticket, verbatim. */
+  target: string;
+  name?: string;
+  domains: string[];
+  relay?: string;
+  totp?: InviteTotp;
 }
 
 /**

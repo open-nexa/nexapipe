@@ -115,21 +115,40 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
     }
 }
 
-/// The token a caller has to present, when one has been published.
+/// Every token that has been published, in the order [`service_token_paths`] finds them.
 ///
-/// `None` is not "authentication is off": it means no desktop session has
-/// published a token, so there is no legitimate caller and every privileged
-/// message gets refused.
-///
-/// Looks past [`token_path`] because the service may not resolve that path the
-/// way the desktop session does — see [`service_token_paths`].
-pub fn read_token() -> Result<Option<String>, AppError> {
+/// All of them, not just the first: on Windows the service scans every profile on the machine
+/// because a loopback socket says nothing about which account dialled it, so which candidate
+/// happens to come first tells it nothing about which token the caller holds. A caller is
+/// legitimate when it presents any one of them — see [`token_matches_any`].
+pub fn read_tokens() -> Result<Vec<String>, AppError> {
+    let mut tokens = Vec::new();
     for candidate in service_token_paths() {
-        if let Some(token) = read_token_at(&candidate)? {
-            return Ok(Some(token));
+        // A root service scans every desktop session candidate. One inaccessible profile must
+        // not make every other session's valid token unusable.
+        match read_token_at(&candidate) {
+            Ok(Some(token)) => tokens.push(token),
+            Ok(None) => {}
+            Err(_) => continue,
         }
     }
-    Ok(None)
+    Ok(tokens)
+}
+
+/// The first published token, when one exists.
+///
+/// `None` is not "authentication is off": it means no desktop session has published a token,
+/// so there is no legitimate caller and every privileged message gets refused.
+///
+/// Looks past [`token_path`] because the service may not resolve that path the way the desktop
+/// session does — see [`service_token_paths`].
+pub fn read_token() -> Result<Option<String>, AppError> {
+    Ok(read_tokens()?.into_iter().next())
+}
+
+/// Whether `presented` is one of the published tokens.
+pub fn token_matches_any(tokens: &[String], presented: &str) -> bool {
+    tokens.iter().any(|token| token_matches(token, presented))
 }
 
 /// Every place the service looks for a token, in order.
@@ -142,7 +161,7 @@ pub fn read_token() -> Result<Option<String>, AppError> {
 /// profile the desktop app wrote into. LocalSystem can open a file inside any
 /// user's profile, so each profile is a candidate; the token itself never moves
 /// somewhere more widely readable just to make it findable.
-fn service_token_paths() -> Vec<PathBuf> {
+pub fn service_token_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     match std::env::var(TOKEN_PATH_ENV) {
         Ok(path) if !path.trim().is_empty() => paths.push(PathBuf::from(path)),
@@ -153,37 +172,130 @@ fn service_token_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
     paths.extend(profile_token_paths());
 
+    #[cfg(not(windows))]
+    paths.extend(unix_service_token_paths());
+
     paths
 }
 
-/// `<Users>\<profile>\AppData\Local\nexapipe\ipc.token` for every profile on
-/// the machine, best effort.
+/// User-session token locations a root service can discover on Unix.
+///
+/// The desktop writes into `XDG_RUNTIME_DIR/nexapipe/ipc.token` on Linux and
+/// `$HOME/.cache/nexapipe/ipc.token` on macOS, while an elevated service has a *root* runtime
+/// directory — and launchd hands a LaunchDaemon neither `HOME` nor `XDG_RUNTIME_DIR`, so
+/// [`token_path`] degrades to `/tmp/nexapipe/ipc.token` there. Scanning the per-session roots
+/// keeps both sides on the same secret without moving a private token to a shared directory.
+#[cfg(not(windows))]
+fn unix_service_token_paths() -> Vec<PathBuf> {
+    unix_service_token_paths_from(unix_home_roots())
+}
+
+/// Directories holding one home directory per user, per platform.
+///
+/// The two layouts are not interchangeable, and only one of them can be the roots for a given
+/// kernel: `/run/user` and `/home` are a Linux layout, while a macOS home — the only place a
+/// macOS desktop session ever writes a token — lives under `/Users`. Keeping the Linux pair as
+/// the sole roots is how a LaunchDaemon came to answer "no desktop session has published an IPC
+/// token" while that token sat in `/Users/<name>/.cache/nexapipe/ipc.token`; the service had no
+/// candidate that could ever reach it.
+#[cfg(not(windows))]
+fn unix_home_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let roots: &[&str] = &["/Users"];
+
+    #[cfg(not(target_os = "macos"))]
+    let roots: &[&str] = &["/run/user", "/home"];
+
+    roots.iter().map(PathBuf::from).collect()
+}
+
+#[cfg(not(windows))]
+fn unix_service_token_paths_from(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            paths.push(path.join(TOKEN_DIR).join(TOKEN_FILE));
+            paths.push(path.join(".cache").join(TOKEN_DIR).join(TOKEN_FILE));
+        }
+    }
+
+    paths
+}
+
+/// `<profiles root>\<profile>\AppData\Local\nexapipe\ipc.token` for every profile found under
+/// every plausible profiles root, best effort.
 #[cfg(windows)]
 fn profile_token_paths() -> Vec<PathBuf> {
-    // `%USERPROFILE%` is `C:\Users\<name>` when the service has one at all; its
-    // parent is the profiles root. Anything unexpected just yields nothing, and
-    // the service then fails closed with "no token on file".
-    let Ok(profile) = std::env::var("USERPROFILE") else {
-        return Vec::new();
-    };
-    let Some(profiles_root) = Path::new(&profile).parent() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(profiles_root) else {
-        return Vec::new();
-    };
+    let mut paths = Vec::new();
 
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
+    for root in profile_roots() {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+
+        paths.extend(entries.filter_map(Result::ok).map(|entry| {
             entry
                 .path()
                 .join("AppData")
                 .join("Local")
                 .join(TOKEN_DIR)
                 .join(TOKEN_FILE)
-        })
-        .collect()
+        }));
+    }
+
+    paths
+}
+
+/// Where user profiles live.
+///
+/// `USERPROFILE` is tried first because it is right whenever the service runs as the account
+/// that installed it — a dev build, or a launchd/systemd user agent. Under **LocalSystem** it
+/// is `C:\Windows\System32\config\systemprofile`, whose parent is the *config* directory and
+/// not the profiles root: scanning the parent then yields nothing at all, which is exactly how
+/// the service came to answer "no desktop session has published an IPC token" while the token
+/// sat in `C:\Users\<name>\AppData\Local\nexapipe\ipc.token`. `PUBLIC` (`C:\Users\Public`) and
+/// `%SystemDrive%\Users` both resolve to the real root for that account, so they are tried too.
+#[cfg(windows)]
+fn profile_roots() -> Vec<PathBuf> {
+    profile_roots_from(
+        std::env::var("USERPROFILE").ok().as_deref(),
+        std::env::var("PUBLIC").ok().as_deref(),
+        std::env::var("SystemDrive").ok().as_deref(),
+    )
+}
+
+/// [`profile_roots`] over explicit inputs, so the LocalSystem case can be tested without
+/// mutating the process environment.
+#[cfg(windows)]
+fn profile_roots_from(
+    user_profile: Option<&str>,
+    public: Option<&str>,
+    system_drive: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut add = |root: PathBuf| {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    };
+
+    if let Some(parent) = user_profile.and_then(|p| Path::new(p).parent()) {
+        add(parent.to_path_buf());
+    }
+    if let Some(parent) = public.and_then(|p| Path::new(p).parent()) {
+        add(parent.to_path_buf());
+    }
+    if let Some(drive) = system_drive {
+        add(Path::new(drive).join("Users"));
+    }
+
+    roots
 }
 
 /// [`read_token`] against an explicit path.
@@ -286,7 +398,13 @@ fn permissions(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_token_at, read_token_at, service_token_paths, token_matches};
+    use super::{
+        ensure_token_at, read_token_at, service_token_paths, token_matches, token_matches_any,
+    };
+    #[cfg(windows)]
+    use super::profile_roots_from;
+    #[cfg(not(windows))]
+    use super::{unix_home_roots, unix_service_token_paths_from};
     use std::path::PathBuf;
 
     /// Every test gets its own file, so none of them can see the others' state.
@@ -349,5 +467,110 @@ mod tests {
         assert!(!token_matches("abc123", "abc124"));
         assert!(!token_matches("abc123", "abc1234"));
         assert!(!token_matches("abc123", "ABC123"));
+    }
+
+    #[test]
+    fn any_published_token_authenticates() {
+        let tokens = vec!["first".to_string(), "second".to_string()];
+        assert!(token_matches_any(&tokens, "second"));
+        assert!(!token_matches_any(&tokens, "third"));
+        assert!(!token_matches_any(&[], "first"));
+    }
+
+    /// A scanned root is read as a directory *of home directories*, and both layouts a session
+    /// may have written into are derived from each home: the `$XDG_RUNTIME_DIR` spelling and the
+    /// `$HOME/.cache` fallback.
+    #[cfg(not(windows))]
+    #[test]
+    fn every_scanned_root_yields_both_token_layouts() {
+        let root = std::env::temp_dir().join(format!("nexapipe-roots-{}", fastrand::u64(..)));
+        let home = root.join("alice");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let candidates = unix_service_token_paths_from([root.clone()]);
+
+        assert!(
+            candidates.contains(&home.join(super::TOKEN_DIR).join(super::TOKEN_FILE)),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.contains(&home.join(".cache").join(super::TOKEN_DIR).join(super::TOKEN_FILE)),
+            "{candidates:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// macOS homes live under `/Users`. Neither `/run/user` (absent) nor `/home` (the empty
+    /// `auto_home` mount point) contains one, so a root service scanning only those has *no*
+    /// candidate that can reach the token a desktop session published — which is exactly how a
+    /// LaunchDaemon came to refuse every call while the token was sitting in
+    /// `/Users/<name>/.cache/nexapipe/ipc.token`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scans_the_directory_its_homes_live_in() {
+        assert!(
+            unix_home_roots().contains(&PathBuf::from("/Users")),
+            "macOS homes are under /Users: {:?}",
+            unix_home_roots()
+        );
+    }
+
+    /// The equivalent end-to-end check on a real account: the path this session actually wrote
+    /// has to be reachable *by the directory scan alone*. Deliberately not the whole candidate
+    /// list — `token_path()` happens to be right whenever `HOME` is set, which is precisely the
+    /// condition a LaunchDaemon does not meet, so asserting on it would pass while the scan that
+    /// has to carry the elevated service reaches nothing. Skipped where the account does not live
+    /// under a scanned root, so it asserts on macOS alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_accounts_token_file_is_a_service_candidate() {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        if home.parent() != Some(std::path::Path::new("/Users")) {
+            return;
+        }
+
+        let scanned = unix_service_token_paths_from(unix_home_roots());
+        let expected = home.join(".cache").join(super::TOKEN_DIR).join(super::TOKEN_FILE);
+
+        assert!(
+            scanned.contains(&expected),
+            "{expected:?} must be found by the scan, which reached {scanned:?}"
+        );
+    }
+
+    /// Linux keeps its own layout; the macOS fix must not have replaced it.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_scans_the_runtime_and_home_roots() {
+        let roots = unix_home_roots();
+
+        assert!(roots.contains(&PathBuf::from("/run/user")), "{roots:?}");
+        assert!(roots.contains(&PathBuf::from("/home")), "{roots:?}");
+    }
+
+    /// A Windows service runs as LocalSystem, whose `USERPROFILE` is the *system* profile —
+    /// `C:\Windows\System32\config\systemprofile`. Its parent is the config directory, not the
+    /// profiles root, so trusting it alone finds no user token at all and the service answers
+    /// "no desktop session has published an IPC token" while the token is sitting in
+    /// `C:\Users\<name>\AppData\Local\nexapipe\ipc.token`.
+    #[cfg(windows)]
+    #[test]
+    fn the_profiles_root_is_found_when_running_as_local_system() {
+        let roots = profile_roots_from(
+            Some(r"C:\Windows\System32\config\systemprofile"),
+            Some(r"C:\Users\Public"),
+            Some("C:"),
+        );
+
+        assert!(
+            roots.iter().any(|root| root == std::path::Path::new(r"C:\Users")),
+            "the real profiles root must be a candidate: {roots:?}"
+        );
+        // The misleading one is still tried — it costs a directory scan and nothing else.
+        assert!(roots.contains(&PathBuf::from(r"C:\Windows\System32\config")));
     }
 }

@@ -4,8 +4,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "vue-i18n";
 import { errorDetail, errorKey } from "../api/errors";
 import type { ServiceState } from "../types";
+import { useProxyStore } from "../stores/proxy";
 
 const { t } = useI18n();
+
+// Installing here changes whether the Connect page may offer TUN, and that gate lives in the
+// proxy store. Nothing else refreshes it, so without this the TUN toggle stays switched off —
+// and its "install service" button stays on screen — until the app is restarted.
+const { refreshServiceRunning } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
@@ -66,6 +72,8 @@ async function run(
     // The state is re-read even after a failure: an install that could not start the service, or
     // an uninstall that was refused, still leaves something behind to show.
     await refresh();
+    // And so is every other surface that depends on the service existing — see the import note.
+    void refreshServiceRunning();
     isLoading.value = false;
     busyWith.value = "";
     setTimeout(() => {

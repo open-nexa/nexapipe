@@ -1,10 +1,57 @@
 ﻿<script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import ServiceManager from "../components/ServiceManager.vue";
-import { useConfigStore } from "../composables/useConfigStore";
+import { useI18n } from "vue-i18n";
+import AppToggle from "../components/base/AppToggle.vue";
+import { useConfigStore } from "../stores/config";
+import { useProxyStore } from "../stores/proxy";
+import { useTheme } from "../composables/useTheme";
+import { useLocale } from "../composables/useLocale";
+import type { ThemePreference } from "../stores/prefs";
 
+const { t } = useI18n();
 const { config, updateConfig } = useConfigStore();
+// Toggling the backend changes where the status comes from, so the panel has to re-read it.
+const { refreshServiceRunning } = useProxyStore();
+
+/**
+ * Appearance is the one group that is not proxy configuration: theme and language are stored as
+ * UI preferences, and both apply live — no reload, and no re-entering the page.
+ */
+const { preference: themePreference, setTheme } = useTheme();
+const { locale, options: localeOptions, setLocale } = useLocale();
+
+/** Labels are i18n keys: the language list is the control that has to stay readable in any UI
+ *  language, so both selects resolve their text where they render. */
+const themeOptions: { value: ThemePreference; label: string }[] = [
+  { value: 'system', label: 'appearance.themeSystem' },
+  { value: 'light', label: 'appearance.themeLight' },
+  { value: 'dark', label: 'appearance.themeDark' },
+];
+
+function onThemeChange(event: Event): void {
+  setTheme((event.target as HTMLSelectElement).value as ThemePreference);
+}
+
+function onLocaleChange(event: Event): void {
+  setLocale((event.target as HTMLSelectElement).value);
+}
+
+/**
+ * Whether the proxy runs inside the app or through the installed system service.
+ *
+ * It used to be presented as a "Proxy Mode" (Normal / Service), which is not what it selects:
+ * the forwarding mode is TUN vs local proxy, and that is the switch on the Connect page. This is
+ * only *where* the proxy runs, so it belongs with the service it depends on.
+ */
+const useServiceModel = computed({
+  get: () => config.useService,
+  set: (enabled: boolean) => {
+    updateConfig({ useService: enabled });
+    void refreshServiceRunning();
+  },
+});
 
 const autoStart = ref(false);
 const minimizeOnClose = ref(true);
@@ -29,10 +76,6 @@ async function saveAutoStart() {
   }
 }
 
-function handleUseServiceChange() {
-  updateConfig({ useService: !config.useService });
-}
-
 loadSettings();
 </script>
 
@@ -40,64 +83,76 @@ loadSettings();
   <div class="settings-page">
     <div class="settings-section">
       <div class="card-header">
-        <h2>Service Management</h2>
+        <h2>{{ t('appearance.title') }}</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="5"/>
+              <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('appearance.theme') }}</span>
+              <span class="setting-hint">{{ t('appearance.themeHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <select class="select-input" :value="themePreference" @change="onThemeChange">
+              <option v-for="option in themeOptions" :key="option.value" :value="option.value">
+                {{ t(option.label) }}
+              </option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('appearance.language') }}</span>
+              <span class="setting-hint">{{ t('appearance.languageHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <!-- Options carry their native name, so the control stays findable even when the
+                 rest of the UI is in a language the reader does not understand. -->
+            <select class="select-input" :value="locale" @change="onLocaleChange">
+              <option v-for="option in localeOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="card-header">
+        <h2>{{ t('service.title') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
+      <div class="backend-row">
+        <div class="backend-text">
+          <span class="backend-label">{{ t('service.routeThrough') }}</span>
+          <span class="backend-hint">{{ t('service.routeThroughHint') }}</span>
+        </div>
+        <AppToggle v-model="useServiceModel" :label="t('service.routeThrough')" />
+      </div>
+
       <ServiceManager />
     </div>
 
     <div class="settings-section">
       <div class="card-header">
-        <h2>Proxy Mode</h2>
-        <div class="card-header-decoration"></div>
-      </div>
-      
-      <div class="mode-options">
-        <div 
-          class="mode-option" 
-          :class="{ active: !config.useService }"
-          @click="handleUseServiceChange"
-        >
-          <div class="mode-icon normal">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
-            </svg>
-          </div>
-          <div class="mode-info">
-            <span class="mode-title">Normal Mode</span>
-            <span class="mode-desc">Runs with standard user privileges; suitable for daily use</span>
-          </div>
-          <div class="mode-radio">
-            <div class="radio-inner"></div>
-          </div>
-        </div>
-        
-        <div 
-          class="mode-option" 
-          :class="{ active: config.useService }"
-          @click="handleUseServiceChange"
-        >
-          <div class="mode-icon service">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              <circle cx="12" cy="12" r="3"/>
-            </svg>
-          </div>
-          <div class="mode-info">
-            <span class="mode-title">Service Mode</span>
-            <span class="mode-desc">Runs as a system service; requires administrator privileges</span>
-          </div>
-          <div class="mode-radio">
-            <div class="radio-inner"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="settings-section">
-      <div class="card-header">
-        <h2>TUN Settings</h2>
+        <h2>{{ t('settings.tun') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
 
@@ -111,8 +166,8 @@ loadSettings();
               <line x1="2" y1="8.5" x2="12" y2="15.5"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">TUN Device Name</span>
-              <span class="setting-hint">Virtual network interface name (auto-assigned by macOS; ignored on that platform)</span>
+              <span class="setting-label">{{ t('settings.tunDeviceName') }}</span>
+              <span class="setting-hint">{{ t('settings.tunDeviceNameHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -131,7 +186,7 @@ loadSettings();
     
     <div class="settings-section">
       <div class="card-header">
-        <h2>Relay Settings</h2>
+        <h2>{{ t('settings.relay') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
 
@@ -144,8 +199,8 @@ loadSettings();
               <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Relay Mode</span>
-              <span class="setting-hint">Configure the iroh relay forwarding mode</span>
+              <span class="setting-label">{{ t('settings.relayMode') }}</span>
+              <span class="setting-hint">{{ t('settings.relayModeHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -154,10 +209,10 @@ loadSettings();
               class="select-input"
               @change="updateConfig({ relayMode: config.relayMode })"
             >
-              <option value="pinned">Pinned (aps1-1, stable)</option>
-              <option value="default">Default (all N0 relays)</option>
-              <option value="disabled">Disabled (direct only)</option>
-              <option value="custom">Custom URL</option>
+              <option value="pinned">{{ t('settings.relayPinned') }}</option>
+              <option value="default">{{ t('settings.relayDefault') }}</option>
+              <option value="disabled">{{ t('settings.relayDisabled') }}</option>
+              <option value="custom">{{ t('settings.relayCustom') }}</option>
             </select>
           </div>
         </div>
@@ -169,8 +224,8 @@ loadSettings();
               <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Relay URL</span>
-              <span class="setting-hint">Custom relay server address</span>
+              <span class="setting-label">{{ t('settings.relayUrl') }}</span>
+              <span class="setting-hint">{{ t('settings.relayUrlHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -183,133 +238,35 @@ loadSettings();
           </div>
         </div>
 
-        <div class="setting-item">
-          <div class="setting-left">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-            </svg>
-            <div class="setting-info">
-              <span class="setting-label">Force Relay</span>
-              <span class="setting-hint">Always route connections through the relay server (disable direct connections)</span>
-            </div>
-          </div>
-          <div class="setting-right">
-            <button
-              class="toggle"
-              :class="{ active: config.forceRelay }"
-              @click="updateConfig({ forceRelay: !config.forceRelay })"
-            >
-              <div class="toggle-thumb"></div>
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="settings-section">
-      <div class="card-header">
-        <h2>2FA Authentication</h2>
-        <div class="card-header-decoration"></div>
-      </div>
-
-      <div class="settings-list">
-        <div class="setting-item">
+        <div class="setting-item" v-if="config.relayMode === 'custom'">
           <div class="setting-left">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="11" width="18" height="11" rx="2"/>
               <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Enable 2FA Authentication</span>
-              <span class="setting-hint">Perform TOTP two-step verification when connecting to the server</span>
+              <span class="setting-label">{{ t('settings.relayAuthToken') }}</span>
+              <span class="setting-hint">{{ t('settings.relayAuthTokenHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
-            <button
-              class="toggle"
-              :class="{ active: config.twoFactorEnabled }"
-              @click="updateConfig({ twoFactorEnabled: !config.twoFactorEnabled })"
-            >
-              <div class="toggle-thumb"></div>
-            </button>
+            <input
+              v-model="config.relayAuthToken"
+              class="text-input"
+              type="password"
+              :placeholder="t('common.optional')"
+              @change="updateConfig({ relayAuthToken: config.relayAuthToken.trim() })"
+            />
           </div>
         </div>
 
-        <template v-if="config.twoFactorEnabled">
-          <div class="setting-item">
-            <div class="setting-left">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="8" r="4"/>
-                <path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>
-              </svg>
-              <div class="setting-info">
-                <span class="setting-label">Client ID</span>
-                <span class="setting-hint">Must match the ID configured under [auth.clients] on the server</span>
-              </div>
-            </div>
-            <div class="setting-right">
-              <input
-                v-model="config.twoFactorClientId"
-                class="text-input"
-                placeholder="client-001"
-                @change="updateConfig({ twoFactorClientId: config.twoFactorClientId.trim() })"
-              />
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <div class="setting-left">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="11" width="18" height="11" rx="2"/>
-                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-              </svg>
-              <div class="setting-info">
-                <span class="setting-label">TOTP Secret</span>
-                <span class="setting-hint">Base32 secret key, generated with nexapipe --generate-2fa</span>
-              </div>
-            </div>
-            <div class="setting-right">
-              <input
-                v-model="config.twoFactorSecret"
-                class="text-input"
-                type="password"
-                placeholder="JBSWY3DPEHPK3PXP"
-                @change="updateConfig({ twoFactorSecret: config.twoFactorSecret.trim() })"
-              />
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <div class="setting-left">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="2" y1="12" x2="22" y2="12"/>
-                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-              </svg>
-              <div class="setting-info">
-                <span class="setting-label">Algorithm</span>
-                <span class="setting-hint">Must match the algorithm in [auth] on the server</span>
-              </div>
-            </div>
-            <div class="setting-right">
-              <select
-                v-model="config.twoFactorAlgorithm"
-                class="select-input"
-                @change="updateConfig({ twoFactorAlgorithm: config.twoFactorAlgorithm })"
-              >
-                <option value="sha1">SHA1 (default)</option>
-                <option value="sha256">SHA256</option>
-                <option value="sha512">SHA512</option>
-              </select>
-            </div>
-          </div>
-        </template>
       </div>
     </div>
 
+
 <div class="settings-section">
       <div class="card-header">
-        <h2>App Settings</h2>
+        <h2>{{ t('settings.app') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
@@ -321,8 +278,8 @@ loadSettings();
               <circle cx="12" cy="12" r="10"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Launch at Startup</span>
-              <span class="setting-hint">Automatically run the proxy when the app launches</span>
+              <span class="setting-label">{{ t('settings.launchAtStartup') }}</span>
+              <span class="setting-hint">{{ t('settings.launchAtStartupHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -342,8 +299,8 @@ loadSettings();
               <path d="M5 12h14M12 5l7 7-7 7"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Minimize on Close</span>
-              <span class="setting-hint">Minimize to the system tray when the close button is clicked</span>
+              <span class="setting-label">{{ t('settings.minimizeOnClose') }}</span>
+              <span class="setting-hint">{{ t('settings.minimizeOnCloseHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -365,17 +322,17 @@ loadSettings();
               <line x1="16" y1="13" x2="8" y2="13"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Log Level</span>
-              <span class="setting-hint">Controls the verbosity of log output</span>
+              <span class="setting-label">{{ t('settings.logLevel') }}</span>
+              <span class="setting-hint">{{ t('settings.logLevelHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
             <select v-model="logLevel" class="select-input">
-              <option value="trace">Trace</option>
-              <option value="debug">Debug</option>
-              <option value="info">Info</option>
-              <option value="warn">Warn</option>
-              <option value="error">Error</option>
+              <option value="trace">{{ t('logs.levelTrace') }}</option>
+              <option value="debug">{{ t('logs.levelDebug') }}</option>
+              <option value="info">{{ t('logs.levelInfo') }}</option>
+              <option value="warn">{{ t('logs.levelWarn') }}</option>
+              <option value="error">{{ t('logs.levelError') }}</option>
             </select>
           </div>
         </div>
@@ -384,21 +341,21 @@ loadSettings();
 
     <div class="settings-section">
       <div class="card-header">
-        <h2>About</h2>
+        <h2>{{ t('settings.about') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
       <div class="about-info">
         <div class="about-item">
-          <span class="about-label">Version</span>
+          <span class="about-label">{{ t('common.version') }}</span>
           <span class="about-value">v0.1.0</span>
         </div>
         <div class="about-item">
-          <span class="about-label">Built With</span>
+          <span class="about-label">{{ t('settings.builtWith') }}</span>
           <span class="about-value">Tauri + Vue 3</span>
         </div>
         <div class="about-item">
-          <span class="about-label">License</span>
+          <span class="about-label">{{ t('settings.license') }}</span>
           <span class="about-value">MIT License</span>
         </div>
       </div>
@@ -453,6 +410,38 @@ loadSettings();
   height: 2px;
   background: var(--gradient-primary);
   border-radius: 1px;
+}
+
+/* The execution backend, sitting with the service it depends on: this chooses *where* the proxy
+   runs, not what it does — that is the TUN switch on the Connect page. */
+.backend-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+}
+
+.backend-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.backend-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.backend-hint {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .mode-options {

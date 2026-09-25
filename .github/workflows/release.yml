@@ -30,8 +30,12 @@ concurrency:
 # not silently hit the same problem again.
 # To switch branch/SHA without touching this workflow: Settings -> Secrets and
 # variables -> Actions -> Variables, and add NEXAPIPE_REF to override the default
-# below.
+# below. NEXAPIPE_REPO does the same for the repository: on a fork, point it at your
+# own server repo (e.g. <your-org>/nexapipe) so the desktop branch picks up the
+# matching server-side crates -- otherwise the clone lands on open-nexa/nexapipe@main,
+# which has none of the branch's client changes and CI dies on unresolved imports.
 env:
+  NEXAPIPE_REPO: ${{ vars.NEXAPIPE_REPO || 'open-nexa/nexapipe' }}
   NEXAPIPE_REF: ${{ vars.NEXAPIPE_REF || 'main' }}
 
 jobs:
@@ -108,7 +112,7 @@ jobs:
         with:
           path: ui-desktop
 
-      - name: Fetch path dependency (open-nexa/nexapipe)
+      - name: Fetch path dependency (${{ vars.NEXAPIPE_REPO || 'open-nexa/nexapipe' }})
         # src-tauri depends on ../../crates/nexapipe-client, which is not part of this
         # repo (see the note at the top of this file).
         #
@@ -129,13 +133,17 @@ jobs:
           DEP_TOKEN: ${{ secrets.NEXAPIPE_REPO_TOKEN }}
         run: |
           set -eo pipefail
+          if [[ ! "$NEXAPIPE_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::NEXAPIPE_REPO must be owner/repo (got: $NEXAPIPE_REPO)"
+            exit 1
+          fi
           git_args=()
           if [ -n "$DEP_TOKEN" ]; then
             auth=$(printf 'x-access-token:%s' "$DEP_TOKEN" | base64 | tr -d '\n')
             git_args=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth")
           fi
           git "${git_args[@]}" clone --depth 1 --branch "$NEXAPIPE_REF" \
-            https://github.com/open-nexa/nexapipe "$GITHUB_WORKSPACE/nexapipe-deps"
+            "https://github.com/$NEXAPIPE_REPO" "$GITHUB_WORKSPACE/nexapipe-deps"
 
       - name: Stage crates at workspace root
         shell: bash
@@ -149,7 +157,8 @@ jobs:
             *) echo "::error::unexpected destination path: $dst"; exit 1 ;;
           esac
           if [ ! -d "$src" ]; then
-            echo "::error::crates/ not found in open-nexa/nexapipe@$NEXAPIPE_REF."
+            echo "::error::crates/ not found in $NEXAPIPE_REPO@$NEXAPIPE_REF."
+            echo "Hint: if this repo is a fork, set the NEXAPIPE_REPO variable to your own server repo."
             echo "--- $GITHUB_WORKSPACE ---"; ls -la "$GITHUB_WORKSPACE" || true
             echo "--- nexapipe-deps ---"; ls -la "$GITHUB_WORKSPACE/nexapipe-deps" || true
             echo "Hint: make sure the branch NEXAPIPE_REF points at really contains crates/ (currently $NEXAPIPE_REF)."
@@ -273,6 +282,11 @@ jobs:
             --bundles ${{ matrix.bundles }} \
             --target ${{ matrix.target }} \
             --config ci-override.json
+
+      - name: Verify Debian service upgrade packaging
+        if: matrix.os == 'linux'
+        shell: bash
+        run: .github/scripts/verify-deb.sh
 
       - name: Stage build artifacts
         id: stage

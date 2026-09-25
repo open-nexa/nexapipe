@@ -97,6 +97,35 @@ fn is_elevated_child() -> bool {
     std::env::args_os().any(|arg| arg.as_os_str() == std::ffi::OsStr::new(ELEVATED_ARG))
 }
 
+/// Resolves the executable that should be re-launched for elevation.
+///
+/// Linux reports a replaced executable as PATH (deleted) through procfs. The replacement
+/// installed at the original path is still the right program to launch, while the deleted path
+/// cannot be opened by pkexec at all.
+pub fn current_executable() -> Result<PathBuf, AppError> {
+    let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
+
+    #[cfg(unix)]
+    if let Some(replacement) = unix_replacement_executable(&exe) {
+        return Ok(replacement);
+    }
+
+    Ok(exe)
+}
+
+#[cfg(unix)]
+fn unix_replacement_executable(path: &Path) -> Option<PathBuf> {
+    let replacement = strip_deleted_marker(path)?;
+    replacement.is_file().then_some(replacement)
+}
+
+#[cfg(unix)]
+fn strip_deleted_marker(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let replacement = raw.strip_suffix(" (deleted)")?;
+    Some(PathBuf::from(replacement))
+}
+
 #[cfg(windows)]
 fn is_privileged_windows() -> bool {
     const SCRIPT: &str = "$identity = [Security.Principal.WindowsIdentity]::GetCurrent(); \
@@ -126,7 +155,7 @@ fn is_privileged_windows() -> bool {
 /// false negative cannot turn into an elevation loop, but the child then runs inline with no
 /// prompt instead of going through the platform dialog.
 pub fn run_self_elevated(args: &[&str]) -> Result<(), AppError> {
-    let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
+    let exe = current_executable()?;
     let requested: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
     let result_path = result_file_path();
@@ -411,11 +440,25 @@ fn spawn_elevated(exe: &Path, args: &[String]) -> Result<ElevatedSpawn, AppError
         // Only a dismissed dialog is a refusal; every other non-zero status — including the
         // child's own exit code — is explained by the output it left behind.
         let denied = output.status.code() == Some(PKEXEC_CANCELLED);
+        let hint = format_output(&output);
+        let failure = if !denied && !output.status.success() {
+            let detail = if hint.is_empty() {
+                format!("pkexec exited with {}", output.status)
+            } else {
+                hint.clone()
+            };
+            Some(AppError::with_detail(
+                codes::SERVICE_ELEVATION_FAILED,
+                detail,
+            ))
+        } else {
+            None
+        };
         return Ok(ElevatedSpawn {
             waited: true,
-            failure: None,
+            failure,
             denied,
-            hint: format_output(&output),
+            hint,
         });
     }
 

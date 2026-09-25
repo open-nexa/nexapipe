@@ -12,6 +12,10 @@ export function detectConnectionType(input: string): ConnectionInfo {
     return { type: 'ticket', value: '' };
   }
   
+  // `nexapipe://` reaches here only from a caller that has not screened for an invite first: an
+  // invitation is a whole link, not a connection string, and the UI routes it to the importer
+  // (`api/invite.ts` `isInviteLink`) before it ever gets this far. Treating it as a ticket keeps
+  // the last-resort behaviour below from silently storing a URI that is not one.
   if (trimmed.startsWith('nexapipe://') || trimmed.startsWith('ticket:')) {
     return { type: 'ticket', value: trimmed };
   }

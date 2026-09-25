@@ -11,12 +11,14 @@
  */
 import { reactive, watch } from 'vue';
 import type {
+  ConnectionType,
+  InvitePayload,
   LoadBalancingStrategy,
   NodeConfig,
+  NodeTwoFactor,
   PersistedConfig,
   ProxyConfig,
 } from '../types';
-import { detectConnectionType } from '../utils/connection';
 
 const STORAGE_KEY = 'nexapipe.config';
 const LEGACY_STORAGE_KEY = 'nexa-config';
@@ -26,17 +28,16 @@ const SAVE_DEBOUNCE_MS = 300;
 /**
  * Whether a migrated legacy payload may be deleted yet.
  *
- * `false` while `composables/useConfigStore.ts` still reads `nexa-config` — that is, while the
- * un-migrated pages are still the ones writing the user's configuration. Deleting the key now
- * would silently reset the Config page to an empty node list and look like data loss, so the copy
- * is written and the original is left alone until the last reader is gone. Phase 3 flips this to
- * `true` in the same commit that deletes the old loader (§5.7, R3).
+ * Now `true`: every page and component reads this store, and the second loader that used to read
+ * `nexa-config` (`composables/useConfigStore.ts`) is gone, so the legacy key has no readers left.
+ * It is deleted in the same commit that removed that loader — the copy is written first either
+ * way, so an older build downgraded onto this one still finds its configuration (§5.7, R3).
  *
  * A function rather than a `const`, because a constant `false` makes the branch unreachable to
  * TypeScript and turns the constant itself into an unused-local error.
  */
 function dropLegacyKey(): boolean {
-  return false;
+  return true;
 }
 
 export function generateNodeId(): string {
@@ -47,7 +48,7 @@ const defaultConfig: ProxyConfig = {
   nodes: [],
   domains: [],
   localAddr: '127.0.0.1:8080',
-  dnsAddr: '10.0.0.254:53',
+  dnsAddr: '198.18.0.254:53',
   upstreamDns: '223.5.5.5:53',
   loadBalancing: 'round_robin',
   tunName: 'nexa-tun',
@@ -55,11 +56,7 @@ const defaultConfig: ProxyConfig = {
   useService: false,
   relayMode: 'pinned',
   relayUrl: '',
-  forceRelay: false,
-  twoFactorEnabled: false,
-  twoFactorClientId: '',
-  twoFactorSecret: '',
-  twoFactorAlgorithm: 'sha1',
+  relayAuthToken: '',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -74,15 +71,34 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
 
+/**
+ * A node's 2FA credentials, or `undefined` when it has none — which is a node that performs no
+ * handshake, not a node with blank credentials.
+ */
+function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
+  if (!isRecord(raw)) return undefined;
+  const secret = asString(raw.secret, '').trim();
+  if (!secret) return undefined;
+  const algorithm =
+    raw.algorithm === 'sha256' || raw.algorithm === 'sha512' ? raw.algorithm : 'sha1';
+  return { clientId: asString(raw.clientId, ''), secret, algorithm };
+}
+
 function normalizeNode(raw: unknown): NodeConfig | null {
   if (!isRecord(raw)) return null;
   const connectionType = raw.connectionType === 'endpoint_id' ? 'endpoint_id' : 'ticket';
+  const twoFactor = normalizeTwoFactor(raw.twoFactor);
+  // `name` is cosmetic but it is the label an invite gave itself; dropping it here would blank
+  // every imported node's name on the next reload.
+  const name = asString(raw.name, '').trim();
   return {
     id: asString(raw.id, '') || generateNodeId(),
     connectionType,
     ticket: asString(raw.ticket, ''),
     endpointId: asString(raw.endpointId, ''),
     domains: Array.isArray(raw.domains) ? raw.domains.filter((d) => typeof d === 'string') : [],
+    ...(name ? { name } : {}),
+    ...(twoFactor ? { twoFactor } : {}),
   };
 }
 
@@ -95,7 +111,16 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   const config: ProxyConfig = { ...defaultConfig };
 
   if (Array.isArray(raw.nodes)) {
-    config.nodes = raw.nodes.map(normalizeNode).filter((node): node is NodeConfig => node !== null);
+    config.nodes = raw.nodes
+      .map(normalizeNode)
+      .filter((node): node is NodeConfig => node !== null)
+      // A node with neither a ticket nor an endpoint ID routes nothing and is dropped by the
+      // backend at start-up, so it is dropped here too. They can only be left over from the
+      // "Add Node" button that created an empty row to be filled in by hand: nodes now come from
+      // invites, which always carry a connection string. Dropping them at load rather than
+      // hiding them in the UI keeps the stored config, the node count and what actually
+      // connects in agreement, and stops the placeholder being written back on every save.
+      .filter((node) => node.ticket.trim() !== '' || node.endpointId.trim() !== '');
   } else if (raw.connectionType || raw.ticket || raw.endpointId) {
     // Pre-nodes payload: a single connection lived at the top level.
     const node = normalizeNode({
@@ -117,8 +142,7 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   config.upstreamDns = asString(raw.upstreamDns, config.upstreamDns);
   config.tunName = asString(raw.tunName, config.tunName) || defaultConfig.tunName;
   config.relayUrl = asString(raw.relayUrl, config.relayUrl);
-  config.twoFactorClientId = asString(raw.twoFactorClientId, config.twoFactorClientId);
-  config.twoFactorSecret = asString(raw.twoFactorSecret, config.twoFactorSecret);
+  config.relayAuthToken = asString(raw.relayAuthToken, config.relayAuthToken);
 
   if (raw.loadBalancing === 'random' || raw.loadBalancing === 'round_robin') {
     config.loadBalancing = raw.loadBalancing;
@@ -131,20 +155,23 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   ) {
     config.relayMode = raw.relayMode;
   }
-  if (
-    raw.twoFactorAlgorithm === 'sha1' ||
-    raw.twoFactorAlgorithm === 'sha256' ||
-    raw.twoFactorAlgorithm === 'sha512'
-  ) {
-    config.twoFactorAlgorithm = raw.twoFactorAlgorithm;
+  // 2FA used to be one global pair. It applied to every server, so the honest migration is to
+  // copy it onto every node this payload had; a node that already carries its own keeps them.
+  const legacyTwoFactor = normalizeTwoFactor({
+    clientId: raw.twoFactorClientId,
+    secret: raw.twoFactorSecret,
+    algorithm: raw.twoFactorAlgorithm,
+  });
+  if (legacyTwoFactor) {
+    for (const node of config.nodes) {
+      if (!node.twoFactor) node.twoFactor = { ...legacyTwoFactor };
+    }
   }
 
   // `useTun` is new in version 1 and defaults to off, so a payload written before the explicit
   // mode model keeps running in local proxy mode rather than suddenly claiming the tunnel.
   config.useTun = asBoolean(raw.useTun, defaultConfig.useTun);
   config.useService = asBoolean(raw.useService, config.useService);
-  config.forceRelay = asBoolean(raw.forceRelay, config.forceRelay);
-  config.twoFactorEnabled = asBoolean(raw.twoFactorEnabled, config.twoFactorEnabled);
 
   return config;
 }
@@ -236,16 +263,115 @@ export function useConfigStore() {
     Object.assign(config, updates);
   }
 
-  function addNode(node?: Partial<NodeConfig>): NodeConfig {
-    const newNode: NodeConfig = {
-      id: node?.id || generateNodeId(),
-      connectionType: node?.connectionType || 'ticket',
-      ticket: node?.ticket || '',
-      endpointId: node?.endpointId || '',
-      domains: node?.domains || [],
+  /**
+   * Creates a node. Private on purpose: a node is something an invite brings, so there is no
+   * longer any code path that can add an empty one (the old `addNode()` used to be wired to a
+   * button on the Config page).
+   */
+  function createNode(node: Partial<NodeConfig> & { connectionType: ConnectionType }): NodeConfig {
+    const created: NodeConfig = {
+      id: node.id || generateNodeId(),
+      connectionType: node.connectionType,
+      ticket: node.ticket ?? '',
+      endpointId: node.endpointId ?? '',
+      domains: node.domains ? [...node.domains] : [],
+      ...(node.name ? { name: node.name } : {}),
+      ...(node.twoFactor ? { twoFactor: node.twoFactor } : {}),
     };
-    config.nodes.push(newNode);
-    return newNode;
+    config.nodes.push(created);
+    return created;
+  }
+
+  /**
+   * Applies a parsed invite: one node carrying its target and domains, plus the two settings an
+   * invite reaches that are *not* per-node — the relay and the 2FA credentials.
+   *
+   * An endpoint already in the list is reused instead of duplicated: a second node pointing at
+   * the same backend would only split traffic between two identical entries, and importing the
+   * same invite twice (or a newer one for the same server) is meant to top up its domains.
+   *
+   * The invite's relay is *not* applied unless the caller opts in: the relay is a global setting,
+   * so adopting it silently would repoint every other node's home relay on the strength of one
+   * invite. It says how that endpoint is reachable, not what this machine should use.
+   *
+   * Returns which of the two happened, so the caller can say so.
+   */
+  function applyInvite(
+    invite: InvitePayload,
+    options: { applyRelay?: boolean } = {},
+  ): 'added' | 'merged' {
+    const connectionType: ConnectionType =
+      invite.kind === 'ticket' ? 'ticket' : 'endpoint_id';
+    const existing = config.nodes.find(
+      (node) =>
+        node.connectionType === connectionType &&
+        (connectionType === 'ticket' ? node.ticket : node.endpointId) === invite.target,
+    );
+
+    const name = invite.name?.trim() || undefined;
+    let outcome: 'added' | 'merged';
+    let node: NodeConfig;
+
+    if (existing) {
+      node = existing;
+      outcome = 'merged';
+      // A name already typed here wins: it is the label the user chose for this endpoint.
+      if (name && !node.name) node.name = name;
+    } else {
+      node = createNode({
+        connectionType,
+        ticket: connectionType === 'ticket' ? invite.target : '',
+        endpointId: connectionType === 'endpoint_id' ? invite.target : '',
+        domains: [],
+        ...(name ? { name } : {}),
+      });
+      outcome = 'added';
+    }
+
+    const domains = [...node.domains];
+    for (const domain of invite.domains) {
+      if (!domains.includes(domain)) domains.push(domain);
+    }
+    node.domains = domains;
+
+    if (invite.relay && options.applyRelay) {
+      config.relayMode = 'custom';
+      config.relayUrl = invite.relay;
+    }
+
+    // The credentials belong to the server this invite came from, so they land on its node and
+    // nowhere else — a second server keeps whatever it was given before.
+    if (invite.totp) {
+      node.twoFactor = {
+        clientId: invite.totp.clientId,
+        secret: invite.totp.secret,
+        algorithm: invite.totp.algorithm,
+      };
+    }
+
+    return outcome;
+  }
+
+  /** Sets or replaces one node's 2FA credentials, leaving every other node alone. */
+  function setNodeTwoFactor(nodeId: string, patch: Partial<NodeTwoFactor>): void {
+    const node = config.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    node.twoFactor = {
+      clientId: patch.clientId ?? node.twoFactor?.clientId ?? '',
+      secret: patch.secret ?? node.twoFactor?.secret ?? '',
+      algorithm: patch.algorithm ?? node.twoFactor?.algorithm ?? 'sha1',
+    };
+  }
+
+  /** Drops a node's credentials, which is what "this server has no 2FA" looks like. */
+  function clearNodeTwoFactor(nodeId: string): void {
+    const node = config.nodes.find((candidate) => candidate.id === nodeId);
+    if (node) delete node.twoFactor;
+  }
+
+  /** Whether a node would perform a handshake: credentials with a secret in them. */
+  function hasTwoFactor(node: NodeConfig): boolean {
+    return !!node.twoFactor && node.twoFactor.secret.trim() !== '';
   }
 
   function removeNode(nodeId: string): void {
@@ -258,19 +384,13 @@ export function useConfigStore() {
     if (node) Object.assign(node, updates);
   }
 
-  function updateConnectionString(nodeId: string, value: string): void {
-    const node = config.nodes.find((candidate) => candidate.id === nodeId);
-    if (!node) return;
-    const info = detectConnectionType(value);
-    node.connectionType = info.type;
-    if (info.type === 'ticket') {
-      node.ticket = info.value;
-      node.endpointId = '';
-    } else {
-      node.endpointId = info.value;
-      node.ticket = '';
-    }
-  }
+  /**
+   * Deliberately absent: `updateConnectionString`.
+   *
+   * A node's target is whatever its invite named, and there is no longer a UI that retypes one —
+   * the connection string is displayed with a reveal/copy affordance instead of edited. Keeping a
+   * setter around would only invite the old free-text field back.
+   */
 
   function updateNodeDomains(nodeId: string, domains: string[]): void {
     updateNode(nodeId, { domains });
@@ -287,11 +407,13 @@ export function useConfigStore() {
   return {
     config,
     updateConfig,
-    addNode,
     removeNode,
     updateNode,
-    updateConnectionString,
     updateNodeDomains,
+    applyInvite,
+    setNodeTwoFactor,
+    clearNodeTwoFactor,
+    hasTwoFactor,
     setLoadBalancing,
     resetConfig,
   };

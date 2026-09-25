@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::AppError,
+    proxy::NodeTwoFactor,
     status::{EndpointLink, ProxyStatus},
 };
 
@@ -13,6 +14,37 @@ pub struct NodeInput {
     pub ticket: String,
     pub endpoint_id: String,
     pub domains: Vec<String>,
+    /// 2FA credentials for this endpoint alone. Every field is optional so a caller that has
+    /// nothing to say about 2FA — and an older UI talking to a newer service — still round-trips.
+    #[serde(default)]
+    pub two_factor_client_id: Option<String>,
+    #[serde(default)]
+    pub two_factor_secret: Option<String>,
+    #[serde(default)]
+    pub two_factor_algorithm: Option<String>,
+}
+
+impl NodeInput {
+    /// The 2FA credentials this node carries, if it carries any.
+    ///
+    /// Credentials live on the node because each server keeps its own `[auth].clients` entry: one
+    /// shared pair is what made a second server either refuse the handshake or be given the first
+    /// one's secret. A node with no secret performs no handshake, which is also how one client
+    /// mixes servers that require 2FA with ones that do not.
+    pub fn two_factor(&self) -> Option<NodeTwoFactor> {
+        let secret = self.two_factor_secret.as_deref().unwrap_or_default().trim();
+        if secret.is_empty() {
+            return None;
+        }
+        Some(NodeTwoFactor {
+            client_id: self.two_factor_client_id.clone().unwrap_or_default(),
+            secret: secret.to_string(),
+            algorithm: self
+                .two_factor_algorithm
+                .clone()
+                .unwrap_or_else(|| "sha1".to_string()),
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,11 +63,9 @@ pub struct StartProxyRequest {
     pub use_tun: Option<bool>,
     pub relay_mode: Option<String>,
     pub relay_url: Option<String>,
-    pub force_relay: Option<bool>,
-    pub two_factor_enabled: Option<bool>,
-    pub two_factor_client_id: Option<String>,
-    pub two_factor_secret: Option<String>,
-    pub two_factor_algorithm: Option<String>,
+    /// Bearer token for a custom relay that requires one.
+    #[serde(default)]
+    pub relay_auth_token: Option<String>,
 }
 
 /// Largest line [`IPC_SOCKET_PATH`] accepts.
@@ -54,12 +84,22 @@ pub enum IpcMessage {
     /// Everything else is refused until this succeeds, because the service runs
     /// elevated and a loopback socket says nothing about who dialled it.
     Auth(String),
-    StartProxy(StartProxyRequest),
+    /// Boxed: `StartProxyRequest` is ~250 bytes while every other variant is a
+    /// `String` or a `Vec`, so the enum would otherwise be sized after its rarest
+    /// variant and every message would pay for it.
+    StartProxy(Box<StartProxyRequest>),
     StopProxy,
     GetStatus,
     GetNodeId,
     /// How each configured node currently reaches its backend (direct / relay).
     GetEndpointLinks,
+    /// The failure the last [`IpcMessage::StartProxy`] recorded after it had already answered
+    /// `Ok`, if any.
+    ///
+    /// The proxy starts on a spawned task and the service cannot wait for it — a TUN run loop
+    /// only returns when the tunnel goes down — so a start that fails a second later would
+    /// otherwise leave the caller with nothing but "it stopped again".
+    GetStartupError,
 }
 
 /// What the service sends back.
@@ -78,4 +118,64 @@ pub enum IpcResponse {
     Status(ProxyStatus),
     NodeId(String),
     EndpointLinks(Vec<EndpointLink>),
+    /// `None` means the last start settled without a failure.
+    StartupError(Option<AppError>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> NodeInput {
+        NodeInput {
+            connection_type: "endpoint_id".to_string(),
+            ticket: String::new(),
+            endpoint_id: "node".to_string(),
+            domains: Vec::new(),
+            two_factor_client_id: None,
+            two_factor_secret: None,
+            two_factor_algorithm: None,
+        }
+    }
+
+    /// An endpoint with no secret performs no handshake, which is what makes a mixed setup —
+    /// some servers with 2FA, some without — expressible at all.
+    #[test]
+    fn a_node_without_a_secret_carries_no_credentials() {
+        let mut node = node();
+        node.two_factor_client_id = Some("client-001".to_string());
+        assert!(node.two_factor().is_none());
+    }
+
+    #[test]
+    fn a_node_with_a_secret_defaults_the_algorithm() {
+        let mut node = node();
+        node.two_factor_client_id = Some("client-001".to_string());
+        // Padded the way a value pasted out of a config file arrives.
+        node.two_factor_secret = Some(" jbswy3dpehpk3pxp ".to_string());
+
+        let two_factor = node.two_factor().expect("the node carries a secret");
+        assert_eq!(two_factor.client_id, "client-001");
+        assert_eq!(two_factor.secret, "jbswy3dpehpk3pxp");
+        assert_eq!(two_factor.algorithm, "sha1");
+    }
+
+    /// Two nodes in one request carry two different keys; nothing here flattens them.
+    #[test]
+    fn two_nodes_keep_their_own_credentials() {
+        let mut first = node();
+        first.two_factor_client_id = Some("client-001".to_string());
+        first.two_factor_secret = Some("jbswy3dpehpk3pxp".to_string());
+        first.two_factor_algorithm = Some("sha256".to_string());
+
+        let mut second = node();
+        second.two_factor_client_id = Some("client-002".to_string());
+        second.two_factor_secret = Some("mfrggzdfmztwq2lk".to_string());
+
+        let first = first.two_factor().expect("the first node has credentials");
+        let second = second.two_factor().expect("the second node has credentials");
+        assert_ne!(first.secret, second.secret);
+        assert_eq!(first.algorithm, "sha256");
+        assert_eq!(second.algorithm, "sha1");
+    }
 }

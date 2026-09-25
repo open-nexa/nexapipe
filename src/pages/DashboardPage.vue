@@ -1,48 +1,98 @@
 ﻿<script setup lang="ts">
 import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import ProxyStatusControl from "../components/ProxyStatusControl.vue";
 import AppIcon from "../components/base/AppIcon.vue";
-import { useConfigStore } from "../composables/useConfigStore";
-import type { NodeConfig } from "../types";
+import { useConfigStore } from "../stores/config";
+import { useProxyStore } from "../stores/proxy";
+import type { LinkKind, NodeConfig } from "../types";
 
-const { config, proxyStatus, linkKindFor } = useConfigStore();
+const { t } = useI18n();
+const { config } = useConfigStore();
+const { status, linkKindFor } = useProxyStore();
 
 /**
- * The icon for one node's current path, or null when nothing is connected to it.
+ * The endpoints traffic is actually going through right now, each with the kind of path it is
+ * using.
  *
- * Only rendered while the proxy is up: an unconnected node has no link kind, and a stale
- * "direct" badge on a node nothing is talking to is worse than no badge.
+ * This is the runtime answer, not the configuration: the node list below says what was set up,
+ * this card says what happened. A node that is configured but not connected is absent here on
+ * purpose — an empty card says "nothing is connected", which is the truth, and a stale badge on
+ * a node nothing is talking to would be a lie.
  */
-function nodeLink(node: NodeConfig) {
-  const kind = linkKindFor(node);
-  if (!kind) return null;
-  const icon =
-    kind === "direct" ? "link-direct" : kind === "relay" ? "link-relay" : "link-unknown";
-  const label = kind === "direct" ? "Direct" : kind === "relay" ? "Relay" : "Connecting";
-  return { kind, icon, label };
+/**
+ * A node with no connection string cannot route anything and the backend drops it at start-up, so
+ * it is not counted here either — otherwise "Node Count" and the list would disagree with what
+ * actually connects. Same filter as the Config page.
+ */
+const nodes = computed(() =>
+  config.nodes.filter((node) => node.ticket.trim() !== "" || node.endpointId.trim() !== ""),
+);
+
+const connected = computed(() =>
+  nodes.value
+    .map((node) => ({ node, kind: linkKindFor(node) }))
+    .filter((entry): entry is { node: NodeConfig; kind: LinkKind } => entry.kind !== null),
+);
+
+const directCount = computed(
+  () => connected.value.filter((entry) => entry.kind === "direct").length,
+);
+const relayCount = computed(
+  () => connected.value.filter((entry) => entry.kind === "relay").length,
+);
+
+/** "2 direct · 1 relay" — only the parts that are non-zero. */
+const linkSummary = computed(() =>
+  [
+    directCount.value ? t("connect.directCount", { count: directCount.value }) : "",
+    relayCount.value ? t("connect.relayCount", { count: relayCount.value }) : "",
+  ]
+    .filter(Boolean)
+    .join(" · "),
+);
+
+/** The name the invite gave it, or a shortened connection string. */
+function endpointLabel(node: NodeConfig): string {
+  if (node.name) return node.name;
+  const value = node.connectionType === "ticket" ? node.ticket : node.endpointId;
+  return value.length <= 24 ? value : `${value.slice(0, 14)}…${value.slice(-6)}`;
+}
+
+function kindIcon(kind: LinkKind): string {
+  return kind === "direct" ? "link-direct" : kind === "relay" ? "link-relay" : "link-unknown";
+}
+
+function kindLabel(kind: LinkKind): string {
+  return kind === "direct"
+    ? t("link.direct")
+    : kind === "relay"
+      ? t("link.relay")
+      : t("link.connecting");
 }
 
 const connectionLabel = computed(() => {
-  if (config.nodes.length === 0) return 'Not configured';
-  const hasTicket = config.nodes.some(n => n.connectionType === 'ticket');
-  const hasEndpoint = config.nodes.some(n => n.connectionType === 'endpoint_id');
-  if (hasTicket && hasEndpoint) return 'Hybrid';
-  return hasTicket ? 'Ticket' : 'Endpoint ID';
+  if (nodes.value.length === 0) return t('connection.notConfigured');
+  const hasTicket = nodes.value.some(n => n.connectionType === 'ticket');
+  const hasEndpoint = nodes.value.some(n => n.connectionType === 'endpoint_id');
+  if (hasTicket && hasEndpoint) return t('connection.hybrid');
+  return hasTicket ? t('connection.ticket') : t('connection.endpointId');
 });
 
+/** The mode the proxy is *actually* running in, which is not always the one that was asked for. */
 const modeLabel = computed(() => {
-  if (!proxyStatus.value.running) return 'Not running';
-  return proxyStatus.value.mode === 'tun' ? 'TUN' : 'Local Proxy';
+  if (!status.value.running) return t('mode.not_running');
+  return status.value.mode === 'tun' ? t('mode.tun') : t('mode.local_proxy');
 });
 
 const modeColor = computed(() => {
-  if (!proxyStatus.value.running) return '#6b7280';
-  return proxyStatus.value.mode === 'tun' ? '#16a34a' : '#d97706';
+  if (!status.value.running) return '#6b7280';
+  return status.value.mode === 'tun' ? '#16a34a' : '#d97706';
 });
 
 const uniqueDomains = computed(() => {
   const domains = new Set<string>();
-  config.nodes.forEach(node => {
+  nodes.value.forEach(node => {
     node.domains.forEach(d => domains.add(d));
   });
   return domains.size;
@@ -52,10 +102,24 @@ const uniqueDomains = computed(() => {
 <template>
   <div class="dashboard">
     <div class="status-card">
-      <ProxyStatusControl
-        :config="config"
-        @status-change="(status) => useConfigStore().setProxyStatus(status)"
-      />
+      <ProxyStatusControl />
+    </div>
+
+    <div v-if="connected.length > 0" class="connected-card">
+      <div class="section-header">
+        <h2>{{ t('connect.connectedEndpoints') }}</h2>
+        <span v-if="linkSummary" class="section-count">{{ linkSummary }}</span>
+      </div>
+
+      <ul class="connected-list">
+        <li v-for="entry in connected" :key="entry.node.id" class="connected-row">
+          <span class="connected-label">{{ endpointLabel(entry.node) }}</span>
+          <span class="link-badge" :class="entry.kind">
+            <AppIcon :name="kindIcon(entry.kind)" :size="12" />
+            <span>{{ kindLabel(entry.kind) }}</span>
+          </span>
+        </li>
+      </ul>
     </div>
 
     <div class="stats-row">
@@ -67,7 +131,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ connectionLabel }}</span>
-          <span class="stat-label">Connection Method</span>
+          <span class="stat-label">{{ t('connect.connectionMethod') }}</span>
         </div>
       </div>
 
@@ -82,7 +146,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value" :style="{ color: modeColor }">{{ modeLabel }}</span>
-          <span class="stat-label">Proxy Mode</span>
+          <span class="stat-label">{{ t('connect.proxyMode') }}</span>
         </div>
       </div>
 
@@ -95,7 +159,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ uniqueDomains }}</span>
-          <span class="stat-label">Domain Count</span>
+          <span class="stat-label">{{ t('connect.domainCount') }}</span>
         </div>
       </div>
 
@@ -115,59 +179,47 @@ const uniqueDomains = computed(() => {
           </svg>
         </div>
         <div class="stat-info">
-          <span class="stat-value">{{ config.nodes.length }}</span>
-          <span class="stat-label">Node Count</span>
+          <span class="stat-value">{{ nodes.length }}</span>
+          <span class="stat-label">{{ t('connect.nodeCount') }}</span>
         </div>
       </div>
     </div>
 
     <div class="nodes-section">
       <div class="section-header">
-        <h2>Node List</h2>
-        <span class="section-count">{{ config.nodes.length }} nodes</span>
+        <h2>{{ t('connect.nodeList') }}</h2>
+        <span class="section-count">{{ t('connect.nodeCountBadge', { count: nodes.length }) }}</span>
       </div>
 
-      <div v-if="config.nodes.length === 0" class="empty-state">
+      <div v-if="nodes.length === 0" class="empty-state">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
           <circle cx="12" cy="12" r="3"/>
         </svg>
-        <span>No nodes configured</span>
-        <span class="empty-hint">Go to the Config page to add nodes</span>
+        <span>{{ t('connect.noNodes') }}</span>
+        <span class="empty-hint">{{ t('connect.noNodesHint') }}</span>
       </div>
 
       <div v-else class="nodes-list">
-        <div 
-          v-for="(node, index) in config.nodes" 
-          :key="node.id" 
+        <div
+          v-for="(node, index) in nodes"
+          :key="node.id"
           class="node-item"
         >
           <div class="node-index">{{ index + 1 }}</div>
           <div class="node-info">
             <div class="node-header">
-              <span 
-                class="type-badge" 
+              <span
+                class="type-badge"
                 :class="node.connectionType === 'ticket' ? 'ticket' : 'endpoint'"
               >
-                {{ node.connectionType === 'ticket' ? 'Ticket' : 'Endpoint ID' }}
+                {{ node.connectionType === 'ticket' ? t('connection.ticket') : t('connection.endpointId') }}
               </span>
-              <span class="node-domains-count">{{ node.domains.length }} domains</span>
-              <span
-                v-if="nodeLink(node)"
-                class="link-badge"
-                :class="nodeLink(node)!.kind"
-                :title="nodeLink(node)!.label"
-              >
-                <AppIcon :name="nodeLink(node)!.icon" :size="12" />
-                <span>{{ nodeLink(node)!.label }}</span>
-              </span>
+              <span class="node-domains-count">{{ t('config.domainsCount', { count: node.domains.length }) }}</span>
             </div>
             <div class="node-value">
-              {{ node.connectionType === 'ticket' ? node.ticket : node.endpointId || 'Not configured' }}
+              {{ endpointLabel(node) }}
             </div>
-          </div>
-          <div class="node-status" :class="{ running: proxyStatus.running }">
-            <span class="status-dot"></span>
           </div>
         </div>
       </div>
@@ -188,6 +240,45 @@ const uniqueDomains = computed(() => {
   padding: 24px;
   box-shadow: var(--shadow-card);
   border: 1px solid var(--border-light);
+}
+
+/* Only rendered while something is connected, so it never appears as an empty heading. */
+.connected-card {
+  background: var(--surface-1);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  box-shadow: var(--shadow-card);
+  border: 1px solid var(--border-light);
+}
+
+.connected-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.connected-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+}
+
+.connected-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .stats-row {
@@ -400,6 +491,7 @@ const uniqueDomains = computed(() => {
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 8px;
+  flex-shrink: 0;
 }
 
 .link-badge.direct {
@@ -426,35 +518,19 @@ const uniqueDomains = computed(() => {
   white-space: nowrap;
 }
 
-.node-status {
-  flex-shrink: 0;
-}
-
-.node-status .status-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--text-muted);
-}
-
-.node-status.running .status-dot {
-  background: var(--success-500);
-  box-shadow: 0 0 6px var(--success-500);
-}
-
 @media (max-width: 600px) {
   .stats-row {
     grid-template-columns: 1fr;
   }
-  
+
   .stat-card {
     padding: 16px;
   }
-  
+
   .stat-value {
     font-size: 16px;
   }
-  
+
   .node-item {
     padding: 12px;
   }

@@ -45,10 +45,19 @@ tun = { version = "0.7", features = ["async"] }
 libc = "0.2"
 nexapipe-client = { path = "../../crates/nexapipe-client", features = [
     "local-proxy",
+    "tun-proxy",
 ] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.5"
+# Only for the TUN address: `netsh` silently does nothing when this runs as a service
+# (LocalSystem), which is the same class of failure as `net session` — see proxy/routing.rs.
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+] }
 
 [[bin]]
 name = "nexa-service"

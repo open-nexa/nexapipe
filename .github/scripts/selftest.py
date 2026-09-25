@@ -86,12 +86,18 @@ try:
         ".github/scripts/ci-config.mjs",
         ".github/scripts/stage-artifact.mjs",
         ".github/scripts/latest-json.mjs",
+        ".github/scripts/verify-deb.sh",
     ]
     blob = yaml_path.read_text(encoding="utf-8")
     for s in scripts:
         check(f"workflow references {s}", s in blob)
         check(f"{s} exists", (ROOT / s).exists())
     check("assemble-release.mjs exists", (ROOT / ".github/scripts/assemble-release.mjs").exists())
+    deb_checks = [s for s in steps if s.get("name") == "Verify Debian service upgrade packaging"]
+    check("there is a Debian service lifecycle verification step", len(deb_checks) == 1, f"actual {len(deb_checks)}")
+    if deb_checks:
+        check("Debian verification is Linux-only", deb_checks[0].get("if") == "matrix.os == 'linux'")
+        check("Debian verification calls verify-deb.sh", "verify-deb.sh" in (deb_checks[0].get("run") or ""))
     check("release job depends on build", doc["jobs"]["release"]["needs"] == "build")
 
     # The AppImage bundler copies /usr/bin/xdg-open into the image (shell-open API is

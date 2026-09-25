@@ -25,7 +25,9 @@ its own history: <https://github.com/open-nexa/nexa-desktop>.
 - Multi-node configuration: several server nodes, each owning a set of domains;
   `round_robin` or `random` load balancing. The same domain on several nodes is
   load balanced automatically.
-- Relay control (`default` / `custom` URL / `disabled`) and "force relay".
+- Relay control: `pinned` (default), `default`, `custom` URL (with an optional
+  auth token), or `disabled`. No "force relay" switch — iroh 1.0.1 offers no way
+  to make it true.
 - TOTP 2FA credentials (client id, secret, algorithm).
 - Live status, in-app log viewer, service install/uninstall.
 - Bilingual UI (English + 简体中文), light/dark theme, self-updater.
@@ -154,10 +156,27 @@ the UI can say exactly why TUN could not start.
   connection around 50 Mbps at 200 ms RTT. Overrides without a rebuild:
   `NEXAPIPE_QUIC_STREAM_WINDOW`, `NEXAPIPE_QUIC_SEND_WINDOW`,
   `NEXAPIPE_QUIC_INITIAL_MTU`, `NEXAPIPE_QUIC_KEEPALIVE_MS`.
-- **Logs**: `%APPDATA%/nexa/logs` on Windows (temp directory elsewhere),
-  rotated daily; `RUST_LOG` controls the level.
+- **Logs**: `%APPDATA%/nexa/logs` on Windows and `$XDG_STATE_HOME/nexa/logs`
+  (or `~/.local/state/nexa/logs`) for the desktop app on Unix; the service writes
+  to `/var/log/nexa-service`. Files rotate daily; `RUST_LOG` controls the level.
 - **i18n**: `en` is the source of truth and the fallback. `lint:i18n` fails the
   build on a key that exists in one locale only.
+- **App icon on macOS comes from `src-tauri/icons/icon.icns`, and nothing
+  regenerates it.** Tauri copies that file into
+  `nexa.app/Contents/Resources/icon.icns` byte for byte; the PNG entries in
+  `bundle.icon` are for Linux and Windows only. Regenerate from the master art
+  whenever the logo changes, or a stale `.icns` ships unnoticed:
+
+  ```bash
+  swift scripts/gen-icons.swift src-tauri/icons/nexapipe.png   # --mode full-bleed for a square icon
+  ```
+
+  `nexapipe.png` is the 1258×1258 master and must stay at least 1024×1024, or
+  the large `.icns` representations get upscaled and the Dock icon turns into a
+  blurry smear. The script renders every representation from the master at its
+  native size and applies Apple's icon grid (824/1024 content box, continuous
+  corners). macOS caches Dock icons aggressively: after rebuilding, touch the
+  bundle and, if the old icon persists, run `killall Dock`.
 - Design notes for the UI refactor live in
   [`docs/ui-refactor-plan.md`](docs/ui-refactor-plan.md).
 

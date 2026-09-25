@@ -11,5 +11,15 @@
         "decorations": true
       }
     ]
+  },
+  "bundle": {
+    "linux": {
+      "deb": {
+        "preInstallScript": "./debian/preinst",
+        "postInstallScript": "./debian/postinst",
+        "preRemoveScript": "./debian/prerm",
+        "postRemoveScript": "./debian/postrm"
+      }
+    }
   }
 }

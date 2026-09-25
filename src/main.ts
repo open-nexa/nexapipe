@@ -22,7 +22,7 @@ import i18n, { resolveLocale, setI18nLocale } from './i18n';
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
-import { initProxyState } from './stores/proxy';
+import { initProxyState, onAppFocused } from './stores/proxy';
 
 import './styles/tokens.css';
 import './styles/themes.css';
@@ -45,6 +45,12 @@ async function bootstrap(): Promise<void> {
   app.mount('#app');
 
   void initProxyState();
+
+  // The status poll keeps running in the background, but a machine that was just asleep has been
+  // showing the status it had before it slept — read immediately instead of waiting the interval.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') onAppFocused();
+  });
 }
 
 void bootstrap();

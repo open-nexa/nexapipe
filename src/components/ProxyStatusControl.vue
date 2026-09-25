@@ -1,470 +1,293 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import AppIcon from "./base/AppIcon.vue";
-import type { ProxyConfig, ProxyStatus, EndpointLink, LinkKind } from "../types";
-import { useConfigStore } from "../composables/useConfigStore";
-
-const props = defineProps<{
-  config: ProxyConfig;
-}>();
-
-const emit = defineEmits<{
-  (e: "statusChange", status: ProxyStatus): void;
-}>();
-
-const {
-  proxyStatus: storeStatus,
-  endpointLinks: storeLinks,
-  setEndpointLinks,
-} = useConfigStore();
-
 /**
- * How often the link type of each node is re-read while the proxy is up. iroh can promote a
- * relayed connection to a direct one at any moment, so this is polled rather than sampled once.
+ * The Connect page's status panel: what the proxy is doing right now, the one control that
+ * changes it, and the forwarding-mode switch.
+ *
+ * It renders state and nothing else. Every `invoke()` lives in `stores/proxy.ts`, which also owns
+ * the poll that keeps this panel current — hence no refresh button: the status, the node ID and
+ * every node's link kind are re-read on a timer, so a service that dies, or a path iroh promotes
+ * from relay to direct, shows up on its own (§3.3).
+ *
+ * The switch is an explicit request, never a probe: TUN is gated on the service being installed,
+ * and when it cannot be honoured the backend fails with `proxy.tun_unavailable` instead of
+ * quietly forwarding traffic another way (docs/ui-refactor-plan.md §5.12).
  */
-const LINK_POLL_INTERVAL_MS = 5000;
+import { computed, ref } from 'vue';
+import { useI18n } from 'vue-i18n';
+import { invoke } from '@tauri-apps/api/core';
+import AppButton from './base/AppButton.vue';
+import AppIcon from './base/AppIcon.vue';
+import AppToggle from './base/AppToggle.vue';
+import { errorKey } from '../api/errors';
+import { confirm } from '../composables/useConfirm';
+import { useToast } from '../composables/useToast';
+import { useConfigStore } from '../stores/config';
+import { useProxyStore } from '../stores/proxy';
+import type { LinkKind } from '../types';
 
-const status = ref<ProxyStatus>(storeStatus.value);
-const nodeId = ref<string>("");
-const isLoading = ref(false);
-const errorMessage = ref<string>("");
+const { t } = useI18n();
+const toast = useToast();
 
-function copyNodeId() {
-  if (nodeId.value) {
-    navigator.clipboard.writeText(nodeId.value);
-  }
-}
+const { config } = useConfigStore();
+const {
+  status,
+  nodeId,
+  busy,
+  startupError,
+  serviceRunning,
+  serviceInstalled,
+  endpointLinks,
+  stale,
+  canStart,
+  start,
+  stop,
+  refreshServiceRunning,
+  setUseTun,
+} = useProxyStore();
 
-const modeLabel = computed(() => {
-  switch (status.value.mode) {
-    case "tun":
-      return "TUN Mode";
-    case "local_proxy":
-      return "Local Proxy Mode";
-    case "starting":
-      return "Starting";
-    case "stopped":
-      return "Stopped";
-    default:
-      return status.value.mode;
-  }
+const installing = ref(false);
+
+const modeLabel = computed(() =>
+  status.value.running ? t(`mode.${status.value.mode}`) : t('status.stopped'),
+);
+
+const statusLabel = computed(() => {
+  if (status.value.running) return t('status.running');
+  if (status.value.mode === 'starting') return t('status.starting');
+  return t('status.stopped');
 });
 
-const statusColor = computed(() => {
-  if (status.value.running) {
-    return "#22c55e";
-  }
-  return "#6b7280";
-});
-
-const modeColor = computed(() => {
-  switch (status.value.mode) {
-    case "tun":
-      return "#16a34a";
-    case "local_proxy":
-      return "#d97706";
-    case "starting":
-      return "#3b82f6";
-    default:
-      return "#6b7280";
-  }
-});
+/** The failure `start_proxy` recorded after it had already returned, if any. */
+const startupMessage = computed(() =>
+  startupError.value ? t(errorKey(startupError.value, 'error.proxy.start_failed')) : '',
+);
 
 /**
  * What the link indicator shows: the kind of path traffic is *actually* taking, not the relay
- * mode from the configuration.
- *
- * This used to read the config (ticket vs endpoint ID), which answered a different question —
- * a node given as a ticket may well connect directly, and an endpoint ID is not a promise of a
- * direct path either. Null when no node has reported a path yet, so nothing is claimed.
+ * mode from the configuration. Null when no node has reported a path yet, so nothing is claimed.
  */
 const linkInfo = computed(() => {
-  const kinds: LinkKind[] = storeLinks.value
-    .map(l => l.link)
-    .filter(k => k !== 'unknown');
+  const kinds: LinkKind[] = endpointLinks.value
+    .map((link) => link.link)
+    .filter((kind) => kind !== 'unknown');
   if (kinds.length === 0) return null;
 
-  const direct = kinds.filter(k => k === 'direct').length;
-  if (direct === kinds.length) {
-    return { label: 'Direct', icon: 'link-direct', color: '#06b6d4' };
+  const direct = kinds.filter((kind) => kind === 'direct').length;
+  if (direct === kinds.length) return { label: 'Direct', icon: 'link-direct', tone: 'direct' };
+  if (direct === 0) return { label: 'Relay', icon: 'link-relay', tone: 'relay' };
+  return { label: 'Mixed', icon: 'link-relay', tone: 'mixed' };
+});
+
+const tunHint = computed(() =>
+  serviceRunning.value ? t('connect.tunHint') : t('connect.tunRequiresService'),
+);
+
+/**
+ * Flipping the mode while the proxy is up is a restart, not a toggle: the backend only reads
+ * `use_tun` when it starts. Asking first is the difference between "the tunnel blinked" and
+ * "the tunnel blinked and I do not know why".
+ */
+async function setTun(enabled: boolean): Promise<void> {
+  if (enabled && !serviceRunning.value) {
+    toast.warning(t('connect.tunRequiresService'));
+    return;
   }
-  if (direct === 0) {
-    return { label: 'Relay', icon: 'link-relay', color: '#8b5cf6' };
+
+  if (!status.value.running) {
+    setUseTun(enabled);
+    return;
   }
-  return { label: 'Mixed', icon: 'link-relay', color: '#f59e0b' };
+
+  const ok = await confirm({
+    title: t('connect.tunRestartTitle'),
+    message: t('connect.tunRestartMessage', {
+      mode: enabled ? t('mode.tun') : t('mode.local_proxy'),
+    }),
+    tone: 'warning',
+  });
+  if (!ok) return;
+
+  setUseTun(enabled);
+  await stop();
+  await start();
+}
+
+/** Bound to the switch: `AppToggle` is controlled, so a refused change has to be swallowed here. */
+const tunModel = computed({
+  get: () => config.useTun,
+  set: (enabled: boolean) => {
+    void setTun(enabled);
+  },
 });
 
 /**
- * Reads how every node is currently reaching its backend.
- *
- * Infallible: an empty answer means "nothing is connected", which the UI renders by drawing no
- * link icon at all — a failure here must never become a red error over an otherwise healthy
- * proxy.
+ * Installing the service from here rather than sending the user to Settings: the switch they
+ * just tried to flip is the thing that needs it, and the elevation prompt explains itself.
  */
-async function updateEndpointLinks() {
+async function installServiceForTun(): Promise<void> {
+  const ok = await confirm({
+    title: t('connect.tunInstallTitle'),
+    message: t('connect.tunInstallMessage'),
+  });
+  if (!ok) return;
+
+  installing.value = true;
   try {
-    setEndpointLinks(
-      await invoke<EndpointLink[]>("get_endpoint_links", {
-        useService: props.config.useService,
-      }),
-    );
-  } catch (e) {
-    console.error("Failed to get endpoint links:", e);
-    setEndpointLinks([]);
-  }
-}
-
-async function updateStatus() {
-  try {
-    // The backend returns a structured `ProxyStatus`; the `"true:tun"` string this used to split
-    // predates that change, which left the panel permanently showing "Stopped". Kept in sync until
-    // this component is replaced in Phase 3.1.
-    const result = await invoke<ProxyStatus>("get_proxy_status", {
-      useService: props.config.useService,
-    });
-    status.value = result;
-    
-    if (status.value.running) {
-      try {
-        nodeId.value = await invoke<string>("get_node_id", {
-          useService: props.config.useService,
-        });
-      } catch {
-        nodeId.value = "";
-      }
-      await updateEndpointLinks();
-    } else {
-      nodeId.value = "";
-      setEndpointLinks([]);
-    }
-    
-    emit("statusChange", status.value);
-    errorMessage.value = "";
-  } catch (e: any) {
-    errorMessage.value = e.message || "Failed to get status";
-    console.error("Failed to get proxy status:", e);
-  }
-}
-
-let linkPollTimer: ReturnType<typeof setInterval> | null = null;
-
-onMounted(() => {
-  updateStatus();
-  // Only while running: a stopped proxy has no link to report, and the poll would be answered
-  // with an empty list anyway.
-  linkPollTimer = setInterval(() => {
-    if (status.value.running) {
-      void updateEndpointLinks();
-    }
-  }, LINK_POLL_INTERVAL_MS);
-});
-
-onUnmounted(() => {
-  if (linkPollTimer !== null) {
-    clearInterval(linkPollTimer);
-    linkPollTimer = null;
-  }
-});
-
-async function startProxy() {
-  if (isLoading.value) return;
-  
-  isLoading.value = true;
-  errorMessage.value = "";
-  
-  const backendNodes = props.config.nodes
-    .filter(n => n.ticket || n.endpointId)
-    .map(n => ({
-      connection_type: n.connectionType,
-      ticket: n.connectionType === 'ticket' ? n.ticket : '',
-      endpoint_id: n.connectionType === 'endpoint_id' ? n.endpointId : '',
-      domains: n.domains,
-    }));
-  
-  try {
-    await invoke<string>("start_proxy", {
-      nodes: backendNodes,
-      domains: props.config.domains,
-      localAddr: props.config.localAddr,
-      dnsAddr: props.config.dnsAddr,
-      upstreamDns: props.config.upstreamDns,
-      loadBalancing: props.config.loadBalancing,
-      tunName: props.config.tunName,
-      useService: props.config.useService,
-        relayMode: props.config.relayMode,
-        relayUrl: props.config.relayUrl,
-        forceRelay: props.config.forceRelay,
-        twoFactorEnabled: props.config.twoFactorEnabled,
-        twoFactorClientId: props.config.twoFactorClientId,
-        twoFactorSecret: props.config.twoFactorSecret,
-        twoFactorAlgorithm: props.config.twoFactorAlgorithm,
-      });
-    
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    await updateStatus();
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const startupError = await invoke<string | null>("get_startup_error");
-    if (startupError) {
-      errorMessage.value = startupError;
-      console.error("Proxy startup error:", startupError);
-    }
-  } catch (e: any) {
-    errorMessage.value = e.message || "Failed to start proxy";
-    console.error("Failed to start proxy:", e);
+    await invoke<void>('install_service');
+    await refreshServiceRunning();
+    toast.success(t('service.installed'));
+  } catch (error) {
+    toast.error(error, 'error.service.install_failed');
   } finally {
-    isLoading.value = false;
+    installing.value = false;
   }
 }
 
-async function stopProxy() {
-  if (isLoading.value) return;
-  
-  isLoading.value = true;
-  errorMessage.value = "";
-  
+async function copyNodeId(): Promise<void> {
+  if (!nodeId.value) return;
   try {
-    await invoke<string>("stop_proxy", {
-      useService: props.config.useService,
-    });
-    
-    await new Promise(resolve => setTimeout(resolve, 500));
-    await updateStatus();
-  } catch (e: any) {
-    errorMessage.value = e.message || "Failed to stop proxy";
-    console.error("Failed to stop proxy:", e);
-  } finally {
-    isLoading.value = false;
+    await navigator.clipboard.writeText(nodeId.value);
+    toast.success(t('common.copied'));
+  } catch {
+    toast.error(t('common.copyFailed'));
   }
 }
 </script>
 
 <template>
-  <div class="status-control">
-    <div class="card-header">
-      <h2>Proxy Status</h2>
-      <div class="card-header-decoration"></div>
-    </div>
-    
-    <div class="status-section">
-      <div class="status-main">
-        <div class="status-ring" :class="{ running: status.running, starting: status.mode === 'starting' }">
-          <div class="status-ring-inner"></div>
-          <div class="status-ring-glow"></div>
-          <div class="status-dot" :style="{ backgroundColor: statusColor }"></div>
-        </div>
-        <div class="status-text-container">
-          <span class="status-title">{{ status.running ? "Running" : "Stopped" }}</span>
-          <span class="status-subtitle">{{ modeLabel }}</span>
-        </div>
+  <div class="proxy-status">
+    <div class="proxy-status__main">
+      <span
+        class="proxy-status__ring"
+        :class="{ running: status.running, starting: status.mode === 'starting' }"
+        aria-hidden="true"
+      >
+        <span class="proxy-status__dot" />
+      </span>
+
+      <div class="proxy-status__text">
+        <span class="proxy-status__title">{{ statusLabel }}</span>
+        <span class="proxy-status__subtitle">{{ modeLabel }}</span>
       </div>
-      
-      <div v-if="status.running" class="mode-indicators">
-        <div class="mode-indicator" :style="{ backgroundColor: modeColor + '15', borderColor: modeColor + '30' }">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :style="{ color: modeColor }">
-            <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
-            <line x1="12" y1="22" x2="12" y2="15.5"/>
-            <line x1="22" y1="8.5" x2="12" y2="15.5"/>
-            <line x1="2" y1="8.5" x2="12" y2="15.5"/>
-          </svg>
-          <span :style="{ color: modeColor }">{{ modeLabel }}</span>
-        </div>
-        <div
-          v-if="linkInfo"
-          class="connection-indicator"
-          :style="{ backgroundColor: linkInfo.color + '15', borderColor: linkInfo.color + '30' }"
-          :title="`Traffic is reaching ${linkInfo.label === 'Mixed' ? 'some nodes directly and others through a relay' : (linkInfo.label === 'Direct' ? 'the backend directly' : 'the backend through a relay')}`"
+
+      <div class="proxy-status__actions">
+        <AppButton
+          v-if="!status.running"
+          tone="primary"
+          icon="play"
+          :loading="busy"
+          :disabled="!canStart"
+          @click="start()"
         >
-          <AppIcon :name="linkInfo.icon" :size="16" :style="{ color: linkInfo.color }" />
-          <span :style="{ color: linkInfo.color }">{{ linkInfo.label }}</span>
-        </div>
+          {{ t('connect.start') }}
+        </AppButton>
+        <AppButton v-else tone="danger" icon="stop" :loading="busy" @click="stop()">
+          {{ t('connect.stop') }}
+        </AppButton>
       </div>
     </div>
 
-    <div v-if="nodeId" class="node-info">
-      <div class="info-header">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-        </svg>
-        <span class="info-title">Node ID</span>
-      </div>
-      <div class="node-id-content">
-        <code class="node-id">{{ nodeId }}</code>
-        <button class="copy-btn" @click="copyNodeId">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-          </svg>
-        </button>
-      </div>
+    <div v-if="status.running" class="proxy-status__pills">
+      <span class="pill pill--mode">{{ modeLabel }}</span>
+      <span v-if="linkInfo" class="pill" :class="`pill--${linkInfo.tone}`">
+        <AppIcon :name="linkInfo.icon" :size="14" />
+        {{ linkInfo.label }}
+      </span>
     </div>
 
-    <div v-if="errorMessage" class="error-message">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="12" y1="8" x2="12" y2="12"/>
-        <line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
-      <span>{{ errorMessage }}</span>
+    <div v-if="nodeId" class="proxy-status__node">
+      <span class="proxy-status__label">{{ t('connect.nodeId') }}</span>
+      <code class="proxy-status__value">{{ nodeId }}</code>
+      <button
+        type="button"
+        class="proxy-status__copy"
+        :aria-label="t('common.copy')"
+        @click="copyNodeId"
+      >
+        <AppIcon name="copy" :size="16" />
+      </button>
     </div>
 
-    <div class="action-buttons">
-      <button
-        v-if="!status.running"
-        class="btn btn-primary"
-        :disabled="isLoading || config.nodes.length === 0 || config.nodes.every(n => !n.ticket && !n.endpointId)"
-        @click="startProxy"
+    <div class="proxy-status__tun">
+      <div class="proxy-status__tun-text">
+        <span class="proxy-status__tun-label">{{ t('connect.tunToggle') }}</span>
+        <span class="proxy-status__tun-hint">{{ tunHint }}</span>
+      </div>
+
+      <AppButton
+        v-if="!serviceInstalled"
+        size="sm"
+        tone="ghost"
+        :loading="installing"
+        @click="installServiceForTun"
       >
-        <svg v-if="isLoading" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="10"/>
-        </svg>
-        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-        <span>{{ isLoading ? 'Starting...' : 'Start Proxy' }}</span>
-      </button>
-      
-      <button
-        v-else
-        class="btn btn-danger"
-        :disabled="isLoading"
-        @click="stopProxy"
-      >
-        <svg v-if="isLoading" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="10"/>
-        </svg>
-        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="6" y="4" width="4" height="16"/>
-          <rect x="14" y="4" width="4" height="16"/>
-        </svg>
-        <span>{{ isLoading ? 'Stopping...' : 'Stop Proxy' }}</span>
-      </button>
-      
-      <button
-        class="btn btn-secondary"
-        :disabled="isLoading"
-        @click="updateStatus"
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="23 4 23 10 17 10"/>
-          <polyline points="1 20 1 14 7 14"/>
-          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-        </svg>
-        <span>Refresh Status</span>
-      </button>
+        {{ t('service.install') }}
+      </AppButton>
+
+      <AppToggle v-model="tunModel" :disabled="!serviceRunning" :label="t('connect.tunToggle')" />
     </div>
+
+    <p v-if="startupMessage" class="proxy-status__error">{{ startupMessage }}</p>
+
+    <p v-if="stale" class="proxy-status__stale">{{ t('connect.stale') }}</p>
   </div>
 </template>
 
 <style scoped>
-.status-control {
-  background: var(--surface-1);
-  border-radius: var(--radius-lg);
-  padding: 28px;
-  box-shadow: var(--shadow-card);
-  border: 1px solid var(--border-light);
+.proxy-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
 
-.card-header {
+.proxy-status__main {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 24px;
+  gap: var(--space-4);
 }
 
-.card-header h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.card-header-decoration {
-  flex: 1;
-  height: 3px;
-  background: var(--gradient-primary);
-  border-radius: 2px;
-}
-
-.status-section {
-  margin-bottom: 20px;
-}
-
-.status-main {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  margin-bottom: 16px;
-}
-
-.status-ring {
+.proxy-status__ring {
   position: relative;
-  width: 56px;
-  height: 56px;
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.status-ring-inner {
   width: 48px;
   height: 48px;
-  border: 3px solid var(--surface-3);
+  border: 3px solid var(--border-default);
   border-radius: 50%;
-  transition: all var(--transition-slow);
+  flex-shrink: 0;
+  transition: border-color var(--duration-fast) var(--ease-standard);
 }
 
-.status-ring.running .status-ring-inner {
-  border-color: rgba(34, 197, 94, 0.3);
+.proxy-status__ring.running {
+  border-color: var(--success);
 }
 
-.status-ring.starting .status-ring-inner {
-  border-color: rgba(59, 130, 246, 0.3);
+.proxy-status__ring.starting {
+  border-color: var(--accent);
 }
 
-.status-ring-glow {
-  position: absolute;
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: radial-gradient(circle, var(--surface-3) 0%, transparent 70%);
-  opacity: 0;
-  transition: opacity var(--transition-normal);
-}
-
-.status-ring.running .status-ring-glow {
-  background: radial-gradient(circle, rgba(34, 197, 94, 0.2) 0%, transparent 70%);
-  opacity: 1;
-}
-
-.status-ring.starting .status-ring-glow {
-  background: radial-gradient(circle, rgba(59, 130, 246, 0.2) 0%, transparent 70%);
-  opacity: 1;
-}
-
-.status-dot {
+.proxy-status__dot {
   width: 16px;
   height: 16px;
   border-radius: 50%;
   background: var(--text-muted);
-  transition: all var(--transition-normal);
-  position: relative;
-  z-index: 1;
+  transition: background-color var(--duration-fast) var(--ease-standard);
 }
 
-.status-ring.running .status-dot {
-  background: var(--success-500);
-  box-shadow: 0 0 12px var(--success-500);
+.proxy-status__ring.running .proxy-status__dot {
+  background: var(--success);
+  box-shadow: 0 0 12px var(--success);
 }
 
-.status-ring.starting .status-dot {
-  background: var(--primary-500);
-  animation: pulse 1.5s ease-in-out infinite;
+.proxy-status__ring.starting .proxy-status__dot {
+  background: var(--accent);
+  animation: proxy-status-pulse 1.5s ease-in-out infinite;
 }
 
-@keyframes pulse {
-  0%, 100% {
+@keyframes proxy-status-pulse {
+  0%,
+  100% {
     transform: scale(1);
     opacity: 1;
   }
@@ -474,232 +297,170 @@ async function stopProxy() {
   }
 }
 
-.status-text-container {
+.proxy-status__text {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
+  /* Without this a long zh-CN label squeezes the button instead of wrapping (§5.5). */
+  min-width: 0;
 }
 
-.status-title {
-  font-size: 18px;
-  font-weight: 700;
+.proxy-status__title {
+  font-size: var(--font-size-18);
+  font-weight: var(--font-weight-bold);
   color: var(--text-primary);
 }
 
-.status-subtitle {
-  font-size: 13px;
+.proxy-status__subtitle {
+  font-size: var(--font-size-13);
+  color: var(--text-secondary);
+}
+
+.proxy-status__actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.proxy-status__pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-12);
+  font-weight: var(--font-weight-medium);
+}
+
+.pill--mode {
+  background: var(--accent-subtle);
+  color: var(--accent-text);
+}
+
+.pill--direct {
+  background: var(--success-subtle);
+  color: var(--success-text);
+}
+
+.pill--relay {
+  background: var(--warning-subtle);
+  color: var(--warning-text);
+}
+
+.pill--mixed {
+  background: var(--bg-inset);
+  color: var(--text-secondary);
+}
+
+.proxy-status__node {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.proxy-status__label {
+  font-size: var(--font-size-12);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.proxy-status__value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-12);
+  line-height: var(--line-height-mono);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.proxy-status__copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.proxy-status__copy:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.proxy-status__copy:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.proxy-status__tun {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.proxy-status__tun-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+}
+
+.proxy-status__tun-label {
+  font-size: var(--font-size-14);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-primary);
+}
+
+.proxy-status__tun-hint {
+  font-size: var(--font-size-12);
   color: var(--text-muted);
 }
 
-.mode-indicators {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.mode-indicator,
-.connection-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  border-radius: 12px;
-  border: 1px solid;
-  font-size: 13px;
-  font-weight: 500;
-  transition: all var(--transition-normal);
-}
-
-.mode-indicator svg,
-.connection-indicator svg {
-  width: 16px;
-  height: 16px;
-}
-
-.node-info {
-  background: var(--surface-2);
-  border-radius: var(--radius-md);
-  padding: 16px;
-  margin-bottom: 16px;
-  border: 1px solid var(--border-light);
-}
-
-.info-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.info-header svg {
-  width: 16px;
-  height: 16px;
-  color: var(--primary-600);
-}
-
-.info-title {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.node-id-content {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.node-id {
-  flex: 1;
-  font-family: 'SF Mono', Monaco, 'Courier New', monospace;
-  font-size: 13px;
-  color: var(--text-primary);
-  background: var(--surface-1);
-  padding: 10px 12px;
+.proxy-status__error {
+  margin: 0;
+  padding: var(--space-3);
+  border-left: 3px solid var(--error);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-color);
-  word-break: break-all;
+  background: var(--error-subtle);
+  color: var(--error-text);
+  font-size: var(--font-size-13);
 }
 
-.copy-btn {
-  width: 36px;
-  height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--surface-3);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-  flex-shrink: 0;
+.proxy-status__stale {
+  margin: 0;
+  font-size: var(--font-size-12);
+  color: var(--warning-text);
 }
 
-.copy-btn:hover {
-  background: var(--primary-100);
-}
-
-.copy-btn svg {
-  width: 16px;
-  height: 16px;
-  color: var(--text-secondary);
-}
-
-.copy-btn:hover svg {
-  color: var(--primary-600);
-}
-
-.error-message {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 14px;
-  background: var(--error-50);
-  border-radius: var(--radius-md);
-  margin-bottom: 16px;
-  border-left: 3px solid var(--error-500);
-}
-
-.error-message svg {
-  width: 18px;
-  height: 18px;
-  color: var(--error-500);
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-
-.error-message span {
-  font-size: 13px;
-  color: var(--error-600);
-  line-height: 1.5;
-}
-
-.action-buttons {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.btn {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 20px;
-  border: none;
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all var(--transition-normal);
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  transform: none !important;
-}
-
-.btn svg {
-  width: 18px;
-  height: 18px;
-}
-
-.btn-primary {
-  background: var(--gradient-primary);
-  color: white;
-  box-shadow: 0 4px 14px rgba(59, 130, 246, 0.3);
-}
-
-.btn-primary:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4);
-}
-
-.btn-danger {
-  background: var(--error-500);
-  color: white;
-  box-shadow: 0 4px 14px rgba(239, 68, 68, 0.3);
-}
-
-.btn-danger:hover:not(:disabled) {
-  background: var(--error-600);
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
-}
-
-.btn-secondary {
-  background: var(--surface-3);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-color);
-}
-
-.btn-secondary:hover:not(:disabled) {
-  background: var(--surface-4);
-  border-color: var(--primary-300);
-  color: var(--text-primary);
-}
-
-.spinner {
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin {
-  from {
-    transform: rotate(0deg);
+@media (max-width: 600px) {
+  .proxy-status__main {
+    flex-wrap: wrap;
   }
-  to {
-    transform: rotate(360deg);
-  }
-}
 
-@media (max-width: 480px) {
-  .action-buttons {
-    flex-direction: column;
-  }
-  
-  .btn {
+  .proxy-status__actions {
+    margin-left: 0;
     width: 100%;
-    justify-content: center;
   }
 }
 </style>
