@@ -227,7 +227,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
@@ -370,7 +370,7 @@ jobs:
         working-directory: ui-desktop/src-tauri
         run: cargo audit
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
