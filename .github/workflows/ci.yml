@@ -199,7 +199,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/dependency-review-action@v5
         with:
           # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
           # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
