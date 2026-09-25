@@ -100,7 +100,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -263,7 +263,7 @@ jobs:
           Get-ChildItem dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.target }}
           path: dist/*
@@ -341,7 +341,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -506,7 +506,7 @@ jobs:
           find release-artifact -type f | sort
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
           # upload-artifact paths are relative to the workspace root and ignore defaults.run.
@@ -521,7 +521,7 @@ jobs:
         # Guarded with hashFiles so it stays a no-op when the failure happened before
         # anything was staged (e.g. the build itself failed).
         if: failure() && hashFiles('ui-desktop/release-artifact/**') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
           path: ui-desktop/release-artifact/**
@@ -558,7 +558,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -897,7 +897,7 @@ jobs:
 
       - name: Upload APK artifact
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-apk
           path: |
@@ -920,7 +920,7 @@ jobs:
       # gh requires the working directory to be a git repo; fetch-depth: 0 keeps
       # --generate-notes able to diff against the previous tag
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -934,21 +934,21 @@ jobs:
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Download server artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ${{ env.BIN_NAME }}-*
           merge-multiple: true
           path: dist-server
 
       - name: Download desktop artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-desktop-*
           merge-multiple: true
           path: dist-desktop
 
       - name: Download APK artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-apk
           merge-multiple: true

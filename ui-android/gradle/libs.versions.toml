@@ -1,13 +1,14 @@
 [versions]
-agp = "8.10.0"
-kotlin = "2.0.21"
+# AGP 9.x is required by the Gradle 9 wrapper (AGP 8.x tops out at Gradle 8.13).
+agp = "9.4.1"
+kotlin = "2.4.20"
 coreKtx = "1.17.0"
 junit = "4.13.2"
 junitVersion = "1.3.0"
 espressoCore = "3.7.0"
 lifecycleRuntimeKtx = "2.10.0"
 activityCompose = "1.12.4"
-composeBom = "2024.09.00"
+composeBom = "2026.09.00"
 cameraX = "1.4.2"
 zxing = "3.5.3"
 
