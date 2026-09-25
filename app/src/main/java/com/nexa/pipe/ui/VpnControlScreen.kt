@@ -1,5 +1,6 @@
 package com.nexa.pipe.ui
 
+import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
@@ -17,22 +18,32 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.PermissionManager
-import com.nexa.pipe.otp.OtpAuth
-import com.nexa.pipe.otp.OtpAuthConfig
-import com.nexa.pipe.otp.OtpAuthParseResult
+import com.nexa.pipe.R
+import com.nexa.pipe.locale.AppLanguage
+import com.nexa.pipe.locale.AppLocale
+import com.nexa.pipe.locale.label
+import com.nexa.pipe.ui.components.NexaDangerButton
+import com.nexa.pipe.ui.components.NexaPrimaryButton
+import com.nexa.pipe.ui.components.NexaTonalButton
+import com.nexa.pipe.ui.components.NexaTextButton
+import com.nexa.pipe.ui.theme.Dimens
 import com.nexa.pipe.provisioning.EndpointInvite
 import com.nexa.pipe.provisioning.EndpointInviteCodec
 import com.nexa.pipe.provisioning.InviteParseResult
@@ -53,11 +64,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
-    val forceRelay by viewModel.forceRelay.collectAsState()
-    val twoFactorEnabled by viewModel.twoFactorEnabled.collectAsState()
-    val twoFactorClientId by viewModel.twoFactorClientId.collectAsState()
-    val twoFactorSecret by viewModel.twoFactorSecret.collectAsState()
-    val twoFactorAlgorithm by viewModel.twoFactorAlgorithm.collectAsState()
+    val relayAuthToken by viewModel.relayAuthToken.collectAsState()
 
     // The endpoints traffic is actually going through right now, each with the kind of path it
     // is using. Empty until the native side reports a connection, which is also what hides the
@@ -68,19 +75,17 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
 
     var showLogs by remember { mutableStateOf(false) }
     var showPermissionGuide by remember { mutableStateOf(false) }
-    var showAddNodeDialog by remember { mutableStateOf(false) }
+    // An endpoint can only be added from an invite, so this is the paste-a-link entry point;
+    // the "type an endpoint ID by hand" dialog is gone.
+    var showInviteLinkDialog by remember { mutableStateOf(false) }
     // The endpoint whose detail page is open; null while on the main page.
-    // Saveable so a rotation keeps the detail page instead of dropping
-    // back to the directory.
-    var selectedNodeId by rememberSaveable { mutableStateOf<String?>(null) }
+    //
+    // Deliberately not saveable. Restoring it brought the app back on the detail page of
+    // whatever endpoint was open before — and since that is a state of *this* screen rather
+    // than a destination of its own, the back button then looked like it switched to an old
+    // state of the app instead of leaving it. The directory is the entry point, every time.
+    var selectedNodeId by remember { mutableStateOf<String?>(null) }
     var showRelaySettings by remember { mutableStateOf(false) }
-    var showTwoFactorSettings by remember { mutableStateOf(false) }
-    var showTwoFactorScanner by remember { mutableStateOf(false) }
-    var showTwoFactorExport by remember { mutableStateOf(false) }
-    // Set when a scan succeeded while credentials were already saved, so the
-    // user explicitly agrees to replace them.
-    var pendingTwoFactorImport by remember { mutableStateOf<OtpAuthConfig?>(null) }
-    var twoFactorImportWarning by remember { mutableStateOf<String?>(null) }
     var showInviteScanner by remember { mutableStateOf(false) }
     // An endpoint invite rewrites shared settings, so it is confirmed when it
     // would overwrite something that already works.
@@ -92,6 +97,19 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // another screen).
     LaunchedEffect(Unit) {
         viewModel.syncVpnServiceState()
+    }
+
+    // ...and again every time the screen comes back to the foreground. The session does not
+    // wait for this UI: the service rebuilds the tunnel on a network switch, and it may give up
+    // and stop it altogether. Re-reading on resume is what keeps the main page from showing the
+    // state it last knew instead of the state that is true now.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.onForeground()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // Second, deliberately redundant channel: the error card sits at the top of the page, but the
@@ -116,31 +134,37 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     }
 
     /**
-     * Stores credentials that came from a scanned QR code. Scanning is the
-     * user's intent to use 2FA, so the switch is turned on as well; mismatched
-     * code parameters are surfaced instead of being silently accepted.
+     * Switches the UI to [language] and rebuilds the Activity.
+     *
+     * The rebuild is not a shortcut: resources are resolved per context, so the
+     * only way every string on screen changes is going through
+     * `MainActivity.attachBaseContext` again. `recreate()` keeps the
+     * ViewModel (and with it the running session's state) alive, so the UI
+     * comes back where it was — only in the new language.
      */
-    fun applyTwoFactorImport(config: OtpAuthConfig) {
-        viewModel.updateTwoFactorConfig(true, config.clientId, config.secret, config.algorithm)
-        twoFactorImportWarning = config.warnings.firstOrNull()
-        config.warnings.forEach { viewModel.addLog("2FA import: $it") }
-        Toast.makeText(context, "2FA imported for \"${config.clientId}\"", Toast.LENGTH_SHORT).show()
+    fun applyLanguage(language: AppLanguage) {
+        AppLocale.select(context, language)
+        (context as? Activity)?.recreate()
     }
 
     /**
+     * The endpoint an invite refers to, or null when it carries a ticket
+     * instead — a ticket bundles addresses the endpoint list has no room for.
+     */
+    fun inviteNodeId(invite: EndpointInvite): String? =
+        (invite.target as? InviteTarget.NodeId)?.id
+
+    /**
      * Applies a scanned endpoint invite: the node, its domains, the relay it
-     * asks for and its 2FA credentials.
+     * asks for and the 2FA credentials of that endpoint.
      *
      * Returns the message to show when the invite cannot be applied at all.
      */
     fun applyInviteImport(invite: EndpointInvite): String? {
-        val nodeId = when (val target = invite.target) {
-            is InviteTarget.NodeId -> target.id
+        val nodeId = inviteNodeId(invite)
             // A ticket bundles addresses the node list has no room for. The
             // server can hand out a Node ID invite instead.
-            is InviteTarget.Ticket ->
-                return "This invite carries an endpoint ticket, which cannot be stored here. Ask for a Node ID invite."
-        }
+            ?: return context.getString(R.string.invite_ticket_unsupported)
 
         if (nodes.none { it.nodeId == nodeId }) {
             viewModel.addNode(nodeId)?.let { return it }
@@ -149,13 +173,26 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             viewModel.addLog("Invite for $nodeId carried no domains")
         }
         invite.domains.forEach { viewModel.addDomainToNode(nodeId, it) }
-        // A relay in the invite is a request to route through it, so the mode
-        // follows: a URL is meaningless unless it is the one being used.
-        invite.relay?.let { relay -> viewModel.updateRelayConfig("custom", relay, forceRelay) }
+        // The relay is global, so an invite only proposes one: it says how
+        // *that* endpoint is reachable, not what this phone should use. The
+        // change is listed by `inviteConflicts`, which is what puts the
+        // confirmation dialog in front of it — a relay that would actually be
+        // overwritten is never applied silently.
+        invite.relay?.let { relay -> viewModel.updateRelayConfig("custom", relay) }
         invite.totp?.let { otp ->
-            viewModel.updateTwoFactorConfig(true, otp.clientId, otp.secret, otp.algorithm)
-            twoFactorImportWarning = invite.warnings().firstOrNull()
+            viewModel.updateNodeTwoFactor(
+                nodeId,
+                NodeTwoFactor(
+                    enabled = true,
+                    clientId = otp.clientId,
+                    secret = otp.secret,
+                    algorithm = otp.algorithm
+                )
+            )
             invite.warnings().forEach { viewModel.addLog("Invite import: $it") }
+            invite.warnings().firstOrNull()?.let {
+                Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            }
         }
         viewModel.addLog(
             "Imported invite: node=$nodeId domains=${invite.domains.size} " +
@@ -163,7 +200,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         )
         Toast.makeText(
             context,
-            "Imported endpoint ${invite.name ?: nodeId.take(8)}",
+            context.getString(R.string.invite_imported, invite.name ?: nodeId.take(8)),
             Toast.LENGTH_SHORT
         ).show()
         return null
@@ -177,32 +214,77 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      */
     fun inviteConflicts(invite: EndpointInvite): List<String> = buildList {
         invite.totp?.let { otp ->
-            if (twoFactorSecret.isNotBlank() &&
-                (twoFactorSecret != otp.secret || twoFactorClientId != otp.clientId)
+            // Only this endpoint's credentials are replaced: 2FA belongs to
+            // the endpoint, so every other one is left alone.
+            val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }?.twoFactor
+            if (current != null && current.secret.isNotBlank() &&
+                (current.secret != otp.secret || current.clientId != otp.clientId)
             ) {
-                add("the 2FA credentials for \"${twoFactorClientId.ifBlank { "the current client" }}\"")
+                val client = current.clientId.ifBlank {
+                    context.getString(R.string.invite_conflict_2fa_current_client)
+                }
+                add(context.getString(R.string.invite_conflict_2fa, client))
             }
         }
         invite.relay?.let { relay ->
             if (relayMode != "custom" || (relayUrl.isNotBlank() && relayUrl != relay)) {
-                add("the relay settings")
+                add(context.getString(R.string.invite_conflict_relay))
             }
         }
     }
 
     /** One line per field, so the confirmation reads like the invite itself. */
-    fun inviteSummary(invite: EndpointInvite): String = buildString {
-        append("Node: ${invite.target.value}")
-        invite.name?.let { append("\nName: $it") }
-        append("\nDomains: ${invite.domains.joinToString(", ").ifEmpty { "none" }}")
+    fun inviteSummary(invite: EndpointInvite): String = buildList<String> {
+        add(context.getString(R.string.invite_summary_node, invite.target.value))
+        invite.name?.let { add(context.getString(R.string.invite_summary_name, it)) }
+        add(
+            context.getString(
+                R.string.invite_summary_domains,
+                invite.domains.joinToString(", ").ifEmpty {
+                    context.getString(R.string.invite_value_none)
+                }
+            )
+        )
         val otp = invite.totp
-        if (otp == null) {
-            append("\n2FA: none")
-        } else {
-            append("\n2FA: ${otp.clientId} (${otp.algorithm.uppercase(Locale.ROOT)})")
+        add(
+            if (otp == null) {
+                context.getString(R.string.invite_summary_2fa_none)
+            } else {
+                context.getString(
+                    R.string.invite_summary_2fa,
+                    otp.clientId,
+                    otp.algorithm.uppercase(Locale.ROOT)
+                )
+            }
+        )
+        invite.relay?.let { add(context.getString(R.string.invite_summary_relay, it)) }
+    }.joinToString("\n")
+
+    /**
+     * Reads one invite and returns the message to show when it cannot be
+     * applied at all, or null when it was accepted.
+     *
+     * Both entry points — the camera and a pasted link — go through here, and
+     * that is the point: the confirmation in the middle is what stops an invite
+     * from silently overwriting the relay or this endpoint's 2FA. A second code
+     * path that skipped it would not be a shortcut, it would be a bug.
+     */
+    fun handleInviteText(text: String): String? =
+        when (val result = EndpointInviteCodec.parse(text)) {
+            is InviteParseResult.Failure -> result.message
+            is InviteParseResult.Success -> {
+                // With nothing to overwrite the invite is applied straight
+                // away; otherwise replacing working settings needs a
+                // confirmation. A rejected import (e.g. a ticket invite) comes
+                // back as the status message instead of vanishing.
+                if (inviteConflicts(result.invite).isEmpty()) {
+                    applyInviteImport(result.invite)
+                } else {
+                    pendingInviteImport = result.invite
+                    null
+                }
+            }
         }
-        invite.relay?.let { append("\nRelay: $it") }
-    }
 
     // While an endpoint is open, its page replaces the whole screen: the
     // domain management lives there, keeping the main page a directory. The
@@ -224,10 +306,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Nexa") },
+                title = { Text(stringResource(R.string.app_title)) },
                 actions = {
                     IconButton(onClick = { showLogs = !showLogs }) {
-                        Icon(Icons.Default.Info, contentDescription = "Logs")
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = stringResource(R.string.logs_title)
+                        )
                     }
                 }
             )
@@ -259,7 +344,11 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 } else {
                     Icon(
                             imageVector = if (isVpnRunning) Icons.Default.Close else Icons.Default.CheckCircle,
-                            contentDescription = if (isVpnRunning) "Disconnect" else "Connect",
+                            contentDescription = if (isVpnRunning) {
+                                stringResource(R.string.action_disconnect)
+                            } else {
+                                stringResource(R.string.action_connect)
+                            },
                             modifier = Modifier.size(28.dp)
                         )
                 }
@@ -293,10 +382,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isVpnRunning) "Connected"
+                            text = if (isVpnRunning) stringResource(R.string.status_connected)
                                 else if (connectionStatusText != null) connectionStatusText!!
-                                else if (isConnecting) "Connecting..."
-                                else "Disconnected",
+                                else if (isConnecting) stringResource(R.string.status_connecting)
+                                else stringResource(R.string.status_disconnected),
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = if (isVpnRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
@@ -319,13 +408,38 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = when {
-                            isVpnRunning -> "Traffic is being routed through iroh"
-                            isConnecting -> "Establishing the tunnel..."
-                            else -> "Not connected"
+                            isVpnRunning -> stringResource(R.string.status_connected_subtitle)
+                            isConnecting -> stringResource(R.string.status_connecting_subtitle)
+                            else -> stringResource(R.string.status_disconnected_subtitle)
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    // The one action this screen is for, as a labelled button in the card.
+                    // It used to live only on the FAB, where a colour and an icon had to stand
+                    // in for the words "connect" and "disconnect".
+                    Spacer(modifier = Modifier.height(Dimens.Space3))
+                    if (isVpnRunning) {
+                        NexaDangerButton(
+                            text = stringResource(R.string.action_disconnect),
+                            onClick = { viewModel.disconnect(context) },
+                            icon = Icons.Default.Close,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        NexaPrimaryButton(
+                            text = if (isConnecting) {
+                                stringResource(R.string.status_connecting)
+                            } else {
+                                stringResource(R.string.action_connect)
+                            },
+                            onClick = { handleConnect(context) },
+                            icon = Icons.Default.CheckCircle,
+                            loading = isConnecting,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
 
                     // ...and through *these* backends, over this kind of path. It belongs to
                     // this card rather than to one of its own: it finishes the sentence the
@@ -333,7 +447,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     AnimatedVisibility(visible = connectedEndpoints.isNotEmpty()) {
                         Column(modifier = Modifier.padding(top = 12.dp)) {
                             Text(
-                                text = "Connected endpoints",
+                                text = stringResource(R.string.connected_endpoints_title),
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -407,12 +521,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     ) {
                         Icon(Icons.Default.Settings, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Configurations", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            stringResource(R.string.configurations_title),
+                            style = MaterialTheme.typography.titleMedium
+                        )
                         Spacer(modifier = Modifier.weight(1f))
                         IconButton(onClick = { showSettings = !showSettings }) {
                             Icon(
                                 if (showSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Toggle"
+                                contentDescription = stringResource(R.string.action_toggle)
                             )
                         }
                     }
@@ -423,9 +540,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
 
                             EndpointsSection(
                                 nodes = nodes,
-                                onAddNode = { showAddNodeDialog = true },
                                 onScanInvite = { showInviteScanner = true },
+                                onPasteInvite = { showInviteLinkDialog = true },
                                 onOpenEndpoint = { selectedNodeId = it }
+                            )
+
+                            Spacer(modifier = Modifier.height(Dimens.Space3))
+
+                            LanguageSection(
+                                onLanguagePicked = { language -> applyLanguage(language) }
                             )
                         }
                     }
@@ -445,12 +568,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     ) {
                         Icon(Icons.Default.Share, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Relay Settings", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            stringResource(R.string.relay_title),
+                            style = MaterialTheme.typography.titleSmall
+                        )
                         Spacer(modifier = Modifier.weight(1f))
                         IconButton(onClick = { showRelaySettings = !showRelaySettings }) {
                             Icon(
                                 if (showRelaySettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Toggle"
+                                contentDescription = stringResource(R.string.action_toggle)
                             )
                         }
                     }
@@ -458,14 +584,17 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     AnimatedVisibility(visible = showRelaySettings) {
                         Column {
                             Spacer(modifier = Modifier.height(8.dp))
-                            Text("Relay Mode", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                stringResource(R.string.relay_mode_title),
+                                style = MaterialTheme.typography.labelMedium
+                            )
                             Spacer(modifier = Modifier.height(4.dp))
 
                             val relayModes = listOf(
-                                "pinned" to "Pinned (aps1-1, stable)",
-                                "default" to "Default (all N0 relays)",
-                                "disabled" to "Disabled (direct only)",
-                                "custom" to "Custom URL"
+                                "pinned" to R.string.relay_mode_pinned,
+                                "default" to R.string.relay_mode_default,
+                                "disabled" to R.string.relay_mode_disabled,
+                                "custom" to R.string.relay_mode_custom
                             )
                             relayModes.forEach { (mode, label) ->
                                 Row(
@@ -477,11 +606,14 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                     RadioButton(
                                         selected = relayMode == mode,
                                         onClick = {
-                                            viewModel.updateRelayConfig(mode, relayUrl, forceRelay)
+                                            viewModel.updateRelayConfig(mode, relayUrl)
                                         }
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text(label, style = MaterialTheme.typography.bodySmall)
+                                    Text(
+                                        stringResource(label),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
                                 }
                             }
 
@@ -490,210 +622,33 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayUrl,
                                     onValueChange = { newUrl ->
-                                        viewModel.updateRelayConfig(relayMode, newUrl, forceRelay)
+                                        viewModel.updateRelayConfig(relayMode, newUrl)
                                     },
-                                    label = { Text("Relay URL") },
-                                    placeholder = { Text("https://relay.example.com") },
+                                    label = { Text(stringResource(R.string.relay_url_label)) },
+                                    placeholder = {
+                                        Text(stringResource(R.string.relay_url_placeholder))
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true
                                 )
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Force Relay", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                                Switch(
-                                    checked = forceRelay,
-                                    onCheckedChange = { newForce ->
-                                        viewModel.updateRelayConfig(relayMode, relayUrl, newForce)
-                                    }
-                                )
-                            }
-                            Text(
-                                "When enabled, connections are always routed through relay servers.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-
-            // 2FA Settings Card
-            Spacer(modifier = Modifier.height(16.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.Lock, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("2FA Settings", style = MaterialTheme.typography.titleSmall)
-                        Spacer(modifier = Modifier.weight(1f))
-                        IconButton(onClick = { showTwoFactorSettings = !showTwoFactorSettings }) {
-                            Icon(
-                                if (showTwoFactorSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Toggle"
-                            )
-                        }
-                    }
-
-                    AnimatedVisibility(visible = showTwoFactorSettings) {
-                        Column {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Enable 2FA", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                                Switch(
-                                    checked = twoFactorEnabled,
-                                    onCheckedChange = { enabled ->
-                                        viewModel.updateTwoFactorConfig(
-                                            enabled,
-                                            twoFactorClientId,
-                                            twoFactorSecret,
-                                            twoFactorAlgorithm
-                                        )
-                                    }
-                                )
-                            }
-
-                            // Import/export live outside the "if (enabled)"
-                            // block: scanning is the main way to add 2FA, so it
-                            // must be reachable before the fields are shown.
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(
-                                    onClick = { showTwoFactorScanner = true },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Search,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Scan QR code",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
-                                }
-                                OutlinedButton(
-                                    onClick = { showTwoFactorExport = true },
-                                    enabled = twoFactorClientId.isNotBlank() && twoFactorSecret.isNotBlank(),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Share,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Share as QR",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
-                                }
-                            }
-
-                            if (twoFactorEnabled) {
                                 Spacer(modifier = Modifier.height(8.dp))
                                 OutlinedTextField(
-                                    value = twoFactorClientId,
-                                    onValueChange = { newId ->
-                                        twoFactorImportWarning = null
-                                        viewModel.updateTwoFactorConfig(
-                                            twoFactorEnabled,
-                                            newId,
-                                            twoFactorSecret,
-                                            twoFactorAlgorithm
-                                        )
+                                    value = relayAuthToken,
+                                    onValueChange = { newToken ->
+                                        viewModel.updateRelayConfig(relayMode, relayUrl, newToken)
                                     },
-                                    label = { Text("Client ID") },
-                                    placeholder = { Text("client-001") },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    singleLine = true
-                                )
-
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedTextField(
-                                    value = twoFactorSecret,
-                                    onValueChange = { newSecret ->
-                                        twoFactorImportWarning = null
-                                        viewModel.updateTwoFactorConfig(
-                                            twoFactorEnabled,
-                                            twoFactorClientId,
-                                            newSecret,
-                                            twoFactorAlgorithm
-                                        )
-                                    },
-                                    label = { Text("TOTP Secret") },
-                                    placeholder = { Text("JBSWY3DPEHPK3PXP") },
+                                    label = { Text(stringResource(R.string.relay_token_label)) },
                                     visualTransformation = PasswordVisualTransformation(),
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true
                                 )
+                                Text(
+                                    stringResource(R.string.relay_token_note),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
 
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("Algorithm", style = MaterialTheme.typography.labelMedium)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                listOf("sha1" to "SHA1 (default)", "sha256" to "SHA256", "sha512" to "SHA512")
-                                    .forEach { (alg, label) ->
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(vertical = 2.dp)
-                                        ) {
-                                            RadioButton(
-                                                selected = twoFactorAlgorithm == alg,
-                                                onClick = {
-                                                    twoFactorImportWarning = null
-                                                    viewModel.updateTwoFactorConfig(
-                                                        twoFactorEnabled,
-                                                        twoFactorClientId,
-                                                        twoFactorSecret,
-                                                        alg
-                                                    )
-                                                }
-                                            )
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Text(label, style = MaterialTheme.typography.bodySmall)
-                                        }
-                                    }
-                            }
-                            twoFactorImportWarning?.let { warning ->
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        Icons.Default.Warning,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = warning,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.error
-                                    )
-                                }
-                            }
-                            Text(
-                                "2FA authenticates each connection with the server using a TOTP code.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
                         }
                     }
                 }
@@ -712,13 +667,22 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Logs", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            stringResource(R.string.logs_title),
+                            style = MaterialTheme.typography.titleLarge
+                        )
                         Spacer(modifier = Modifier.weight(1f))
                         IconButton(onClick = { viewModel.clearLogs() }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Clear logs")
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = stringResource(R.string.logs_clear)
+                            )
                         }
                         IconButton(onClick = { showLogs = false }) {
-                            Icon(Icons.Default.Close, contentDescription = "Close")
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = stringResource(R.string.action_close)
+                            )
                         }
                     }
 
@@ -750,57 +714,17 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             }
         }
 
-        if (showAddNodeDialog) {
-            AddNodeDialog(
-                existingNodeIds = nodes.map { it.nodeId }.toSet(),
-                onDismiss = { showAddNodeDialog = false },
-                onAdd = { nodeId -> viewModel.addNode(nodeId) }
-            )
-        }
-
-        if (showTwoFactorScanner) {
-            QrScannerDialog(
-                onDismiss = { showTwoFactorScanner = false },
-                onResult = { scanned ->
-                    when (val result = OtpAuth.parse(scanned)) {
-                        is OtpAuthParseResult.Failure -> result.message
-                        is OtpAuthParseResult.Success -> {
-                            // With nothing configured yet the scan is applied
-                            // straight away; otherwise replacing working
-                            // credentials needs a confirmation.
-                            if (twoFactorClientId.isBlank() && twoFactorSecret.isBlank()) {
-                                applyTwoFactorImport(result.config)
-                            } else {
-                                pendingTwoFactorImport = result.config
-                            }
-                            null
-                        }
-                    }
-                }
+        if (showInviteLinkDialog) {
+            InviteLinkDialog(
+                onDismiss = { showInviteLinkDialog = false },
+                onImport = { link -> handleInviteText(link) }
             )
         }
 
         if (showInviteScanner) {
             QrScannerDialog(
                 onDismiss = { showInviteScanner = false },
-                onResult = { scanned ->
-                    when (val result = EndpointInviteCodec.parse(scanned)) {
-                        is InviteParseResult.Failure -> result.message
-                        is InviteParseResult.Success -> {
-                            // With nothing to overwrite the invite is applied
-                            // straight away; otherwise replacing working
-                            // settings needs a confirmation. A rejected import
-                            // (e.g. a ticket invite) is returned as the status
-                            // message instead of vanishing.
-                            if (inviteConflicts(result.invite).isEmpty()) {
-                                applyInviteImport(result.invite)
-                            } else {
-                                pendingInviteImport = result.invite
-                                null
-                            }
-                        }
-                    }
-                }
+                onResult = { scanned -> handleInviteText(scanned) }
             )
         }
 
@@ -808,73 +732,40 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             val conflicts = inviteConflicts(invite)
             AlertDialog(
                 onDismissRequest = { pendingInviteImport = null },
-                title = { Text("Import Endpoint Invite") },
+                title = { Text(stringResource(R.string.invite_import_title)) },
                 text = {
                     Text(
                         inviteSummary(invite) +
                             if (conflicts.isEmpty()) {
                                 ""
                             } else {
-                                "\n\nThis replaces ${conflicts.joinToString(" and ")}."
+                                stringResource(
+                                    R.string.invite_replaces,
+                                    conflicts.joinToString(" and ")
+                                )
                             }
                     )
                 },
                 confirmButton = {
-                    TextButton(
+                    NexaPrimaryButton(
+                        text = stringResource(R.string.action_import),
                         onClick = {
                             applyInviteImport(invite)?.let { failure ->
                                 Toast.makeText(context, failure, Toast.LENGTH_LONG).show()
                             }
                             pendingInviteImport = null
                         }
-                    ) {
-                        Text("Import")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { pendingInviteImport = null }) {
-                        Text("Cancel")
-                    }
-                }
-            )
-        }
-
-        pendingTwoFactorImport?.let { scanned ->
-            AlertDialog(
-                onDismissRequest = { pendingTwoFactorImport = null },
-                title = { Text("Replace 2FA Configuration") },
-                text = {
-                    Text(
-                        "A 2FA configuration is already saved.\n\n" +
-                            "Replace it with the scanned one for \"${scanned.clientId}\"?"
                     )
                 },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            applyTwoFactorImport(scanned)
-                            pendingTwoFactorImport = null
-                        }
-                    ) {
-                        Text("Replace")
-                    }
-                },
                 dismissButton = {
-                    TextButton(onClick = { pendingTwoFactorImport = null }) {
-                        Text("Cancel")
-                    }
+                    NexaTextButton(
+                        text = stringResource(R.string.action_cancel),
+                        onClick = { pendingInviteImport = null }
+                    )
                 }
             )
         }
 
-        if (showTwoFactorExport) {
-            TwoFactorExportDialog(
-                clientId = twoFactorClientId,
-                secret = twoFactorSecret,
-                algorithm = twoFactorAlgorithm,
-                onDismiss = { showTwoFactorExport = false }
-            )
-        }
     }
 }
 
@@ -899,8 +790,8 @@ internal fun shortenNodeId(nodeId: String): String =
 @Composable
 private fun EndpointsSection(
     nodes: List<NodeConfig>,
-    onAddNode: () -> Unit,
     onScanInvite: () -> Unit,
+    onPasteInvite: () -> Unit,
     onOpenEndpoint: (String) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -909,9 +800,12 @@ private fun EndpointsSection(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Endpoints", style = MaterialTheme.typography.titleSmall)
                 Text(
-                    text = "Tap an endpoint to manage its domains",
+                    stringResource(R.string.endpoints_title),
+                    style = MaterialTheme.typography.titleSmall
+                )
+                Text(
+                    text = stringResource(R.string.endpoints_subtitle),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -933,29 +827,28 @@ private fun EndpointsSection(
 
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(Dimens.Space2)
         ) {
-            FilledTonalButton(
-                onClick = onAddNode,
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Add endpoint", maxLines = 1)
-            }
-            FilledTonalButton(
+            NexaTonalButton(
+                text = stringResource(R.string.endpoints_scan_invite),
                 onClick = onScanInvite,
+                // `Search` is the wrong glyph for "scan", but the camera icons
+                // live in `material-icons-extended`, which cannot be added
+                // while the release build has R8 off.
+                icon = Icons.Default.Search,
                 modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Scan invite", maxLines = 1)
-            }
+            )
+            NexaTonalButton(
+                text = stringResource(R.string.endpoints_paste_link),
+                onClick = onPasteInvite,
+                // `ContentPaste` / `ContentCopy` are not in the core icon set
+                // either, so this stays on the generic add glyph.
+                icon = Icons.Default.Add,
+                modifier = Modifier.weight(1f),
+            )
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(Dimens.Space3))
 
         if (nodes.isEmpty()) {
             EmptyNodesHint()
@@ -1009,15 +902,29 @@ private fun EndpointRow(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = when (domainCount) {
-                        0 -> "No domains yet"
-                        1 -> "1 domain"
-                        else -> "$domainCount domains"
+                    text = if (domainCount == 0) {
+                        stringResource(R.string.endpoint_domains_none)
+                    } else {
+                        pluralStringResource(
+                            R.plurals.endpoint_domains_count,
+                            domainCount,
+                            domainCount
+                        )
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = if (domainCount == 0) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+            // 2FA is per endpoint now, so the list says which ones have it.
+            if (node.twoFactor?.enabled == true) {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = stringResource(R.string.endpoint_2fa_enabled),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
             }
             Icon(
                 Icons.Default.KeyboardArrowRight,
@@ -1043,10 +950,13 @@ private fun EmptyNodesHint() {
             modifier = Modifier.size(36.dp)
         )
         Spacer(modifier = Modifier.height(8.dp))
-        Text("No endpoints yet", style = MaterialTheme.typography.titleSmall)
+        Text(
+            stringResource(R.string.endpoints_empty_title),
+            style = MaterialTheme.typography.titleSmall
+        )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "Add an endpoint ID or scan an invite to start routing domains.",
+            text = stringResource(R.string.endpoints_empty_body),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
@@ -1054,26 +964,35 @@ private fun EmptyNodesHint() {
     }
 }
 
+/**
+ * Paste-an-invite-link entry point, the keyboard equivalent of the scanner.
+ *
+ * [onImport] returns null when the invite was accepted — the dialog closes — or
+ * a message that is shown in place and keeps the dialog open, exactly like the
+ * scanner's `(String) -> String?` contract: an invite that was rejected (a
+ * ticket invite, a link that will not parse) must not make the user start over.
+ */
 @Composable
-private fun AddNodeDialog(
-    existingNodeIds: Set<String>,
+private fun InviteLinkDialog(
     onDismiss: () -> Unit,
-    onAdd: (String) -> String?
+    onImport: (String) -> String?
 ) {
-    var nodeId by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    var link by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add Endpoint") },
+        title = { Text(stringResource(R.string.invite_paste_title)) },
         text = {
             OutlinedTextField(
-                value = nodeId,
+                value = link,
                 onValueChange = {
-                    nodeId = it
+                    link = it
                     error = null
                 },
-                label = { Text("Endpoint ID") },
+                label = { Text(stringResource(R.string.invite_paste_label)) },
+                placeholder = { Text(stringResource(R.string.invite_paste_placeholder)) },
                 isError = error != null,
                 supportingText = error?.let { message -> { Text(message) } },
                 modifier = Modifier.fillMaxWidth(),
@@ -1081,26 +1000,111 @@ private fun AddNodeDialog(
             )
         },
         confirmButton = {
-            TextButton(
+            NexaPrimaryButton(
+                text = stringResource(R.string.action_import),
                 onClick = {
-                    val id = nodeId.trim()
-                    if (id.isEmpty()) {
-                        error = "Endpoint ID cannot be empty"
-                    } else if (existingNodeIds.contains(id)) {
-                        error = "Endpoint ID already exists"
-                    } else {
-                        val failure = onAdd(id)
-                        if (failure != null) error = failure else onDismiss()
+                    val value = link.trim()
+                    if (value.isEmpty()) {
+                        error = context.getString(R.string.invite_paste_empty)
+                        return@NexaPrimaryButton
                     }
+                    val failure = onImport(value)
+                    if (failure != null) error = failure else onDismiss()
                 }
-            ) {
-                Text("Add")
-            }
+            )
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
+            NexaTextButton(text = stringResource(R.string.action_cancel), onClick = onDismiss)
         }
     )
+}
+
+// ---------------------------------------------------------------------------
+// Configurations > Language
+//
+// The picker is where the switch is: the language is a setting of this app,
+// not of a session, so it belongs next to the endpoints rather than behind a
+// menu item. Picking one rebuilds the Activity (see `applyLanguage`).
+// ---------------------------------------------------------------------------
+
+/**
+ * The language the UI is in, and the way to change it.
+ *
+ * The current one is re-read on every composition instead of being remembered:
+ * the row is only drawn while the settings panel is expanded, and a change
+ * comes back as a new Activity anyway.
+ */
+@Composable
+private fun LanguageSection(
+    onLanguagePicked: (AppLanguage) -> Unit
+) {
+    val context = LocalContext.current
+    var showPicker by remember { mutableStateOf(false) }
+    val current = AppLocale.selected(context)
+
+    // No leading icon: `material-icons-core` (all the app can use with R8 off)
+    // has no glyph for "language", and a wrong one is worse than none. The row
+    // matches the endpoints section above it — title, subtitle, chevron.
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { showPicker = true },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(R.string.language_title),
+                style = MaterialTheme.typography.titleSmall
+            )
+            Text(
+                text = current.label(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Icon(
+            Icons.Default.KeyboardArrowRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+
+    if (showPicker) {
+        AlertDialog(
+            onDismissRequest = { showPicker = false },
+            title = { Text(stringResource(R.string.language_title)) },
+            text = {
+                Column {
+                    AppLanguage.all().forEach { language ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    showPicker = false
+                                    if (language != current) onLanguagePicked(language)
+                                }
+                                .padding(vertical = 2.dp)
+                        ) {
+                            RadioButton(
+                                selected = language == current,
+                                onClick = {
+                                    showPicker = false
+                                    if (language != current) onLanguagePicked(language)
+                                }
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(language.label(), style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                NexaTextButton(
+                    text = stringResource(R.string.action_close),
+                    onClick = { showPicker = false }
+                )
+            }
+        )
+    }
 }

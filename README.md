@@ -39,8 +39,9 @@ so the tunnel survives Wi-Fi ↔ cellular switches.
 - Per-domain routing: a list of server nodes, each owning a set of domains.
 - Domain hijack + TCP redirect with a smoltcp userspace stack on the Rust side
   (the old hand-written Kotlin TCP stack is gone).
-- Relay control: `pinned` (default), `default`, `custom` URL, or `disabled`;
-  "force relay" disables direct connections.
+- Relay control: `pinned` (default), `default`, `custom` URL (with an optional
+  auth token), or `disabled`. There is no "force relay" switch: iroh 1.0.1 gives
+  no way to keep a connection relayed, so one is not offered.
 - DNS workarounds for hostile networks: system DNS servers are injected into
   Rust (`nativeSetDnsServers`), and iroh infrastructure domains can be
   pre-resolved and pinned (`nativeSetDnsOverride`).
@@ -132,7 +133,9 @@ start), `-SkipRust`, `-SkipInstall`, `-SkipLaunch`, `-NoLog`, `-Check`
 | `nativeSetDnsServers(csv)` | Inject system DNS servers (must precede `nativeStartIroh`). |
 | `nativeSetDnsOverride("d=ip,ip;…")` | Pin pre-resolved IPs for iroh domains. |
 | `nativeSetRelayConfig(mode, url)` | `default` / `disabled` / `custom`. |
-| `nativeSetTwoFactor(id, secret, alg)` | TOTP credentials. |
+| `nativeSetTwoFactorForNode(nodeId, id, secret, alg)` | TOTP credentials of one endpoint. |
+| `nativeClearNodeTwoFactor()` | Drop every per-endpoint credential before re-reading them. |
+| `nativeSetTwoFactor(id, secret, alg)` | TOTP credentials shared by *every* endpoint; per-endpoint ones win. |
 | `nativeStartIroh()` | Bring up the endpoint; returns the Node ID. |
 | `nativeStartProxy(port)` | Start the local proxy and the endpoint group. |
 | `nativePreconnect()` | Warm up one connection per configured backend. |

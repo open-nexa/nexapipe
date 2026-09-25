@@ -17,6 +17,7 @@ import android.util.Log
 import com.nexa.pipe.IrohProxy
 import com.nexa.pipe.MainActivity
 import com.nexa.pipe.R
+import com.nexa.pipe.locale.AppLocale
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,7 +25,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * VPN service: creates the TUN interface and hands the fd over to the smoltcp
@@ -40,6 +44,13 @@ import kotlinx.coroutines.withTimeout
  * are all done on the Rust side.
  */
 class NexaVpnService : VpnService() {
+    // The notification this service shows is written from its own context, so
+    // it needs the selected language as much as the Activity does; switching
+    // language and reconnecting is enough to rebuild it.
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLocale.apply(newBase))
+    }
+
     private val TAG = "NexaVpnService"
     private var vpnInterface: ParcelFileDescriptor? = null
     // @Volatile: written from the main thread (onStartCommand/onRevoke) and
@@ -53,15 +64,14 @@ class NexaVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var isUserStarted = false
 
-    // Reconnect on network switch: keeps the reconnect job and its mutex so
-    // that concurrent native calls cannot race.
+    // Reconnect on network switch: keeps the reconnect job. The mutex serializes the rebuilds
+    // themselves — one cannot be interrupted inside a native call, so two must never run at once.
     private var reconnectJob: Job? = null
-    @Volatile private var reconnectInProgress = false
     // Whether the TUN proxy has started successfully. A network switch only
     // triggers a reconnect when this is true, so the initial VPN setup cannot
     // trigger one by accident.
     @Volatile private var tunProxyStarted = false
-    private val reconnectMutex = Any()
+    private val reconnectMutex = Mutex()
 
     // TUN subnet configuration (must match the virtual IP constants in Rust
     // tun_proxy.rs)
@@ -446,68 +456,100 @@ class NexaVpnService : VpnService() {
         }
     }
 
+    /**
+     * Runs one reconnect, serialized against any other.
+     *
+     * The debounce cancels the previous job, but a cancelled coroutine only notices at a
+     * suspension point and a rebuild has none inside its native calls — so the previous attempt
+     * can still be mid-flight when this one starts. Waiting for it is the whole point: the
+     * earlier code returned on "already in progress" instead, and the attempt that had been
+     * cancelled had already stopped the TUN proxy. That combination is how a network switch
+     * could end with the TUN down and nothing left to rebuild it.
+     */
     private suspend fun reconnectTunnel() {
         if (!isUserStarted || !isRunning) return
-        synchronized(reconnectMutex) {
-            if (reconnectInProgress) return
-            reconnectInProgress = true
+        val completed = withTimeoutOrNull(RECONNECT_HANDOVER_TIMEOUT_MS) {
+            reconnectMutex.withLock { reconnectTunnelOnce() }
+            true
         }
-        try {
-            // The switch is not finished yet (e.g. airplane mode was turned
-            // on): wait for the next network event.
-            if (underlyingNetwork == null) {
-                Log.d(TAG, "Reconnect: no underlying network yet, skipping")
-                return
-            }
-            if (!IrohProxy.isNativeLoaded()) {
-                Log.e(TAG, "Reconnect: native library not loaded")
-                return
-            }
-            Log.d(TAG, "Reconnect: rebuilding tunnel on underlying network $underlyingNetwork")
-
-            var lastError: Exception? = null
-            for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
-                if (!isUserStarted || !isRunning) return
-                try {
-                    withTimeout(RECONNECT_ATTEMPT_TIMEOUT_MS) {
-                        rebuildTunnel()
-                    }
-                    Log.d(TAG, "Reconnect complete (attempt $attempt/$MAX_RECONNECT_ATTEMPTS)")
-                    return
-                } catch (e: TimeoutCancellationException) {
-                    lastError = e
-                    Log.e(TAG, "Reconnect attempt $attempt/$MAX_RECONNECT_ATTEMPTS timed out")
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    // Deliberate cancellation from a manual disconnect or
-                    // service destruction: do not retry.
-                    throw e
-                } catch (e: Exception) {
-                    lastError = e
-                    Log.e(TAG, "Reconnect attempt $attempt/$MAX_RECONNECT_ATTEMPTS failed: ${e.message}")
-                }
-                if (attempt < MAX_RECONNECT_ATTEMPTS) {
-                    delay(RECONNECT_BACKOFF_MS)
-                }
-            }
-            Log.e(TAG, "Reconnect: all attempts failed: ${lastError?.message}")
-            // Keep the service running: request-level retries on the Rust side
-            // act as a safety net, and the next network change triggers another
-            // reconnect.
-        } finally {
-            synchronized(reconnectMutex) { reconnectInProgress = false }
+        if (completed == null) {
+            Log.w(
+                TAG,
+                "Reconnect: the previous attempt did not finish within " +
+                    "${RECONNECT_HANDOVER_TIMEOUT_MS}ms, skipping this one"
+            )
         }
     }
 
+    private suspend fun reconnectTunnelOnce() {
+        // The switch is not finished yet (e.g. airplane mode was turned
+        // on): wait for the next network event.
+        if (underlyingNetwork == null) {
+            Log.d(TAG, "Reconnect: no underlying network yet, skipping")
+            return
+        }
+        if (!IrohProxy.isNativeLoaded()) {
+            Log.e(TAG, "Reconnect: native library not loaded")
+            return
+        }
+        Log.d(TAG, "Reconnect: rebuilding tunnel on underlying network $underlyingNetwork")
+
+        var lastError: Exception? = null
+        for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
+            if (!isUserStarted || !isRunning) return
+            try {
+                withTimeout(RECONNECT_ATTEMPT_TIMEOUT_MS) {
+                    rebuildTunnel()
+                }
+                Log.d(TAG, "Reconnect complete (attempt $attempt/$MAX_RECONNECT_ATTEMPTS)")
+                return
+            } catch (e: TimeoutCancellationException) {
+                lastError = e
+                Log.e(TAG, "Reconnect attempt $attempt/$MAX_RECONNECT_ATTEMPTS timed out")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Deliberate cancellation from a manual disconnect or
+                // service destruction: do not retry.
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Log.e(TAG, "Reconnect attempt $attempt/$MAX_RECONNECT_ATTEMPTS failed: ${e.message}")
+            }
+            if (attempt < MAX_RECONNECT_ATTEMPTS) {
+                delay(RECONNECT_BACKOFF_MS)
+            }
+        }
+        Log.e(TAG, "Reconnect: all attempts failed: ${lastError?.message}")
+        // The TUN proxy is stopped at this point and the VPN went down with it, while
+        // `isRunning` / `isServiceActive` are still true. That combination is what used to
+        // leave the UI showing "Connected" over a dead data plane with no way back short of
+        // killing the app: report it and tear the session down so the UI can say so and the
+        // user can reconnect.
+        //
+        // Tear the session down *before* reporting it: the UI tells "the session is over" apart
+        // from "the tunnel is up but the backend is not answering" by looking at
+        // isServiceActive, which stopVPN() has just cleared.
+        stopVPN()
+        stopSelf()
+        notifyBroken(getString(R.string.notify_tunnel_rebuild_failed))
+    }
+
     /**
-     * Rebuilds the tunnel: stop the old TUN proxy -> re-establish the VPN and
-     * the TUN proxy on the new underlying network.
+     * Rebuilds the tunnel: stop the old TUN proxy -> drop the connections that
+     * were opened on the previous network -> re-establish the VPN and the TUN
+     * proxy on the new underlying network -> warm the pool again.
      *
-     * The iroh endpoint and the local proxy are left untouched: iroh handles
-     * path migration and relay reconnection itself, and the connection pool
-     * opens new backend connections on demand. Do not destroy and recreate the
-     * endpoint - that opens an outage window of seconds to tens of seconds
-     * (nativeStartIroh can block for 30s on a weak network) and may leave the
-     * tunnel unusable if the rebuild fails.
+     * The iroh endpoint and the local proxy are left untouched on purpose:
+     * recreating the endpoint opens an outage window of seconds to tens of
+     * seconds (nativeStartIroh can block for 30s on a weak network) and may
+     * leave the tunnel unusable if the rebuild fails.
+     *
+     * Step 2 is the one that used to be missing, and it is why a rebuilt tunnel
+     * could still not reach the backend: QUIC does not notice a network switch.
+     * A connection opened on the old network reports no close reason while its
+     * path is dead, so the pool keeps handing it out and every proxied request
+     * fails or hangs — the UI says "Connected" over a tunnel that carries
+     * nothing. Dropping them makes the next request dial on the network that is
+     * actually up.
      */
     private suspend fun rebuildTunnel() {
         // 1. Stop the old TUN proxy (closes the duplicated fd -> the old VPN is
@@ -516,10 +558,25 @@ class NexaVpnService : VpnService() {
             .onFailure { Log.e(TAG, "Reconnect: nativeStopTunProxy failed: ${it.message}") }
         tunProxyStarted = false
 
-        // 2. Re-establish the VPN (new TUN fd + new underlying network) and
+        // 2. Forget the connections the old network left behind.
+        runCatching { IrohProxy.nativeDropConnections() }
+            .onFailure { Log.e(TAG, "Reconnect: nativeDropConnections failed: ${it.message}") }
+
+        // 3. Re-establish the VPN (new TUN fd + new underlying network) and
         //    start the TUN proxy.
         if (!establishVpnInternal()) {
             throw Exception("Reconnect: failed to re-establish VPN/TUN proxy")
+        }
+
+        // 4. Warm the pool again, and check that the backend is reachable from
+        //    the new network. Without this a network the backend cannot be
+        //    dialed on looks exactly like a working one until a request fails.
+        val warmed = IrohProxy.nativePreconnect()
+        if (warmed <= 0) {
+            Log.w(TAG, "Reconnect: no backend answered the warm-up (nativePreconnect=$warmed)")
+            notifyBroken(getString(R.string.notify_backend_unreachable))
+        } else {
+            Log.d(TAG, "Reconnect: $warmed backend(s) reachable on the new network")
         }
     }
 
@@ -529,8 +586,12 @@ class NexaVpnService : VpnService() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "Nexa", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Nexa Service"
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = getString(R.string.notification_channel_description)
                 setShowBadge(false)
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
             }
@@ -556,8 +617,8 @@ class NexaVpnService : VpnService() {
         }
 
         return builder
-            .setContentTitle("Nexa")
-            .setContentText("Connected")
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(getString(R.string.notification_text))
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -575,6 +636,10 @@ class NexaVpnService : VpnService() {
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_ATTEMPT_TIMEOUT_MS = 60_000L
         private const val RECONNECT_BACKOFF_MS = 2_000L
+        // How long a new reconnect waits for the one before it. Generous on purpose: a rebuild
+        // blocked in a native call cannot be interrupted, so the wait is what keeps two of them
+        // from ever touching the TUN at the same time.
+        private const val RECONNECT_HANDOVER_TIMEOUT_MS = 120_000L
 
         /**
          * Process-level flag: whether the VPN service is active (the TUN proxy
@@ -614,6 +679,31 @@ class NexaVpnService : VpnService() {
 
         private fun notifyVpnRevoked() {
             revokedListener?.invoke()
+        }
+
+        /**
+         * Push channel for "the session is up but not actually working": a network switch the
+         * tunnel did not survive, or one it survived while the backend stayed unreachable.
+         *
+         * Both used to be invisible — `isServiceActive` stayed true, so the UI kept showing a
+         * healthy "Connected" over a dead data plane. The listener lets a foreground UI drop
+         * back to the error state instead of lying.
+         */
+        @Volatile
+        @JvmStatic
+        private var brokenListener: ((String) -> Unit)? = null
+
+        fun setBrokenListener(listener: ((String) -> Unit)?) {
+            brokenListener = listener
+        }
+
+        /**
+         * Reports a session that can no longer carry traffic. [reason] is the
+         * message to show; the service decides whether the session is merely
+         * degraded (the tunnel is up, the backend is not) or over.
+         */
+        private fun notifyBroken(reason: String) {
+            brokenListener?.invoke(reason)
         }
     }
 }

@@ -10,7 +10,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.nexa.pipe.IrohProxy
 import com.nexa.pipe.PermissionManager
+import com.nexa.pipe.R
 import com.nexa.pipe.SettingsManager
+import com.nexa.pipe.locale.AppStrings
 import com.nexa.pipe.vpn.NexaVpnService
 import com.nexa.pipe.vpn.UnderlyingNetworkSelector
 import kotlinx.coroutines.Dispatchers
@@ -29,10 +31,27 @@ import java.net.InetAddress
 
 import kotlinx.serialization.Serializable
 
+/**
+ * The 2FA credentials of one endpoint.
+ *
+ * They belong to the endpoint, not to the app: every server keeps its own
+ * `[auth].clients` table, so a second server either needs its own pair or has
+ * to be handed the first one's secret. [secret] is only ever persisted in the
+ * prefs file that backup excludes — see `SettingsManager`.
+ */
+@Serializable
+data class NodeTwoFactor(
+    val enabled: Boolean = true,
+    val clientId: String = "",
+    val secret: String = "",
+    val algorithm: String = "sha1" // "sha1", "sha256", "sha512"
+)
+
 @Serializable
 data class NodeConfig(
     val nodeId: String,
-    val domains: List<String> = emptyList()
+    val domains: List<String> = emptyList(),
+    val twoFactor: NodeTwoFactor? = null
 )
 
 class VpnViewModel : ViewModel() {
@@ -53,12 +72,14 @@ class VpnViewModel : ViewModel() {
     val vpnPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
     val notificationPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
 
-    // Relay configuration
+    // Relay configuration. There is deliberately no "force relay" switch: iroh 1.0.1 exposes
+    // no stable way to stop it promoting a connection to a direct path, so a switch that
+    // claimed to would be a lie.
     val relayMode = kotlinx.coroutines.flow.MutableStateFlow("pinned") // "pinned", "default", "disabled", "custom"
     val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
-    val forceRelay = kotlinx.coroutines.flow.MutableStateFlow(false)
+    // Bearer token for a custom relay that asks for one. Never logged.
+    val relayAuthToken = kotlinx.coroutines.flow.MutableStateFlow("")
 
-    // 2FA configuration
     /**
      * Runtime link type per backend (endpoint ID -> direct/relay), reported by iroh and
      * refreshed while the tunnel is up. Empty whenever nothing is connected, which is what
@@ -66,10 +87,8 @@ class VpnViewModel : ViewModel() {
      */
     val linkKinds = kotlinx.coroutines.flow.MutableStateFlow<Map<String, LinkKind>>(emptyMap())
 
-    val twoFactorEnabled = kotlinx.coroutines.flow.MutableStateFlow(false)
-    val twoFactorClientId = kotlinx.coroutines.flow.MutableStateFlow("")
-    val twoFactorSecret = kotlinx.coroutines.flow.MutableStateFlow("")
-    val twoFactorAlgorithm = kotlinx.coroutines.flow.MutableStateFlow("sha1") // "sha1", "sha256", "sha512"
+    // 2FA lives on the endpoint now (`NodeConfig.twoFactor`): one server, one
+    // pair of credentials. There is no app-wide setting left to publish here.
 
     // Serialize connect/disconnect so concurrent native calls cannot race.
     private val connectionMutex = Mutex()
@@ -90,17 +109,55 @@ class VpnViewModel : ViewModel() {
             viewModelScope.launch {
                 if (isVpnRunning.value) {
                     isVpnRunning.value = false
-                    errorMessage.value = VPN_TAKEN_OVER_MESSAGE
+                    errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
                     addLog("Tunnel revoked: another app (e.g. Clash) took over the tunnel slot")
                 }
+            }
+        }
+        // The service telling us the session stopped working (a network switch it could not
+        // recover from, or a backend it cannot reach on the new network). Reported while this
+        // UI was in the background or not alive at all, so it is the only way the status card
+        // stops claiming "Connected" over a tunnel that carries nothing.
+        NexaVpnService.setBrokenListener { reason ->
+            viewModelScope.launch {
+                // The service clears `isServiceActive` when it tore the session down, and leaves
+                // it set when the tunnel survived but nothing behind it answers — so this is how
+                // "the session is over" is told apart from "the session is degraded". Only the
+                // former drops back to Disconnected; reporting the latter as a disconnect would
+                // send the user to reconnect a tunnel that is still up.
+                if (!NexaVpnService.isServiceActive) {
+                    stopLinkPolling()
+                    isVpnRunning.value = false
+                    isIrohStarted.value = false
+                    addLog("Tunnel stopped working: $reason")
+                } else {
+                    addLog("Tunnel degraded: $reason")
+                }
+                errorMessage.value = reason
             }
         }
     }
 
     override fun onCleared() {
         NexaVpnService.setRevokedListener(null)
+        NexaVpnService.setBrokenListener(null)
         stopLinkPolling()
         super.onCleared()
+    }
+
+    /**
+     * Re-reads what the UI shows after it comes back to the foreground.
+     *
+     * Everything a session reports can change while this screen is not visible: the service
+     * rebuilds the tunnel on a network switch, and it may give up and tear the session down.
+     * Without a re-read the main page keeps showing whatever it last knew — an "old state"
+     * that no longer matches the tunnel.
+     */
+    fun onForeground() {
+        syncVpnServiceState()
+        // A session that survived in the service also has to be reported again: this ViewModel
+        // may have been created after connect() ran, in which case nothing is polling yet.
+        if (isVpnRunning.value) startLinkPolling()
     }
 
     /**
@@ -108,9 +165,16 @@ class VpnViewModel : ViewModel() {
      *
      * Best-effort: a failed read leaves the last known values in place rather than emptying the
      * map, so a transient JNI hiccup does not make every icon disappear.
+     *
+     * Deliberately **not** gated on [isIrohStarted]. That flag lives in this ViewModel, so it is
+     * false again as soon as the UI is recreated — which is exactly what a background switch or a
+     * process restore does while the tunnel keeps running in the service. Gating on it emptied
+     * the map for the rest of the session: the status card said "Connected" while the connection
+     * type was never shown again. Whether anything is started is the native side's answer to
+     * give, and it says so by returning null.
      */
     fun refreshLinkKinds() {
-        if (!isIrohStarted.value || !IrohProxy.isNativeLoaded()) {
+        if (!IrohProxy.isNativeLoaded()) {
             if (linkKinds.value.isNotEmpty()) linkKinds.value = emptyMap()
             return
         }
@@ -143,8 +207,14 @@ class VpnViewModel : ViewModel() {
         return parsed
     }
 
-    /** Starts re-reading the link types; no-op when a poll is already running. */
-    private fun startLinkPolling() {
+    /**
+     * Starts re-reading the link types; no-op when a poll is already running.
+     *
+     * Public because `connect()` is not the only way a session comes to exist: the service
+     * outlives a UI that was recreated in the background, and the ViewModel that wakes up with
+     * it has to pick the reporting back up. See [onForeground].
+     */
+    fun startLinkPolling() {
         if (linkPollJob?.isActive == true) return
         linkPollJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
@@ -172,11 +242,8 @@ class VpnViewModel : ViewModel() {
         // startProxyWithRetries increments it automatically on a port conflict.
         private const val LOCAL_PROXY_PORT = 8080
 
-        // Shown when another proxy app (e.g. Clash) owns the single tunnel slot
-        // Android allows per user.
-        private const val VPN_TAKEN_OVER_MESSAGE =
-            "Another app (e.g. Clash) took over the tunnel. " +
-                "Android allows only one active tunnel at a time — disconnect the other app to use Nexa."
+        // `error_vpn_taken_over` is what is shown when another proxy app (e.g.
+        // Clash) owns the single tunnel slot Android allows per user.
 
         // Upper bound on the in-memory log buffer.
         private const val MAX_LOG_LINES = 100
@@ -198,11 +265,7 @@ class VpnViewModel : ViewModel() {
             nodes.value = loadedNodes
             relayMode.value = manager.loadRelayMode()
             relayUrl.value = manager.loadRelayUrl()
-            forceRelay.value = manager.loadForceRelay()
-            twoFactorEnabled.value = manager.loadTwoFactorEnabled()
-            twoFactorClientId.value = manager.loadTwoFactorClientId()
-            twoFactorSecret.value = manager.loadTwoFactorSecret()
-            twoFactorAlgorithm.value = manager.loadTwoFactorAlgorithm()
+            relayAuthToken.value = manager.loadRelayAuthToken()
             addLog("Settings loaded: ${loadedNodes.size} nodes, relay=${relayMode.value}")
         }
     }
@@ -210,33 +273,42 @@ class VpnViewModel : ViewModel() {
     private fun saveSettings() {
         settingsManager?.let { manager ->
             manager.saveNodes(nodes.value)
-            manager.saveRelayConfig(relayMode.value, relayUrl.value, forceRelay.value)
-            manager.saveTwoFactorConfig(
-                twoFactorEnabled.value,
-                twoFactorClientId.value,
-                twoFactorSecret.value,
-                twoFactorAlgorithm.value
-            )
+            manager.saveRelayConfig(relayMode.value, relayUrl.value, relayAuthToken.value)
         }
     }
 
-    fun updateRelayConfig(mode: String, url: String, force: Boolean) {
+    fun updateRelayConfig(mode: String, url: String, authToken: String = relayAuthToken.value) {
         relayMode.value = mode
-        relayUrl.value = url
-        forceRelay.value = force
+        // A URL only means anything in "custom"; keeping one around after a switch to
+        // another mode would leave a stale field behind.
+        relayUrl.value = if (mode == "custom") url else ""
+        relayAuthToken.value = if (mode == "custom") authToken else ""
         saveSettings()
-        addLog("Relay config updated: mode=${mode}, force=${force}")
+        addLog("Relay config updated: mode=${mode}, url=${relayUrl.value}")
     }
 
-    fun updateTwoFactorConfig(enabled: Boolean, clientId: String, secret: String, algorithm: String) {
-        twoFactorEnabled.value = enabled
-        twoFactorClientId.value = clientId
-        twoFactorSecret.value = secret
-        twoFactorAlgorithm.value = algorithm
+    /**
+     * Replaces the 2FA credentials of one endpoint.
+     *
+     * A null [twoFactor] means this endpoint has none, which also drops the
+     * saved secret rather than leaving it behind for whatever endpoint next
+     * reuses the ID.
+     *
+     * No client id in the log: debug builds expose Log.d, and the ID is half
+     * of the 2FA credential pair.
+     */
+    fun updateNodeTwoFactor(nodeId: String, twoFactor: NodeTwoFactor?) {
+        val index = nodes.value.indexOfFirst { it.nodeId == nodeId }
+        if (index == -1) return
+        val updated = nodes.value.toMutableList().apply {
+            set(index, this[index].copy(twoFactor = twoFactor))
+        }
+        nodes.value = updated
         saveSettings()
-        // No client id in the log: debug builds expose Log.d, and the ID is
-        // half of the 2FA credential pair.
-        addLog("2FA config updated: enabled=${enabled}, algorithm=${algorithm}")
+        addLog(
+            "2FA updated for ${nodeId.take(8)}: enabled=${twoFactor?.enabled ?: false}, " +
+                "algorithm=${twoFactor?.algorithm ?: "-"}"
+        )
     }
 
     fun addLog(message: String) {
@@ -264,7 +336,7 @@ class VpnViewModel : ViewModel() {
                 ensureIrohStarted()
             } catch (e: Exception) {
                 addLog("Error starting iroh: ${e.message}")
-                errorMessage.value = e.message ?: "Unknown error"
+                errorMessage.value = e.message ?: AppStrings.get(R.string.error_unknown)
             }
         }
     }
@@ -282,7 +354,7 @@ class VpnViewModel : ViewModel() {
             isIrohStarted.value = true
             addLog("Iroh started: $id")
         } else {
-            throw Exception("Failed to start iroh")
+            throw Exception(AppStrings.get(R.string.error_start_iroh))
         }
     }
 
@@ -398,7 +470,7 @@ class VpnViewModel : ViewModel() {
             }
         }
         if (!hasDomainMappings) {
-            throw Exception("No domain mappings configured. Please add nodes with domains.")
+            throw Exception(AppStrings.get(R.string.error_no_domain_mappings))
         }
         return nodes.value.flatMap { it.domains }
     }
@@ -424,7 +496,7 @@ class VpnViewModel : ViewModel() {
             if (result == 0) break
             if (result == IrohProxy.RESULT_CONFIG_ERROR) {
                 throw Exception(
-                    nativeFailureReason() ?: "Invalid proxy configuration"
+                    nativeFailureReason() ?: AppStrings.get(R.string.error_invalid_proxy_config)
                 )
             }
             addLog("Failed to start proxy on port $actualPort, retrying...")
@@ -433,7 +505,7 @@ class VpnViewModel : ViewModel() {
         if (result != 0) {
             val reason = nativeFailureReason()
             throw Exception(
-                "Failed to start proxy on ports $basePort..${basePort + 9}" +
+                AppStrings.get(R.string.error_proxy_ports, basePort, basePort + 9) +
                     if (reason != null) ": $reason" else ""
             )
         }
@@ -452,20 +524,22 @@ class VpnViewModel : ViewModel() {
     private fun preconnectFailureReason(result: Int): String {
         val targets = nodes.value
             .map { it.nodeId }
-            .ifEmpty { listOf("the configured backends") }
+            .ifEmpty { listOf(AppStrings.get(R.string.error_configured_backends)) }
             .joinToString(", ")
         val base = if (result == 0) {
-            "No backend is reachable ($targets). " +
-                "Check that the endpoint IDs are correct and that the servers are online."
+            AppStrings.get(R.string.error_no_backend_reachable, targets)
         } else {
-            "Backend reachability check failed (nativePreconnect returned $result). " +
-                "See the log for details."
+            AppStrings.get(R.string.error_preconnect_failed, result)
         }
         // A server that answered and then refused the connection (2FA, most
         // often) leaves its reason on the native side. Without it a refusal
         // looks exactly like an offline server.
         val detail = nativeFailureReason()
-        return if (detail != null) "$base Cause: $detail." else base
+        return if (detail != null) {
+            "$base ${AppStrings.get(R.string.error_cause, detail)}"
+        } else {
+            base
+        }
     }
 
     /** Reason behind the last failed native call, or null when there is none. */
@@ -491,8 +565,7 @@ class VpnViewModel : ViewModel() {
             addLog("Node ID validation unavailable: ${e.message}")
             return null
         } ?: return null
-        return "Invalid endpoint ID '$id': $reason. " +
-            "Endpoint IDs are 64 hexadecimal characters."
+        return AppStrings.get(R.string.error_invalid_endpoint_id, id, reason)
     }
 
     /**
@@ -571,11 +644,11 @@ class VpnViewModel : ViewModel() {
                 }
 
                 if (!IrohProxy.isNativeLoaded()) {
-                    throw Exception("Native library not loaded. Please check if libnexapipe_client.so is properly included in the APK.")
+                    throw Exception(AppStrings.get(R.string.error_native_library))
                 }
                 val vpnPermissionGranted = VpnService.prepare(context) == null
                 if (!vpnPermissionGranted) {
-                    throw Exception("Proxy permission not granted. Grant it from the permission guide first.")
+                    throw Exception(AppStrings.get(R.string.error_vpn_permission))
                 }
 
                 // Mutual-exclusion guard: Android allows only one active
@@ -588,7 +661,7 @@ class VpnViewModel : ViewModel() {
                 if (!NexaVpnService.isServiceActive &&
                     UnderlyingNetworkSelector.hasActiveVpnNetwork(cm)
                 ) {
-                    errorMessage.value = VPN_TAKEN_OVER_MESSAGE
+                    errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
                     addLog("connect aborted: another proxy app is active")
                     return@launch
                 }
@@ -631,14 +704,26 @@ class VpnViewModel : ViewModel() {
                                 IrohProxy.nativeSetDnsOverride(dnsOverrides)
                             }
                             // Configure the relay mode
-                            IrohProxy.nativeSetRelayConfig(relayMode.value, relayUrl.value)
+                            IrohProxy.nativeSetRelayConfig(
+                                relayMode.value,
+                                relayUrl.value,
+                                relayAuthToken.value
+                            )
                             // Configure the 2FA credentials (must be injected
-                            // before nativeStartProxy)
-                            if (twoFactorEnabled.value) {
-                                IrohProxy.nativeSetTwoFactor(
-                                    twoFactorClientId.value,
-                                    twoFactorSecret.value,
-                                    twoFactorAlgorithm.value
+                            // before nativeStartProxy). Every endpoint carries
+                            // its own pair, so the native table is cleared
+                            // first: without that, an endpoint whose 2FA was
+                            // switched off would still hold the credentials of
+                            // an earlier connect for as long as the process
+                            // lives.
+                            IrohProxy.nativeClearNodeTwoFactor()
+                            for (node in nodes.value) {
+                                val otp = node.twoFactor?.takeIf { it.enabled } ?: continue
+                                IrohProxy.nativeSetTwoFactorForNode(
+                                    node.nodeId,
+                                    otp.clientId,
+                                    otp.secret,
+                                    otp.algorithm
                                 )
                             }
                             ensureIrohStarted()
@@ -700,7 +785,8 @@ class VpnViewModel : ViewModel() {
                         delay(BACKOFF_MS[attempt])
                     }
                 }
-                errorMessage.value = lastError?.message ?: "All connection attempts failed"
+                errorMessage.value = lastError?.message
+                    ?: AppStrings.get(R.string.error_all_attempts_failed)
                 addLog("All $MAX_CONNECT_ATTEMPTS attempts failed")
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Deliberate cancellation from disconnect: propagate quietly;
@@ -711,7 +797,7 @@ class VpnViewModel : ViewModel() {
                 // permission not granted, ...). Without this catch the
                 // exception escapes the coroutine and crashes the app.
                 addLog("Connect failed: ${e.message}")
-                errorMessage.value = e.message ?: "Connection failed"
+                errorMessage.value = e.message ?: AppStrings.get(R.string.error_connection_failed)
             } finally {
                 isConnecting.value = false
                 connectionStatusText.value = null
@@ -773,8 +859,10 @@ class VpnViewModel : ViewModel() {
      */
     fun addNode(nodeId: String): String? {
         val id = nodeId.trim()
-        if (id.isEmpty()) return "Endpoint ID cannot be empty"
-        if (nodes.value.any { it.nodeId == id }) return "Endpoint ID already exists: $id"
+        if (id.isEmpty()) return AppStrings.get(R.string.error_endpoint_id_empty)
+        if (nodes.value.any { it.nodeId == id }) {
+            return AppStrings.get(R.string.error_endpoint_id_exists, id)
+        }
         nodeIdFormatError(id)?.let { return it }
 
         nodes.value = nodes.value + NodeConfig(id)
@@ -809,12 +897,14 @@ class VpnViewModel : ViewModel() {
      */
     fun renameNode(oldNodeId: String, newNodeId: String): String? {
         val newId = newNodeId.trim()
-        if (newId.isEmpty()) return "Endpoint ID cannot be empty"
+        if (newId.isEmpty()) return AppStrings.get(R.string.error_endpoint_id_empty)
         if (newId == oldNodeId) return null
 
         val index = nodes.value.indexOfFirst { it.nodeId == oldNodeId }
-        if (index == -1) return "Endpoint not found: $oldNodeId"
-        if (nodes.value.any { it.nodeId == newId }) return "Endpoint ID already exists: $newId"
+        if (index == -1) return AppStrings.get(R.string.error_endpoint_not_found, oldNodeId)
+        if (nodes.value.any { it.nodeId == newId }) {
+            return AppStrings.get(R.string.error_endpoint_id_exists, newId)
+        }
         nodeIdFormatError(newId)?.let { return it }
 
         val node = nodes.value[index]
@@ -879,7 +969,16 @@ class VpnViewModel : ViewModel() {
     fun syncVpnServiceState() {
         if (!isVpnRunning.value && !isConnecting.value && NexaVpnService.isServiceActive) {
             isVpnRunning.value = true
+            // The native endpoint is up too — the service only becomes active after
+            // nativeStartIroh and nativeStartProxy succeeded. Recording it matters when this
+            // ViewModel was created *after* the connect that started the session (a background
+            // switch that recreated the activity): `removeNode`/`renameNode` re-point the
+            // native side only when it is set.
+            isIrohStarted.value = true
             addLog("Synced UI state: service is active")
+            // ...and the connection types have to be reported again, since the poll that used
+            // to run belongs to the ViewModel that is gone.
+            startLinkPolling()
         }
         // The VPN slot was lost to another VPN app while this ViewModel had no
         // revoked-listener registered (app was backgrounded or the ViewModel
@@ -887,7 +986,7 @@ class VpnViewModel : ViewModel() {
         // "Connected".
         if (isVpnRunning.value && !isConnecting.value && NexaVpnService.wasRevoked) {
             isVpnRunning.value = false
-            errorMessage.value = VPN_TAKEN_OVER_MESSAGE
+            errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
             addLog("Synced UI state: tunnel was revoked by another app")
         }
     }

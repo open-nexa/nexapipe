@@ -22,8 +22,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import com.nexa.pipe.R
 import com.nexa.pipe.otp.OtpAuth
 
 /**
@@ -46,14 +48,14 @@ fun TwoFactorExportDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Share 2FA Configuration") },
+        title = { Text(stringResource(R.string.two_factor_export_title)) },
         text = {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Scan this code with NexaPipe on another device to copy the client ID, secret and algorithm.",
+                    text = stringResource(R.string.two_factor_export_body),
                     style = MaterialTheme.typography.bodySmall
                 )
 
@@ -73,7 +75,7 @@ fun TwoFactorExportDialog(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Anyone who scans this code gets full 2FA access for \"$clientId\".",
+                        text = stringResource(R.string.two_factor_export_warning, clientId),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -81,12 +83,15 @@ fun TwoFactorExportDialog(
 
                 Column(modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        text = "Client ID: $clientId",
+                        text = stringResource(R.string.two_factor_export_client_id, clientId),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = "Algorithm: ${algorithm.uppercase()}",
+                        text = stringResource(
+                            R.string.two_factor_export_algorithm,
+                            algorithm.uppercase()
+                        ),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -97,16 +102,20 @@ fun TwoFactorExportDialog(
             TextButton(
                 onClick = {
                     clipboardManager.setText(AnnotatedString(uri))
-                    Toast.makeText(context, "otpauth URI copied", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.two_factor_export_copied),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     onDismiss()
                 }
             ) {
-                Text("Copy URI")
+                Text(stringResource(R.string.two_factor_export_copy))
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Close")
+                Text(stringResource(R.string.action_close))
             }
         }
     )

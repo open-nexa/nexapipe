@@ -1,6 +1,5 @@
 package com.nexa.pipe.ui.theme
 
-import android.app.Activity
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
@@ -11,33 +10,80 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
 
+/**
+ * Both schemes spell out the surface containers the screens read
+ * (`surfaceContainerLow` for cards, `surfaceContainerHigh` for rows on them), so
+ * a card is visibly a card in either theme instead of falling back to whatever
+ * Material picked.
+ */
 private val DarkColorScheme = darkColorScheme(
-    primary = Purple80,
-    secondary = PurpleGrey80,
-    tertiary = Pink80
+    primary = NexaBlue300,
+    onPrimary = NexaBlue800,
+    primaryContainer = NexaBlue800,
+    onPrimaryContainer = NexaBlue100,
+    secondary = NexaSlate400,
+    onSecondary = NexaSlate900,
+    secondaryContainer = NexaSlate800,
+    onSecondaryContainer = NexaSlate100,
+    background = NexaSlate900,
+    onBackground = NexaSlate50,
+    surface = NexaSlate800,
+    onSurface = NexaSlate50,
+    surfaceVariant = NexaSlate800,
+    onSurfaceVariant = NexaSlate200,
+    surfaceContainerLowest = NexaSlate900,
+    surfaceContainerLow = NexaSlate800,
+    surfaceContainer = NexaSlate800,
+    surfaceContainerHigh = NexaSlate800,
+    surfaceContainerHighest = NexaSlate600,
+    outline = NexaSlate600,
+    error = NexaRed500,
+    onError = NexaSlate900,
+    errorContainer = NexaRed800,
+    onErrorContainer = NexaRed100,
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    primary = NexaBlue600,
+    onPrimary = NexaSlate50,
+    primaryContainer = NexaBlue100,
+    onPrimaryContainer = NexaBlue800,
+    secondary = NexaSlate600,
+    onSecondary = NexaSlate50,
+    secondaryContainer = NexaSlate100,
+    onSecondaryContainer = NexaSlate800,
+    background = NexaSlate50,
+    onBackground = NexaSlate900,
+    surface = NexaSlate50,
+    onSurface = NexaSlate900,
+    surfaceVariant = NexaSlate100,
+    onSurfaceVariant = NexaSlate600,
+    surfaceContainerLowest = NexaSlate50,
+    surfaceContainerLow = NexaSlate50,
+    surfaceContainer = NexaSlate100,
+    surfaceContainerHigh = NexaSlate100,
+    surfaceContainerHighest = NexaSlate200,
+    outline = NexaSlate400,
+    error = NexaRed600,
+    onError = NexaSlate50,
+    errorContainer = NexaRed100,
+    onErrorContainer = NexaRed800,
 )
 
+/**
+ * The app theme.
+ *
+ * `dynamicColor` is off by default now. Material You takes the whole scheme
+ * from the wallpaper, which meant the app changed colour every time the user
+ * changed their background — and on anything below Android 12 it fell back to
+ * the template purple, so two phones running the same build looked unrelated.
+ * The brand scheme is the same everywhere instead; the parameter is left so it
+ * can be offered as a setting later.
+ */
 @Composable
 fun NexaTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
@@ -52,6 +98,7 @@ fun NexaTheme(
 
     MaterialTheme(
         colorScheme = colorScheme,
+        shapes = NexaShapes,
         typography = Typography,
         content = content
     )

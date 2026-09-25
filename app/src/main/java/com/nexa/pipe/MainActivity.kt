@@ -1,5 +1,6 @@
 package com.nexa.pipe
 
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -8,11 +9,19 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.nexa.pipe.locale.AppLocale
 import com.nexa.pipe.ui.VpnControlScreen
 import com.nexa.pipe.ui.VpnViewModel
 import com.nexa.pipe.ui.theme.NexaTheme
 
 class MainActivity : ComponentActivity() {
+    // Resources are resolved per context, so the selected language is applied
+    // here rather than once for the process: a language switch recreates this
+    // activity and it comes back through this hook with the new one.
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLocale.apply(newBase))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()

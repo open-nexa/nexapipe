@@ -18,8 +18,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.google.zxing.BarcodeFormat
+import com.nexa.pipe.R
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
@@ -45,7 +47,7 @@ fun QrCodeImage(content: String, modifier: Modifier = Modifier) {
         val image = bitmap
         if (image == null) {
             Text(
-                text = "Unable to render this code as a QR code.",
+                text = stringResource(R.string.qr_code_render_failed),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
             )
@@ -53,7 +55,7 @@ fun QrCodeImage(content: String, modifier: Modifier = Modifier) {
             Surface(color = Color.White, shape = RoundedCornerShape(12.dp)) {
                 Image(
                     bitmap = image,
-                    contentDescription = "2FA configuration QR code",
+                    contentDescription = stringResource(R.string.qr_code_cd),
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .padding(12.dp)

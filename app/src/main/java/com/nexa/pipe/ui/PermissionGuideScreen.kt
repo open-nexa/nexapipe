@@ -18,10 +18,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.nexa.pipe.PermissionManager
+import com.nexa.pipe.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,10 +59,13 @@ fun PermissionGuideScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Permission Guide") },
+                title = { Text(stringResource(R.string.permission_guide_title)) },
                 navigationIcon = {
                     IconButton(onClick = onComplete) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back)
+                        )
                     }
                 }
             )
@@ -86,7 +91,7 @@ fun PermissionGuideScreen(
             Spacer(modifier = Modifier.height(24.dp))
 
             Text(
-                text = "Enable Required Permissions",
+                text = stringResource(R.string.permission_enable_title),
                 style = MaterialTheme.typography.headlineLarge,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
@@ -95,7 +100,7 @@ fun PermissionGuideScreen(
             Spacer(modifier = Modifier.height(12.dp))
 
             Text(
-                text = "Nexa needs these permissions to provide a secure proxy service.",
+                text = stringResource(R.string.permission_intro),
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
@@ -105,8 +110,8 @@ fun PermissionGuideScreen(
 
             PermissionCard(
                 icon = Icons.Default.CheckCircle,
-                title = "Proxy Permission",
-                description = "Required to route network traffic through the secure proxy.",
+                title = stringResource(R.string.permission_vpn_title),
+                description = stringResource(R.string.permission_vpn_body),
                 isGranted = vpnPermissionChecked,
                 onClick = {
                     val intent = VpnService.prepare(context)
@@ -124,8 +129,8 @@ fun PermissionGuideScreen(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 PermissionCard(
                     icon = Icons.Default.Info,
-                    title = "Notification Permission",
-                    description = "Required to show a persistent notification while the service is running.",
+                    title = stringResource(R.string.permission_notification_title),
+                    description = stringResource(R.string.permission_notification_body),
                     isGranted = notificationPermissionChecked,
                     onClick = {
                         notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -137,8 +142,8 @@ fun PermissionGuideScreen(
 
             PermissionCard(
                 icon = Icons.Default.Settings,
-                title = "Background Service",
-                description = "Nexa runs as a foreground service to ensure continuous connectivity.",
+                title = stringResource(R.string.permission_background_title),
+                description = stringResource(R.string.permission_background_body),
                 isGranted = true,
                 onClick = {
                     PermissionManager.openAppSettings(context)
@@ -159,7 +164,7 @@ fun PermissionGuideScreen(
                 enabled = vpnPermissionChecked && (notificationPermissionChecked || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU)
             ) {
                 Text(
-                    text = "Continue",
+                    text = stringResource(R.string.action_continue),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )

@@ -20,10 +20,12 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.nexa.pipe.R
 
 /**
  * How traffic to a backend is actually routed, as reported by iroh at runtime.
@@ -43,10 +45,11 @@ enum class LinkKind {
 }
 
 /** Short label for the icon; also its talk-back description. */
+@Composable
 fun linkKindLabel(kind: LinkKind): String = when (kind) {
-    LinkKind.DIRECT -> "Direct"
-    LinkKind.RELAY -> "Relay"
-    LinkKind.UNKNOWN -> "Connecting"
+    LinkKind.DIRECT -> stringResource(R.string.link_direct)
+    LinkKind.RELAY -> stringResource(R.string.link_relay)
+    LinkKind.UNKNOWN -> stringResource(R.string.link_connecting)
 }
 
 /** Direct is the good case, relay still works but is a detour, and undetermined is muted. */

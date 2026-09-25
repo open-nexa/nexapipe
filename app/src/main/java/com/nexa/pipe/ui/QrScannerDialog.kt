@@ -52,7 +52,9 @@ import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import com.nexa.pipe.R
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
@@ -200,7 +202,7 @@ private fun ScannerContent(
                     )
                 } catch (e: Exception) {
                     // No back camera, camera already in use, ...
-                    cameraError = e.message ?: "Unable to start the camera"
+                    cameraError = e.message ?: context.getString(R.string.scanner_camera_error)
                 }
             },
             ContextCompat.getMainExecutor(context)
@@ -224,7 +226,11 @@ private fun ScannerContent(
                 .statusBarsPadding()
                 .padding(16.dp)
         ) {
-            Icon(Icons.Default.Close, contentDescription = "Close scanner", tint = ScannerTextColor)
+            Icon(
+                Icons.Default.Close,
+                contentDescription = stringResource(R.string.scanner_close),
+                tint = ScannerTextColor
+            )
         }
 
         Column(
@@ -237,7 +243,7 @@ private fun ScannerContent(
             val message = when {
                 cameraError != null -> cameraError
                 status.value != null -> status.value
-                else -> "Point the camera at an otpauth:// QR code"
+                else -> stringResource(R.string.scanner_hint)
             }
             Text(
                 text = message ?: "",
@@ -260,7 +266,10 @@ private fun ScannerContent(
                     .navigationBarsPadding()
                     .padding(bottom = 56.dp)
             ) {
-                Text(if (torchEnabled) "Turn torch off" else "Turn torch on")
+                Text(
+                    if (torchEnabled) stringResource(R.string.scanner_torch_off)
+                    else stringResource(R.string.scanner_torch_on)
+                )
             }
         }
     }
@@ -311,17 +320,17 @@ private fun CameraPermissionRequest(onRequest: () -> Unit, onClose: () -> Unit) 
     ) {
         Spacer(modifier = Modifier.weight(1f))
         Text(
-            text = "Camera access is required to scan a QR code.",
+            text = stringResource(R.string.scanner_camera_permission),
             color = ScannerTextColor,
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center
         )
         Spacer(modifier = Modifier.height(16.dp))
         Button(onClick = onRequest) {
-            Text("Grant permission")
+            Text(stringResource(R.string.action_grant_permission))
         }
         TextButton(onClick = onClose) {
-            Text("Cancel", color = ScannerTextColor)
+            Text(stringResource(R.string.action_cancel), color = ScannerTextColor)
         }
         Spacer(modifier = Modifier.weight(1f))
     }
