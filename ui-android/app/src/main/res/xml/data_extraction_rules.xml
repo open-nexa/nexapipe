@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   Data extraction rules for API 31+ backups and device transfers.
+   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
+   for details.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- TOTP seeds must never leave the device, not even in a backup. -->
+        <exclude domain="sharedpref" path="NexaPipeSecrets.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <!-- Nor may they ride along a device-to-device transfer. -->
+        <exclude domain="sharedpref" path="NexaPipeSecrets.xml" />
+    </device-transfer>
+</data-extraction-rules>

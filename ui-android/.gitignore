@@ -1,0 +1,35 @@
+# Gradle
+.gradle
+gradle.properties.local
+
+# IDE
+*.iml
+/.idea/
+/.kotlin/
+
+# Local config
+/local.properties
+local.properties
+
+# Builds
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+nexa_vpn_log.txt
+
+# Debug notes
+debug-*.md
+
+# Signing — 绝不入库
+*.jks
+*.keystore
+keystore.properties
+.workbuddy

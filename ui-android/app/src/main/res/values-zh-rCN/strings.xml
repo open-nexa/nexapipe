@@ -1,0 +1,201 @@
+<resources>
+    <!-- Simplified Chinese. Every string of values/strings.xml has to exist
+         here: a missing one silently falls back to English. -->
+
+    <string name="app_name">nexa</string>
+    <string name="app_title">Nexa</string>
+
+    <!-- 状态卡片 -->
+    <string name="status_connected">已连接</string>
+    <string name="status_connecting">正在连接…</string>
+    <string name="status_disconnected">未连接</string>
+    <string name="status_connected_subtitle">流量正通过 iroh 转发</string>
+    <string name="status_connecting_subtitle">正在建立隧道…</string>
+    <string name="status_disconnected_subtitle">未连接</string>
+    <string name="action_connect">连接</string>
+    <string name="action_disconnect">断开</string>
+    <string name="connected_endpoints_title">已连接的端点</string>
+
+    <!-- 日志 -->
+    <string name="logs_title">日志</string>
+    <string name="logs_clear">清除日志</string>
+
+    <!-- 通用操作 -->
+    <string name="action_close">关闭</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_save">保存</string>
+    <string name="action_add">添加</string>
+    <string name="action_delete">删除</string>
+    <string name="action_import">导入</string>
+    <string name="action_copy">复制</string>
+    <string name="action_back">返回</string>
+    <string name="action_toggle">展开/收起</string>
+    <string name="action_undo">撤销</string>
+    <string name="action_replace">替换</string>
+    <string name="action_continue">继续</string>
+    <string name="action_grant_permission">授予权限</string>
+
+    <!-- 配置 > 端点 -->
+    <string name="configurations_title">配置</string>
+    <string name="endpoints_title">端点</string>
+    <string name="endpoints_subtitle">点按端点即可管理其域名与两步验证</string>
+    <string name="endpoints_scan_invite">扫描邀请</string>
+    <string name="endpoints_paste_link">粘贴链接</string>
+    <string name="endpoints_empty_title">还没有端点</string>
+    <string name="endpoints_empty_body">扫描邀请二维码，或粘贴 nexapipe:// 链接，即可开始转发域名。</string>
+    <plurals name="endpoint_domains_count">
+        <item quantity="other">%1$d 个域名</item>
+    </plurals>
+    <string name="endpoint_domains_none">还没有域名</string>
+    <string name="endpoint_2fa_enabled">已启用两步验证</string>
+
+    <!-- 配置 > 语言 -->
+    <string name="language_title">语言</string>
+    <string name="language_system">跟随系统</string>
+    <string name="language_english">English</string>
+    <string name="language_chinese_simplified">简体中文</string>
+
+    <!-- 导入邀请 -->
+    <string name="invite_import_title">导入端点邀请</string>
+    <string name="invite_replaces">\n\n这将覆盖%1$s。</string>
+    <string name="invite_conflict_2fa">该端点的两步验证凭据（“%1$s”）</string>
+    <string name="invite_conflict_2fa_current_client">当前的客户端</string>
+    <string name="invite_conflict_relay">中继设置</string>
+    <string name="invite_summary_node">节点：%1$s</string>
+    <string name="invite_summary_name">名称：%1$s</string>
+    <string name="invite_summary_domains">域名：%1$s</string>
+    <string name="invite_summary_2fa_none">两步验证：无</string>
+    <string name="invite_summary_2fa">两步验证：%1$s（%2$s）</string>
+    <string name="invite_summary_relay">中继：%1$s</string>
+    <string name="invite_value_none">无</string>
+    <string name="invite_ticket_unsupported">该邀请携带的是端点票据，无法保存在这里。请改用节点 ID 形式的邀请。</string>
+    <string name="invite_imported">已导入端点 %1$s</string>
+    <string name="invite_paste_title">粘贴邀请链接</string>
+    <string name="invite_paste_label">nexapipe:// 链接</string>
+    <string name="invite_paste_placeholder">nexapipe://endpoint/…</string>
+    <string name="invite_paste_empty">请先粘贴 nexapipe:// 链接</string>
+
+    <!-- 端点详情 -->
+    <string name="endpoint_title">端点</string>
+    <string name="endpoint_options">端点选项</string>
+    <string name="endpoint_copy_id">复制端点 ID</string>
+    <string name="endpoint_edit_id">修改端点 ID</string>
+    <string name="endpoint_delete">删除端点</string>
+    <string name="endpoint_id_label">端点 ID</string>
+    <string name="endpoint_id_current">当前：%1$s</string>
+    <string name="endpoint_delete_title">删除端点</string>
+    <string name="endpoint_delete_body">确定要删除这个端点吗？\n\n%1$s\n\n其 %2$d 条域名映射也会一并移除。</string>
+    <string name="endpoint_id_updated">端点 ID 已更新</string>
+
+    <!-- 连接方式 -->
+    <string name="link_direct">直连</string>
+    <string name="link_relay">中继</string>
+    <string name="link_connecting">连接中</string>
+    <string name="link_title">连接 · %1$s</string>
+    <string name="link_direct_body">流量直达该端点</string>
+    <string name="link_relay_body">流量经由中继服务器转发</string>
+    <string name="link_connecting_body">正在选择最佳路径</string>
+
+    <!-- 域名 -->
+    <string name="domains_title">域名</string>
+    <string name="domain_add">添加域名</string>
+    <string name="domain_add_title">添加域名</string>
+    <string name="domain_label">域名</string>
+    <string name="domain_placeholder">example.com</string>
+    <string name="domain_empty_body">在这里添加的域名都会通过该端点转发。</string>
+    <string name="domain_removed">已移除“%1$s”</string>
+    <string name="domain_remove_cd">移除 %1$s</string>
+
+    <!-- 剪贴板 -->
+    <string name="copied_toast">已复制%1$s</string>
+    <string name="clipboard_label_endpoint_id">端点 ID</string>
+    <string name="clipboard_label_domain">域名</string>
+
+    <!-- 两步验证 -->
+    <string name="two_factor_title">两步验证</string>
+    <string name="two_factor_on">开</string>
+    <string name="two_factor_off">关</string>
+    <string name="two_factor_off_body">连接该端点时不做身份验证；要求两步验证的服务器会拒绝建立隧道。</string>
+    <string name="two_factor_client_id">客户端 ID</string>
+    <string name="two_factor_client_id_placeholder">client-001</string>
+    <string name="two_factor_secret">TOTP 密钥</string>
+    <string name="two_factor_secret_placeholder">JBSWY3DPEHPK3PXP</string>
+    <string name="two_factor_algorithm">算法</string>
+    <string name="two_factor_sha1">SHA1（默认）</string>
+    <string name="two_factor_sha256">SHA256</string>
+    <string name="two_factor_sha512">SHA512</string>
+    <string name="two_factor_scan">扫描二维码</string>
+    <string name="two_factor_share_qr">以二维码分享</string>
+    <string name="two_factor_per_endpoint_note">这些凭据只属于该端点，其他端点仍各自使用自己的凭据。</string>
+    <string name="two_factor_imported">已为“%1$s”导入两步验证</string>
+    <string name="two_factor_replace_title">替换两步验证配置</string>
+    <string name="two_factor_replace_body">该端点已配置两步验证。\n\n要用扫描到的凭据（“%1$s”）替换它吗？</string>
+    <string name="two_factor_export_title">分享两步验证配置</string>
+    <string name="two_factor_export_body">用另一台设备上的 NexaPipe 扫描此二维码，即可复制客户端 ID、密钥和算法。</string>
+    <string name="two_factor_export_warning">任何扫描此二维码的人都会获得“%1$s”的完整两步验证权限。</string>
+    <string name="two_factor_export_client_id">客户端 ID：%1$s</string>
+    <string name="two_factor_export_algorithm">算法：%1$s</string>
+    <string name="two_factor_export_copy">复制 URI</string>
+    <string name="two_factor_export_copied">otpauth URI 已复制</string>
+    <string name="qr_code_cd">两步验证配置二维码</string>
+    <string name="qr_code_render_failed">无法将此内容渲染为二维码。</string>
+
+    <!-- 中继设置 -->
+    <string name="relay_title">中继设置</string>
+    <string name="relay_mode_title">中继模式</string>
+    <string name="relay_mode_pinned">固定（aps1-1，稳定）</string>
+    <string name="relay_mode_default">默认（全部 N0 中继）</string>
+    <string name="relay_mode_disabled">停用（完全不使用中继）</string>
+    <string name="relay_mode_custom">自定义 URL（独占）</string>
+    <string name="relay_url_label">中继 URL</string>
+    <string name="relay_url_placeholder">https://relay.example.com</string>
+    <string name="relay_token_label">中继鉴权令牌（可选）</string>
+    <string name="relay_token_note">仅当中继要求时才需要填写，且服务器必须使用相同的令牌。</string>
+
+    <!-- 权限引导 -->
+    <string name="permission_guide_title">权限引导</string>
+    <string name="permission_enable_title">启用所需权限</string>
+    <string name="permission_intro">Nexa 需要这些权限才能提供安全的代理服务。</string>
+    <string name="permission_vpn_title">代理权限</string>
+    <string name="permission_vpn_body">用于把网络流量导入安全代理。</string>
+    <string name="permission_notification_title">通知权限</string>
+    <string name="permission_notification_body">用于在服务运行期间显示常驻通知。</string>
+    <string name="permission_background_title">后台服务</string>
+    <string name="permission_background_body">Nexa 以前台服务运行，以保持持续连接。</string>
+
+    <!-- 二维码扫描 -->
+    <string name="scanner_close">关闭扫描</string>
+    <string name="scanner_hint">将摄像头对准 otpauth:// 二维码</string>
+    <string name="scanner_torch_on">打开手电筒</string>
+    <string name="scanner_torch_off">关闭手电筒</string>
+    <string name="scanner_camera_permission">扫描二维码需要使用摄像头权限。</string>
+    <string name="scanner_camera_error">无法启动摄像头</string>
+
+    <!-- 前台服务 -->
+    <string name="notification_channel_name">Nexa</string>
+    <string name="notification_channel_description">Nexa 服务</string>
+    <string name="notification_title">Nexa</string>
+    <string name="notification_text">已连接</string>
+    <string name="notify_backend_unreachable">网络已切换，而新网络下没有后端响应。若隧道持续不可用，请重新连接。</string>
+    <string name="notify_tunnel_rebuild_failed">网络切换后无法重建隧道，请重新连接。</string>
+
+    <!-- 错误提示 -->
+    <string name="error_vpn_taken_over">另一个应用（如 Clash）占用了隧道。Android 同时只允许一个隧道处于活动状态——请先断开那个应用，再使用 Nexa。</string>
+    <string name="error_native_library">原生库未加载。请检查 APK 中是否正确包含 libnexapipe_client.so。</string>
+    <string name="error_vpn_permission">尚未授予代理权限，请先在权限引导中授予。</string>
+    <string name="error_invalid_endpoint_id">端点 ID “%1$s”无效：%2$s。端点 ID 应为 64 个十六进制字符。</string>
+    <string name="error_endpoint_id_empty">端点 ID 不能为空</string>
+    <string name="error_endpoint_id_exists">端点 ID 已存在：%1$s</string>
+    <string name="error_endpoint_not_found">找不到端点：%1$s</string>
+    <string name="error_no_domain_mappings">尚未配置任何域名映射，请先添加带域名的端点。</string>
+    <string name="error_invalid_proxy_config">代理配置无效</string>
+    <string name="error_proxy_ports">无法在端口 %1$d..%2$d 上启动代理</string>
+    <string name="error_no_backend_reachable">没有可用的后端（%1$s）。请确认端点 ID 是否正确、服务器是否在线。</string>
+    <string name="error_preconnect_failed">后端可达性检查失败（nativePreconnect 返回 %1$d）。详情见日志。</string>
+    <string name="error_cause">原因：%1$s。</string>
+    <string name="error_configured_backends">已配置的后端</string>
+    <string name="error_start_iroh">无法启动 iroh</string>
+    <string name="error_unknown">未知错误</string>
+    <string name="error_connection_failed">连接失败</string>
+    <string name="error_all_attempts_failed">所有连接尝试均失败</string>
+</resources>
