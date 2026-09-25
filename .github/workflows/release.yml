@@ -934,21 +934,21 @@ jobs:
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Download server artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ${{ env.BIN_NAME }}-*
           merge-multiple: true
           path: dist-server
 
       - name: Download desktop artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-desktop-*
           merge-multiple: true
           path: dist-desktop
 
       - name: Download APK artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-apk
           merge-multiple: true
