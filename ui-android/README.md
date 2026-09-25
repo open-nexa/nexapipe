@@ -177,9 +177,17 @@ storeFile / storePassword / keyAlias / keyPassword
 RELEASE_KEYSTORE_PATH / RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
 ```
 
-Pushing a `v*` tag runs `.github/workflows/release-apk.yml`: it checks out the
-upstream Rust repo, cross-compiles the `.so` with cargo-ndk, verifies the
-required JNI symbols, assembles and signs the APK, verifies it with
+All four values must be set. AGP discards a signing config that is missing any
+of them, and the release build then fails at `:app:validateSigningRelease` with
+`Keystore file not set for signing config release` — a message that blames the
+keystore even when the missing value is `keyAlias` or `keyPassword`. When the
+set is incomplete, `app/build.gradle.kts` leaves the release build type unsigned
+and logs which values are missing, so an `assembleRelease` still finishes (the
+APK is then unsigned and `apksigner` rejects it).
+
+Pushing a `v*` tag runs `.github/workflows/release.yml` (`build-apk` job): it
+cross-compiles the `.so` from `crates/nexapipe-client` with cargo-ndk, verifies
+the required JNI symbols, assembles and signs the APK, verifies it with
 `apksigner`, and publishes a GitHub Release. The workflow can also be dispatched
 manually with `signing_only` to validate the signing secrets in about a minute.
 

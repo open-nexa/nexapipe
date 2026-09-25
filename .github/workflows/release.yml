@@ -771,12 +771,25 @@ jobs:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           die() { echo "::error::$1"; exit 1; }
 
           [ -n "${RELEASE_KEYSTORE_BASE64:-}" ] \
             || die "Missing secret RELEASE_KEYSTORE_BASE64 (base64 of the *.jks keystore itself)"
+
+          # All four values are required. AGP silently drops a signing config
+          # that is missing any of them and the build then fails at
+          # :app:validateSigningRelease with "Keystore file not set for signing
+          # config release", which does not name the value that is actually
+          # missing. Report the gap here instead.
+          [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ] \
+            || die "Missing secret RELEASE_KEYSTORE_PASSWORD (keystore password)"
+          [ -n "${RELEASE_KEY_ALIAS:-}" ] \
+            || die "Missing secret RELEASE_KEY_ALIAS (key alias; scripts/verify-signing-secrets.ps1 defaults to 'nexapipe')"
+          [ -n "${RELEASE_KEY_PASSWORD:-}" ] \
+            || die "Missing secret RELEASE_KEY_PASSWORD (password of the key itself)"
 
           # Tolerate whitespace, newlines, quotes, backticks and a data URI
           # prefix that may have been picked up while pasting.
@@ -822,21 +835,16 @@ jobs:
 
           # Validate the password and the alias with keytool up front; that is
           # far quicker than waiting for the Gradle packaging step to fail.
-          if [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ]; then
-            ALIAS_ARGS=""
-            if [ -n "${RELEASE_KEY_ALIAS:-}" ]; then
-              ALIAS_ARGS="-alias ${RELEASE_KEY_ALIAS}"
-            fi
-            if ! keytool -list -keystore "$KS" \
-                   -storepass "$RELEASE_KEYSTORE_PASSWORD" $ALIAS_ARGS \
-                   > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
-              cat "$RUNNER_TEMP/keytool.err"
-              die "keytool cannot read the keystore: check RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
-            fi
-            echo "keytool check passed: password and alias ${RELEASE_KEY_ALIAS:-<unset>} are both correct"
-          else
-            echo "::warning::RELEASE_KEYSTORE_PASSWORD is not set, skipping the keytool pre-check"
+          if ! keytool -list -keystore "$KS" \
+                 -storepass "$RELEASE_KEYSTORE_PASSWORD" -alias "$RELEASE_KEY_ALIAS" \
+                 > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
+            cat "$RUNNER_TEMP/keytool.err"
+            echo "Private key entries in this keystore (use one of these as RELEASE_KEY_ALIAS):"
+            keytool -list -keystore "$KS" -storepass "$RELEASE_KEYSTORE_PASSWORD" 2>/dev/null \
+              | grep -i "PrivateKeyEntry" || echo "  (none listed)"
+            die "keytool cannot read alias '${RELEASE_KEY_ALIAS}': check RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD / RELEASE_KEYSTORE_PASSWORD"
           fi
+          echo "keytool check passed: password and alias ${RELEASE_KEY_ALIAS} are both correct"
 
           {
             echo ""
