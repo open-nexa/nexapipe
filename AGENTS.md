@@ -46,6 +46,12 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 - The L4 tests drive `l4::serve_stream` over a `tokio::io::duplex` pair and the client's `l4::open_*` against the same, so a TCP or UDP flow can be tested end to end without an iroh endpoint.
 - Run `cargo test --workspace`; for Android changes, compile-verify with `gradlew :app:compileDebugKotlin`.
 
+## Git Safety Rules (MANDATORY)
+
+- **Never run `git push` (or any remote-writing command: push, force-push, remote-add-then-push, branch delete on remote, `gh release ...`).** Create local commits only; the owner pushes themselves.
+- The only exception is an explicit instruction in the current task, e.g. the user says "推上去/请推送". "Tests pass, so push it" style inference is NOT authorization.
+- Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
+
 ## Commit & Pull Request Guidelines
 
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
