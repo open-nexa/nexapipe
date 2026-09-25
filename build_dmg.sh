@@ -6,8 +6,8 @@
 # handles via github runners but a macOS laptop still needs.
 #
 # What it does:
-#   1. Preflight  - ui-desktop submodule present, crates/ path dependency
-#                   reachable, node/npm/cargo on PATH, rustup macOS target,
+#   1. Preflight  - ui-desktop present, crates/ path dependency reachable,
+#                   node/npm/cargo on PATH, rustup macOS target,
 #                   Tauri macOS deps (Xcode CLI tools) present.
 #   2. Frontend   - npm install (skipped when node_modules exists), then a probe
 #                   of the local @tauri-apps/cli; wipe & reinstall on failure.
@@ -149,7 +149,7 @@ tauri_cli_version() {
 # ---------------------------------------------------------------------------
 step "Preflight"
 
-[[ -d "$DESKTOP_DIR/.git" ]]                || die "ui-desktop submodule not initialised (run: git submodule update --init --recursive)"
+[[ -d "$DESKTOP_DIR" ]]                        || die "ui-desktop/ not found - run from the repository root (it is part of this repo, no submodule init needed)"
 [[ -f "$TAURI_DIR/Cargo.toml" ]]            || die "src-tauri/Cargo.toml missing"
 [[ -f "$TAURI_DIR/tauri.conf.json" ]]       || die "src-tauri/tauri.conf.json missing"
 

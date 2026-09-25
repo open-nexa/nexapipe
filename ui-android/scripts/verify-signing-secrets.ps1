@@ -158,7 +158,7 @@ if (-not $keytool) {
 # ---- 4. Compare against CI -------------------------------------------------
 Write-Step "Fill in the GitHub Secret and compare"
 Write-Host @"
-  1) Open https://github.com/open-nexa/nexa-android/settings/secrets/actions
+  1) Open https://github.com/open-nexa/nexapipe/settings/secrets/actions
      Edit RELEASE_KEYSTORE_BASE64; the pasted content must be identical,
      character for character, to the output of this command.
      Opening the file with notepad and pressing Ctrl+A / Ctrl+C is recommended,

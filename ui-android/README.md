@@ -5,8 +5,9 @@ the traffic of selected domains through a `VpnService` TUN interface and forward
 it to a NexaPipe server over iroh/QUIC — the server needs no public IP and no
 open port.
 
-This repository is a git submodule of the main workspace (`ui-android/`), with
-its own history: <https://github.com/open-nexa/nexa-android>.
+This tree is part of the NexaPipe monorepo (`ui-android/`); its git history was
+preserved when it was imported from the former standalone repository,
+<https://github.com/open-nexa/nexa-android>.
 
 ---
 

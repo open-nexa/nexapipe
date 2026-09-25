@@ -5,23 +5,23 @@ clone to a merged change, plus a list of work that is genuinely open.
 
 ## Where things live
 
-NexaPipe is one workspace plus two app repositories wired in as submodules:
+NexaPipe is one repository: the server workspace, the Android app and the
+desktop app (the two app trees were imported from their former standalone
+repos with their git history preserved):
 
-| Directory | What it is | Lives in |
-| --- | --- | --- |
-| `crates/nexapipe/` | The server: iroh endpoint, L7 router, TLS passthrough, L4 tunnel, 2FA | this repo |
-| `crates/nexapipe-client/` | The client library (`rlib` + `cdylib` + UniFFI) | this repo |
-| `crates/nexapipe-proto/` | The L4 wire format, dependency-free and shared by both sides | this repo |
-| `ui-android/` | Android app (Kotlin + Compose), submodule | `open-nexa/nexa-android` |
-| `ui-desktop/` | Tauri 2 desktop app (Vue 3), submodule | `open-nexa/nexa-desktop` |
+| Directory | What it is |
+| --- | --- |
+| `crates/nexapipe/` | The server: iroh endpoint, L7 router, TLS passthrough, L4 tunnel, 2FA |
+| `crates/nexapipe-client/` | The client library (`rlib` + `cdylib` + UniFFI) |
+| `crates/nexapipe-proto/` | The L4 wire format, dependency-free and shared by both sides |
+| `ui-android/` | Android app (Kotlin + Compose), formerly `open-nexa/nexa-android` |
+| `ui-desktop/` | Tauri 2 desktop app (Vue 3), formerly `open-nexa/nexa-desktop` |
 
 A change to the wire format touches `crates/nexapipe-proto/` and **both** sides —
 never hand-encode it on one end.
 
-Clone with submodules, or `ui-android/` and `ui-desktop/` arrive empty:
-
 ```bash
-git clone --recurse-submodules https://github.com/open-nexa/nexapipe.git
+git clone https://github.com/open-nexa/nexapipe.git
 ```
 
 ## Getting set up

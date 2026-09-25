@@ -41,7 +41,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/open-nexa/nexa-desktop/releases/latest/download/latest.json"
+        "https://github.com/open-nexa/nexapipe/releases/latest/download/latest.json"
       ],
       "dialog": true
     }

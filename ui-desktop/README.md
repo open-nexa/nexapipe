@@ -6,8 +6,9 @@ server over iroh/QUIC and forwards selected domains either through a local HTTP
 proxy or through a system TUN interface — no public IP required on the server
 side.
 
-This repository is a git submodule of the main workspace (`ui-desktop/`), with
-its own history: <https://github.com/open-nexa/nexa-desktop>.
+This tree is part of the NexaPipe monorepo (`ui-desktop/`); its git history was
+preserved when it was imported from the former standalone repository,
+<https://github.com/open-nexa/nexa-desktop>.
 
 ---
 
@@ -185,7 +186,7 @@ the UI can say exactly why TUN could not start.
 ## Updates
 
 `tauri.conf.json` is configured with the Tauri updater plugin, pointing at
-`https://github.com/open-nexa/nexa-desktop/releases/latest/download/latest.json`
+`https://github.com/open-nexa/nexapipe/releases/latest/download/latest.json`
 with signature verification enabled. `npm run tauri:build` produces
 `createUpdaterArtifacts` output as part of the bundle.
 

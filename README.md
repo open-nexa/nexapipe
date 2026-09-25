@@ -30,8 +30,8 @@ NexaPipe is a Rust workspace with four parts:
   the status byte, and UDP framing. Dependency-free, used by both sides so they
   cannot disagree about it.
 - **Apps** — an Android client (`ui-android`, TUN/VpnService) and a desktop
-  client (`ui-desktop`, Tauri 2 + Vue 3), both living in their own repositories
-  and wired in as git submodules.
+  client (`ui-desktop`, Tauri 2 + Vue 3), both part of this repository
+  (imported with their full git history from their former standalone repos).
 
 [How it works](#how-it-works) · [Why NexaPipe](#why-nexapipe) ·
 [Embed it](#embed-it-in-your-app) · [Layout](#repository-layout) ·
@@ -172,8 +172,8 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 | `crates/nexapipe-client/` | Client library (`lib` + `cdylib`). Pool in `connection_pool.rs`, domain→node mapping in `endpoint_group.rs`, local proxy in `local_proxy.rs`, L4 tunnel client in `l4.rs`, smoltcp TUN proxy in `tun_proxy.rs`, TUN virtual-IP mapping in `virtual_ip.rs`, QUIC tuning in `transport.rs`, JNI in `jni.rs`, UniFFI in `uniffi_bindings.rs`. |
 | `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` (magic, version, host, port, status byte) and `udp.rs` (`u16`-length framing). No dependencies, so the server and the client can both link it. |
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
-| `ui-android/` | Android app (submodule → `open-nexa/nexa-android`). |
-| `ui-desktop/` | Tauri 2 desktop app (submodule → `open-nexa/nexa-desktop`). |
+| `ui-android/` | Android app (Kotlin + Compose). |
+| `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.2fa.example` | Example server + local-proxy configuration (2FA enabled). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
@@ -843,17 +843,18 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 
 ## Client apps
 
-| App | Repository | What it does |
+| App | Directory | What it does |
 | --- | --- | --- |
-| Android | [`ui-android`](ui-android/README.md) → `open-nexa/nexa-android` | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
-| Desktop | [`ui-desktop`](ui-desktop/README.md) → `open-nexa/nexa-desktop` | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
+| Android | [`ui-android`](ui-android/README.md) | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
+| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
 
-Both are git submodules with their own history — commit inside them separately.
-Clone with `--recurse-submodules`, otherwise those two directories come down
-empty:
+Both are regular directories of this repository (their git history was
+preserved when they were imported from the former standalone repos
+`open-nexa/nexa-android` / `open-nexa/nexa-desktop`), and they ship from the
+same tags as the server:
 
 ```bash
-git clone --recurse-submodules https://github.com/open-nexa/nexapipe.git
+git clone https://github.com/open-nexa/nexapipe.git
 ```
 
 ---

@@ -11,6 +11,8 @@ Nexapipe is a Rust workspace: an iroh/QUIC-based proxy server forwarding HTTP/We
 - `ui-desktop/` — Tauri 2 desktop app (Vue 3 + TypeScript, Rust backend in `src-tauri/`).
 - Root — workspace `Cargo.toml`, `config.toml`, Dockerfiles, and the per-platform local build scripts (`build_dmg.sh` macOS, `build_deb.sh` Linux, `build_windows.ps1` Windows, `run_android.ps1` Android debug loop). Each mirrors the matching CI job: `--version` reproduces the tag-derived version, and `build_deb.sh` runs the same `verify-deb.sh` check as the Linux CI job.
 
+This is a monorepo: `ui-android/` and `ui-desktop/` are plain directories (their git histories were preserved via `git subtree` when they were imported from the former standalone repos `open-nexa/nexa-android` / `open-nexa/nexa-desktop`), not submodules — commit app changes directly here, alongside the server crates. One tag (e.g. `v0.2.0`) releases the server archives, the desktop bundles and the signed APK together from `.github/workflows/release.yml`.
+
 ## Build, Test, and Development Commands
 
 - `cargo build` — build the workspace.

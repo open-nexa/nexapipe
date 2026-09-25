@@ -7,7 +7,7 @@
 # webkit/appindicator packages, the updater signing key and a crates/ checkout; locally
 # none of that exists. This script fills the gaps so one command produces the same .deb:
 #
-#   1. Preflight  - ui-desktop submodule present; ../../crates/nexapipe-client path
+#   1. Preflight  - ui-desktop present; ../../crates/nexapipe-client path
 #                   dependency present (src-tauri/Cargo.toml points at it and cargo fails
 #                   with a misleading "failed to load manifest" without it); node/npm/cargo
 #                   on PATH; rustup target installed; Tauri's Linux system packages present.
@@ -172,8 +172,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DESKTOP_DIR="$REPO_ROOT/ui-desktop"
 SRC_TAURI_DIR="$DESKTOP_DIR/src-tauri"
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
-# src-tauri is exactly the repository root. CI copies crates/ there, locally it comes
-# from the submodule layout.
+# src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 CLIENT_CRATE="$REPO_ROOT/crates/nexapipe-client/Cargo.toml"
 # The generated override lands in ui-desktop/.workbuddy, which ui-desktop/.gitignore
 # already ignores, so it never shows up in git status.
@@ -191,9 +190,9 @@ printf '%snexapipe desktop .deb build (arch=%s, target=%s, profile=%s)%s\n' \
 step "Preflight"
 
 [[ -f "$DESKTOP_DIR/package.json" ]] \
-    || die "$DESKTOP_DIR/package.json not found - the ui-desktop submodule is probably not initialised: git submodule update --init --recursive"
+    || die "$DESKTOP_DIR/package.json not found - run from the repository root (ui-desktop is part of this repo)"
 [[ -f "$SRC_TAURI_DIR/Cargo.toml" ]] \
-    || die "$SRC_TAURI_DIR/Cargo.toml not found - same cause, initialise the submodules first"
+    || die "$SRC_TAURI_DIR/Cargo.toml not found - same cause, check the repository checkout"
 ok "ui-desktop is in place"
 
 for script in preinst postinst prerm postrm; do
@@ -489,7 +488,7 @@ elif ! command -v dpkg-deb >/dev/null 2>&1; then
     warn "dpkg-deb not available - skipping the CI Debian lifecycle check"
 else
     step "Verifying the Debian service lifecycle (same check as CI)"
-    # Invoked through bash so the submodule's executable bit cannot matter; TARGET_DIR
+    # Invoked through bash so the file's executable bit cannot matter; TARGET_DIR
     # matches the script's CI default (it scans for */bundle/deb/*.deb underneath).
     TARGET_DIR="$SRC_TAURI_DIR/target" bash "$VERIFY_DEB"
     ok "Debian service lifecycle verification passed"

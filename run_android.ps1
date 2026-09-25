@@ -539,7 +539,7 @@ Write-Ok "installed into $JniLibDir"
 if (-not $SkipInstall) {
     Write-Step "gradlew :app:installDebug"
     if (-not (Test-Path -LiteralPath $GradleWrapper)) {
-        Stop-Script "gradlew.bat not found at $GradleWrapper (is ui-android a checked-out submodule?)"
+        Stop-Script "gradlew.bat not found at $GradleWrapper (is ui-android checked out in this repository?)"
     }
     Invoke-Native -Label 'gradlew installDebug' -Exe $GradleWrapper -Arguments @('-p', $AndroidDir, ':app:installDebug')
     Write-Ok "installed $AppId on $device"
