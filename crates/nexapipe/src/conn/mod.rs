@@ -22,11 +22,16 @@ type HttpClient = legacy::Client<
 /// How long the server waits for the client to open the 2FA handshake stream.
 ///
 /// A client that has credentials sends AUTH_START right after the QUIC
-/// handshake finishes, so this only has to cover one round trip. Without it a
-/// client that never authenticates — one with no 2FA configured, which happily
-/// completes the QUIC handshake and then sends nothing — keeps the connection
-/// and the task serving it alive until the peer itself goes away.
-const AUTH_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+/// handshake finishes, so in principle this only has to cover one round trip.
+/// In practice the deadline also has to absorb the handshake itself: on a slow
+/// or relayed link the QUIC handshake plus the client's first stream can take
+/// several round trips, and a client that loses this race is closed with
+/// `auth_close_code::REQUIRED` — indistinguishable from a client that never had
+/// a credential — so it is deliberately generous. Five seconds is still short
+/// enough that a peer which completes the QUIC handshake and then sends
+/// nothing — one with no 2FA configured — does not keep its connection and the
+/// task serving it alive indefinitely.
+const AUTH_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
 /// How long the server holds a connection open after refusing it, so the
 /// AUTH_FAILED it just wrote can reach the client.
