@@ -126,7 +126,7 @@
     <string name="two_factor_on">On</string>
     <string name="two_factor_off">Off</string>
     <string name="two_factor_off_body">Connections to this endpoint are not authenticated. A server that requires 2FA will refuse the tunnel.</string>
-    <string name="two_factor_enrollment_pending">Waiting to enroll as %1$s: the server issues this endpoint's credentials on the next connect.</string>
+    <string name="two_factor_enrollment_pending">Waiting to enroll as %1$s: the server issues this endpoint\'s credentials on the next connect.</string>
     <string name="two_factor_client_id">Client ID</string>
     <string name="two_factor_client_id_placeholder">client-001</string>
     <string name="two_factor_secret">TOTP Secret</string>
