@@ -146,19 +146,13 @@ impl PreconnectReport {
 }
 
 impl EndpointGroup {
-    pub async fn new_with_nodes(
-        nodes: Vec<NodeConfig>,
-        default_endpoint_addr: Option<EndpointAddr>,
-        default_strategy: LoadBalancingStrategy,
-    ) -> Result<Self, ClientError> {
-        let domain_mappings: Vec<DomainMapping> = nodes
-            .into_iter()
-            .flat_map(|node| node.to_domain_mappings())
-            .collect();
-
-        Self::new_with_domain_mappings(domain_mappings, default_endpoint_addr, default_strategy).await
-    }
-
+    /// Builds a group that binds its **own** iroh endpoints, one per distinct backend.
+    ///
+    /// Nothing in this workspace calls it: both UIs build the endpoint themselves (so it can
+    /// carry the relay mode and the QUIC tuning) and pass it to
+    /// [`Self::new_with_domain_mappings_and_endpoint`]. Prefer that one — an endpoint created
+    /// inside here gets iroh's defaults, which means the preset's relay map, no auth token and
+    /// a 1.25 MB stream window.
     pub async fn new_with_domain_mappings(
         domain_mappings: Vec<DomainMapping>,
         default_endpoint_addr: Option<EndpointAddr>,
@@ -281,6 +275,36 @@ impl EndpointGroup {
         Self {
             domains: HashMap::new(),
             default_pools,
+        }
+    }
+
+    /// Configure client 2FA credentials for one backend, leaving every other
+    /// pool untouched.
+    ///
+    /// [`Self::set_two_factor`] writes the same value into every pool, which a
+    /// client talking to several servers cannot use: each server has its own
+    /// `[auth].clients` entry, and the one shared secret is the reason a second
+    /// server either refuses the handshake or has to be given the first one's
+    /// key. Credentials are keyed by the configured endpoint ID here, so a
+    /// backend left out keeps none at all — and a backend with none never opens
+    /// an auth stream, which is what makes a mixed setup (some servers with
+    /// 2FA, some without) work.
+    ///
+    /// Safe to call any time before connections are established.
+    pub async fn set_two_factor_for(&self, node_id: &str, auth: Option<TwoFactorAuth>) {
+        for pools in self.domains.values() {
+            for pool in &pools.pools {
+                if pool.backend_id().to_string() == node_id {
+                    pool.set_two_factor(auth.clone()).await;
+                }
+            }
+        }
+        if let Some(default) = &self.default_pools {
+            for pool in &default.pools {
+                if pool.backend_id().to_string() == node_id {
+                    pool.set_two_factor(auth.clone()).await;
+                }
+            }
         }
     }
 
@@ -407,11 +431,21 @@ impl EndpointGroup {
                     Ok(true) => true,
                     Ok(false) => {
                         jni_log!("[preconnect] Node unreachable (preconnect returned false)");
+                        // `jni_log` only reaches logcat; the desktop and the service need
+                        // this in their own log — the pool's warning says why.
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("preconnect: node {} is unreachable", backend_id);
                         false
                     }
                     Err(_) => {
                         jni_log!(
                             "[preconnect] Node timed out after {}s",
+                            PRECONNECT_TIMEOUT.as_secs()
+                        );
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "preconnect: node {} gave no answer within {}s",
+                            backend_id,
                             PRECONNECT_TIMEOUT.as_secs()
                         );
                         false
@@ -486,6 +520,20 @@ impl EndpointGroup {
             kinds.push((backend_id, pool.link_kind().await));
         }
         kinds
+    }
+
+    /// Closes and forgets every cached connection to every backend, keeping the endpoints.
+    ///
+    /// Called when the device switched networks: the tunnel itself stays up, but the
+    /// connections inside it were opened on the old network and are dead while still looking
+    /// open. See [`IrohConnectionPool::drop_connections`] for why they have to be closed
+    /// explicitly instead of waiting for QUIC to notice.
+    pub async fn drop_connections(&self) {
+        let pools = self.unique_pools();
+        for (backend_id, pool) in pools {
+            pool.drop_connections().await;
+            jni_log!("[drop-connections] dropped cached connections to {}", backend_id);
+        }
     }
 
     /// Every distinct backend in this group, with its pool.
@@ -612,6 +660,7 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TotpAlgorithm;
     use iroh::endpoint::presets;
 
     /// A syntactically valid backend node ID that no endpoint is bound to.
@@ -697,6 +746,53 @@ mod tests {
                 .expect("the domain must have a pool");
             assert_eq!(pools.pools.len(), 1, "{domain} should map to one pool");
             assert_eq!(pools.pools[0].backend_id(), expected);
+        }
+    }
+
+    /// Credentials given for one backend must not reach any other.
+    ///
+    /// `set_two_factor` writes to every pool, so the only way a client can hold
+    /// a different key per server is `set_two_factor_for`. If it ever leaks, a
+    /// server that has no 2FA at all gets an auth stream it never asked for.
+    #[tokio::test]
+    async fn per_backend_two_factor_does_not_spill_to_other_backends() {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+
+        let backend_a = unused_backend_id();
+        let backend_b = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        let auth = TwoFactorAuth::new("client-a", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1)
+            .expect("a Base32 secret must decode");
+        group
+            .set_two_factor_for(&backend_a.to_string(), Some(auth))
+            .await;
+
+        for (domain, expected) in [("a.example.com", true), ("b.example.com", false)] {
+            let pools = group
+                .domains
+                .get(domain)
+                .expect("the domain must have a pool");
+            for pool in &pools.pools {
+                assert_eq!(
+                    pool.has_two_factor().await,
+                    expected,
+                    "{domain} (backend {}) should{} have credentials",
+                    pool.backend_id(),
+                    if expected { "" } else { " not" }
+                );
+            }
         }
     }
 

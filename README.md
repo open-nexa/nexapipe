@@ -169,7 +169,7 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 | Path | What it is |
 | --- | --- |
 | `crates/nexapipe/` | Server binary and library. CLI in `src/main.rs`, config in `src/config.rs`, iroh stream handling in `src/conn/`, HTTP/WebSocket proxying in `src/http/` and `src/proxy/`, TLS passthrough in `src/passthrough.rs`, TCP/UDP tunnel in `src/l4/`, shared byte-copying in `src/stream_util.rs`, routing in `src/routes/` and `src/lb/`, health checks in `src/health/`, TOTP 2FA in `src/auth/`. |
-| `crates/nexapipe-client/` | Client library (`lib` + `cdylib`). Pool in `connection_pool.rs`, domain→node mapping in `endpoint_group.rs`, local proxy in `local_proxy.rs`, L4 tunnel client in `l4.rs`, smoltcp TUN proxy in `tun_proxy.rs`, TUN virtual-IP mapping in `virtual_ip.rs`, QUIC tuning in `transport.rs`, JNI in `jni.rs`, UniFFI in `uniffi.rs`. |
+| `crates/nexapipe-client/` | Client library (`lib` + `cdylib`). Pool in `connection_pool.rs`, domain→node mapping in `endpoint_group.rs`, local proxy in `local_proxy.rs`, L4 tunnel client in `l4.rs`, smoltcp TUN proxy in `tun_proxy.rs`, TUN virtual-IP mapping in `virtual_ip.rs`, QUIC tuning in `transport.rs`, JNI in `jni.rs`, UniFFI in `uniffi_bindings.rs`. |
 | `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` (magic, version, host, port, status byte) and `udp.rs` (`u16`-length framing). No dependencies, so the server and the client can both link it. |
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (submodule → `open-nexa/nexa-android`). |
@@ -290,8 +290,34 @@ them and see [TLS](#tls).
 | --- | --- |
 | `secret_key` | Hex secret key from `--generate-secret`; keeps the Node ID stable. |
 | `bind_port` | Fixed UDP port instead of an ephemeral one. |
-| `relay_mode` | `disabled` / `default` / `custom`. |
-| `relay_url` | Required when `relay_mode = "custom"`. |
+| `relay_mode` | `pinned` / `default` / `disabled` / `custom`. Absent means `default`. |
+| `relay_url` | The relay to use with `relay_mode = "custom"`; setting it without a `relay_mode` means `custom`. |
+| `relay_auth_token` | Optional bearer token for a `custom` relay that requires one. |
+
+Relay modes:
+
+- **`default`** — every N0 relay, home relay chosen by latency. It can migrate
+  between relays, which drops the connections routed through it.
+- **`pinned`** — one fixed N0 relay (`aps1-1`, Singapore). Use this when relay
+  migration is worse than a slightly slower relay.
+- **`disabled`** — no relay transport at all. Stronger than it sounds: with no
+  relay transport the endpoint cannot dial through a *peer's* relay either, so a
+  client with `relay_mode = "disabled"` cannot reach a server that is only
+  reachable via relay.
+- **`custom`** — one relay you run, and **only** that one: no N0 relay is used,
+  neither as a home relay nor as a net_report probe target. Pointing it at an
+  `*.relay.n0.iroh.link` URL is rejected; use `pinned` or `default` for those.
+
+A `relay_mode` that is present but unusable — `custom` with no URL, or an
+unrecognised spelling — stops startup rather than quietly falling back to
+another mode. A `relay_url` next to a mode that does not take one is ignored and
+logged; it is usually left over from an earlier mode.
+
+`custom` constrains **this** endpoint: its home relay and its probe traffic. It
+does not isolate the process from n0 entirely — a peer that advertises an N0
+relay is still dialled through it, and Endpoint ID discovery still queries
+`dns.iroh.link`. Both are properties of how iroh resolves and connects peers,
+and neither has a switch in iroh 1.0.1.
 
 ### `[[routes]]` — routing
 
@@ -853,9 +879,10 @@ cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
-The Android TUN module is `cfg(target_os = "android")`, so the host build never
-compiles it — that `cargo ndk` line is the only thing that type-checks it, and it
-is easy to forget. `ui-desktop/src-tauri` is a separate cargo project, so the
+The TUN stack (`crates/nexapipe-client/src/tun_proxy.rs`) is shared by Android
+and the desktop; only its fd-based entry point is `cfg(target_os = "android")`,
+so that `cargo ndk` line is still the only thing that type-checks the Android
+half — easy to forget. `ui-desktop/src-tauri` is a separate cargo project, so the
 workspace lint gate does not cover it either.
 
 Tests worth running on their own:
@@ -872,10 +899,11 @@ Notes:
   `[patch.crates-io]`; keep `third_party/` in the build context (Docker already
   does).
 - Platform code lives behind cargo features (`jni`, `local-proxy`, `tun-proxy`,
-  `uniffi`) — keep it that way. `--all-features` does not build (uniffi 0.25).
+  `uniffi`) — keep it that way. The `uniffi` bindings are proc-macro based
+  (`setup_scaffolding!` at the crate root); there is no UDL file to keep in sync.
 - `cargo test --workspace` runs on Windows too, because the Unix-only parts are
-  gated: `cfg(unix)` for signal handling, `cfg(target_os = "android")` for the
-  TUN module. CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
+  gated (`cfg(unix)` for signal handling). The TUN stack itself is
+  platform-independent; its Android fd entry point is gated inside the module. CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
   multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is
   published as a GitHub **pre-release** so it never takes over "latest"; a plain
   tag (`v1.0.0`) is a normal release — the same rule as `ui-desktop` and

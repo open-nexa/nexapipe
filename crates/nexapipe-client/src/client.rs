@@ -4,12 +4,10 @@ use crate::ClientError;
 use iroh::{EndpointAddr, EndpointId};
 use std::sync::Arc;
 
-#[cfg(feature = "uniffi")]
-use uniffi::export;
-
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
 
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct IrohProxyClient {
     conn_pool: Arc<IrohConnectionPool>,
 }

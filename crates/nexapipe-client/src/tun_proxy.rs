@@ -1,17 +1,19 @@
-//! TUN proxy: a user-space TCP/IP stack implemented in Rust with netstack-smoltcp, replacing the Kotlin hand-written TCP stack.
+//! TUN proxy: a user-space TCP/IP stack implemented in Rust with netstack-smoltcp,
+//! shared by the Android client (fd-based entry, [`TunProxy::new`]) and the desktop
+//! app (IP-packet reader/writer entry, [`TunProxy::with_io`]).
 //!
 //! Data flow:
 //! ```text
-//! APP → TUN fd → Rust(AsyncFd) → Stack(Sink: IP packets in)
+//! APP → TUN (fd on Android / tun crate device on desktop) → Stack(Sink: IP packets in)
 //!                                  ↓ smoltcp processing
 //!                            ┌──────┴────────┐
 //!                       TcpListener      UdpSocket
 //!                            │              │
-//!                            │              ├─ dst 10.0.1.2:53 ─→ DNS hijack,
+//!                            │              ├─ dst <dns_ip>:53 ─→ DNS hijack,
 //!                            │              │                     answers with a
 //!                            │              │                     per-domain IP
 //!                            │              │
-//!                            │              └─ dst 10.0.1.16+ ─→ l4::open_udp(domain, port)
+//!                            │              └─ dst <mapped IP>+ ─→ l4::open_udp(domain, port)
 //!                            │                                   (one bi-stream per flow,
 //!                            │                                    one datagram per frame)
 //!                            ↓
@@ -23,7 +25,7 @@
 //!                            ↓
 //!                  iroh bi-stream → server route → backend (TCP or UDP)
 //!
-//! Stack(Stream: IP packets out) → AsyncFd → write back to TUN fd
+//! Stack(Stream: IP packets out) → TUN → APP
 //! ```
 //!
 //! # The destination address is the destination
@@ -42,9 +44,10 @@
 //! db.example.com    → 10.0.1.17:5432  → l4::open_tcp("db.example.com", 5432)
 //! ```
 //!
-//! `10.0.1.3` is still accepted **for TCP only**, so applications that cached
-//! the address before this change keep working; it goes down the old
-//! payload-sniffing path ([`handle_local_connection`]).
+//! On Android, `10.0.1.3` is still accepted **for TCP only**, so applications
+//! that cached the address before the per-domain change keep working; it goes
+//! down the old payload-sniffing path ([`handle_local_connection`]). The desktop
+//! never handed out a fixed proxy address, so it passes no legacy IP.
 
 use crate::ClientError;
 use crate::EndpointGroup;
@@ -55,12 +58,20 @@ use crate::virtual_ip::IpMapping;
 #[cfg(feature = "jni")]
 use crate::jni_log;
 
-/// No-op `jni_log!` for builds without the `jni` feature.
+/// Desktop/server builds log through `tracing`; builds without either the `jni`
+/// or the `tracing` feature get a no-op.
 ///
-/// The format arguments are still *evaluated* (borrowed) inside a dead branch,
-/// so the optimiser removes the call but `unused_variables` does not fire on
-/// variables that only ever appear inside a log statement.
-#[cfg(not(feature = "jni"))]
+/// The format arguments are still *evaluated* (borrowed) inside the no-op's dead
+/// branch, so the optimiser removes the call but `unused_variables` does not fire
+/// on variables that only ever appear inside a log statement.
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+macro_rules! jni_log {
+    ($($arg:tt)*) => {
+        ::tracing::info!($($arg)*)
+    };
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
 macro_rules! jni_log {
     ($($arg:tt)*) => {
         if false {
@@ -71,19 +82,22 @@ macro_rules! jni_log {
 
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::udp::{ReadHalf as UdpReadHalf, UdpMsg, WriteHalf as UdpWriteHalf};
-use netstack_smoltcp::{StackBuilder, TcpListener as SmolTcpListener, TcpStream as SmolTcpStream};
-use nexapipe_proto::{
-    FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame,
+use netstack_smoltcp::{
+    AnyIpPktFrame, Stack, StackBuilder, TcpListener as SmolTcpListener, TcpStream as SmolTcpStream,
 };
+use nexapipe_proto::{FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame};
 use std::collections::HashMap;
+#[cfg(target_os = "android")]
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(target_os = "android")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+#[cfg(target_os = "android")]
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -95,8 +109,10 @@ use tokio::task::JoinHandle;
 /// Virtual DNS server IP — matches Kotlin-side NexaVpnService.virtualDNSIP, which
 /// the system resolver is pointed at (`addDnsServer`). The query's dst_addr is this
 /// IP, and it is used as-is as the src_addr in the response.
+#[cfg(target_os = "android")]
 const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 /// The address every proxied domain used to resolve to. See the module docs.
+#[cfg(target_os = "android")]
 const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
 /// The only port the DNS hijack answers on. A datagram to any other port is a flow.
 const DNS_PORT: u16 = 53;
@@ -154,6 +170,13 @@ struct TunContext {
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
     ip_mapping: Arc<IpMapping>,
+    /// The address the system resolver is pointed at: a UDP datagram to this
+    /// address on port 53 is a DNS query (Android: 10.0.1.2, assigned to nothing
+    /// so the packets traverse the TUN; the desktop: the interface's own address).
+    dns_ip: Ipv4Addr,
+    /// The legacy single virtual proxy address (payload sniffing for stale DNS
+    /// caches) or `None` where none was ever handed out (the desktop).
+    legacy_proxy_ip: Option<Ipv4Addr>,
     /// Every datagram leaving the proxy for the application, from both the DNS
     /// hijack and the L4 UDP flows.
     ///
@@ -165,8 +188,98 @@ struct TunContext {
     stopped: Arc<AtomicBool>,
 }
 
+/// The platform-independent half of [`TunProxy::with_io`]: the network layout
+/// the stack is expected to live in.
+pub struct TunStackConfig {
+    /// See [`TunContext::dns_ip`].
+    pub dns_ip: Ipv4Addr,
+    /// See [`TunContext::legacy_proxy_ip`].
+    pub legacy_proxy_ip: Option<Ipv4Addr>,
+    /// The per-domain virtual IP mapping. Must be the same instance the DNS
+    /// answers are handed out from — on the desktop the local DNS server and the
+    /// stack share it, so an address allocated by either is routable by both.
+    pub ip_mapping: Arc<IpMapping>,
+}
+
+/// The stack's packet halves: IP packets in (from the TUN) and out (to the TUN).
+type StackSink = futures_util::stream::SplitSink<Stack, AnyIpPktFrame>;
+type StackStream = futures_util::stream::SplitStream<Stack>;
+
+/// Build the smoltcp stack and spawn every task that is not a TUN device pump:
+/// the stack runner (retransmits, timeouts), the TCP acceptor and the UDP
+/// writer/demultiplexer.
+///
+/// Returns the stack's packet sink/stream halves for the caller's platform
+/// pumps — fd-based on Android ([`TunProxy::new`]), `AsyncDevice` halves on the
+/// desktop ([`TunProxy::with_io`]).
+fn start_stack_services(
+    endpoint_group: Arc<EndpointGroup>,
+    proxy_domains: Vec<String>,
+    custom_dns_servers: Vec<SocketAddr>,
+    net: TunStackConfig,
+    stopped: Arc<AtomicBool>,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Result<(StackSink, StackStream), ClientError> {
+    let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
+        .enable_tcp(true)
+        .enable_udp(true)
+        .mtu(TUN_MTU)
+        .build()?;
+
+    // The Runner drives smoltcp's internal processing: retransmits, timeouts, etc.
+    if let Some(runner) = runner {
+        let stopped_clone = stopped.clone();
+        tasks.push(tokio::spawn(async move {
+            match runner.await {
+                Ok(()) => jni_log!("[tun-proxy] smoltcp runner completed"),
+                Err(e) => jni_log!("[tun-proxy] smoltcp runner error: {}", e),
+            }
+            stopped_clone.store(true, Ordering::Release);
+        }));
+    }
+
+    // Split Stack → (Sink for IP packets in, Stream for IP packets out).
+    let (sink, stream) = stack.split();
+
+    let (tun_out, tun_out_rx) = mpsc::channel::<UdpMsg>(TUN_WRITE_QUEUE);
+    let ctx = TunContext {
+        endpoint_group,
+        proxy_domains: Arc::new(proxy_domains),
+        ip_mapping: net.ip_mapping,
+        dns_ip: net.dns_ip,
+        legacy_proxy_ip: net.legacy_proxy_ip,
+        tun_out,
+        stopped: stopped.clone(),
+    };
+
+    // TCP acceptor — accept the TCP connections produced by smoltcp and route them by destination IP.
+    //
+    // Beware a netstack-smoltcp naming trap: TcpListener yields (stream, local_addr, remote_addr)
+    // where local_addr = stream.local_addr() = src_addr = the packet's source IP = the client address,
+    //      remote_addr = stream.remote_addr() = dst_addr = the packet's destination IP = the server address.
+    // So local/remote semantics are the REVERSE of standard TCP! We use the third element (remote_addr) to decide the destination IP.
+    if let Some(tcp_listener) = tcp_listener {
+        let ctx = ctx.clone();
+        tasks.push(tokio::spawn(run_tcp_acceptor(tcp_listener, ctx)));
+    }
+
+    // UDP: one writer for everything going back to the application, and one
+    // demultiplexer splitting the inbound stream into DNS queries and L4 flows.
+    if let Some(udp_socket) = udp_socket {
+        let (udp_rx, udp_tx) = udp_socket.split();
+        tasks.push(tokio::spawn(run_tun_udp_writer(udp_tx, tun_out_rx)));
+        tasks.push(tokio::spawn(run_udp_demux(
+            udp_rx,
+            Arc::new(custom_dns_servers),
+            ctx,
+        )));
+    }
+
+    Ok((sink, stream))
+}
+
 impl TunProxy {
-    /// Create and start the TUN proxy.
+    /// Create and start the TUN proxy (Android).
     ///
     /// - `tun_fd`: the raw fd returned by Kotlin's `ParcelFileDescriptor.detachFd()`.
     ///   This function `dup`s it twice (read/write) and closes the original fd.
@@ -175,6 +288,7 @@ impl TunProxy {
     /// - `custom_dns_servers`: the system DNS server list (read from `CUSTOM_DNS_SERVERS`).
     ///
     /// All tasks are started via `runtime.spawn()` internally — **no block_on**.
+    #[cfg(target_os = "android")]
     pub fn new(
         tun_fd: RawFd,
         endpoint_group: Arc<EndpointGroup>,
@@ -207,32 +321,24 @@ impl TunProxy {
             fd_write
         );
 
-        // 2. Build the smoltcp stack.
-        let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
-            .enable_tcp(true)
-            .enable_udp(true)
-            .mtu(TUN_MTU)
-            .build()?;
-
         let stopped = Arc::new(AtomicBool::new(false));
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-        // 3. spawn the Runner (drives smoltcp's internal processing: retransmits, timeouts, etc.).
-        if let Some(runner) = runner {
-            let stopped_clone = stopped.clone();
-            tasks.push(tokio::spawn(async move {
-                match runner.await {
-                    Ok(()) => jni_log!("[tun-proxy] smoltcp runner completed"),
-                    Err(e) => jni_log!("[tun-proxy] smoltcp runner error: {}", e),
-                }
-                stopped_clone.store(true, Ordering::Release);
-            }));
-        }
+        // 2. Build the stack and every service task; we get back the packet halves.
+        let (stack_sink, stack_stream) = start_stack_services(
+            endpoint_group,
+            proxy_domains,
+            custom_dns_servers,
+            TunStackConfig {
+                dns_ip: VIRTUAL_DNS_IP,
+                legacy_proxy_ip: Some(VIRTUAL_PROXY_IP),
+                ip_mapping: Arc::new(IpMapping::new()),
+            },
+            stopped.clone(),
+            &mut tasks,
+        )?;
 
-        // 4. split Stack → (Sink for IP packets in, Stream for IP packets out).
-        let (stack_sink, stack_stream) = stack.split();
-
-        // 5. TUN → Stack pump (read fd → Stack Sink).
+        // 3. TUN → Stack pump (read fd → Stack Sink).
         {
             let file = unsafe { std::fs::File::from_raw_fd(fd_read) };
             let async_fd = AsyncFd::new(file)?;
@@ -277,11 +383,12 @@ impl TunProxy {
                         }
                     }
                 }
+                stopped_clone.store(true, Ordering::Release);
                 jni_log!("[tun-proxy] pump-in task exiting");
             }));
         }
 
-        // 6. Stack → TUN pump (Stack Stream → write fd).
+        // 4. Stack → TUN pump (Stack Stream → write fd).
         {
             let file = unsafe { std::fs::File::from_raw_fd(fd_write) };
             let async_fd = AsyncFd::new(file)?;
@@ -331,40 +438,107 @@ impl TunProxy {
                         }
                     }
                 }
+                stopped_clone.store(true, Ordering::Release);
                 jni_log!("[tun-proxy] pump-out task exiting");
             }));
         }
 
-        let (tun_out, tun_out_rx) = mpsc::channel::<UdpMsg>(TUN_WRITE_QUEUE);
-        let ctx = TunContext {
-            endpoint_group,
-            proxy_domains: Arc::new(proxy_domains),
-            ip_mapping: Arc::new(IpMapping::new()),
-            tun_out,
-            stopped: stopped.clone(),
-        };
+        jni_log!("[tun-proxy] Started with {} tasks", tasks.len());
+        Ok(Self { stopped, tasks })
+    }
 
-        // 7. TCP acceptor — accept the TCP connections produced by smoltcp and route them by destination IP.
-        //
-        // Beware a netstack-smoltcp naming trap: TcpListener yields (stream, local_addr, remote_addr)
-        // where local_addr = stream.local_addr() = src_addr = the packet's source IP = the client address,
-        //      remote_addr = stream.remote_addr() = dst_addr = the packet's destination IP = the server address.
-        // So local/remote semantics are the REVERSE of standard TCP! We use the third element (remote_addr) to decide the destination IP.
-        if let Some(tcp_listener) = tcp_listener {
-            let ctx = ctx.clone();
-            tasks.push(tokio::spawn(run_tcp_acceptor(tcp_listener, ctx)));
+    /// Create and start the TUN proxy over an IP-packet reader/writer pair.
+    ///
+    /// The desktop uses this with a `tun` crate `AsyncDevice`'s split halves:
+    /// each `read`/`write_all` carries exactly one IP packet. The Android
+    /// fd-based entry point is [`TunProxy::new`].
+    pub fn with_io<R, W>(
+        reader: R,
+        writer: W,
+        endpoint_group: Arc<EndpointGroup>,
+        proxy_domains: Vec<String>,
+        custom_dns_servers: Vec<SocketAddr>,
+        net: TunStackConfig,
+    ) -> Result<Self, ClientError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+
+        let (sink, stream) = start_stack_services(
+            endpoint_group,
+            proxy_domains,
+            custom_dns_servers,
+            net,
+            stopped.clone(),
+            &mut tasks,
+        )?;
+
+        // TUN → Stack pump (reader → Stack Sink). One read = one IP packet.
+        {
+            let stopped_clone = stopped.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut reader = reader;
+                let mut sink = sink;
+                let mut buf = vec![0u8; TUN_MTU];
+                loop {
+                    if stopped_clone.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match reader.read(&mut buf).await {
+                        Ok(0) => {
+                            // EOF — the TUN device was closed.
+                            jni_log!("[tun-proxy] TUN read EOF, stopping pump-in");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = sink.send(buf[..n].to_vec()).await {
+                                jni_log!("[tun-proxy] stack send error: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            jni_log!("[tun-proxy] TUN read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                stopped_clone.store(true, Ordering::Release);
+                jni_log!("[tun-proxy] pump-in task exiting");
+            }));
         }
 
-        // 8. UDP: one writer for everything going back to the application, and one
-        // demultiplexer splitting the inbound stream into DNS queries and L4 flows.
-        if let Some(udp_socket) = udp_socket {
-            let (udp_rx, udp_tx) = udp_socket.split();
-            tasks.push(tokio::spawn(run_tun_udp_writer(udp_tx, tun_out_rx)));
-            tasks.push(tokio::spawn(run_udp_demux(
-                udp_rx,
-                Arc::new(custom_dns_servers),
-                ctx,
-            )));
+        // Stack → TUN pump (Stack Stream → writer).
+        {
+            let stopped_clone = stopped.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut writer = writer;
+                let mut stream = stream;
+                loop {
+                    if stopped_clone.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match stream.next().await {
+                        Some(Ok(pkt)) => {
+                            if let Err(e) = writer.write_all(&pkt).await {
+                                jni_log!("[tun-proxy] TUN write error: {}", e);
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            jni_log!("[tun-proxy] stack stream error: {}", e);
+                        }
+                        None => {
+                            jni_log!("[tun-proxy] stack stream ended, stopping pump-out");
+                            break;
+                        }
+                    }
+                }
+                stopped_clone.store(true, Ordering::Release);
+                jni_log!("[tun-proxy] pump-out task exiting");
+            }));
         }
 
         jni_log!("[tun-proxy] Started with {} tasks", tasks.len());
@@ -379,6 +553,27 @@ impl TunProxy {
             task.abort();
         }
         jni_log!("[tun-proxy] Stopped (aborted {} tasks)", self.tasks.len());
+    }
+
+    /// Whether every task has wound down — the stop flag is set by `stop()` and
+    /// by each task on its own exit, so a `false` here means the stack is live.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Abort all tasks and wait for them to finish (with a timeout), from async
+    /// context. Consumes self; the TUN device halves held by the pumps are
+    /// dropped here, releasing the device.
+    pub async fn shutdown_async(mut self) {
+        self.stopped.store(true, Ordering::Release);
+        // Use mem::take to pull tasks out, avoiding E0509 (can't move a field out of a Drop type).
+        let tasks = std::mem::take(&mut self.tasks);
+        for task in tasks {
+            task.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+        }
+        jni_log!("[tun-proxy] Shutdown complete (all tasks joined)");
+        // self dropped here → Drop::drop calls stop() (idempotent; tasks are already empty).
     }
 
     /// Abort all tasks and wait for them to finish (with a timeout), ensuring the fd is closed before returning.
@@ -436,7 +631,8 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
         // per-domain addresses existed still connect to 10.0.1.3, so those
         // connections keep the payload-sniffing path (SNI / Host header) instead
         // of being dropped. DNS answers only live 60 s, so this is a short tail.
-        if dest_ip == VIRTUAL_PROXY_IP {
+        // (Android only — the desktop never handed out a fixed proxy address.)
+        if ctx.legacy_proxy_ip == Some(dest_ip) {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_local_connection(
@@ -467,12 +663,7 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
 ///
 /// Nothing is sniffed: the domain came from the destination address, so a raw
 /// binary protocol on any port works as well as TLS on 443.
-async fn serve_tcp_flow(
-    stream: SmolTcpStream,
-    ctx: TunContext,
-    domain: String,
-    port: u16,
-) {
+async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, port: u16) {
     // The tunnel is opened before any payload is read, so the application sees
     // the connection go quiet rather than being told a connection exists that
     // the server has no route for.
@@ -485,7 +676,12 @@ async fn serve_tcp_flow(
             }
         };
 
-    jni_log!("[tun-proxy] TCP flow {} -> {}:{}", client_addr_hint(&stream), domain, port);
+    jni_log!(
+        "[tun-proxy] TCP flow {} -> {}:{}",
+        client_addr_hint(&stream),
+        domain,
+        port
+    );
 
     let (mut app_read, mut app_write) = tokio::io::split(stream);
 
@@ -521,7 +717,12 @@ async fn serve_tcp_flow(
                     }
                 }
                 Err(e) => {
-                    jni_log!("[tun-proxy] TCP {}:{} tunnel read error: {}", domain, port, e);
+                    jni_log!(
+                        "[tun-proxy] TCP {}:{} tunnel read error: {}",
+                        domain,
+                        port,
+                        e
+                    );
                     break;
                 }
             }
@@ -602,10 +803,11 @@ async fn run_udp_demux(
             break;
         };
 
-        // The system resolver is pointed at VIRTUAL_DNS_IP (Kotlin: addDnsServer),
-        // and 10.0.1.0/24 is the only route into the TUN, so a datagram to port 53
-        // there is a DNS query and nothing else.
-        if dst_addr.ip() == IpAddr::V4(VIRTUAL_DNS_IP) && dst_addr.port() == DNS_PORT {
+        // The system resolver is pointed at the DNS address (Kotlin: addDnsServer;
+        // the desktop: the TUN interface address), and the virtual /24 is the only
+        // route into the TUN, so a datagram to port 53 there is a DNS query and
+        // nothing else.
+        if dst_addr.ip() == IpAddr::V4(ctx.dns_ip) && dst_addr.port() == DNS_PORT {
             // Answer from the address the query went to: the application's socket
             // may be connected, and a reply from anywhere else is discarded by the
             // kernel before the application ever sees it.
@@ -631,11 +833,17 @@ async fn run_udp_demux(
         }
 
         let IpAddr::V4(dst_ip) = dst_addr.ip() else {
-            jni_log!("[tun-proxy] UDP to {} has no domain mapping, dropping", dst_addr);
+            jni_log!(
+                "[tun-proxy] UDP to {} has no domain mapping, dropping",
+                dst_addr
+            );
             continue;
         };
         let Some(domain) = ctx.ip_mapping.lookup_domain(&dst_ip) else {
-            jni_log!("[tun-proxy] UDP to {} has no domain mapping, dropping", dst_addr);
+            jni_log!(
+                "[tun-proxy] UDP to {} has no domain mapping, dropping",
+                dst_addr
+            );
             continue;
         };
 
@@ -710,7 +918,12 @@ async fn run_udp_flow(
             }
         };
 
-    jni_log!("[tun-proxy] UDP flow {} -> {}:{}", client_addr, domain, port);
+    jni_log!(
+        "[tun-proxy] UDP flow {} -> {}:{}",
+        client_addr,
+        domain,
+        port
+    );
 
     let mut read_buf = vec![0u8; MAX_UDP_PAYLOAD + FRAME_HEADER_LEN];
     // A bi-stream has no message boundaries, so a datagram can start in one read
@@ -798,7 +1011,10 @@ async fn run_udp_flow(
                 }
                 partial.drain(..consumed);
                 if tun_gone {
-                    jni_log!("[tun-proxy] TUN writer is gone, ending UDP flow to {}", domain);
+                    jni_log!(
+                        "[tun-proxy] TUN writer is gone, ending UDP flow to {}",
+                        domain
+                    );
                     break;
                 }
             }
@@ -840,6 +1056,7 @@ fn lock_flows(table: &FlowTable) -> MutexGuard<'_, HashMap<FlowKey, mpsc::Sender
 // ============================================================
 
 /// Put the fd into non-blocking mode.
+#[cfg(target_os = "android")]
 fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -866,10 +1083,14 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
 /// private IP" as "no internet" (DNS returned private IP = no internet), which shows a WiFi
 /// exclamation mark in the status bar. Let them use the real DNS and reach the physical network,
 /// matching the behavior when the VPN is off.
-async fn handle_dns_query(
+///
+/// Public so the desktop's loopback DNS listener (queries the OS local-delivers
+/// to `[::1]:53`, which never traverse the TUN) can answer with the same
+/// mapping the stack routes by.
+pub async fn handle_dns_query(
     query: &[u8],
-    proxy_domains: &Arc<Vec<String>>,
-    dns_servers: &Arc<Vec<SocketAddr>>,
+    proxy_domains: &[String],
+    dns_servers: &[SocketAddr],
     ip_mapping: &IpMapping,
 ) -> Option<Vec<u8>> {
     let (domain, qtype) = match parse_dns_query(query) {
@@ -1014,7 +1235,7 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
 ///
 /// Fix: the system DNS list often starts with IPv6 servers (e.g. 2408:8888::8), which made binding
 /// 0.0.0.0:0 then connect() fail, and the old code only tried dns_servers[0] with no fallback.
-async fn forward_dns_query(query: &[u8], dns_servers: &Arc<Vec<SocketAddr>>) -> Option<Vec<u8>> {
+pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
     if dns_servers.is_empty() {
         jni_log!("[tun-proxy] No DNS servers configured, dropping query");
         return None;

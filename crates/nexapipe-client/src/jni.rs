@@ -4,9 +4,10 @@ use crate::auth::{TotpAlgorithm, TwoFactorAuth};
 use crate::{
     DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, LocalProxy, NodeConfig,
 };
+use crate::relay::RelayModeSpec;
 use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl};
+use iroh::Endpoint;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -29,6 +30,13 @@ static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
 // 2FA config: Kotlin injects (client_id, secret, algorithm) via nativeSetTwoFactor before startup.
 static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+// 2FA credentials per backend, keyed by endpoint ID. Kotlin registers one entry
+// per endpoint that carries 2FA (nativeSetTwoFactorForNode); a backend without
+// an entry keeps none, so it never opens an auth stream. That is what lets one
+// client talk to several servers with different secrets — the single global
+// TWO_FACTOR above cannot express it.
+static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, (String, String, String)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Generation counter: incremented each time nativeStopProxy releases the endpoint.
 // nativeStartIroh compares this before/after bind(); if a stop happened in between, the late
@@ -69,23 +77,23 @@ const PROXY_RUN_JOIN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::fro
 /// Pre-connect / warm-up timeout for establishing iroh connections to all backends.
 const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 
-/// The relay server we always use (aps1-1, Singapore — the closest N0 relay in this region).
-///
-/// By default iroh picks a home relay from the 4 N0 relays by latency; in this region aps1-1
-/// (Asia-Pacific) and euc1-1 (Europe) have similar latency, so iroh keeps flip-flopping between
-/// them. Each home-relay switch forces connections routed through relay (WebSocket, etc.) to
-/// drop and reconnect.
-///
-/// Pinning to aps1-1 stops iroh from switching, keeping WS connections stable.
-/// Side effect: if aps1-1 goes down, the relay path is unavailable (direct connections are fine).
-/// DNS still pre-resolves aps1-1's IP on the Kotlin side via resolveIrohDnsOverrides and injects
-/// it into OverrideResolver.
-const PINNED_RELAY_URL: &str = "https://aps1-1.relay.n0.iroh.link.";
+// Why "pinned" exists at all, and why it is the default: iroh otherwise picks a home relay from
+// the 4 N0 relays by latency, and here aps1-1 (Asia-Pacific) and euc1-1 (Europe) measure
+// similarly, so iroh keeps flip-flopping between them. Each home-relay switch forces the
+// connections routed through relay (WebSocket, etc.) to drop and reconnect. The URL itself is
+// `crate::relay::PINNED_RELAY_URL`; DNS still pre-resolves aps1-1's IP on the Kotlin side via
+// resolveIrohDnsOverrides and injects it into OverrideResolver.
 
 // Relay configuration: mode and custom URL from Kotlin settings.
-// "default" = iroh default (all N0 relays), "disabled" = no relay, "custom" = user-provided URL.
+// "pinned" = aps1-1 (the default), "default" = iroh default (all N0 relays),
+// "disabled" = no relay at all, "custom" = user-provided URL.
+// An empty mode means nothing has been injected yet, which falls back to "pinned".
+// A mode that is set but unusable is an error: see `crate::relay`.
 static RELAY_MODE: Mutex<String> = Mutex::new(String::new());
 static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
+// Bearer token for a `custom` relay that asks for one. Only ever read together with the two
+// above; never logged.
+static RELAY_AUTH_TOKEN: Mutex<String> = Mutex::new(String::new());
 
 // Reason behind the last failed native call, so Kotlin can read it back.
 //
@@ -592,8 +600,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
     0
 }
 
-/// Configure the relay mode and custom URL. relay_mode: "default"/"disabled"/"custom".
-/// relay_url is only used when relay_mode="custom".
+/// Configure the relay mode, custom URL and, for a relay that asks for one, the bearer token.
+/// relay_mode: "pinned"/"default"/"disabled"/"custom". relay_url and relay_auth_token are only
+/// used when relay_mode="custom".
 /// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
@@ -601,6 +610,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
     _class: JClass,
     relay_mode: JString,
     relay_url: JString,
+    relay_auth_token: JString,
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetRelayConfig");
@@ -630,10 +640,19 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
         Err(_) => String::new(),
     };
 
+    let token_str = match env.get_string(&relay_auth_token) {
+        Ok(s) => match s.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+
     jni_log!(
-        "[DEBUG:jni] nativeSetRelayConfig: mode='{}', url='{}'",
+        "[DEBUG:jni] nativeSetRelayConfig: mode='{}', url='{}', auth_token={}",
         mode_str,
-        url_str
+        url_str,
+        if token_str.is_empty() { "none" } else { "set" }
     );
 
     if let Ok(mut mode) = RELAY_MODE.lock() {
@@ -642,23 +661,62 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
     if let Ok(mut url) = CUSTOM_RELAY_URL.lock() {
         *url = url_str;
     }
+    if let Ok(mut token) = RELAY_AUTH_TOKEN.lock() {
+        *token = token_str;
+    }
     0
 }
 
-/// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
-fn current_two_factor_auth() -> Option<TwoFactorAuth> {
-    let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
+/// Reads a Java string argument; None when it is null or not valid UTF-8.
+fn read_jstring(env: &mut JNIEnv, s: &JString) -> Option<String> {
+    env.get_string(s).ok().and_then(|j| match j.to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(_) => None,
+    })
+}
+
+/// Builds a [`TwoFactorAuth`] from a stored (client id, secret, algorithm) triple.
+///
+/// An empty secret means "no 2FA", which is how an endpoint that was never
+/// given credentials — or whose credentials were cleared — is represented.
+fn two_factor_auth(cfg: &(String, String, String)) -> Option<TwoFactorAuth> {
     let (client_id, secret, algorithm) = cfg;
     if secret.trim().is_empty() {
         return None;
     }
-    match TwoFactorAuth::new(&client_id, &secret, TotpAlgorithm::from_name(&algorithm)) {
+    match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
         Ok(auth) => Some(auth),
         Err(e) => {
             jni_log!("2FA auth config invalid: {}", e);
             None
         }
     }
+}
+
+/// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
+fn current_two_factor_auth() -> Option<TwoFactorAuth> {
+    let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
+    two_factor_auth(&cfg)
+}
+
+/// A snapshot of the per-endpoint credentials, so the mutex is not held across
+/// the async calls that apply them.
+fn node_two_factor_snapshot() -> Vec<(String, (String, String, String))> {
+    match NODE_TWO_FACTOR.lock() {
+        Ok(map) => map
+            .iter()
+            .map(|(id, cfg)| (id.clone(), cfg.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The credentials registered for one endpoint, if any.
+fn node_two_factor_for(node_id: &str) -> Option<(String, String, String)> {
+    NODE_TWO_FACTOR
+        .lock()
+        .ok()
+        .and_then(|map| map.get(node_id).cloned())
 }
 
 /// Configure the client's 2FA credentials. Must be called before nativeStartProxy /
@@ -677,22 +735,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
         return -1;
     }
 
-    let read_str = |env: &mut JNIEnv, s: &JString| -> Option<String> {
-        env.get_string(s).ok().and_then(|j| match j.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => None,
-        })
-    };
-
-    let client_id = match read_str(&mut env, &client_id) {
+    let client_id = match read_jstring(&mut env, &client_id) {
         Some(v) => v,
         None => {
             jni_log!("Failed to read client_id in nativeSetTwoFactor");
             return -1;
         }
     };
-    let secret = read_str(&mut env, &secret).unwrap_or_default();
-    let algorithm = read_str(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+    let secret = read_jstring(&mut env, &secret).unwrap_or_default();
+    let algorithm = read_jstring(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
 
     jni_log!(
         "[DEBUG:jni] nativeSetTwoFactor: client_id='{}', algorithm='{}', secret={} chars",
@@ -703,6 +754,88 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
 
     if let Ok(mut tf) = TWO_FACTOR.lock() {
         *tf = Some((client_id, secret, algorithm));
+    }
+    0
+}
+
+/// Configure the 2FA credentials of a single endpoint.
+///
+/// node_id:   endpoint ID these credentials belong to.
+/// client_id: must match the ID configured in that server's [auth.clients].
+/// secret:    Base32-encoded TOTP key (generated by `nexapipe --generate-2fa`).
+/// algorithm: "sha1" / "sha256" / "sha512".
+///
+/// Only the pools of that backend get the credentials; every other endpoint is
+/// left alone, so servers that do not share a secret — or that have 2FA turned
+/// off altogether — stay reachable. Call `nativeClearNodeTwoFactor` first when
+/// re-reading the configuration, otherwise credentials of an endpoint that no
+/// longer has any are still applied.
+///
+/// Must be called before nativeStartProxy / nativeStartProxyLegacy.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
+    mut env: JNIEnv,
+    _class: JClass,
+    node_id: JString,
+    client_id: JString,
+    secret: JString,
+    algorithm: JString,
+) -> jint {
+    if env.exception_check().unwrap_or(false) {
+        jni_log!("JNI exception pending before nativeSetTwoFactorForNode");
+        env.exception_clear().unwrap();
+        return -1;
+    }
+
+    let node_id = match read_jstring(&mut env, &node_id) {
+        Some(v) => v.trim().to_string(),
+        None => {
+            jni_log!("Failed to read node_id in nativeSetTwoFactorForNode");
+            return -1;
+        }
+    };
+    let client_id = match read_jstring(&mut env, &client_id) {
+        Some(v) => v,
+        None => {
+            jni_log!("Failed to read client_id in nativeSetTwoFactorForNode");
+            return -1;
+        }
+    };
+    let secret = read_jstring(&mut env, &secret).unwrap_or_default();
+    let algorithm = read_jstring(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+
+    if node_id.is_empty() {
+        jni_log!("nativeSetTwoFactorForNode: empty node_id");
+        return -1;
+    }
+
+    jni_log!(
+        "[DEBUG:jni] nativeSetTwoFactorForNode: node='{}', client_id='{}', algorithm='{}', secret={} chars",
+        node_id,
+        client_id,
+        algorithm,
+        secret.len()
+    );
+
+    if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
+        map.insert(node_id, (client_id, secret, algorithm));
+    }
+    0
+}
+
+/// Drops every credential registered with `nativeSetTwoFactorForNode`.
+///
+/// Read the configuration back through this pair on every connect: without the
+/// clear, an endpoint whose 2FA the user just turned off would keep the old
+/// credentials for the lifetime of the process and keep opening auth streams
+/// the server no longer expects.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
+        map.clear();
     }
     0
 }
@@ -750,33 +883,34 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
 
     let bind_result: Result<Endpoint, ()> = runtime.block_on(async move {
         // Read the relay config injected by Kotlin (set by nativeSetRelayConfig).
-        // relay_mode: "default" = iroh default (all N0 relays), "disabled" = no relay,
-        // "custom" = user-provided relay URL; empty string = fall back to PINNED_RELAY_URL.
+        // An empty mode means Kotlin has not injected one yet -> "pinned", which is what the
+        // UI defaults to. Anything else either resolves or is a hard error; no mode is ever
+        // silently substituted for the one that was asked for.
         let cfg_mode = RELAY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
         let cfg_url = CUSTOM_RELAY_URL
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let builder = if cfg_mode == "disabled" {
-            jni_log!("[iroh] relay mode: disabled (direct connections only)");
-            Endpoint::builder(presets::N0).relay_mode(RelayMode::Disabled)
-        } else if cfg_mode == "custom" && !cfg_url.is_empty() {
-            jni_log!("[iroh] relay mode: custom, url={}", cfg_url);
-            let custom_url: RelayUrl = cfg_url.parse().expect("custom relay URL must be valid");
-            Endpoint::builder(presets::N0)
-                .relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![custom_url])))
-        } else if cfg_mode == "default" {
-            jni_log!("[iroh] relay mode: default (all N0 relays)");
-            Endpoint::builder(presets::N0)
-        } else {
-            // Default behavior: pin the relay to aps1-1 (Asia-Pacific South) to stop iroh from switching between relays and dropping WS connections.
-            let relay_url: RelayUrl = PINNED_RELAY_URL
-                .parse()
-                .expect("PINNED_RELAY_URL must be a valid relay URL");
-            jni_log!("[iroh] pinning relay to {}", PINNED_RELAY_URL);
-            Endpoint::builder(presets::N0)
-                .relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![relay_url])))
+        let cfg_token = RELAY_AUTH_TOKEN
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let relay = match RelayModeSpec::parse(Some(&cfg_mode), Some(&cfg_url), Some(&cfg_token)) {
+            Ok(spec) => spec.unwrap_or(RelayModeSpec::Pinned),
+            Err(e) => {
+                jni_log!("[iroh] invalid relay configuration: {e}");
+                return Err(());
+            }
         };
+        if !relay.uses_url() && !cfg_url.is_empty() {
+            jni_log!(
+                "[iroh] ignoring relay_url {:?}: mode {} does not use one",
+                cfg_url,
+                cfg_mode
+            );
+        }
+        jni_log!("[iroh] relay: {}", relay.describe());
+        let builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
         // Always wrap hickory with OverrideResolver:
         // - For iroh infrastructure domains in DNS_OVERRIDES (dns.iroh.link, *.relay.n0.iroh.link),
         //   return Kotlin's pre-resolved IPs directly, bypassing the GFW's blocking of iroh.link
@@ -1002,8 +1136,18 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
             }
 
             // 2FA: push the Kotlin-injected credentials to the connection group; new connections run the auth handshake first.
+            // The global pair goes to every pool first, then each endpoint's own
+            // credentials override it. An endpoint with no entry of its own —
+            // and an empty secret counts as an explicit "none" — ends up with
+            // no credentials, so it never opens an auth stream against a server
+            // that does not expect one.
             if let Some(auth) = current_two_factor_auth() {
                 endpoint_group.set_two_factor(Some(auth)).await;
+            }
+            for (node_id, cfg) in node_two_factor_snapshot() {
+                endpoint_group
+                    .set_two_factor_for(&node_id, two_factor_auth(&cfg))
+                    .await;
             }
 
             jni_log!("[DEBUG:jni] Creating LocalProxy on {}", listen_addr);
@@ -1298,6 +1442,71 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeLinkKinds(
     }
 }
 
+/// Closes and forgets every cached backend connection, keeping the iroh endpoint.
+///
+/// This is the Android network-switch recovery step. A connection opened on the previous
+/// network is not closed as far as QUIC is concerned — its `close_reason()` is still `None`
+/// while its path is dead — so the pool keeps handing it out and every proxied request fails
+/// or hangs, even though the tunnel itself was rebuilt correctly. Dropping them makes the next
+/// request dial on the current network; `nativePreconnect` then fills the pool again.
+///
+/// The endpoint is deliberately left alone: it is shared with the running TUN proxy, and
+/// rebinding it would pull a working tunnel apart.
+///
+/// Returns 0 when the connections were dropped, -1 when nothing has been started yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let runtime = match get_runtime() {
+        Some(r) => r,
+        None => {
+            jni_log!("[DEBUG:jni] nativeDropConnections: runtime not initialized");
+            return -1;
+        }
+    };
+
+    let endpoint_group = {
+        let state = match get_state() {
+            Some(s) => s,
+            None => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: state not initialized");
+                return -1;
+            }
+        };
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: failed to lock state");
+                return -1;
+            }
+        };
+        match guard.endpoint_group.clone() {
+            Some(eg) => eg,
+            None => {
+                jni_log!("[DEBUG:jni] nativeDropConnections: no endpoint group yet");
+                return -1;
+            }
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        runtime.block_on(async move { endpoint_group.drop_connections().await })
+    }));
+
+    match result {
+        Ok(()) => {
+            jni_log!("[DEBUG:jni] nativeDropConnections: dropped every cached connection");
+            0
+        }
+        Err(_) => {
+            jni_log!("[DEBUG:jni] Panic occurred during nativeDropConnections");
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
     mut env: JNIEnv,
@@ -1378,6 +1587,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
                 // 2FA: push the Kotlin-injected credentials to the connection pool; new connections run the auth handshake first.
                 if let Some(auth) = current_two_factor_auth() {
                     pool.set_two_factor(Some(auth)).await;
+                }
+                // Per-endpoint credentials win over the global pair.
+                if let Some(cfg) = node_two_factor_for(&target_id) {
+                    pool.set_two_factor(two_factor_auth(&cfg)).await;
                 }
 
                 match LocalProxy::new_with_single_pool(&listen_addr, domains, pool.clone()).await {

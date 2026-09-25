@@ -19,6 +19,7 @@ macro_rules! jni_log {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct HttpRequest {
     method: String,
     path: String,
@@ -68,6 +69,7 @@ impl HttpRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct HttpResponse {
     status_code: u16,
     status_text: String,

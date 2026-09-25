@@ -1,8 +1,18 @@
 name: CI
 
-# Fast checks for regular commits/PRs (Linux only): formatting, lint, tests.
+# Fast checks for regular commits/PRs (Linux only): formatting, lint, tests,
+# dependency audit, secret scan.
 # Multi-platform builds are verified by release.yml when a tag is pushed.
 # Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test on Windows.
+#
+# Two jobs exist purely because the default feature set cannot see the code they cover:
+#   - android:  the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
+#               cfg(target_os = "android"); a host check covers the shared stack but not
+#               the Android half. Without this job a break there only surfaces when the
+#               release APK is built from a tag.
+#   - features: `local-proxy` / `webpki-roots` / `uniffi` change which optional
+#               dependencies are compiled, so the combinations that matter are listed
+#               explicitly instead of relying on --all-features.
 on:
   push:
     branches: [main, master]
@@ -30,6 +40,9 @@ jobs:
       - name: Configure rustfmt
         run: rustup component add rustfmt
       - name: cargo fmt --check
+        # Advisory: not every file in the tree is formatted yet, so this must not
+        # turn the PR red. Make it blocking once `cargo fmt --all -- --check` is
+        # clean at baseline.
         continue-on-error: true
         run: cargo fmt --all -- --check
 
@@ -44,8 +57,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy
+      # -D warnings: without this clippy exits 0 and the job is decorative.
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test
@@ -58,3 +72,149 @@ jobs:
           key: test
       - name: cargo test
         run: cargo test --workspace --locked
+
+  features:
+    name: client features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "local-proxy"
+          - "tun-proxy" # the shared smoltcp stack (host entry point)
+          - "webpki-roots"
+          - "uniffi"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+      - name: cargo check
+        run: cargo check -p nexapipe-client --all-targets --features "${{ matrix.features }}" --locked
+
+  android:
+    name: android (tun-proxy / jni)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Android NDK
+        id: ndk
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
+          if [ -z "${NDK_DIR:-}" ]; then
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)
+            [ -n "${SM:-}" ] || { echo "::error::no sdkmanager and no NDK under $SDK"; exit 1; }
+            yes | "$SM" --licenses > /dev/null 2>&1 || true
+            "$SM" --install "ndk;29.0.14206865" \
+              || echo "::warning::pinned NDK unavailable, falling back to whatever is in the image"
+            NDK_DIR=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n 1 | sed 's:/$::' || true)
+          fi
+          [ -n "${NDK_DIR:-}" ] || { echo "::error::no NDK available"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "NDK: $NDK_DIR"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-check
+
+      # The repo .cargo/config.toml hardcodes a Windows NDK linker path; --config
+      # takes precedence over both env vars and the config file.
+      - name: cargo ndk check (jni + local-proxy + tun-proxy)
+        run: |
+          set -euo pipefail
+          LINKER="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          cargo ndk --target arm64-v8a --platform 26 check \
+            -p nexapipe-client \
+            --features "jni local-proxy tun-proxy" \
+            --config "target.aarch64-linux-android.linker='${LINKER}'"
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # RUSTSEC advisories for everything in Cargo.lock. Unmaintained/unsound
+      # advisories are informational (exit 0); vulnerabilities fail the job.
+      - name: cargo audit
+        run: cargo audit
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Free for public repositories. If a repo ever becomes private, add
+      # GITLEAKS_LICENSE (orgs need a paid licence) as a secret.
+      #
+      # Advisory on purpose: gitleaks scans the whole history, so anything
+      # already committed (a stray keystore.properties, a 2FA seed in a test
+      # fixture) would turn every future PR red. Run it once, clean up whatever
+      # it reports, then drop continue-on-error.
+      - uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+
+  # Optional: AI review. Nothing here runs until a key is configured.
+  #
+  # Two ways to get one, neither of them a plain workflow change:
+  #   1. Install a review app on the repo (CodeRabbit, or GitHub Copilot code
+  #      review with "assign copilot as reviewer"). No workflow needed.
+  #   2. Self-hosted reviewer via claude-code-action: add ANTHROPIC_API_KEY to
+  #      the repo secrets, give the job `permissions: { contents: read,
+  #      pull-requests: write }`, and uncomment the block below.
+  #
+  # ai-review:
+  #   name: ai review
+  #   if: github.event_name == 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     pull-requests: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #     - uses: anthropics/claude-code-action@v1
+  #       with:
+  #         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+  #         direct_prompt: |
+  #           Review this PR. Focus on: incorrect async/cancellation handling,
+  #           config parsing regressions, and anything that breaks the L4 wire
+  #           format in crates/nexapipe-proto.

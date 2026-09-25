@@ -27,6 +27,13 @@ const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration
 /// observation short would turn a backend that demands 2FA into one that merely
 /// looks unreachable, with the real reason lost.
 pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
+/// Budget for the connect half of a preconnect.
+///
+/// Deliberately shorter than [`PRECONNECT_TIMEOUT`]: the caller cancels the whole
+/// preconnect at its own deadline, and a cancelled connect reports nothing — so a
+/// node that hangs stayed silent, which is exactly the case that needs explaining.
+/// With a smaller budget here, the timeout (or iroh's error) surfaces in the log.
+const PRECONNECT_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(6);
 
 /// How long a freshly established connection is watched for a 2FA refusal when
 /// this client has no credentials.
@@ -255,6 +262,12 @@ impl IrohConnectionPool {
         *self.inner.two_factor.lock().await = auth;
     }
 
+    /// Test-only: whether this pool has credentials configured.
+    #[cfg(test)]
+    pub(crate) async fn has_two_factor(&self) -> bool {
+        self.inner.two_factor.lock().await.is_some()
+    }
+
     /// Takes the reason the backend last refused a connection for missing 2FA,
     /// and clears it.
     ///
@@ -265,14 +278,41 @@ impl IrohConnectionPool {
     }
 
     /// Connect to the backend and run the 2FA handshake when configured.
-    async fn connect_and_auth(&self, ep: &Endpoint) -> Result<Connection, ClientError> {
+    /// `timeout` is the budget for the QUIC handshake itself; see
+    /// [`PRECONNECT_CONNECT_TIMEOUT`] for why a warm-up uses a tighter one than
+    /// [`CONNECTION_TIMEOUT`].
+    async fn connect_and_auth(
+        &self,
+        ep: &Endpoint,
+        timeout: tokio::time::Duration,
+    ) -> Result<Connection, ClientError> {
+        let started = tokio::time::Instant::now();
         let conn = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
+            timeout,
             ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
         )
         .await
-        .map_err(|_| ClientError::TimeoutError)?
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|_| {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "connect to {} timed out after {}s (no QUIC handshake)",
+                self.backend_id(),
+                timeout.as_secs()
+            );
+            ClientError::TimeoutError
+        })?
+        .map_err(|e| {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "connect to {} failed after {:.1}s: {}",
+                self.backend_id(),
+                started.elapsed().as_secs_f32(),
+                e
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = started;
+            anyhow::anyhow!(e)
+        })?;
 
         let two_factor = self.inner.two_factor.lock().await.clone();
         if let Some(auth) = two_factor {
@@ -317,7 +357,7 @@ impl IrohConnectionPool {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self.connect_and_auth(ep).await?;
+        let conn = self.connect_and_auth(ep, CONNECTION_TIMEOUT).await?;
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
 
         Ok(conn)
@@ -364,11 +404,16 @@ impl IrohConnectionPool {
             let Some(ep) = ep.as_ref() else {
                 return false;
             };
-            match tokio::time::timeout(CONNECTION_TIMEOUT, self.connect_and_auth(ep)).await {
+            match tokio::time::timeout(
+                PRECONNECT_TIMEOUT,
+                self.connect_and_auth(ep, PRECONNECT_CONNECT_TIMEOUT),
+            )
+            .await
+            {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]
-                    tracing::warn!("preconnect failed: {}", e);
+                    tracing::warn!("preconnect to {} failed: {}", self.backend_id(), e);
                     #[cfg(not(feature = "tracing"))]
                     let _ = &e;
                     return false;
@@ -441,6 +486,32 @@ impl IrohConnectionPool {
             tracing::info!("Closing iroh endpoint");
             endpoint.close().await;
         }
+    }
+
+    /// Closes and forgets every cached connection, leaving the endpoint alone.
+    ///
+    /// This is what a network switch needs. A connection opened on the previous network is
+    /// *not* closed as far as QUIC is concerned — `close_reason()` stays `None` while its path
+    /// is dead — so it would sit in the pool looking healthy and be handed to every request
+    /// until QUIC gives up on it, which is long after the user has decided the backend is
+    /// unreachable. Dropping them here makes the next request dial on the current network.
+    ///
+    /// Deliberately not [`Self::close_all`]: that also closes an endpoint the pool owns, and a
+    /// pool that shares a caller-owned endpoint (the Android JNI shape) must keep it — closing
+    /// it would tear down a running tunnel and break every later dial with "Endpoint is
+    /// closed".
+    pub async fn drop_connections(&self) {
+        let mut connections = self.inner.connections.lock().await;
+        // Close before clearing: `close()` only marks the connection, so doing it while the
+        // pool still owns them is what stops a concurrent `get_connection` from handing one
+        // out in between.
+        for pooled in connections.iter() {
+            pooled.conn.close(0u32.into(), b"network changed");
+        }
+        connections.clear();
+        // Nothing is connected any more, so the last observed kind describes nothing.
+        // Leaving it would let a UI keep showing "direct" for a backend it cannot reach.
+        *self.inner.link_kind.lock().await = LinkKind::Unknown;
     }
 }
 

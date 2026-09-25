@@ -10,3 +10,6 @@ nexa_vpn_log.txt
 logs/*
 !logs/.gitkeep
 config.toml
+docs/*plan*
+docs/*fix*
+docs/*patch*
