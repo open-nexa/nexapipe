@@ -553,8 +553,10 @@ jobs:
       MIN_SDK: 26
       TARGET_ABI: arm64-v8a
       TARGET_TRIPLE: aarch64-linux-android
-      ANDROID_PLATFORM: '36'
-      BUILD_TOOLS: 36.0.0
+      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
+      # named android-37.0 — plain "android-37" no longer exists upstream.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
 
     steps:
       - name: Checkout

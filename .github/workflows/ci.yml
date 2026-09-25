@@ -396,8 +396,10 @@ jobs:
         working-directory: ui-android
 
     env:
-      ANDROID_PLATFORM: '36'
-      BUILD_TOOLS: 36.0.0
+      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
+      # named android-37.0 — plain "android-37" no longer exists upstream.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
 
     steps:
       - uses: actions/checkout@v7
@@ -463,8 +465,10 @@ jobs:
         working-directory: ui-android
 
     env:
-      ANDROID_PLATFORM: '36'
-      BUILD_TOOLS: 36.0.0
+      # compileSdk 37 (Compose 1.12 requires it); note the platform package is
+      # named android-37.0 — plain "android-37" no longer exists upstream.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
 
     steps:
       - uses: actions/checkout@v7

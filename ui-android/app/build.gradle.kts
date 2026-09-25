@@ -1,8 +1,10 @@
 import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    // AGP 9 ships Kotlin itself: applying org.jetbrains.kotlin.android on top
+    // of it is rejected ("no longer required for Kotlin support since AGP 9.0").
     alias(libs.plugins.kotlin.compose)
     kotlin("plugin.serialization") version "2.4.20"
 }
@@ -34,7 +36,10 @@ val releaseStoreFile = signingValue("storeFile", "RELEASE_KEYSTORE_PATH")
 
 android {
     namespace = "com.nexa.pipe"
-    compileSdk = 36
+    // Compose 1.12.x (BOM 2026.09) refuses to compile against anything older
+    // than API 37; AGP resolves 37 to platforms;android-37.0. targetSdk stays
+    // at 36 so the app's runtime behaviour is unchanged.
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.nexa.pipe"
@@ -80,9 +85,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
-    }
     buildFeatures {
         compose = true
     }
@@ -90,6 +92,14 @@ android {
         named("main") {
             jniLibs.srcDirs("src/main/jniLibs")
         }
+    }
+}
+
+// AGP 9 compiles Kotlin itself and drops the old android.kotlinOptions{} DSL;
+// the compiler options now live in the Kotlin extension AGP registers.
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_11
     }
 }
 
@@ -104,6 +114,9 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    // androidx.compose.material.icons.Icons: material3 no longer brings the
+    // icon artifact in transitively (BOM 2026.09), so declare it explicitly.
+    implementation(libs.androidx.material.icons.core)
     // QR code scanning (camera) and generation. CameraX is used directly with
     // ZXing's core decoder instead of ML Kit so that scanning works without
     // Google Play Services and offline.
