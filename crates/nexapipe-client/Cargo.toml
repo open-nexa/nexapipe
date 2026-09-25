@@ -39,7 +39,7 @@ netstack-smoltcp = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support
 totp-rs = { version = "5.6", features = ["gen_secret"] }
-base32 = "0.4"
+base32 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
