@@ -49,7 +49,7 @@ nexapipe-client = { path = "../../crates/nexapipe-client", features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.5"
+windows-service = "0.8"
 # Only for the TUN address: `netsh` silently does nothing when this runs as a service
 # (LocalSystem), which is the same class of failure as `net session` — see proxy/routing.rs.
 windows-sys = { version = "0.61", features = [
