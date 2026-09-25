@@ -3,7 +3,7 @@
  * Base button. Text comes from the caller (already localized); this component only owns size,
  * tone, and the disabled/loading affordances.
  *
- * Sizing rule from §5.5: `min-width`, never a fixed `width` — "Start Proxy" and "启动代理"
+  * Sizing rule from §5.5: `min-width`, never a fixed `width` — the English and Chinese labels for
  * differ in length by roughly 2×, and a fixed width truncates one of them.
  */
 import AppIcon from './AppIcon.vue';

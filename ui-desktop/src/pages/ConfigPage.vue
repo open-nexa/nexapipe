@@ -116,7 +116,7 @@ function getNodeTypeColor(type: ConnectionType): string {
  * This used to be a `Map` snapshotted once during setup, seeded from the nodes that existed at
  * that moment. A node created afterwards — every node an invite imports — therefore had no
  * entry and rendered an *empty* box, while the count badge beside it printed the live
- * `node.domains.length`: "5 个域名" above an empty field. Because that box is also the editor,
+  * `node.domains.length`: "5 domains" above an empty field. Because that box is also the editor,
  * the first keystroke then wrote the empty text back through `updateNodeDomainsText`, which is
  * how an imported domain list could disappear for real rather than just look missing.
  *

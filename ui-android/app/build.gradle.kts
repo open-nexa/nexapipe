@@ -1,3 +1,4 @@
+import java.security.KeyStore
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -15,12 +16,10 @@ plugins {
 // Value precedence: keystore.properties (local, ignored by .gitignore) >
 // environment variables (CI). The CI injects RELEASE_KEYSTORE_PATH /
 // RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD from
-// .github/workflows/release-apk.yml.
+// .github/workflows/release.yml.
 //
-// When no signing information is available the release build is not assigned a
-// signingConfig (an unsigned APK is produced), but everyday tasks such as
-// assembleDebug are unaffected; CI additionally verifies the signature with
-// apksigner.
+// The release build is only signed when every value is present; otherwise it is
+// left unsigned, which keeps assembleDebug and local builds working.
 // ---------------------------------------------------------------------------
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -33,6 +32,31 @@ fun signingValue(propertyKey: String, envKey: String): String? =
     (keystoreProperties.getProperty(propertyKey) ?: System.getenv(envKey))?.takeIf { it.isNotBlank() }
 
 val releaseStoreFile = signingValue("storeFile", "RELEASE_KEYSTORE_PATH")
+val releaseStorePassword = signingValue("storePassword", "RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias = signingValue("keyAlias", "RELEASE_KEY_ALIAS")
+val releaseKeyPassword = signingValue("keyPassword", "RELEASE_KEY_PASSWORD")
+val releaseStoreType = signingValue("storeType", "RELEASE_KEYSTORE_TYPE") ?: KeyStore.getDefaultType()
+
+// AGP needs all four of storeFile / storePassword / keyAlias / keyPassword; a
+// config missing even one of them is discarded (SigningConfigImpl.createSigningConfigInfo
+// returns null) and the release build then fails with "Keystore file not set".
+val releaseSigningComplete = releaseStoreFile != null &&
+    releaseStorePassword != null &&
+    releaseKeyAlias != null &&
+    releaseKeyPassword != null
+
+if (!releaseSigningComplete) {
+    val missing = listOfNotNull(
+        "RELEASE_KEYSTORE_PATH".takeIf { releaseStoreFile == null },
+        "RELEASE_KEYSTORE_PASSWORD".takeIf { releaseStorePassword == null },
+        "RELEASE_KEY_ALIAS".takeIf { releaseKeyAlias == null },
+        "RELEASE_KEY_PASSWORD".takeIf { releaseKeyPassword == null },
+    )
+    logger.warn(
+        "Release signing is not configured (missing: ${missing.joinToString(", ")}); " +
+            "assembleRelease will produce an unsigned APK."
+    )
+}
 
 android {
     namespace = "com.nexa.pipe"
@@ -56,12 +80,13 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            if (releaseStoreFile != null) {
-                storeFile = file(releaseStoreFile)
-                storePassword = signingValue("storePassword", "RELEASE_KEYSTORE_PASSWORD")
-                keyAlias = signingValue("keyAlias", "RELEASE_KEY_ALIAS")
-                keyPassword = signingValue("keyPassword", "RELEASE_KEY_PASSWORD")
+        if (releaseSigningComplete) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                storeType = releaseStoreType
             }
         }
     }
@@ -74,11 +99,11 @@ android {
                 "proguard-rules.pro"
             )
             // Only bind the signingConfig when the signing information is
-            // complete, so that assembleDebug and other tasks do not fail at
-            // configuration time when no keystore is available locally.
-            signingConfigs.findByName("release")
-                ?.takeIf { it.storeFile != null }
-                ?.let { signingConfig = it }
+            // complete; an incomplete one is dropped by AGP and then fails the
+            // build with a misleading "Keystore file not set" message.
+            if (releaseSigningComplete) {
+                signingConfigs.findByName("release")?.let { signingConfig = it }
+            }
         }
     }
     compileOptions {

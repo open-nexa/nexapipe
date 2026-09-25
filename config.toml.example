@@ -1,181 +1,209 @@
-# Nexapipe 配置示例
+# Nexapipe configuration example
 #
-# 用法：
-#   cp config.toml.example config.toml     # config.toml 已被 .gitignore 忽略，是运行时的活配置
+# Usage:
+#   cp config.toml.example config.toml     # config.toml is gitignored: it is the operator's live config
 #   cargo run -p nexapipe -- --config config.toml
 #
-# 本文件是"通用"示例，不含 2FA；需要 TOTP 双因素认证的请看 config.toml.2fa.example。
+# This is the general example, with 2FA off. See config.toml.2fa.example for the
+# same file with TOTP authentication enabled.
 #
-# 热重载：文件每 5 秒重新读取一次。`default_backend` 和 `[[routes]]` 改完即时生效，
-# 解析或校验失败会报错并保留当前配置（半截的编辑不会把代理搞挂）。
-# 其余字段只在启动时读一次，改动需要重启：[server]、[iroh]、[auth]、[log]。
+# Reloading: the file is re-read every 5 seconds. `default_backend` and
+# `[[routes]]` are applied live; a config that fails to parse or validate is
+# reported and ignored, so a half-saved edit cannot take the proxy down. The
+# rest is read once at startup and needs a restart: `[server]`, `[iroh]`,
+# `[auth]`, `[log]`.
 #
-# 所有字段都是可选的，下面写的是"用得上时的样子"，不是最小配置。
+# Every key is optional. What follows is "what it looks like when you use it",
+# not a minimal config.
 
 # ============================================================
-# 顶层
+# Top level
 # ============================================================
 
-# HTTP 请求的 Host 没匹配到任何 mode = "http" 路由时的兜底后端。
-# 可选：不写的话，未匹配的域名直接返回 404，而不是被悄悄转发到某个服务上。
-# passthrough / tcp / udp 三种查找从不看它，它们匹配不到就直接拒绝。
+# Where an HTTP request goes when its Host matches no `mode = "http"` route.
+# Optional: without it an unrouted host is answered 404 instead of being
+# silently forwarded somewhere. `passthrough`, `tcp` and `udp` lookups never
+# consult it - they refuse instead.
 default_backend = "http://127.0.0.1:18080"
 
-# 调试日志开关。
+# Debug logging.
 debug = false
 
 # ============================================================
-# [server] —— 明文直连入口（默认不监听）
+# [server] - direct plaintext ingress (off by default)
 # ============================================================
 
 [server]
-# 不写 = 完全不绑定这个监听器，这也是默认值。
+# Left unset = the listener is never bound, and that is the default.
 #
-# 这个监听器上的任何连接都不做认证：2FA 握手跑在 iroh 的 accept 循环里，
-# 从这里进来的请求不经过它就直接打到路由上。只给同主机的进程用（sidecar、
-# 共享网络命名空间的容器），并保持 127.0.0.1。
+# Nothing on this listener is authenticated: the 2FA handshake runs in the iroh
+# accept loop, so a request arriving here reaches a route without ever being
+# asked for a credential. Use it only for something on the same host (a sidecar,
+# a container sharing the network namespace), and keep it on 127.0.0.1.
 # listen_addr = "127.0.0.1:8080"
 
-# 允许 listen_addr 填非回环地址（如 0.0.0.0:8080）。
-# 打开等于把每个 http 路由和每个 passthrough 后端暴露给所有能连到该端口的人，
-# 中间没有任何认证环节。只有在下游另有一层把关（反向代理、防火墙、私有网络）
-# 时才打开。与 [auth] enabled = true 同时存在会在启动时被拒绝。
+# Allows listen_addr to name a non-loopback address (e.g. 0.0.0.0:8080).
+# Turning it on publishes every `http` route and every `passthrough` backend to
+# anyone who can reach the port, with no authentication in between. Enable it
+# only when something downstream does the gating (reverse proxy, firewall,
+# private network). Combined with `[auth] enabled = true` it is refused at
+# startup.
 expose = false
 
-# 已移除、仅为了兼容旧配置仍可解析的键：tls_enabled / tls_listen_addr /
-# cert_path / key_path。TLS 现在由后端（Caddy 等）终结，本进程不持有证书。
+# Removed keys, still accepted so an old config.toml keeps parsing:
+# tls_enabled / tls_listen_addr / cert_path / key_path. TLS is terminated by the
+# backend now; this process holds no certificate.
 
 # ============================================================
-# [iroh] —— QUIC 隧道端点
+# [iroh] - the QUIC tunnel endpoint
 # ============================================================
 
 [iroh]
-# 固定端点身份：填了它，重启后 Node ID 不变。用 `nexapipe --generate-secret` 生成。
-# 客户端填 server_node_id 时尤其需要它，否则服务端一重启客户端就找不到人。
-# secret_key = "你的十六进制密钥"
+# A fixed endpoint identity: with it, the Node ID survives a restart. Generate
+# one with `nexapipe --generate-secret`. Clients that fill in `server_node_id`
+# need it, otherwise they lose track of the server every time it restarts.
+# secret_key = "your-hex-encoded-secret-key"
 
-# 固定 UDP 端口，不填则用临时端口。
+# Fixed UDP port; unset means an ephemeral one.
 bind_port = 0
 
-# 中继模式：pinned / default / disabled / custom，不填为 default。
-#   default  —— 全部 N0 中继，按延迟选 home 中继；可能在中继之间迁移，会断连接
-#   pinned   —— 固定一个 N0 中继（新加坡）。中继迁移比慢一点更难受时用这个
-#   disabled —— 完全不用中继。注意：这样也无法通过对方的中继去连对方
-#   custom   —— 只用自己的中继，完全不走 N0
+# Relay mode: pinned / default / disabled / custom. Unset means default.
+#   default  - every N0 relay, home relay chosen by latency; it can migrate
+#              between relays, which drops the connections routed through it
+#   pinned   - one fixed N0 relay (Singapore). Use when relay migration is
+#              worse than a slightly slower relay
+#   disabled - no relay transport at all. Note this also means you cannot dial
+#              a peer through *its* relay
+#   custom   - one relay you run, and only that one; no N0 relay is used
 relay_mode = "default"
 
-# 仅当 relay_mode = "custom" 时生效；写了 relay_url 而没写 relay_mode 即视为 custom。
-# 指向 *.relay.n0.iroh.link 会被拒绝（那种用 pinned / default）。
+# Only used when relay_mode = "custom"; setting relay_url without a relay_mode
+# means custom. Pointing it at *.relay.n0.iroh.link is rejected (use pinned or
+# default for those).
 # relay_url = "https://relay.example.com"
 
-# 自建中继需要 bearer token 时填；只有 custom 模式有意义，且两端都要配。
+# Bearer token for a self-hosted relay that requires one. Only meaningful for
+# custom, and both sides need it.
 # relay_auth_token = ""
 
 # ============================================================
-# [log] —— 日志与轮转
+# [log] - logging and rotation
 # ============================================================
 
 [log]
-# 写日志文件。默认 true。
+# Write log files. Default true.
 file = true
-# 日志目录，默认 ./logs；也可用环境变量 NEXAPIPE_LOG_DIR 覆盖。
+# Log directory, default ./logs; NEXAPIPE_LOG_DIR overrides it.
 dir = "./logs"
-# 当前日志文件名，默认 nexapipe.log；轮转副本写成 nexapipe.<时间戳>.log。
+# Current log file name, default nexapipe.log; rotated copies are
+# nexapipe.<timestamp>.log.
 file_name = "nexapipe.log"
-# 每个代理请求打一行访问日志。默认 true。
+# One line per proxied request. Default true.
 access_log = true
 access_log_file_name = "access.log"
-# 轮转周期：daily（默认）/ hourly / never
+# Rotation period: daily (default) / hourly / never
 rotation = "daily"
-# 超过该体积（MiB）也轮转一次，0 = 关闭。默认 0。
+# Rotate above this size (MiB) as well; 0 = off. Default 0.
 max_size_mb = 0
-# 每个日志文件保留的轮转份数，0 = 全留。默认 14。
+# Rotated files to keep; 0 = keep all. Default 14.
 max_files = 14
-# 同时输出到 stdout。默认 true。
+# Also write to stdout. Default true.
 console = true
-# 访问日志里把查询参数的值替换成 <redacted>，只留参数名。默认 true。
+# Replace query-string values with <redacted> in the access log, keeping the
+# names. Default true.
 #   /api/items?token=hunter2&page=2 -> /api/items?token=<redacted>&page=<redacted>
-# token、签名、一次性验证码都走查询值，而日志是要轮转、归档、转手的，所以值丢掉、
-# 名字留下。设为 false 则原样记录（只在没人能读到的日志文件上这么做）。
+# Tokens, signatures and one-time codes travel in query values, and a log file
+# gets rotated, archived and handed around - so values are dropped and the names
+# that make the line worth reading stay. Set false to log URIs verbatim.
 redact_query = true
 
 # ============================================================
-# [[routes]] —— 路由
+# [[routes]] - routing
 # ============================================================
 
-# 1) 普通 HTTP：解析请求、套用 path_pattern / path_rewrite，再用共享客户端重发。
-#    后端必须是 http:// —— https:// 后端会在启动时被拒（TLS 由后端终结，
-#    本进程对后端只说明文）。
+# 1) Plain HTTP: parse the request, apply path_pattern / path_rewrite, re-issue
+#    it with the shared client. Backends must be http:// - an https:// backend
+#    is rejected at startup (the backend terminates TLS; the hop to it is plain).
 [[routes]]
 host_pattern = "app.example.com"
 path_pattern = "/"
 path_is_prefix = true
-strategy = "round_robin"          # 或 "random"
+strategy = "round_robin"          # or "random"
 backends = ["http://127.0.0.1:18080", "http://127.0.0.2:18080"]
-mode = "http"                     # 默认值，可省略
-# path_rewrite = "/api"           # 转发前改写路径前缀
+mode = "http"                     # the default; may be omitted
+# path_rewrite = "/api"           # rewrite the path prefix before forwarding
 
-# 2) passthrough：按 SNI 选路由，原样搬运字节，TLS 由后端终结。
-#    后端可以写成裸 host:port，path_pattern / path_rewrite 对它无意义。
+# 2) passthrough: selected by SNI, bytes are copied verbatim, the backend
+#    terminates TLS. The backend may be a bare host:port, and path_pattern /
+#    path_rewrite do not apply.
 [[routes]]
 host_pattern = "web.example.com"
 mode = "passthrough"
 backends = ["127.0.0.1:443"]
 
-# 3) tcp：把原始 TCP 流送到后端，按 L4 preface 里的主机名选路由。
-#    client_ports 只是选择器（决定这条路由是否匹配），从不决定连接去哪；
-#    不写则所有端口都匹配。后端必须显式写出端口。
+# 3) tcp: carry a raw TCP flow to backends, selected by the host name in the L4
+#    preface. client_ports is only a selector (it decides whether this route can
+#    match); it never decides where the connection goes. Absent = every port
+#    matches. Backends must spell out the port.
 [[routes]]
 host_pattern = "db.example.com"
 mode = "tcp"
 backends = ["127.0.0.1:5432"]
 client_ports = [5432, 6432]
 
-# 4) udp：UDP 流，一条 QUIC 双向流承载一个 flow。
-#    idle_timeout_secs = 静默多少秒后关闭 flow，不填用服务端默认值。
+# 4) udp: UDP flows, one QUIC bi-stream per flow.
+#    idle_timeout_secs = close the flow after this many silent seconds; unset
+#    falls back to the server default.
 [[routes]]
 host_pattern = "turn.example.com"
 mode = "udp"
 backends = ["127.0.0.1:3478"]
 idle_timeout_secs = 60
 
-# 5) 一个域名同时要响应请求和承载隧道（Android TUN 客户端的常见形态）：
-#    用 modes 写多个，共用一份 backends。mode 与 modes 可以一起写，取并集，重复去重。
-#    代价是地址必须满足所有模式，而 L4 的规则更严：端口必须写出来。
-#    想给不同模式配不同后端，就写两条 [[routes]]（一条路由只有一个后端池）。
+# 5) One host that has to answer both a request and a tunnel - the ordinary
+#    shape for an Android TUN client: `modes` takes several, `mode` takes one.
+#    They may be written together; the route serves the union, duplicates
+#    collapse. The cost is that the address has to satisfy every declared mode,
+#    and the L4 rules are stricter: the port must be written out. Give the modes
+#    separate entries when they need different backends - a route has exactly
+#    one backend pool.
 [[routes]]
 host_pattern = "vpn.example.com"
 modes = ["passthrough", "tcp"]
 backends = ["127.0.0.1:443"]
 
 # ============================================================
-# [local_proxy] —— 客户端模式（服务端不需要时可整段删除）
+# [local_proxy] - client mode (delete the section on a server)
 # ============================================================
 
 [local_proxy]
 enabled = false
 listen_addr = "127.0.0.1:8081"
-# 走隧道的域名；--generate-invite 不带 --invite-domains 时也从这里取域名。
+# Domains to tunnel; --generate-invite without --invite-domains takes its
+# domains from here too.
 proxy_domains = ["app.example.com", "web.example.com"]
 strategy = "round_robin"
 
-# 推荐写法：多个服务端节点。同一个域名可以出现在多个节点上，这就是跨服务端负载均衡。
-# 把 Node ID 换成服务端 `nexapipe --generate-secret` 后打印的那个（64 位十六进制）。
+# Preferred form: several server nodes. The same domain may appear on more than
+# one node - that is how you load balance across servers. Replace the Node ID
+# with the one the server prints (64 hex chars).
 [[local_proxy.nodes]]
 server_node_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 domains = ["app.example.com"]
 
-# 完整 ticket（含 Node ID + 地址）也可以：地址一变 ticket 就变，但连接信息完整。
+# A full ticket (Node ID + addresses) works too: it changes whenever the
+# addresses do, but it carries the complete connection information.
 # [[local_proxy.nodes]]
-# server_ticket = "nodeabc...#地址"
+# server_ticket = "nodeabc...#addresses"
 # domains = ["web.example.com"]
 
-# 已废弃的单节点写法，仍在用：server_ticket / server_node_id。优先用 [[local_proxy.nodes]]。
+# Deprecated single-node keys, still honoured: server_ticket / server_node_id.
+# Prefer [[local_proxy.nodes]].
 # server_node_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-# server_ticket  = "完整 ticket"
+# server_ticket  = "full ticket"
 
-# 客户端 2FA 凭据：必须与服务端 [auth.clients] 里的某个 client 一致，否则连接全被拒。
-# 完整示例见 config.toml.2fa.example。
+# Client 2FA credentials: must match a client listed under [auth.clients] on the
+# server, otherwise every connection is rejected. See config.toml.2fa.example.
 # [local_proxy.two_factor]
 # enabled = true
 # client_id = "client-001"
@@ -183,20 +211,24 @@ domains = ["app.example.com"]
 # algorithm = "sha1"
 
 # ============================================================
-# [auth] —— 服务端 2FA（默认关闭）
+# [auth] - server-side 2FA (off by default)
 # ============================================================
-# 打开后每个客户端连接都要先完成 TOTP 握手才允许代理。
-# 这里的 secret 是把守 iroh 监听器的唯一凭据，所以文件必须私有：
-# enabled = true 时，config.toml 若能被其他账号读写，服务端拒绝启动（chmod 600）。
+# With this on, every client connection must complete a TOTP handshake before
+# proxying is allowed. The secrets below are the only credential gating the iroh
+# listener, so keep the file private: with enabled = true the server refuses to
+# start when config.toml is readable or writable by another account - chmod 600.
 #
-# 生成密钥与二维码（都会把结果写回 config.toml，注意别指向示例文件本身）：
+# Generate a secret and its enrollment QR code (both write the result back into
+# config.toml, so do not point them at the example file itself):
 #   nexapipe --generate-2fa client-001 --config config.toml
-#   nexapipe --generate-invite client-001 --config config.toml   # 端点 + 域名 + 2FA 一次扫码
+#   nexapipe --generate-invite client-001 --config config.toml
 #
-# 上面那个邀请二维码里带的是明文 secret，它本身就是凭据。`--registration` 换成
-# 一次性注册令牌：`--generate-invite client-001 --registration --config config.toml`
-# 会把令牌写进这里的 pending_enrollment，首台设备扫码后用它换取新密钥，令牌随即作废
-# —— 详细流程见 config.toml.2fa.example。
+# The invite above carries the secret in the clear, so the code itself is the
+# credential. `--registration` swaps it for a one-time enrollment token:
+#   nexapipe --generate-invite client-001 --registration --config config.toml
+# That token lands in `pending_enrollment` here; the first device to scan it
+# trades it for a fresh secret and the token is spent - see
+# config.toml.2fa.example for the full flow.
 #
 # [auth]
 # enabled = true
@@ -211,4 +243,4 @@ domains = ["app.example.com"]
 # [auth.clients.client-001]
 # secret = "JBSWY3DPEHPK3PXP"
 # created_at = "1723756800"
-# allow_hosts = ["app.example.com", "*.db.example.com"]   # 不填 = 可访问所有路由
+# allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route

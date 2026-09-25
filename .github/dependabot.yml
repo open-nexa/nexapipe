@@ -5,15 +5,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # iroh / quinn 这种大半版本号更新往往带 breaking change，单独一个 PR 好评估。
+    # A major iroh / quinn bump usually carries breaking changes, so it is easier to review as its own PR.
     groups:
       rust-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # ui-desktop/src-tauri 有自己的 Cargo.lock（被根 workspace exclude），需要单独一条。
-  # nexapipe-client 是 path 依赖（../../crates/nexapipe-client，同仓库），dependabot
-  # 不会去动它，只更新 Cargo.lock 里的直接外部依赖。
+  # ui-desktop/src-tauri has its own Cargo.lock (excluded from the root workspace), so it needs its own entry.
+  # nexapipe-client is a path dependency (../../crates/nexapipe-client, same repo); dependabot leaves it
+  # alone and only bumps the direct external dependencies in that Cargo.lock.
   - package-ecosystem: cargo
     directory: "/ui-desktop/src-tauri"
     schedule:
