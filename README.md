@@ -112,7 +112,8 @@ One binary and one `config.toml`. No account to create, no coordination server,
 no third party holding a map of your nodes, their keys and their online times.
 
 What that costs: no central device list, no remote revocation, no SSO. Adding a
-client means editing the config, and `[auth]` changes need a restart.
+client means editing the config (an edit the running server picks up within
+seconds, see [Configuration](#configuration)).
 
 ### There is nothing to rent
 
@@ -247,12 +248,16 @@ running on the Docker host are reachable.
 `config.toml` is the single source of truth for both the server and the client
 mode. Every key is optional.
 
-The file is re-read every 5 seconds and **applied live**: `[[routes]]` and
-`default_backend` take effect without a restart, and a config that fails to
-parse or validate is reported and ignored so a half-saved edit cannot take the
-proxy down. The rest still needs a restart, because it is read once when the
-process starts: `[server] listen_addr`, `[iroh] secret_key` / `bind_port` /
-relay settings, `[auth]` and `[log]`.
+The file is re-read every 5 seconds and **applied live**: `[[routes]]`,
+`default_backend` and the `[auth.clients]` table take effect without a restart
+— an invite generated while the server runs (`--generate-invite --registration`
+writes `pending_enrollment` into the file) becomes spendable on the running
+server within one poll, and a client added or removed from `[auth.clients]`
+does not need a restart either. A config that fails to parse or validate is
+reported and ignored so a half-saved edit cannot take the proxy down. The rest
+still needs a restart, because it is read once when the process starts:
+`[server] listen_addr`, `[iroh] secret_key` / `bind_port` / relay settings,
+`[auth]` `enabled` and its TOTP parameters, and `[log]`.
 
 ### Top level
 
@@ -659,8 +664,10 @@ handshake before any traffic is proxied.
    algorithm = "sha1"
    ```
 
-Auth settings are read once at startup, so restart the server after adding a
-client. See `config.toml.2fa.example`.
+New and changed `[auth.clients]` entries are picked up live by the config
+watcher (see [Configuration](#configuration)) — adding a client does not need a
+restart. Whether 2FA is enabled at all (`[auth] enabled`) is read once at
+startup. See `config.toml.2fa.example`.
 
 Those secrets are the *only* credential gating the iroh listener, so the file
 holding them has to stay private: with `[auth] enabled = true` the server

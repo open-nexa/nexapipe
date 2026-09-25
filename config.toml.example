@@ -189,9 +189,14 @@ domains = ["app.example.com"]
 # 这里的 secret 是把守 iroh 监听器的唯一凭据，所以文件必须私有：
 # enabled = true 时，config.toml 若能被其他账号读写，服务端拒绝启动（chmod 600）。
 #
-# 生成密钥与二维码：
+# 生成密钥与二维码（都会把结果写回 config.toml，注意别指向示例文件本身）：
 #   nexapipe --generate-2fa client-001 --config config.toml
 #   nexapipe --generate-invite client-001 --config config.toml   # 端点 + 域名 + 2FA 一次扫码
+#
+# 上面那个邀请二维码里带的是明文 secret，它本身就是凭据。`--registration` 换成
+# 一次性注册令牌：`--generate-invite client-001 --registration --config config.toml`
+# 会把令牌写进这里的 pending_enrollment，首台设备扫码后用它换取新密钥，令牌随即作废
+# —— 详细流程见 config.toml.2fa.example。
 #
 # [auth]
 # enabled = true

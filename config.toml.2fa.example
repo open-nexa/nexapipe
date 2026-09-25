@@ -12,6 +12,11 @@
 # The secrets below are the only credential gating the iroh listener, so keep
 # the file private: with `enabled = true` the server refuses to start when
 # config.toml is readable or writable by another account — `chmod 600` it.
+#
+# This file is the 2FA one; the sibling `config.toml.example` writes out every
+# other section (relay modes, all four route modes, `[log]`) at length and leaves
+# `[auth]` off. Everything except `[server]`, `[iroh]`, `[auth]` and `[log]` is
+# reread every 5 s and takes effect without a restart.
 
 # ===== Server Configuration =====
 default_backend = "http://localhost:3000"
@@ -126,10 +131,6 @@ issuer = "NexaPipe"
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"
-# Written by `--generate-invite --registration`, cleared again when it is spent.
-# Not touched when a lockout is saved: it belongs to the operator, not the
-# runtime, so leave it alone.
-# pending_enrollment = ""
 # Optional per-client host authorization. Patterns use the same spelling as a
 # route's host_pattern — an exact name or a "*.suffix" wildcard,
 # case-insensitively. Left unset, the client may reach every route (the
@@ -138,8 +139,10 @@ created_at = "1723756800"
 # refusals look exactly like "no route" (404 / NoRoute / hang-up), so the
 # restriction cannot be used to probe which hosts exist.
 # allow_hosts = ["api.example.com", "*.db.example.com"]
-# `failed_attempts`, `locked_until` and `last_used` may turn up here too: the
-# server writes them back so a lockout survives a restart. Nothing to configure.
+# The server also writes `failed_attempts`, `locked_until` and `last_used` back
+# into a client that has failed a handshake, so a lockout survives a restart.
+# Nothing to configure; and `pending_enrollment`, written by the enrollment
+# command above, should never be edited by hand either.
 
 [auth.clients.client-002]
 secret = "KBSWY3DPEHPK3PXQ"
@@ -187,13 +190,7 @@ client_id = "client-001"
 secret = "JBSWY3DPEHPK3PXP"
 algorithm = "sha1"
 
-# Rotating log files next to the console output. Every key is optional and
-# defaults to the value shown; see README.md, "Logging".
-# [log]
-# file = true
-# dir = "./logs"                  # NEXAPIPE_LOG_DIR overrides it
-# rotation = "daily"              # daily | hourly | never
-# max_size_mb = 0                 # also rotate past this size (MiB), 0 = off
-# max_files = 14                  # rotated copies kept per file, 0 = keep all
-# access_log = true
-# redact_query = true             # ?token=<redacted> in the access log
+# Rotating log files under ./logs next to the console output are on by default
+# (`file`, `rotation`, `max_files`, `redact_query`, …); every key and its default
+# is written out in config.toml.example under `[log]`.
+# NEXAPIPE_LOG_DIR overrides the directory without touching this file.
