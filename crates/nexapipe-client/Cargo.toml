@@ -29,7 +29,7 @@ rustls-native-certs = { version = "0.8.4", optional = true }
 webpki-roots = { version = "1.0.8", optional = true }
 uniffi = { version = "0.32", optional = true }
 tracing = { version = "0.1.44", optional = true }
-jni = { version = "0.21", features = ["invocation"], optional = true }
+jni = { version = "0.22", features = ["invocation"], optional = true }
 log = { version = "0.4", optional = true }
 android_logger = { version = "0.14", optional = true }
 once_cell = "1.19"
