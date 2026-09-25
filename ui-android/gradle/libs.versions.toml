@@ -10,7 +10,7 @@ lifecycleRuntimeKtx = "2.10.0"
 activityCompose = "1.12.4"
 composeBom = "2026.09.00"
 cameraX = "1.4.2"
-zxing = "3.5.3"
+zxing = "3.5.4"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
