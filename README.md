@@ -746,8 +746,8 @@ with `--invite-domains`, `--invite-name`, `--invite-relay`, `--endpoint-id`.
 Two details worth knowing before you build on the format:
 
 - Clients **ignore parameters they do not recognise**, so a newer server can add
-  fields without breaking older apps. What is strict is `v` (must be `1`) and
-  `algorithm` — an unknown name is an error, never a silent fallback to SHA1,
+  fields without breaking older apps. What is strict is `v` (must be `1` or `2`)
+  and `algorithm` — an unknown name is an error, never a silent fallback to SHA1,
   because a downgrade would be invisible to the person scanning.
 - Keep the code under ~400 characters so it stays easy to scan; the command warns
   when it is longer.
@@ -761,6 +761,41 @@ Two details worth knowing before you build on the format:
   rewrites `config.toml` in place and every device enrolled with the old secret has
   to scan again. Deleting the `[auth.clients.client-001]` section revokes everyone
   at once. Treat an invite you cannot account for as rotated.
+
+
+### Enrollment invites (`--registration`)
+
+The problem with the code above is that it stays a credential for as long as the
+secret lives. `--registration` puts a **one-time enrollment token** in the link
+instead:
+
+```bash
+cargo run -p nexapipe -- --generate-invite client-001 --registration
+```
+
+```text
+nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
+    &enroll=9f2c…c41b
+```
+
+The first device to connect sends the token, the server answers with a freshly
+generated secret and **burns the token in the same write**, so a link that was
+copied in transit stops being a credential the moment it is used — instead of
+staying one until somebody remembers to rotate. Enrolling therefore also rotates
+that client's secret, and every device already using it has to scan again. A link
+you never delivered is revoked by generating another one, which replaces the
+outstanding token.
+
+Two consequences worth knowing:
+
+- `v=2` is a **version of its own**, so an app that only knows `v=1` refuses the
+  code rather than reading it as an endpoint share whose credentials went missing.
+- The device that enrolled has to **persist the secret it was issued** — the
+  token is spent, so an app that restarts holding the invite cannot enroll twice.
+  The Rust client hands it back through
+  `IrohConnectionPool::take_issued_credential()`; an app that stores its settings
+  somewhere durable must write `client_id`, `secret` and `algorithm` down there.
+  (The Android app's scanner still understands `v=1` only.)
 
 Scanning is implemented in the Android app (the "Scan Invite" button beside "Add
 Node"), which accepts the `endpoint/` form only — its stored nodes hold a Node ID
@@ -792,7 +827,7 @@ document is `docs/security-fix-plan-2026-09-21.md`.
 | fixed | A peer could open unlimited concurrent connections. There is now a per-peer cap (64, `NEXAPIPE_MAX_CONNS_PER_PEER`); excess connections are closed before the 2FA handshake |
 | open | Any peer that learns the Node ID can complete the handshake; there is no allow-list of client public keys |
 | open | An authenticated client can reach every route; there is no per-client authorization |
-| open | 2FA is a symmetric shared secret — anyone who scans an invite QR becomes a legitimate client, and a single device cannot be revoked |
+| narrowed | 2FA is a symmetric shared secret — anyone who scans an invite QR becomes a legitimate client, and a single device cannot be revoked. `--generate-invite --registration` now hands out a one-time enrollment token instead of the secret, so a copied link stops being a credential once it has been used; per-device revocation is still rotation |
 
 Reporting a vulnerability: open an issue, or contact a maintainer directly
 instead if it is exploitable.
