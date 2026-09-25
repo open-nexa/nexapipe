@@ -38,7 +38,7 @@ nexapipe-proto.workspace = true
 totp-rs = { version = '5.6', features = ['gen_secret'] }
 base32 = '0.4'
 # Challenge binding: AUTH_RESPONSE is signed HMAC-SHA256(secret, nonce||timestamp).
-hmac = '0.12'
+hmac = '0.13'
 sha2 = '0.10'
 qrcode = { version = "0.14.1", default-features = false }
 
