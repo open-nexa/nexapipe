@@ -10,7 +10,9 @@ use std::fmt;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Application error codes the server closes a connection with during the 2FA
-/// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`.
+/// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`
+/// and `PEER_NOT_ALLOWED_CLOSE_CODE` in
+/// `crates/nexapipe/src/conn/allow_list.rs`.
 mod auth_close_code {
     /// No AUTH_START arrived within the handshake deadline, or the server does
     /// not run the handshake on that first stream at all.
@@ -19,6 +21,10 @@ mod auth_close_code {
     pub const REJECTED: u32 = 3;
     /// The peer already holds as many connections as it is allowed.
     pub const TOO_MANY: u32 = 4;
+    /// The server runs a `[peers]` allow-list and this Node ID is not on it.
+    /// Sent right after the QUIC handshake, so the client never gets as far as
+    /// sending credentials.
+    pub const PEER_NOT_ALLOWED: u32 = 5;
 }
 
 /// HMAC-SHA256 keyed by the TOTP secret, used to sign auth challenges.
@@ -202,6 +208,11 @@ impl TwoFactorAuth {
                 "{}: the server refused this connection because this peer already holds too many",
                 detail
             )),
+            Ok(auth_close_code::PEER_NOT_ALLOWED) => ClientError::AuthenticationFailed(
+                "the server runs a [peers] allow-list and does not permit this Node ID; ask \
+                 its operator to add it (the reason itself never arrived, the close did)"
+                    .to_string(),
+            ),
             _ => ClientError::ConnectionFailed(detail),
         }
     }

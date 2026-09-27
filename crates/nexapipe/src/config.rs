@@ -225,10 +225,67 @@ pub struct ProxyConfig {
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,
     pub local_proxy: Option<LocalProxyConfig>,
+    /// Which client Node IDs may hold a connection at all. Optional, and
+    /// different in kind from `[auth]`: this is not a second factor, so it is
+    /// what a server without 2FA uses to stop being reachable by anyone who
+    /// learns the Node ID. See [`crate::conn::allow_list`].
+    pub peers: Option<PeersConfig>,
     /// Removed: certificates are managed by the backend now. Parsed as an opaque
     /// value so `[acme]` is detected and reported, not silently swallowed.
     pub acme: Option<toml::Value>,
     pub log: Option<LogConfig>,
+}
+
+/// The `[peers]` section: a server-side allow-list of client public keys.
+///
+/// Deliberately not a key under `[auth]`. It is the knob for exactly the server
+/// the "no allow-list" gap describes — one running with 2FA off — so tying it to
+/// a section that server may not even have would bury it, and its semantics do
+/// not depend on `[auth] enabled` either way. `[peers]` is checked on every
+/// inbound connection, before the accept loop sees it.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PeersConfig {
+    /// Node IDs allowed to connect. `None` (the section present but the key
+    /// absent) means unrestricted, like every build before this existed.
+    ///
+    /// A present-but-*empty* list is refused at load time rather than read as
+    /// "refuse everybody": "restrict to nobody" is a plausible typo, and the
+    /// cost of guessing wrong is an operator locked out of their own server. An
+    /// empty list is spelled by naming one Node ID that is not yours.
+    pub allow: Option<Vec<String>>,
+}
+
+impl PeersConfig {
+    /// Parses the configured Node IDs into the set the hook checks against.
+    ///
+    /// Fails on anything that is not a valid Node ID rather than skipping it: a
+    /// typo in one entry of a list whose whole job is to refuse strangers would
+    /// otherwise silently narrow the allow-list, and a silent narrowing here is
+    /// worse than a refusal to start.
+    pub fn parse_allow_list(
+        &self,
+    ) -> anyhow::Result<Option<std::collections::HashSet<iroh::EndpointId>>> {
+        let Some(entries) = &self.allow else {
+            return Ok(None);
+        };
+
+        if entries.is_empty() {
+            anyhow::bail!(
+                "[peers] allow = [] refuses every peer, including the operator's own clients. \
+                 Remove the key to leave the listener unrestricted, or list the Node IDs that \
+                 may connect"
+            );
+        }
+
+        let mut allowed = std::collections::HashSet::with_capacity(entries.len());
+        for entry in entries {
+            let id: iroh::EndpointId = entry
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[peers] allow: {entry:?} is not a Node ID ({e})"))?;
+            allowed.insert(id);
+        }
+        Ok(Some(allowed))
+    }
 }
 
 impl ProxyConfig {
@@ -237,7 +294,8 @@ impl ProxyConfig {
     /// TLS moved to the backend, so a config.toml written for the old layout
     /// parses but does nothing useful. Reporting it beats a silent failure.
     pub fn warn_removed_tls_keys(&self) {
-        const HINT: &str = "TLS is terminated by the backend now (see README, `mode = \"passthrough\"`)";
+        const HINT: &str =
+            "TLS is terminated by the backend now (see README, `mode = \"passthrough\"`)";
 
         if self.acme.is_some() {
             tracing::warn!("[acme] is ignored and can be removed from config.toml: {HINT}");
@@ -251,7 +309,9 @@ impl ProxyConfig {
                 tracing::warn!("[server] tls_listen_addr is ignored and can be removed: {HINT}");
             }
             if server.cert_path.is_some() || server.key_path.is_some() {
-                tracing::warn!("[server] cert_path/key_path are ignored and can be removed: {HINT}");
+                tracing::warn!(
+                    "[server] cert_path/key_path are ignored and can be removed: {HINT}"
+                );
             }
         }
 
@@ -1071,7 +1131,10 @@ idle_timeout_secs = 120
         assert_eq!(routes.len(), 1);
         assert_eq!(get_route_mode(&routes[0].mode), RouteMode::Tcp);
         assert_eq!(routes[0].path_pattern, "/");
-        assert_eq!(routes[0].client_ports.as_deref(), Some(&[5432u16, 6432][..]));
+        assert_eq!(
+            routes[0].client_ports.as_deref(),
+            Some(&[5432u16, 6432][..])
+        );
         assert_eq!(routes[0].idle_timeout_secs, Some(120));
 
         // A udp route without the optional keys still parses, with the defaults.
@@ -1440,5 +1503,81 @@ domains = ["fn.iroh.iakl.top"]
         let err = ProxyConfig::write_pending_enrollment(&path, "ghost", "deadbeef")
             .expect_err("a missing client must not be silently created");
         assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    /// A Node ID to write into `[peers] allow`.
+    fn node_id(seed: u8) -> String {
+        iroh::SecretKey::from_bytes(&[seed; 32])
+            .public()
+            .to_string()
+    }
+
+    /// The default has to stay permissive: every deployment that predates
+    /// `[peers]` has no section at all, and none of them may start refusing
+    /// connections after an upgrade.
+    #[test]
+    fn no_peers_section_means_no_restriction() {
+        assert!(parse("").peers.is_none());
+
+        // The section present but the key absent is the same thing.
+        let config = parse("[peers]\n");
+        assert!(
+            config
+                .peers
+                .as_ref()
+                .unwrap()
+                .parse_allow_list()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_peers_allow_list_parses_into_node_ids() {
+        let source = format!("[peers]\nallow = [{:?}, {:?}]\n", node_id(1), node_id(2));
+        let config = parse(&source);
+
+        let allowed = config
+            .peers
+            .as_ref()
+            .unwrap()
+            .parse_allow_list()
+            .unwrap()
+            .expect("the list is configured");
+
+        assert_eq!(allowed.len(), 2);
+        assert!(allowed.contains(&node_id(1).parse::<iroh::EndpointId>().unwrap()));
+        assert!(allowed.contains(&node_id(2).parse::<iroh::EndpointId>().unwrap()));
+    }
+
+    /// A typo in one entry would otherwise silently narrow a list whose whole
+    /// job is to refuse strangers — so it is fatal, not skipped.
+    #[test]
+    fn a_malformed_node_id_is_refused_not_dropped() {
+        let source = format!("[peers]\nallow = [{:?}, \"not-a-node-id\"]\n", node_id(1));
+        let err = parse(&source)
+            .peers
+            .as_ref()
+            .unwrap()
+            .parse_allow_list()
+            .expect_err("a malformed entry must be reported");
+
+        assert!(err.to_string().contains("not-a-node-id"), "{err}");
+    }
+
+    /// `allow = []` is refused rather than read as "refuse everybody": it is a
+    /// plausible typo, and guessing wrong locks the operator out of their own
+    /// server.
+    #[test]
+    fn an_empty_allow_list_is_refused() {
+        let config = parse("[peers]\nallow = []\n");
+        let err = config
+            .peers
+            .as_ref()
+            .unwrap()
+            .parse_allow_list()
+            .expect_err("an empty list must not be read as either case");
+
+        assert!(err.to_string().contains("[peers] allow = []"), "{err}");
     }
 }
