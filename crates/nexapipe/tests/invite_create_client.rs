@@ -23,7 +23,6 @@ fn scratch_config(name: &str) -> (tempfile::TempDir, PathBuf) {
     fs::write(
         &path,
         "# my proxy\n\
-         default_backend = \"http://127.0.0.1:15666\"\n\
          \n\
          [iroh]\n\
          secret_key = \"f3d4cade20c162ac5bb9d582b84a10755b1bf61a44c05f4fec4e4282f2f1f9c0\"\n\

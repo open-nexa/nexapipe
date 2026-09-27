@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.nexa.pipe.R
+import com.nexa.pipe.locale.rememberLocalizedContext
 import com.nexa.pipe.otp.OtpAuth
 import com.nexa.pipe.otp.OtpAuthConfig
 import com.nexa.pipe.otp.OtpAuthParseResult
@@ -49,6 +50,7 @@ fun EndpointDetailScreen(
     onRenamed: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
     val clipboardManager = LocalClipboardManager.current
     val nodes by viewModel.nodes.collectAsState()
     val linkKinds by viewModel.linkKinds.collectAsState()
@@ -79,7 +81,7 @@ fun EndpointDetailScreen(
     // not a composable scope. The context is the (locale-wrapped) Activity one.
     fun copyToClipboard(text: String, label: String) {
         clipboardManager.setText(AnnotatedString(text))
-        Toast.makeText(context, context.getString(R.string.copied_toast, label), Toast.LENGTH_SHORT)
+        Toast.makeText(context, localizedContext.getString(R.string.copied_toast, label), Toast.LENGTH_SHORT)
             .show()
     }
 
@@ -111,7 +113,7 @@ fun EndpointDetailScreen(
         config.warnings.forEach { viewModel.addLog("2FA import: $it") }
         Toast.makeText(
             context,
-            context.getString(R.string.two_factor_imported, config.clientId),
+            localizedContext.getString(R.string.two_factor_imported, config.clientId),
             Toast.LENGTH_SHORT
         ).show()
     }
@@ -122,8 +124,8 @@ fun EndpointDetailScreen(
         // of a confirmation dialog in front of every delete.
         scope.launch {
             val result = snackbarHostState.showSnackbar(
-                message = context.getString(R.string.domain_removed, domain),
-                actionLabel = context.getString(R.string.action_undo),
+                message = localizedContext.getString(R.string.domain_removed, domain),
+                actionLabel = localizedContext.getString(R.string.action_undo),
                 duration = SnackbarDuration.Short
             )
             if (result == SnackbarResult.ActionPerformed) {
@@ -166,7 +168,7 @@ fun EndpointDetailScreen(
                                     menuExpanded = false
                                     copyToClipboard(
                                         nodeId,
-                                        context.getString(R.string.clipboard_label_endpoint_id)
+                                        localizedContext.getString(R.string.clipboard_label_endpoint_id)
                                     )
                                 },
                                 leadingIcon = {
@@ -267,7 +269,7 @@ fun EndpointDetailScreen(
                             onClick = {
                                 copyToClipboard(
                                     node.nodeId,
-                                    context.getString(R.string.clipboard_label_endpoint_id)
+                                    localizedContext.getString(R.string.clipboard_label_endpoint_id)
                                 )
                             }
                         ) {
@@ -597,7 +599,7 @@ fun EndpointDetailScreen(
                                     onCopy = {
                                         copyToClipboard(
                                             domain,
-                                            context.getString(R.string.clipboard_label_domain)
+                                            localizedContext.getString(R.string.clipboard_label_domain)
                                         )
                                     },
                                     onRemove = { removeDomain(domain) }
@@ -635,7 +637,7 @@ fun EndpointDetailScreen(
                     onRenamed(newNodeId)
                     Toast.makeText(
                         context,
-                        context.getString(R.string.endpoint_id_updated),
+                        localizedContext.getString(R.string.endpoint_id_updated),
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -839,6 +841,7 @@ private fun EditNodeDialog(
     onSave: (String) -> String?
 ) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
     var value by remember { mutableStateOf(nodeId) }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -872,9 +875,9 @@ private fun EditNodeDialog(
                 onClick = {
                     val newId = value.trim()
                     if (newId.isEmpty()) {
-                        error = context.getString(R.string.error_endpoint_id_empty)
+                        error = localizedContext.getString(R.string.error_endpoint_id_empty)
                     } else if (newId != nodeId && existingNodeIds.contains(newId)) {
-                        error = context.getString(R.string.error_endpoint_id_exists, newId)
+                        error = localizedContext.getString(R.string.error_endpoint_id_exists, newId)
                     } else {
                         val failure = onSave(newId)
                         if (failure != null) error = failure else onDismiss()

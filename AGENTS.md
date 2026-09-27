@@ -47,10 +47,22 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 - The L4 tests drive `l4::serve_stream` over a `tokio::io::duplex` pair and the client's `l4::open_*` against the same, so a TCP or UDP flow can be tested end to end without an iroh endpoint.
 - Run `cargo test --workspace`; for Android changes, compile-verify with `gradlew :app:compileDebugKotlin`.
 
+## Task Execution Workflow (MANDATORY)
+
+Do not jump straight into edits. For any task that writes something:
+
+1. **Plan first.** Restate the goal, read the relevant code/config, then produce a concrete plan: which files change, what each change does, what could break, and how it will be verified (build/test/lint commands, CI jobs).
+2. **Ask before acting.** Present that plan and wait for explicit approval. Surface assumptions, alternatives and risks; when several approaches exist, list them and let the owner choose.
+3. **Execute only after approval** and stay inside the agreed scope. Stop and re-ask if the task grows, uncovers a bigger problem, or needs files that were not in the plan.
+
+No approval is needed for read-only work: answering questions, reading files, searching, explaining code, or producing a report / scan-only listing. Anything that writes, deletes, or has external effects does need it.
+
 ## Git Safety Rules (MANDATORY)
 
-- **Never run `git push` (or any remote-writing command: push, force-push, remote-add-then-push, branch delete on remote, `gh release ...`).** Create local commits only; the owner pushes themselves.
-- The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
+- **Never push or write to a remote.** No `git push`, force-push, remote-add-then-push, remote branch deletion, or `gh release ...`. Local commits only; the owner pushes themselves.
+- **Never `git commit` automatically.** Committing belongs to the owner. When the work is verified, stop, summarize the change and hand over a suggested commit message — do not run `git commit`, `git commit -a`, or an implicit "stage then commit".
+- Do not run history/discard commands (`git reset --hard`, `git checkout --`, `git clean -fd`, `git stash` without being asked, branch switches that drop work) unless explicitly requested.
+- The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "commit it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
 ## Working Files & Plan Documents (MANDATORY)
@@ -61,6 +73,7 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 
 ## Commit & Pull Request Guidelines
 
+- The agent does **not** create commits (see Git Safety Rules). Hand the owner a ready-to-use commit message instead and let them commit.
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
 - Keep one logical change per commit.
 - Pull requests: describe what and why, link related issues, and add screenshots/videos for UI or VPN behavior changes.

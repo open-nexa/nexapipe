@@ -42,7 +42,7 @@ fn loads_the_auth_section_of_the_example_config() {
 fn accepts_a_config_without_auth() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    std::fs::write(&path, "default_backend = \"http://localhost:3000\"\n").unwrap();
+    std::fs::write(&path, "").unwrap();
 
     let (_, auth) = ProxyConfig::load_with_auth(path.to_str().unwrap()).unwrap();
     assert!(auth.is_none());
@@ -56,8 +56,7 @@ fn reports_a_broken_auth_section() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "default_backend = \"http://localhost:3000\"\n\
-         [auth]\n\
+        "[auth]\n\
          enabled = \"not a boolean\"\n",
     )
     .unwrap();

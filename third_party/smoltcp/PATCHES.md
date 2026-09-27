@@ -35,3 +35,33 @@ tearing down the whole TUN tunnel a few seconds after connecting.
   `tcp_trace!`; it now uses the same guarded expression.
 
 Everything else is byte-for-byte upstream 0.12.0.
+
+## Rules
+
+- Do not edit this copy for anything but the four fixes above. It is a vendored
+  crate, not a fork: a local "improvement" silently diverges from upstream and
+  makes the next re-vendor a manual merge.
+- Any change here goes in this file, with the reason and the upstream state.
+
+## Dropping the patch
+
+This patch exists only because released smoltcp 0.12.0 panics on modular
+sequence-number subtraction. Once upstream ships a release that no longer
+panics, the vendored copy — and this directory — can go away:
+
+1. Check upstream (`smoltcp` master, and the changelog of the release you want
+   to move to) for the two spots this patch touches:
+   - `src/wire/tcp.rs`: `impl Sub for SeqNumber` — must not panic on a negative
+     difference (sequence numbers are modular 2^32).
+   - `src/socket/tcp.rs`: `last_scaled_window` and the transmit-path
+     `remote_last_seq - local_seq_no` subtraction — must be guarded or
+     saturating.
+2. Remove the `[patch.crates-io]` entry from the workspace root `Cargo.toml`
+   and run `cargo update -p smoltcp`, so the crates.io version is used again.
+3. Actually exercise it: bring the TUN proxy up (Android or desktop) and push
+   real traffic through it, including a lossy link. The panic this patch guards
+   only appeared seconds into a real connection, never in a unit test.
+4. Delete `third_party/smoltcp/` and this file.
+
+Until upstream releases the fix, the patch is load-bearing: without it the TUN
+tunnel disconnects a few seconds after connecting.

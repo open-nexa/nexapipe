@@ -55,6 +55,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import com.nexa.pipe.R
+import com.nexa.pipe.locale.rememberLocalizedContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
@@ -127,6 +128,7 @@ private fun ScannerContent(
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView = remember {
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
@@ -202,7 +204,7 @@ private fun ScannerContent(
                     )
                 } catch (e: Exception) {
                     // No back camera, camera already in use, ...
-                    cameraError = e.message ?: context.getString(R.string.scanner_camera_error)
+                    cameraError = e.message ?: localizedContext.getString(R.string.scanner_camera_error)
                 }
             },
             ContextCompat.getMainExecutor(context)

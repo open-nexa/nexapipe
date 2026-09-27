@@ -26,6 +26,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import com.nexa.pipe.R
+import com.nexa.pipe.locale.rememberLocalizedContext
 import com.nexa.pipe.otp.OtpAuth
 
 /**
@@ -43,6 +44,7 @@ fun TwoFactorExportDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
     val clipboardManager = LocalClipboardManager.current
     val uri = remember(clientId, secret, algorithm) { OtpAuth.build(clientId, secret, algorithm) }
 
@@ -104,7 +106,7 @@ fun TwoFactorExportDialog(
                     clipboardManager.setText(AnnotatedString(uri))
                     Toast.makeText(
                         context,
-                        context.getString(R.string.two_factor_export_copied),
+                        localizedContext.getString(R.string.two_factor_export_copied),
                         Toast.LENGTH_SHORT
                     ).show()
                     onDismiss()

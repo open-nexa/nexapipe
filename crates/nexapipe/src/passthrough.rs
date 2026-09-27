@@ -445,18 +445,15 @@ mod tests {
         use crate::lb::LoadBalancingStrategy;
         use crate::routes::{Route, RouteConfig};
 
-        let config = RouteConfig::new(
-            vec![Route::new(
-                "fn.iroh.iakl.top",
-                "/",
-                true,
-                vec!["caddy:443".to_string()],
-                LoadBalancingStrategy::RoundRobin,
-                RouteMode::Passthrough,
-                None,
-            )],
+        let config = RouteConfig::new(vec![Route::new(
+            "fn.iroh.iakl.top",
+            "/",
+            true,
+            vec!["caddy:443".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Passthrough,
             None,
-        );
+        )]);
 
         // Off-list: refused, even though a passthrough route exists.
         let acl = ClientAcl::from_hosts(Some(&["other.iakl.top".to_string()]));

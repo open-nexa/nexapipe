@@ -8,15 +8,6 @@ Expose HTTP, HTTPS, WebSocket, TCP and UDP services that live behind NAT through
 a single [iroh](https://github.com/n0-computer/iroh) endpoint — **without ever
 holding a certificate, without a control plane, and without a server to rent.**
 
-Three things are true here that are not true of the usual alternatives:
-
-| | NexaPipe | Cloudflare Tunnel / ngrok | Pangolin / frp | Tailscale |
-| --- | --- | --- | --- | --- |
-| Terminates TLS | **never** — your backend keeps the certificates | yes | yes (Traefik) | yes (Funnel) |
-| Needs a control plane or an account | **no** — one binary, one `config.toml` | yes | yes | yes |
-| Needs a public server you rent | **no** — clients hole-punch straight to you | no (theirs) | **yes** | no (theirs) |
-| Can be linked into your own app | **yes** — rlib, JNI cdylib, UniFFI | no | no | Go only (tsnet) |
-
 Put plainly: **the proxy is a pipe, not a party.** It cannot read what it
 carries, it is not an account you have to trust, and it does not rent anyone's
 machine. See [Why NexaPipe](#why-nexapipe) for what that costs you.
@@ -40,7 +31,8 @@ NexaPipe is a Rust workspace with four parts:
 [How it works](#how-it-works) · [Why NexaPipe](#why-nexapipe) ·
 [Embed it](#embed-it-in-your-app) · [Layout](#repository-layout) ·
 [Quick start](#quick-start-server) · [CLI](#cli) ·
-[Configuration](#configuration) · [TLS](#tls) · [TCP & UDP](#tcp--udp) ·
+[Configuration](#configuration) · [Minimal config](#minimal-config) ·
+[TLS](#tls) · [TCP & UDP](#tcp--udp) ·
 [2FA](#2fa-totp) · [Endpoint invites](#endpoint-invites) ·
 [Security](#security-boundary) ·
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
@@ -52,33 +44,15 @@ NexaPipe is a Rust workspace with four parts:
 ## How it works
 
 ```
-                    ┌─────────────────────── your LAN / host ───────────────────┐
-                    │   Caddy :443 ──► backend A        backend B       ...     │
-                    │   (certificates) 192.0.2.20:18188 127.0.0.1:18080          │
-                    └────────▲───────────────────▲──────────────────▲───────────┘
-                             │                   │                  │
-                    ┌────────┴───────────────────┴──────────────────┴───────────┐
-                    │  nexapipe server                                          │
-                    │  · L7 router (Host + path, round_robin / random)          │
-                    │  · hyper, WebSocket upgrade, health checks                │
-                    │  · L4 passthrough by SNI (TLS bytes copied, never read)   │
-                    │  · L4 tunnel (TCP / UDP to a route's backend)             │
-                    │  · iroh endpoint, ALPN b"\x05nexapipe"                    │
-                    └────────▲───────────────────────────────▲──────────────────┘
-                             │                               │
-        plain HTTP + TLS     │                               │   QUIC over iroh
-        passthrough          │                               │   (hole punched,
-        (optional, [server]) │                               │    relay fallback)
-                    ┌────────┴───────────┐         ┌─────────┴──────────────────┐
-                    │  any HTTP client   │         │  nexapipe-client           │
-                    └────────────────────┘         │  · local HTTP proxy        │
-                                                   │  · or TUN (Android/desktop)│
-                                                   │  · or embedded Rust API    │
-                                                   └────────────────────────────┘
+   clients                       nexapipe server                    your LAN / host
+   ───────                       ───────────────                    ───────────────
+   any HTTP client  ── TLS ───►  passthrough by SNI      ── TCP ──►  Caddy :443 (certs)
+   nexapipe-client  ── QUIC ──►  L7 router (Host + path) ── HTTP ──► backend A  backend B
+   (local proxy / TUN)           L4 tunnel (tcp / udp)               :18080  :15432  :3478
 ```
 
-One inner TCP connection maps to one QUIC bidirectional stream. What a stream
-carries depends on who opened it: an HTTP request (or a WebSocket upgrade), a TLS
+One inner TCP connection maps to one QUIC bidirectional stream. What it carries
+depends on who opened it: an HTTP request (or a WebSocket upgrade), a TLS
 session, or an L4 flow — a raw TCP connection or a UDP flow. For HTTP the server
 routes by `Host` exactly like an ordinary reverse proxy — the NAT traversal
 happens underneath and is invisible to both the app and the backend.
@@ -96,77 +70,41 @@ never have to be told apart by guessing:
 
 ## Why NexaPipe
 
-Three properties you cannot get together anywhere else — and what each one costs
-you, because none of them is free.
+Three properties, and what each one costs, because none of them is free.
 
-### It never terminates TLS
+- **It never terminates TLS.** A `ClientHello` is matched by SNI and copied
+  through as bytes, so the session runs end to end between the visitor and your
+  backend. What that costs: an opaque pipe cannot rewrite paths, cannot decide on
+  the request, cannot probe `/health`, and its access log records bytes rather
+  than a request line. (`mode = "http"` is the exception — there the proxy does
+  parse the request. See [Security boundary](#security-boundary).)
+- **There is no control plane.** One binary and one `config.toml`; no account, no
+  coordination server, no third party holding a map of your nodes. What that
+  costs: no central device list, no remote revocation, no SSO — adding a client
+  means editing the config, which the running server picks up within seconds.
+- **There is nothing to rent.** Clients hole-punch straight to your endpoint over
+  QUIC. What that costs: hole punching succeeds for roughly 90–95% of
+  connections and the rest fall back to a relay, so for anything you depend on
+  you should run your own — and once you are maintaining a public machine anyway,
+  "no server to rent" stops being much of an advantage.
 
-A `ClientHello` is matched by SNI and copied through as bytes. The proxy holds no
-certificate and never sees a plaintext byte of an `https://` request, so the TLS
-session runs end to end between your browser and your Caddy.
+When not to use it:
 
-What that costs: an opaque pipe cannot rewrite paths, cannot make a decision based
-on the request, cannot probe `/health`, and its access log records bytes rather
-than a request line. Those move to the backend, which sees the decrypted request
-and does them properly. (`mode = "http"` is the exception: there the proxy does
-parse the request. See [Security boundary](#security-boundary).)
-
-### There is no control plane
-
-One binary and one `config.toml`. No account to create, no coordination server,
-no third party holding a map of your nodes, their keys and their online times.
-
-What that costs: no central device list, no remote revocation, no SSO. Adding a
-client means editing the config (an edit the running server picks up within
-seconds, see [Configuration](#configuration)).
-
-### There is nothing to rent
-
-Clients hole-punch straight to your endpoint over QUIC.
-
-What that costs: hole punching is not universal. It succeeds for roughly 90–95%
-of connections; the rest fall back to a relay, so for anything you depend on you
-should run your own. And note what that means — once you are maintaining a public
-machine anyway, "no server to rent" stops being much of an advantage.
-
-### When not to use it
-
-- **Your visitors cannot install anything** → use Cloudflare Tunnel or Pangolin;
-  they serve a plain URL to any browser, NexaPipe needs a client.
-- **You need SSO, ACLs and an audit trail** → use Pangolin or Teleport. NexaPipe
-  authenticates a client and then serves every route it has.
-- **You need a connection that is never relayed** → use something with a
-  permanent middle machine.
+- **Your visitors cannot install anything** — NexaPipe needs a client; a hosted
+  tunnel serves a plain URL to any browser.
+- **You need SSO, ACLs and an audit trail** — NexaPipe authenticates a client and
+  then serves every route it has.
+- **A relayed connection is unacceptable** — use something with a permanent
+  middle machine.
 
 ---
 
 ## Embed it in your app
 
-This is the part no hosted tunnel can copy: the client is a library, so your own
-app can reach a private network without shelling out to anything.
-
-```rust
-use std::sync::Arc;
-
-use nexapipe_client::{EndpointGroup, LoadBalancingStrategy, LocalProxy, NodeConfig};
-
-let group = EndpointGroup::new_with_nodes(
-    vec![NodeConfig {
-        server_node_id: Some(server_node_id),
-        server_ticket: None,
-        domains: vec!["app.example.com".to_string()],
-    }],
-    None,
-    LoadBalancingStrategy::RoundRobin,
-)
-.await?;
-
-let proxy = LocalProxy::new("127.0.0.1:8081", vec!["app.example.com".into()], Arc::new(group)).await?;
-proxy.run().await?;
-```
-
-Shipped as an `rlib`, a `cdylib` for Android JNI, and UniFFI bindings for
-Swift/Kotlin/Python — see [Using the client library](#using-the-client-library).
+The client is a library, so your own app can reach a private network without
+shelling out to anything — as an `rlib`, a `cdylib` for Android JNI, and UniFFI
+bindings for Swift/Kotlin/Python. See
+[Using the client library](#using-the-client-library).
 
 ---
 
@@ -174,16 +112,14 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 
 | Path | What it is |
 | --- | --- |
-| `crates/nexapipe/` | Server binary and library. CLI in `src/main.rs`, config in `src/config.rs`, iroh stream handling in `src/conn/`, HTTP/WebSocket proxying in `src/http/` and `src/proxy/`, TLS passthrough in `src/passthrough.rs`, TCP/UDP tunnel in `src/l4/`, shared byte-copying in `src/stream_util.rs`, routing in `src/routes/` and `src/lb/`, health checks in `src/health/`, TOTP 2FA in `src/auth/`. |
-| `crates/nexapipe-client/` | Client library (`lib` + `cdylib`). Pool in `connection_pool.rs`, domain→node mapping in `endpoint_group.rs`, local proxy in `local_proxy.rs`, L4 tunnel client in `l4.rs`, smoltcp TUN proxy in `tun_proxy.rs`, TUN virtual-IP mapping in `virtual_ip.rs`, QUIC tuning in `transport.rs`, JNI in `jni.rs`, UniFFI in `uniffi_bindings.rs`. |
-| `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` (magic, version, host, port, status byte) and `udp.rs` (`u16`-length framing). No dependencies, so the server and the client can both link it. |
+| `crates/nexapipe/` | Server binary and library: CLI (`src/main.rs`), config, iroh stream handling (`src/conn/`), HTTP/WebSocket proxying (`src/http/`, `src/proxy/`), TLS passthrough, the L4 tunnel (`src/l4/`), routing (`src/routes/`, `src/lb/`), health checks, TOTP 2FA (`src/auth/`). |
+| `crates/nexapipe-client/` | Client library (`lib` + `cdylib`): pool, domain→node mapping, local proxy, L4 client, smoltcp TUN proxy, QUIC tuning, JNI, UniFFI. |
+| `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` and `udp.rs`. No dependencies, so both sides link the same code. |
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
-| `screenshots/` | Client-app screenshots, used by this README and the two app READMEs. |
 | `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
 | `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
-| `README.zh-CN.md` | Chinese translation of this file ([简体中文](README.zh-CN.md)). |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -192,9 +128,21 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 
 ```bash
 cargo build --release -p nexapipe
-cp config.toml.2fa.example config.toml   # config.toml is gitignored; start from the example
+
+cat > config.toml <<'EOF'               # config.toml is gitignored; this is a whole server config
+[[routes]]
+host_pattern = "*"
+backends = ["http://127.0.0.1:3000"]    # the service you want to expose
+EOF
+
 cargo run -p nexapipe -- --config config.toml
 ```
+
+Three lines is a working server: one catch-all route, one backend, every other key
+left at its default. The client side is the same length — see
+[Minimal config](#minimal-config), which also lists what each omitted key
+defaults to. Start from `config.toml.example` instead when you want every
+section written out, or `config.toml.2fa.example` when you want 2FA on.
 
 On startup the server prints what clients need:
 
@@ -207,9 +155,9 @@ Ticket (for clients):                 endpoint:...
 ========================================
 ```
 
-Give clients either the **Node ID** (stable, needs discovery) or the **Ticket**
-(contains addresses, changes when they change). Setting `[iroh] secret_key`
-keeps the Node ID — and therefore the Ticket — identical across restarts:
+Give clients either the **Node ID** (stable, but it needs discovery) or the
+**Ticket** (carries addresses, so it changes when they do). Set
+`[iroh] secret_key` to keep both stable across restarts:
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -223,104 +171,130 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
 `docker-compose.yaml` mounts your `config.toml` and a `logs/` volume, and points
-`NEXAPIPE_LOG_DIR` at the mount. `host.docker.internal` is wired up so backends
+`NEXAPIPE_LOG_DIR` at it. `host.docker.internal` is configured, so backends
 running on the Docker host are reachable.
 
 ---
 
 ## CLI
 
-| Flag | Description |
+| Flag | Meaning |
 | --- | --- |
 | `-c, --config <PATH>` | Config file (default `config.toml`). |
 | `--local-proxy` | Run as a client-side local HTTP proxy instead of a server. |
 | `--generate-secret` | Print a new iroh secret key for a stable endpoint identity. |
-| `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print an enrollment QR code. |
-| `--force` | With `--generate-2fa`: rotate the secret of a client that already has one. |
+| `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print the enrollment QR code. |
+| `--force` | With `--generate-2fa`: rotate an existing client's secret. |
 | `--show-2fa <CLIENT_ID>` | Print the QR code of a client already in `[auth.clients]`. |
 | `--issuer <NAME>` | Issuer label shown by the authenticator app. |
 | `--qr-format <FMT>` | `unicode` (default), `plain`, `ascii`, `svg`, `none`. |
-| `--qr-invert` | Draw the QR code light on dark. |
-| `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, else ASCII). |
-| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` the 2FA secret goes in too; without one it carries only the endpoint and its domains. |
-| `--registration` | With `--generate-invite CLIENT_ID`: carry a one-time enrollment token instead of the secret. |
-| `--create-client` | With `--generate-invite CLIENT_ID`: create the client when it does not exist yet, generating and writing its secret in the same run. |
-| `--invite-domains <LIST>` | Comma-separated domains for the invite (default: `[local_proxy] proxy_domains`, else the route hosts). |
+| `--qr-invert` | Draw the QR code inverted (light on dark). |
+| `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, anything else → ASCII). |
+| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` it carries the 2FA secret too; without one, only endpoint and domains. |
+| `--registration` | With `--generate-invite CLIENT_ID`: put a one-time enrollment token in the link instead of the secret. |
+| `--create-client` | With `--generate-invite CLIENT_ID`: create the client if it does not exist yet, generating and writing its secret in the same run. |
+| `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
-| `--invite-relay <URL>` | Relay URL for the invite (default: `[iroh] relay_url`). |
-| `--endpoint-id <NODE_ID>` | Endpoint to advertise (default: derived from `[iroh] secret_key`). |
+| `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
+| `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). |
 
 ---
 
 ## Configuration
 
-`config.toml` is the single source of truth for both the server and the client
-mode. Every key is optional.
+`config.toml` is the single source of truth for both the server and client mode.
+Every key is optional.
 
-The file is re-read every 5 seconds and **applied live**: `[[routes]]`,
-`default_backend` and the `[auth.clients]` table take effect without a restart
-— an invite generated while the server runs (`--generate-invite --registration`
-writes `pending_enrollment` into the file) becomes spendable on the running
-server within one poll, and a client added or removed from `[auth.clients]`
-does not need a restart either. `[auth] enabled = true` also takes effect live,
-for connections opened after the reload (connections already authenticated keep
-the authorization they were given). A config that fails to parse or validate is
-reported and ignored so a half-saved edit cannot take the proxy down.
+The file is re-read every 5 seconds and applied live: `[[routes]]` and the
+`[auth.clients]` table need no restart, and a config
+that fails to parse or validate is reported and ignored, so a half-saved edit
+cannot take the proxy down. The rest is read once at startup and needs a restart:
+`[server] listen_addr`, `[iroh]`, `[peers]`, the `[auth]` TOTP parameters and
+`[log]`.
 
-The rest still needs a restart, because it is read once when the process starts:
-`[server] listen_addr`, `[iroh] secret_key` / `bind_port` / relay settings,
-`[peers] allow`, the `[auth]` TOTP parameters (`algorithm`, `time_step`, `digits`,
-`window`, `issuer`, `max_attempts`, `lockout_duration`), and `[log]`. Two reloads
-are *refused* rather than applied, each because applying it would weaken a
-running server: `enabled = false` once 2FA is gating (restart to disable it), and
-`enabled = true` while the plaintext listener is exposed or while the config file
-is readable by other accounts — both of which the startup path would have refused
-outright.
+Two changes are deliberately one-way on a running server: `[auth] enabled = true`
+is picked up by the watcher, but turning 2FA *off* is refused (restart to
+disable it), and `enabled = true` together with an exposed plaintext listener is
+refused outright.
+
+### Minimal config
+
+A whole **server** — one catch-all `http` route to one backend:
+
+```toml
+[[routes]]
+host_pattern = "*"
+backends = ["http://127.0.0.1:3000"]
+```
+
+A whole **client** (`nexapipe --local-proxy`), turning `127.0.0.1:8081` into an
+HTTP proxy that tunnels the listed domains:
+
+```toml
+[local_proxy]
+enabled = true
+listen_addr = "127.0.0.1:8081"
+proxy_domains = ["app.example.com"]
+
+[[local_proxy.nodes]]
+server_node_id = "<the Node ID the server printed>"
+domains = ["app.example.com"]
+```
+
+What the short forms leave out, and what you get instead:
+
+| Omitted | You get |
+| --- | --- |
+| `[server] listen_addr` | no plaintext listener — traffic comes in over iroh only |
+| `[iroh] secret_key` | a fresh Node ID on every restart; add one (`--generate-secret`) when clients should not lose track of the server |
+| `[iroh] relay_mode` | `default`: N0 relays, home relay picked by latency |
+| `mode` | `http` |
+| `path_pattern` | `/`, prefix match |
+| `strategy` | `round_robin` |
+| `[health_check]` | enabled: `GET {backend}/health` every 10 s. A backend with no such endpoint is logged as failing, but **traffic still flows** — with nothing healthy the pool falls back to its first entry — so this is log noise, not an outage. Set `enabled = false` to silence it. |
+| `[log]` | rotating files under `./logs` plus console output, query values redacted |
+| `[auth]`, `[peers]` | no authentication — the server prints a warning banner at startup. Fine on a laptop; add `[peers] allow` (or 2FA) before this faces anything you care about. |
+
+Everything below this section is optional. Two keys are not: a route needs
+`host_pattern` and `backends`, and a `[local_proxy]` block needs `listen_addr`
+and `proxy_domains`.
 
 ### Top level
 
-```toml
-# Where an HTTP request goes when its Host matches no `mode = "http"` route.
-# Optional: without it, an unrouted host is answered 404 instead of being
-# forwarded somewhere arbitrary. `passthrough`, `tcp` and `udp` lookups never
-# use it — they refuse instead.
-default_backend = "http://192.0.2.10:18080"
-debug = true
-```
+`debug` (default `false`) turns on debug logging.
+
+**There is no fallback.** A host no route names is answered 404 over HTTP, and
+refused outright by `passthrough`, `tcp` and `udp` lookups. "Send everything
+here" is spelled as a catch-all route — `host_pattern = "*"` — which is
+load-balanced and health-checked like any other route. The old top-level
+`default_backend` has been **removed**: a config that still names it is refused
+at startup rather than silently ignored, so an existing config cannot quietly
+start answering 404 where it used to forward.
 
 ### `[server]` — direct ingress (off by default)
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `listen_addr` | *unset — not bound* | Plain HTTP listener. A TLS session opened against it is passed through, not terminated. |
-| `expose` | `false` | Required for `listen_addr` to name anything but loopback. Refused at startup while `[auth] enabled = true` — see below. |
+| `expose` | `false` | Required for `listen_addr` to name anything but loopback. Refused at startup while `[auth] enabled = true`. |
 
-Leave `listen_addr` unset and the listener is never bound, which is the
-default: **nothing on this listener is authenticated**. The 2FA handshake runs
-in the iroh accept loop, so a request arriving here reaches a route without
-ever being asked for a credential. Configure it only for something on the same
-host, and keep it on `127.0.0.1`; binding `0.0.0.0` additionally requires
-`expose = true`, which publishes every `http` route and every `passthrough`
-backend to whoever can reach the port.
+**Nothing on this listener is authenticated**: the 2FA handshake runs in the iroh
+accept loop, so a request arriving here reaches a route without ever being asked
+for a credential. Leave `listen_addr` unset (the default) or keep it on
+`127.0.0.1` for something on the same host; a non-loopback bind additionally
+needs `expose = true` and publishes every `http` route and every `passthrough`
+backend to whoever can reach the port. `expose = true` together with
+`[auth] enabled = true` is **refused at startup** — with 2FA on, the combination
+reads as a protected proxy but is not one. (Older versions logged a warning and
+started anyway.)
 
-`expose = true` together with `[auth] enabled = true` is **refused at startup**:
-with 2FA on, the combination reads as a protected proxy but is not one, since
-the handshake lives in the iroh accept loop and this listener never runs it.
-Either gate the port with a firewall or a reverse proxy and leave `[auth]`
-disabled, or drop `expose` and keep the listener on loopback. (Older versions
-logged a warning and started anyway; if a deployment that used both stops
-starting, this is why.)
+One difference from the tunnel path: **WebSocket upgrades are proxied over iroh
+but answered `426 Upgrade Required` here** — the listener has no WebSocket
+client. Clients that need WebSocket must come through the tunnel.
 
-`tls_enabled`, `tls_listen_addr`, `cert_path` and `key_path` used to configure
-in-process TLS termination. They are still accepted so an existing
-`config.toml` parses, but they do nothing and are reported at startup — delete
-them and see [TLS](#tls).
-
-One difference from the tunnel path worth knowing before you point a browser at
-it: **WebSocket upgrades are proxied over iroh but answered `426 Upgrade
-Required` here.** The listener has no WebSocket client, only the byte-level
-passthrough for TLS and the HTTP proxy; iroh streams get their own upgrade
-handling. Clients that need WebSocket must come through the tunnel.
+`tls_enabled`, `tls_listen_addr`, `cert_path` and `key_path` are still accepted
+so an existing `config.toml` parses, but they do nothing and are reported at
+startup — delete them and see [TLS](#tls).
 
 ### `[iroh]` — the tunnel endpoint
 
@@ -336,26 +310,20 @@ Relay modes:
 
 - **`default`** — every N0 relay, home relay chosen by latency. It can migrate
   between relays, which drops the connections routed through it.
-- **`pinned`** — one fixed N0 relay (`aps1-1`, Singapore). Use this when relay
+- **`pinned`** — one fixed N0 relay (`aps1-1`, Singapore). Use when relay
   migration is worse than a slightly slower relay.
-- **`disabled`** — no relay transport at all. Stronger than it sounds: with no
-  relay transport the endpoint cannot dial through a *peer's* relay either, so a
-  client with `relay_mode = "disabled"` cannot reach a server that is only
-  reachable via relay.
-- **`custom`** — one relay you run, and **only** that one: no N0 relay is used,
-  neither as a home relay nor as a net_report probe target. Pointing it at an
+- **`disabled`** — no relay transport at all. Stronger than it sounds: you also
+  cannot dial a peer through *its* relay.
+- **`custom`** — one relay you run, and only that one: no N0 relay is used,
+  neither as a home relay nor as a probe target. Pointing it at an
   `*.relay.n0.iroh.link` URL is rejected; use `pinned` or `default` for those.
 
-A `relay_mode` that is present but unusable — `custom` with no URL, or an
-unrecognised spelling — stops startup rather than quietly falling back to
-another mode. A `relay_url` next to a mode that does not take one is ignored and
-logged; it is usually left over from an earlier mode.
-
-`custom` constrains **this** endpoint: its home relay and its probe traffic. It
-does not isolate the process from n0 entirely — a peer that advertises an N0
-relay is still dialled through it, and Endpoint ID discovery still queries
-`dns.iroh.link`. Both are properties of how iroh resolves and connects peers,
-and neither has a switch in iroh 1.0.1.
+A `relay_mode` that is present but unusable — `custom` with no URL, an
+unrecognised spelling — stops startup instead of quietly falling back. A
+`relay_url` next to a mode that does not take one is ignored and logged.
+`custom` constrains **this** endpoint only: a peer advertising an N0 relay is
+still dialled through it, and Endpoint ID discovery still queries
+`dns.iroh.link` — neither has a switch in iroh 1.0.1.
 
 ### `[[routes]]` — routing
 
@@ -375,7 +343,7 @@ mode = "passthrough"              # TLS, routed by SNI; see TLS below
 backends = ["caddy:443"]
 
 [[routes]]
-host_pattern = "db.example.com" # a raw TCP service, any port
+host_pattern = "db.example.com"   # a raw TCP service, any port
 mode = "tcp"
 backends = ["192.0.2.30:15432"]
 
@@ -405,28 +373,18 @@ encrypted as what you put on the wire, and only `passthrough` keeps the client's
 TLS session intact all the way there.
 
 A route serves **one** mode with `mode = "..."` and **several** with
-`modes = [...]`, sharing one `backends` list:
-
-```toml
-[[routes]]
-host_pattern = "app.example.com"
-modes = ["http", "tcp"]           # also reachable as an L4 tunnel
-backends = ["http://host.docker.internal:18080"]
-```
-
-`mode` and `modes` may be written together — the route serves the union, and
-duplicates collapse. Which of them a *connection* uses is still decided by its
+`modes = [...]`; they may be written together and the route serves the union,
+with duplicates collapsed. Which one a *connection* uses is still decided by its
 first byte, so one connection only ever takes one path.
 
 The cost of sharing one `backends` list is that the address has to satisfy every
-declared mode, and the L4 rules are the stricter ones: **the port must be
-written out**, because an L4 route dials an address and has nothing to default
-to (`http://host` is fine for `http` alone, where 80 is implied, and rejected
-once `tcp` is added). Write two entries instead when the modes need different
-backends, since a route has exactly one pool.
+declared mode, and the L4 rules are stricter: **the port must be written out**
+(`http://host` is fine for `http` alone, where 80 is implied, and rejected once
+`tcp` is added). A route has exactly one pool, so write two entries when the
+modes need different backends.
 
-Removed route keys, still parsed but ignored: `cert_path`, `key_path` and
-`redirect_to_https` (let the backend redirect). They are reported at startup.
+Removed route keys, still parsed but ignored and reported at startup:
+`cert_path`, `key_path`, `redirect_to_https`.
 
 ### `[health_check]` — probing `http` backends
 
@@ -440,21 +398,15 @@ path = "/health"   # appended to the backend URL
 ```
 
 Each `mode = "http"` backend is probed with `GET {backend}{path}` and leaves the
-pool after `threshold` *consecutive* failures — one lost probe never empties it,
-because a restart or a GC pause should not take a service offline. It returns on
-the first probe that succeeds. `passthrough`, `tcp` and `udp` routes are never
-probed: a TLS listener and a database cannot answer an HTTP request, and a failed
-probe would only take a healthy backend out of rotation.
+pool after `threshold` *consecutive* failures — one lost probe never empties it —
+returning on the first probe that succeeds. `passthrough`, `tcp` and `udp` routes
+are never probed: a TLS listener and a database cannot answer an HTTP request.
 
 **Set `enabled = false` when your backends cannot answer a health endpoint** — a
-static file server, a device's admin UI, anything that answers 404 or nothing on
-`{path}`. With checks off every backend stays in the pool and traffic is simply
-forwarded, which is how the proxy behaved before health checks existed.
-
-`enabled` is live: a config reload flips it for checks that are already running,
-which are paused rather than cancelled. The other four keys are read when a
-checker starts, so changing them takes effect on restart, or for routes that
-appear in a reload.
+static file server, a device's admin UI. Every backend then stays in the pool and
+traffic is simply forwarded. `enabled` is live: a reload pauses the checks that
+are already running. The other four keys are read when a checker starts, so
+changing them takes effect on restart or for routes added by a reload.
 
 ### `[local_proxy]` — client mode
 
@@ -476,10 +428,10 @@ work but are deprecated — prefer `[[local_proxy.nodes]]`.
 
 ### `[peers]` — which Node IDs may connect at all
 
-Optional, and the check that runs earliest: an allow-list of client public keys
-applied during the QUIC handshake, before the connection is accepted. A peer that
-is not on the list gets a close frame and nothing else — no stream is ever opened,
-no connection slot is taken, no task is spawned.
+The check that runs earliest: an allow-list of client public keys applied during
+the QUIC handshake, before the connection is accepted. An unlisted peer gets a
+close frame with application code `5` and nothing else — no stream is opened, no
+slot is taken.
 
 ```toml
 [peers]
@@ -491,25 +443,17 @@ allow = [
 ]
 ```
 
-This is not a second factor and not a replacement for 2FA. It answers *may this
-Node ID be here*, where 2FA answers *who is it* — so it is the knob for the server
-that runs with 2FA off, and the two compose: with both set, an unlisted peer never
-reaches the handshake, and a listed one still has to authenticate.
+Not a second factor and not a replacement for 2FA: it answers *may this Node ID
+be here*, where 2FA answers *who is it* — so it is the knob for a server that
+runs with 2FA off, and the two compose.
 
 - **Absent or key omitted** — every peer that can reach the endpoint proceeds to
-  the next check. Adding or upgrading without this section changes nothing.
-- **A typo fails at startup.** An entry that is not a valid Node ID is an error,
-  not a silently skipped line: a list whose whole job is to refuse strangers must
-  not come out shorter than it was written.
-- **`allow = []` is refused.** It would refuse everybody, which is a plausible
-  typo and would lock the operator out of their own server — so it is not
-  guessable in either direction.
-- **An unlisted peer is closed with application code `5`.** The client maps that
-  to "the server runs a `[peers]` allow-list and does not permit this Node ID",
-  rather than a bare connection loss.
-
-Restart-only for now: it is read once at startup, like `[iroh]` — see
-[Configuration](#configuration).
+  the next check.
+- **A typo fails at startup** — an entry that is not a valid Node ID is an error,
+  not a silently skipped line.
+- **`allow = []` is refused** — it would lock the operator out of their own
+  server.
+- **Restart-only for now**, read once at startup like `[iroh]`.
 
 ### `[log]`
 
@@ -518,18 +462,14 @@ Rotating log files plus console output. `file`, `dir`, `file_name`,
 `max_files`, `console`, `redact_query`. `NEXAPIPE_LOG_DIR` overrides `dir`.
 
 `redact_query` (default `true`) replaces the values in an access log's query
-string, keeping the names:
+string, keeping the names — tokens, signatures and one-time codes travel in query
+values, and a log file gets rotated, archived and handed around. A parameter with
+no `=` (`?raw`) is a flag and is left alone; the path is not touched. Set
+`redact_query = false` to log URIs verbatim.
 
 ```text
 /api/v1/items?token=hunter2&page=2   ->   /api/v1/items?token=<redacted>&page=<redacted>
 ```
-
-Tokens, signatures and one-time codes travel in query values, and a log file
-gets rotated, archived and handed around — so values are dropped while the
-names that make the line worth reading stay. A parameter with no `=` (`?raw`)
-is a flag and is left alone. The path is not touched: nothing in it says which
-segment is an identifier and which is an endpoint, so redacting it would mean
-dropping the whole path. Set `redact_query = false` to log URIs verbatim.
 
 ### `[acme]`
 
@@ -543,26 +483,19 @@ ignored, and reported at startup. See [TLS](#tls).
 TLS is terminated **by the backend**, never by this proxy: the proxy holds no
 certificate and never sees a plaintext byte of an `https://` request.
 
-What happens to a TLS connection:
-
 1. A client opens a TLS session as usual — through the local HTTP proxy, the
    TUN, or straight at `[server] listen_addr`.
-2. The proxy recognises the `ClientHello`. Its first byte is `0x16`, which no
-   HTTP request can start with, so the two are told apart with a single byte.
+2. The proxy recognises the `ClientHello`: its first byte is `0x16`, which no
+   HTTP request can start with.
 3. The SNI is matched against the `mode = "passthrough"` routes, and every byte
    of the session is copied to that route's backend.
 
-Nothing is decrypted, so WebSocket, gRPC, HTTP/2 and plain HTTP over TLS all
-work unchanged. No client rebuild is needed: the client tunnels have always
-forwarded raw bytes, they simply had nothing to hand them to before.
-
-A TLS session that arrives through `CONNECT` or a TUN takes a different path: the
-client announces host and port with the L4 preface instead of handing over a
-`ClientHello`, so it is matched by a `mode = "tcp"` route and not by a
-`passthrough` one. A domain you want reachable both ways therefore needs **both**
-modes — as two entries, or as one with `modes = ["passthrough", "tcp"]` when the
-same backend serves them — both pointing at the same TLS-speaking backend. See
-[TCP & UDP](#tcp--udp).
+Nothing is decrypted, so WebSocket, gRPC and HTTP/2 work unchanged. A TLS session
+that arrives through `CONNECT` or a TUN takes another path: the client announces
+host and port with the L4 preface instead of a `ClientHello`, so it matches a
+`mode = "tcp"` route. A domain you want reachable both ways therefore needs
+**both** modes — two entries, or one `modes = ["passthrough", "tcp"]` when the
+same backend serves them. See [TCP & UDP](#tcp--udp).
 
 ### Caddy
 
@@ -591,30 +524,29 @@ backends = ["caddy:443"]          # or "https://caddy:443", the scheme is ignore
 }
 ```
 
-Use the **DNS-01** challenge. The proxied names resolve to a loopback address
+Use the **DNS-01** challenge: the proxied names resolve to a loopback address
 inside the tunnel, so an inbound `HTTP-01` request never reaches Caddy — and
-DNS-01 also means Caddy needs no public IP, the same property the tunnel has. A
-wildcard like `*.example.com` makes new subdomains free. The stock `caddy`
-image ships no DNS provider: build one with `github.com/caddy-dns/cloudflare`
-via `xcaddy` or a `-builder` image.
+DNS-01 also means Caddy needs no public IP. A wildcard like `*.example.com` makes
+new subdomains free. The stock `caddy` image ships no DNS provider: build one
+with `github.com/caddy-dns/cloudflare` via `xcaddy` or a `-builder` image.
 
 ### What passthrough costs
 
-A passthrough route is opaque, so the access log records bytes rather than a
-request line, `/health` probing does not apply, and the proxy cannot rewrite
-paths or redirect `http://` to `https://`. Those move to Caddy, which sees the
-decrypted request and does them better. Plain `http://` routes keep everything.
+A passthrough route is opaque: the access log records bytes rather than a request
+line, `/health` probing does not apply, and the proxy cannot rewrite paths or
+redirect `http://` to `https://`. Those move to Caddy, which sees the decrypted
+request. Plain `http://` routes keep everything.
 
 ---
 
 ## TCP & UDP
 
-Everything above speaks HTTP or TLS. A database wire protocol, an MQTT or STUN
-socket, a game server — those are neither, and UDP carries no host name at all,
-so nothing can be routed by reading payload bytes.
-
-The L4 tunnel does not read payload bytes. The client writes a **preface** as the
-first bytes of a bi-stream and the server answers with exactly one status byte:
+A database wire protocol, an MQTT or STUN socket, a game server — none of them
+speaks HTTP or TLS, and UDP carries no host name at all, so nothing can be routed
+by reading payload bytes. The L4 tunnel does not read them either: the client
+writes a **preface** as the first bytes of a bi-stream and the server answers
+with exactly one status byte. It is part of the **iroh** entry path only — the
+plain `[server] listen_addr` listener knows nothing about `0x05`:
 
 ```text
 client → server   0x05  version=0x01  proto(0x01 tcp | 0x02 udp)  len  host  port(u16-be)
@@ -633,13 +565,10 @@ server → client   status   0x00 ok       0x01 no route        0x02 backend fai
 ### The server owns the dial target
 
 The client names a **host and a port**; the route decides which address is
-dialled. `backends` is the only place an address appears, so a client holding
-valid 2FA credentials still cannot use the server as an open relay.
-
-An L4 lookup **never falls back to `default_backend`**. A host with no `tcp`/`udp`
-route is a refusal the caller can act on, not a stream quietly forwarded
-somewhere else — which is exactly what used to happen when a
-`CONNECT host:port` line reached the HTTP parser with an empty path.
+dialled, and `backends` is the only place an address appears — so a client
+holding valid 2FA credentials still cannot use the server as an open relay. An
+An L4 lookup **never falls back**: a host with no `tcp`/`udp` route is a refusal
+the caller can act on, not a stream quietly forwarded somewhere else.
 
 ### `client_ports`
 
@@ -654,20 +583,16 @@ client_ports = [15432, 16432]       # ports this route answers on
 ```
 
 It only decides *which* route a flow matches, so one host can have `tcp` routes
-on different ports pointing at different backends. It never changes the address
-that is dialled. With no `client_ports`, every port matches.
+on different ports pointing at different backends. With no `client_ports`, every
+port matches.
 
 ### What it costs
 
 L4 flows are opaque: the access log records bytes rather than a request line, and
-there is no health check (probing a `tcp`/`udp` backend with an HTTP request would
-be meaningless). Concurrency is bounded per QUIC connection — a client that opens
-too many flows gets `0x03 too many flows` instead of silently queueing inside the
-endpoint.
-
+there is no health check. Concurrency is bounded per QUIC connection — a client
+that opens too many flows gets `0x03 too many flows` instead of silently queueing.
 Because one UDP flow is one bi-stream, a TUN device can hold several hundred at
-once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under
-[QUIC tuning](#quic-tuning).
+once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under [QUIC tuning](#quic-tuning).
 
 ### Which clients can use it
 
@@ -678,36 +603,18 @@ once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under
 | Desktop TUN | any port | — |
 
 The TUNs hand the application **one virtual address per domain** (`10.0.1.16+` on
-Android, `10.0.0.2+` on desktop), so the destination *is* the name and the port on
-the packet is the port on the wire. Nothing is sniffed, which is what makes UDP
-possible at all.
+Android, `10.0.0.2+` on desktop), so the destination *is* the name. Nothing is
+sniffed, which is what makes UDP possible at all.
 
 Note the route mode this implies: traffic a TUN sends to a domain arrives as L4,
 so that domain needs a `tcp` (or `udp`) route — **even for plain HTTP on port
-80**, because a TUN hands over an IP packet, not an HTTP request, and the client
-states the host and port in the preface instead. A TUN reaching an HTTPS service
-therefore points a `tcp` route at the TLS-speaking backend —
-`backends = ["caddy:443"]`, which is the same Caddy as
-[TLS passthrough](#caddy) but with the port stated explicitly. `mode =
-"passthrough"` stays for clients that open a `ClientHello` straight at the
-proxy's own address.
-
-If the same backend answers a TUN and a plain request, say so in one entry:
-
-```toml
-[[routes]]
-host_pattern = "app.example.com"
-modes = ["http", "tcp"]
-backends = ["http://host.docker.internal:18080"]
-```
-
-### Where the L4 tunnel lives
-
-It is part of the **iroh** entry path only. The plain `[server] listen_addr`
-listener tells TLS from HTTP by the first byte and knows nothing about `0x05`, so
-a preface sent there would be parsed as an HTTP request. All four kinds of
-traffic coexist on the iroh endpoint; the plain listener serves HTTP and TLS
-passthrough.
+80**, because a TUN hands over an IP packet and the client states the host and
+port in the preface. A TUN reaching an HTTPS service therefore points a `tcp`
+route at the TLS-speaking backend (`backends = ["caddy:443"]`, the same Caddy as
+[TLS passthrough](#caddy) with the port stated explicitly); `mode =
+"passthrough"` stays for clients that open a `ClientHello` straight at the proxy.
+If one backend answers both a TUN and a plain request, say so in a single entry
+with `modes = ["http", "tcp"]`.
 
 ---
 
@@ -753,60 +660,41 @@ handshake before any traffic is proxied.
    algorithm = "sha1"
    ```
 
-New and changed `[auth.clients]` entries are picked up live by the config
-watcher (see [Configuration](#configuration)) — adding a client does not need a
-restart. `[auth] enabled = true` is picked up live too, for connections opened
-after the reload; the TOTP parameters (`algorithm`, `time_step`, `digits`) are
-read once at startup and need a restart. See `config.toml.2fa.example`.
+New and changed `[auth.clients]` entries are picked up live by the config watcher,
+so adding a client needs no restart, and `[auth] enabled = true` is picked up
+live too, for connections opened after the reload. The TOTP parameters
+(`algorithm`, `time_step`, `digits`) are read once at startup and need a restart;
+see `config.toml.2fa.example`.
 
-Those secrets are the *only* credential gating the iroh listener, so the file
-holding them has to stay private: with `[auth] enabled = true` the server
-**refuses to start** when `config.toml` is readable or writable by any account
-other than its owner (`chmod 600 config.toml`). With `[auth]` off — a 0644
-config is how a Docker bind mount arrives — it logs the same warning and starts.
-The file is also re-checked after it is rewritten to persist a lockout, since an
-editor or a mount can widen a mode that was private at startup.
-
-A client that has no credentials against a server that requires them is refused
-too: the QUIC handshake succeeds, and the server closes the connection once the
-handshake deadline (5 s) passes with no `AUTH_START`. The client watches for that
-close and reports a failed start naming the cause, instead of a green
-"connected" over a tunnel the server will not serve.
+Those secrets are the *only* credential gating the iroh listener, so with
+`[auth] enabled = true` the server **refuses to start** when `config.toml` is
+readable or writable by another account (`chmod 600 config.toml`); with `[auth]`
+off it logs the same warning and starts. A client with no credentials against a
+server that requires them is refused too: the QUIC handshake succeeds, and the
+server closes the connection once the handshake deadline (5 s) passes.
 
 The QR code carries a standard `otpauth://` URI, so any authenticator app can
-import it, not just the NexaPipe app:
+import it:
 
 ```text
 otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algorithm=SHA1&digits=6&period=30
 ```
 
-Notes:
-
 - Set `issuer` under `[auth]` to change the label shown by the app; `--issuer`
   overrides it for a single run. Both default to `NexaPipe`.
-- An already configured client can be printed again later, for another device:
-  `cargo run -p nexapipe -- --show-2fa client-001`.
+- `--show-2fa CLIENT_ID` prints an already configured client's code again, for
+  another device.
 - `--generate-2fa` on a client that already has a secret prints **that** secret
-  instead of a new one, so the QR code always matches the server. Add `--force`
-  to rotate it: the config is updated, and every device enrolled with the old
-  secret has to scan again.
+  instead of a new one. Add `--force` to rotate it: every device enrolled with
+  the old secret has to scan again.
 - The write edits `config.toml` in place, keeping comments and formatting. If the
-  file cannot be read or written (missing, not valid TOML, read-only), the secret
-  is only printed and you add it by hand.
+  file cannot be read or written, the secret is only printed.
 - `algorithm`, `time_step` and `digits` are read when the QR code is generated,
-  not when it is scanned: a client that has already imported the credentials
-  keeps the values it was enrolled with, so leave them stable.
+  not when it is scanned — leave them stable after devices are enrolled.
 - **The secret is the credential, not the six digits.** The server checks the
   response signature (HMAC-SHA256 keyed by the secret) *before* it looks at the
-  code, so anyone who does not have the secret cannot even reach the code
-  comparison, let alone guess their way through it. That also means the secret
-  is the thing to protect:
-  - keep `config.toml` at `0600` — with `[auth] enabled` the server logs an error
-    on startup if other accounts can read it, because it holds every secret;
-  - the enrollment QR above and any `nexapipe://` invite with `secret=` carry it
-    **in the clear**. Treat both as passwords: send them over a channel you would
-    send a password on, and don't leave the rendered file lying around
-    (`--qr-out` writes it `0600` on Unix).
+  code. Any `nexapipe://` invite with `secret=` and any enrollment QR carry it
+  **in the clear** — treat both as passwords (`--qr-out` writes `0600` on Unix).
 
 ---
 
@@ -835,83 +723,54 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 | `otpauth` | Alternative to the six parameters above: a whole `otpauth://` URI, used when the flat form is absent. |
 
 Without a `CLIENT_ID` the invite carries the endpoint and its domains and nothing
-else, which is what you want when sharing a server with people who have their own
-credentials. Domains default to `[local_proxy] proxy_domains`, then to the
-`[[routes]]` hosts; the endpoint defaults to the public key of
-`[iroh] secret_key`, so the code stays valid across restarts. Override any of it
-with `--invite-domains`, `--invite-name`, `--invite-relay`, `--endpoint-id`.
-
-Two details worth knowing before you build on the format:
+else. Domains default to `[local_proxy] proxy_domains`, then to the `[[routes]]`
+hosts; the endpoint defaults to the public key of `[iroh] secret_key`, so the
+code stays valid across restarts. Override any of it with `--invite-domains`,
+`--invite-name`, `--invite-relay`, `--endpoint-id`.
 
 - Clients **ignore parameters they do not recognise**, so a newer server can add
   fields without breaking older apps. What is strict is `v` (must be `1` or `2`)
-  and `algorithm` — an unknown name is an error, never a silent fallback to SHA1,
-  because a downgrade would be invisible to the person scanning.
+  and `algorithm` — an unknown name is an error, never a silent fallback to SHA1.
 - Keep the code under ~400 characters so it stays easy to scan; the command warns
   when it is longer.
-- An invite that carries `secret=` is a **password in the clear**, and so is the
-  QR code rendering of it. Anyone who scans it holds the client's credentials —
-  hand it to one device over one channel, and don't publish it. `--generate-invite`
-  says the same thing in a banner above the URI, and names the client it hands out.
-- **Revoking one is rotating.** There is no per-device revocation: a device that
-  scanned the code holds the secret, and the only way to take it back is to give
-  the client a new one — `cargo run -p nexapipe -- --generate-2fa client-001 --force`
-  rewrites `config.toml` in place and every device enrolled with the old secret has
-  to scan again. Deleting the `[auth.clients.client-001]` section revokes everyone
-  at once. Treat an invite you cannot account for as rotated.
-
+- An invite that carries `secret=` is a **password in the clear**, and so is its
+  QR rendering — anyone who scans it holds that client's credentials.
+- **Revoking one is rotating.** There is no per-device revocation:
+  `--generate-2fa client-001 --force` rewrites `config.toml` in place and every
+  device enrolled with the old secret has to scan again; deleting the
+  `[auth.clients.client-001]` section revokes everyone at once.
 
 ### Inviting a client that does not exist yet (`--create-client`)
 
 `--generate-invite CLIENT_ID` hands out the secret a client *already* has, so it
-refuses a `CLIENT_ID` that is not in `[auth.clients]`. Adding one first is a
-separate step:
-
-```bash
-cargo run -p nexapipe -- --generate-2fa client-001      # writes the secret
-cargo run -p nexapipe -- --generate-invite client-001   # hands it out
-```
-
-`--create-client` folds the two together — the secret is generated, written to
-the config and put into the invite in one run:
+refuses a `CLIENT_ID` that is not in `[auth.clients]`. `--create-client` folds
+"create" and "invite" into one run — the secret is generated, written to the
+config and put into the invite:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --create-client
-```
-
-This also covers `--registration`, which needs a secret on disk before it can
-record the enrollment token, so a new client can be enrolled in one command:
-
-```bash
 cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
 ```
 
-What it deliberately does **not** do:
-
-- **It never touches a client that already exists.** A `--create-client` run
-  against a configured client reuses the stored secret instead of minting a
-  second one, which would lock out every device already enrolled with the first.
-  Rotating stays the explicit `--generate-2fa CLIENT_ID --force`.
+- **It never touches a client that already exists.** A run against a configured
+  client reuses the stored secret instead of minting a second one, which would
+  lock out every device enrolled with the first. Rotating stays the explicit
+  `--generate-2fa CLIENT_ID --force`.
 - **It only fills in a client that is missing entirely.** A `[auth.clients.x]`
-  section that exists with no `secret` is a broken file, not a blank to fill in,
-  and is still reported as one.
-- **It is not a standalone "add a client" command.** It requires
+  section that exists with no `secret` is a broken file, not a blank to fill in.
+- **It is not a standalone "add a client" command** — it requires
   `--generate-invite`, so a secret is only ever created as part of an invite
   someone is about to hand out.
 
 Since the new secret is written to `config.toml`, remember that the TOTP
-parameters are read once at startup: if this invite is the first one and you also
-turned `[auth] enabled = true` on in the same edit, the running server does pick
-that up — for connections opened after the reload — but changing `algorithm`,
-`time_step` or `digits` still needs a restart. A client added under
-`[auth.clients]` is picked up on its own (the file is re-read every 5 seconds).
-
+parameters are read once at startup: a client added under `[auth.clients]` is
+picked up on its own (the file is re-read every 5 seconds), but changing
+`algorithm`, `time_step` or `digits` still needs a restart.
 
 ### Enrollment invites (`--registration`)
 
-The problem with the code above is that it stays a credential for as long as the
-secret lives. `--registration` puts a **one-time enrollment token** in the link
-instead:
+The code above stays a credential for as long as the secret lives.
+`--registration` puts a **one-time enrollment token** in the link instead:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --registration
@@ -923,25 +782,20 @@ nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
 ```
 
 The first device to connect sends the token, the server answers with a freshly
-generated secret and **burns the token in the same write**, so a link that was
-copied in transit stops being a credential the moment it is used — instead of
-staying one until somebody remembers to rotate. Enrolling therefore also rotates
-that client's secret, and every device already using it has to scan again. A link
-you never delivered is revoked by generating another one, which replaces the
-outstanding token.
-
-Two consequences worth knowing:
+generated secret and **burns the token in the same write**, so a link copied in
+transit stops being a credential the moment it is used. Enrolling therefore also
+rotates that client's secret, and every device already using it has to scan
+again; a link you never delivered is revoked by generating another one, which
+replaces the outstanding token.
 
 - `v=2` is a **version of its own**, so an app that only knows `v=1` refuses the
-  code rather than reading it as an endpoint share whose credentials went missing.
+  code rather than reading it as an endpoint share whose credentials went
+  missing.
 - The device that enrolled has to **persist the secret it was issued** — the
   token is spent, so an app that restarts holding the invite cannot enroll twice.
-  Both apps do this: the desktop asks `take_issued_credential` after a start and
-  writes the answer onto the node's 2FA credentials, and Android reads the same
-  thing out of `IrohProxy.nativeTakeIssuedCredential()` after its pre-connect
-  warm-up. The token itself is kept where each app keeps secrets — the desktop
-  stores it on the node, Android keeps it out of the backed-up preferences and
-  clears it once the secret has landed.
+  Both apps do this: the desktop asks `take_issued_credential` after a start, and
+  Android reads the same thing from
+  `IrohProxy.nativeTakeIssuedCredential()`.
 
 Scanning is implemented in the Android app (the "Scan Invite" button beside "Add
 Node"), which accepts the `endpoint/` form only — its stored nodes hold a Node ID
@@ -960,30 +814,26 @@ host (`127.0.0.1`) or inside your own LAN, which is the same trust assumption as
 reverse-proxying to `localhost:3000`.
 
 **Query strings are not logged.** The access log keeps parameter names and
-replaces their values with `<redacted>` (`[log] redact_query`, on by default),
-because that is where tokens and signatures travel.
+replaces their values with `<redacted>` (`[log] redact_query`, on by default).
 
 **What gates the listener.** Three independent checks, each answering a different
 question:
 
 - `[peers] allow` — *may this Node ID be here at all*. Checked in the QUIC
-  handshake, before the connection is accepted, so a peer that is not on the list
-  is closed without ever taking a slot or a task. Optional: with no `[peers]`
-  section every Node ID that can reach the endpoint gets as far as the next check.
+  handshake, before the connection is accepted. Optional: with no `[peers]`
+  section every Node ID that can reach the endpoint gets as far as the next
+  check.
 - 2FA — *who is this*. A TOTP handshake whose response needs an HMAC over that
-  connection's nonce, keyed by the client's secret, so knowing a Node ID
-  authenticates nothing.
+  connection's nonce, keyed by the client's secret.
 - `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
   at the handshake.
 
-The limits that remain are deliberate, and worth stating rather than discovering:
-a revocation (a deleted `[auth.clients.<id>]`, a rotated secret, an edited
-`allow_hosts`) takes effect on *new* connections only, because a connection
-snapshots its authorization when it authenticates; 2FA is a symmetric shared
-secret, so anyone who scans an invite QR becomes a legitimate client and the
-finest revocation granularity is one client section per device; and turning 2FA
-*on* takes effect on the next connection, while turning it *off* is refused on a
-running server — restart to disable it.
+The limits that remain are deliberate: a revocation (a deleted client, a rotated
+secret, an edited `allow_hosts`) takes effect on *new* connections only, because
+a connection snapshots its authorization when it authenticates; 2FA is a
+symmetric shared secret, so anyone who scans an invite becomes a legitimate
+client; and turning 2FA *off* is refused on a running server — restart to
+disable it.
 
 Reporting a vulnerability: open an issue, or contact a maintainer directly
 instead if it is exploitable.
@@ -1077,14 +927,9 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
   </tr>
 </table>
 
-Both are regular directories of this repository (their git history was
-preserved when they were imported from the former standalone repos
-`open-nexa/nexa-android` / `open-nexa/nexa-desktop`), and they ship from the
-same tags as the server:
-
-```bash
-git clone https://github.com/open-nexa/nexapipe.git
-```
+Both are regular directories of this repository (their git history was preserved
+when they were imported from their former standalone repos), and they ship from
+the same tags as the server.
 
 ---
 
@@ -1098,7 +943,7 @@ cargo fmt --all -- --check                    # report formatting drift
 ```
 
 Do **not** run `cargo fmt --all`: the tree has pre-existing drift in files you
-did not touch. Format only your own file — `rustfmt --edition 2024 <path>` —
+did not touch. Format only your own file — `rustfmt --edition 2024 <path>`,
 which is enough because `rustfmt` follows `mod` declarations anyway.
 
 Per-target checks the workspace build cannot cover:
@@ -1109,36 +954,20 @@ cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
-The TUN stack (`crates/nexapipe-client/src/tun_proxy.rs`) is shared by Android
-and the desktop; only its fd-based entry point is `cfg(target_os = "android")`,
-so that `cargo ndk` line is still the only thing that type-checks the Android
-half — easy to forget. `ui-desktop/src-tauri` is a separate cargo project, so the
-workspace lint gate does not cover it either.
-
-Tests worth running on their own:
-
-```bash
-cargo test -p nexapipe-proto                                  # the wire format
-cargo test -p nexapipe-client --features local-proxy --lib    # local proxy + L4 client
-cargo test -p nexapipe-client --features tun-proxy --lib      # + virtual_ip, runs on any host
-```
+The TUN stack is shared by Android and the desktop, and only its fd-based entry
+point is `cfg(target_os = "android")`, so that `cargo ndk` line is the only thing
+that type-checks the Android half — easy to forget. `ui-desktop/src-tauri` is a
+separate cargo project, so the workspace lint gate does not cover it either.
 
 Notes:
 
 - The workspace pins edition 2024 and vendors smoltcp through
   `[patch.crates-io]`; keep `third_party/` in the build context (Docker already
-  does).
-- Platform code lives behind cargo features (`jni`, `local-proxy`, `tun-proxy`,
-  `uniffi`) — keep it that way. The `uniffi` bindings are proc-macro based
-  (`setup_scaffolding!` at the crate root); there is no UDL file to keep in sync.
-- `cargo test --workspace` runs on Windows too, because the Unix-only parts are
-  gated (`cfg(unix)` for signal handling). The TUN stack itself is
-  platform-independent; its Android fd entry point is gated inside the module. CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
-  multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is
-  published as a GitHub **pre-release** so it never takes over "latest"; a plain
-  tag (`v1.0.0`) is a normal release — the same rule as `ui-desktop` and
-  `ui-android`. `duct` is a dev-dependency of the server crate on purpose: the
-  integration tests spawn the built binary with it.
+  does). Platform code stays behind cargo features (`jni`, `local-proxy`,
+  `tun-proxy`, `uniffi`).
+- CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
+  multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a
+  GitHub **pre-release**, so it never takes over "latest".
 - Inline comments are in English.
 
 For what comes next — and for why some things are deliberately not planned — see

@@ -65,10 +65,10 @@ pub async fn proxy_request(
     let backend_info: BackendInfo = match config.get_backend(host, path).await {
         Some(info) => info,
         None => {
-            // No route and no `default_backend`: saying 404 beats guessing.
+            // No route serves this host: saying 404 beats guessing at one.
             return Ok(create_error_response(
                 hyper::StatusCode::NOT_FOUND,
-                &format!("No route for host {host} and no default_backend is configured"),
+                &format!("No route for host {host}"),
             ));
         }
     };

@@ -18,11 +18,7 @@ fn node_id(seed: u8) -> String {
 
 fn write_config(dir: &std::path::Path, peers_block: &str) -> String {
     let path = dir.join("config.toml");
-    std::fs::write(
-        &path,
-        format!("default_backend = \"http://localhost:3000\"\n{peers_block}"),
-    )
-    .unwrap();
+    std::fs::write(&path, peers_block).unwrap();
     path.to_str().unwrap().to_string()
 }
 

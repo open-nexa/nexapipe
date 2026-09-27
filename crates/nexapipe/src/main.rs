@@ -241,17 +241,7 @@ async fn run_server_mode(
         }
     };
 
-    let route_config = Arc::new(RouteConfig::new(
-        routes,
-        proxy_config.default_backend.clone(),
-    ));
-
-    match &proxy_config.default_backend {
-        Some(url) => tracing::info!("Default backend: {}", url),
-        // Optional now: an unrouted host is answered 404 rather than forwarded
-        // somewhere arbitrary. See ProxyConfig::default_backend.
-        None => tracing::info!("No default backend: an unrouted host is answered with 404"),
-    }
+    let route_config = Arc::new(RouteConfig::new(routes));
 
     tracing::info!("Starting proxy with domain-based and path-based routing");
 

@@ -199,27 +199,18 @@ pub async fn handle_bidi_stream(
         .map(|pq| pq.as_str())
         .unwrap_or(request.uri().path());
 
+    // No `Host` header — HTTP/1.0, or a malformed request — means no route can
+    // be matched, because every route, including a `host_pattern = "*"`
+    // catch-all, is selected by host. There is nothing to serve it with.
     let backend_info: Option<BackendInfo> = match host {
         Some(h) => config.get_backend_with_acl(h, path, acl.as_deref()).await,
-        // A restricted client cannot be authorized against a host it never
-        // named, and the default backend serves exactly those; an
-        // unrestricted context keeps the historical fallback.
-        None if acl.is_some() => None,
-        None => config.default_backend().await.map(|url| BackendInfo {
-            url,
-            path_rewrite: None,
-            path_pattern: "/".to_string(),
-            path_is_prefix: true,
-        }),
+        None => None,
     };
 
     let Some(backend_info) = backend_info else {
         // Nothing serves this host and there is no default backend. A 404 the
         // client can read beats closing the stream mid-request.
-        tracing::warn!(
-            "No route for host={:?} and no default_backend configured, answering 404",
-            host
-        );
+        tracing::warn!("No route for host={:?}, answering 404", host);
         let mut send = send;
         let _ = send
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")

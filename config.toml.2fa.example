@@ -21,10 +21,13 @@
 # the `[auth]` TOTP parameters and `[log]` need a restart.
 
 # ===== Server Configuration =====
-default_backend = "http://localhost:3000"
-# Optional: without it a host that matches no route is answered 404 instead of
-# being forwarded somewhere arbitrary. `passthrough` and `tcp`/`udp` routes
-# never consult it.
+
+# Removed: `default_backend` no longer exists, and a config that still names it
+# is refused at startup rather than silently ignored. A host with no
+# `mode = "http"` route is answered 404; "send everything here" is spelled as a
+# catch-all route (see the `host_pattern = "*"` entry below), which is also
+# load-balanced and health-checked. `passthrough` and `tcp`/`udp` lookups never
+# had a fallback and still have none.
 debug = true
 
 [server]

@@ -20,11 +20,18 @@
 # Top level
 # ============================================================
 
-# Where an HTTP request goes when its Host matches no `mode = "http"` route.
-# Optional: without it an unrouted host is answered 404 instead of being
-# silently forwarded somewhere. `passthrough`, `tcp` and `udp` lookups never
-# consult it - they refuse instead.
-default_backend = "http://127.0.0.1:18080"
+# Removed: `default_backend` no longer exists, and a config that still names it
+# is refused at startup rather than silently ignored. A host with no
+# `mode = "http"` route is answered 404; "send everything here" is spelled as a
+# catch-all route, which is also load-balanced and health-checked:
+#
+#   [[routes]]
+#   host_pattern = "*"
+#   mode = "http"
+#   backends = ["http://127.0.0.1:18080"]
+#
+# `passthrough`, `tcp` and `udp` lookups never had a fallback and still have
+# none - they refuse instead.
 
 # Debug logging.
 debug = false
