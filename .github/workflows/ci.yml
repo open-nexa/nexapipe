@@ -42,18 +42,19 @@ env:
 
 jobs:
   fmt:
-    name: rustfmt (advisory)
+    name: rustfmt
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: Configure rustfmt
-        run: rustup component add rustfmt
+      # Pin the toolchain here as the other jobs do. Without it this job would
+      # use whatever rustfmt the runner image happens to ship, so a format change
+      # in a new rustfmt release would fail a PR that touched no Rust at all.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: cargo fmt --check
-        # Advisory: not every file in the tree is formatted yet, so this must not
-        # turn the PR red. Make it blocking once `cargo fmt --all -- --check` is
-        # clean at baseline.
-        continue-on-error: true
         run: cargo fmt --all -- --check
 
   clippy:
