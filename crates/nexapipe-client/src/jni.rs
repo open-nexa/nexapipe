@@ -1,13 +1,13 @@
+use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::relay::RelayModeSpec;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
-use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::{
     DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, LocalProxy, NodeConfig,
 };
-use crate::relay::RelayModeSpec;
+use iroh::Endpoint;
 use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
-use iroh::Endpoint;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -156,7 +156,10 @@ fn node_id_error(node_id: &str) -> Option<String> {
 /// Mirrors `parse_endpoint_addr` (which reads `server_node_id` first, then `server_ticket`), so a
 /// problem is caught here — before any port is bound — instead of surfacing as a bind failure from
 /// inside endpoint-group construction.
-fn first_invalid_node_id(domain_mappings: &[DomainMapping], nodes: &[NodeConfig]) -> Option<String> {
+fn first_invalid_node_id(
+    domain_mappings: &[DomainMapping],
+    nodes: &[NodeConfig],
+) -> Option<String> {
     for mapping in domain_mappings {
         if let Some(node_id) = mapping.server_node_id.as_deref() {
             if let Some(reason) = node_id_error(node_id) {
@@ -1860,8 +1863,8 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
                 tp.shutdown(r);
                 jni_log!("[DEBUG:jni] TUN proxy shutdown complete");
             } else {
-            // No runtime — just abort; Drop will call stop().
-            jni_log!("[DEBUG:jni] No runtime, aborting TUN proxy without join");
+                // No runtime — just abort; Drop will call stop().
+                jni_log!("[DEBUG:jni] No runtime, aborting TUN proxy without join");
             }
             // tp dropped here (if not consumed by shutdown)
         }

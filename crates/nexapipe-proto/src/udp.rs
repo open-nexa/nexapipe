@@ -82,7 +82,10 @@ mod tests {
         for payload in [&b""[..], &b"x"[..], &[0u8; 1400][..]] {
             let frame = encode_frame_to_vec(payload).unwrap();
             match decode_frame(&frame) {
-                Frame::Ready { payload: out, consumed } => {
+                Frame::Ready {
+                    payload: out,
+                    consumed,
+                } => {
                     assert_eq!(out, payload);
                     assert_eq!(consumed, frame.len());
                 }

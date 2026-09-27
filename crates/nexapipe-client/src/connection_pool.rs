@@ -765,8 +765,14 @@ mod tests {
 
     #[test]
     fn link_kind_serializes_in_snake_case() {
-        assert_eq!(serde_json::to_string(&LinkKind::Direct).unwrap(), "\"direct\"");
-        assert_eq!(serde_json::to_string(&LinkKind::Relay).unwrap(), "\"relay\"");
+        assert_eq!(
+            serde_json::to_string(&LinkKind::Direct).unwrap(),
+            "\"direct\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LinkKind::Relay).unwrap(),
+            "\"relay\""
+        );
         assert_eq!(
             serde_json::to_string(&LinkKind::Unknown).unwrap(),
             "\"unknown\""

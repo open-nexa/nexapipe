@@ -159,7 +159,8 @@ impl TwoFactorAuth {
     ///
     /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`.
     pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
         mac.update(nonce);
         mac.update(&timestamp.to_le_bytes());
         mac.finalize().into_bytes().to_vec()
@@ -445,13 +446,13 @@ impl Enrollment {
             // either right or it is not, and saying which would only help
             // someone who is guessing.
             AuthMessage::EnrollFailed { reason } => {
-                return Err(ClientError::AuthenticationFailed(reason))
+                return Err(ClientError::AuthenticationFailed(reason));
             }
             other => {
                 return Err(ClientError::Other(format!(
                     "expected ENROLL_ISSUE, the server sent {}",
                     message_name(&other)
-                )))
+                )));
             }
         };
 
@@ -482,9 +483,9 @@ async fn read_message(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<auth_protocol::AuthMessage, ClientError> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message length: {e}")))?;
+    recv.read_exact(&mut len_buf).await.map_err(|e| {
+        ClientError::ConnectionFailed(format!("Failed to read message length: {e}"))
+    })?;
     let msg_len = u32::from_le_bytes(len_buf) as usize;
     // The server caps what it will read at 64 KiB; anything longer is a peer
     // that is not speaking this protocol, not a message worth allocating for.

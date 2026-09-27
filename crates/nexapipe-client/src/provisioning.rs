@@ -523,10 +523,7 @@ fn totp_from_params(params: &QueryParams) -> Result<Option<InviteTotp>> {
 /// `enroll` is only meaningful in a v=2 code: an app that understands v=1
 /// ignores unknown parameters, so a token smuggled into a v=1 code would be
 /// dropped silently and the scan would import a credential-less endpoint.
-fn enrollment_from_params(
-    params: &QueryParams,
-    version: u32,
-) -> Result<Option<InviteEnrollment>> {
+fn enrollment_from_params(params: &QueryParams, version: u32) -> Result<Option<InviteEnrollment>> {
     let Some(token) = params.first("enroll") else {
         return Ok(None);
     };
@@ -1180,7 +1177,9 @@ mod tests {
         // Same thing on the way out: whichever was attached last wins.
         let invite = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
             .unwrap()
-            .with_totp(Some(InviteTotp::new("client-001", "JBSWY3DPEHPK3PXP").unwrap()))
+            .with_totp(Some(
+                InviteTotp::new("client-001", "JBSWY3DPEHPK3PXP").unwrap(),
+            ))
             .with_enrollment(Some(InviteEnrollment::new("client-001", "tok").unwrap()));
         assert!(invite.totp.is_none());
         assert!(invite.is_enrollment());

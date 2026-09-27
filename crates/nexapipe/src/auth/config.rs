@@ -335,9 +335,15 @@ mod tests {
 
         assert!(acl.allows("api.example.com"));
         assert!(acl.allows("API.Example.Com"), "hosts fold like route hosts");
-        assert!(acl.allows("api.example.com."), "a trailing FQDN dot is not a different host");
+        assert!(
+            acl.allows("api.example.com."),
+            "a trailing FQDN dot is not a different host"
+        );
         assert!(acl.allows("pg.db.example.com"));
-        assert!(!acl.allows("db.example.com"), "the wildcard needs the *. prefix, like a route");
+        assert!(
+            !acl.allows("db.example.com"),
+            "the wildcard needs the *. prefix, like a route"
+        );
         assert!(!acl.allows("db.example.com.evil.test"));
         assert!(!acl.allows("admin.example.com"));
     }

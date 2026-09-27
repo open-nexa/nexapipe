@@ -133,9 +133,9 @@ impl RelayModeSpec {
         match self {
             Self::Disabled => RelayMode::Disabled,
             Self::Default => RelayMode::Default,
-            Self::Pinned => RelayMode::Custom(RelayMap::from_iter([RelayConfig::from(
-                pinned_relay_url(),
-            )])),
+            Self::Pinned => {
+                RelayMode::Custom(RelayMap::from_iter([RelayConfig::from(pinned_relay_url())]))
+            }
             Self::Custom { url, auth_token } => {
                 let config = RelayConfig::from(url.clone());
                 let config = match auth_token {
@@ -162,14 +162,14 @@ impl RelayModeSpec {
     }
 
     /// Whether this mode carries a relay URL of its own.
-///
-/// Lets a caller notice a `relay_url` that does nothing: the field is stale, and while it must
-/// not stop the show, it should not stay silent either.
-pub fn uses_url(&self) -> bool {
-    matches!(self, Self::Custom { .. })
-}
+    ///
+    /// Lets a caller notice a `relay_url` that does nothing: the field is stale, and while it must
+    /// not stop the show, it should not stay silent either.
+    pub fn uses_url(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
 
-/// One line for the startup log: what actually took effect.
+    /// One line for the startup log: what actually took effect.
     pub fn describe(&self) -> String {
         match self {
             Self::Disabled => "disabled (no relay at all; a peer's relay is unusable too)".into(),
@@ -218,7 +218,9 @@ mod tests {
 
     #[test]
     fn a_url_without_a_mode_is_custom() {
-        let spec = RelayModeSpec::parse(None, Some(OWN_RELAY), None).unwrap().unwrap();
+        let spec = RelayModeSpec::parse(None, Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
         assert!(matches!(spec, RelayModeSpec::Custom { .. }));
     }
 
@@ -241,7 +243,10 @@ mod tests {
     #[test]
     fn custom_requires_a_url() {
         let err = RelayModeSpec::parse(Some("custom"), None, None).unwrap_err();
-        assert!(err.to_string().contains("requires a non-empty relay_url"), "{err}");
+        assert!(
+            err.to_string().contains("requires a non-empty relay_url"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -252,7 +257,10 @@ mod tests {
             "https://relay.n0.iroh.link.",
         ] {
             let err = RelayModeSpec::parse(Some("custom"), Some(url), None).unwrap_err();
-            assert!(err.to_string().contains("n0-operated relay"), "{url}: {err}");
+            assert!(
+                err.to_string().contains("n0-operated relay"),
+                "{url}: {err}"
+            );
         }
     }
 

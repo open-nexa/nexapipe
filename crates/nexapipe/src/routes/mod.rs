@@ -380,7 +380,12 @@ impl RouteConfig {
     /// requests whose `Host` header matched nothing; for a tunnel it would mean a
     /// mistyped or unconfigured domain silently reaches an unrelated service, which is
     /// exactly the failure this lookup exists to prevent.
-    pub async fn get_l4_backend(&self, host: &str, port: u16, mode: RouteMode) -> Option<L4RouteInfo> {
+    pub async fn get_l4_backend(
+        &self,
+        host: &str,
+        port: u16,
+        mode: RouteMode,
+    ) -> Option<L4RouteInfo> {
         debug_assert!(mode.is_l4(), "get_l4_backend called with {mode:?}");
 
         let matched_route = {
@@ -441,7 +446,11 @@ impl RouteConfig {
 /// byte of the connection — a TLS handshake goes to `Passthrough`, an L4 preface
 /// to `Tcp` or `Udp`, anything else to `Http`. One route may declare several
 /// modes; a connection still takes exactly one path.
-fn best_match(routes: &[Route], mode: RouteMode, matches: impl Fn(&Route) -> bool) -> Option<Route> {
+fn best_match(
+    routes: &[Route],
+    mode: RouteMode,
+    matches: impl Fn(&Route) -> bool,
+) -> Option<Route> {
     let mut best: Option<(Route, u32)> = None;
 
     for route in routes.iter() {
@@ -525,7 +534,10 @@ mod tests {
         );
         // A host that is only served over plain HTTP has no TLS backend, and
         // the default backend is not a passthrough fallback.
-        assert_eq!(config.get_passthrough_backend("mt.iroh.iakl.top").await, None);
+        assert_eq!(
+            config.get_passthrough_backend("mt.iroh.iakl.top").await,
+            None
+        );
         assert_eq!(config.get_passthrough_backend("unknown.test").await, None);
     }
 
@@ -743,7 +755,12 @@ mod tests {
         // The default backend is a real, working address here. If the lookup fell back
         // to it, a mistyped domain would quietly reach it instead of being refused.
         let config = RouteConfig::new(
-            vec![l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None)],
+            vec![l4_route(
+                "db.iroh.iakl.top",
+                RouteMode::Tcp,
+                "10.0.0.50:5432",
+                None,
+            )],
             Some("http://default:80".to_string()),
         );
 
@@ -811,7 +828,12 @@ mod tests {
     #[tokio::test]
     async fn without_client_ports_every_port_matches() {
         let config = RouteConfig::new(
-            vec![l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None)],
+            vec![l4_route(
+                "db.iroh.iakl.top",
+                RouteMode::Tcp,
+                "10.0.0.50:5432",
+                None,
+            )],
             Some("http://default:80".to_string()),
         );
 
@@ -829,7 +851,12 @@ mod tests {
 
     #[test]
     fn l4_matching_is_host_then_ports() {
-        let exact = l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", Some(&[5432]));
+        let exact = l4_route(
+            "db.iroh.iakl.top",
+            RouteMode::Tcp,
+            "10.0.0.50:5432",
+            Some(&[5432]),
+        );
         assert!(exact.matches_l4("db.iroh.iakl.top", 5432));
         assert!(!exact.matches_l4("db.iroh.iakl.top", 5433));
         assert!(!exact.matches_l4("other.iakl.top", 5432));
@@ -854,7 +881,10 @@ mod tests {
             client_ports: None,
             idle_timeout: Some(std::time::Duration::from_secs(120)),
         });
-        assert_eq!(route.idle_timeout(), Some(std::time::Duration::from_secs(120)));
+        assert_eq!(
+            route.idle_timeout(),
+            Some(std::time::Duration::from_secs(120))
+        );
 
         // An HTTP route has no L4 knobs, and asking for them must not invent one.
         assert_eq!(http_route("a.test", &["http://b:80"]).idle_timeout(), None);
@@ -872,7 +902,12 @@ mod tests {
             None,
         );
 
-        assert!(config.get_backend("typo.iroh.iakl.top", "/").await.is_none());
+        assert!(
+            config
+                .get_backend("typo.iroh.iakl.top", "/")
+                .await
+                .is_none()
+        );
         assert_eq!(config.default_backend().await, None);
         // The routed host is unaffected.
         assert_eq!(
@@ -911,9 +946,19 @@ mod tests {
             "http://10.0.0.5:8080"
         );
         // A routed host the allowlist never named is refused, not served.
-        assert!(config.get_backend_with_acl("admin.iakl.top", "/", Some(&acl)).await.is_none());
+        assert!(
+            config
+                .get_backend_with_acl("admin.iakl.top", "/", Some(&acl))
+                .await
+                .is_none()
+        );
         // So is an unrouted one, with or without a default backend configured.
-        assert!(config.get_backend_with_acl("typo.iakl.top", "/", Some(&acl)).await.is_none());
+        assert!(
+            config
+                .get_backend_with_acl("typo.iakl.top", "/", Some(&acl))
+                .await
+                .is_none()
+        );
     }
 
     /// The default backend is not a hole in the allowlist: a restricted client
@@ -944,7 +989,12 @@ mod tests {
 
         // An unrestricted client keeps the fallback, whatever host it sends.
         assert!(config.get_backend("other.iakl.top", "/").await.is_some());
-        assert!(config.get_backend_with_acl("other.iakl.top", "/", None).await.is_some());
+        assert!(
+            config
+                .get_backend_with_acl("other.iakl.top", "/", None)
+                .await
+                .is_some()
+        );
     }
 
     #[test]

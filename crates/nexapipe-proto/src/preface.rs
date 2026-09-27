@@ -236,9 +236,7 @@ impl Preface {
 /// bracketed IPv6 literals. International names must arrive as punycode, which is what
 /// a resolver hands out anyway.
 fn is_valid_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= MAX_HOST_LEN
-        && host.bytes().all(|b| b.is_ascii_graphic())
+    !host.is_empty() && host.len() <= MAX_HOST_LEN && host.bytes().all(|b| b.is_ascii_graphic())
 }
 
 #[cfg(test)]
@@ -374,7 +372,10 @@ mod tests {
             tcp(&"a".repeat(256), 443).to_bytes(),
             Err(ProtoError::InvalidHost)
         );
-        assert_eq!(tcp("db.example", 0).to_bytes(), Err(ProtoError::InvalidPort));
+        assert_eq!(
+            tcp("db.example", 0).to_bytes(),
+            Err(ProtoError::InvalidPort)
+        );
         // 255 is the last length that fits the single length byte.
         assert!(tcp(&"a".repeat(255), 443).to_bytes().is_ok());
     }
@@ -405,8 +406,14 @@ mod tests {
 
     #[test]
     fn protocol_bytes_round_trip() {
-        assert_eq!(L4Proto::from_byte(L4Proto::Tcp.as_byte()), Some(L4Proto::Tcp));
-        assert_eq!(L4Proto::from_byte(L4Proto::Udp.as_byte()), Some(L4Proto::Udp));
+        assert_eq!(
+            L4Proto::from_byte(L4Proto::Tcp.as_byte()),
+            Some(L4Proto::Tcp)
+        );
+        assert_eq!(
+            L4Proto::from_byte(L4Proto::Udp.as_byte()),
+            Some(L4Proto::Udp)
+        );
         assert_eq!(L4Proto::from_byte(0x03), None);
         assert_eq!(L4Proto::Tcp.name(), "TCP");
     }

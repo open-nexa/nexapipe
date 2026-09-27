@@ -1,6 +1,6 @@
+use crate::ClientError;
 use crate::client::IrohProxyClient;
 use crate::http::{HttpRequest, HttpResponse};
-use crate::ClientError;
 use std::sync::Arc;
 use uniffi::export;
 
