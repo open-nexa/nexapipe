@@ -1,7 +1,7 @@
 pub mod local_proxy;
 
 use crate::auth::AuthConfig;
-use crate::config::{IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
+use crate::config::{HealthCheckConfig, IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
 use crate::health::HealthChecker;
@@ -9,7 +9,7 @@ use crate::http;
 use crate::log;
 use crate::passthrough;
 use crate::routes::RouteConfig;
-use crate::shutdown::ShutdownSignal;
+use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
 use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
@@ -42,7 +42,16 @@ pub async fn spawn_health_checks(
     config: &Arc<RouteConfig>,
     http_client: &Arc<HttpClient>,
     seen: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+    health: &HealthCheckConfig,
+    enabled: &Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // Backends that cannot answer a probe are a supported deployment, not an
+    // error, so the whole loop is skipped rather than configured around.
+    if !health.enabled {
+        tracing::debug!("Health checks disabled, no probes started");
+        return;
+    }
+
     let mut seen = seen.lock().await;
 
     for route in config.routes().await {
@@ -78,10 +87,11 @@ pub async fn spawn_health_checks(
         let health_checker = HealthChecker::new(
             backend_pool,
             http_client_clone,
-            tokio::time::Duration::from_secs(10),
-            tokio::time::Duration::from_secs(5),
-            3,
-            "/health",
+            std::time::Duration::from_secs(health.interval.max(1)),
+            std::time::Duration::from_secs(health.timeout.max(1)),
+            health.threshold,
+            &health.path,
+            enabled.clone(),
         );
         tokio::spawn(async move {
             health_checker.run().await;
@@ -94,19 +104,48 @@ pub async fn spawn_health_checks(
 /// arrive, short enough not to park the task.
 const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What [`run_proxy`] needs from the parsed config file.
+///
+/// A struct rather than a longer argument list: these are all "a section of
+/// `config.toml`", and every one of them is optional, so a positional list was
+/// one more section away from being unreadable at the call site.
+pub struct ProxyOptions {
+    pub server: Option<ServerConfig>,
+    pub iroh: Option<IrohConfig>,
+    pub auth: Option<AuthConfig>,
+    pub peers: Option<conn::allow_list::PeerAllowList>,
+    pub health_check: HealthCheckConfig,
+}
+
 pub async fn run_proxy(
     config: Arc<RouteConfig>,
-    server_config: Option<ServerConfig>,
-    iroh_config: Option<IrohConfig>,
     config_path: &str,
     shutdown_signal: Arc<ShutdownSignal>,
-    auth_config: Option<AuthConfig>,
-    peer_allow_list: Option<conn::allow_list::PeerAllowList>,
+    options: ProxyOptions,
 ) -> anyhow::Result<()> {
+    let ProxyOptions {
+        server: server_config,
+        iroh: iroh_config,
+        auth: auth_config,
+        peers: peer_allow_list,
+        health_check,
+    } = options;
+
     let http_client = Arc::new(http::create_http_client());
 
     let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-    spawn_health_checks(&config, &http_client, &health_seen).await;
+    let health_enabled = Arc::new(std::sync::atomic::AtomicBool::new(health_check.enabled));
+    // Shared by both accept loops: a shutdown has to wait for the work they
+    // spawned, not for a fixed number of seconds.
+    let in_flight = Arc::new(InFlight::new());
+    spawn_health_checks(
+        &config,
+        &http_client,
+        &health_seen,
+        &health_check,
+        &health_enabled,
+    )
+    .await;
 
     // 2FA state: the shared config plus the file its lockout counters persist to.
     let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
@@ -123,6 +162,7 @@ pub async fn run_proxy(
         config.clone(),
         http_client.clone(),
         health_seen,
+        health_enabled,
         auth_state.clone(),
     ));
     tokio::spawn({
@@ -350,6 +390,7 @@ pub async fn run_proxy(
         let config_clone = config.clone();
         let http_client_clone = http_client.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
+        let in_flight_clone = in_flight.clone();
 
         tokio::spawn(async move {
             if let Err(e) = start_http_server(
@@ -357,6 +398,7 @@ pub async fn run_proxy(
                 config_clone,
                 http_client_clone,
                 shutdown_signal_clone,
+                in_flight_clone,
             )
             .await
             {
@@ -374,7 +416,9 @@ pub async fn run_proxy(
                         let http_client_clone = http_client.clone();
                         let auth_state_clone = auth_state.clone();
                         let limiter_clone = conn_limiter.clone();
+                        let in_flight_clone = in_flight.clone();
                         tokio::spawn(async move {
+                            let _connection = in_flight_clone.enter();
                             conn::handle_incoming(
                                 incoming,
                                 config_clone,
@@ -400,8 +444,16 @@ pub async fn run_proxy(
         }
     }
 
-    tracing::info!("Waiting for existing connections to close...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let open = in_flight.count();
+    if open > 0 {
+        // Both accept loops have stopped taking new work by now, so this is a
+        // countdown rather than a race.
+        tracing::info!("Draining {} open connection(s)...", open);
+        in_flight.wait_until_idle(DRAIN_TIMEOUT).await;
+        tracing::info!("Drained, {} connection(s) left open", in_flight.count());
+    } else {
+        tracing::info!("No open connections, shutting down");
+    }
 
     Ok(())
 }
@@ -411,6 +463,7 @@ async fn start_http_server(
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     shutdown_signal: Arc<ShutdownSignal>,
+    in_flight: Arc<InFlight>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -421,8 +474,10 @@ async fn start_http_server(
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 let remote_addr_str = addr.to_string();
+                let in_flight_clone = in_flight.clone();
 
                 tokio::spawn(async move {
+                    let _connection = in_flight_clone.enter();
                     // The listener speaks HTTP, but a client may also open a
                     // TLS session straight at it. One peeked byte tells the two
                     // apart — a request line can never start with 0x16 — and a

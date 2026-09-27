@@ -173,6 +173,24 @@ modes = ["passthrough", "tcp"]
 backends = ["127.0.0.1:443"]
 
 # ============================================================
+# [health_check] - probing http backends
+# ============================================================
+# Every `mode = "http"` backend is asked `GET {backend}{path}` on a timer and
+# leaves the pool after `threshold` consecutive failures. `passthrough`, `tcp`
+# and `udp` routes are never probed: they cannot answer an HTTP request, and a
+# failed probe would only take a healthy backend out of rotation.
+#
+# Set `enabled = false` when your backends have no health endpoint - a static
+# file server, a device UI, anything that answers 404 or nothing on `{path}`.
+# Everything then stays in the pool and traffic is simply forwarded.
+[health_check]
+enabled = true
+interval = 10
+timeout = 5
+threshold = 3
+path = "/health"
+
+# ============================================================
 # [local_proxy] - client mode (delete the section on a server)
 # ============================================================
 

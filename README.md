@@ -44,7 +44,8 @@ NexaPipe is a Rust workspace with four parts:
 [2FA](#2fa-totp) · [Endpoint invites](#endpoint-invites) ·
 [Security](#security-boundary) ·
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
-[Development](#development) · [Contributing](CONTRIBUTING.md)
+[Development](#development) · [Contributing](CONTRIBUTING.md) ·
+[Roadmap](docs/ROADMAP.md)
 
 ---
 
@@ -315,6 +316,12 @@ in-process TLS termination. They are still accepted so an existing
 `config.toml` parses, but they do nothing and are reported at startup — delete
 them and see [TLS](#tls).
 
+One difference from the tunnel path worth knowing before you point a browser at
+it: **WebSocket upgrades are proxied over iroh but answered `426 Upgrade
+Required` here.** The listener has no WebSocket client, only the byte-level
+passthrough for TLS and the HTTP proxy; iroh streams get their own upgrade
+handling. Clients that need WebSocket must come through the tunnel.
+
 ### `[iroh]` — the tunnel endpoint
 
 | Key | Notes |
@@ -420,6 +427,34 @@ backends, since a route has exactly one pool.
 
 Removed route keys, still parsed but ignored: `cert_path`, `key_path` and
 `redirect_to_https` (let the backend redirect). They are reported at startup.
+
+### `[health_check]` — probing `http` backends
+
+```toml
+[health_check]
+enabled = true     # default: true — set false when no backend answers a probe
+interval = 10      # seconds between two rounds of checks
+timeout = 5        # seconds before one check is abandoned
+threshold = 3      # consecutive failures before a backend leaves the pool
+path = "/health"   # appended to the backend URL
+```
+
+Each `mode = "http"` backend is probed with `GET {backend}{path}` and leaves the
+pool after `threshold` *consecutive* failures — one lost probe never empties it,
+because a restart or a GC pause should not take a service offline. It returns on
+the first probe that succeeds. `passthrough`, `tcp` and `udp` routes are never
+probed: a TLS listener and a database cannot answer an HTTP request, and a failed
+probe would only take a healthy backend out of rotation.
+
+**Set `enabled = false` when your backends cannot answer a health endpoint** — a
+static file server, a device's admin UI, anything that answers 404 or nothing on
+`{path}`. With checks off every backend stays in the pool and traffic is simply
+forwarded, which is how the proxy behaved before health checks existed.
+
+`enabled` is live: a config reload flips it for checks that are already running,
+which are paused rather than cancelled. The other four keys are read when a
+checker starts, so changing them takes effect on restart, or for routes that
+appear in a reload.
 
 ### `[local_proxy]` — client mode
 
@@ -1102,9 +1137,12 @@ Notes:
   multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is
   published as a GitHub **pre-release** so it never takes over "latest"; a plain
   tag (`v1.0.0`) is a normal release — the same rule as `ui-desktop` and
-  `ui-android`. `duct` and `nix` are unused dev-dependencies of
-  the server crate — leftovers, worth deleting rather than adding to.
+  `ui-android`. `duct` is a dev-dependency of the server crate on purpose: the
+  integration tests spawn the built binary with it.
 - Inline comments are in English.
+
+For what comes next — and for why some things are deliberately not planned — see
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 

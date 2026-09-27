@@ -8,6 +8,21 @@ name: Release
 #   release        - assembles every artifact into a single GitHub Release with one
 #                    SHA256SUMS.txt
 #
+# Artifact naming, one rule for all three products:
+#
+#   <product>-<version>-<platform>.<ext>
+#
+#   product   "nexapipe" for the server archives, "nexa" for the GUI (the desktop
+#             bundles and the APK, i.e. tauri.conf.json productName / app_name)
+#   version   bare semver, no leading "v" (0.2.0, 0.2.0-rc.1)
+#   platform  the cargo target triple for the server (musl vs. glibc is part of it),
+#             "<os>-<cpu>" for the GUI: macos-aarch64, windows-x86_64, linux-x86_64,
+#             android-arm64
+#
+# Tauri's own bundle names break that rule (nexa_0.2.0_amd64.deb, nexa-0.2.0-1.x86_64.rpm,
+# an arch-less nexa.app.tar.gz), so ui-desktop/.github/scripts/stage-artifact.mjs renames
+# them — and any .sig that was made for the old name is regenerated right after.
+#
 # Can also be triggered manually (workflow_dispatch); an existing tag must be
 # provided. Tick "signing_only" to run just the Android keystore-secrets check.
 #
@@ -475,20 +490,26 @@ jobs:
           MATRIX_TARGET: ${{ matrix.target }}
         run: node .github/scripts/stage-artifact.mjs
 
-      - name: Re-sign renamed macOS updater payload
-        # Tauri names the macOS updater bundle `<productName>.app.tar.gz`, without the
-        # arch, so the two macOS jobs would collide. stage-artifact.mjs renames it to
-        # include the arch; since the minisign signature is bound to the file metadata,
-        # the renamed file has to be signed again.
-        if: matrix.os == 'macos' && steps.stage.outputs.renamed == 'true' && steps.stage.outputs.updater_file != ''
+      - name: Re-sign renamed artifacts
+        # stage-artifact.mjs renames every bundle to <product>-<version>-<os>-<arch>
+        # (Tauri's macOS updater bundle carries no arch at all, and the deb/rpm/NSIS
+        # names mix `_` and `-`). A minisign signature is bound to the file it was made
+        # for, so each renamed artifact that has a .sig is signed again here — on
+        # macOS the updater payload, on Windows both the NSIS installer and its
+        # updater .zip, on Linux the AppImage update archive.
+        if: steps.stage.outputs.resign_files != ''
         shell: bash
         env:
-          UPDATER: ${{ steps.stage.outputs.updater_file }}
+          RESIGN_FILES: ${{ steps.stage.outputs.resign_files }}
         run: |
-          rm -f "release-artifact/$UPDATER.sig"
-          npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release-artifact/$UPDATER"
-          test -f "release-artifact/$UPDATER.sig"
-          echo "re-signed: $UPDATER"
+          set -euo pipefail
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            rm -f "release-artifact/$f.sig"
+            npx tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "release-artifact/$f"
+            test -f "release-artifact/$f.sig"
+            echo "re-signed: $f"
+          done <<< "$RESIGN_FILES"
 
       - name: Generate updater manifest
         # TAG_NAME overrides GITHUB_REF_NAME so a workflow_dispatch re-run of an
@@ -893,12 +914,11 @@ jobs:
           BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
           "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
 
-          # The APK carries the GUI's product name, "nexa", exactly like the desktop
-          # bundles (tauri.conf.json productName -> nexa_*.dmg/.deb) and this app's own
-          # app_name/app_title. Only the server archives keep the "nexapipe-" prefix.
-          # Renaming it back to nexapipe-* would make one Release contain two names for
-          # one product, and read as if the .apk were part of the CLI.
-          OUT="nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk"
+          # <product>-<version>-<platform>, the same rule as the desktop bundles
+          # (productName "nexa" -> nexa-0.2.0-macos-aarch64.dmg). The GUI keeps its own
+          # product name; only the server archives are "nexapipe-" prefixed, so one
+          # Release never carries two names for one product.
+          OUT="nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk"
           cp "$APK" "$OUT"
           sha256sum "$OUT" > "${OUT}.sha256"
 
@@ -916,8 +936,8 @@ jobs:
         with:
           name: dist-apk
           path: |
-            ui-android/nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk
-            ui-android/nexa-${{ steps.opts.outputs.version_name }}-arm64-v8a.apk.sha256
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk.sha256
           if-no-files-found: error
           retention-days: 7
 

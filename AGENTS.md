@@ -42,7 +42,7 @@ cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,loc
 
 ## Testing Guidelines
 
-- Tests use `#[test]` / `#[tokio::test]`; the server crate's integration tests rely on `duct`, `tempfile`, and `nix` dev-dependencies.
+- Tests use `#[test]` / `#[tokio::test]`; the server crate's integration tests spawn the built binary with the `duct` dev-dependency and use `tempfile` for scratch configs.
 - Name tests descriptively, e.g. `handles_ws_upgrade()`.
 - The L4 tests drive `l4::serve_stream` over a `tokio::io::duplex` pair and the client's `l4::open_*` against the same, so a TCP or UDP flow can be tested end to end without an iroh endpoint.
 - Run `cargo test --workspace`; for Android changes, compile-verify with `gradlew :app:compileDebugKotlin`.

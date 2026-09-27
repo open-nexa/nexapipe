@@ -1,0 +1,146 @@
+name: CodeQL
+
+# Advanced setup for code scanning. The repository used CodeQL default setup,
+# which cannot be configured: because ui-android contains Kotlin, default setup
+# switches java-kotlin to the "autobuild" build mode (Kotlin analysis requires a
+# build) and autobuild fails — the GitHub-hosted image has no
+# platforms;android-37.0 / build-tools;37.0.0 and it does not know that gradle
+# has to be run from ui-android. That is what the Security tab reports as
+# "CodeQL is reporting errors".
+#
+# Default setup must be turned off in Settings > Advanced Security > Code
+# scanning before this workflow is merged, otherwise both run and the analyses
+# collide.
+#
+# Two jobs, because java-kotlin is the only language here that needs a build:
+#   - analyze: rust / javascript-typescript / actions, all build-mode none.
+#   - analyze-android: java-kotlin with manual build steps (the same Android SDK
+#     setup as the android-app CI job, then :app:compileDebugKotlin).
+# compileDebugKotlin is enough for the extractor and avoids the NDK, the Rust
+# .so build and dexing that assembleDebug would pull in.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Weekly, Monday 04:17 UTC — off the hour so it does not queue behind other
+    # scheduled workflows.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust, TypeScript and the workflow files all support build-mode none,
+          # so no toolchain is needed beyond what the runner already has.
+          - language: rust
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: .github/codeql/codeql-config.yml
+          # Drop this line to fall back to the default query suite.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  analyze-android:
+    name: CodeQL (java-kotlin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    env:
+      # Keep in sync with the android-app job in ci.yml.
+      ANDROID_PLATFORM: '37.0'
+      BUILD_TOOLS: 37.0.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        # Not android-actions/setup-android: it installs "tools" by default, a package that has been pulled
+        # from the SDK repository and fails outright on current images.
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SM=$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
+          fi
+          [ -x "${SM:-}" ] || { echo "::error::sdkmanager not found under $SDK/cmdline-tools"; exit 1; }
+
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: manual
+          config-file: .github/codeql/codeql-config.yml
+          # Drop this line to fall back to the default query suite.
+          queries: security-extended
+
+      # CodeQL traces the compiler, so the Kotlin sources have to be actually
+      # compiled between init and analyze.
+      - name: Build Kotlin
+        working-directory: ui-android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace :app:compileDebugKotlin
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:java-kotlin

@@ -2,6 +2,16 @@
 // directory and picks out this platform's updater payload (with its .sig signature) so
 // latest.json can be generated afterwards.
 //
+// Every file is renamed to the repository-wide rule
+//
+//   <product>-<version>-<platform>[-setup].<ext>
+//
+// because Tauri's own bundle names are not consistent across formats: the deb/dmg/NSIS
+// installers use `nexa_0.2.0_amd64`, the rpm uses `nexa-0.2.0-1.x86_64`, and the macOS
+// updater payload carries no arch at all. The server archives follow the same rule with
+// the `nexapipe` product name and the cargo target triple as the platform, so one
+// Release never mixes two spellings of one artifact.
+//
 // Environment variables:
 //   MATRIX_OS      windows | macos | linux
 //   MATRIX_ARCH    amd64 | arm64
@@ -11,8 +21,11 @@
 //
 // Written to $GITHUB_OUTPUT:
 //   updater_file=   updater payload file name (inside release-artifact/)
-//   renamed=       true/false, whether it was renamed to avoid a name clash (a rename
-//                  means it has to be signed again)
+//   renamed=       true/false, whether the payload was renamed away from the name Tauri
+//                  gave it
+//   resign_files=  newline-separated list of artifacts (inside release-artifact/) whose
+//                  .sig was made for the old name and must be regenerated
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -45,6 +58,45 @@ function setOutput(key, value) {
   console.log(`output ${key}=${value}`);
   const file = process.env.GITHUB_OUTPUT;
   if (file) fs.appendFileSync(file, `${key}=${value}\n`);
+}
+
+// ---------------------------------------------------------------- canonical file names
+
+// Product name of the GUI (tauri.conf.json productName). The server archives are named
+// by the release workflow itself and keep "nexapipe"; everything here is the client app.
+const product = (() => {
+  try {
+    return JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).productName || "nexa";
+  } catch {
+    console.warn("::warning::could not read productName from src-tauri/tauri.conf.json, falling back to 'nexa'");
+    return "nexa";
+  }
+})();
+
+// amd64/arm64 from the matrix, normalized to the CPU names used everywhere else in the
+// repository (the cargo triples and the updater manifest keys).
+const cpu = arch === "arm64" ? "aarch64" : "x86_64";
+const platformSlug = `${os}-${cpu}`;
+const assetBase = `${product}-${version}-${platformSlug}`;
+console.log(`Canonical asset base: ${assetBase}`);
+
+// Tauri bundle name -> canonical release asset name. Returns null for anything this
+// script does not publish, so the two lists cannot drift apart silently.
+function canonicalName(name) {
+  const isSig = name.endsWith(".sig");
+  const stem = isSig ? name.slice(0, -".sig".length) : name;
+  // Longest suffix first: ".app.tar.gz" must win over ".tar.gz", "-setup.nsis.zip"
+  // over ".zip".
+  let out = null;
+  if (stem.endsWith(".app.tar.gz")) out = `${assetBase}.app.tar.gz`;
+  else if (stem.endsWith(".AppImage.tar.gz")) out = `${assetBase}.AppImage.tar.gz`;
+  else if (stem.endsWith(".nsis.zip")) out = `${assetBase}-setup.nsis.zip`;
+  else if (stem.endsWith("-setup.exe")) out = `${assetBase}-setup.exe`;
+  else if (stem.endsWith(".AppImage")) out = `${assetBase}.AppImage`;
+  else if (stem.endsWith(".dmg")) out = `${assetBase}.dmg`;
+  else if (stem.endsWith(".deb")) out = `${assetBase}.deb`;
+  else if (stem.endsWith(".rpm")) out = `${assetBase}.rpm`;
+  return out === null ? null : isSig ? `${out}.sig` : out;
 }
 
 // ---------------------------------------------------------------- locate bundle dirs
@@ -119,22 +171,21 @@ if (os === "windows") {
   updaterSource = byName(/\.AppImage\.tar\.gz$/)[0] ?? null;
 }
 
-// Target file name:
-//   - macOS must be renamed: the Tauri-generated `<productName>.app.tar.gz` has no
-//     arch, so the amd64 and arm64 jobs would clash inside the same Release.
-//   - Windows / Linux names already contain the arch (x64/arm64, amd64/arm64) and are
-//     kept as-is, so the minisign signature does not need to be recomputed.
+// The payload gets the canonical name too. Tauri's macOS payload has no arch at all
+// (the amd64 and arm64 jobs would clash), and the Windows/Linux ones spell the arch
+// differently per bundle format, so in practice every payload is renamed here — and
+// therefore has to be signed again, because minisign binds the signature to the file
+// name.
 let updaterName = null;
 let renamed = false;
 if (updaterSource) {
   const original = path.basename(updaterSource);
-  if (os === "macos") {
-    const product = original.replace(/\.app\.tar\.gz$/, "");
-    updaterName = `${product}_${version}_${arch}.app.tar.gz`;
-    renamed = updaterName !== original;
-  } else {
-    updaterName = original;
+  updaterName = canonicalName(original);
+  if (!updaterName) {
+    console.error(`::error::cannot map updater payload ${original} to a canonical release name`);
+    process.exit(1);
   }
+  renamed = updaterName !== original;
 }
 
 // ---------------------------------------------------------------- copy artifacts
@@ -143,38 +194,27 @@ fs.rmSync(outDir, { recursive: true, force: true });
 fs.mkdirSync(outDir, { recursive: true });
 
 const copied = new Map(); // destination file name -> source path
-const skippedOriginals = new Set();
-
-// After a rename, neither the original payload **nor its .sig** may be published:
-// that signature was produced for the old file name, so keeping it would only let users
-// download a bundle whose signature does not match.
-const staleSources = new Set();
-if (updaterSource && renamed) {
-  staleSources.add(updaterSource);
-  staleSources.add(`${updaterSource}.sig`);
-}
+// Artifacts whose .sig was produced for the name Tauri gave them: after a rename the
+// signature has to be regenerated (the workflow does it with `tauri signer sign`).
+const resign = [];
 
 for (const src of bundleFiles) {
   const name = path.basename(src);
   if (!isPublishable(name)) continue;
-  if (staleSources.has(src)) {
-    skippedOriginals.add(src);
+  const dst = canonicalName(name);
+  if (!dst) {
+    console.warn(`::warning::no canonical name for publishable artifact ${name}, skipping`);
     continue;
   }
-  if (copied.has(name)) {
-    console.warn(`::warning::overwriting artifact with the same name: ${name} (${copied.get(name)} -> ${src})`);
+  if (copied.has(dst) && copied.get(dst) !== src) {
+    console.warn(`::warning::overwriting artifact with the same name: ${dst} (${copied.get(dst)} -> ${src})`);
   }
-  copied.set(name, src);
-}
-
-// The renamed updater payload and its .sig both land in the flat directory
-if (updaterSource && renamed) {
-  copied.set(updaterName, updaterSource);
-  const sig = `${updaterSource}.sig`;
-  if (fs.existsSync(sig)) copied.set(`${updaterName}.sig`, sig);
+  copied.set(dst, src);
+  if (dst !== name && !dst.endsWith(".sig") && fs.existsSync(`${src}.sig`)) resign.push(dst);
 }
 
 for (const [name, src] of copied) {
+  if (name !== path.basename(src)) console.log(`renamed: ${path.basename(src)} -> ${name}`);
   fs.copyFileSync(src, path.join(outDir, name));
 }
 
@@ -201,6 +241,13 @@ if (updaterSource) {
 
 setOutput("renamed", renamed ? "true" : "false");
 
-if (skippedOriginals.size > 0) {
-  console.log(`\nRenamed (originals are no longer published on their own): ${[...skippedOriginals].map((p) => path.basename(p)).join(", ")}`);
+// Multiline values need the random-delimiter form of $GITHUB_OUTPUT; the workflow reads
+// them back with a `while read` loop.
+const resignFile = process.env.GITHUB_OUTPUT;
+if (resignFile) {
+  const delimiter = `resign-${crypto.randomUUID()}`;
+  fs.appendFileSync(resignFile, `resign_files<<${delimiter}\n${[...new Set(resign)].join("\n")}\n${delimiter}\n`);
+}
+if (resign.length > 0) {
+  console.log(`\nSignatures to regenerate (file name changed): ${[...new Set(resign)].join(", ")}`);
 }

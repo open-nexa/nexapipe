@@ -41,7 +41,7 @@ NexaPipe 是一个 Rust workspace，由四部分组成：
 [2FA](#2fa-totp) · [端点邀请码](#端点邀请码) ·
 [安全边界](#安全边界) ·
 [客户端库](#使用客户端库) · [客户端应用](#客户端应用) ·
-[开发](#开发) · [贡献](CONTRIBUTING.md)
+[开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md)
 
 ---
 
@@ -285,6 +285,11 @@ debug = true
 终止。它们仍被接受以便已有的 `config.toml` 能解析，但不再有任何作用，并会在启动时
 报告 —— 请删除它们并参见 [TLS](#tls)。
 
+在把浏览器直接指向这个监听器之前，有一个与隧道路径的差异值得知道：**WebSocket 升级在
+iroh 上会被正常代理，在这里则返回 `426 Upgrade Required`。** 该监听器只有面向 TLS 的
+字节级 passthrough 与 HTTP 代理，没有 WebSocket 客户端；升级处理只存在于 iroh 流上。
+需要 WebSocket 的客户端必须走隧道。
+
 ### `[iroh]` —— 隧道端点
 
 | 配置项 | 说明 |
@@ -383,6 +388,29 @@ backends = ["http://host.docker.internal:18080"]
 
 已移除但仍能解析并被忽略的路由配置项：`cert_path`、`key_path` 与
 `redirect_to_https`（改由后端重定向）。它们会在启动时被报告。
+
+### `[health_check]` —— 探测 http 后端
+
+```toml
+[health_check]
+enabled = true     # 默认 true —— 后端无法应答探测时改成 false
+interval = 10      # 两轮检查之间的秒数
+timeout = 5        # 单次检查超时秒数
+threshold = 3      # 连续失败多少次后该后端离开后端池
+path = "/health"   # 追加到后端 URL 之后
+```
+
+每个 `mode = "http"` 的后端都会被 `GET {backend}{path}` 探测，**连续**失败
+`threshold` 次后离开后端池 —— 单次失败永远不会摘除它，因为一次重启或 GC 停顿不该让
+服务下线；第一次探测成功即恢复。`passthrough`、`tcp`、`udp` 路由从不探测：TLS 监听器
+和数据库无法回答一个 HTTP 请求，探测失败只会把健康的后端剔出轮换。
+
+**当你的后端无法提供健康检查端点时，请设 `enabled = false`** —— 静态文件服务器、
+设备管理的 Web UI，以及任何对 `{path}` 返回 404 或不响应的服务。关闭后所有后端都留在
+池里、流量照常转发，这也是健康检查出现之前代理的行为。
+
+`enabled` 是热生效的：重载配置会翻转已经在跑的检查（它们被暂停，而不是被取消）。
+其余四个键在检查器启动时读取，改动需要重启，或对重载中出现的新路由立即生效。
 
 ### `[local_proxy]` —— 客户端模式
 
@@ -941,9 +969,12 @@ cargo test -p nexapipe-client --features tun-proxy --lib      # + virtual_ip，�
   被门控。CI（`.github/workflows/ci.yml`）只跑 Linux；`release.yml` 在打 tag 时
   覆盖多平台构建。含连字符的 tag（`v0.2.0-rc.1`）会作为 GitHub **pre-release**
   发布，因此永远不会占据 "latest"；普通 tag（`v1.0.0`）是常规发布 —— 与
-  `ui-desktop`、`ui-android` 规则相同。`duct` 与 `nix` 是服务端 crate 中未被使用的
-  dev-dependency —— 是遗留物，值得删除而不是继续往上加。
+  `ui-desktop`、`ui-android` 规则相同。`duct` 是服务端 crate 刻意的
+  dev-dependency：集成测试要用它启动编译出来的二进制。
 - 行内注释使用英文。
+
+关于接下来要做什么 —— 以及为什么有些东西是刻意不做的 —— 见
+[docs/ROADMAP.md](docs/ROADMAP.md)（英文）。
 
 ## License
 
