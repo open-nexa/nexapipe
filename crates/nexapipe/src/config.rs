@@ -206,6 +206,45 @@ pub struct LogConfig {
     pub redact_query: Option<bool>,
 }
 
+/// The `[health_check]` section: periodic `GET {path}` probing of `http` route
+/// backends.
+///
+/// A switch rather than a behaviour everyone gets, because a probe is only
+/// meaningful if the backend answers it. Plenty of backends — a static file
+/// server, a device's web UI, anything that 404s or hangs on an unknown path —
+/// cannot answer `GET /health` at all, and before this section existed a single
+/// failed probe was enough to take such a backend out of rotation for good. Set
+/// `enabled = false` for those: every backend stays in the pool and traffic is
+/// simply forwarded, which is what the proxy did before health checks existed.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct HealthCheckConfig {
+    /// `false` disables probing entirely. Default: `true`.
+    pub enabled: bool,
+    /// Seconds between two rounds of checks. Default: 10.
+    pub interval: u64,
+    /// Seconds before a single check is abandoned. Default: 5.
+    pub timeout: u64,
+    /// Consecutive failed checks before a backend leaves the pool. One failure
+    /// is never enough: a probe lost to a restart or a GC pause must not empty
+    /// the pool. Default: 3.
+    pub threshold: usize,
+    /// Path appended to the backend URL. Default: `/health`.
+    pub path: String,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        HealthCheckConfig {
+            enabled: true,
+            interval: 10,
+            timeout: 5,
+            threshold: 3,
+            path: "/health".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
     /// Fallback for an HTTP request whose `Host` matches no route.
@@ -234,6 +273,9 @@ pub struct ProxyConfig {
     /// value so `[acme]` is detected and reported, not silently swallowed.
     pub acme: Option<toml::Value>,
     pub log: Option<LogConfig>,
+    /// Probing of `http` backends. Absent means the defaults, i.e. enabled.
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
 }
 
 /// The `[peers]` section: a server-side allow-list of client public keys.

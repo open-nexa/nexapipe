@@ -43,7 +43,7 @@ sha2 = '0.11'
 qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]
+# Spawns the built binary in the integration tests (see tests/).
 duct = '1.1.1'
-nix = { version = '0.31.3', features = ['signal', 'process'] }
 rqrr = { version = "0.11", default-features = false }
 tempfile = '3.8'

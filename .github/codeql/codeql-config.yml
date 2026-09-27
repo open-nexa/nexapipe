@@ -1,0 +1,11 @@
+# Configuration shared by every language in .github/workflows/codeql.yml.
+#
+# Only vendored / non-owned code is excluded:
+#   - third_party/smoltcp is a reference copy that is not part of any workspace
+#     (nothing in Cargo.toml points at it), so scanning it only adds noise.
+name: nexapipe-codeql-config
+
+paths-ignore:
+  - third_party
+  - '**/node_modules'
+  - '**/dist'

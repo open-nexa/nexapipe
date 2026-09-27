@@ -225,6 +225,17 @@ pub async fn handle_bidi_stream(
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             .await;
         let _ = send.finish();
+        // Unroutable hosts are logged too: "which hosts are people asking for
+        // that I do not serve" is a routing question, and without the line the
+        // answer is invisible.
+        crate::log::log_access(
+            peer,
+            request.method().as_str(),
+            request.uri().path(),
+            404,
+            0,
+            0,
+        );
         return Ok(());
     };
 
@@ -236,9 +247,15 @@ pub async fn handle_bidi_stream(
     );
     tracing::debug!("Received request: {} {}", request.method(), request.uri());
 
-    if http::is_websocket_request_static(&request) {
+    // The access log has to be fed from here: this is the path every client
+    // takes, and the HTTP server on the plaintext listener logs its own.
+    let started = std::time::Instant::now();
+    let method = request.method().to_string();
+    let request_target = request.uri().to_string();
+
+    let outcome = if http::is_websocket_request_static(&request) {
         tracing::debug!("WebSocket request detected");
-        handle_websocket_stream(send, recv, &request, &backend_info.url).await?;
+        handle_websocket_stream(send, recv, &request, &backend_info.url).await
     } else {
         let mut send = send;
         http::proxy_to_backend_streaming(
@@ -249,18 +266,39 @@ pub async fn handle_bidi_stream(
             &mut send,
             &mut recv,
         )
-        .await?;
-    }
+        .await
+    };
 
-    Ok(())
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok(summary) => {
+            crate::log::log_access(
+                peer,
+                &method,
+                &request_target,
+                summary.status,
+                elapsed_ms,
+                summary.bytes_sent,
+            );
+            Ok(())
+        }
+        Err(e) => {
+            crate::log::log_access(peer, &method, &request_target, 502, elapsed_ms, 0);
+            Err(e)
+        }
+    }
 }
 
+/// Returns the status the client was answered with: 101 once the tunnel is up,
+/// or whatever the backend answered when it refused the upgrade. Bytes are the
+/// handshake response only — once both directions are piped the session has no
+/// finite length to report.
 async fn handle_websocket_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     req: &Request<()>,
     backend_url: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<http::ProxySummary> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -338,6 +376,7 @@ async fn handle_websocket_stream(
     }
 
     let response = http::parse_http_response_legacy(&response_buf)?;
+    let handshake_bytes = response_buf.len() + trailing_ws_data.len();
     if response.status().as_u16() == 101 {
         tracing::debug!("WebSocket handshake successful with backend");
         send.write_all(&response_buf).await?;
@@ -400,9 +439,17 @@ async fn handle_websocket_stream(
         );
         send.write_all(&response_buf).await?;
         send.finish()?;
+
+        return Ok(http::ProxySummary {
+            status: response.status().as_u16(),
+            bytes_sent: response_buf.len(),
+        });
     }
 
-    Ok(())
+    Ok(http::ProxySummary {
+        status: 101,
+        bytes_sent: handshake_bytes,
+    })
 }
 
 fn get_connection_type(path: &iroh::endpoint::Path<'_>) -> &'static str {

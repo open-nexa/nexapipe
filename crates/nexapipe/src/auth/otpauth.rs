@@ -219,11 +219,11 @@ mod tests {
         let uri = OtpAuthUri::new("NexaPipe", "c1", "jbswy3dpehpk3pxp==", "Sha256", 8, 60)
             .unwrap()
             .to_uri();
-        assert!(
-            uri.ends_with("&algorithm=SHA256&digits=8&period=60"),
-            "{uri}"
-        );
-        assert!(uri.contains("?secret=JBSWY3DPEHPK3PXP&"), "{uri}");
+        // The URI is deliberately not part of the message: it carries the
+        // secret, and an assertion failure would put it wherever the test
+        // output goes.
+        assert!(uri.ends_with("&algorithm=SHA256&digits=8&period=60"));
+        assert!(uri.contains("?secret=JBSWY3DPEHPK3PXP&"));
     }
 
     #[test]
@@ -248,10 +248,7 @@ mod tests {
     #[test]
     fn encodes_non_ascii_client_ids_as_utf8() {
         let uri = entry("手机-01").to_uri();
-        assert!(
-            uri.starts_with("otpauth://totp/NexaPipe:%E6%89%8B%E6%9C%BA-01?"),
-            "{uri}"
-        );
+        assert!(uri.starts_with("otpauth://totp/NexaPipe:%E6%89%8B%E6%9C%BA-01?"));
     }
 
     #[test]
@@ -301,10 +298,7 @@ mod tests {
         let uri = OtpAuthUri::from_auth_config("NexaPipe", "c1", "JBSWY3DPEHPK3PXP", &config)
             .unwrap()
             .to_uri();
-        assert!(
-            uri.contains("&algorithm=SHA512&digits=6&period=30"),
-            "{uri}"
-        );
+        assert!(uri.contains("&algorithm=SHA512&digits=6&period=30"));
     }
 
     #[test]

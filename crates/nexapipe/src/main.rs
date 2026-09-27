@@ -4,7 +4,7 @@ use nexapipe::auth::AuthConfig;
 use nexapipe::config::{
     ClientSecretWrite, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
 };
-use nexapipe::proxy::{run_local_proxy, run_proxy};
+use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use nexapipe_client::relay::RelayModeSpec;
@@ -217,8 +217,8 @@ async fn main() {
         run_server_mode(&proxy_config, &cli.config, &shutdown_signal).await;
     }
 
-    tracing::info!("Waiting for graceful shutdown...");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // The server mode has already drained its connections by the time it
+    // returns, so there is nothing left to wait for here.
     tracing::info!("Proxy shutdown complete");
 }
 
@@ -306,12 +306,15 @@ async fn run_server_mode(
 
     if let Err(e) = run_proxy(
         route_config,
-        server_config,
-        iroh_config,
         config_path,
         shutdown_signal.clone(),
-        auth_config,
-        peer_allow_list,
+        ProxyOptions {
+            server: server_config,
+            iroh: iroh_config,
+            auth: auth_config,
+            peers: peer_allow_list,
+            health_check: proxy_config.health_check.clone(),
+        },
     )
     .await
     {

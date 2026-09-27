@@ -236,6 +236,19 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
     false
 }
 
+/// What one proxied request came to.
+///
+/// The streaming path writes the response straight into the QUIC stream, so
+/// there is no `Response` left for the caller to inspect; without this the
+/// tunnel path — the one every client actually uses — could not be logged at
+/// all.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxySummary {
+    pub status: u16,
+    /// Response headers plus body payload, excluding chunk framing.
+    pub bytes_sent: usize,
+}
+
 pub async fn proxy_to_backend_streaming(
     client: &HttpClient,
     req: &Request<()>,
@@ -243,7 +256,7 @@ pub async fn proxy_to_backend_streaming(
     body_data: Vec<u8>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
-) -> Result<(), anyhow::Error> {
+) -> Result<ProxySummary, anyhow::Error> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -327,6 +340,7 @@ pub async fn proxy_to_backend_streaming(
     }
     response_buf.extend_from_slice(b"\r\n");
 
+    let mut bytes_sent = response_buf.len();
     send.write_all(&response_buf).await?;
 
     // Body chunks used to go out as one `write_all` per hyper chunk (plus three more per
@@ -344,6 +358,7 @@ pub async fn proxy_to_backend_streaming(
     while let Some(chunk) = body_stream.next().await {
         match chunk {
             Ok(data) => {
+                bytes_sent += data.len();
                 if use_chunked {
                     out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
                     out.extend_from_slice(&data);
@@ -372,7 +387,10 @@ pub async fn proxy_to_backend_streaming(
 
     send.finish()?;
 
-    Ok(())
+    Ok(ProxySummary {
+        status: status.as_u16(),
+        bytes_sent,
+    })
 }
 
 async fn read_remaining_request_body(
