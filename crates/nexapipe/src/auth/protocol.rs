@@ -106,7 +106,10 @@ mod tests {
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
         assert_eq!(
-            AuthMessage::from_bytes(json.as_bytes()).unwrap().to_bytes().unwrap(),
+            AuthMessage::from_bytes(json.as_bytes())
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
             start.to_bytes().unwrap()
         );
 

@@ -1,9 +1,9 @@
-use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
-use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::lb::{LoadBalancingStrategy, RoundRobinBalancer, RandomBalancer, LoadBalancer};
 use crate::ClientError;
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
+use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
+use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -64,7 +64,9 @@ impl DomainPools {
 
     pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
         if self.pools.is_empty() {
-            return Err(ClientError::InvalidConfig("No endpoint pools configured".to_string()));
+            return Err(ClientError::InvalidConfig(
+                "No endpoint pools configured".to_string(),
+            ));
         }
         let index = self.balancer.select(self.pools.len());
         let conn = self.pools[index].get_connection().await?;
@@ -77,7 +79,9 @@ impl DomainPools {
         }
         let index = pooled_conn.pool_index();
         if index < self.pools.len() {
-            self.pools[index].return_connection(pooled_conn.into_inner()).await;
+            self.pools[index]
+                .return_connection(pooled_conn.into_inner())
+                .await;
         }
     }
 
@@ -161,26 +165,48 @@ impl EndpointGroup {
         let mut pool_by_key: HashMap<String, Arc<IrohConnectionPool>> = HashMap::new();
         let mut domain_to_keys: HashMap<String, Vec<String>> = HashMap::new();
 
-        jni_log!("[DEBUG:endpoint-group] Creating EndpointGroup with {} domain mappings", domain_mappings.len());
+        jni_log!(
+            "[DEBUG:endpoint-group] Creating EndpointGroup with {} domain mappings",
+            domain_mappings.len()
+        );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
             let domain_lower = mapping.domain.to_lowercase();
-            jni_log!("[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'", i, domain_lower, key);
-            
+            jni_log!(
+                "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
+                i,
+                domain_lower,
+                key
+            );
+
             if !pool_by_key.contains_key(&key) {
                 let endpoint_addr = mapping.to_endpoint_addr()?;
                 let pool = IrohConnectionPool::new(endpoint_addr).await?;
                 pool_by_key.insert(key.clone(), Arc::new(pool));
-                jni_log!("[DEBUG:endpoint-group] Created connection pool for key: {}", key);
+                jni_log!(
+                    "[DEBUG:endpoint-group] Created connection pool for key: {}",
+                    key
+                );
             }
 
-            domain_to_keys.entry(domain_lower.clone()).or_default().push(key.clone());
-            jni_log!("[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'", domain_lower, key);
+            domain_to_keys
+                .entry(domain_lower.clone())
+                .or_default()
+                .push(key.clone());
+            jni_log!(
+                "[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'",
+                domain_lower,
+                key
+            );
         }
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
-            jni_log!("[DEBUG:endpoint-group] Domain '{}' maps to backends: {:?}", domain, keys);
+            jni_log!(
+                "[DEBUG:endpoint-group] Domain '{}' maps to backends: {:?}",
+                domain,
+                keys
+            );
             let pools: Vec<Arc<IrohConnectionPool>> = keys
                 .into_iter()
                 .filter_map(|k| pool_by_key.get(&k).cloned())
@@ -188,20 +214,32 @@ impl EndpointGroup {
             if !pools.is_empty() {
                 let domain_pools = Arc::new(DomainPools::new(pools, default_strategy));
                 domains.insert(domain.clone(), domain_pools);
-                jni_log!("[DEBUG:endpoint-group] Created DomainPools for domain '{}'", domain);
+                jni_log!(
+                    "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
+                    domain
+                );
             }
         }
 
-        jni_log!("[DEBUG:endpoint-group] Final domain map: {:?}", domains.keys());
+        jni_log!(
+            "[DEBUG:endpoint-group] Final domain map: {:?}",
+            domains.keys()
+        );
 
         let default_pools = if let Some(addr) = default_endpoint_addr {
             let pool = IrohConnectionPool::new(addr).await?;
-            Some(Arc::new(DomainPools::new(vec![Arc::new(pool)], default_strategy)))
+            Some(Arc::new(DomainPools::new(
+                vec![Arc::new(pool)],
+                default_strategy,
+            )))
         } else {
             None
         };
 
-        Ok(Self { domains, default_pools })
+        Ok(Self {
+            domains,
+            default_pools,
+        })
     }
 
     pub async fn new_with_nodes_and_endpoint(
@@ -215,7 +253,13 @@ impl EndpointGroup {
             .flat_map(|node| node.to_domain_mappings())
             .collect();
 
-        Self::new_with_domain_mappings_and_endpoint(domain_mappings, default_endpoint_addr, default_strategy, ep).await
+        Self::new_with_domain_mappings_and_endpoint(
+            domain_mappings,
+            default_endpoint_addr,
+            default_strategy,
+            ep,
+        )
+        .await
     }
 
     pub async fn new_with_domain_mappings_and_endpoint(
@@ -227,26 +271,48 @@ impl EndpointGroup {
         let mut pool_by_key: HashMap<String, Arc<IrohConnectionPool>> = HashMap::new();
         let mut domain_to_keys: HashMap<String, Vec<String>> = HashMap::new();
 
-        jni_log!("[DEBUG:endpoint-group] Creating EndpointGroup (with endpoint) with {} domain mappings", domain_mappings.len());
+        jni_log!(
+            "[DEBUG:endpoint-group] Creating EndpointGroup (with endpoint) with {} domain mappings",
+            domain_mappings.len()
+        );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
             let domain_lower = mapping.domain.to_lowercase();
-            jni_log!("[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'", i, domain_lower, key);
-            
+            jni_log!(
+                "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
+                i,
+                domain_lower,
+                key
+            );
+
             if !pool_by_key.contains_key(&key) {
                 let endpoint_addr = mapping.to_endpoint_addr()?;
                 let pool = IrohConnectionPool::new_with_endpoint(ep.clone(), endpoint_addr);
                 pool_by_key.insert(key.clone(), Arc::new(pool));
-                jni_log!("[DEBUG:endpoint-group] Created connection pool for key: {}", key);
+                jni_log!(
+                    "[DEBUG:endpoint-group] Created connection pool for key: {}",
+                    key
+                );
             }
 
-            domain_to_keys.entry(domain_lower.clone()).or_default().push(key.clone());
-            jni_log!("[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'", domain_lower, key);
+            domain_to_keys
+                .entry(domain_lower.clone())
+                .or_default()
+                .push(key.clone());
+            jni_log!(
+                "[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'",
+                domain_lower,
+                key
+            );
         }
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
-            jni_log!("[DEBUG:endpoint-group] Domain '{}' maps to backends: {:?}", domain, keys);
+            jni_log!(
+                "[DEBUG:endpoint-group] Domain '{}' maps to backends: {:?}",
+                domain,
+                keys
+            );
             let pools: Vec<Arc<IrohConnectionPool>> = keys
                 .into_iter()
                 .filter_map(|k| pool_by_key.get(&k).cloned())
@@ -254,24 +320,39 @@ impl EndpointGroup {
             if !pools.is_empty() {
                 let domain_pools = Arc::new(DomainPools::new(pools, default_strategy));
                 domains.insert(domain.clone(), domain_pools);
-                jni_log!("[DEBUG:endpoint-group] Created DomainPools for domain '{}'", domain);
+                jni_log!(
+                    "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
+                    domain
+                );
             }
         }
 
-        jni_log!("[DEBUG:endpoint-group] Final domain map (with endpoint): {:?}", domains.keys());
+        jni_log!(
+            "[DEBUG:endpoint-group] Final domain map (with endpoint): {:?}",
+            domains.keys()
+        );
 
         let default_pools = if let Some(addr) = default_endpoint_addr {
             let pool = IrohConnectionPool::new_with_endpoint(ep, addr);
-            Some(Arc::new(DomainPools::new(vec![Arc::new(pool)], default_strategy)))
+            Some(Arc::new(DomainPools::new(
+                vec![Arc::new(pool)],
+                default_strategy,
+            )))
         } else {
             None
         };
 
-        Ok(Self { domains, default_pools })
+        Ok(Self {
+            domains,
+            default_pools,
+        })
     }
 
     pub async fn new_with_single_pool(conn_pool: IrohConnectionPool) -> Self {
-        let default_pools = Some(Arc::new(DomainPools::new(vec![Arc::new(conn_pool)], LoadBalancingStrategy::RoundRobin)));
+        let default_pools = Some(Arc::new(DomainPools::new(
+            vec![Arc::new(conn_pool)],
+            LoadBalancingStrategy::RoundRobin,
+        )));
         Self {
             domains: HashMap::new(),
             default_pools,
@@ -383,41 +464,62 @@ impl EndpointGroup {
 
     pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {
         let domain_lower = domain.to_lowercase();
-        jni_log!("[DEBUG:endpoint-group] Looking up connection for domain: '{}'", domain_lower);
-        
+        jni_log!(
+            "[DEBUG:endpoint-group] Looking up connection for domain: '{}'",
+            domain_lower
+        );
+
         if let Some(pools) = self.domains.get(&domain_lower) {
-            jni_log!("[DEBUG:endpoint-group] Found exact match for domain: '{}'", domain_lower);
+            jni_log!(
+                "[DEBUG:endpoint-group] Found exact match for domain: '{}'",
+                domain_lower
+            );
             return pools.get_connection().await;
         }
-        
+
         let mut parts: Vec<&str> = domain_lower.split('.').collect();
         while parts.len() > 1 {
             parts.remove(0);
             let parent_domain = parts.join(".");
-            jni_log!("[DEBUG:endpoint-group] Trying parent domain: '{}'", parent_domain);
+            jni_log!(
+                "[DEBUG:endpoint-group] Trying parent domain: '{}'",
+                parent_domain
+            );
             if let Some(pools) = self.domains.get(&parent_domain) {
-                jni_log!("[DEBUG:endpoint-group] Found parent domain match: '{}'", parent_domain);
+                jni_log!(
+                    "[DEBUG:endpoint-group] Found parent domain match: '{}'",
+                    parent_domain
+                );
                 return pools.get_connection().await;
             }
         }
-        
+
         if let Some(default) = &self.default_pools {
-            jni_log!("[DEBUG:endpoint-group] Using default pools for domain: '{}'", domain_lower);
+            jni_log!(
+                "[DEBUG:endpoint-group] Using default pools for domain: '{}'",
+                domain_lower
+            );
             return default.get_connection().await;
         }
-        
-        jni_log!("[DEBUG:endpoint-group] No endpoint configured for domain: '{}'", domain_lower);
-        Err(ClientError::InvalidConfig(format!("No endpoint configured for domain: {}", domain)))
+
+        jni_log!(
+            "[DEBUG:endpoint-group] No endpoint configured for domain: '{}'",
+            domain_lower
+        );
+        Err(ClientError::InvalidConfig(format!(
+            "No endpoint configured for domain: {}",
+            domain
+        )))
     }
 
     pub async fn return_connection(&self, domain: &str, pooled_conn: PooledConnection) {
         let domain_lower = domain.to_lowercase();
-        
+
         if let Some(pools) = self.domains.get(&domain_lower) {
             pools.return_connection(pooled_conn).await;
             return;
         }
-        
+
         let mut parts: Vec<&str> = domain_lower.split('.').collect();
         while parts.len() > 1 {
             parts.remove(0);
@@ -427,7 +529,7 @@ impl EndpointGroup {
                 return;
             }
         }
-        
+
         if let Some(default) = &self.default_pools {
             default.return_connection(pooled_conn).await;
         }
@@ -484,31 +586,31 @@ impl EndpointGroup {
             let backend_id = *backend_id;
             let pool = pool.clone();
             join_set.spawn(async move {
-                let answered = match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await
-                {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        jni_log!("[preconnect] Node unreachable (preconnect returned false)");
-                        // `jni_log` only reaches logcat; the desktop and the service need
-                        // this in their own log — the pool's warning says why.
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("preconnect: node {} is unreachable", backend_id);
-                        false
-                    }
-                    Err(_) => {
-                        jni_log!(
-                            "[preconnect] Node timed out after {}s",
-                            PRECONNECT_TIMEOUT.as_secs()
-                        );
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            "preconnect: node {} gave no answer within {}s",
-                            backend_id,
-                            PRECONNECT_TIMEOUT.as_secs()
-                        );
-                        false
-                    }
-                };
+                let answered =
+                    match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            jni_log!("[preconnect] Node unreachable (preconnect returned false)");
+                            // `jni_log` only reaches logcat; the desktop and the service need
+                            // this in their own log — the pool's warning says why.
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!("preconnect: node {} is unreachable", backend_id);
+                            false
+                        }
+                        Err(_) => {
+                            jni_log!(
+                                "[preconnect] Node timed out after {}s",
+                                PRECONNECT_TIMEOUT.as_secs()
+                            );
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                "preconnect: node {} gave no answer within {}s",
+                                backend_id,
+                                PRECONNECT_TIMEOUT.as_secs()
+                            );
+                            false
+                        }
+                    };
                 (backend_id, answered)
             });
         }
@@ -590,7 +692,10 @@ impl EndpointGroup {
         let pools = self.unique_pools();
         for (backend_id, pool) in pools {
             pool.drop_connections().await;
-            jni_log!("[drop-connections] dropped cached connections to {}", backend_id);
+            jni_log!(
+                "[drop-connections] dropped cached connections to {}",
+                backend_id
+            );
         }
     }
 
@@ -707,11 +812,14 @@ impl NodeConfig {
     }
 
     pub fn to_domain_mappings(&self) -> Vec<DomainMapping> {
-        self.domains.iter().map(|domain| DomainMapping {
-            domain: domain.clone(),
-            server_node_id: self.server_node_id.clone(),
-            server_ticket: self.server_ticket.clone(),
-        }).collect()
+        self.domains
+            .iter()
+            .map(|domain| DomainMapping {
+                domain: domain.clone(),
+                server_node_id: self.server_node_id.clone(),
+                server_ticket: self.server_ticket.clone(),
+            })
+            .collect()
     }
 }
 
@@ -757,7 +865,10 @@ mod tests {
         assert_ne!(backend_a, backend_b);
 
         let group = EndpointGroup::new_with_nodes_and_endpoint(
-            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            vec![
+                node(backend_a, "a.example.com"),
+                node(backend_b, "b.example.com"),
+            ],
             None,
             LoadBalancingStrategy::RoundRobin,
             ep.clone(),
@@ -788,7 +899,10 @@ mod tests {
         let backend_b = unused_backend_id();
 
         let group = EndpointGroup::new_with_nodes_and_endpoint(
-            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            vec![
+                node(backend_a, "a.example.com"),
+                node(backend_b, "b.example.com"),
+            ],
             None,
             LoadBalancingStrategy::RoundRobin,
             ep,
@@ -823,7 +937,10 @@ mod tests {
         let backend_b = unused_backend_id();
 
         let group = EndpointGroup::new_with_nodes_and_endpoint(
-            vec![node(backend_a, "a.example.com"), node(backend_b, "b.example.com")],
+            vec![
+                node(backend_a, "a.example.com"),
+                node(backend_b, "b.example.com"),
+            ],
             None,
             LoadBalancingStrategy::RoundRobin,
             ep,

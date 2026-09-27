@@ -143,7 +143,15 @@ pub async fn handle_iroh_stream(
     peer: &str,
     acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
-    serve_stream(DuplexIroh::new(send, recv), initial, config, limiter, peer, acl).await
+    serve_stream(
+        DuplexIroh::new(send, recv),
+        initial,
+        config,
+        limiter,
+        peer,
+        acl,
+    )
+    .await
 }
 
 /// The protocol itself, over any duplex stream.
@@ -620,10 +628,9 @@ mod tests {
 
         let config = config_with(&backend_addr.to_string(), "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         // Preface and first payload in one write, which is what a real client does.
@@ -653,10 +660,9 @@ mod tests {
         // it, this test would fail with BackendFailed instead of NoRoute.
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         client_write
@@ -740,10 +746,9 @@ mod tests {
         // two modes are different services, not two spellings of one.
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         client_write
@@ -760,10 +765,9 @@ mod tests {
         // Port 1 on loopback: nothing listens there, so connect is refused immediately.
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         client_write
@@ -771,10 +775,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            read_status(&mut client_read).await,
-            Status::BackendFailed
-        );
+        assert_eq!(read_status(&mut client_read).await, Status::BackendFailed);
         assert!(task.await.unwrap().is_err());
     }
 
@@ -782,10 +783,9 @@ mod tests {
     async fn a_preface_from_a_newer_client_answers_bad_preface() {
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         client_write
@@ -820,10 +820,9 @@ mod tests {
 
         let config = config_with("127.0.0.1:1", &backend_addr.to_string());
         let (client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
         // Preface and the first datagram in one write: the datagram must not be lost
@@ -861,15 +860,18 @@ mod tests {
 
         let idle = Duration::from_millis(150);
         let config = RouteConfig::new(
-            vec![udp_route("turn.test", &backend_addr.to_string(), Some(idle))],
+            vec![udp_route(
+                "turn.test",
+                &backend_addr.to_string(),
+                Some(idle),
+            )],
             Some("http://default:80".to_string()),
         );
 
         let (mut client, server) = tokio::io::duplex(4096);
-        let task =
-            tokio::spawn(
-                async move { serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await },
-            );
+        let task = tokio::spawn(async move {
+            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+        });
 
         client
             .write_all(&preface(L4Proto::Udp, "turn.test", 3478))

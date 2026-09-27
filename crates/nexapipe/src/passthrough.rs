@@ -93,10 +93,13 @@ pub async fn handle_tcp_stream(
 }
 
 async fn connect(host: &str, port: u16) -> anyhow::Result<tokio::net::TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect((host, port)))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out connecting to backend {}:{}", host, port))?
-        .map_err(|e| anyhow::anyhow!("failed to connect to backend {}:{}: {}", host, port, e))?;
+    let stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {}:{}", host, port))?
+    .map_err(|e| anyhow::anyhow!("failed to connect to backend {}:{}: {}", host, port, e))?;
 
     // The tunnel carries TLS records; Nagle would only add latency here.
     let _ = stream.set_nodelay(true);
@@ -438,9 +441,9 @@ mod tests {
     #[tokio::test]
     async fn an_sni_off_the_clients_allowlist_resolves_to_nothing() {
         use crate::auth::ClientAcl;
-        use crate::routes::{Route, RouteConfig};
-        use crate::lb::LoadBalancingStrategy;
         use crate::config::RouteMode;
+        use crate::lb::LoadBalancingStrategy;
+        use crate::routes::{Route, RouteConfig};
 
         let config = RouteConfig::new(
             vec![Route::new(

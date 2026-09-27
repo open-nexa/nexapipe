@@ -257,10 +257,7 @@ fn persists_lockout_counters_across_a_reload() {
 
     // A success zeroes the counters, and zeroed counters leave no keys behind.
     let mut auth = reloaded;
-    auth.clients
-        .get_mut("client-001")
-        .unwrap()
-        .record_success();
+    auth.clients.get_mut("client-001").unwrap().record_success();
     save_auth_state(path_str, &auth).unwrap();
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(!on_disk.contains("failed_attempts"));

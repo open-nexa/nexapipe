@@ -268,7 +268,9 @@ mod tests {
     fn the_preface_starts_with_the_dispatch_byte() {
         // The server keys on this byte before it parses anything, so the client's first
         // byte has to be the one the dispatcher expects.
-        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432).to_bytes().unwrap();
+        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
+            .to_bytes()
+            .unwrap();
         assert_eq!(preface[0], PREFACE_MAGIC);
     }
 

@@ -1,6 +1,6 @@
+use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::http::{HttpRequest, HttpResponse};
-use crate::ClientError;
 use iroh::{EndpointAddr, EndpointId};
 use std::sync::Arc;
 
@@ -35,7 +35,10 @@ impl IrohProxyClient {
         send.write_all(request.to_bytes().as_slice()).await?;
         send.finish().map_err(|e| anyhow::anyhow!(e))?;
 
-        let response = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| anyhow::anyhow!(e))?;
+        let response = recv
+            .read_to_end(MAX_RESPONSE_SIZE)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         self.conn_pool.return_connection(conn).await;
 
         HttpResponse::parse(&response)
@@ -48,16 +51,21 @@ impl IrohProxyClient {
         send.write_all(data).await?;
         send.finish().map_err(|e| anyhow::anyhow!(e))?;
 
-        let response = recv.read_to_end(MAX_RESPONSE_SIZE).await.map_err(|e| anyhow::anyhow!(e))?;
+        let response = recv
+            .read_to_end(MAX_RESPONSE_SIZE)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         self.conn_pool.return_connection(conn).await;
 
         Ok(response)
     }
 
-    pub async fn open_bi_stream(&self) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), ClientError> {
+    pub async fn open_bi_stream(
+        &self,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), ClientError> {
         let conn = self.conn_pool.get_connection().await?;
         let (send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
-        
+
         Ok((send, recv))
     }
 

@@ -30,9 +30,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(url) = &pin {
         // Same construction as `RelayModeSpec::Pinned`: a map holding exactly one relay.
         let url: RelayUrl = url.parse()?;
-        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter([
-            RelayConfig::from(url.clone()),
-        ])));
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter([RelayConfig::from(
+            url.clone(),
+        )])));
         println!("relay map restricted to {url}");
     }
     let ep = builder.bind().await?;

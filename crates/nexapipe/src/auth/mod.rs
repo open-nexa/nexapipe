@@ -1,4 +1,4 @@
-﻿//! 2FA authentication module for Nexapipe server.
+//! 2FA authentication module for Nexapipe server.
 //!
 //! Provides TOTP (Time-based One-Time Password) verification for client connections.
 
@@ -7,9 +7,7 @@ pub mod otpauth;
 pub mod protocol;
 pub mod totp;
 
-pub use config::{
-    AuthConfig, ClientAcl, ClientAuth, TotpAlgorithm, generate_enrollment_token,
-};
+pub use config::{AuthConfig, ClientAcl, ClientAuth, TotpAlgorithm, generate_enrollment_token};
 pub use otpauth::{DEFAULT_ISSUER, OtpAuthUri};
 pub use protocol::AuthMessage;
 pub use totp::{AuthError, TotpValidator};
