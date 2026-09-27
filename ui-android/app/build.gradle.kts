@@ -118,6 +118,20 @@ android {
             jniLibs.srcDirs("src/main/jniLibs")
         }
     }
+
+    // The 26 pre-existing LocalContextGetResourceValueCall findings are recorded
+    // in lint-baseline.xml, which is what lets CI gate on lint at all: a new
+    // finding fails the job, a recorded one does not. They are not ignored for
+    // convenience — the call sites are Toast, log and dialog-summary strings
+    // built outside a composable scope, where stringResource() cannot be used,
+    // and switching the app language recreates the Activity, so the stale-value
+    // risk the lint describes does not apply here.
+    //
+    // After fixing some of them, refresh the file with:
+    //   ./gradlew :app:updateLintBaseline
+    lint {
+        baseline = file("lint-baseline.xml")
+    }
 }
 
 // AGP 9 compiles Kotlin itself and drops the old android.kotlinOptions{} DSL;

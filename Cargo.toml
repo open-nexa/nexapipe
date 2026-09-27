@@ -17,6 +17,10 @@ edition = "2024"
 # `panic: attempt to subtract sequence numbers with underflow` in
 # smoltcp-0.12.0/src/wire/tcp.rs, which kills the TUN proxy stack and
 # disconnects the tunnel a few seconds after connecting.
+#
+# What exactly is patched, why, and when this can be dropped once upstream
+# fixes the panic: see third_party/smoltcp/PATCHES.md. Do not remove this
+# entry, or edit the vendored copy, without reading that file first.
 [patch.crates-io]
 smoltcp = { path = "third_party/smoltcp" }
 

@@ -39,6 +39,7 @@ import com.nexa.pipe.R
 import com.nexa.pipe.locale.AppLanguage
 import com.nexa.pipe.locale.AppLocale
 import com.nexa.pipe.locale.label
+import com.nexa.pipe.locale.rememberLocalizedContext
 import com.nexa.pipe.ui.components.NexaDangerButton
 import com.nexa.pipe.ui.components.NexaPrimaryButton
 import com.nexa.pipe.ui.components.NexaTonalButton
@@ -54,6 +55,7 @@ import java.util.Locale
 @Composable
 fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
 
     val isVpnRunning by viewModel.isVpnRunning.collectAsState()
     val isConnecting by viewModel.isConnecting.collectAsState()
@@ -164,7 +166,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         val nodeId = inviteNodeId(invite)
             // A ticket bundles addresses the node list has no room for. The
             // server can hand out a Node ID invite instead.
-            ?: return context.getString(R.string.invite_ticket_unsupported)
+            ?: return localizedContext.getString(R.string.invite_ticket_unsupported)
 
         if (nodes.none { it.nodeId == nodeId }) {
             viewModel.addNode(nodeId)?.let { return it }
@@ -213,7 +215,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         )
         Toast.makeText(
             context,
-            context.getString(R.string.invite_imported, invite.name ?: nodeId.take(8)),
+            localizedContext.getString(R.string.invite_imported, invite.name ?: nodeId.take(8)),
             Toast.LENGTH_SHORT
         ).show()
         return null
@@ -234,46 +236,46 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 (current.secret != otp.secret || current.clientId != otp.clientId)
             ) {
                 val client = current.clientId.ifBlank {
-                    context.getString(R.string.invite_conflict_2fa_current_client)
+                    localizedContext.getString(R.string.invite_conflict_2fa_current_client)
                 }
-                add(context.getString(R.string.invite_conflict_2fa, client))
+                add(localizedContext.getString(R.string.invite_conflict_2fa, client))
             }
         }
         invite.relay?.let { relay ->
             if (relayMode != "custom" || (relayUrl.isNotBlank() && relayUrl != relay)) {
-                add(context.getString(R.string.invite_conflict_relay))
+                add(localizedContext.getString(R.string.invite_conflict_relay))
             }
         }
     }
 
     /** One line per field, so the confirmation reads like the invite itself. */
     fun inviteSummary(invite: EndpointInvite): String = buildList<String> {
-        add(context.getString(R.string.invite_summary_node, invite.target.value))
-        invite.name?.let { add(context.getString(R.string.invite_summary_name, it)) }
+        add(localizedContext.getString(R.string.invite_summary_node, invite.target.value))
+        invite.name?.let { add(localizedContext.getString(R.string.invite_summary_name, it)) }
         add(
-            context.getString(
+            localizedContext.getString(
                 R.string.invite_summary_domains,
                 invite.domains.joinToString(", ").ifEmpty {
-                    context.getString(R.string.invite_value_none)
+                    localizedContext.getString(R.string.invite_value_none)
                 }
             )
         )
         val otp = invite.totp
         add(
             when {
-                otp != null -> context.getString(
+                otp != null -> localizedContext.getString(
                     R.string.invite_summary_2fa,
                     otp.clientId,
                     otp.algorithm.uppercase(Locale.ROOT)
                 )
-                invite.enrollment != null -> context.getString(
+                invite.enrollment != null -> localizedContext.getString(
                     R.string.invite_summary_enrollment,
                     invite.enrollment!!.clientId
                 )
-                else -> context.getString(R.string.invite_summary_2fa_none)
+                else -> localizedContext.getString(R.string.invite_summary_2fa_none)
             }
         )
-        invite.relay?.let { add(context.getString(R.string.invite_summary_relay, it)) }
+        invite.relay?.let { add(localizedContext.getString(R.string.invite_summary_relay, it)) }
     }.joinToString("\n")
 
     /**
@@ -994,6 +996,7 @@ private fun InviteLinkDialog(
     onImport: (String) -> String?
 ) {
     val context = LocalContext.current
+    val localizedContext = rememberLocalizedContext()
     var link by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -1021,7 +1024,7 @@ private fun InviteLinkDialog(
                 onClick = {
                     val value = link.trim()
                     if (value.isEmpty()) {
-                        error = context.getString(R.string.invite_paste_empty)
+                        error = localizedContext.getString(R.string.invite_paste_empty)
                         return@NexaPrimaryButton
                     }
                     val failure = onImport(value)

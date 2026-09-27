@@ -4,8 +4,11 @@ name: CI
 # combinations, the Android NDK cfg check, plus the desktop and Android app
 # jobs that used to live in the open-nexa/nexa-desktop / nexa-android repos.
 # Multi-platform builds are verified by release.yml when a tag is pushed.
-# Note: the nix/duct dev-dependencies are Unix-only, so do not run cargo test
-# on Windows (the desktop check job only runs cargo check there).
+#
+# The `test` job runs on Linux and macOS. Windows is compile-checked only: the
+# integration tests spawn the built binary, and the cfg(unix) parts of the
+# config and shutdown tests do not exist there, so a red Windows test job would
+# report a platform nobody has committed to supporting.
 #
 # Jobs that exist purely because the default feature set cannot see the code they cover:
 #   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
@@ -73,14 +76,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS matters because development happens on one: a test that only
+        # passes on the Linux runner is a test that breaks the maintainer's
+        # machine. Architecture variants do not change which cfg branch runs,
+        # so one runner per OS is enough.
+        os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test
+          key: test-${{ matrix.os }}
       - name: cargo test
         run: cargo test --workspace --locked
 
@@ -497,10 +508,13 @@ jobs:
           yes | "$SM" --licenses > /dev/null 2>&1 || true
           "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
 
-      # Observing for now: there are many pre-existing warnings (missing translations, default lint rules).
-      # Drop continue-on-error once the baseline is clean so it actually gates PRs.
+      # Gating, not observing: `app/lint-baseline.xml` records the pre-existing
+      # findings (26 LocalContextGetResourceValueCall errors among them — Toast,
+      # log and dialog-summary strings built outside a composable scope, where
+      # stringResource() cannot be used), so a red job here means a *new* one.
+      # Fixing a recorded finding means refreshing the baseline with
+      # `./gradlew :app:updateLintBaseline` in the same change.
       - name: lintDebug
-        continue-on-error: true
         id: lint
         run: |
           chmod +x ./gradlew
