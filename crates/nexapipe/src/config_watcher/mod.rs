@@ -14,9 +14,9 @@ use tokio::sync::Mutex;
 ///
 /// Reloading used to stop at re-parsing the file: the new `ProxyConfig` was
 /// stored, the log said "reloaded successfully", and the routes — built once at
-/// startup — kept serving the old table. An edit to `[[routes]]` or
-/// `default_backend` only took effect after a restart, which is exactly how a
-/// freshly added route came to look like it had never been added. The watcher
+/// startup — kept serving the old table. An edit to `[[routes]]` only took
+/// effect after a restart, which is exactly how a freshly added route came to
+/// look like it had never been added. The watcher
 /// now owns what applying one takes: the `RouteConfig` to update and the HTTP
 /// client any new health check needs.
 ///
@@ -148,9 +148,6 @@ impl ConfigWatcher {
             }
         };
 
-        self.route_config
-            .update_default_backend(new_config.default_backend.clone())
-            .await;
         self.route_config.update_routes(routes).await;
 
         // Live, unlike the intervals a running checker was built with: those are

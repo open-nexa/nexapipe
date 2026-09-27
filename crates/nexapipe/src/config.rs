@@ -247,18 +247,15 @@ impl Default for HealthCheckConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
-    /// Fallback for an HTTP request whose `Host` matches no route.
+    /// **Removed.** Kept in the struct for exactly one reason: serde drops keys
+    /// it does not know, so deleting this field would let a config that still
+    /// names a `default_backend` keep running — and quietly start answering 404
+    /// for hosts it used to forward somewhere. Parsed as an opaque value so its
+    /// presence is detected, and refused by [`Self::build_routes`].
     ///
-    /// Optional on purpose: when it is absent, an unrouted host is answered with
-    /// 404 rather than quietly forwarded to whatever service happens to be
-    /// listed. A config that routes every domain it serves does not need one,
-    /// and requiring it only invited a placeholder that silently absorbed
-    /// mistyped and unknown hosts.
-    ///
-    /// `passthrough` and L4 lookups never consult it — see
-    /// [`crate::routes::RouteConfig::get_l4_backend`].
+    /// What it did is spelled as a route now: `host_pattern = "*"`.
     #[serde(default)]
-    pub default_backend: Option<String>,
+    pub default_backend: Option<toml::Value>,
     pub debug: Option<bool>,
     pub routes: Option<Vec<RouteConfig>>,
     pub server: Option<ServerConfig>,
@@ -383,8 +380,16 @@ impl ProxyConfig {
     /// differently depending on when it was made. An error here is not fatal for
     /// a reload — the caller keeps the routes it already has.
     pub fn build_routes(&self) -> anyhow::Result<Vec<Route>> {
-        if let Some(default_backend) = &self.default_backend {
-            validate_backend("default_backend", RouteMode::Http, default_backend)?;
+        // Refused rather than ignored: silently dropping the key would turn
+        // every host it used to forward into a 404, which is a routing change
+        // nobody asked for. A reload keeps the routes it already has, so a
+        // config that fails here is the one that was never serving anyway.
+        if self.default_backend.is_some() {
+            anyhow::bail!(
+                "default_backend has been removed: a host with no `http` route is answered 404. \
+                 Replace it with the catch-all route it always meant — \
+                 [[routes]] host_pattern = \"*\", mode = \"http\", backends = [\"<backend>\"]"
+            );
         }
 
         let mut routes = Vec::new();
@@ -1007,9 +1012,39 @@ backends = ["http://10.0.0.5:8080"]
         assert!(!routes[1].matches_l4("fn.iakl.top", 8443));
         assert_eq!(routes[2].modes(), &[RouteMode::Http][..]);
 
-        // No `default_backend` at all: the key is optional and building routes
+        // No `default_backend` at all: the key is gone, and building routes
         // must not require one.
         assert!(config.default_backend.is_none());
+    }
+
+    /// A config that still names `default_backend` is refused, not ignored.
+    ///
+    /// The key is still parsed, because serde drops what the struct does not
+    /// name: without this the config would keep starting and every host the
+    /// fallback used to serve would quietly become a 404.
+    #[test]
+    fn build_routes_refuses_the_removed_default_backend() {
+        let config = parse(
+            r#"
+default_backend = "http://10.0.0.5:8080"
+
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("default_backend has been removed"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("host_pattern = \"*\""),
+            "the error must say what to write instead: {message}"
+        );
     }
 
     #[test]
@@ -1158,7 +1193,6 @@ backends = ["http://host.docker.internal"]
     fn parses_a_tcp_route_with_its_l4_keys() {
         let config = parse(
             r#"
-default_backend = "http://10.0.0.72:15666"
 
 [[routes]]
 host_pattern = "db.iroh.iakl.top"
@@ -1182,7 +1216,6 @@ idle_timeout_secs = 120
         // A udp route without the optional keys still parses, with the defaults.
         let config = parse(
             r#"
-default_backend = "http://10.0.0.72:15666"
 
 [[routes]]
 host_pattern = "turn.iroh.iakl.top"
@@ -1238,7 +1271,6 @@ backends = ["udp://10.0.0.60:3478"]
     fn parses_a_passthrough_route_without_a_path() {
         let config = parse(
             r#"
-default_backend = "http://10.0.0.72:15666"
 
 [[routes]]
 host_pattern = "fn.iroh.iakl.top"
@@ -1263,7 +1295,6 @@ backends = ["caddy:443"]
         // the operator — rather than failing to start.
         let config = parse(
             r#"
-default_backend = "http://10.0.0.72:15666"
 
 [server]
 listen_addr = "0.0.0.0:8080"

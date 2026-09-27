@@ -14,8 +14,8 @@
 //! actually dialled** ([`RouteConfig::get_l4_backend`]). A client holding 2FA
 //! credentials therefore cannot use the server as an open relay. A host with no
 //! `mode = "tcp"` / `mode = "udp"` route gets [`Status::NoRoute`] and the stream ends:
-//! there is no fallback to `default_backend`, because that is how a mistyped domain
-//! ends up quietly talking to an unrelated service.
+//! there is no fallback, because that is how a mistyped domain ends up quietly
+//! talking to an unrelated service.
 //!
 //! # Handshake
 //!
@@ -584,13 +584,10 @@ mod tests {
     }
 
     fn config_with(tcp_backend: &str, udp_backend: &str) -> RouteConfig {
-        RouteConfig::new(
-            vec![
-                tcp_route("db.test", tcp_backend),
-                udp_route("turn.test", udp_backend, None),
-            ],
-            Some("http://default:80".to_string()),
-        )
+        RouteConfig::new(vec![
+            tcp_route("db.test", tcp_backend),
+            udp_route("turn.test", udp_backend, None),
+        ])
     }
 
     fn limiter() -> Arc<FlowLimiter> {
@@ -655,9 +652,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_without_a_route_gets_no_route_and_never_the_default_backend() {
-        // The default backend is deliberately unreachable: if the lookup fell back to
-        // it, this test would fail with BackendFailed instead of NoRoute.
+    async fn a_host_without_a_route_gets_no_route() {
+        // The other route's backend is deliberately unreachable: if the lookup
+        // served a host it has no route for, this test would fail with
+        // BackendFailed instead of NoRoute.
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
@@ -859,14 +857,11 @@ mod tests {
         let backend_addr = backend.local_addr().unwrap();
 
         let idle = Duration::from_millis(150);
-        let config = RouteConfig::new(
-            vec![udp_route(
-                "turn.test",
-                &backend_addr.to_string(),
-                Some(idle),
-            )],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![udp_route(
+            "turn.test",
+            &backend_addr.to_string(),
+            Some(idle),
+        )]);
 
         let (mut client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {

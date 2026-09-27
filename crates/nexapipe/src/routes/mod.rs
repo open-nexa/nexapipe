@@ -11,9 +11,9 @@ use tokio::sync::RwLock;
 /// A `Host` header may arrive in any case (`API.example.com`) and may carry a
 /// fully-qualified trailing dot (`api.example.com.`) — both name the same host
 /// the route was written for. Matching them raw would let such a request slip
-/// past its route and fall through to `default_backend`, a different service
-/// entirely. Both the pattern and every input go through here, so a config
-/// written with uppercase letters keeps working too.
+/// past its route and reach a different service entirely. Both the pattern and
+/// every input go through here, so a config written with uppercase letters
+/// keeps working too.
 pub(crate) fn normalize_host(host: &str) -> String {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.to_ascii_lowercase()
@@ -229,8 +229,8 @@ pub struct BackendInfo {
 /// What the L4 tunnel needs in order to serve one flow.
 #[derive(Debug, Clone)]
 pub struct L4RouteInfo {
-    /// The address to dial. Never the default backend — see
-    /// [`RouteConfig::get_l4_backend`].
+    /// The address to dial, and the only address involved: the route decides
+    /// it, the client cannot. See [`RouteConfig::get_l4_backend`].
     pub backend: String,
     /// `udp` routes only; `None` means the caller's own default.
     pub idle_timeout: Option<Duration>,
@@ -239,39 +239,31 @@ pub struct L4RouteInfo {
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
     routes: Arc<RwLock<Vec<Route>>>,
-    default_backend: Arc<RwLock<Option<String>>>,
 }
 
 impl RouteConfig {
-    pub fn new(routes: Vec<Route>, default_backend: Option<String>) -> Self {
+    pub fn new(routes: Vec<Route>) -> Self {
         Self {
             routes: Arc::new(RwLock::new(routes)),
-            default_backend: Arc::new(RwLock::new(default_backend)),
         }
     }
 
     /// Backend for an HTTP request, or `None` when nothing serves it.
     ///
     /// `None` means the caller must answer 404 — not pick some address at
-    /// random. The old behaviour of falling back to a required
-    /// `default_backend` meant a mistyped host silently reached an unrelated
-    /// service; with it optional, the honest answer is "no route".
+    /// random. There is no fallback: a host with no `http` route of its own is
+    /// a routing question the operator answers by adding one, and a
+    /// `host_pattern = "*"` route is how "send everything here" is spelled.
     pub async fn get_backend(&self, host: &str, path: &str) -> Option<BackendInfo> {
         self.get_backend_with_acl(host, path, None).await
     }
 
     /// [`Self::get_backend`] under a client's host authorization.
     ///
-    /// Two rules beyond the plain lookup:
-    ///
-    /// * A host the ACL does not list is refused before any route is
-    ///   consulted, and the refusal is indistinguishable from "no route" —
-    ///   a 404, not a 403, so a client cannot use the difference to probe
-    ///   which hosts exist behind the proxy.
-    /// * A restricted client never falls back to `default_backend`. The
-    ///   fallback serves whatever host arrived, including hosts the ACL never
-    ///   heard of, so honouring it would be the one hole in the allowlist.
-    ///   Unrestricted clients (the default) keep the fallback.
+    /// One rule beyond the plain lookup: a host the ACL does not list is
+    /// refused before any route is consulted, and the refusal is
+    /// indistinguishable from "no route" — a 404, not a 403, so a client cannot
+    /// use the difference to probe which hosts exist behind the proxy.
     pub async fn get_backend_with_acl(
         &self,
         host: &str,
@@ -294,57 +286,29 @@ impl RouteConfig {
             best_match(&routes, RouteMode::Http, |route| route.matches(host, path))
         };
 
-        if let Some(route) = matched_route {
-            let backend_url = route.backend_pool().select_backend().await;
-            tracing::debug!(
-                "Selected backend: {} for host={}, path={}",
-                backend_url,
-                host,
-                path
-            );
-            return Some(BackendInfo {
-                url: backend_url,
-                path_rewrite: route.path_rewrite().clone(),
-                path_pattern: route.path_pattern().to_string(),
-                path_is_prefix: route.path_is_prefix(),
-            });
-        }
-
-        // A restricted client stops here: the fallback would serve a host the
-        // allowlist never authorized. See the method docs.
-        if acl.is_some() {
+        let Some(route) = matched_route else {
+            tracing::debug!("No http route matched: host={host}, path={path} -> 404");
             return None;
-        }
+        };
 
-        let default_backend = self.default_backend.read().await.clone();
-        match default_backend {
-            Some(default_backend) => {
-                tracing::debug!(
-                    "No route matched, using default backend: {} for host={}, path={}",
-                    default_backend,
-                    host,
-                    path
-                );
-                Some(BackendInfo {
-                    url: default_backend,
-                    path_rewrite: None,
-                    path_pattern: "/".to_string(),
-                    path_is_prefix: true,
-                })
-            }
-            None => {
-                tracing::debug!(
-                    "No route matched and no default_backend is configured: \
-                     host={host}, path={path} -> 404"
-                );
-                None
-            }
-        }
+        let backend_url = route.backend_pool().select_backend().await;
+        tracing::debug!(
+            "Selected backend: {} for host={}, path={}",
+            backend_url,
+            host,
+            path,
+        );
+        Some(BackendInfo {
+            url: backend_url,
+            path_rewrite: route.path_rewrite().clone(),
+            path_pattern: route.path_pattern().to_string(),
+            path_is_prefix: route.path_is_prefix(),
+        })
     }
 
     /// Backend for a raw TLS passthrough connection, selected by SNI.
     ///
-    /// Only `mode = "passthrough"` routes take part; the response is `None`
+    /// Only `mode = "passthrough"` routes take part, so the response is `None`
     /// when nothing serves this name, which is the caller's cue to hang up
     /// rather than guess at a backend.
     pub async fn get_passthrough_backend(&self, sni: &str) -> Option<String> {
@@ -376,10 +340,10 @@ impl RouteConfig {
     /// vice versa — and the response is `None` when nothing serves this host, which is
     /// the caller's cue to answer `NoRoute` rather than guess.
     ///
-    /// **There is no fallback to `default_backend`.** That default exists for HTTP
-    /// requests whose `Host` header matched nothing; for a tunnel it would mean a
-    /// mistyped or unconfigured domain silently reaches an unrelated service, which is
-    /// exactly the failure this lookup exists to prevent.
+    /// **There is no fallback.** A `tcp` or `udp` lookup sees only the routes of
+    /// its own mode, so a host with none of them is refused: forwarding a
+    /// mistyped or unconfigured domain to some other service is exactly the
+    /// failure this lookup exists to prevent.
     pub async fn get_l4_backend(
         &self,
         host: &str,
@@ -413,29 +377,10 @@ impl RouteConfig {
         self.routes.read().await.clone()
     }
 
-    pub async fn default_backend(&self) -> Option<String> {
-        self.default_backend.read().await.clone()
-    }
-
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
         let mut routes = self.routes.write().await;
         *routes = new_routes;
         tracing::info!("Routes updated successfully");
-    }
-
-    pub async fn update_default_backend(&self, new_default: Option<String>) {
-        let mut default_backend = self.default_backend.write().await;
-        // A reload rewrites the whole table, so most of them change nothing:
-        // only announce an actual change, or every save of the file would claim
-        // to have removed a default that was never there.
-        if *default_backend == new_default {
-            return;
-        }
-        match &new_default {
-            Some(url) => tracing::info!("Default backend updated to: {}", url),
-            None => tracing::info!("Default backend removed: unrouted hosts now get 404"),
-        }
-        *default_backend = new_default;
     }
 }
 
@@ -511,14 +456,11 @@ mod tests {
     /// share a host name.
     #[tokio::test]
     async fn each_mode_only_sees_its_own_routes() {
-        let config = RouteConfig::new(
-            vec![
-                passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
-                http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
-                http_route("mt.iroh.iakl.top", &["http://10.0.0.6:9000"]),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
+            http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
+            http_route("mt.iroh.iakl.top", &["http://10.0.0.6:9000"]),
+        ]);
 
         assert_eq!(
             config.get_passthrough_backend("fn.iroh.iakl.top").await,
@@ -549,13 +491,10 @@ mod tests {
     /// entries, where forgetting the second one cost a runtime `NoRoute`.
     #[tokio::test]
     async fn one_route_may_serve_both_a_request_and_a_tunnel() {
-        let config = RouteConfig::new(
-            vec![
-                http_route("fn.iroh.iakl.top", &["http://host.docker.internal:15666"])
-                    .with_modes(vec![RouteMode::Http, RouteMode::Tcp]),
-            ],
-            None,
-        );
+        let config = RouteConfig::new(vec![
+            http_route("fn.iroh.iakl.top", &["http://host.docker.internal:15666"])
+                .with_modes(vec![RouteMode::Http, RouteMode::Tcp]),
+        ]);
 
         assert_eq!(
             config
@@ -594,20 +533,17 @@ mod tests {
     /// `passthrough`, even though both point at the same backend here.
     #[tokio::test]
     async fn one_config_serves_http_https_tcp_and_udp_at_once() {
-        let config = RouteConfig::new(
-            vec![
-                // https:// reaching the server as raw TLS, routed by SNI.
-                passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
-                // http:// reaching it as a request, routed by Host.
-                http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
-                // The same https:// service seen through a TUN or a CONNECT tunnel,
-                // where the client announces host and port instead of sending TLS.
-                l4_route("fn.iroh.iakl.top", RouteMode::Tcp, "caddy:443", None),
-                // A UDP service on the same name.
-                l4_route("fn.iroh.iakl.top", RouteMode::Udp, "10.0.0.60:3478", None),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            // https:// reaching the server as raw TLS, routed by SNI.
+            passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
+            // http:// reaching it as a request, routed by Host.
+            http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
+            // The same https:// service seen through a TUN or a CONNECT tunnel,
+            // where the client announces host and port instead of sending TLS.
+            l4_route("fn.iroh.iakl.top", RouteMode::Tcp, "caddy:443", None),
+            // A UDP service on the same name.
+            l4_route("fn.iroh.iakl.top", RouteMode::Udp, "10.0.0.60:3478", None),
+        ]);
 
         // Plain HTTP request.
         assert_eq!(
@@ -656,25 +592,22 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert_eq!(
+        // The one thing HTTP does not share with the tunnels: it is the only
+        // lookup with no route for this host either, so it says 404.
+        assert!(
             config
                 .get_backend("nothing.iroh.iakl.top", "/")
                 .await
-                .expect("an unrouted host falls back to the default backend")
-                .url,
-            "http://default:80"
+                .is_none()
         );
     }
 
     #[tokio::test]
     async fn passthrough_catch_all_and_exact_host_priority() {
-        let config = RouteConfig::new(
-            vec![
-                passthrough_route("*", &["caddy:443"]),
-                passthrough_route("other.iakl.top", &["caddy-alt:443"]),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            passthrough_route("*", &["caddy:443"]),
+            passthrough_route("other.iakl.top", &["caddy-alt:443"]),
+        ]);
 
         assert_eq!(
             config.get_passthrough_backend("anything.test").await,
@@ -705,13 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn l4_lookups_only_see_their_own_mode() {
-        let config = RouteConfig::new(
-            vec![
-                l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
-                http_route("web.iroh.iakl.top", &["http://10.0.0.5:8080"]),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
+            http_route("web.iroh.iakl.top", &["http://10.0.0.5:8080"]),
+        ]);
 
         let tcp = config
             .get_l4_backend("db.iroh.iakl.top", 5432, RouteMode::Tcp)
@@ -751,18 +681,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unrouted_host_never_falls_back_to_the_default_backend() {
-        // The default backend is a real, working address here. If the lookup fell back
-        // to it, a mistyped domain would quietly reach it instead of being refused.
-        let config = RouteConfig::new(
-            vec![l4_route(
-                "db.iroh.iakl.top",
-                RouteMode::Tcp,
-                "10.0.0.50:5432",
-                None,
-            )],
-            Some("http://default:80".to_string()),
-        );
+    async fn an_unrouted_host_is_refused() {
+        // The other route's backend is a real, working address here. If the
+        // lookup served a host it has no route for, a mistyped domain would
+        // quietly reach it instead of being refused.
+        let config = RouteConfig::new(vec![l4_route(
+            "db.iroh.iakl.top",
+            RouteMode::Tcp,
+            "10.0.0.50:5432",
+            None,
+        )]);
 
         assert!(
             config
@@ -780,23 +708,20 @@ mod tests {
 
     #[tokio::test]
     async fn client_ports_pick_a_route_without_changing_its_target() {
-        let config = RouteConfig::new(
-            vec![
-                l4_route(
-                    "db.iroh.iakl.top",
-                    RouteMode::Tcp,
-                    "10.0.0.50:5432",
-                    Some(&[5432]),
-                ),
-                l4_route(
-                    "db.iroh.iakl.top",
-                    RouteMode::Tcp,
-                    "10.0.0.51:6432",
-                    Some(&[6432]),
-                ),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            l4_route(
+                "db.iroh.iakl.top",
+                RouteMode::Tcp,
+                "10.0.0.50:5432",
+                Some(&[5432]),
+            ),
+            l4_route(
+                "db.iroh.iakl.top",
+                RouteMode::Tcp,
+                "10.0.0.51:6432",
+                Some(&[6432]),
+            ),
+        ]);
 
         // Each port selects its own route, and each route dials its own backend: the
         // client's port is a selector, never the address that is dialled.
@@ -827,15 +752,12 @@ mod tests {
 
     #[tokio::test]
     async fn without_client_ports_every_port_matches() {
-        let config = RouteConfig::new(
-            vec![l4_route(
-                "db.iroh.iakl.top",
-                RouteMode::Tcp,
-                "10.0.0.50:5432",
-                None,
-            )],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![l4_route(
+            "db.iroh.iakl.top",
+            RouteMode::Tcp,
+            "10.0.0.50:5432",
+            None,
+        )]);
 
         for port in [1u16, 443, 5432, 65535] {
             assert_eq!(
@@ -890,17 +812,17 @@ mod tests {
         assert_eq!(http_route("a.test", &["http://b:80"]).idle_timeout(), None);
     }
 
-    /// Without a `default_backend`, an unrouted host has nowhere to go and says so.
+    /// An unrouted host has nowhere to go, and says so.
     ///
-    /// This is why the key is optional: a config that routes every domain it
-    /// serves used to be forced to name one anyway, and that placeholder then
-    /// quietly absorbed every mistyped or unknown `Host`.
+    /// There is no fallback a config can name any more: a route is the only way
+    /// to serve a host, so a mistyped or unknown `Host` is a 404 instead of
+    /// quietly reaching whatever service happened to be listed.
     #[tokio::test]
-    async fn without_a_default_backend_an_unrouted_host_is_refused() {
-        let config = RouteConfig::new(
-            vec![http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"])],
-            None,
-        );
+    async fn an_unrouted_host_is_answered_404() {
+        let config = RouteConfig::new(vec![http_route(
+            "fn.iroh.iakl.top",
+            &["http://10.0.0.5:8080"],
+        )]);
 
         assert!(
             config
@@ -908,7 +830,6 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert_eq!(config.default_backend().await, None);
         // The routed host is unaffected.
         assert_eq!(
             config
@@ -920,6 +841,45 @@ mod tests {
         );
     }
 
+    /// `host_pattern = "*"` is how "send everything here" is spelled now.
+    ///
+    /// It is an ordinary `http` route — same pool, same priority rules, same
+    /// lookup — so an exact host still outranks it, and it is not a fallback for
+    /// anything else: an SNI or L4 lookup cannot reach it.
+    #[tokio::test]
+    async fn a_catch_all_route_serves_every_unrouted_host() {
+        let config = RouteConfig::new(vec![
+            http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
+            http_route("*", &["http://10.0.0.9:9000"]),
+        ]);
+
+        assert_eq!(
+            config
+                .get_backend("anything.test", "/")
+                .await
+                .expect("the catch-all serves what no other route names")
+                .url,
+            "http://10.0.0.9:9000"
+        );
+        // An exact host still outranks the catch-all.
+        assert_eq!(
+            config
+                .get_backend("api.iakl.top", "/")
+                .await
+                .expect("the exact route serves this host")
+                .url,
+            "http://10.0.0.5:8080"
+        );
+        // It is an `http` route, not a fallback for the other modes.
+        assert_eq!(config.get_passthrough_backend("anything.test").await, None);
+        assert!(
+            config
+                .get_l4_backend("anything.test", 443, RouteMode::Tcp)
+                .await
+                .is_none()
+        );
+    }
+
     /// A restricted client reaches the hosts its allowlist names, and nothing
     /// else — the refusal for a host not on the list is the same 404 an
     /// unrouted host gets, so the difference cannot be used as a probe.
@@ -927,13 +887,10 @@ mod tests {
     async fn a_restricted_client_reaches_only_its_allowed_hosts() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(
-            vec![
-                http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
-                http_route("admin.iakl.top", &["http://10.0.0.9:9090"]),
-            ],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
+            http_route("admin.iakl.top", &["http://10.0.0.9:9090"]),
+        ]);
         let acl = ClientAcl::from_hosts(Some(&["api.iakl.top".to_string()]));
 
         // The allowed host reaches its own route.
@@ -952,7 +909,8 @@ mod tests {
                 .await
                 .is_none()
         );
-        // So is an unrouted one, with or without a default backend configured.
+        // So is an unrouted one: being on the allowlist does not conjure a
+        // route for a host the server does not serve.
         assert!(
             config
                 .get_backend_with_acl("typo.iakl.top", "/", Some(&acl))
@@ -961,40 +919,44 @@ mod tests {
         );
     }
 
-    /// The default backend is not a hole in the allowlist: a restricted client
-    /// whose host matches no route gets 404 rather than the fallback, because
-    /// the fallback serves hosts the allowlist never authorized.
+    /// A restricted client is served by routes, not by anything unnamed: a host
+    /// on the allowlist with no route of its own is a 404, the same one an
+    /// unrouted host gets, so the difference cannot be used as a probe.
     #[tokio::test]
-    async fn a_restricted_client_never_falls_back_to_the_default_backend() {
+    async fn a_restricted_client_needs_a_route_and_not_just_a_host() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(
-            vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![
+            http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
+            http_route("*", &["http://10.0.0.9:9000"]),
+        ]);
 
-        // `other.iakl.top` is on the allowlist but has no route of its own:
-        // the fallback would happily serve it, and must not.
+        // `other.iakl.top` is on the allowlist and has no route of its own; the
+        // catch-all matches it, and that is a route like any other, so the
+        // allowlist is what decides.
         let acl = ClientAcl::from_hosts(Some(&[
             "api.iakl.top".to_string(),
             "other.iakl.top".to_string(),
         ]));
-        assert!(
+        assert_eq!(
             config
                 .get_backend_with_acl("other.iakl.top", "/", Some(&acl))
                 .await
-                .is_none(),
-            "the default backend must not serve a restricted client"
+                .expect("the allowlist names this host")
+                .url,
+            "http://10.0.0.9:9000"
         );
 
-        // An unrestricted client keeps the fallback, whatever host it sends.
-        assert!(config.get_backend("other.iakl.top", "/").await.is_some());
+        // A host the allowlist never named is refused even though the catch-all
+        // would serve it for anyone else.
+        let narrow = ClientAcl::from_hosts(Some(&["api.iakl.top".to_string()]));
         assert!(
             config
-                .get_backend_with_acl("other.iakl.top", "/", None)
+                .get_backend_with_acl("other.iakl.top", "/", Some(&narrow))
                 .await
-                .is_some()
+                .is_none()
         );
+        assert!(config.get_backend("other.iakl.top", "/").await.is_some());
     }
 
     #[test]
@@ -1011,14 +973,10 @@ mod tests {
 
     /// A `Host` header is case-insensitive and may carry a fully-qualified
     /// trailing dot. Both spellings name the host the route was written for, so
-    /// neither may slip past it and land on `default_backend` — a different
-    /// service entirely.
+    /// neither may slip past it and reach a different service entirely.
     #[tokio::test]
     async fn a_differently_spelled_host_still_reaches_its_route() {
-        let config = RouteConfig::new(
-            vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])],
-            Some("http://default:80".to_string()),
-        );
+        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
 
         for host in ["API.IAKL.TOP", "Api.Iakl.Top", "api.iakl.top."] {
             assert_eq!(
@@ -1034,10 +992,8 @@ mod tests {
 
         // The pattern side is folded the same way, so a config written with
         // uppercase letters answers the lowercase request.
-        let uppercase = RouteConfig::new(
-            vec![http_route("API.Iakl.Top", &["http://10.0.0.7:8080"])],
-            None,
-        );
+        let uppercase =
+            RouteConfig::new(vec![http_route("API.Iakl.Top", &["http://10.0.0.7:8080"])]);
         assert_eq!(
             uppercase
                 .get_backend("api.iakl.top", "/")
@@ -1052,13 +1008,10 @@ mod tests {
     /// `matches_host`, so both are folded.
     #[tokio::test]
     async fn sni_and_l4_hosts_are_folded_the_same_way() {
-        let config = RouteConfig::new(
-            vec![
-                passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
-                l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
-            ],
-            None,
-        );
+        let config = RouteConfig::new(vec![
+            passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
+            l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
+        ]);
 
         assert_eq!(
             config.get_passthrough_backend("FN.IROH.IAKL.TOP.").await,

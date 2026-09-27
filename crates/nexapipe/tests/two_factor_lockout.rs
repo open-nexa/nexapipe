@@ -223,7 +223,6 @@ fn persists_lockout_counters_across_a_reload() {
     std::fs::write(
         &path,
         "# operator comment that must survive\n\
-         default_backend = \"http://localhost:3000\"\n\
          [auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
@@ -287,8 +286,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
     let path_str = path.to_str().unwrap();
     std::fs::write(
         &path,
-        "default_backend = \"http://localhost:3000\"\n\
-         [auth]\n\
+        "[auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
          secret = \"JBSWY3DPEHPK3PXP\"\n",
