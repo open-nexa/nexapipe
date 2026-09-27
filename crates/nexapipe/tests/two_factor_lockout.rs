@@ -24,6 +24,16 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The nonce the tests sign over, minted the way the connection layer mints
+/// its challenge (`conn::perform_authentication` draws 32 random bytes).
+///
+/// A test could just as well sign over a fixed literal, but a constant sitting
+/// in a nonce slot is exactly what CWE-798 is about — and it would be the one
+/// place in the tree where the challenge is the same twice.
+fn fresh_nonce() -> Vec<u8> {
+    (0..32).map(|_| rand::random::<u8>()).collect()
+}
+
 fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConfig {
     let mut config = AuthConfig {
         enabled: true,
@@ -57,14 +67,14 @@ fn accepts_a_signed_current_response() {
     let config = auth_config_with_client(3, 60);
     let client = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
 
-    let nonce = b"server-challenge-nonce";
+    let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(nonce, timestamp);
+    let signature = client.sign_challenge(&nonce, timestamp);
     let code = client.generate_code().unwrap();
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
-        nonce,
+        &nonce,
         timestamp,
         &signature,
         &code,
@@ -85,12 +95,13 @@ fn rejects_a_response_signed_over_a_different_nonce() {
     let client = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
 
     let timestamp = now();
-    let signature = client.sign_challenge(b"another-connections-nonce", timestamp);
+    let signed_over = fresh_nonce();
+    let signature = client.sign_challenge(&signed_over, timestamp);
     let code = client.generate_code().unwrap();
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
-        b"server-challenge-nonce",
+        &fresh_nonce(),
         timestamp,
         &signature,
         &code,
@@ -106,16 +117,12 @@ fn rejects_a_stale_timestamp() {
     let client = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
 
     let stale = now() - 120;
-    let signature = client.sign_challenge(b"server-challenge-nonce", stale);
+    let nonce = fresh_nonce();
+    let signature = client.sign_challenge(&nonce, stale);
     let code = client.generate_code().unwrap();
 
-    let outcome = TotpValidator::new(&config).verify_response(
-        "client-001",
-        b"server-challenge-nonce",
-        stale,
-        &signature,
-        &code,
-    );
+    let outcome =
+        TotpValidator::new(&config).verify_response("client-001", &nonce, stale, &signature, &code);
     assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
 }
 
@@ -127,13 +134,13 @@ fn reports_a_wrong_code_as_a_counted_failure() {
     let config = auth_config_with_client(3, 60);
     let client = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
 
-    let nonce = b"server-challenge-nonce";
+    let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(nonce, timestamp);
+    let signature = client.sign_challenge(&nonce, timestamp);
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
-        nonce,
+        &nonce,
         timestamp,
         &signature,
         "000000",
@@ -150,15 +157,15 @@ fn locks_out_after_max_attempts() {
     let mut config = auth_config_with_client(3, 60);
     let client = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
 
-    let nonce = b"server-challenge-nonce";
+    let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(nonce, timestamp);
+    let signature = client.sign_challenge(&nonce, timestamp);
     let code = client.generate_code().unwrap();
 
     for _ in 0..3 {
         let outcome = TotpValidator::new(&config).verify_response(
             "client-001",
-            nonce,
+            &nonce,
             timestamp,
             &signature,
             "000000",
@@ -178,7 +185,7 @@ fn locks_out_after_max_attempts() {
 
     let locked = TotpValidator::new(&config).verify_response(
         "client-001",
-        nonce,
+        &nonce,
         timestamp,
         &signature,
         &code,
@@ -195,7 +202,7 @@ fn locks_out_after_max_attempts() {
         .record_success();
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
-        nonce,
+        &nonce,
         timestamp,
         &signature,
         &code,
