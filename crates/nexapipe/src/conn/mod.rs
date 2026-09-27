@@ -10,14 +10,13 @@ use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub mod allow_list;
 pub mod limits;
 
 use limits::ConnectionLimiter;
 
-type HttpClient = legacy::Client<
-    legacy::connect::HttpConnector,
-    http_body_util::Full<bytes::Bytes>,
->;
+type HttpClient =
+    legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
 
 /// How long the server waits for the client to open the 2FA handshake stream.
 ///
@@ -134,16 +133,33 @@ pub async fn handle_bidi_stream(
                 // send its first payload in the same segment, which `buf` already
                 // holds and must hand over intact.
                 if buf.first().is_some_and(|b| l4::is_l4_stream(*b)) {
-                    return l4::handle_iroh_stream(send, recv, buf, config, limiter, peer, acl.as_deref())
-                        .await;
+                    return l4::handle_iroh_stream(
+                        send,
+                        recv,
+                        buf,
+                        config,
+                        limiter,
+                        peer,
+                        acl.as_deref(),
+                    )
+                    .await;
                 }
 
                 // TLS is terminated by the backend, so a ClientHello is not a
                 // request: hand the raw bytes (and both halves of the stream)
                 // to the passthrough path, which routes on SNI.
-                if buf.first().is_some_and(|b| passthrough::is_tls_handshake(*b)) {
-                    return passthrough::handle_iroh_stream(send, recv, buf, config, acl.as_deref())
-                        .await;
+                if buf
+                    .first()
+                    .is_some_and(|b| passthrough::is_tls_handshake(*b))
+                {
+                    return passthrough::handle_iroh_stream(
+                        send,
+                        recv,
+                        buf,
+                        config,
+                        acl.as_deref(),
+                    )
+                    .await;
                 }
 
                 if let Some(pos) = find_headers_end(&buf) {
@@ -439,20 +455,22 @@ async fn enroll_client(
 
     // Is there a client at all, and does it have this token outstanding? Asked
     // before anything is mutated so the refusal paths stay a single read.
-    let accepted = cfg
-        .clients
-        .get(client_id)
-        .is_some_and(|client| {
-            client
-                .pending_enrollment
-                .as_deref()
-                .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
-        });
+    let accepted = cfg.clients.get(client_id).is_some_and(|client| {
+        client
+            .pending_enrollment
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
+    });
     if !accepted {
         drop(cfg);
-        write_auth_message(send, &AuthMessage::EnrollFailed { reason: REFUSED.to_string() })
-            .await
-            .map_err(AuthFailure::NotStarted)?;
+        write_auth_message(
+            send,
+            &AuthMessage::EnrollFailed {
+                reason: REFUSED.to_string(),
+            },
+        )
+        .await
+        .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(format!(
             "enrollment refused for client '{client_id}': {REFUSED}"
         )));
@@ -479,11 +497,8 @@ async fn enroll_client(
     // Persisted before anything is promised to the client: a secret that is
     // live in memory but missing from disk is a secret that silently reverts
     // on the next restart, which would put the old one back in service.
-    if let Err(e) = crate::config::ProxyConfig::complete_enrollment(
-        auth.path(),
-        client_id,
-        &secret,
-    ) {
+    if let Err(e) = crate::config::ProxyConfig::complete_enrollment(auth.path(), client_id, &secret)
+    {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
         if let Some(client) = cfg.clients.get_mut(client_id) {
@@ -492,9 +507,14 @@ async fn enroll_client(
         }
         drop(cfg);
         let reason = format!("enrollment could not be saved: {e}");
-        write_auth_message(send, &AuthMessage::EnrollFailed { reason: reason.clone() })
-            .await
-            .map_err(AuthFailure::NotStarted)?;
+        write_auth_message(
+            send,
+            &AuthMessage::EnrollFailed {
+                reason: reason.clone(),
+            },
+        )
+        .await
+        .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(reason));
     }
     drop(cfg);
@@ -784,7 +804,12 @@ async fn perform_authentication(
                     tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
                 }
                 _ => {
-                    tracing::warn!("2FA: response from {} for '{}' rejected: {}", peer, client_id, e);
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' rejected: {}",
+                        peer,
+                        client_id,
+                        e
+                    );
                 }
             }
             false
@@ -915,8 +940,14 @@ pub async fn handle_connection(
     // Resolved before the block, not inside an `if let` condition: the read
     // guard has to be gone by the time `perform_authentication` asks for the
     // write lock, and holding a read guard across that would deadlock the
-    // endpoint's own RwLock. `enabled` is restart-only, so reading it a
-    // statement early changes nothing.
+    // endpoint's own RwLock.
+    //
+    // `enabled` is read here, once per connection, which is also where a reload
+    // that turns 2FA on takes effect: the value is live, so a connection opened
+    // after that reload is gated. A connection already carrying a `client_acl`
+    // is not re-gated mid-flight — its authorization was decided at its own
+    // handshake, the same rule that lets a deleted client finish an open
+    // connection.
     let auth = match &auth_state {
         Some(auth) => {
             let enabled = auth.config().read().await.enabled;
@@ -1067,9 +1098,18 @@ mod tests {
     fn token_comparison_only_accepts_an_exact_match() {
         let token = "0123456789abcdef";
         assert!(constant_time_eq(token.as_bytes(), token.as_bytes()));
-        assert!(!constant_time_eq(token.as_bytes(), "1123456789abcdef".as_bytes()));
-        assert!(!constant_time_eq(token.as_bytes(), "0123456789abcdeF".as_bytes()));
-        assert!(!constant_time_eq(token.as_bytes(), "0123456789abcdef0".as_bytes()));
+        assert!(!constant_time_eq(
+            token.as_bytes(),
+            "1123456789abcdef".as_bytes()
+        ));
+        assert!(!constant_time_eq(
+            token.as_bytes(),
+            "0123456789abcdeF".as_bytes()
+        ));
+        assert!(!constant_time_eq(
+            token.as_bytes(),
+            "0123456789abcdef0".as_bytes()
+        ));
         assert!(!constant_time_eq(token.as_bytes(), b""));
         // Two empty tokens compare equal, which is why a client with no token
         // outstanding must not be enrolled at all rather than compared here.

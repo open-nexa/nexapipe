@@ -26,6 +26,10 @@ use tokio::sync::Mutex;
 /// into the file, and without a reload the enrollment link only worked after a
 /// restart. When an auth state is present, a reload swaps the clients table in
 /// the same pass; see [`ConfigWatcher::reload_auth`].
+///
+/// `enabled` now moves too, in one direction only: a reload may turn 2FA *on*
+/// (for connections opened after it), and is refused when it would turn 2FA
+/// *off*. See [`ConfigWatcher::apply_auth_enabled`].
 pub struct ConfigWatcher {
     config_path: String,
     route_config: Arc<RouteConfig>,
@@ -36,6 +40,33 @@ pub struct ConfigWatcher {
     /// The live 2FA state, when 2FA is configured. Its `RwLock` is what makes a
     /// client-table reload possible without dropping an existing connection.
     auth: Option<AuthState>,
+    /// Where the plaintext listener ended up, when it is bound at all.
+    ///
+    /// Carried here for one check: turning 2FA on is only sound if the plaintext
+    /// listener is not reachable from the network, which is the conflict
+    /// `run_proxy` refuses a *start* over. A reload has to reach the same
+    /// verdict, and it cannot see the bound socket from inside this task.
+    ///
+    /// A `OnceLock` rather than a constructor argument because the socket is
+    /// bound minutes of code after the watcher is constructed and spawned; the
+    /// reload that needs this value cannot run before the first 5 s poll, so the
+    /// two are ordered by construction, not by luck. Empty means "bound a
+    /// listener whose address nobody recorded, or none at all", which the
+    /// enabling check treats as the permissive case — losing the check is not a
+    /// reason to refuse an operator's edit.
+    plaintext: std::sync::OnceLock<PlaintextListener>,
+}
+
+/// The plaintext listener as the reload path needs to judge it: the address it
+/// actually bound and whether the operator opted into exposing it.
+///
+/// Copied out of `run_proxy` rather than looked up later because the socket's
+/// own `local_addr` is the only thing that knows what `0.0.0.0` and a concrete
+/// LAN address have in common, and the listener task owns it after startup.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaintextListener {
+    pub addr: std::net::SocketAddr,
+    pub exposed: bool,
 }
 
 impl ConfigWatcher {
@@ -52,7 +83,14 @@ impl ConfigWatcher {
             http_client,
             health_seen,
             auth,
+            plaintext: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Records where the plaintext listener ended up, once `run_proxy` has bound
+    /// it. Ignored on a second call: there is only one listener per process.
+    pub fn set_plaintext_listener(&self, listener: PlaintextListener) {
+        let _ = self.plaintext.set(listener);
     }
 
     pub async fn start_watch(&self) {
@@ -135,12 +173,14 @@ impl ConfigWatcher {
     /// Applies the `[auth]` section of a freshly read config to the live 2FA
     /// state.
     ///
-    /// Only the clients table is swapped: `enabled` and the TOTP parameters
-    /// stay as they were at startup. Gating the listener on 2FA is a decision
-    /// with consequences for every warning and every connection, and flipping
-    /// `enabled` — or the algorithm the issued secrets are keyed with —
-    /// mid-run would silently strand clients that were enrolled under the old
-    /// parameters. Those still need a restart; a client list edit does not.
+    /// The clients table is swapped unconditionally; `enabled` is applied by
+    /// [`ConfigWatcher::apply_auth_enabled`], which may refuse it. The TOTP
+    /// parameters stay as they were at startup: flipping the algorithm the
+    /// issued secrets are keyed with — or the step and digit count their codes
+    /// are computed under — mid-run would silently strand every client enrolled
+    /// under the old ones, and unlike `enabled` there is no direction of that
+    /// change which is ever safe. Those still need a restart; a client list edit
+    /// does not.
     ///
     /// Counters live in memory and are only periodically flushed to disk by
     /// [`save_auth_state`], so for a client that survives the reload the
@@ -162,6 +202,26 @@ impl ConfigWatcher {
         };
 
         let mut live = state.config().write().await;
+
+        // Before the clients table, because it is the only step that can decide
+        // not to apply anything: refusing a change that would ungate the
+        // listener has to leave the clients where they were too, or the file
+        // gets half-applied.
+        if let Some(refusal) = ConfigWatcher::auth_enabled_refusal(
+            &live,
+            &new_auth,
+            &self.config_path,
+            self.plaintext.get().copied(),
+        ) {
+            tracing::error!("{refusal}");
+        } else if apply_auth_enabled(&mut live, &new_auth) == Some(true) {
+            tracing::warn!(
+                "[auth] enabled is now true: connections opened from here on must complete \
+                 the 2FA handshake. Connections that are already authenticated keep working — \
+                 they carry the authorization they were given when they connected"
+            );
+        }
+
         let (added, removed) = merge_auth_clients(&mut live, &new_auth);
 
         for id in &added {
@@ -179,6 +239,109 @@ impl ConfigWatcher {
             );
         }
     }
+
+    /// Why this reload must not move `enabled`, when it must not.
+    ///
+    /// Returns the message to log and otherwise does nothing; the caller keeps
+    /// the live state and applies the rest of the section. Three refusals, all
+    /// about the single direction that can go wrong — turning the gate on:
+    ///
+    /// - **The file wants 2FA off.** Nothing requires this direction, and it
+    ///   silently removes the listener's only gate on a running server. An
+    ///   operator who wants it off restarts, which is also the only way to be
+    ///   sure the change was meant rather than a half-saved edit.
+    /// - **The plaintext listener is reachable from the network.** `run_proxy`
+    ///   already refuses to *start* in this configuration, and 2FA does not run
+    ///   on that listener, so enabling it mid-run would produce exactly the
+    ///   state the startup check exists to prevent. A reload must not be the way
+    ///   around a check the startup path enforces.
+    /// - **The config file is not private.** 2FA off is how a 0644 file is
+    ///   allowed to exist (a Docker bind mount arrives that way); enabling 2FA
+    ///   turns every secret in it into a live credential for every account that
+    ///   can read it, which `check_config_permissions` refuses at startup for
+    ///   the same reason.
+    ///
+    /// `live.enabled == true` short-circuits all of it: once 2FA is on, the file
+    /// saying `true` again changes nothing, so a reload that only edits routes
+    /// cannot be blocked by any of the three.
+    fn auth_enabled_refusal(
+        live: &AuthConfig,
+        incoming: &AuthConfig,
+        config_path: &str,
+        plaintext: Option<PlaintextListener>,
+    ) -> Option<String> {
+        if live.enabled == incoming.enabled {
+            return None;
+        }
+
+        // The file says false while the process is gating: refuse the change.
+        if live.enabled {
+            return Some(
+                "[auth] enabled = false is ignored: 2FA gates this listener and a reload cannot \
+                 drop the only gate it has. Restart to disable 2FA."
+                    .to_string(),
+            );
+        }
+
+        // The file says true while the process is not gating: three conditions
+        // have to hold, and each has a message naming the way out.
+        if let Some(plaintext) = plaintext
+            && crate::proxy::plaintext_auth_conflict(plaintext.addr, plaintext.exposed, true)
+                .is_some()
+        {
+            return Some(format!(
+                "[auth] enabled = true is ignored: the plaintext listener on {} would still reach \
+                 every route without credentials, because 2FA only runs on the iroh listener. \
+                 Remove [server] listen_addr or set expose = false, then restart.",
+                plaintext.addr
+            ));
+        }
+
+        if let Some(refusal) = config_file_enabling_refusal(config_path) {
+            return Some(format!("[auth] enabled = true is ignored: {refusal}"));
+        }
+
+        None
+    }
+}
+
+/// The refusal for turning 2FA on against the config file as it is right now.
+///
+/// The rule itself is `config::world_readable_refusal` — the same "the secrets
+/// become live credentials, so the file has to be private" test the startup path
+/// applies — reused rather than restated so the two cannot drift. Only the mode
+/// is read here, because that is the one input the caller cannot supply.
+#[cfg(unix)]
+fn config_file_enabling_refusal(path: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The file has just been read, so a failed stat is its own problem and not a
+    // reason to refuse a change.
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    crate::config::world_readable_refusal(path, mode, true)
+}
+
+/// No file modes to inspect outside Unix, so there is nothing to refuse.
+#[cfg(not(unix))]
+fn config_file_enabling_refusal(_path: &str) -> Option<String> {
+    None
+}
+
+/// Moves `enabled` from the file onto the live state, and reports the transition.
+///
+/// Returns `Some(true)` when 2FA was just switched on, `Some(false)` when it was
+/// switched off, and `None` when nothing changed — so the caller can log the one
+/// transition worth a word without re-reading the state.
+///
+/// Deliberately only `enabled`: every other field of `[auth]` is either applied
+/// by [`merge_auth_clients`] or startup-only, and the TOTP parameters are the
+/// latter for the reason on [`ConfigWatcher::reload_auth`].
+fn apply_auth_enabled(live: &mut AuthConfig, incoming: &AuthConfig) -> Option<bool> {
+    if live.enabled == incoming.enabled {
+        return None;
+    }
+    live.enabled = incoming.enabled;
+    Some(live.enabled)
 }
 
 pub type SharedConfigWatcher = Arc<ConfigWatcher>;
@@ -205,10 +368,15 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
         .and_then(|item| item.as_table_like_mut())
         .and_then(|auth| auth.get_mut("clients"))
         .and_then(|item| item.as_table_like_mut())
-        .ok_or_else(|| anyhow::anyhow!("{path} has no [auth.clients] table, auth state not written"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("{path} has no [auth.clients] table, auth state not written")
+        })?;
 
     for (id, client) in &config.clients {
-        let Some(table) = clients.get_mut(id).and_then(|item| item.as_table_like_mut()) else {
+        let Some(table) = clients
+            .get_mut(id)
+            .and_then(|item| item.as_table_like_mut())
+        else {
             // Not on disk: the operator edited the file under us; writing a
             // section without a secret would break the next load.
             continue;
@@ -356,26 +524,166 @@ mod tests {
         assert_eq!(client.locked_until, Some(12345));
     }
 
-    /// `enabled` and the TOTP parameters are startup-only: the merge touches
-    /// the clients table and nothing else, so a mid-run edit cannot strand
-    /// clients enrolled under the old parameters.
+    /// The TOTP parameters are startup-only: the merge touches the clients
+    /// table and nothing else, so a mid-run edit cannot strand clients enrolled
+    /// under the old algorithm, step or digit count.
     #[test]
-    fn the_merge_leaves_everything_but_the_clients_alone() {
+    fn the_merge_leaves_the_totp_parameters_alone() {
         let mut live = config_with(&[("a", client("A"))]);
-        live.enabled = true;
         live.issuer = "Startup Issuer".to_string();
         live.max_attempts = 9;
 
         let mut incoming = config_with(&[("a", client("A2"))]);
-        incoming.enabled = false;
         incoming.issuer = "File Issuer".to_string();
         incoming.max_attempts = 3;
 
         merge_auth_clients(&mut live, &incoming);
 
-        assert!(live.enabled);
         assert_eq!(live.issuer, "Startup Issuer");
         assert_eq!(live.max_attempts, 9);
         assert_eq!(live.clients["a"].secret, "A2");
+    }
+
+    /// Turning 2FA on mid-run is the half of the old startup-only rule that had
+    /// to go: without it, an operator who writes `enabled = true` gets a log
+    /// line saying the config reloaded and a listener that is still ungated.
+    #[test]
+    fn a_reload_turns_2fa_on() {
+        let mut live = config_with(&[("a", client("A"))]);
+        live.enabled = false;
+
+        let mut incoming = config_with(&[("a", client("A"))]);
+        incoming.enabled = true;
+
+        assert_eq!(apply_auth_enabled(&mut live, &incoming), Some(true));
+        assert!(
+            live.enabled,
+            "the file's `true` is what the listener now uses"
+        );
+    }
+
+    /// The transition is reported only when it happens, so the reload path can
+    /// log it without re-reading the state — and so a route-only edit while 2FA
+    /// is on stays quiet.
+    #[test]
+    fn an_unchanged_enabled_reports_no_transition() {
+        let mut live = config_with(&[("a", client("A"))]);
+        live.enabled = true;
+
+        let mut incoming = config_with(&[("a", client("A"))]);
+        incoming.enabled = true;
+
+        assert_eq!(apply_auth_enabled(&mut live, &incoming), None);
+        assert!(live.enabled);
+    }
+
+    /// The direction that has to be refused: `enabled = false` on a server that
+    /// is gating would remove the listener's only gate, and an operator who
+    /// wants that restarts.
+    #[test]
+    fn a_reload_may_not_turn_2fa_off() {
+        let mut live = config_with(&[("a", client("A"))]);
+        live.enabled = true;
+
+        let mut incoming = config_with(&[("a", client("A"))]);
+        incoming.enabled = false;
+
+        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None)
+            .expect("turning 2FA off must be refused");
+
+        assert!(
+            refusal.contains("[auth] enabled = false is ignored"),
+            "{refusal}"
+        );
+        // The refusal is only a message; the caller applies nothing, so the live
+        // state still gates.
+        assert!(live.enabled);
+    }
+
+    /// Once 2FA is on, the file repeating `true` is not a transition, so none of
+    /// the three enabling checks can block an unrelated edit — a route change
+    /// during a `chmod 644` moment still reloads.
+    #[test]
+    fn an_already_enabled_config_is_never_refused() {
+        let mut live = config_with(&[]);
+        live.enabled = true;
+
+        let mut incoming = config_with(&[]);
+        incoming.enabled = true;
+
+        assert_eq!(
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "/nonexistent", None),
+            None
+        );
+    }
+
+    /// Enabling 2FA against a config file other accounts can read would turn
+    /// every secret in it into a live credential, which is what
+    /// `check_config_permissions` refuses a start over.
+    #[cfg(unix)]
+    #[test]
+    fn a_reload_may_not_enable_2fa_on_a_world_readable_config() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "[auth]\nenabled = true").unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let live = config_with(&[]);
+        let mut incoming = config_with(&[]);
+        incoming.enabled = true;
+
+        let refusal =
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, path.to_str().unwrap(), None)
+                .expect("a world-readable config must not be enabled on");
+
+        assert!(refusal.contains("chmod 600"), "{refusal}");
+
+        // And the check is about the mode alone: private is not refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, path.to_str().unwrap(), None),
+            None
+        );
+    }
+
+    /// 2FA does not run on the plaintext listener, so enabling it while that
+    /// listener is reachable from the network would produce exactly the state
+    /// `run_proxy` refuses to start in. A reload must not be the way around a
+    /// check the startup path enforces.
+    #[test]
+    fn a_reload_may_not_enable_2fa_while_plaintext_is_exposed() {
+        let live = config_with(&[]);
+        let mut incoming = config_with(&[]);
+        incoming.enabled = true;
+
+        let exposed = Some(PlaintextListener {
+            addr: "0.0.0.0:8080".parse().unwrap(),
+            exposed: true,
+        });
+        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", exposed)
+            .expect("an exposed plaintext listener must block the flip");
+        assert!(refusal.contains("plaintext listener"), "{refusal}");
+
+        // A loopback listener is the case the startup path allows, so it is not
+        // refused here either.
+        let loopback = Some(PlaintextListener {
+            addr: "127.0.0.1:8080".parse().unwrap(),
+            exposed: false,
+        });
+        assert_eq!(
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", loopback),
+            None
+        );
+
+        // And no plaintext listener at all is always fine.
+        assert_eq!(
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None),
+            None
+        );
     }
 }

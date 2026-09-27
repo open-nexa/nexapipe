@@ -15,8 +15,10 @@
 #
 # This file is the 2FA one; the sibling `config.toml.example` writes out every
 # other section (relay modes, all four route modes, `[log]`) at length and leaves
-# `[auth]` off. Everything except `[server]`, `[iroh]`, `[auth]` and `[log]` is
-# reread every 5 s and takes effect without a restart.
+# `[auth]` off. `[[routes]]`, `default_backend` and `[auth.clients]` are reread
+# every 5 s and take effect without a restart; `[auth] enabled = true` is picked
+# up live too (but turning it off is not), while `[server]`, `[iroh]`, `[peers]`,
+# the `[auth]` TOTP parameters and `[log]` need a restart.
 
 # ===== Server Configuration =====
 default_backend = "http://localhost:3000"
@@ -59,9 +61,25 @@ bind_port = 0
 # Bearer token for that relay; it has to be configured on both sides.
 # relay_auth_token = ""
 
+# ===== Peer allow-list (optional, runs before 2FA) =====
+# Which client Node IDs may complete a QUIC handshake at all. A peer that is not
+# listed is closed before any stream is opened, so this is checked earlier than
+# everything below. It is not a substitute for 2FA - it answers "may this Node ID
+# be here", where 2FA answers "who is it" - but the two compose usefully: an
+# unlisted peer never reaches the handshake, and a listed one still has to
+# authenticate. Take each Node ID from the client app. A typo is a startup error
+# and an empty list is refused, so neither can silently lock you out.
+# [peers]
+# allow = [
+#   "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+# ]
+
 # ===== 2FA Authentication Configuration (server side) =====
 # When enabled, every client connection must complete a TOTP handshake before
-# proxying is allowed. Read once at startup — restart after changing any of it.
+# proxying is allowed. `enabled` is picked up live by the config watcher, taking
+# effect for connections opened after the reload; turning it back *off* on a
+# running server is refused, so disabling 2FA needs a restart. The TOTP
+# parameters below are read once at startup - restart after changing any of them.
 [auth]
 enabled = true
 algorithm = "sha1"      # sha1, sha256, sha512
@@ -128,6 +146,19 @@ issuer = "NexaPipe"
 # Warning: changing algorithm, time_step or digits here does NOT change what the
 # app does once it has scanned the code. Those values are only read when the
 # enrollment QR code is generated; keep them stable after clients are enrolled.
+#
+# Both invite forms above need the client to exist already, since they hand out
+# the secret this file holds. To create one and invite it in a single run, add
+# --create-client — it generates the secret, writes it here and puts it in the
+# invite, which is two commands folded into one:
+#
+#   nexapipe --generate-invite client-003 --create-client --config config.toml
+#   nexapipe --generate-invite client-003 --create-client --registration
+#
+# It only ever creates a client that is missing entirely: run against one that
+# already has a secret it reuses that secret rather than issuing a second, so an
+# existing device is never locked out. Rotating a secret stays explicit:
+# --generate-2fa client-001 --force.
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"

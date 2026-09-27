@@ -1,3 +1,7 @@
+<p align="right">
+  English · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 # NexaPipe
 
 Expose HTTP, HTTPS, WebSocket, TCP and UDP services that live behind NAT through
@@ -175,8 +179,10 @@ Swift/Kotlin/Python — see [Using the client library](#using-the-client-library
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
+| `screenshots/` | Client-app screenshots, used by this README and the two app READMEs. |
 | `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
 | `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
+| `README.zh-CN.md` | Chinese translation of this file ([简体中文](README.zh-CN.md)). |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -236,6 +242,8 @@ running on the Docker host are reachable.
 | `--qr-invert` | Draw the QR code light on dark. |
 | `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, else ASCII). |
 | `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` the 2FA secret goes in too; without one it carries only the endpoint and its domains. |
+| `--registration` | With `--generate-invite CLIENT_ID`: carry a one-time enrollment token instead of the secret. |
+| `--create-client` | With `--generate-invite CLIENT_ID`: create the client when it does not exist yet, generating and writing its secret in the same run. |
 | `--invite-domains <LIST>` | Comma-separated domains for the invite (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
 | `--invite-relay <URL>` | Relay URL for the invite (default: `[iroh] relay_url`). |
@@ -253,11 +261,20 @@ The file is re-read every 5 seconds and **applied live**: `[[routes]]`,
 — an invite generated while the server runs (`--generate-invite --registration`
 writes `pending_enrollment` into the file) becomes spendable on the running
 server within one poll, and a client added or removed from `[auth.clients]`
-does not need a restart either. A config that fails to parse or validate is
-reported and ignored so a half-saved edit cannot take the proxy down. The rest
-still needs a restart, because it is read once when the process starts:
+does not need a restart either. `[auth] enabled = true` also takes effect live,
+for connections opened after the reload (connections already authenticated keep
+the authorization they were given). A config that fails to parse or validate is
+reported and ignored so a half-saved edit cannot take the proxy down.
+
+The rest still needs a restart, because it is read once when the process starts:
 `[server] listen_addr`, `[iroh] secret_key` / `bind_port` / relay settings,
-`[auth]` `enabled` and its TOTP parameters, and `[log]`.
+`[peers] allow`, the `[auth]` TOTP parameters (`algorithm`, `time_step`, `digits`,
+`window`, `issuer`, `max_attempts`, `lockout_duration`), and `[log]`. Two reloads
+are *refused* rather than applied, each because applying it would weaken a
+running server: `enabled = false` once 2FA is gating (restart to disable it), and
+`enabled = true` while the plaintext listener is exposed or while the config file
+is readable by other accounts — both of which the startup path would have refused
+outright.
 
 ### Top level
 
@@ -421,6 +438,43 @@ domains = ["app.example.com"]
 The same domain may appear on several nodes; that is how you load balance across
 servers. `server_ticket` and `server_node_id` at the `[local_proxy]` level still
 work but are deprecated — prefer `[[local_proxy.nodes]]`.
+
+### `[peers]` — which Node IDs may connect at all
+
+Optional, and the check that runs earliest: an allow-list of client public keys
+applied during the QUIC handshake, before the connection is accepted. A peer that
+is not on the list gets a close frame and nothing else — no stream is ever opened,
+no connection slot is taken, no task is spawned.
+
+```toml
+[peers]
+# A client's Node ID, exactly as the app shows it. There is no wildcard form:
+# these are ed25519 public keys, not host names.
+allow = [
+  "a1b2c3d4e5f6...",
+  "0f1e2d3c4b5a...",
+]
+```
+
+This is not a second factor and not a replacement for 2FA. It answers *may this
+Node ID be here*, where 2FA answers *who is it* — so it is the knob for the server
+that runs with 2FA off, and the two compose: with both set, an unlisted peer never
+reaches the handshake, and a listed one still has to authenticate.
+
+- **Absent or key omitted** — every peer that can reach the endpoint proceeds to
+  the next check. Adding or upgrading without this section changes nothing.
+- **A typo fails at startup.** An entry that is not a valid Node ID is an error,
+  not a silently skipped line: a list whose whole job is to refuse strangers must
+  not come out shorter than it was written.
+- **`allow = []` is refused.** It would refuse everybody, which is a plausible
+  typo and would lock the operator out of their own server — so it is not
+  guessable in either direction.
+- **An unlisted peer is closed with application code `5`.** The client maps that
+  to "the server runs a `[peers]` allow-list and does not permit this Node ID",
+  rather than a bare connection loss.
+
+Restart-only for now: it is read once at startup, like `[iroh]` — see
+[Configuration](#configuration).
 
 ### `[log]`
 
@@ -666,8 +720,9 @@ handshake before any traffic is proxied.
 
 New and changed `[auth.clients]` entries are picked up live by the config
 watcher (see [Configuration](#configuration)) — adding a client does not need a
-restart. Whether 2FA is enabled at all (`[auth] enabled`) is read once at
-startup. See `config.toml.2fa.example`.
+restart. `[auth] enabled = true` is picked up live too, for connections opened
+after the reload; the TOTP parameters (`algorithm`, `time_step`, `digits`) are
+read once at startup and need a restart. See `config.toml.2fa.example`.
 
 Those secrets are the *only* credential gating the iroh listener, so the file
 holding them has to stay private: with `[auth] enabled = true` the server
@@ -771,6 +826,52 @@ Two details worth knowing before you build on the format:
   at once. Treat an invite you cannot account for as rotated.
 
 
+### Inviting a client that does not exist yet (`--create-client`)
+
+`--generate-invite CLIENT_ID` hands out the secret a client *already* has, so it
+refuses a `CLIENT_ID` that is not in `[auth.clients]`. Adding one first is a
+separate step:
+
+```bash
+cargo run -p nexapipe -- --generate-2fa client-001      # writes the secret
+cargo run -p nexapipe -- --generate-invite client-001   # hands it out
+```
+
+`--create-client` folds the two together — the secret is generated, written to
+the config and put into the invite in one run:
+
+```bash
+cargo run -p nexapipe -- --generate-invite client-001 --create-client
+```
+
+This also covers `--registration`, which needs a secret on disk before it can
+record the enrollment token, so a new client can be enrolled in one command:
+
+```bash
+cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
+```
+
+What it deliberately does **not** do:
+
+- **It never touches a client that already exists.** A `--create-client` run
+  against a configured client reuses the stored secret instead of minting a
+  second one, which would lock out every device already enrolled with the first.
+  Rotating stays the explicit `--generate-2fa CLIENT_ID --force`.
+- **It only fills in a client that is missing entirely.** A `[auth.clients.x]`
+  section that exists with no `secret` is a broken file, not a blank to fill in,
+  and is still reported as one.
+- **It is not a standalone "add a client" command.** It requires
+  `--generate-invite`, so a secret is only ever created as part of an invite
+  someone is about to hand out.
+
+Since the new secret is written to `config.toml`, remember that the TOTP
+parameters are read once at startup: if this invite is the first one and you also
+turned `[auth] enabled = true` on in the same edit, the running server does pick
+that up — for connections opened after the reload — but changing `algorithm`,
+`time_step` or `digits` still needs a restart. A client added under
+`[auth.clients]` is picked up on its own (the file is re-read every 5 seconds).
+
+
 ### Enrollment invites (`--registration`)
 
 The problem with the code above is that it stays a credential for as long as the
@@ -827,17 +928,27 @@ reverse-proxying to `localhost:3000`.
 replaces their values with `<redacted>` (`[log] redact_query`, on by default),
 because that is where tokens and signatures travel.
 
-**Known gaps.** Listed here rather than quietly fixed later; the tracking
-document is `docs/security-fix-plan-2026-09-21.md`.
+**What gates the listener.** Three independent checks, each answering a different
+question:
 
-| State | Gap |
-| --- | --- |
-| fixed | Access logs wrote the full URI, so `?token=…` landed on disk |
-| fixed | `[server] listen_addr` served plain HTTP **without** 2FA and defaulted to `0.0.0.0:8080`. It now defaults to *not bound*; a non-loopback bind needs `[server] expose = true` |
-| fixed | A peer could open unlimited concurrent connections. There is now a per-peer cap (64, `NEXAPIPE_MAX_CONNS_PER_PEER`); excess connections are closed before the 2FA handshake |
-| open | Any peer that learns the Node ID can complete the handshake; there is no allow-list of client public keys |
-| open | An authenticated client can reach every route; there is no per-client authorization |
-| narrowed | 2FA is a symmetric shared secret — anyone who scans an invite QR becomes a legitimate client, and a single device cannot be revoked. `--generate-invite --registration` now hands out a one-time enrollment token instead of the secret, so a copied link stops being a credential once it has been used; per-device revocation is still rotation |
+- `[peers] allow` — *may this Node ID be here at all*. Checked in the QUIC
+  handshake, before the connection is accepted, so a peer that is not on the list
+  is closed without ever taking a slot or a task. Optional: with no `[peers]`
+  section every Node ID that can reach the endpoint gets as far as the next check.
+- 2FA — *who is this*. A TOTP handshake whose response needs an HMAC over that
+  connection's nonce, keyed by the client's secret, so knowing a Node ID
+  authenticates nothing.
+- `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
+  at the handshake.
+
+The limits that remain are deliberate, and worth stating rather than discovering:
+a revocation (a deleted `[auth.clients.<id>]`, a rotated secret, an edited
+`allow_hosts`) takes effect on *new* connections only, because a connection
+snapshots its authorization when it authenticates; 2FA is a symmetric shared
+secret, so anyone who scans an invite QR becomes a legitimate client and the
+finest revocation granularity is one client section per device; and turning 2FA
+*on* takes effect on the next connection, while turning it *off* is refused on a
+running server — restart to disable it.
 
 Reporting a vulnerability: open an issue, or contact a maintainer directly
 instead if it is exploitable.
@@ -919,6 +1030,17 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 | --- | --- | --- |
 | Android | [`ui-android`](ui-android/README.md) | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
 | Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
+
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/android-disconnected.jpg" width="240" alt="Android client, not connected"><br><sub>Android — not connected</sub></td>
+    <td align="center"><img src="screenshots/android-connected.jpg" width="240" alt="Android client, connected to an endpoint"><br><sub>Android — connected</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/desktop-disconnected.png" width="400" alt="Desktop client, proxy stopped"><br><sub>Desktop — stopped</sub></td>
+    <td align="center"><img src="screenshots/desktop-connected.png" width="400" alt="Desktop client, proxy running in TUN mode"><br><sub>Desktop — running (TUN)</sub></td>
+  </tr>
+</table>
 
 Both are regular directories of this repository (their git history was
 preserved when they were imported from the former standalone repos

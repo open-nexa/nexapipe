@@ -2,7 +2,7 @@ pub mod local_proxy;
 
 use crate::auth::AuthConfig;
 use crate::config::{IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
-use crate::config_watcher::ConfigWatcher;
+use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
 use crate::health::HealthChecker;
 use crate::http;
@@ -27,7 +27,8 @@ use tokio::net::TcpListener;
 
 /// Shared by the startup path and the config watcher, which spawns checkers for
 /// routes that appear in a reload.
-pub type HttpClient = legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
+pub type HttpClient =
+    legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
 
 /// One background `GET /health` probe per `http` route.
 ///
@@ -100,6 +101,7 @@ pub async fn run_proxy(
     config_path: &str,
     shutdown_signal: Arc<ShutdownSignal>,
     auth_config: Option<AuthConfig>,
+    peer_allow_list: Option<conn::allow_list::PeerAllowList>,
 ) -> anyhow::Result<()> {
     let http_client = Arc::new(http::create_http_client());
 
@@ -109,10 +111,13 @@ pub async fn run_proxy(
     // 2FA state: the shared config plus the file its lockout counters persist to.
     let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
 
-    // The watcher needs both to apply a reload: it rebuilds the routes and
-    // restarts whatever health checks the new routes need — and, when 2FA is
-    // configured, swaps in the `[auth.clients]` table the file now carries, so
-    // an invite generated while the server runs works without a restart.
+    // The watcher needs three things to apply a reload: it rebuilds the routes,
+    // restarts whatever health checks the new routes need, swaps in the
+    // `[auth.clients]` table the file now carries — so an invite generated while
+    // the server runs works without a restart — and moves `[auth] enabled` when
+    // the file turns 2FA on. `plaintext` is filled in further down, once the
+    // listener has been bound; the watcher is an `Arc` by then, so the field is
+    // set through `OnceLock` rather than a constructor argument.
     let config_watcher = Arc::new(ConfigWatcher::new(
         config_path.to_string(),
         config.clone(),
@@ -128,9 +133,10 @@ pub async fn run_proxy(
     });
     tracing::info!("Config watcher started, monitoring: {}", config_path);
 
-    // Whether 2FA actually gates the iroh listener at startup. `enabled` is
-    // restart-only, so this is the value the whole run uses, and it decides
-    // both warnings below.
+    // Whether 2FA gates the iroh listener *right now*. The value is live — a
+    // reload can turn it on, taking effect for connections opened after it — so
+    // this is a startup reading, used for the two startup warnings below and
+    // nothing else. Nothing later in this function may cache it.
     let auth_enabled = match &auth_state {
         Some(state) => state.config().read().await.enabled,
         None => false,
@@ -140,17 +146,30 @@ pub async fn run_proxy(
     // authentication one: without 2FA, anyone who obtains either reaches every
     // route and every backend. That is easy to miss when the config simply has
     // no `[auth]` section yet, so it is said out loud rather than left to the
-    // reader of the docs.
+    // reader of the docs. An allow-list narrows it, so the wording says which of
+    // the two is actually holding the line.
     if !auth_enabled {
-        tracing::warn!(
-            "2FA is not enabled: the endpoint's node id and ticket alone reach every route"
-        );
-        eprintln!(
-            "\n*** WARNING: 2FA authentication is NOT enabled. ***\n\
-             Anyone who obtains this endpoint's Node ID or ticket can connect and\n\
-             reach every route and every backend. Add an [auth] section with\n\
-             enabled = true (see config.toml.2fa.example) to require credentials.\n"
-        );
+        match &peer_allow_list {
+            Some(list) if list.is_configured() => {
+                tracing::warn!(
+                    "2FA is not enabled: peers are gated by the [peers] allow list ({} Node IDs) \
+                     instead, so a Node ID or ticket that is not on it is refused",
+                    list.len()
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    "2FA is not enabled: the endpoint's node id and ticket alone reach every route"
+                );
+                eprintln!(
+                    "\n*** WARNING: 2FA authentication is NOT enabled. ***\n\
+                     Anyone who obtains this endpoint's Node ID or ticket can connect and\n\
+                     reach every route and every backend. Add an [auth] section with\n\
+                     enabled = true (see config.toml.2fa.example) to require credentials, or\n\
+                     a [peers] allow list to restrict which Node IDs may connect at all.\n"
+                );
+            }
+        }
     }
 
     let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
@@ -173,7 +192,9 @@ pub async fn run_proxy(
         if !relay.uses_url()
             && let Some(url) = iroh_config.as_ref().and_then(|c| c.relay_url.as_deref())
         {
-            tracing::warn!("[iroh] relay_url {url:?} is set but this mode does not use one; ignoring it");
+            tracing::warn!(
+                "[iroh] relay_url {url:?} is set but this mode does not use one; ignoring it"
+            );
         }
         builder = builder.relay_mode(relay.relay_mode());
     }
@@ -208,7 +229,22 @@ pub async fn run_proxy(
     // See nexapipe_client::transport for the numbers and the override variables.
     let transport_tuning = nexapipe_client::transport::TransportTuning::from_env();
     tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
-    let builder = builder.transport_config(transport_tuning.transport_config());
+    let mut builder = builder.transport_config(transport_tuning.transport_config());
+
+    // The allow-list is installed as an endpoint hook rather than checked in the
+    // accept loop, which is what makes a refusal cost the peer a close frame and
+    // nothing else: the hook runs inside `accept`, so a refused connection never
+    // becomes an `Incoming`, never takes a per-peer slot and never gets a task.
+    // Installed last, so it is the final word on whether a handshake that got
+    // this far is allowed to proceed.
+    if let Some(list) = peer_allow_list {
+        tracing::info!(
+            "Peer allow-list active: {} Node IDs; every other peer is closed right after the \
+             QUIC handshake",
+            list.len()
+        );
+        builder = builder.hooks(list);
+    }
 
     let ep = builder.bind().await?;
 
@@ -259,6 +295,11 @@ pub async fn run_proxy(
         .and_then(|s| s.expose)
         .unwrap_or(false);
 
+    // The watcher has to reach the same verdict on a reload that turns 2FA on,
+    // and its first poll is 5 s away, so the address is recorded before the
+    // accept loop starts.
+    let mut plaintext = None;
+
     let http_listener = match listen_addr {
         Some(addr) => {
             let listener = TcpListener::bind(&addr).await?;
@@ -278,6 +319,10 @@ pub async fn run_proxy(
                 anyhow::bail!(refusal);
             }
             tracing::info!("HTTP server listening on: {}", bound);
+            plaintext = Some(PlaintextListener {
+                addr: bound,
+                exposed,
+            });
             Some(listener)
         }
         None => {
@@ -288,6 +333,10 @@ pub async fn run_proxy(
             None
         }
     };
+
+    if let Some(listener) = plaintext {
+        config_watcher.set_plaintext_listener(listener);
+    }
 
     // One limiter for the whole endpoint: the per-peer cap only means anything
     // if every accepted connection counts against the same map.
@@ -431,8 +480,14 @@ fn may_bind_plaintext(bound: SocketAddr, exposed: bool) -> bool {
 ///
 /// Split out from [`run_proxy`] for the same reason as
 /// [`may_bind_plaintext`]: the decision is three booleans' worth of input and
-/// deserves its own tests.
-fn plaintext_auth_conflict(bound: SocketAddr, exposed: bool, auth_enabled: bool) -> Option<String> {
+/// deserves its own tests. `pub(crate)` because the config watcher asks the same
+/// question when a reload turns 2FA on — a reload must not be the way around a
+/// check the startup path enforces.
+pub(crate) fn plaintext_auth_conflict(
+    bound: SocketAddr,
+    exposed: bool,
+    auth_enabled: bool,
+) -> Option<String> {
     (exposed && auth_enabled).then(|| {
         format!(
             "[server] expose = true leaves {bound} unauthenticated even though [auth] is \
@@ -574,6 +629,9 @@ mod tests {
         // warns about.
         assert_eq!(plaintext_auth_conflict(bound, true, false), None);
         // 2FA on, but the listener is loopback-only.
-        assert_eq!(plaintext_auth_conflict(addr("127.0.0.1", 8080), false, true), None);
+        assert_eq!(
+            plaintext_auth_conflict(addr("127.0.0.1", 8080), false, true),
+            None
+        );
     }
 }

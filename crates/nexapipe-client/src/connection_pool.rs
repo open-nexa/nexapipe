@@ -53,6 +53,16 @@ const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_s
 /// in `crates/nexapipe/src/conn/mod.rs`.
 const AUTH_REQUIRED_CLOSE_CODE: u32 = 2;
 
+/// The application error code the server closes a connection with when a
+/// `[peers]` allow-list refuses this Node ID. Must match
+/// `PEER_NOT_ALLOWED_CLOSE_CODE` in `crates/nexapipe/src/conn/allow_list.rs`.
+///
+/// Reached from a different place than the 2FA codes: the server refuses inside
+/// the QUIC handshake, so `connect` itself fails rather than a later stream. The
+/// preconnect has to read the close reason from that failure to turn "connection
+/// lost" into a cause the operator can act on.
+const PEER_NOT_ALLOWED_CLOSE_CODE: u32 = 5;
+
 /// How traffic currently reaches a backend: direct, or through a relay.
 ///
 /// iroh keeps several paths open per connection and marks exactly one of them *selected* — the
@@ -359,7 +369,16 @@ impl IrohConnectionPool {
             );
             #[cfg(not(feature = "tracing"))]
             let _ = started;
-            anyhow::anyhow!(e)
+
+            // A `[peers]` allow-list refuses inside the QUIC handshake, so the
+            // only place its verdict shows up is the error from `connect`
+            // itself — there is no connection left to ask. Turn it into the same
+            // actionable sentence the 2FA refusals produce, instead of a bare
+            // "connection lost".
+            if let Some(reason) = peer_not_allowed_reason(&e) {
+                return ClientError::AuthenticationFailed(reason);
+            }
+            ClientError::ConnectionFailed(e.to_string())
         })?;
 
         // Enrollment first: a token is spent once and buys the credentials the
@@ -613,6 +632,25 @@ async fn wait_for_auth_required(conn: &Connection) -> Option<String> {
     }
 }
 
+/// The text to show when the server's `[peers]` allow-list refused this Node ID.
+///
+/// Read off the `connect` failure rather than a connection, because the refusal
+/// happens inside the QUIC handshake: `after_handshake` closes with
+/// [`PEER_NOT_ALLOWED_CLOSE_CODE`] and the connection is never handed to the
+/// client at all. iroh surfaces that as an `ApplicationClosed` carrying the
+/// code, so matching on it here is the only place the client can learn why.
+fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<String> {
+    let iroh::endpoint::ConnectError::Connection { source, meta: _ } = error else {
+        return None;
+    };
+    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = source else {
+        return None;
+    };
+    if close.error_code.into_inner() != PEER_NOT_ALLOWED_CLOSE_CODE as u64 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&close.reason).into_owned())
+}
 /// Watches one connection's paths and records which kind is carrying traffic.
 ///
 /// The initial snapshot matters: right after the handshake iroh has already selected a path

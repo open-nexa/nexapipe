@@ -105,6 +105,15 @@ struct Cli {
     registration: bool,
 
     #[arg(
+        long,
+        requires = "generate_invite",
+        help = "With --generate-invite CLIENT_ID: create the client when it does not exist \
+                yet, generating and writing its TOTP secret in the same run. Only a client \
+                that is missing entirely is created; an existing one is used as it is"
+    )]
+    create_client: bool,
+
+    #[arg(
         long = "invite-domains",
         value_delimiter = ',',
         value_name = "DOMAINS",
@@ -255,8 +264,7 @@ async fn run_server_mode(
                 // on the host could authenticate as every client. With `[auth]`
                 // off they authenticate nobody, and a 0644 config is a fixture
                 // of Docker deployments — those only get the warning.
-                if let Err(e) =
-                    nexapipe::config::check_config_permissions(config_path, cfg.enabled)
+                if let Err(e) = nexapipe::config::check_config_permissions(config_path, cfg.enabled)
                 {
                     tracing::error!("{}", e);
                     std::process::exit(1);
@@ -277,6 +285,25 @@ async fn run_server_mode(
             None
         }
     };
+
+    // The `[peers]` allow-list. A malformed entry is fatal rather than dropped:
+    // a list whose whole purpose is to refuse strangers must not silently come
+    // out shorter than it was written.
+    let peer_allow_list = match proxy_config
+        .peers
+        .as_ref()
+        .map(nexapipe::config::PeersConfig::parse_allow_list)
+        .transpose()
+    {
+        Ok(list) => list
+            .flatten()
+            .map(|allowed| nexapipe::conn::allow_list::PeerAllowList::new(Some(allowed))),
+        Err(e) => {
+            tracing::error!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
     if let Err(e) = run_proxy(
         route_config,
         server_config,
@@ -284,6 +311,7 @@ async fn run_server_mode(
         config_path,
         shutdown_signal.clone(),
         auth_config,
+        peer_allow_list,
     )
     .await
     {
@@ -547,7 +575,9 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     // Read off the resolved spec rather than the raw strings, so a `"custom"` that is really
     // unusable (no URL, n0-operated URL) does not end up in the invite.
     let relay = cli.invite_relay.clone().or_else(|| {
-        let iroh = proxy_config.as_ref().and_then(|config| config.iroh.as_ref())?;
+        let iroh = proxy_config
+            .as_ref()
+            .and_then(|config| config.iroh.as_ref())?;
         let spec = RelayModeSpec::parse(
             iroh.relay_mode.as_deref(),
             iroh.relay_url.as_deref(),
@@ -578,22 +608,33 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        let client = auth_config.clients.get(client_id).ok_or_else(|| {
-            let known = if auth_config.clients.is_empty() {
-                " (no client is configured yet)".to_string()
-            } else {
-                let mut names: Vec<&str> = auth_config.clients.keys().map(String::as_str).collect();
-                names.sort_unstable();
-                format!(" (configured: {})", names.join(", "))
-            };
-            anyhow::anyhow!(
-                "client \"{}\" has no [auth.clients.{}] section in {}{}",
-                client_id,
-                toml_key(client_id),
-                cli.config,
-                known
-            )
-        })?;
+        // The secret this invite will carry: the one already in the config, or
+        // one created on the spot by `--create-client`. Held as a `String`
+        // rather than borrowed from `auth_config` because the creation branch
+        // below has no client to borrow from yet.
+        let secret = match auth_config.clients.get(client_id) {
+            Some(client) => client.secret.clone(),
+            None if cli.create_client => create_client_for_invite(cli, client_id, &auth_config)?,
+            None => {
+                let known = if auth_config.clients.is_empty() {
+                    " (no client is configured yet)".to_string()
+                } else {
+                    let mut names: Vec<&str> =
+                        auth_config.clients.keys().map(String::as_str).collect();
+                    names.sort_unstable();
+                    format!(" (configured: {})", names.join(", "))
+                };
+                anyhow::bail!(
+                    "client \"{}\" has no [auth.clients.{}] section in {}{}; \
+                     pass --create-client to make one now, or run --generate-2fa {} first",
+                    client_id,
+                    toml_key(client_id),
+                    cli.config,
+                    known,
+                    client_id
+                )
+            }
+        };
 
         if cli.registration {
             // An enrollment invite has to be written down before it is printed:
@@ -620,7 +661,7 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             let totp = InviteTotp::with_params(
                 issuer,
                 client_id,
-                &client.secret,
+                &secret,
                 TotpAlgorithm::from_name(auth_config.algorithm.name()),
                 auth_config.digits,
                 auth_config.time_step,
@@ -630,7 +671,9 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             invite = invite.with_totp(Some(totp));
         }
     } else if cli.registration {
-        anyhow::bail!("--registration needs a CLIENT_ID: --generate-invite <CLIENT_ID> --registration");
+        anyhow::bail!(
+            "--registration needs a CLIENT_ID: --generate-invite <CLIENT_ID> --registration"
+        );
     }
 
     let link = invite.to_uri();
@@ -718,7 +761,10 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         println!(" THIS LINK CARRIES AN ENROLLMENT TOKEN, NOT THE SECRET.");
         println!();
         println!(" The first device to scan it trades the token for a freshly");
-        println!(" generated secret for client \"{}\", and the token is spent: a", enrollment.client_id);
+        println!(
+            " generated secret for client \"{}\", and the token is spent: a",
+            enrollment.client_id
+        );
         println!(" copy of this link stops being a credential the moment it is used.");
         println!(" Enrolling also rotates that client's secret, so every device");
         println!(" already using it has to scan again.");
@@ -747,10 +793,59 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         println!("step.");
     } else {
         println!("Scanning imports the endpoint and its domains. Pass a client id to");
-        println!("--generate-invite to put that client's 2FA credentials in the code too.");
+        println!("--generate-invite to put that client's 2FA credentials in the code too");
+        println!("(add --create-client when that client does not exist yet).");
     }
 
     Ok(())
+}
+
+/// Generates a TOTP secret for a client that does not exist yet, writes it into
+/// the config, and returns it so the invite being built can carry it.
+///
+/// This is what `--create-client` does, and it only ever runs for a client that
+/// is missing **entirely**: a section that exists but holds no secret is a
+/// broken file, not an invitation to fill in the blank, and the caller's lookup
+/// handles that case by refusing.
+///
+/// Unlike [`save_generated_secret`] a failure here is fatal. That one prints a
+/// secret the operator can paste by hand because `--generate-2fa` has nothing
+/// riding on the file; an invite with `--create-client` is a promise that the
+/// server will recognise the client, so a secret that never reached the disk
+/// would produce a link that is refused on first connect.
+fn create_client_for_invite(
+    cli: &Cli,
+    client_id: &str,
+    auth_config: &AuthConfig,
+) -> anyhow::Result<String> {
+    let secret = nexapipe::auth::TotpValidator::generate_secret();
+    ProxyConfig::write_client_secret(&cli.config, client_id, &secret, false).map_err(|e| {
+        anyhow::anyhow!(
+            "could not create client \"{client_id}\" in {} ({e}); without the section there \
+             is nothing for the invite to authenticate against",
+            cli.config
+        )
+    })?;
+
+    println!(
+        "Created [auth.clients.{}] in {} with a newly generated secret.",
+        toml_key(client_id),
+        cli.config
+    );
+    // Same warning `--generate-2fa` prints: the secret on disk is worthless
+    // until the server is allowed to ask for it.
+    if !auth_config.enabled {
+        eprintln!(
+            "warning: [auth] enabled is not true in {}, so the server will not ask for this \
+             secret; add enabled = true under [auth]",
+            cli.config
+        );
+    }
+    println!("The 2FA settings are read once at startup, so restart the server before the");
+    println!("client above can connect.");
+    println!();
+
+    Ok(secret)
 }
 
 /// Loads the proxy config and `[auth]` together.
