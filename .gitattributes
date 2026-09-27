@@ -1,0 +1,40 @@
+# Line-ending policy.
+#
+# The repository stores every text file with LF in the object database, and the
+# working tree is LF too - that is what rustfmt, cargo and the CI runners write,
+# and it is the only convention that keeps the checkout byte-identical to the
+# index on every platform. Without this file the checkout follows the host's
+# core.autocrlf, so a Windows clone silently gets CRLF working-tree files while
+# `git diff` still reports them as unmodified; the first tool that rewrites one
+# of those files (rustfmt, an editor) then flips it to LF and the file shows up
+# as fully modified. Pinning `eol=lf` here removes that mismatch.
+#
+# `text=auto` makes Git normalise line endings on the way in, so a commit made
+# from a CRLF working tree still stores LF. `eol=lf` then forces the checkout to
+# LF as well.
+* text=auto eol=lf
+
+# Windows-only scripts. Command Prompt and PowerShell tolerate LF in most cases,
+# but `.bat` parsing has known traps around LF-only line endings and `gradlew.bat`
+# is already stored as CRLF in the index, so keep these as CRLF explicitly.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Not text: never touched by end-of-line conversion. Listed explicitly (rather
+# than relying on auto-detection) so that a future binary format is not
+# accidentally normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.gif binary
+*.svg  text
+*.jar binary
+*.dll binary
+*.exe binary
+*.so binary
+*.dylib binary
+*.bin binary
