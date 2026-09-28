@@ -690,8 +690,52 @@ fn validate_l4_backend(label: &str, backend: &str) -> anyhow::Result<()> {
 
 // ===== 2FA authentication config =====
 
-/// Authentication config in TOML format
+/// Refuses TOTP parameters the validator cannot honour as written.
+///
+/// `window` is the one that was quietly wrong: it is handed to the TOTP library
+/// as a `u8`, so anything above 255 was truncated by the cast — `window = 300`
+/// became 44, which widens a code's validity from ±5 minutes to ±22 minutes,
+/// and `window = 256` became 0. The other two only failed later, inside the
+/// library, at the first login and with nothing to say which knob was wrong.
+fn validate_totp_parameters(time_step: u32, digits: u32, window: u32) -> anyhow::Result<()> {
+    if time_step == 0 {
+        anyhow::bail!(
+            "[auth] time_step is 0: a code would cover no time at all, and the step is what \
+             the counter is divided by"
+        );
+    }
+    if !(6..=8).contains(&digits) {
+        anyhow::bail!("[auth] digits is {digits}: a code is 6, 7 or 8 digits long");
+    }
+    if window > u8::MAX as u32 {
+        anyhow::bail!(
+            "[auth] window is {window}, above the {max} the TOTP library's field holds: larger \
+             values were silently truncated, so 300 came out as 44",
+            max = u8::MAX
+        );
+    }
+    if window > 10 {
+        // Legal, but wide enough to be worth saying out loud: `window` counts
+        // steps in *both* directions, so 10 already means a code stays valid
+        // for ten minutes either side of now.
+        tracing::warn!(
+            "[auth] window is {window}: a code stays valid for {} minutes either side of now",
+            window * time_step / 60
+        );
+    }
+    Ok(())
+}
+
+/// Authentication config in TOML format.
+///
+/// Unknown keys are refused here, and only here. This is the one section where
+/// a typo is a security change rather than a lost setting: `enable = true`
+/// instead of `enabled` left 2FA off with nothing in the log to say so, since
+/// serde drops what it does not recognise and the default for `enabled` is
+/// false. Every other section stays lenient, the way a config that has carried
+/// a stray key for years expects.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthTomlConfig {
     pub enabled: Option<bool>,
     pub issuer: Option<String>,
@@ -704,7 +748,13 @@ pub struct AuthTomlConfig {
     pub clients: Option<HashMap<String, ClientAuthToml>>,
 }
 
+/// One `[auth.clients.<id>]` entry.
+///
+/// Unknown keys are refused for the same reason as in [`AuthTomlConfig`]: a
+/// misspelled `allow_host` is not "no restriction", but that is what it
+/// quietly became.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuthToml {
     pub secret: String,
     pub created_at: Option<String>,
@@ -884,15 +934,20 @@ impl ProxyConfig {
                         _ => crate::auth::TotpAlgorithm::SHA1,
                     };
 
+                    let time_step = auth_toml.time_step.unwrap_or(30);
+                    let digits = auth_toml.digits.unwrap_or(6);
+                    let window = auth_toml.window.unwrap_or(1);
+                    validate_totp_parameters(time_step, digits, window)?;
+
                     Some(crate::auth::AuthConfig {
                         enabled: auth_toml.enabled.unwrap_or(false),
                         issuer: auth_toml
                             .issuer
                             .unwrap_or_else(|| crate::auth::DEFAULT_ISSUER.to_string()),
                         algorithm,
-                        time_step: auth_toml.time_step.unwrap_or(30),
-                        digits: auth_toml.digits.unwrap_or(6),
-                        window: auth_toml.window.unwrap_or(1),
+                        time_step,
+                        digits,
+                        window,
                         clients,
                         max_attempts: auth_toml.max_attempts.unwrap_or(5),
                         lockout_duration: auth_toml.lockout_duration.unwrap_or(300),
@@ -1047,6 +1102,17 @@ mod tests {
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")
+    }
+
+    /// Writes `source` to a throwaway file and loads it the way a start does.
+    ///
+    /// `load_with_auth` takes a path rather than a string — it is also what
+    /// checks the file's permissions — so parsing a snippet needs a real file.
+    fn load_from(source: &str) -> anyhow::Result<(ProxyConfig, Option<crate::auth::AuthConfig>)> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, source).expect("write the config");
+        ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
     }
 
     /// `build_routes` is what both a cold start and a config reload use, so a
@@ -1815,5 +1881,39 @@ allow_hosts = ["*iakl.top"]
         let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
             .expect_err("the pattern has to be refused");
         assert!(err.to_string().contains("label boundary"), "{err}");
+    }
+
+    /// `window` is handed to the TOTP library as a `u8`, so 300 was truncated
+    /// to 44 by the cast: a code valid for ±22 minutes instead of ±30 seconds.
+    #[test]
+    fn a_window_that_does_not_fit_is_refused() {
+        let err = load_from("[auth]\nwindow = 300\n").expect_err("300 does not fit a u8");
+        assert!(err.to_string().contains("window is 300"), "{err}");
+
+        // And a sane window still loads.
+        let (_, auth) = load_from("[auth]\nwindow = 1\n").expect("a normal window loads");
+        assert_eq!(auth.expect("auth section present").window, 1);
+    }
+
+    #[test]
+    fn a_digit_count_no_code_has_is_refused() {
+        let err = load_from("[auth]\ndigits = 4\n").expect_err("a code is not 4 digits");
+        assert!(err.to_string().contains("digits is 4"), "{err}");
+    }
+
+    #[test]
+    fn a_time_step_of_zero_is_refused() {
+        let err = load_from("[auth]\ntime_step = 0\n").expect_err("0 covers no time at all");
+        assert!(err.to_string().contains("time_step"), "{err}");
+    }
+
+    /// Why `[auth]` is the one section that refuses keys it does not know:
+    /// `enable = true` for `enabled` used to leave 2FA off, and the log said
+    /// nothing, because serde drops what it does not recognise and the default
+    /// for `enabled` is false.
+    #[test]
+    fn an_unknown_auth_key_is_refused_rather_than_ignored() {
+        let err = load_from("[auth]\nenable = true\n").expect_err("a typo must not disable 2FA");
+        assert!(err.to_string().contains("enable"), "{err}");
     }
 }
