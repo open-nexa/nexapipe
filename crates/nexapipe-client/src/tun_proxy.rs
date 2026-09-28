@@ -1209,15 +1209,14 @@ pub async fn handle_dns_query(
             return Some(build_empty_dns_response(query));
         }
         let virtual_ip = ip_mapping.allocate(&domain);
-        jni_log!("[tun-proxy] DNS: '{}' -> {}", domain, virtual_ip);
+        // The name is deliberately left out: this runs for every name the
+        // device resolves, so logging it turns logcat into a record of where
+        // the user goes. What debugging needs is the decision, not the name.
+        jni_log!("[tun-proxy] DNS: proxying a query -> {}", virtual_ip);
         Some(build_dns_response(query, virtual_ip, qtype))
     } else {
         // Forward to the real DNS.
-        jni_log!(
-            "[tun-proxy] DNS: '{}' -> forwarding to real DNS (qtype={})",
-            domain,
-            qtype
-        );
+        jni_log!("[tun-proxy] DNS: forwarding a query (qtype={})", qtype);
         forward_dns_query(query, dns_servers).await
     }
 }
@@ -1370,6 +1369,11 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
 /// Iterates over all configured DNS servers, **preferring IPv4**, binding the socket by address family
 /// (IPv4→0.0.0.0:0, IPv6→[::]:0). Each server has its own 800ms timeout, with an overall 3s cap.
 ///
+/// A name that was resolved recently is answered from a cache instead, for as
+/// long as the answer's own records say it is good — see [`remember_answer`].
+/// The transaction ID of the query asking now is written into the answer before
+/// it goes out.
+///
 /// Fix: the system DNS list often starts with IPv6 servers (e.g. 2408:8888::8), which made binding
 /// 0.0.0.0:0 then connect() fail, and the old code only tried dns_servers[0] with no fallback.
 pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
@@ -1378,6 +1382,26 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
         return None;
     }
 
+    // Every name the device looks up comes through here, and a lookup the
+    // resolver has already answered does not need another round trip to a
+    // server — which on a phone is a radio wake-up, not a LAN packet.
+    let key = parse_dns_query(query).map(|(domain, qtype)| (domain.to_lowercase(), qtype));
+    if let Some(key) = &key
+        && let Some(answer) = cached_answer(key, query)
+    {
+        return Some(answer);
+    }
+
+    let answer = forward_dns_query_uncached(query, dns_servers).await;
+
+    if let (Some(key), Some(answer)) = (key, &answer) {
+        remember_answer(key.clone(), answer);
+    }
+
+    answer
+}
+
+async fn forward_dns_query_uncached(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
     // Prefer IPv4: try IPv4 DNS first (faster and more reliable), then IPv6.
     let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
     ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) goes first
@@ -1432,9 +1456,159 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
     }
 }
 
+// ============================================================
+// DNS answer cache
+// ============================================================
+
+/// How long an answer may be kept when the records disagree, or carry a TTL
+/// nobody would wait for. Bounded on both sides: a `0` TTL is a record the
+/// server wanted re-asked, and one that never expires would pin an address to
+/// a name for as long as the process lives.
+const DNS_CACHE_MIN_TTL: Duration = Duration::from_secs(1);
+const DNS_CACHE_MAX_TTL: Duration = Duration::from_secs(300);
+
+/// Answers kept before the oldest are dropped to make room. A phone resolves a
+/// few dozen names; this is a few hundred, so a busy app cannot grow it.
+const DNS_CACHE_MAX_ENTRIES: usize = 512;
+
+/// A name and the record type asked for, which together are what an answer is
+/// for. Lower-cased, because DNS names are case-insensitive.
+type CacheKey = (String, u16);
+
+struct CachedAnswer {
+    response: Vec<u8>,
+    expires_at: tokio::time::Instant,
+}
+
+static DNS_CACHE: std::sync::LazyLock<Mutex<HashMap<CacheKey, CachedAnswer>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_cache() -> MutexGuard<'static, HashMap<CacheKey, CachedAnswer>> {
+    DNS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The answer already held for `key`, with the transaction ID of the query
+/// asking now.
+///
+/// `None` when there is none, or when the one there has expired.
+fn cached_answer(key: &CacheKey, query: &[u8]) -> Option<Vec<u8>> {
+    let cache = lock_cache();
+    let entry = cache.get(key)?;
+    if entry.expires_at <= tokio::time::Instant::now() {
+        return None;
+    }
+
+    // The answer was fetched with a different ID, and a resolver drops a reply
+    // whose ID does not match the question it sent — so without this a cached
+    // answer looks to the application exactly like no answer at all.
+    let mut response = entry.response.clone();
+    if response.len() >= 2 && query.len() >= 2 {
+        response[0] = query[0];
+        response[1] = query[1];
+    }
+    Some(response)
+}
+
+/// Stores `response` for `key`, for as long as its own records say it is good.
+fn remember_answer(key: CacheKey, response: &[u8]) {
+    let Some(ttl) = answer_ttl(response) else {
+        // Nothing to keep: an answer with no records, or one the server
+        // refused, is either a negative answer (which a resolver may want to
+        // re-ask at any moment) or unreadable.
+        return;
+    };
+
+    let mut cache = lock_cache();
+    let now = tokio::time::Instant::now();
+    cache.retain(|_, entry| entry.expires_at > now);
+
+    // No room and nothing expired: the whole table is dropped rather than
+    // picking a victim one record at a time, which for a cache this size is
+    // not worth the bookkeeping.
+    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+
+    cache.insert(
+        key,
+        CachedAnswer {
+            response: response.to_vec(),
+            expires_at: now + ttl,
+        },
+    );
+}
+
+/// How long the records in `response` may be served from the cache: the
+/// shortest TTL among the answers, since one expired record makes the answer
+/// wrong. `None` when the response has no answers to read a TTL from, or is
+/// an error.
+fn answer_ttl(response: &[u8]) -> Option<Duration> {
+    if response.len() < 12 {
+        return None;
+    }
+
+    // RCODE is the low four bits of the flags: anything but 0 is a refusal or
+    // a failure, which is not something to keep answering with.
+    if response[3] & 0x0F != 0 {
+        return None;
+    }
+
+    let answers = u16::from_be_bytes([response[6], response[7]]) as usize;
+    if answers == 0 {
+        return None;
+    }
+
+    // Skip the header and the question — one name plus QTYPE and QCLASS.
+    let mut pos = skip_dns_name(response, 12)? + 4;
+
+    let mut shortest: Option<u32> = None;
+    for _ in 0..answers {
+        pos = skip_dns_name(response, pos)?;
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2).
+        if pos + 10 > response.len() {
+            return None;
+        }
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10 + rdlength;
+
+        shortest = Some(match shortest {
+            Some(seen) => seen.min(ttl),
+            None => ttl,
+        });
+    }
+
+    shortest.map(|ttl| {
+        let bounded = (ttl as u64).clamp(DNS_CACHE_MIN_TTL.as_secs(), DNS_CACHE_MAX_TTL.as_secs());
+        Duration::from_secs(bounded)
+    })
+}
+
+/// The offset just past the name starting at `pos`, following a compression
+/// pointer if the name ends in one.
+fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *payload.get(pos)? as usize;
+        match len {
+            0 => return Some(pos + 1),
+            // A pointer ends the name, and is two bytes long.
+            0xC0.. => return Some(pos + 2),
+            _ => pos += 1 + len,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_dns_query;
+    use super::{answer_ttl, cached_answer, parse_dns_query, remember_answer};
+    use std::time::Duration;
 
     /// A query packet: 12 bytes of header, then the question.
     fn query(name: &[u8], qtype: u16) -> Vec<u8> {
@@ -1500,5 +1674,88 @@ mod tests {
     fn refuses_a_pointer_outside_the_packet() {
         let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
         assert!(parse_dns_query(&query(&name, 1)).is_none());
+    }
+
+    /// An answer with two A records: the same header and question, then two
+    /// records whose TTLs differ, so the cache has to keep the shorter one.
+    fn answer(ttls: &[u32]) -> Vec<u8> {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let mut packet = vec![0xAA, 0xBB, 0x81, 0x80, 0x00, 0x01];
+        packet.extend_from_slice(&(ttls.len() as u16).to_be_bytes()); // ANCOUNT
+        packet.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT + ARCOUNT
+        packet.extend_from_slice(&name);
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+
+        for ttl in ttls {
+            packet.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to the question
+            packet.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+            packet.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+            packet.extend_from_slice(&ttl.to_be_bytes());
+            packet.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+            packet.extend_from_slice(&[10, 0, 0, 1]); // RDATA
+        }
+        packet
+    }
+
+    #[test]
+    fn the_cache_keeps_the_shortest_ttl_in_the_answer() {
+        assert_eq!(
+            answer_ttl(&answer(&[300, 60])),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            answer_ttl(&answer(&[60, 300])),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    /// A TTL nobody would wait for, and one that never expires: both are
+    /// bounded, or the cache would re-ask constantly / pin a name forever.
+    #[test]
+    fn ttls_outside_the_bounds_are_clamped() {
+        assert_eq!(answer_ttl(&answer(&[0])), Some(Duration::from_secs(1)));
+        assert_eq!(
+            answer_ttl(&answer(&[u32::MAX])),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    /// Nothing to keep: an answer with no records, or one the server refused.
+    #[test]
+    fn an_answer_with_no_records_is_not_cached() {
+        assert_eq!(answer_ttl(&answer(&[])), None);
+
+        let mut refused = answer(&[60]);
+        refused[3] = 0x83; // RCODE = NXDOMAIN
+        assert_eq!(answer_ttl(&refused), None);
+    }
+
+    /// The answer is fetched once and served to many queries, each with its own
+    /// transaction ID — a resolver drops a reply whose ID does not match the
+    /// question it sent.
+    #[test]
+    fn a_cached_answer_is_served_with_the_asking_query_id() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let fetched = query(&name, 1); // ID 0x1234
+        let asking = {
+            let mut other = fetched.clone();
+            other[0] = 0xAB;
+            other[1] = 0xCD;
+            other
+        };
+
+        remember_answer(("example.com".to_string(), 1), &answer(&[60]));
+
+        let served = cached_answer(&("example.com".to_string(), 1), &asking)
+            .expect("the answer was remembered with a 60s TTL");
+        assert_eq!(&served[..2], &[0xAB, 0xCD]);
+
+        // A different record type is a different question, even for one name.
+        assert!(cached_answer(&("example.com".to_string(), 28), &asking).is_none());
     }
 }
