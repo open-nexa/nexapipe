@@ -121,7 +121,12 @@ async fn open(
                 return Err(status_error(status, proto, host, port));
             }
             Err(e) => {
-                endpoint_group.return_connection(host, pooled).await;
+                // Discarded, not returned: the server did not answer the
+                // preface, which is what a connection whose path died looks
+                // like. Handing it back would put it straight on top of the
+                // pool (it is last-in-first-out), so every remaining attempt
+                // would ask the same dead connection.
+                drop(pooled);
                 last_err = Some(e);
             }
         }
