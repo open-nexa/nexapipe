@@ -13,7 +13,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
+use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -120,6 +120,11 @@ async fn read_tls_record<R>(
 where
     R: AsyncRead + Unpin,
 {
+    // One deadline for the whole record, not one per read: a peer that dribbles
+    // a byte at a time restarts a per-read timeout forever, and holding this
+    // stream open is the whole cost of the attack.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     loop {
         let Some(record_end) = first_record_end(&buf) else {
             if buf.len() > MAX_HANDSHAKE_LEN {
@@ -128,7 +133,7 @@ where
                     "TLS ClientHello header not received",
                 ));
             }
-            if !read_more(reader, &mut buf, timeout).await? {
+            if !read_more_by(reader, &mut buf, deadline).await? {
                 return Ok(buf);
             }
             continue;
@@ -143,7 +148,7 @@ where
                 "TLS record larger than a ClientHello can be",
             ));
         }
-        if !read_more(reader, &mut buf, timeout).await? {
+        if !read_more_by(reader, &mut buf, deadline).await? {
             return Ok(buf);
         }
     }

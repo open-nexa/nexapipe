@@ -437,6 +437,21 @@ impl Enrollment {
     /// long as it lives, but an app that wants to survive a restart has to
     /// persist [`TwoFactorAuth::secret_base32`] and drop the token.
     pub async fn exchange(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
+        // The same deadline the handshake below gets, and for the same reason:
+        // a server that takes the ENROLL_START and never answers leaves this
+        // future pending forever, and callers hold the endpoint's lock while
+        // they wait for it.
+        let exchange = self.exchange_inner(conn);
+        match tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, exchange).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(ClientError::ConnectionFailed(format!(
+                "the server did not answer the enrollment within {}s",
+                AUTH_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    async fn exchange_inner(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
 
         let (mut send, mut recv) = conn

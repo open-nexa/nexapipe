@@ -61,13 +61,17 @@ use crate::jni_log;
 /// Desktop/server builds log through `tracing`; builds without either the `jni`
 /// or the `tracing` feature get a no-op.
 ///
+/// At `debug`, not `info`: these are the per-packet and per-flow lines of the
+/// data path, and one of them names the domain every TCP and UDP flow is for.
+/// A default-level desktop build logged every site a user visited.
+///
 /// The format arguments are still *evaluated* (borrowed) inside the no-op's dead
 /// branch, so the optimiser removes the call but `unused_variables` does not fire
 /// on variables that only ever appear inside a log statement.
 #[cfg(all(not(feature = "jni"), feature = "tracing"))]
 macro_rules! jni_log {
     ($($arg:tt)*) => {
-        ::tracing::info!($($arg)*)
+        ::tracing::debug!($($arg)*)
     };
 }
 
@@ -1436,6 +1440,33 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
     answer
 }
 
+/// Whether `response` is an answer to `query` rather than to something else.
+///
+/// A UDP socket hands back whatever arrives first, and the answer is believed
+/// without this on a path where DNS is interfered with — a reply that races the
+/// real one wins, is cached under the name that was asked for, and every app on
+/// the device is told that address for as long as its TTL says. The 16-bit ID
+/// is the only thing tying a response to a query, so it and the question are
+/// both required to match.
+fn answer_matches_query(response: &[u8], query: &[u8]) -> bool {
+    if response.len() < 12 || query.len() < 12 {
+        return false;
+    }
+    if response[0..2] != query[0..2] {
+        return false;
+    }
+    // QR: a query is the wrong kind of packet to be answering with.
+    if response[2] & 0x80 == 0 {
+        return false;
+    }
+    match (parse_dns_query(response), parse_dns_query(query)) {
+        (Some((answered, answered_type)), Some((asked, asked_type))) => {
+            answered.eq_ignore_ascii_case(&asked) && answered_type == asked_type
+        }
+        _ => false,
+    }
+}
+
 async fn forward_dns_query_uncached(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
     // Prefer IPv4: try IPv4 DNS first (faster and more reliable), then IPv6.
     let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
@@ -1458,8 +1489,17 @@ async fn forward_dns_query_uncached(query: &[u8], dns_servers: &[SocketAddr]) ->
                 sock.connect(**dns_server).await.ok()?;
                 sock.send(query).await.ok()?;
                 let mut buf = vec![0u8; 4096];
-                let n = sock.recv(&mut buf).await.ok()?;
-                Some(buf[..n].to_vec())
+                // Keep reading: the first datagram to arrive is not necessarily
+                // an answer to this query, and believing one that is not is how
+                // a forged address gets cached under the name asked for. The
+                // enclosing timeout is what ends the wait.
+                loop {
+                    let n = sock.recv(&mut buf).await.ok()?;
+                    let response = buf[..n].to_vec();
+                    if answer_matches_query(&response, query) {
+                        return Some(response);
+                    }
+                }
             })
             .await;
 
@@ -1642,7 +1682,9 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{answer_ttl, cached_answer, parse_dns_query, remember_answer};
+    use super::{
+        answer_matches_query, answer_ttl, cached_answer, parse_dns_query, remember_answer,
+    };
     use std::time::Duration;
 
     /// A query packet: 12 bytes of header, then the question.
@@ -1709,6 +1751,60 @@ mod tests {
     fn refuses_a_pointer_outside_the_packet() {
         let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
         assert!(parse_dns_query(&query(&name, 1)).is_none());
+    }
+
+    /// What a forwarded answer is checked against: a UDP socket hands over
+    /// whatever arrived first, and an answer that is not for this query would
+    /// otherwise be cached under the name that was asked for.
+    #[test]
+    fn an_answer_matches_when_its_id_and_question_do() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let q = query(&name, 1);
+        let mut response = q.clone();
+        response[2] = 0x81; // QR: this is an answer, not another query.
+
+        assert!(answer_matches_query(&response, &q));
+        // The query is not an answer to itself.
+        assert!(!answer_matches_query(&q, &q));
+    }
+
+    #[test]
+    fn an_answer_for_another_id_is_not_taken() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let q = query(&name, 1);
+        let mut response = q.clone();
+        response[2] = 0x81;
+        response[1] ^= 0xff;
+
+        assert!(!answer_matches_query(&response, &q));
+    }
+
+    #[test]
+    fn an_answer_for_another_name_or_type_is_not_taken() {
+        let asked = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let other = [0x04, b'e', b'v', b'i', b'l', 0x03, b'c', b'o', b'm', 0x00];
+        let q = query(&asked, 1);
+
+        // Same ID, different question: the forged answer that races the real
+        // one on a path where DNS is interfered with.
+        let mut forged = query(&other, 1);
+        forged[0] = q[0];
+        forged[1] = q[1];
+        forged[2] = 0x81;
+        assert!(!answer_matches_query(&forged, &q));
+
+        // Same name, wrong record type.
+        let mut wrong_type = query(&asked, 28);
+        wrong_type[0] = q[0];
+        wrong_type[1] = q[1];
+        wrong_type[2] = 0x81;
+        assert!(!answer_matches_query(&wrong_type, &q));
     }
 
     /// An answer with two A records: the same header and question, then two

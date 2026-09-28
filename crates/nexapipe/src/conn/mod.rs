@@ -1,9 +1,12 @@
-use crate::auth::{AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator};
+use crate::auth::{
+    AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
+};
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
 use crate::passthrough;
 use crate::routes::{BackendInfo, RouteConfig};
+use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
@@ -697,7 +700,7 @@ async fn enroll_client(
             if let Some(client) = cfg.clients.get_mut(client_id) {
                 client.record_failure(max_attempts, lockout_duration);
             }
-            let snapshot = cfg.clone();
+            let snapshot = cfg.counter_snapshot();
             if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
                 save_auth_state(path, &snapshot)
             })
@@ -785,7 +788,7 @@ async fn enroll_client(
         if let Some(client) = cfg.clients.get_mut(client_id) {
             client.record_success();
         }
-        let snapshot = cfg.clone();
+        let snapshot = cfg.counter_snapshot();
         if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
             save_auth_state(path, &snapshot)
         })
@@ -965,6 +968,20 @@ async fn perform_authentication(
         AuthFailure::NotStarted("the first stream is not an AUTH_START".to_string())
     })?;
 
+    // Checked before the id is used for anything, because the first thing it is
+    // used for is being printed: the log line for a refusal, a lockout or an
+    // unknown client all carry it, and a peer that names itself with a trailing
+    // CRLF writes the rest of that line itself. This is before any secret has
+    // been checked, so it is reachable by anyone who can open a stream.
+    if let AuthMessage::Start { client_id, .. } | AuthMessage::EnrollStart { client_id, .. } =
+        &start_msg
+        && !is_presentable_client_id(client_id)
+    {
+        return Err(AuthFailure::Rejected(
+            "client id is not printable ASCII".to_string(),
+        ));
+    }
+
     // Enrollment, when the client asked for it: the token is exchanged for a
     // freshly generated secret ahead of the ordinary handshake, on the same
     // stream — the two messages are read in order here, so a client that
@@ -1093,7 +1110,7 @@ async fn perform_authentication(
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
                 }
-                let snapshot = cfg.clone();
+                let snapshot = cfg.counter_snapshot();
                 if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
                     save_auth_state(path, &snapshot)
                 })
@@ -1121,7 +1138,7 @@ async fn perform_authentication(
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
-                let snapshot = cfg.clone();
+                let snapshot = cfg.counter_snapshot();
                 if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
                     save_auth_state(path, &snapshot)
                 })
@@ -1418,12 +1435,19 @@ pub async fn handle_connection(
     tracing::info!("Connection closed for peer: {}", peer_id);
 }
 
+/// `in_flight` is the guard the accept loop took for this connection. It has to
+/// travel all the way into the task that serves the connection: the drain at
+/// shutdown counts these, and a guard dropped when the accept returns would
+/// make it count only connections still being accepted — every established
+/// one, including WebSocket sessions and L4 flows, would be invisible to it and
+/// cut off the moment the process decided to stop.
 pub async fn handle_incoming(
     incoming: Incoming,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     auth_state: Option<AuthState>,
     limiter: Arc<ConnectionLimiter>,
+    in_flight: InFlightGuard,
 ) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -1444,8 +1468,11 @@ pub async fn handle_incoming(
                 };
                 tokio::spawn(async move {
                     // Held for as long as the connection is served, and released
-                    // by the guard's Drop however this task ends.
+                    // by the guard's Drop however this task ends: the limiter
+                    // one for the peer's allowance, the in-flight one so a
+                    // shutdown knows this connection is still here.
                     let _guard = guard;
+                    let _in_flight = in_flight;
                     handle_connection(conn, config, client, auth_state).await;
                 });
             }

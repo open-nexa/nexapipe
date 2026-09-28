@@ -6,10 +6,25 @@
  * configured and persists it; `proxy.ts` owns runtime status; `prefs.ts` owns UI preferences.
  *
  * Persistence is versioned (D11): `nexa-config` held a flat object with no version field, so
- * migrations could not be sequenced. The current shape is `{ version: 1, ...config }` under
+ * migrations could not be sequenced. The current shape is `{ version: 2, ...config }` under
  * `nexapipe.config`, and each future migration is a `from -> to` step in `migrate()`.
+ *
+ * # Credentials are not persisted here
+ *
+ * As of version 2 a TOTP secret, an enrollment token and the relay bearer are **not** written to
+ * `localStorage`: they go to the encrypted store behind `api/credentials.ts`, whose master key
+ * the OS keychain holds. What is persisted is the shape — that a node has 2FA, its client id and
+ * its algorithm — and the values are read back into this config by [`initConfigStore`], which
+ * the app awaits before it mounts. A payload written by version 1 does carry its secrets, and
+ * the same call moves them into the store rather than leaving them in a file nothing protects.
  */
 import { reactive, watch } from 'vue';
+import {
+  clearCredentials,
+  deleteCredential,
+  getCredential,
+  putCredential,
+} from '../api/credentials';
 import type {
   ConnectionType,
   EnrollmentToken,
@@ -24,7 +39,7 @@ import type {
 
 const STORAGE_KEY = 'nexapipe.config';
 const LEGACY_STORAGE_KEY = 'nexa-config';
-const CONFIG_VERSION = 1;
+const CONFIG_VERSION = 2;
 const SAVE_DEBOUNCE_MS = 300;
 
 /**
@@ -80,10 +95,15 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
 function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
   if (!isRecord(raw)) return undefined;
   const secret = asString(raw.secret, '').trim();
-  if (!secret) return undefined;
+  const clientId = asString(raw.clientId, '');
+  // A node whose secret lives in the credential store persists with an empty one: the stored
+  // shape still says "this node authenticates, with this client id", and `initConfigStore` puts
+  // the secret back. Dropping the whole structure here would turn a configured node into one
+  // that performs no handshake until somebody re-entered its credentials.
+  if (!secret && !clientId) return undefined;
   const algorithm =
     raw.algorithm === 'sha256' || raw.algorithm === 'sha512' ? raw.algorithm : 'sha1';
-  return { clientId: asString(raw.clientId, ''), secret, algorithm };
+  return { clientId, secret, algorithm };
 }
 
 /**
@@ -95,8 +115,11 @@ function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
 function normalizeEnrollment(raw: unknown): EnrollmentToken | undefined {
   if (!isRecord(raw)) return undefined;
   const token = asString(raw.token, '').trim();
-  if (!token) return undefined;
-  return { clientId: asString(raw.clientId, ''), token };
+  const clientId = asString(raw.clientId, '');
+  // Same reason as `normalizeTwoFactor`: a spent-or-stored token is an empty string here, and
+  // the client id is what says which node is waiting for one.
+  if (!token && !clientId) return undefined;
+  return { clientId, token };
 }
 
 function normalizeNode(raw: unknown): NodeConfig | null {
@@ -253,12 +276,124 @@ function loadConfig(): ProxyConfig {
   return { ...defaultConfig };
 }
 
+/**
+ * The shape that goes into `localStorage`: everything except the credentials.
+ *
+ * A node keeps its credential *structure* — that it has 2FA, with which client id and algorithm —
+ * because those are configuration, and a node with none is a node that performs no handshake.
+ * The secret itself does not: it belongs to the encrypted store, and leaving it here would keep
+ * the one copy this whole change is about removing.
+ */
+function toPersisted(config: ProxyConfig): PersistedConfig {
+  return {
+    version: CONFIG_VERSION,
+    ...config,
+    relayAuthToken: '',
+    nodes: config.nodes.map((node) => {
+      const { twoFactor, enrollment, ...rest } = node;
+      return {
+        ...rest,
+        ...(twoFactor ? { twoFactor: { ...twoFactor, secret: '' } } : {}),
+        ...(enrollment ? { enrollment: { ...enrollment, token: '' } } : {}),
+      };
+    }),
+  };
+}
+
+/**
+ * Mirrors the credentials into the encrypted store: written when a node has them, deleted when it
+ * does not, so a credential that was cleared here is not left behind there.
+ */
+async function persistCredentials(config: ProxyConfig): Promise<void> {
+  if (config.relayAuthToken.trim()) {
+    await putCredential('relay', config.relayAuthToken);
+  } else {
+    await deleteCredential('relay');
+  }
+
+  for (const node of config.nodes) {
+    if (node.twoFactor?.secret.trim()) {
+      await putCredential('totp', node.twoFactor.secret, node.id);
+    } else {
+      await deleteCredential('totp', node.id);
+    }
+
+    if (node.enrollment?.token.trim()) {
+      await putCredential('enrollment', node.enrollment.token, node.id);
+    } else {
+      await deleteCredential('enrollment', node.id);
+    }
+  }
+}
+
 function persist(config: ProxyConfig): void {
-  const payload: PersistedConfig = { version: CONFIG_VERSION, ...config };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersisted(config)));
   } catch (error) {
     console.error('[config] failed to save:', error);
+  }
+
+  // Not awaited: a save is a mirror, and the in-memory config is what the app runs on. A failure
+  // here means the credential will be missing after a restart, which is worth shouting about but
+  // must not stop the app from working now.
+  persistCredentials(config).catch((error: unknown) => {
+    console.error('[config] failed to save credentials:', error);
+  });
+}
+
+/**
+ * Reads the credentials back into `config`, migrating anything `localStorage` still holds.
+ *
+ * A payload written before version 2 carries its secrets in the clear. This is where they leave:
+ * the store wins when it has a value, and when it does not but the payload does, the payload's
+ * value is *written* to the store rather than merely trusted — so the migration happens once and
+ * the cleartext copy is gone on the next save.
+ */
+async function hydrateCredentials(config: ProxyConfig): Promise<void> {
+  const relay = await getCredential('relay');
+  if (relay) {
+    config.relayAuthToken = relay;
+  } else if (config.relayAuthToken.trim()) {
+    await putCredential('relay', config.relayAuthToken);
+  }
+
+  for (const node of config.nodes) {
+    const secret = await getCredential('totp', node.id);
+    if (secret) {
+      node.twoFactor = {
+        clientId: node.twoFactor?.clientId ?? '',
+        secret,
+        algorithm: node.twoFactor?.algorithm ?? 'sha1',
+      };
+    } else if (node.twoFactor?.secret.trim()) {
+      await putCredential('totp', node.twoFactor.secret, node.id);
+    }
+
+    const token = await getCredential('enrollment', node.id);
+    if (token) {
+      node.enrollment = { clientId: node.enrollment?.clientId ?? '', token };
+    } else if (node.enrollment?.token.trim()) {
+      await putCredential('enrollment', node.enrollment.token, node.id);
+    }
+  }
+}
+
+/**
+ * Completes loading the configuration: everything except the credentials is already in `config`
+ * by the time this module is imported, and the credentials are read here because reading them is
+ * asynchronous.
+ *
+ * Awaited before the app mounts, so no page ever renders a node's credentials as absent and then
+ * fills them in.
+ */
+export async function initConfigStore(): Promise<void> {
+  try {
+    await hydrateCredentials(config);
+  } catch (error) {
+    // A store that cannot be read leaves the nodes without credentials: they will refuse to
+    // handshake and the UI says so. Not fatal — the app has to stay usable enough to re-import
+    // an invite.
+    console.error('[config] failed to load credentials:', error);
   }
 }
 
@@ -422,6 +557,10 @@ export function useConfigStore() {
   function clearNodeTwoFactor(nodeId: string): void {
     const node = config.nodes.find((candidate) => candidate.id === nodeId);
     if (node) delete node.twoFactor;
+    // The store is told as well: what is dropped here must not survive there.
+    void deleteCredential('totp', nodeId).catch((error: unknown) => {
+      console.error('[config] failed to delete the stored secret:', error);
+    });
   }
 
   /** Whether a node would perform a handshake: credentials with a secret in them. */
@@ -432,6 +571,15 @@ export function useConfigStore() {
   function removeNode(nodeId: string): void {
     const index = config.nodes.findIndex((node) => node.id === nodeId);
     if (index !== -1) config.nodes.splice(index, 1);
+
+    // A removed node takes its credentials with it. Done here rather than by sweeping the store
+    // for orphans, because this is the only place a node stops existing.
+    void Promise.all([
+      deleteCredential('totp', nodeId),
+      deleteCredential('enrollment', nodeId),
+    ]).catch((error: unknown) => {
+      console.error('[config] failed to delete the credentials of a removed node:', error);
+    });
   }
 
   function updateNode(nodeId: string, updates: Partial<NodeConfig>): void {
@@ -457,6 +605,12 @@ export function useConfigStore() {
 
   function resetConfig(): void {
     Object.assign(config, { ...defaultConfig, nodes: [], domains: [] });
+
+    // Every node is gone, so every credential is: the store is cleared rather than left holding
+    // secrets for nodes that no longer exist.
+    void clearCredentials().catch((error: unknown) => {
+      console.error('[config] failed to clear the credential store:', error);
+    });
   }
 
   return {

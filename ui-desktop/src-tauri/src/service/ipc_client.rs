@@ -1,4 +1,5 @@
-use tokio::io::{AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{codes, AppError};
@@ -8,6 +9,14 @@ use crate::service::ipc::{
 use crate::status::{EndpointLink, ProxyStatus};
 
 pub struct IpcClient;
+
+/// How long the service gets to open with its challenge.
+///
+/// A peer that says nothing at all is not this build's service but an older one:
+/// that one waits for the caller to speak first, which is exactly the shape the
+/// handshake replaced. Without a deadline the difference shows up as a hang
+/// rather than as an error anybody can act on.
+const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The service answered with a message kind that does not match the request. This also covers
 /// "the response was produced by a service build we do not understand", which is why the raw
@@ -32,43 +41,124 @@ impl IpcClient {
         // can drive the service; see `service::ipc_token`.
         let token = crate::service::ipc_token::ensure_token()?;
 
-        // The handshake's answer has to be read, not discarded. The service refuses it for
-        // exactly one reason it can name — nothing is published, or what was presented does not
-        // match — and closes the connection right after. Dropping that answer leaves the *next*
-        // write to fail on a socket the peer has already closed, which surfaces as "the service
-        // closed the connection without answering": the one message that says nothing about why,
-        // and the reason a missing token looked like a broken service.
-        match Self::exchange(&mut stream, IpcMessage::Auth(token)).await? {
-            IpcResponse::Ok => {}
+        // One reader for the whole connection. `exchange` used to build a fresh
+        // `BufReader` per message, which drops whatever the previous one had
+        // already buffered — harmless while every exchange was write-then-read
+        // one line at a time, and a lost reply as soon as the service speaks
+        // first and two answers can arrive together.
+        let (read_half, mut write_half) = stream.split();
+        let mut reader = BufReader::new(read_half);
+
+        Self::handshake(&mut reader, &mut write_half, &token).await?;
+
+        tracing::debug!("Authenticated, sending message");
+        Self::write_message(&mut write_half, &msg).await?;
+        Self::read_response(&mut reader).await
+    }
+
+    /// The mutual authentication exchange over an already-connected channel.
+    ///
+    /// Split out from [`Self::send_message`] so it can be driven against a
+    /// stand-in peer: every decision it makes is visible in the messages alone,
+    /// and the case that matters — a peer that cannot answer for this side's
+    /// nonce — is otherwise only reachable by squatting on the real port.
+    async fn handshake<R, W>(reader: &mut R, writer: &mut W, token: &str) -> Result<(), AppError>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        // The service speaks first. This side offers nothing until it has a
+        // nonce to answer for, so a squatter on the port — the reason this
+        // replaced a bare token — is handed nothing it could replay.
+        let challenge =
+            match tokio::time::timeout(CHALLENGE_TIMEOUT, Self::read_response(reader)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(AppError::with_detail(
+                        codes::SERVICE_PROTOCOL_MISMATCH,
+                        format!(
+                            "nothing on {IPC_SOCKET_PATH} opened with a challenge within \
+                             {CHALLENGE_TIMEOUT:?}; the installed service is older than this app"
+                        ),
+                    ))
+                }
+            };
+
+        let service_nonce = match challenge {
+            IpcResponse::Challenge { nonce } => nonce,
+            IpcResponse::Error(e) => return Err(e),
+            other => return Err(unexpected(&other)),
+        };
+
+        // A nonce of this side's own, which the service has to answer back for:
+        // what makes the exchange mutual rather than one-way.
+        let caller_nonce = crate::service::ipc_token::random_nonce()?;
+        let mac = crate::service::ipc_token::auth_mac(token, &service_nonce, &caller_nonce);
+        Self::write_message(
+            writer,
+            &IpcMessage::Auth {
+                nonce: caller_nonce.clone(),
+                mac,
+            },
+        )
+        .await?;
+
+        // Checked rather than trusted: a peer that cannot answer for this side's
+        // nonce does not hold the token, whatever it accepted above.
+        match Self::read_response(reader).await? {
+            IpcResponse::AuthOk { mac } => {
+                if !crate::service::ipc_token::proof_matches(
+                    token,
+                    &service_nonce,
+                    &caller_nonce,
+                    &mac,
+                ) {
+                    return Err(AppError::with_detail(
+                        codes::SERVICE_UNAUTHORIZED,
+                        "the service could not prove it holds the IPC token: something else is \
+                         answering on the IPC port",
+                    ));
+                }
+            }
             IpcResponse::Error(e) => return Err(e),
             other => return Err(unexpected(&other)),
         }
 
-        tracing::debug!("Authenticated, sending message");
-        Self::exchange(&mut stream, msg).await
+        Ok(())
     }
 
-    /// Writes one newline-delimited message and reads the answer.
-    async fn exchange(stream: &mut TcpStream, msg: IpcMessage) -> Result<IpcResponse, AppError> {
+    /// Writes one newline-delimited message.
+    async fn write_message<W>(writer: &mut W, msg: &IpcMessage) -> Result<(), AppError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let msg_str =
-            serde_json::to_string(&msg).map_err(|e| AppError::cause(codes::SERVICE_FAILED, e))?;
+            serde_json::to_string(msg).map_err(|e| AppError::cause(codes::SERVICE_FAILED, e))?;
 
-        stream
+        writer
             .write_all(msg_str.as_bytes())
             .await
             .map_err(|e| AppError::cause(codes::SERVICE_IO_ERROR, e))?;
-        stream
+        writer
             .write_all(b"\n")
             .await
             .map_err(|e| AppError::cause(codes::SERVICE_IO_ERROR, e))?;
-        stream
+        writer
             .flush()
             .await
             .map_err(|e| AppError::cause(codes::SERVICE_IO_ERROR, e))?;
 
-        let mut reader = BufReader::new(stream);
+        Ok(())
+    }
+
+    /// Reads one newline-delimited answer.
+    async fn read_response<R>(reader: &mut R) -> Result<IpcResponse, AppError>
+    where
+        R: AsyncBufRead + Unpin,
+    {
         let mut buffer = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buffer)
+        AsyncBufReadExt::read_line(reader, &mut buffer)
             .await
             .map_err(|e| AppError::cause(codes::SERVICE_IO_ERROR, e))?;
 
@@ -162,5 +252,150 @@ impl IpcClient {
     /// view. The reason is logged by [`Self::send_message`] on the way out.
     pub async fn is_service_running() -> bool {
         Self::get_status().await.is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpcClient, IpcMessage, IpcResponse};
+    use crate::error::{codes, AppError};
+    use crate::service::ipc_token::{auth_mac, proof_mac};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+    const TOKEN: &str = "a-token-the-service-and-the-ui-both-hold";
+
+    /// Runs the handshake against a stand-in peer.
+    ///
+    /// `answer` decides what the peer replies to the caller's `Auth`: its own
+    /// proof, or nothing at all. Returns what the handshake concluded.
+    async fn handshake_against(answer: Answer) -> Result<(), AppError> {
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let service_nonce = crate::service::ipc_token::random_nonce().expect("a nonce");
+
+        let peer = tokio::spawn(peer_side(server_end, service_nonce.clone(), answer));
+
+        let (read_half, mut write_half) = tokio::io::split(client_end);
+        let mut reader = BufReader::new(read_half);
+        let result = IpcClient::handshake(&mut reader, &mut write_half, TOKEN).await;
+
+        peer.abort();
+        result
+    }
+
+    /// What a stand-in peer replies with.
+    enum Answer {
+        /// The proof the token really produces.
+        Proof,
+        /// A proof computed under some other token — what a squatter holding
+        /// nothing would have to send.
+        Forged,
+    }
+
+    /// The service's half: challenge, read the answer, reply.
+    async fn peer_side(server_end: DuplexStream, service_nonce: String, answer: Answer) {
+        let (read_half, mut write_half) = tokio::io::split(server_end);
+        let mut reader = BufReader::new(read_half);
+
+        write_line(
+            &mut write_half,
+            &IpcResponse::Challenge {
+                nonce: service_nonce.clone(),
+            },
+        )
+        .await;
+
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .expect("the caller answers");
+        if read == 0 {
+            return;
+        }
+
+        let caller_nonce = match serde_json::from_str::<IpcMessage>(&line) {
+            Ok(IpcMessage::Auth { nonce, .. }) => nonce,
+            other => panic!("the caller must answer with an Auth, got {other:?}"),
+        };
+
+        let mac = match answer {
+            Answer::Proof => proof_mac(TOKEN, &service_nonce, &caller_nonce),
+            Answer::Forged => proof_mac(
+                "a-token-the-peer-does-not-hold",
+                &service_nonce,
+                &caller_nonce,
+            ),
+        };
+        write_line(&mut write_half, &IpcResponse::AuthOk { mac }).await;
+    }
+
+    async fn write_line<W>(writer: &mut W, response: &IpcResponse)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let line = serde_json::to_string(response).expect("the response serializes");
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("the line is written");
+        writer
+            .write_all(b"\n")
+            .await
+            .expect("the line is terminated");
+        writer.flush().await.expect("the line is flushed");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_answers_for_the_callers_nonce_is_accepted() {
+        handshake_against(Answer::Proof)
+            .await
+            .expect("a peer holding the token proves it");
+    }
+
+    /// The case the handshake exists for: something on the port that accepted the
+    /// caller's answer but cannot answer for its nonce does not hold the token,
+    /// and the caller has to find out rather than keep talking to it.
+    #[tokio::test]
+    async fn a_peer_that_cannot_prove_it_holds_the_token_is_refused() {
+        let error = handshake_against(Answer::Forged)
+            .await
+            .expect_err("a forged proof is refused");
+
+        assert_eq!(error.code, codes::SERVICE_UNAUTHORIZED);
+    }
+
+    /// An older service waits for the caller to speak first, so it never opens
+    /// with a challenge. That has to surface as a mismatch the UI can act on —
+    /// reinstall the service — and not as a call that never returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_challenges_is_a_mismatch() {
+        let (client_end, server_end) = tokio::io::duplex(64);
+
+        let handshake = tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(client_end);
+            let mut reader = BufReader::new(read_half);
+            IpcClient::handshake(&mut reader, &mut write_half, TOKEN).await
+        });
+
+        // Held open and silent: the connection is alive, nothing arrives on it.
+        let _silent_peer = server_end;
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        let error = handshake
+            .await
+            .expect("the task ends")
+            .expect_err("no challenge");
+        assert_eq!(error.code, codes::SERVICE_PROTOCOL_MISMATCH);
+    }
+
+    /// The caller's answer is bound to the challenge: an answer recorded from one
+    /// connection is not an answer on the next, so it cannot be replayed.
+    #[test]
+    fn an_answer_is_bound_to_the_challenge_it_was_made_for() {
+        assert_ne!(
+            auth_mac(TOKEN, "one-challenge", "caller"),
+            auth_mac(TOKEN, "another", "caller")
+        );
     }
 }

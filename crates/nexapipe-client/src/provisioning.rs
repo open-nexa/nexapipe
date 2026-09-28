@@ -656,11 +656,17 @@ fn normalize_secret(raw: &str) -> Result<String> {
     if secret.is_empty() {
         bail!("the 2FA secret is empty");
     }
+    // The secret itself is left out of both messages: these errors are shown
+    // to a user and end up in logs, and this module redacts the secret
+    // everywhere else it prints an invite.
     if secret.len() < 8 {
-        bail!("the 2FA secret {secret:?} is too short (at least 8 characters)");
+        bail!(
+            "the 2FA secret is too short: {} characters, at least 8",
+            secret.len()
+        );
     }
     if !secret.chars().all(|c| matches!(c, 'A'..='Z' | '2'..='7')) {
-        bail!("the 2FA secret {secret:?} is not Base32");
+        bail!("the 2FA secret is not Base32");
     }
     Ok(secret)
 }
@@ -1039,6 +1045,16 @@ mod tests {
 
         let error = InviteTotp::new("client-001", "ab").unwrap_err();
         assert!(error.to_string().contains("too short"), "{error}");
+    }
+
+    #[test]
+    fn a_rejected_secret_is_not_quoted_back() {
+        // These errors are shown to a user and end up in logs, so the secret
+        // has to stay out of them whatever the reason it was refused.
+        for bad in ["hello-there", "ab", "JBSWY3DPEHPK3PX!"] {
+            let error = InviteTotp::new("client-001", bad).unwrap_err();
+            assert!(!error.to_string().contains(bad), "{error}");
+        }
     }
 
     #[test]

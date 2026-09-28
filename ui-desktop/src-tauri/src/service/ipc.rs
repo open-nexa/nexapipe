@@ -8,7 +8,37 @@ use crate::{
 
 pub const IPC_SOCKET_PATH: &str = "127.0.0.1:12345";
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// What a credential looks like in a `Debug` output.
+///
+/// These structs are logged whole when the service runs at debug level, and a
+/// node carries the TOTP secret or the enrollment token it hands to the server.
+/// The debug output is the only place that would print them, so it is written
+/// by hand rather than derived.
+const REDACTED: &str = "<redacted>";
+
+/// `Some(REDACTED)` when the field carries a value: whether there is a
+/// credential matters when debugging, what it is does not.
+fn present(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
+}
+
+impl std::fmt::Debug for NodeInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeInput")
+            .field("connection_type", &self.connection_type)
+            .field("ticket", &self.ticket)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("domains", &self.domains)
+            .field("two_factor_client_id", &self.two_factor_client_id)
+            .field("two_factor_secret", &present(&self.two_factor_secret))
+            .field("two_factor_algorithm", &self.two_factor_algorithm)
+            .field("enrollment_client_id", &self.enrollment_client_id)
+            .field("enrollment_token", &present(&self.enrollment_token))
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NodeInput {
     pub connection_type: String,
     pub ticket: String,
@@ -69,7 +99,25 @@ impl NodeInput {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl std::fmt::Debug for StartProxyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartProxyRequest")
+            .field("nodes", &self.nodes)
+            .field("domains", &self.domains)
+            .field("local_addr", &self.local_addr)
+            .field("dns_addr", &self.dns_addr)
+            .field("upstream_dns", &self.upstream_dns)
+            .field("load_balancing", &self.load_balancing)
+            .field("tun_name", &self.tun_name)
+            .field("use_tun", &self.use_tun)
+            .field("relay_mode", &self.relay_mode)
+            .field("relay_url", &self.relay_url)
+            .field("relay_auth_token", &present(&self.relay_auth_token))
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct StartProxyRequest {
     pub nodes: Vec<NodeInput>,
     pub domains: Vec<String>,
@@ -114,12 +162,20 @@ pub struct IssuedCredentialPayload {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcMessage {
-    /// First message on every connection: hands over the token written by the
-    /// desktop session (see [`crate::service::ipc_token`]).
+    /// The caller's answer to [`IpcResponse::Challenge`]: proof it holds the token
+    /// written by the desktop session (see [`crate::service::ipc_token`]) without
+    /// ever sending the token itself.
     ///
     /// Everything else is refused until this succeeds, because the service runs
     /// elevated and a loopback socket says nothing about who dialled it.
-    Auth(String),
+    ///
+    /// `nonce` is the caller's own, chosen by the caller: the service has to
+    /// answer for it too, so a caller can tell the real service from anything
+    /// else sitting on the port.
+    Auth {
+        nonce: String,
+        mac: String,
+    },
     /// Boxed: `StartProxyRequest` is ~250 bytes while every other variant is a
     /// `String` or a `Vec`, so the enum would otherwise be sized after its rarest
     /// variant and every message would pay for it.
@@ -155,6 +211,23 @@ pub enum IpcMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcResponse {
     Ok,
+    /// The first thing the service says on every connection, before the caller
+    /// has offered anything: nonce the caller's [`IpcMessage::Auth`] answers for.
+    ///
+    /// The service speaks first on purpose. Used to be the caller that did, and
+    /// on a fixed port that meant handing a bearer credential to whatever was
+    /// listening — a squatter on `IPC_SOCKET_PATH` collected it and drove the
+    /// real service with it. Nothing is offered here until the peer has proved
+    /// itself, and the caller proves itself to nobody until it has heard this.
+    Challenge {
+        nonce: String,
+    },
+    /// Proof that the service holds the token, so the caller can tell it from a
+    /// squatter: HMAC over the caller's nonce. Checked by the caller, which
+    /// otherwise has no way to know who answered.
+    AuthOk {
+        mac: String,
+    },
     Error(AppError),
     Status(ProxyStatus),
     NodeId(String),

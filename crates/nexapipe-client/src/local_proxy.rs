@@ -48,7 +48,45 @@ fn debug_log_enabled() -> bool {
     false
 }
 
+/// Headers whose value is a credential, and so never belongs in a log.
+const SENSITIVE_HEADERS: [&str; 5] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+/// The headers of a request, with the values that carry credentials replaced.
+///
+/// Logging them whole put `Authorization` and `Cookie` into logcat on every
+/// request. Names and non-sensitive values are still what makes a dump useful
+/// when debugging, so only the values are dropped.
+fn redacted_headers(headers: &::http::HeaderMap) -> String {
+    let mut out = String::from("{");
+    for (name, value) in headers {
+        if SENSITIVE_HEADERS.contains(&name.as_str().to_lowercase().as_str()) {
+            out.push_str(&format!("{}: <redacted>, ", name));
+        } else {
+            out.push_str(&format!("{}: {:?}, ", name, value));
+        }
+    }
+    out.push('}');
+    out
+}
+
 const STREAM_BUF_SIZE: usize = 128 * 1024;
+
+/// Largest request header the local proxy collects, before it gives up on a
+/// peer that never ends one. Same order as the server's own head limit, and
+/// far above any real request: what it bounds is a client that keeps the
+/// connection open and dribbles bytes into it.
+const MAX_REQUEST_HEADER: usize = 64 * 1024;
+
+/// How long the accept loop waits after an error before trying again, and how
+/// many it takes before it concludes the listener is not coming back.
+const ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(100);
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 10;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Number of attempts for opening a fresh iroh bi-stream for a new request.
 /// If the pooled connection is stale (already closed by the peer), `open_bi` or
@@ -146,6 +184,12 @@ impl LocalProxy {
         let endpoint_group = self.endpoint_group.clone();
         let stop_notify = self.stop_notify.clone();
 
+        // Accept errors that are not fatal: a moment with no file descriptors
+        // left, say. Counting them keeps the loop from spinning on a listener
+        // that is genuinely broken, which is the case the old single-error exit
+        // was there for.
+        let mut consecutive_accept_errors = 0usize;
+
         loop {
             if stopped.load(Ordering::Acquire) {
                 #[cfg(feature = "tracing")]
@@ -173,6 +217,7 @@ impl LocalProxy {
 
             match accepted {
                 Ok((stream, addr)) => {
+                    consecutive_accept_errors = 0;
                     #[cfg(feature = "tracing")]
                     tracing::debug!("New connection from: {}", addr);
 
@@ -199,7 +244,21 @@ impl LocalProxy {
                     }
                     #[cfg(feature = "tracing")]
                     tracing::error!("Local proxy accept error: {}", e);
-                    break;
+
+                    // Transient ones — out of file descriptors under a burst of
+                    // connections — used to end the loop, leaving the listener
+                    // open and nothing accepting from it. Back off and go round
+                    // again instead, but not forever.
+                    consecutive_accept_errors += 1;
+                    if consecutive_accept_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            "Local proxy accept failed {} times in a row, giving up",
+                            consecutive_accept_errors
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             }
         }
@@ -505,6 +564,14 @@ where
         let prev_len = request_buf.len();
         request_buf.extend_from_slice(&temp_buf[..n]);
 
+        // A peer that keeps sending without ever ending its headers grows this
+        // buffer without bound — one read every 30s is enough, because each
+        // read is what resets the timeout above.
+        if request_buf.len() > MAX_REQUEST_HEADER {
+            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+            return Ok(());
+        }
+
         // Search for \r\n\r\n, starting a few bytes before the new data
         let search_start = prev_len.saturating_sub(3);
         if let Some(pos) = request_buf[search_start..]
@@ -690,10 +757,10 @@ where
     if is_websocket_request_static(&request) {
         jni_log!("[DEBUG:local-proxy] WebSocket request, rewriting to absolute URI");
         jni_log!(
-            "[DEBUG:local-proxy] WebSocket request details: uri={}, host={}, headers={:?}",
+            "[DEBUG:local-proxy] WebSocket request details: uri={}, host={}, headers={}",
             request.uri(),
             host,
-            request.headers()
+            redacted_headers(request.headers())
         );
 
         // Find the first line (request line)
@@ -753,20 +820,33 @@ where
                                 return "client_eof";
                             }
                             Ok(n) => {
-                                jni_log!(
-                                    "[DEBUG:local-proxy] WS client->iroh: {}",
-                                    websocket_frame_preview(&buf[..n])
-                                );
-                                ws_buffer.extend_from_slice(&buf[..n]);
-                                let mut frames = Vec::new();
-                                parse_websocket_frames(&mut ws_buffer, &mut frames);
-                                for (opcode, payload) in frames {
-                                    if opcode == 1 || opcode == 8 {
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
-                                            opcode,
-                                            String::from_utf8_lossy(&payload)
-                                        );
+                                // Payload, not metadata: it costs a preview to
+                                // build and it is the user's traffic, so it is
+                                // only worth it while debugging.
+                                if debug_log_enabled() {
+                                    jni_log!(
+                                        "[DEBUG:local-proxy] WS client->iroh: {}",
+                                        websocket_frame_preview(&buf[..n])
+                                    );
+                                }
+                                // The buffer only feeds the dumps above, and it
+                                // only empties once a whole frame is in it: a
+                                // client that sends a frame header and then
+                                // nothing would grow it forever, logs or no
+                                // logs. So the decode is part of what is
+                                // switched off with them.
+                                if debug_log_enabled() {
+                                    ws_buffer.extend_from_slice(&buf[..n]);
+                                    let mut frames = Vec::new();
+                                    parse_websocket_frames(&mut ws_buffer, &mut frames);
+                                    for (opcode, payload) in frames {
+                                        if opcode == 1 || opcode == 8 {
+                                            jni_log!(
+                                                "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
+                                                opcode,
+                                                String::from_utf8_lossy(&payload)
+                                            );
+                                        }
                                     }
                                 }
                                 if let Err(e) = send.write_all(&buf[..n]).await {
@@ -795,10 +875,12 @@ where
                                 if first {
                                     first = false;
                                     let p = &buf[..std::cmp::min(n, 200)];
-                                    jni_log!(
-                                        "[DEBUG:local-proxy] WS first response: {}",
-                                        String::from_utf8_lossy(p)
-                                    );
+                                    if debug_log_enabled() {
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS first response: {}",
+                                            String::from_utf8_lossy(p)
+                                        );
+                                    }
                                 }
                                 if debug_log_enabled() {
                                     jni_log!(
@@ -806,7 +888,7 @@ where
                                         websocket_frame_preview(&buf[..n])
                                     );
                                 }
-                                if n <= 1024 {
+                                if n <= 1024 && debug_log_enabled() {
                                     jni_log!(
                                         "[DEBUG:local-proxy] WS iroh->client decoded: {}",
                                         String::from_utf8_lossy(&buf[..n])
@@ -929,7 +1011,7 @@ where
                     if !response_sent {
                         response_sent = true;
                         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
-                        if !debug_preview.is_empty() {
+                        if !debug_preview.is_empty() && debug_log_enabled() {
                             jni_log!(
                                 "[DEBUG:local-proxy] Response preview: {}",
                                 String::from_utf8_lossy(&debug_preview)
@@ -949,7 +1031,7 @@ where
                 "[DEBUG:local-proxy] Response sent (late): {} bytes",
                 total_bytes
             );
-            if !debug_preview.is_empty() {
+            if !debug_preview.is_empty() && debug_log_enabled() {
                 jni_log!(
                     "[DEBUG:local-proxy] Response preview: {}",
                     String::from_utf8_lossy(&debug_preview)
@@ -962,8 +1044,8 @@ where
     // Regular HTTP request-response handling
     jni_log!("[DEBUG:local-proxy] Detected HTTP request, using request-response mode");
     jni_log!(
-        "[DEBUG:local-proxy] Request headers: {:?}",
-        request.headers()
+        "[DEBUG:local-proxy] Request headers: {}",
+        redacted_headers(request.headers())
     );
     let client_task = tokio::spawn(client_to_backend);
     let mut backend_task = tokio::spawn(backend_to_client);

@@ -448,13 +448,16 @@ pub async fn run_proxy(
                         // this connection is still being set up.
                         let guard = in_flight_clone.enter();
                         tokio::spawn(async move {
-                            let _connection = guard;
+                            // Handed on rather than dropped here: it stands for
+                            // the connection, and the task that serves it is
+                            // what decides when that is over.
                             conn::handle_incoming(
                                 incoming,
                                 config_clone,
                                 http_client_clone,
                                 auth_state_clone,
                                 limiter_clone,
+                                guard,
                             )
                             .await;
                         });

@@ -280,9 +280,13 @@
       "elevation_failed": "Requesting administrator permission failed.",
       "unauthorized": "The system service refused the request: the caller could not prove it is the NexaPipe app.",
       "ipc_token": "The service credential could not be read. Restart NexaPipe so it issues a new one.",
+      "protocol_mismatch": "The installed service is older than this app. Reinstall the service, then start it again.",
       "malformed_request": "The system service received a request it could not read.",
       "local_addr_not_loopback": "The local proxy can only listen on this computer (127.0.0.1).",
       "dns_addr_outside_tun": "The DNS server can only listen inside the TUN network."
+    },
+    "credentials": {
+      "store_failed": "The saved credentials could not be read or written. Re-import the invite to restore them."
     },
     "invite": {
       "parse_failed": "This invite link could not be read."

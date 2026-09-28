@@ -158,6 +158,47 @@ fn default_created_at() -> String {
     unix_now().to_string()
 }
 
+impl AuthConfig {
+    /// A copy carrying only the counters the config file is written back to.
+    ///
+    /// The whole config used to be cloned on every attempt worth counting, and
+    /// a clone copies every client's secret and enrollment token with it — once
+    /// per wrong code, from any peer that can name a client id. Only
+    /// `failed_attempts`, `locked_until` and `last_used` are persisted, so only
+    /// those travel. Extend this alongside `save_auth_state`, or a field added
+    /// there is silently written as empty.
+    pub fn counter_snapshot(&self) -> AuthConfig {
+        AuthConfig {
+            enabled: self.enabled,
+            issuer: String::new(),
+            algorithm: self.algorithm.clone(),
+            time_step: self.time_step,
+            digits: self.digits,
+            window: self.window,
+            clients: self
+                .clients
+                .iter()
+                .map(|(id, client)| {
+                    (
+                        id.clone(),
+                        ClientAuth {
+                            secret: String::new(),
+                            created_at: String::new(),
+                            allow_hosts: None,
+                            pending_enrollment: None,
+                            last_used: client.last_used,
+                            failed_attempts: client.failed_attempts,
+                            locked_until: client.locked_until,
+                        },
+                    )
+                })
+                .collect(),
+            max_attempts: self.max_attempts,
+            lockout_duration: self.lockout_duration,
+        }
+    }
+}
+
 /// Seconds since the Unix epoch.
 ///
 /// The fallible `SystemTime` dance is centralised here so the lockout rules

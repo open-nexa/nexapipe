@@ -149,6 +149,33 @@ where
     }
 }
 
+/// The same, bounded by a deadline for the whole read rather than by one idle
+/// gap between chunks.
+///
+/// A peer that sends a byte just inside the timeout restarts a per-read one
+/// every time, which kept a stream slot — and the buffer behind it — alive for
+/// as long as it cared to keep dribbling. Anything that waits on a peer to
+/// finish saying something wants this one, not [`read_more`].
+pub async fn read_more_by<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 4096];
+    match tokio::time::timeout_at(deadline, reader.read(&mut chunk)).await {
+        Ok(Ok(0)) => Ok(false),
+        Ok(Ok(n)) => {
+            buf.extend_from_slice(&chunk[..n]);
+            Ok(true)
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

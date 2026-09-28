@@ -135,11 +135,27 @@ android {
     // app language recreates the Activity, so the stale-value risk the lint
     // describes does not apply here.
     //
+    // Version nags are the one kind of finding the baseline cannot hold.
+    // `gradle/libs.versions.toml` and `gradle/wrapper/gradle-wrapper.properties`
+    // live outside this module, so lint records them under an absolute
+    // `$HOME/...` path — `$HOME/rust/nexapipe/...` here, `$HOME/work/
+    // nexapipe/nexapipe/...` on a runner — and the entry matches nothing as
+    // soon as the checkout is anywhere else. Baseline or not, a new release of
+    // any dependency outside our control would fail the job. Bumping them is a
+    // change of its own, not something a pull request about unrelated code
+    // should be forced to carry.
+    //
     // After fixing something the file records, refresh it in the same change:
     //   ./gradlew :app:updateLintBaseline
     lint {
         baseline = file("lint-baseline.xml")
         warningsAsErrors = true
+        disable +=
+            setOf(
+                "GradleDependency",
+                "NewerVersionAvailable",
+                "AndroidGradlePluginVersion",
+            )
     }
 }
 

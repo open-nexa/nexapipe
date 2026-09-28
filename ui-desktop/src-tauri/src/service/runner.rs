@@ -110,6 +110,17 @@ impl ServiceRunner {
         let mut reader = BufReader::new(stream);
         let mut line = Vec::new();
 
+        // And this process speaks first, so a caller never hands anything to a
+        // peer that has not identified itself — see `IpcResponse::Challenge`.
+        let service_nonce = crate::service::ipc_token::random_nonce()?;
+        Self::write_response(
+            reader.get_mut(),
+            &IpcResponse::Challenge {
+                nonce: service_nonce.clone(),
+            },
+        )
+        .await?;
+
         loop {
             line.clear();
             match Self::read_ipc_line(&mut reader, &mut line).await {
@@ -153,15 +164,16 @@ impl ServiceRunner {
             };
 
             if !authenticated {
-                let presented = match &msg {
-                    IpcMessage::Auth(token) => token.clone(),
+                let (caller_nonce, presented) = match &msg {
+                    IpcMessage::Auth { nonce, mac } => (nonce.clone(), mac.clone()),
                     other => {
                         // Obeyed nothing, answered once, connection closed.
                         tracing::warn!(
                             "Refusing an IPC client that spoke before authenticating: {:?}",
                             std::mem::discriminant(other)
                         );
-                        let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
+                        let response =
+                            IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
                         Self::write_response(reader.get_mut(), &response).await?;
                         break;
                     }
@@ -169,29 +181,47 @@ impl ServiceRunner {
 
                 // Every published token is a candidate: the service cannot tell which account
                 // dialled it, so which one happens to be found first says nothing about which
-                // one the caller holds.
+                // one the caller holds. The answer is bound to both nonces, so a recorded one
+                // is worth nothing on the next connection.
                 let known = crate::service::ipc_token::read_tokens()?;
-                if crate::service::ipc_token::token_matches_any(&known, &presented) {
-                    authenticated = true;
-                    tracing::debug!("IPC client authenticated");
-                } else if known.is_empty() {
-                    // No token published yet means no desktop session has asked for the
-                    // service, so there is nobody to answer.
-                    tracing::warn!("Refusing an IPC call with no token on file");
-                    let response = IpcResponse::Error(AppError::with_detail(
-                        codes::SERVICE_IPC_TOKEN,
-                        "no desktop session has published an IPC token",
-                    ));
-                    Self::write_response(reader.get_mut(), &response).await?;
-                    break;
-                } else {
-                    tracing::warn!("Refusing an IPC client that presented a wrong token");
-                    let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
-                    Self::write_response(reader.get_mut(), &response).await?;
-                    break;
-                }
+                let matched = crate::service::ipc_token::token_for_auth(
+                    &known,
+                    &service_nonce,
+                    &caller_nonce,
+                    &presented,
+                );
 
-                Self::write_response(reader.get_mut(), &IpcResponse::Ok).await?;
+                let token = match matched {
+                    Some(token) => {
+                        authenticated = true;
+                        tracing::debug!("IPC client authenticated");
+                        token
+                    }
+                    None if known.is_empty() => {
+                        // No token published yet means no desktop session has asked for the
+                        // service, so there is nobody to answer.
+                        tracing::warn!("Refusing an IPC call with no token on file");
+                        let response = IpcResponse::Error(AppError::with_detail(
+                            codes::SERVICE_IPC_TOKEN,
+                            "no desktop session has published an IPC token",
+                        ));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!("Refusing an IPC client that answered the challenge wrong");
+                        let response =
+                            IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                };
+
+                // The caller proved itself; now this side proves itself back, so a caller
+                // that connected to something else on the port finds out.
+                let proof =
+                    crate::service::ipc_token::proof_mac(&token, &service_nonce, &caller_nonce);
+                Self::write_response(reader.get_mut(), &IpcResponse::AuthOk { mac: proof }).await?;
                 continue;
             }
 
@@ -227,8 +257,14 @@ impl ServiceRunner {
                 IpcMessage::GetStartupError => {
                     IpcResponse::StartupError(startup_error_slot().read().await.clone())
                 }
-                // Handled above, when the caller introduced itself.
-                IpcMessage::Auth(_) => IpcResponse::Ok,
+                // Handled above, when the caller introduced itself. A second
+                // handshake on a connection that already has one is refused
+                // rather than answered: there is nothing it could establish, and
+                // answering it would make this side sign arbitrary nonces for
+                // whoever is on the other end.
+                IpcMessage::Auth { .. } => {
+                    IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED))
+                }
             };
 
             Self::write_response(reader.get_mut(), &response).await?;

@@ -2,6 +2,7 @@ use crate::routes::{L4Options, Route};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1100,8 +1101,7 @@ impl ProxyConfig {
         }
         client.insert("secret", toml_edit::value(secret));
 
-        fs::write(path, doc.to_string())
-            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))?;
+        write_config_file(path, &doc.to_string())?;
 
         Ok(if replaced {
             ClientSecretWrite::Replaced
@@ -1142,7 +1142,7 @@ impl ProxyConfig {
 
         client.insert("pending_enrollment", toml_edit::value(token));
 
-        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+        write_config_file(path, &doc.to_string())
     }
 
     /// Spends the token: writes the issued `secret` and drops
@@ -1165,8 +1165,76 @@ impl ProxyConfig {
         client.insert("secret", toml_edit::value(secret));
         client.remove("pending_enrollment");
 
-        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+        write_config_file(path, &doc.to_string())
     }
+}
+
+/// Replaces the file at `path` with `contents` in one step.
+///
+/// Written next to the target and renamed over it, rather than truncated in
+/// place: a process killed in the middle of `fs::write` leaves a short file,
+/// and a short config is one the proxy cannot start from again. A rename is a
+/// single directory entry swap, so anything reading the file sees either the
+/// old contents or the new ones.
+///
+/// The replacement is created `0600`, because what it holds is TOTP secrets and
+/// enrollment tokens: a new file takes the umask, and the file it replaces was
+/// checked at startup for being private.
+pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
+    let target = Path::new(path);
+    let directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let temp = directory.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let write = || -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", temp.display()))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", temp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("cannot set the mode of {}: {e}", temp.display()))?;
+        }
+        Ok(())
+    };
+
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+
+    // A rename cannot replace a file that is itself a mount point, which is
+    // what a bind-mounted single config file is. Falling back to writing in
+    // place is the lesser evil: it loses the atomicity, not the write.
+    if let Err(rename) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        let fallback = fs::write(target, contents)
+            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e} (rename failed: {rename})"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fallback.is_ok() {
+                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+            }
+        }
+        return fallback;
+    }
+
+    Ok(())
 }
 
 /// What [`ProxyConfig::write_client_secret`] did to the config file.

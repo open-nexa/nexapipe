@@ -280,9 +280,13 @@
       "elevation_failed": "请求管理员授权失败。",
       "unauthorized": "系统服务已拒绝该请求：调用方无法证明它是 NexaPipe 本体。",
       "ipc_token": "无法读取服务凭据，请重启 NexaPipe 以重新签发。",
+      "protocol_mismatch": "已安装的服务版本低于当前应用，请重新安装服务后再次启动。",
       "malformed_request": "系统服务收到了无法解析的请求。",
       "local_addr_not_loopback": "本地代理只能监听本机地址（127.0.0.1）。",
       "dns_addr_outside_tun": "DNS 服务只能监听在 TUN 网段内。"
+    },
+    "credentials": {
+      "store_failed": "无法读取或写入已保存的凭据，请重新导入邀请以恢复。"
     },
     "invite": {
       "parse_failed": "无法读取该邀请链接。"

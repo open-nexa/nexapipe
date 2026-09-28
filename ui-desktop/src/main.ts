@@ -23,6 +23,7 @@ import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
 import { initProxyState, onAppFocused } from './stores/proxy';
+import { initConfigStore } from './stores/config';
 
 import './styles/tokens.css';
 import './styles/themes.css';
@@ -34,6 +35,10 @@ applyStoredTheme();
 
 async function bootstrap(): Promise<void> {
   await initPlatform();
+
+  // Credentials are read from the encrypted store, which is asynchronous, so this is awaited
+  // before mount: a page must never render a node's 2FA as absent and then fill it in.
+  await initConfigStore();
 
   // The composition root owns the *initial* locale; `useLocale` owns every later change, so the
   // two cannot fight over the value — both resolve it the same way.

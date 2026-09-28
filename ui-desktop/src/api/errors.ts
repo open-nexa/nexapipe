@@ -43,9 +43,12 @@ export const ERROR_CODES = [
   // IPC authentication
   'service.unauthorized',
   'service.ipc_token',
+  'service.protocol_mismatch',
   'service.malformed_request',
   'service.local_addr_not_loopback',
   'service.dns_addr_outside_tun',
+  // credential store
+  'credentials.store_failed',
   // invite
   'invite.parse_failed',
   // logs

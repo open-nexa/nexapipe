@@ -77,6 +77,24 @@ pub enum AuthMessage {
     EnrollFailed { reason: String },
 }
 
+/// Longest client id the handshake accepts.
+///
+/// Long enough for any name a config would carry, short enough that one cannot
+/// be used to push a wall of text through the logs.
+pub const MAX_CLIENT_ID_LEN: usize = 255;
+
+/// Whether a client id may be printed as it stands.
+///
+/// A client id arrives before anything about the peer is known, and the server
+/// puts it in the log line for every outcome — a refusal, a lockout, an
+/// unknown client. Printable ASCII only, which is what keeps a peer from
+/// ending its id with a CRLF and writing the next line itself.
+pub fn is_presentable_client_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CLIENT_ID_LEN
+        && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 impl AuthMessage {
     /// Serialize message to bytes
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {

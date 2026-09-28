@@ -7,6 +7,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::io::Write;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 /// Client used to reach backends.
 ///
@@ -515,10 +516,21 @@ pub async fn proxy_to_backend_streaming(
         proxied_req.uri()
     );
 
-    let response = client.request(proxied_req).await.map_err(|e| {
-        tracing::error!("Failed to send request: {:?}", e);
-        anyhow::anyhow!("failed to send request: {:?}", e)
-    })?;
+    // The same deadline `proxy_request` uses. Without it a backend that
+    // accepts the connection and then never sends a head keeps this task, and
+    // the stream slot it holds, alive forever.
+    let response = match tokio::time::timeout(RESPONSE_TIMEOUT, client.request(proxied_req)).await {
+        Ok(result) => result.map_err(|e| {
+            tracing::error!("Failed to send request: {:?}", e);
+            anyhow::anyhow!("failed to send request: {:?}", e)
+        })?,
+        Err(_) => {
+            return Err(ProxyFailure::from(anyhow::anyhow!(
+                "backend did not respond within {:?}",
+                RESPONSE_TIMEOUT
+            )));
+        }
+    };
 
     let (parts, body) = response.into_parts();
 
@@ -779,28 +791,47 @@ fn request_is_chunked(req: &Request<()>) -> bool {
         .is_some_and(|v| v.to_lowercase().contains("chunked"))
 }
 
-async fn read_remaining_request_body(
-    recv: &mut iroh::endpoint::RecvStream,
+/// Generic over the reader so the idle cap below can be tested without an
+/// endpoint; callers pass an iroh receive stream.
+async fn read_remaining_request_body<R>(
+    recv: &mut R,
     body: &mut Vec<u8>,
     content_length: usize,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), anyhow::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut remaining = content_length.saturating_sub(body.len());
     let mut buf = [0u8; 8192];
 
     while remaining > 0 {
-        let n = recv
-            .read(&mut buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "request body ended before content-length: expected {} bytes, got {}",
-                    content_length,
-                    body.len()
-                )
-            })?;
+        // Idle-capped per read, like the chunked path: a peer that declares a
+        // large `content-length` and then drips it a byte at a time otherwise
+        // holds the buffer, and the stream slot, for as long as it likes.
+        let read = match tokio::time::timeout(REQUEST_BODY_READ_TIMEOUT, recv.read(&mut buf)).await
+        {
+            Ok(result) => result
+                .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "request body went {}s without sending anything: {} of {} bytes arrived",
+                    REQUEST_BODY_READ_TIMEOUT.as_secs(),
+                    body.len(),
+                    content_length
+                ));
+            }
+        };
+        // Zero is the reader's end of stream, which is an iroh `None` on the
+        // concrete receive stream: the peer gave up before the declared length.
+        if read == 0 {
+            return Err(anyhow::anyhow!(
+                "request body ended before content-length: expected {} bytes, got {}",
+                content_length,
+                body.len()
+            ));
+        }
 
-        let take = n.min(remaining);
+        let take = read.min(remaining);
         body.extend_from_slice(&buf[..take]);
         remaining -= take;
     }
@@ -1136,5 +1167,88 @@ mod tests {
         for kept in ["host", "accept", "content-length", "sec-websocket-key"] {
             assert!(forwards_request_header(kept), "{kept} is the message's own");
         }
+    }
+
+    /// Hands over `chunks` one read at a time and then either ends the stream
+    /// or stalls forever — the two shapes a peer that declared a
+    /// `content-length` can take once the head has been sent.
+    struct ScriptedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        ends: bool,
+    }
+
+    impl ScriptedReader {
+        fn pieces(pieces: &[&[u8]], ends: bool) -> Self {
+            Self {
+                chunks: pieces.iter().map(|p| p.to_vec()).collect(),
+                ends,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    buf.put_slice(&chunk);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                // Nothing left and the peer gave up: end of stream, which is
+                // what reports the body as shorter than it claimed to be.
+                None if self.ends => std::task::Poll::Ready(Ok(())),
+                // Still connected, still silent.
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    /// The clock is paused, so the 30s cap is reached without the test waiting
+    /// for it: what is being checked is that there is a cap at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_declared_body_that_stops_arriving_is_given_up_on() {
+        let mut reader = ScriptedReader::pieces(&[b"a-few-bytes"], false);
+        let mut body = Vec::new();
+
+        let err = read_remaining_request_body(&mut reader, &mut body, 64)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("without sending anything"),
+            "{err}"
+        );
+        assert_eq!(body, b"a-few-bytes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_declared_body_that_keeps_arriving_is_read_whole() {
+        let mut reader = ScriptedReader::pieces(&[b"abc", b"de"], true);
+        // Two bytes came in with the head, so five are still owed.
+        let mut body = b"xx".to_vec();
+
+        read_remaining_request_body(&mut reader, &mut body, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(body, b"xxabcde");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_declared_body_that_ends_early_is_an_error() {
+        let mut reader = ScriptedReader::pieces(&[b"abc"], true);
+        let mut body = Vec::new();
+
+        let err = read_remaining_request_body(&mut reader, &mut body, 16)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("ended before content-length"),
+            "{err}"
+        );
     }
 }

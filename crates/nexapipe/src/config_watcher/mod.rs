@@ -420,8 +420,7 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
         set_counter(table, "last_used", client.last_used.unwrap_or(0));
     }
 
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))?;
+    crate::config::write_config_file(path, &doc.to_string())?;
 
     // The startup check only runs once, and this write recreates the file under
     // some editors and bind mounts — so a mode that was private when the proxy

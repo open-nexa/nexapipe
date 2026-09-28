@@ -30,7 +30,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
+use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
     encode_frame,
@@ -535,6 +535,11 @@ async fn read_preface<S>(
 where
     S: AsyncRead + Unpin,
 {
+    // One deadline for the whole preface: a per-read timeout is restarted by
+    // every byte, and a peer dribbling this out one byte at a time would hold
+    // the flow open for as long as it liked.
+    let deadline = tokio::time::Instant::now() + PREFACE_TIMEOUT;
+
     loop {
         match Preface::decode(&buf) {
             Ok(Some((preface, len))) => {
@@ -550,7 +555,7 @@ where
         // cannot make this loop buffer without bound.
         debug_assert!(buf.len() < MAX_PREFACE_LEN);
 
-        if !read_more(reader, &mut buf, PREFACE_TIMEOUT)
+        if !read_more_by(reader, &mut buf, deadline)
             .await
             .map_err(PrefaceFailure::Io)?
         {

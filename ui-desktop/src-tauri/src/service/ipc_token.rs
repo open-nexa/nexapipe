@@ -31,6 +31,13 @@ use std::path::{Path, PathBuf};
 /// Bytes of entropy in a token.
 const TOKEN_BYTES: usize = 32;
 
+/// Bytes of entropy in a handshake nonce.
+///
+/// A nonce is single-use and never leaves the connection it was made for, so it
+/// needs only to be unpredictable — which is the same thing a token needs, and
+/// comes from the same place.
+pub const NONCE_BYTES: usize = 32;
+
 /// Overrides [`token_path`], used by installs that keep runtime state somewhere
 /// unusual. Both processes have to see the same value.
 pub const TOKEN_PATH_ENV: &str = "NEXAPIPE_IPC_TOKEN_FILE";
@@ -102,7 +109,7 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
             Ok(token)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let token = generate_token();
+            let token = generate_token()?;
             write_private(path, &token).map_err(|e| {
                 AppError::cause(codes::SERVICE_IPC_TOKEN, format!("cannot write {path:?}: {e}"))
             })?;
@@ -133,22 +140,6 @@ pub fn read_tokens() -> Result<Vec<String>, AppError> {
         }
     }
     Ok(tokens)
-}
-
-/// The first published token, when one exists.
-///
-/// `None` is not "authentication is off": it means no desktop session has published a token,
-/// so there is no legitimate caller and every privileged message gets refused.
-///
-/// Looks past [`token_path`] because the service may not resolve that path the way the desktop
-/// session does — see [`service_token_paths`].
-pub fn read_token() -> Result<Option<String>, AppError> {
-    Ok(read_tokens()?.into_iter().next())
-}
-
-/// Whether `presented` is one of the published tokens.
-pub fn token_matches_any(tokens: &[String], presented: &str) -> bool {
-    tokens.iter().any(|token| token_matches(token, presented))
 }
 
 /// Every place the service looks for a token, in order.
@@ -317,22 +308,6 @@ pub fn read_token_at(path: &Path) -> Result<Option<String>, AppError> {
     }
 }
 
-/// Whether `presented` is the expected token.
-///
-/// Length-tolerant but otherwise constant-time: nothing in the timing is worth
-/// attacking when the token is 256 bits, but there is no reason to hand out the
-/// leading bytes for free either.
-pub fn token_matches(expected: &str, presented: &str) -> bool {
-    if expected.len() != presented.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in expected.as_bytes().iter().zip(presented.as_bytes()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 /// A token anybody could read is the same as no token at all, so it is refused
 /// rather than trusted — and loudly, because the fix is to delete the file.
 fn reject_world_readable(path: &Path) -> Result<(), AppError> {
@@ -348,12 +323,130 @@ fn reject_world_readable(path: &Path) -> Result<(), AppError> {
     }
 }
 
-fn generate_token() -> String {
-    let mut token = String::with_capacity(TOKEN_BYTES * 2);
-    for _ in 0..TOKEN_BYTES {
-        token.push_str(&format!("{:02x}", fastrand::u8(..)));
+/// A fresh token, drawn from the OS CSPRNG.
+///
+/// `fastrand` used to be the source here. It is a fast non-cryptographic
+/// generator seeded from the clock and ASLR, which is fine for a scratch
+/// directory name and not for the one secret that decides who may drive an
+/// elevated service: a token an attacker can predict is a token they can
+/// present.
+fn generate_token() -> Result<String, AppError> {
+    random_hex(TOKEN_BYTES)
+}
+
+/// A fresh handshake nonce.
+///
+/// The service sends one and the caller sends one; everything the handshake
+/// proves is bound to the pair, so a captured answer cannot be replayed on
+/// another connection.
+pub fn random_nonce() -> Result<String, AppError> {
+    random_hex(NONCE_BYTES)
+}
+
+/// `len` bytes from the OS CSPRNG, lowercase hex.
+///
+/// Hex rather than raw bytes because both a token and a nonce cross a
+/// newline-delimited JSON channel, and the token file is a text file a human may
+/// end up looking at.
+fn random_hex(len: usize) -> Result<String, AppError> {
+    let mut bytes = vec![0u8; len];
+    getrandom::fill(&mut bytes).map_err(|e| {
+        AppError::cause(
+            codes::SERVICE_IPC_TOKEN,
+            format!("cannot read {len} random bytes from the OS: {e}"),
+        )
+    })?;
+
+    let mut hex = String::with_capacity(len * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
     }
-    token
+    Ok(hex)
+}
+
+/// What the caller answers a challenge with: HMAC-SHA256 over the service's
+/// nonce followed by the caller's own.
+///
+/// Binding both nonces is what makes the answer single-use, and the caller's
+/// nonce is what the service then has to answer back for — see [`proof_mac`].
+pub fn auth_mac(token: &str, service_nonce: &str, caller_nonce: &str) -> String {
+    mac_hex(token, service_nonce, caller_nonce)
+}
+
+/// What the service answers with, so the caller can tell it from a squatter on
+/// the IPC port.
+///
+/// The nonces are the other way round so the two directions cannot produce the
+/// same value: otherwise a caller that recorded the service's own challenge
+/// answer could hand it back as proof.
+pub fn proof_mac(token: &str, service_nonce: &str, caller_nonce: &str) -> String {
+    mac_hex(token, caller_nonce, service_nonce)
+}
+
+/// Whether `presented` is what [`auth_mac`] produces for the caller's nonce
+/// under any published token, and which token it was.
+///
+/// The token itself is returned because [`proof_mac`] has to be computed under
+/// the same one: the service may have several candidates on file (one per
+/// desktop session) and only the matching one proves anything.
+pub fn token_for_auth(
+    tokens: &[String],
+    service_nonce: &str,
+    caller_nonce: &str,
+    presented: &str,
+) -> Option<String> {
+    tokens
+        .iter()
+        .find(|token| constant_time_eq(&auth_mac(token, service_nonce, caller_nonce), presented))
+        .cloned()
+}
+
+/// Whether `presented` is what [`proof_mac`] produces under `token`.
+pub fn proof_matches(
+    token: &str,
+    service_nonce: &str,
+    caller_nonce: &str,
+    presented: &str,
+) -> bool {
+    constant_time_eq(&proof_mac(token, service_nonce, caller_nonce), presented)
+}
+
+/// HMAC-SHA256 of two nonces under a token, lowercase hex.
+fn mac_hex(token: &str, first: &str, second: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    // HMAC accepts a key of any length, so this cannot fail.
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC takes a key of any length");
+    // The separator keeps two nonces from being ambiguous: both directions carry
+    // the same pair, and "ab" + "c" must not hash like "a" + "bc".
+    mac.update(first.as_bytes());
+    mac.update(b".");
+    mac.update(second.as_bytes());
+
+    let bytes = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// Length-tolerant, otherwise constant-time comparison.
+///
+/// The same shape as [`token_matches`]: the length already differs, so nothing
+/// is gained by hiding it, and comparing the leading bytes one by one is not
+/// free information either.
+fn constant_time_eq(expected: &str, presented: &str) -> bool {
+    if expected.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected.as_bytes().iter().zip(presented.as_bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// Writes `content` to a file only the creating account can read.
@@ -399,7 +492,8 @@ fn permissions(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_token_at, read_token_at, service_token_paths, token_matches, token_matches_any,
+        auth_mac, ensure_token_at, proof_mac, proof_matches, random_nonce, read_token_at,
+        service_token_paths, token_for_auth,
     };
     #[cfg(windows)]
     use super::profile_roots_from;
@@ -454,27 +548,94 @@ mod tests {
         let candidates = service_token_paths();
         assert_eq!(candidates.first().map(PathBuf::as_path), Some(path.as_path()));
         assert_eq!(
-            super::read_token().unwrap().as_deref(),
+            super::read_tokens().unwrap().first().map(String::as_str),
             Some(token.as_str())
         );
 
         std::env::remove_var(super::TOKEN_PATH_ENV);
     }
 
+    /// The two directions of the handshake must never produce the same value: a
+    /// caller that recorded the service's proof could otherwise hand it back as
+    /// its own answer, and the service would be signing its own nonce.
     #[test]
-    fn matching_only_happens_for_the_whole_token() {
-        assert!(token_matches("abc123", "abc123"));
-        assert!(!token_matches("abc123", "abc124"));
-        assert!(!token_matches("abc123", "abc1234"));
-        assert!(!token_matches("abc123", "ABC123"));
+    fn the_two_directions_of_the_handshake_differ() {
+        assert_ne!(
+            auth_mac("token", "server", "caller"),
+            proof_mac("token", "server", "caller")
+        );
+    }
+
+    /// Which token answered matters: the service has to compute its proof under
+    /// the same one, and it may have several on file.
+    #[test]
+    fn an_answer_is_found_under_the_token_that_produced_it() {
+        let tokens = vec!["first".to_string(), "second".to_string()];
+
+        assert_eq!(
+            token_for_auth(
+                &tokens,
+                "server",
+                "caller",
+                &auth_mac("second", "server", "caller")
+            )
+            .as_deref(),
+            Some("second")
+        );
+    }
+
+    /// An answer made for one pair of nonces is not an answer for another. This
+    /// is the whole point of the handshake: a recorded exchange is worth nothing
+    /// on the next connection.
+    #[test]
+    fn an_answer_does_not_carry_to_another_challenge() {
+        let tokens = vec!["token".to_string()];
+        let answered = auth_mac("token", "server", "caller");
+
+        assert!(token_for_auth(&tokens, "server", "caller", &answered).is_some());
+        assert!(token_for_auth(&tokens, "server", "other-caller", &answered).is_none());
+        assert!(token_for_auth(&tokens, "other-server", "caller", &answered).is_none());
+        assert!(token_for_auth(
+            &tokens,
+            "server",
+            "caller",
+            &auth_mac("other", "server", "caller")
+        )
+        .is_none());
     }
 
     #[test]
-    fn any_published_token_authenticates() {
-        let tokens = vec!["first".to_string(), "second".to_string()];
-        assert!(token_matches_any(&tokens, "second"));
-        assert!(!token_matches_any(&tokens, "third"));
-        assert!(!token_matches_any(&[], "first"));
+    fn the_service_proof_is_checked_against_the_same_nonces() {
+        assert!(proof_matches(
+            "token",
+            "server",
+            "caller",
+            &proof_mac("token", "server", "caller")
+        ));
+        // Not under another token, and not the caller's answer handed back.
+        assert!(!proof_matches(
+            "token",
+            "server",
+            "caller",
+            &proof_mac("other", "server", "caller")
+        ));
+        assert!(!proof_matches(
+            "token",
+            "server",
+            "caller",
+            &auth_mac("token", "server", "caller")
+        ));
+    }
+
+    /// Two nonces from the same process differ; a repeated one would make two
+    /// handshakes interchangeable.
+    #[test]
+    fn two_nonces_are_not_the_same() {
+        let first = random_nonce().expect("the OS has randomness");
+        let second = random_nonce().expect("the OS has randomness");
+
+        assert_eq!(first.len(), super::NONCE_BYTES * 2);
+        assert_ne!(first, second);
     }
 
     /// A scanned root is read as a directory *of home directories*, and both layouts a session

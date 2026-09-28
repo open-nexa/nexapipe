@@ -133,6 +133,29 @@ fn clear_last_error() {
     }
 }
 
+/// Runs `body` with a panic caught, turning one into `None`.
+///
+/// Unwinding out of an `extern "system"` frame is a native crash on Android,
+/// not a Java exception, so every entry point that drives the runtime — and
+/// that is most of them, since a start or a stop blocks on it — has to catch.
+/// The entry points wrap their whole body in this and answer with whatever the
+/// function returns on failure.
+fn catching_panic<T, F>(what: &str, body: F) -> Option<T>
+where
+    F: FnOnce() -> T,
+{
+    match panic::catch_unwind(panic::AssertUnwindSafe(body)) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            // `jni_log!` is a macro, so it is not in scope this early in the
+            // file; this is the same call it would make.
+            android_log(log::Level::Error, &format!("[WARN:jni] {what} panicked"));
+            set_last_error(format!("{what} panicked"));
+            None
+        }
+    }
+}
+
 fn take_last_error() -> Option<String> {
     match LAST_ERROR.lock() {
         Ok(mut guard) => guard.take(),
@@ -404,12 +427,23 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
         unsafe {
             let raw_env = env.get_raw();
             let mut raw_vm = std::ptr::null_mut();
-            (**raw_env).GetJavaVM.unwrap()(raw_env, &mut raw_vm);
-            ndk_context::initialize_android_context(raw_vm as *mut _, std::ptr::null_mut());
+            // The result is checked rather than unwrapped: a null VM handed to
+            // the context is a crash the first time anything logs, and this
+            // runs before there is a logger to say so.
+            if let Some(get_java_vm) = (**raw_env).GetJavaVM
+                && get_java_vm(raw_env, &mut raw_vm) == jni::sys::JNI_OK
+                && !raw_vm.is_null()
+            {
+                ndk_context::initialize_android_context(raw_vm as *mut _, std::ptr::null_mut());
+            }
         }
+        // `Info` by default, not `Debug`: the debug logs along the data path
+        // print request headers and payload previews, and logcat is readable
+        // by anything with adb. Raise the level here to bring them back, and
+        // only on a build you are debugging.
         android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Debug)
+                .with_max_level(log::LevelFilter::Info)
                 .with_tag("NexaVpnService"),
         );
     }
@@ -478,7 +512,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetDnsServers");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -538,7 +572,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetDnsOverride");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -629,7 +663,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetRelayConfig");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -778,7 +812,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetTwoFactor");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -830,7 +864,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetTwoFactorForNode");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -898,7 +932,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetEnrollmentForNode(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeSetEnrollmentForNode");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -971,35 +1005,43 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeIssuedCredential(
         None => return std::ptr::null_mut(),
     };
 
-    let issued = runtime.block_on(async {
-        // The endpoint group is where a start with several nodes keeps its pools; the
-        // single-pool legacy path keeps the same answer one level down.
-        if let Some(state) = get_state() {
-            let group = {
-                let guard = match state.lock() {
-                    Ok(g) => g,
-                    Err(_) => return None,
+    // Caught rather than let out of the frame: this blocks on the runtime, and
+    // a panic there unwinds through an `extern "system"` boundary, which on
+    // Android is a native crash instead of something the JVM can report.
+    let issued = match catching_panic("nativeTakeIssuedCredential", || {
+        runtime.block_on(async {
+            // The endpoint group is where a start with several nodes keeps its pools; the
+            // single-pool legacy path keeps the same answer one level down.
+            if let Some(state) = get_state() {
+                let group = {
+                    let guard = match state.lock() {
+                        Ok(g) => g,
+                        Err(_) => return None,
+                    };
+                    guard.endpoint_group.clone()
                 };
-                guard.endpoint_group.clone()
-            };
-            if let Some(group) = group {
-                if let Some(issued) = group.take_issued_credential().await {
-                    return Some(issued);
+                if let Some(group) = group {
+                    if let Some(issued) = group.take_issued_credential().await {
+                        return Some(issued);
+                    }
+                }
+                let pool = {
+                    let guard = match state.lock() {
+                        Ok(g) => g,
+                        Err(_) => return None,
+                    };
+                    guard.conn_pool.clone()
+                };
+                if let Some(pool) = pool {
+                    return pool.take_issued_credential().await;
                 }
             }
-            let pool = {
-                let guard = match state.lock() {
-                    Ok(g) => g,
-                    Err(_) => return None,
-                };
-                guard.conn_pool.clone()
-            };
-            if let Some(pool) = pool {
-                return pool.take_issued_credential().await;
-            }
-        }
-        None
-    });
+            None
+        })
+    }) {
+        Some(issued) => issued,
+        None => return std::ptr::null_mut(),
+    };
 
     let Some(issued) = issued else {
         return std::ptr::null_mut();
@@ -1021,7 +1063,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
 ) -> jstring {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartIroh");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return std::ptr::null_mut();
     }
 
@@ -1168,7 +1210,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartProxy");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -1703,7 +1745,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartProxyLegacy");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -1755,85 +1797,94 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
 
     let listen_addr = format!("127.0.0.1:{}", listen_port);
 
-    let result = runtime.block_on(async move {
-        match crate::connection_pool::parse_endpoint_addr(Some(&target_id), None) {
-            Ok(addr) => {
-                let pool: IrohConnectionPool;
-                if let Some(ep) = get_endpoint() {
-                    pool = IrohConnectionPool::new_with_endpoint(ep.clone(), addr);
-                } else {
-                    match IrohConnectionPool::new(addr).await {
-                        Ok(p) => pool = p,
-                        Err(e) => {
-                            jni_log!("Failed to create connection pool: {}", e);
-                            return Err(format!("Failed to create connection pool: {}", e));
+    // Caught rather than let out of the frame: this blocks on the runtime, and
+    // a panic there unwinds through an `extern "system"` boundary, which on
+    // Android is a native crash instead of something the JVM can report.
+    let result = match catching_panic("nativeStartProxyLegacy", || {
+        runtime.block_on(async move {
+            match crate::connection_pool::parse_endpoint_addr(Some(&target_id), None) {
+                Ok(addr) => {
+                    let pool: IrohConnectionPool;
+                    if let Some(ep) = get_endpoint() {
+                        pool = IrohConnectionPool::new_with_endpoint(ep.clone(), addr);
+                    } else {
+                        match IrohConnectionPool::new(addr).await {
+                            Ok(p) => pool = p,
+                            Err(e) => {
+                                jni_log!("Failed to create connection pool: {}", e);
+                                return Err(format!("Failed to create connection pool: {}", e));
+                            }
                         }
                     }
-                }
 
-                // 2FA: push the Kotlin-injected credentials to the connection pool; new connections run the auth handshake first.
-                if let Some(auth) = current_two_factor_auth() {
-                    pool.set_two_factor(Some(auth)).await;
-                }
-                // Per-endpoint credentials win over the global pair, and a node that has
-                // them never enrolls: enrolling rotates the secret out from under every
-                // other device that scanned the same code.
-                let credentials = node_two_factor_for(&target_id);
-                if let Some(cfg) = &credentials {
-                    pool.set_two_factor(two_factor_auth(cfg)).await;
-                }
-                if !node_has_two_factor(&target_id) {
-                    if let Some((client_id, token)) = node_enrollment_for(&target_id) {
-                        pool.set_enrollment(Some(Enrollment::new(&client_id, &token)))
-                            .await;
-                        jni_log!("[DEBUG:jni] enrollment armed for node '{}'", target_id);
+                    // 2FA: push the Kotlin-injected credentials to the connection pool; new connections run the auth handshake first.
+                    if let Some(auth) = current_two_factor_auth() {
+                        pool.set_two_factor(Some(auth)).await;
                     }
-                }
-
-                match LocalProxy::new_with_single_pool(&listen_addr, domains, pool.clone()).await {
-                    Ok(proxy) => {
-                        {
-                            let mut guard = match state.lock() {
-                                Ok(g) => g,
-                                Err(_) => {
-                                    jni_log!("Failed to lock state mutex (poisoned)");
-                                    return Err("Failed to update state".to_string());
-                                }
-                            };
-                            guard.conn_pool = Some(pool);
+                    // Per-endpoint credentials win over the global pair, and a node that has
+                    // them never enrolls: enrolling rotates the secret out from under every
+                    // other device that scanned the same code.
+                    let credentials = node_two_factor_for(&target_id);
+                    if let Some(cfg) = &credentials {
+                        pool.set_two_factor(two_factor_auth(cfg)).await;
+                    }
+                    if !node_has_two_factor(&target_id) {
+                        if let Some((client_id, token)) = node_enrollment_for(&target_id) {
+                            pool.set_enrollment(Some(Enrollment::new(&client_id, &token)))
+                                .await;
+                            jni_log!("[DEBUG:jni] enrollment armed for node '{}'", target_id);
                         }
+                    }
 
-                        tokio::spawn(async move {
-                            let proxy_run =
-                                match panic::catch_unwind(panic::AssertUnwindSafe(|| async move {
-                                    proxy.run().await
-                                })) {
+                    match LocalProxy::new_with_single_pool(&listen_addr, domains, pool.clone())
+                        .await
+                    {
+                        Ok(proxy) => {
+                            {
+                                let mut guard = match state.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => {
+                                        jni_log!("Failed to lock state mutex (poisoned)");
+                                        return Err("Failed to update state".to_string());
+                                    }
+                                };
+                                guard.conn_pool = Some(pool);
+                            }
+
+                            tokio::spawn(async move {
+                                let proxy_run = match panic::catch_unwind(panic::AssertUnwindSafe(
+                                    || async move { proxy.run().await },
+                                )) {
                                     Ok(future) => future,
                                     Err(_) => {
                                         jni_log!("Proxy run panicked during setup");
                                         return;
                                     }
                                 };
-                            match proxy_run.await {
-                                Err(e) => jni_log!("Proxy run failed: {}", e),
-                                Ok(_) => jni_log!("Proxy run completed"),
-                            }
-                        });
+                                match proxy_run.await {
+                                    Err(e) => jni_log!("Proxy run failed: {}", e),
+                                    Ok(_) => jni_log!("Proxy run completed"),
+                                }
+                            });
 
-                        Ok(())
-                    }
-                    Err(e) => {
-                        jni_log!("Failed to create local proxy: {}", e);
-                        Err(format!("Failed to create local proxy: {}", e))
+                            Ok(())
+                        }
+                        Err(e) => {
+                            jni_log!("Failed to create local proxy: {}", e);
+                            Err(format!("Failed to create local proxy: {}", e))
+                        }
                     }
                 }
+                Err(e) => {
+                    jni_log!("Failed to parse endpoint address: {}", e);
+                    Err(format!("Failed to parse endpoint address: {}", e))
+                }
             }
-            Err(e) => {
-                jni_log!("Failed to parse endpoint address: {}", e);
-                Err(format!("Failed to parse endpoint address: {}", e))
-            }
-        }
-    });
+        })
+    }) {
+        Some(result) => result,
+        None => return -1,
+    };
 
     match result {
         Ok(_) => 0,
@@ -1846,6 +1897,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
+    // The body drives the runtime through three `block_on`s. Unwinding out of
+    // an `extern "system"` frame is a native crash on Android rather than
+    // something the JVM can turn into an exception, so it is caught here.
+    catching_panic("nativeStopProxy", stop_proxy).unwrap_or(-1)
+}
+
+fn stop_proxy() -> jint {
     jni_log!("[DEBUG:jni] nativeStopProxy called (proxy-only, keeping iroh endpoint)");
 
     // Note: this function only stops local_proxy / endpoint_group / conn_pool / proxy_task,
@@ -1983,7 +2041,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeAddNode");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -2057,7 +2115,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeAddDomainMapping");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -2116,7 +2174,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveNode(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeRemoveNode");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -2172,7 +2230,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomain(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeAddDomain");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -2208,7 +2266,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveDomain(
 ) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeRemoveDomain");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 
@@ -2264,8 +2322,12 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
     // endpoint (new()); the shared global endpoint is closed here.
     if let Some(ep) = endpoint {
         if let Some(r) = get_runtime() {
-            let _ = r.block_on(async {
-                let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
+            // Caught for the same reason as above: closing blocks on the
+            // runtime, and an unwind out of this frame is a crash.
+            let _ = catching_panic("nativeDestroy", || {
+                r.block_on(async {
+                    let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
+                })
             });
             jni_log!("[DEBUG:jni] Endpoint closed");
         }
@@ -2316,7 +2378,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
 fn start_tun_proxy(mut env: JNIEnv, _class: JClass, tun_fd: jint, proxy_domains: JString) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartTunProxy");
-        env.exception_clear().unwrap();
+        let _ = env.exception_clear();
         return -1;
     }
 

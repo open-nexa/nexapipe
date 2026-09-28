@@ -45,5 +45,7 @@ qrcode = { version = "0.14.1", default-features = false }
 [dev-dependencies]
 # Spawns the built binary in the integration tests (see tests/).
 duct = '1.1.1'
+# `start_paused`, so the read timeouts are tested without waiting them out.
+tokio = { workspace = true, features = ['test-util'] }
 rqrr = { version = "0.11", default-features = false }
 tempfile = '3.8'
