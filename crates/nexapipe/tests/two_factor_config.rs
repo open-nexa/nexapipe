@@ -8,8 +8,13 @@
 
 use nexapipe::auth::OtpAuthUri;
 use nexapipe::config::ProxyConfig;
+use std::time::{Duration, Instant};
 
 const EXAMPLE_CONFIG: &str = "../../config.toml.2fa.example";
+
+/// How long the server gets to refuse to start in
+/// [`a_broken_auth_section_refuses_to_start`].
+const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// `[auth]` reaches [`nexapipe::auth::AuthConfig`] with all of its clients.
 ///
@@ -90,16 +95,36 @@ fn a_broken_auth_section_refuses_to_start() {
     )
     .unwrap();
 
-    let output = duct::cmd(
-        env!("CARGO_BIN_EXE_nexapipe"),
-        ["--config", path.to_str().unwrap()],
-    )
-    .stdin_null()
-    .stdout_capture()
-    .stderr_capture()
-    .unchecked()
-    .run()
-    .expect("run nexapipe");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args(["--config", path.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe");
+
+    // The process is supposed to refuse to start, and the assertion below is
+    // about how it exits. Waiting without a deadline would turn a regression —
+    // one that lets a broken `[auth]` section through — into a hung suite
+    // rather than a failure, so the wait is bounded and a child that outlives
+    // it is killed and reported.
+    let deadline = Instant::now() + STARTUP_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check on nexapipe") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "nexapipe did not exit within {}s: a broken [auth] section has to refuse to start",
+                STARTUP_DEADLINE.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let output = child.wait_with_output().expect("read nexapipe output");
 
     // Both streams: the CLI prints through tracing, which decides on its own
     // which one a refusal lands on.
@@ -110,7 +135,7 @@ fn a_broken_auth_section_refuses_to_start() {
     );
 
     assert!(
-        !output.status.success(),
+        !status.success(),
         "a server with a broken [auth] must not start:\n{text}"
     );
     assert!(
