@@ -83,6 +83,16 @@ const STREAM_BUF_SIZE: usize = 128 * 1024;
 /// connection open and dribbles bytes into it.
 const MAX_REQUEST_HEADER: usize = 64 * 1024;
 
+/// Whether what has been read of a request is over [`MAX_REQUEST_HEADER`].
+///
+/// The cap is on the header, not on the request: a small header followed by a
+/// body of any size is an ordinary upload, so what is measured is what precedes
+/// the terminator. Until one arrives, everything read so far is header as far as
+/// anyone can tell — which is the case that bounds a peer that never ends one.
+fn header_over_limit(request: &[u8], header_end: Option<usize>) -> bool {
+    header_end.unwrap_or(request.len()) > MAX_REQUEST_HEADER
+}
+
 /// How long the accept loop waits after an error before trying again, and how
 /// many it takes before it concludes the listener is not coming back.
 const ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(100);
@@ -599,6 +609,14 @@ where
         header_end = Some(pos + 4);
     }
 
+    // The same cap as the loop below, applied to the first read: a header that
+    // arrives whole in one read never enters the loop, and would otherwise
+    // escape the limit entirely.
+    if header_over_limit(&request_buf, header_end) {
+        jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+        return Ok(());
+    }
+
     while header_end.is_none() {
         let n = match tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
@@ -621,14 +639,6 @@ where
         let prev_len = request_buf.len();
         request_buf.extend_from_slice(&temp_buf[..n]);
 
-        // A peer that keeps sending without ever ending its headers grows this
-        // buffer without bound — one read every 30s is enough, because each
-        // read is what resets the timeout above.
-        if request_buf.len() > MAX_REQUEST_HEADER {
-            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
-            return Ok(());
-        }
-
         // Search for \r\n\r\n, starting a few bytes before the new data
         let search_start = prev_len.saturating_sub(3);
         if let Some(pos) = request_buf[search_start..]
@@ -636,6 +646,14 @@ where
             .position(|w| w == b"\r\n\r\n")
         {
             header_end = Some(search_start + pos + 4);
+        }
+
+        // A peer that keeps sending without ever ending its headers grows this
+        // buffer without bound — one read every 30s is enough, because each
+        // read is what resets the timeout above.
+        if header_over_limit(&request_buf, header_end) {
+            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+            return Ok(());
         }
     }
 
@@ -1638,5 +1656,50 @@ mod tests {
             .expect("the client read never returned")
             .expect("the client read failed");
         assert_eq!(read, 0, "the handler kept its socket open after stop()");
+    }
+
+    /// The cap is on the header, not on the whole request: a short header
+    /// followed by a body larger than the cap is an ordinary upload, and used
+    /// to be refused for being one.
+    #[test]
+    fn the_header_limit_ignores_the_body() {
+        let mut request = b"POST /upload HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'x', MAX_REQUEST_HEADER * 4));
+
+        let header_end = header_terminator(&request);
+
+        assert!(!header_over_limit(&request, header_end));
+    }
+
+    /// A header that arrives whole in one read never enters the read loop, so
+    /// the first read is measured as well — otherwise the cap only ever applied
+    /// to a header split across two.
+    #[test]
+    fn an_oversized_header_is_refused_even_when_it_is_complete() {
+        let mut request = b"GET / HTTP/1.1\r\nX-Pad: ".to_vec();
+        request.extend(std::iter::repeat_n(b'a', MAX_REQUEST_HEADER));
+        request.extend_from_slice(b"\r\n\r\n");
+
+        let header_end = header_terminator(&request).expect("the terminator is written above");
+
+        assert!(header_over_limit(&request, Some(header_end)));
+    }
+
+    /// Until a terminator arrives, everything read is header as far as anyone
+    /// can tell — which is the case that bounds a peer that never ends one.
+    #[test]
+    fn a_header_that_never_ends_is_still_capped() {
+        let request: Vec<u8> = std::iter::repeat_n(b'a', MAX_REQUEST_HEADER + 1).collect();
+
+        assert!(header_over_limit(&request, None));
+        assert!(!header_over_limit(&request[..MAX_REQUEST_HEADER], None));
+    }
+
+    /// Where the header ends in `request`, if it ends at all.
+    fn header_terminator(request: &[u8]) -> Option<usize> {
+        request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
     }
 }

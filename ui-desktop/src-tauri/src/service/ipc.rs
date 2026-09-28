@@ -151,13 +151,26 @@ pub const MAX_IPC_LINE: usize = 64 * 1024;
 /// Separate from `nexapipe_client::auth::IssuedCredential` because that one is not
 /// serializable, and because the IPC channel — like the Tauri command surface, which
 /// reuses this type — speaks camelCase to the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuedCredentialPayload {
     pub client_id: String,
     pub secret: String,
     /// Lowercase algorithm name, which is what `twoFactorAlgorithm` holds.
     pub algorithm: String,
+}
+
+// Hand-written rather than derived, for the same reason as `NodeInput`'s: this
+// is what carries a freshly issued TOTP secret back to the UI, and the whole
+// response is logged at debug level on the way through the client.
+impl std::fmt::Debug for IssuedCredentialPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCredentialPayload")
+            .field("client_id", &self.client_id)
+            .field("secret", &REDACTED)
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

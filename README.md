@@ -767,6 +767,11 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - `--generate-2fa` on a client that already has a secret prints **that** secret
   instead of a new one. Add `--force` to rotate it: every device enrolled with
   the old secret has to scan again.
+- Both ways of revoking apply to **connections made afterwards**: the
+  authorization a handshake carries is a snapshot of that moment, and a
+  connection that already authenticated runs until it ends — rotating the secret
+  or deleting the client does not cut it off. Restart the server to disconnect
+  those immediately.
 - The write edits `config.toml` in place, keeping comments and formatting. If the
   file cannot be read or written, the secret is only printed.
 - `algorithm`, `time_step` and `digits` are read when the QR code is generated,

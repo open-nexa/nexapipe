@@ -1323,16 +1323,37 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     // place is the lesser evil: it loses the atomicity, not the write.
     if let Err(rename) = fs::rename(&temp, target) {
         let _ = fs::remove_file(&temp);
-        let fallback = fs::write(target, contents)
-            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e} (rename failed: {rename})"));
+
+        // Writing in place keeps whatever mode the target already has, so the
+        // mode is tightened *before* anything is written: a target that is
+        // world-readable would otherwise hold the secrets that way for as long
+        // as the write leaves it. A mode that cannot be set is an error rather
+        // than something to log past — a config of secrets at 0644 is worse
+        // than one that was not written.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if fallback.is_ok() {
-                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+            if target.exists() {
+                fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("cannot set the mode of {path}: {e}"))?;
             }
         }
-        return fallback;
+
+        let written = fs::write(target, contents)
+            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e} (rename failed: {rename})"));
+
+        // Covers a target that did not exist: the write above creates it under
+        // the process umask, which is not what a file of secrets should inherit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if written.is_ok() {
+                fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("cannot set the mode of {path}: {e}"))?;
+            }
+        }
+
+        return written;
     }
 
     Ok(())

@@ -302,10 +302,27 @@ function toPersisted(config: ProxyConfig): PersistedConfig {
 }
 
 /**
+/**
+ * Whether `hydrateCredentials` has finished.
+ *
+ * Until it has, every secret in the config is empty — not because the user cleared it, but because
+ * nothing has read the store back yet. A mirror that ran inside that window would read the
+ * emptiness as a deletion and drop credentials it has not read, and the store is the only copy.
+ */
+let credentialsHydrated = false;
+
+/**
  * Mirrors the credentials into the encrypted store: written when a node has them, deleted when it
  * does not, so a credential that was cleared here is not left behind there.
+ *
+ * Gated on `credentialsHydrated`, because "cleared here" and "not read back yet" look the same in
+ * `config` and only one of them is something the user did.
  */
 async function persistCredentials(config: ProxyConfig): Promise<void> {
+  if (!credentialsHydrated) {
+    return;
+  }
+
   if (config.relayAuthToken.trim()) {
     await putCredential('relay', config.relayAuthToken);
   } else {
@@ -349,16 +366,26 @@ function persist(config: ProxyConfig): void {
  * the store wins when it has a value, and when it does not but the payload does, the payload's
  * value is *written* to the store rather than merely trusted — so the migration happens once and
  * the cleartext copy is gone on the next save.
+ *
+ * Returns a copy rather than filling `config` in place: each lookup awaits, and the config watcher
+ * is live while they run, so a node-by-node fill would expose a config whose first node has been
+ * read and whose second has not — and a save started there deletes the second node's credentials
+ * as if the user had cleared them.
  */
-async function hydrateCredentials(config: ProxyConfig): Promise<void> {
+async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
+  const hydrated: ProxyConfig = {
+    ...source,
+    nodes: source.nodes.map((node) => ({ ...node })),
+  };
+
   const relay = await getCredential('relay');
   if (relay) {
-    config.relayAuthToken = relay;
-  } else if (config.relayAuthToken.trim()) {
-    await putCredential('relay', config.relayAuthToken);
+    hydrated.relayAuthToken = relay;
+  } else if (hydrated.relayAuthToken.trim()) {
+    await putCredential('relay', hydrated.relayAuthToken);
   }
 
-  for (const node of config.nodes) {
+  for (const node of hydrated.nodes) {
     const secret = await getCredential('totp', node.id);
     if (secret) {
       node.twoFactor = {
@@ -377,6 +404,8 @@ async function hydrateCredentials(config: ProxyConfig): Promise<void> {
       await putCredential('enrollment', node.enrollment.token, node.id);
     }
   }
+
+  return hydrated;
 }
 
 /**
@@ -389,11 +418,20 @@ async function hydrateCredentials(config: ProxyConfig): Promise<void> {
  */
 export async function initConfigStore(): Promise<void> {
   try {
-    await hydrateCredentials(config);
+    // Assigned once, rather than filled in as each lookup returns: see
+    // `hydrateCredentials`.
+    Object.assign(config, await hydrateCredentials(config));
+
+    // Only from here may a save touch the store. Nothing before this line has
+    // read it, so nothing before this line may delete from it — a failure
+    // above leaves the secrets in `config` empty, and an ungated mirror would
+    // empty the store to match.
+    credentialsHydrated = true;
   } catch (error) {
     // A store that cannot be read leaves the nodes without credentials: they will refuse to
     // handshake and the UI says so. Not fatal — the app has to stay usable enough to re-import
-    // an invite.
+    // an invite. `credentialsHydrated` stays false, so the next save writes
+    // `localStorage` and leaves the store alone.
     console.error('[config] failed to load credentials:', error);
   }
 

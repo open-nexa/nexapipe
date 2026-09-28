@@ -128,9 +128,59 @@ impl Drop for MasterKey {
     }
 }
 
+/// A cached master key: the bytes, and where they came from.
+type CachedMasterKey = ([u8; KEY_LEN], KeySource);
+
+/// The master key once it has been read or minted, kept for the rest of the
+/// process.
+///
+/// `MasterKey::load` runs on every credential command, and Tauri runs commands
+/// in parallel — the frontend fires several at once, `removeNode` with
+/// `Promise.all` among them. On a first run two of them would each find the
+/// keychain empty and each mint a key: the second `set_password` overwrites the
+/// first, and every entry the first had already encrypted becomes unreadable.
+/// One key behind one lock makes the second caller wait instead of racing.
+static MASTER_KEY: std::sync::LazyLock<std::sync::Mutex<Option<CachedMasterKey>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Serialises the read-change-write sequences in [`Store`].
+///
+/// `put` and `remove` are three steps — read the whole file, change it, write it
+/// back — and two at once both start from the same snapshot, so the second write
+/// drops the first one's change: a deleted secret comes back, or a new one
+/// disappears. Both also write to the same temporary path, which two writers can
+/// interleave into a file that is not valid JSON. The lock is what makes each
+/// sequence appear whole.
+static STORE_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+fn lock_store() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl MasterKey {
     /// The master key for this installation, creating one if there is none yet.
+    ///
+    /// Cached in [`MASTER_KEY`]: the key is the same for the life of the process,
+    /// and minting it twice is the one thing here that loses data.
     fn load(dir: &Path) -> Result<Self, AppError> {
+        let mut cached = MASTER_KEY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some((key, source)) = *cached {
+            return Ok(Self { key, source });
+        }
+
+        let loaded = Self::load_uncached(dir)?;
+        *cached = Some((loaded.key, loaded.source));
+        Ok(loaded)
+    }
+
+    /// The uncached half of [`Self::load`]: where the key actually comes from.
+    fn load_uncached(dir: &Path) -> Result<Self, AppError> {
         if let Some(key) = Self::from_keychain() {
             return Ok(Self {
                 key,
@@ -159,15 +209,29 @@ impl MasterKey {
             return None;
         };
 
-        if let Ok(hex) = entry.get_password() {
-            if let Some(key) = parse_key(&hex) {
-                return Some(key);
+        match entry.get_password() {
+            Ok(hex) => {
+                if let Some(key) = parse_key(&hex) {
+                    return Some(key);
+                }
+                // Present but unreadable: carrying on would overwrite a key that
+                // existing credentials are encrypted under, so this is left alone
+                // and the caller falls back — with a key that cannot decrypt them
+                // either.
+                tracing::warn!("the keychain master key is not 32 bytes; not replacing it");
+                return None;
             }
-            // Present but unreadable: carrying on would overwrite a key that
-            // existing credentials are encrypted under, so this is left alone and
-            // the caller falls back — with a key that cannot decrypt them either.
-            tracing::warn!("the keychain master key is not 32 bytes; not replacing it");
-            return None;
+            // The ordinary first run, and the one case in which minting a key is
+            // right: there is nothing there for it to overwrite.
+            Err(keyring::Error::NoEntry) => {}
+            // Anything else — a locked keychain, access denied, a backend that
+            // would not start — is not proof that no key exists. Minting one
+            // here would replace a key that credentials are encrypted under,
+            // which is unrecoverable; a call that cannot read loses nothing.
+            Err(e) => {
+                tracing::warn!("the keychain could not be read, master key left alone: {e}");
+                return None;
+            }
         }
 
         let Ok(fresh) = random_bytes::<KEY_LEN>() else {
@@ -392,27 +456,33 @@ impl Store {
 
 /// Reads one credential. `None` when it was never stored.
 pub fn get(key: &str) -> Result<Option<String>, AppError> {
+    let _guard = lock_store();
     Store::open()?.get(key)
 }
 
 /// Writes one credential.
 pub fn put(key: &str, value: &str) -> Result<(), AppError> {
+    // Held across all three steps, not just the write: see [`STORE_LOCK`].
+    let _guard = lock_store();
     Store::open()?.put(key, value)
 }
 
 /// Forgets one credential.
 pub fn remove(key: &str) -> Result<(), AppError> {
+    let _guard = lock_store();
     Store::open()?.remove(key)
 }
 
 /// Every stored key, for dropping credentials whose node no longer exists.
 pub fn keys() -> Result<Vec<String>, AppError> {
+    let _guard = lock_store();
     Store::open()?.keys()
 }
 
 /// Where the master key ended up, so the UI can say when the weaker fallback is
 /// in use instead of letting it look identical to the keychain case.
 pub fn status() -> Result<KeySource, AppError> {
+    let _guard = lock_store();
     let dir = store_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?;

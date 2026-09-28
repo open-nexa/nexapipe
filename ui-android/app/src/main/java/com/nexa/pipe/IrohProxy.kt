@@ -209,8 +209,6 @@ object IrohProxy {
      */
     external fun nativeDropConnections(): Int
 
-    external fun nativeStartProxyLegacy(listenPort: Int, targetEndpointId: String): Int
-
     external fun nativeStopProxy(): Int
 
     external fun nativeAddNode(nodeId: String, domains: String): Int

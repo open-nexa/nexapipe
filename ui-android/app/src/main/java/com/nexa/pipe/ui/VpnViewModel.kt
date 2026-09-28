@@ -266,10 +266,6 @@ class VpnViewModel : ViewModel() {
         private const val ATTEMPT_TIMEOUT_MS = 60_000L
         private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
         private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
-        // Local proxy listening port (only used to warm up preConnect; in TUN
-        // mode data does not flow through the local proxy).
-        // startProxyWithRetries increments it automatically on a port conflict.
-        private const val LOCAL_PROXY_PORT = 8080
 
         // `error_vpn_taken_over` is what is shown when another proxy app (e.g.
         // Clash) owns the single tunnel slot Android allows per user.
@@ -564,41 +560,30 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * Starts the local proxy. nativeStopProxy runs first (Rust releases the
-     * listening port deterministically, no delay needed), then it retries up to
-     * 10 times with an incrementing port. Returns the port actually in use.
+     * Builds the endpoint group the tunnel runs on. nativeStopProxy runs first so a
+     * previous attempt cannot leave half of one behind.
      *
-     * A configuration error (RESULT_CONFIG_ERROR) is not retried: every other port would
-     * fail identically, and its real reason is in nativeTakeLastError() — retrying it was
-     * what turned a malformed node ID into a bogus "ports 8080..8089" message.
+     * Nothing is bound on loopback: on Android every app shares 127.0.0.1, so a
+     * local proxy port hands any of them an already-authenticated tunnel without
+     * the user being asked. The tunnel is entered through the TUN fd alone
+     * (nativeStartTunProxy), which is what the VPN permission covers.
+     *
+     * A configuration error (RESULT_CONFIG_ERROR) carries its own reason in
+     * nativeTakeLastError(); without it a malformed endpoint ID would come back as
+     * a generic failure.
      */
-    private suspend fun startProxyWithRetries(basePort: Int): Int {
-        addLog("Starting proxy...")
+    private suspend fun startEndpointGroup() {
+        addLog("Starting endpoint group...")
         IrohProxy.nativeStopProxy()
-        var result = -1
-        var actualPort = basePort
-        for (attempt in 0..9) {
-            actualPort = basePort + attempt
-            addLog("Trying to start proxy on port $actualPort...")
-            result = IrohProxy.nativeStartProxy(actualPort)
-            if (result == 0) break
-            if (result == IrohProxy.RESULT_CONFIG_ERROR) {
-                throw Exception(
-                    nativeFailureReason() ?: AppStrings.get(R.string.error_invalid_proxy_config)
-                )
-            }
-            addLog("Failed to start proxy on port $actualPort, retrying...")
-            delay(200)
-        }
+        val result = IrohProxy.nativeStartProxy()
         if (result != 0) {
             val reason = nativeFailureReason()
             throw Exception(
-                AppStrings.get(R.string.error_proxy_ports, basePort, basePort + 9) +
+                AppStrings.get(R.string.error_invalid_proxy_config) +
                     if (reason != null) ": $reason" else ""
             )
         }
-        addLog("Proxy started on port $actualPort")
-        return actualPort
+        addLog("Endpoint group started")
     }
 
     /**
@@ -754,16 +739,15 @@ class VpnViewModel : ViewModel() {
                     return@launch
                 }
 
-                // Pre-flight the configuration before anything is started or bound: a malformed
-                // endpoint ID has to be reported as such, immediately, instead of surfacing as a
-                // port failure after 10 ports x 3 attempts.
+                // Pre-flight the configuration before anything is started: a malformed
+                // endpoint ID has to be reported as such, immediately, instead of
+                // surfacing after the endpoint group is built.
                 validateConfiguredNodeIds()?.let { reason ->
                     addLog("connect aborted: $reason")
                     errorMessage.value = reason
                     return@launch
                 }
 
-                val basePort = LOCAL_PROXY_PORT
                 var lastError: Exception? = null
 
                 // Retry loop: every attempt has an overall timeout of
@@ -831,7 +815,7 @@ class VpnViewModel : ViewModel() {
                             }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()
-                            startProxyWithRetries(basePort)
+                            startEndpointGroup()
 
                             // Pre-connect: warm up iroh connections directly on the Rust side
                             // and cache them in the shared connection pool. Unlike HTTP-based

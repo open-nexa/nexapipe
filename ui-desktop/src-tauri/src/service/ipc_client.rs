@@ -10,12 +10,17 @@ use crate::status::{EndpointLink, ProxyStatus};
 
 pub struct IpcClient;
 
-/// How long the service gets to open with its challenge.
+/// How long the service gets to answer each step of the handshake.
 ///
 /// A peer that says nothing at all is not this build's service but an older one:
 /// that one waits for the caller to speak first, which is exactly the shape the
 /// handshake replaced. Without a deadline the difference shows up as a hang
 /// rather than as an error anybody can act on.
+///
+/// The same deadline covers the proof: a peer that opens with a challenge and
+/// then stops — a squatter on the port, or a service that stalled mid-handshake —
+/// would otherwise park every caller here indefinitely, including the one that
+/// feeds the status indicator.
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The service answered with a message kind that does not match the request. This also covers
@@ -106,7 +111,21 @@ impl IpcClient {
 
         // Checked rather than trusted: a peer that cannot answer for this side's
         // nonce does not hold the token, whatever it accepted above.
-        match Self::read_response(reader).await? {
+        let proof =
+            match tokio::time::timeout(CHALLENGE_TIMEOUT, Self::read_response(reader)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(AppError::with_detail(
+                        codes::SERVICE_UNAUTHORIZED,
+                        format!(
+                            "nothing on {IPC_SOCKET_PATH} proved it holds the token within \
+                             {CHALLENGE_TIMEOUT:?}"
+                        ),
+                    ))
+                }
+            };
+        match proof {
             IpcResponse::AuthOk { mac } => {
                 if !crate::service::ipc_token::proof_matches(
                     token,
