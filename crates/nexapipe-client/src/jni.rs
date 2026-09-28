@@ -414,7 +414,12 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
         );
     }
 
-    std::panic::set_hook(Box::new(|panic_info| {
+    // Chained rather than installed: whatever hook the host process already had
+    // — the JVM's, or another library's — is still the one that decides what a
+    // panic does to the process. `set_hook` on its own deletes it, so a host
+    // that crash-reports through its own hook would silently stop reporting.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
         let msg = match panic_info.payload().downcast_ref::<&str>() {
             Some(s) => *s,
             None => match panic_info.payload().downcast_ref::<String>() {
@@ -427,6 +432,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
             .map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
         jni_log!("RUST PANIC: {}{}", msg, location);
+        previous_hook(panic_info);
     }));
 
     // Four workers left two cores idle on every modern phone and made the TUN pump,
@@ -2005,6 +2011,21 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
         Err(_) => return -1,
     };
 
+    // Re-adding a node updates it instead of appending a second entry. `nodes`
+    // becomes one pool per backend, so a duplicate would hand that backend two
+    // pools — double the weight in the balancer, two sets of health checks —
+    // and the list would grow every time the UI re-applies the same settings.
+    if let Some(existing) = guard
+        .nodes
+        .iter_mut()
+        .find(|n| n.server_node_id.as_deref() == Some(node_id_str.as_str()))
+    {
+        if !domains_list.is_empty() {
+            existing.domains = domains_list;
+        }
+        return 0;
+    }
+
     let node_config = NodeConfig {
         server_node_id: Some(node_id_str),
         server_ticket: None,
@@ -2053,6 +2074,17 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
         Ok(g) => g,
         Err(_) => return -1,
     };
+
+    // A mapping is the pair (domain, node), so re-adding the same pair is not a
+    // second route — it is the same one again. Without this the list grew on
+    // every re-apply, and every duplicate made the lookup walk further for
+    // nothing.
+    let already_mapped = guard.domain_mappings.iter().any(|m| {
+        m.domain == domain_str && m.server_node_id.as_deref() == Some(node_id_str.as_str())
+    });
+    if already_mapped {
+        return 0;
+    }
 
     let domain_mapping = DomainMapping {
         domain: domain_str,
