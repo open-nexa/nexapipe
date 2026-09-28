@@ -88,6 +88,12 @@ jobs:
           # brings it back. It is applied to the cdylib step only (see "Build client cdylib"),
           # so the nexapipe binary itself stays statically linked. Never put it in
           # .cargo/config.toml — that would make every musl binary dynamic.
+          #
+          # Expect the same warning from the binary step above, and ignore it: cargo builds
+          # the client's cdylib slot even when the client is only a dependency, because it is
+          # a workspace member, and there is no way to drop the crate type for one target
+          # only — a platform-specific `[target.'cfg(...)'.lib]` key is not supported by
+          # cargo. The rlib is what the binary needs, and that is what gets built.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
@@ -390,6 +396,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build artifacts
@@ -705,6 +712,7 @@ jobs:
         if: steps.opts.outputs.skip_rust != 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
+          toolchain: 1.98.1
           targets: ${{ env.TARGET_TRIPLE }}
 
       - name: Install cargo-ndk
