@@ -200,7 +200,6 @@
     <string name="error_endpoint_not_found">Endpoint not found: %1$s</string>
     <string name="error_no_domain_mappings">No domain mappings configured. Please add nodes with domains.</string>
     <string name="error_invalid_proxy_config">Invalid proxy configuration</string>
-    <string name="error_proxy_ports">Failed to start proxy on ports %1$d..%2$d</string>
     <string name="error_no_backend_reachable">No backend is reachable (%1$s). Check that the endpoint IDs are correct and that the servers are online.</string>
     <string name="error_preconnect_failed">Backend reachability check failed (nativePreconnect returned %1$d). See the log for details.</string>
     <string name="error_cause">Cause: %1$s.</string>

@@ -568,9 +568,10 @@ class VpnViewModel : ViewModel() {
      * the user being asked. The tunnel is entered through the TUN fd alone
      * (nativeStartTunProxy), which is what the VPN permission covers.
      *
-     * A configuration error (RESULT_CONFIG_ERROR) carries its own reason in
-     * nativeTakeLastError(); without it a malformed endpoint ID would come back as
-     * a generic failure.
+     * There is nothing to retry here: a failure is either a configuration error
+     * (malformed endpoint ID, no domains) or a group that could not be built,
+     * and both fail identically on every attempt. Either way the real reason is
+     * on the native side, so it leads the message instead of a generic string.
      */
     private suspend fun startEndpointGroup() {
         addLog("Starting endpoint group...")

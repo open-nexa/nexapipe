@@ -2,9 +2,7 @@ use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::relay::RelayModeSpec;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
-use crate::{
-    DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, NodeConfig,
-};
+use crate::{DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, NodeConfig};
 use iroh::Endpoint;
 use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::presets;

@@ -772,7 +772,7 @@ jobs:
           MISSING=0
           for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
                     nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
-                    nativeStartProxyLegacy nativeStopProxy nativeAddNode nativeStartTunProxy \
+                    nativeStopProxy nativeAddNode nativeStartTunProxy \
                     nativeStopTunProxy nativeDestroy; do
             if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
               echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"

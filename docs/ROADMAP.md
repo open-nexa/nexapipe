@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-09-27 |
+| Last updated | 2026-09-28 |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -240,6 +240,82 @@ removed from rotation (`endpoint_group.rs` keeps no health state). Multi-node
 failover is request-level only: drop the stale connection and retry three times.
 `local_proxy.rs:267`
 
+### 4.7 Client-side credential protection (P0)
+
+Both clients hold the material that authenticates a node — endpoint ID, ticket,
+TOTP secret, enrollment token, relay auth token — and neither one gates access
+to it. This is the only item here rated P0: the exposure is a credential
+disclosure, not a missing convenience.
+
+Both clients already encrypt credentials at rest — the desktop with a
+keychain-held master key, Android with the Keystore — and neither asks anything
+before handing them back. Stating that precisely matters because it decides what
+the work is: **the vault exists, the door does not.**
+
+| # | Gap | Where |
+|---|---|---|
+| C8 | **Desktop: encrypted at rest, ungated on read.** The TOTP secret, the enrollment token and the relay bearer already live in an AES-256-GCM file whose master key the OS keychain holds, so the original "secrets in a WebKit `localStorage` blob" exposure is closed. Two holes remain: the node ticket and the endpoint ID are still persisted in cleartext `localStorage`, and reading any of it back costs nothing — the store opens silently for whatever asks, and the renderer is handed plaintext on request with no prompt in front of it. | `ui-desktop/src-tauri/src/credentials.rs` (what exists); `ui-desktop/src/stores/config.ts` (ticket and endpoint ID, still cleartext) |
+| C9 | **The masking is cosmetic.** The dashboard and the config page return the value in full when it happens to be short, the sidebar tooltip carries the unmasked node ID, and the invite import dialog renders the parsed ticket and endpoint verbatim. | `ui-desktop/src/pages/DashboardPage.vue`, `ConfigPage.vue`, `app/shell/SideBarFooter.vue`, `components/InviteImportDialog.vue` |
+| C10 | **Android stores encrypted but never asks.** `SecretStore` already wraps values with Keystore AES-256-GCM, so at-rest storage is not the problem; the endpoint detail screen shows and edits the TOTP secret and can export it as an `otpauth` URI with no prompt at all. | `ui-android/.../SecretStore.kt`, `ui/EndpointDetailScreen.kt` |
+
+The direction is that **authentication is delegated to the operating system, and
+no secret reaches the UI that the OS has not authenticated**:
+
+- **No application password.** NexaPipe must never hold a credential of its own,
+  so there is nothing to forget and nothing to reset. The consequence to state
+  plainly in the UI is the price of that: if the OS-side key is lost — Keychain
+  reset, cleared app data, a new machine — the ciphertext is unreadable for good
+  and the node has to be re-imported from its invite.
+- **One interface, per-platform native primitives**, following the shape RustDesk
+  uses (a platform module per OS behind a single trait): Authorization Services
+  on macOS, Windows Hello via `UserConsentVerifier` with a `LogonUserW` fallback
+  on machines without it, PAM on Linux, `BiometricPrompt` with
+  `DEVICE_CREDENTIAL` on Android. No third-party Tauri plugin; this means
+  accepting a native build dependency on Linux.
+- **Do not build a second vault on desktop.** The keychain-held master key and
+  the encrypted credential file already exist; the ticket and the endpoint ID
+  join the values already in it, and the work is the gate in front of reads.
+  Android is the mirror image: `SecretStore` already encrypts at rest, so there
+  too the work is the door.
+- **Masks are produced on the Rust side.** A mask computed in the renderer is not
+  a mask — the plaintext is still in the renderer, one console away.
+- The lock is **mandatory, not a setting**, and an upgrade from an older version
+  lands locked.
+- **Scope boundary: the lock protects configuration disclosure and modification,
+  not proxy state.** Starting, stopping and restarting the proxy is never gated.
+  That forces a two-level model — a short-lived UI unlock state plus a
+  process-scoped credential cache cleared only when the process exits — so a
+  locked UI never breaks a proxy that is running or being restarted.
+
+Two non-goals worth recording now. The Android Keystore key must **not** be
+gated on user authentication: `setUserAuthenticationRequired(true)` would leave
+an unattended VPN unable to read its own credentials after reboot and break
+automatic reconnect — only the UI door is locked. And a device with neither a
+biometric nor a screen-lock credential enrolled cannot be authenticated by
+anything, so it is refused rather than downgraded.
+
+### 4.8 Client DNS resolution (P1)
+
+The TUN answers DNS itself: a query that is not for one of its own virtual IPs is
+forwarded to the configured resolvers, and the answer is kept for as long as its
+own records say it is good. The cache is a first implementation whose semantics
+are incomplete, which makes this capability work rather than a defect: nothing
+crashes or loses data, but a name can resolve to an address that is no longer the
+right one, and only a cache that understands what it is holding can avoid it.
+
+| # | Gap | Where |
+|---|---|---|
+| C11 | **The cache key ignores QCLASS.** The question is parsed into a name and a QTYPE, and the class is neither checked nor part of the key, so a query in another class is answered from an entry cached for `IN`. | `crates/nexapipe-client/src/tun_proxy.rs:1269` (`parse_dns_query`); key at `:1551` |
+| C12 | **The cache is not scoped to the resolvers that answered.** The key is a name and a type with no notion of who answered, so changing the DNS servers in the configuration keeps serving what the previous ones said. | `crates/nexapipe-client/src/tun_proxy.rs:1551` |
+| C13 | **A cached answer is not aged.** A hit rewrites the transaction ID and nothing else, so a record fetched with a 300s TTL is handed back with the full 300s still on it even when it is 290s old: the entry expires on time, but the record it carries outlives itself. The remaining TTL belongs in each RR it writes out. | `crates/nexapipe-client/src/tun_proxy.rs:1571-1587` |
+| C14 | **A zero TTL is cached anyway.** TTLs are clamped into 1–300s, so a record the server said not to cache is kept for a second; by RFC 1035 a zero TTL means do not cache, and the clamp should not invent a floor. | `crates/nexapipe-client/src/tun_proxy.rs:1542-1543`, clamp at `:1664` |
+
+What is already right, and should stay right: the TTL kept is the shortest among
+the answer's records rather than the first or the longest, an error or an empty
+answer is not cached at all, the table is bounded, and the transaction ID is
+rewritten on every hit so a cached answer does not look to the application like
+no answer.
+
 ---
 
 ## 5. Platform policy
@@ -291,14 +367,20 @@ missing a feature — it is broken, and it gets fixed.
 
 | ID | Deliverable | Notes |
 |---|---|---|
+| R14 | **Local credential lock** | Gate every surface that can read or change a full endpoint ID, ticket, TOTP secret or enrollment token behind system authentication (Touch ID / Face / Windows Hello / PAM / Android biometric, falling back to the OS account credential where those are absent). Desktop: bring the ticket and the endpoint ID into the encrypted credential store that already exists ([4.7](#47-client-side-credential-protection-p0)), gate every read behind the OS prompt, and mask in Rust rather than in the renderer. Android: gate the endpoint detail screen and the 2FA export. Mandatory, with no opt-out; the dashboard keeps showing masked values and stays unlocked; proxy start/stop is explicitly *not* gated. See [4.7](#47-client-side-credential-protection-p0) |
 | R4 | **Management surface** | Loopback-only admin API for read-only state (routes, clients, connections, health, direct ratio), with write operations going through CLI subcommands (`client add\|revoke\|list`, `route list`, `status`); shares the hot-reload path; token-authenticated like the desktop IPC token |
 | R5 | **Per-device identity** | Move from "one client, one shared secret" to **per-device key pairs** issued by the server and revocable individually, with TOTP demoted to a human second factor; add a minimal audit log (who, when, which host) |
 | R6 | **Operations and distribution** | Self-hosted relay as a first-class deployment (derper + compose + docs, including relay authentication); systemd unit in the docs; publish a container image; land in at least two of Homebrew, winget and scoop |
 | R7 | **Instance metrics** | `/metrics` (and `/healthz`) behind a feature, plus request IDs and a tracing span per request: the access log answers "what happened", not "how is this instance doing". Gauges for connections, streams, backend health and the direct-vs-relayed ratio |
 | R8 | **Boundary documentation** | State plainly what still depends on third-party infrastructure today (Endpoint ID discovery, far-side relays) so the sovereignty story is not oversold |
 
+R14 and R15 carry high IDs because they were added after R13 was written; each
+sits in the phase its notes put it in, not later.
+
 **Done when:** revoke one of three devices and the other two keep working; a
-newcomer brings up a self-hosted relay from the docs without asking anyone.
+newcomer brings up a self-hosted relay from the docs without asking anyone; and
+no client renders a full secret without the operating system having
+authenticated the user first.
 
 ### Phase 1 — v0.5, "wider"
 
@@ -308,6 +390,7 @@ newcomer brings up a self-hosted relay from the docs without asking anyone.
 | R10 | **Transport parity** | IPv6 inside the TUN (virtual IPv6 addresses plus AAAA answers) and UDP in the desktop TUN |
 | R11 | **Android ABI coverage** | Ship `x86_64` alongside `arm64-v8a`, or at least document why not |
 | R12 | **Backend handling** | Configurable connect/read/idle timeouts towards backends, `least_conn` for the pool, and an explicit failure when every backend is unhealthy instead of falling back to the first — see [4.1](#41-backend-handling-p2) |
+| R15 | **Client DNS cache semantics** | Make the cache answer only what it actually holds: key it on QCLASS as well as name and type, scope it to the resolvers that produced the answer, rewrite each record's TTL on every hit to the part that is left, and stop caching a zero TTL — see [4.8](#48-client-dns-resolution-p1) |
 
 Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
@@ -327,10 +410,12 @@ not to be the main reason people walk away, this stays shelved.
 ### Dependencies
 
 ```text
+R14 credential lock ───────────────────────────────────► v0.4
 R4 management ── R5 per-device ──┬── R6 distribution ──► v0.4
                                  └── R7 metrics ────────►
                                               │
-      R9 resilience ── R10 transport ── R11 Android ABI ── R12 backends ──► v0.5
+      R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.5
+                                       └── R12 backends ──────────────────────►
                                               │
                               R13 edge (after validation) ──► v1.0
 ```
@@ -357,13 +442,14 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
 | Time to locate a failing backend | the access log covers every path, but there is nothing to aggregate | 5 minutes with metrics and structured logs |
 | Direct-connection rate | unmeasured | opt-in client telemetry: direct vs relayed, one-way latency — so "nothing to rent" becomes a number we can publish |
 | Platform coverage | Android (one ABI) + desktop | desktop TUN does UDP, TUN speaks IPv6, Android ships a second ABI |
+| Full secret rendered without authentication | the dashboard tooltip, the config page and the invite import dialog all show one | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
 | Release rhythm | no CHANGELOG | regular minor releases, each with a readable CHANGELOG |
 
 ---
 
 ## 9. Evidence index
 
-Every gap still listed above was confirmed against the tree on 2026-09-27. The
+Every gap still listed above was confirmed against the tree on 2026-09-28. The
 three fixed defects are recorded in [section 4](#4-self-review-what-is-missing)
 and in the commit history; they are kept here only so the audit that found them
 is reproducible.
@@ -374,8 +460,12 @@ is reproducible.
 | Load balancing strategies and fallback | `crates/nexapipe/src/lb/mod.rs:6-9,83-90` |
 | Health checks skipped for three route modes | `crates/nexapipe/src/proxy/mod.rs:58-65` |
 | No IPv6 in the TUN | `crates/nexapipe-client/src/tun_proxy.rs:1178-1180` |
+| Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
 | No metrics or admin surface | no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144` |
 | No CHANGELOG, no image publication | no `CHANGELOG*` at the repository root; `.github/workflows/release.yml` produces archives, desktop bundles and the APK only |
 | iroh version and boundary conditions | `Cargo.toml:34` pins `iroh 1.0.1`; the `[iroh]` section of the README describes discovery and far-side relays |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
+| Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
+| Masking that is not masking | `ui-desktop/src/app/shell/SideBarFooter.vue:59` puts the full node ID in a tooltip while showing the short form; the dashboard and config pages return short values in full |
+| Android: encrypted at rest, no gate in front | `ui-android/.../SecretStore.kt` (Keystore AES-256-GCM, `v1:` prefix) versus `ui/EndpointDetailScreen.kt` (shows and edits the 2FA secret, ~349-416, and exports an `otpauth` URI) |
