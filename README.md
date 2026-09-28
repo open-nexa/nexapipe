@@ -468,6 +468,11 @@ traffic is simply forwarded. `enabled` is live: a reload pauses the checks that
 are already running. The other four keys are read when a checker starts, so
 changing them takes effect on restart or for routes added by a reload.
 
+`interval`, `timeout` and `threshold` must each be at least `1`: `0` used to be
+clamped silently, and each of the three then meant something nobody would ask for
+— a probe round every second, a probe that can never finish, or a single failure
+emptying the pool. A config that says `0` is refused at load.
+
 ### `[local_proxy]` — client mode
 
 ```toml

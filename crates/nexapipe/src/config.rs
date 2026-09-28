@@ -419,6 +419,41 @@ impl ProxyConfig {
     /// carries `[iroh] secret_key` — the endpoint's private key, which is what
     /// makes a Node ID yours — and `relay_auth_token`, a bearer token. Either one
     /// is worth refusing a permissive mode over, on a server with `[auth]` off.
+    /// Refuses the `[health_check]` numbers that would otherwise be rewritten
+    /// on the way in.
+    ///
+    /// Each of them was clamped with `max(1)`, which turns a typo into
+    /// behaviour nobody asked for: `interval = 0` is one round of probes per
+    /// second, per route; `timeout = 0` is a probe that can never succeed, so
+    /// every backend is taken out of rotation; and `threshold = 0` means a
+    /// single lost probe empties the pool, the opposite of what the knob is
+    /// for. All three are seconds nobody would write on purpose.
+    fn validate_health_check(&self) -> anyhow::Result<()> {
+        let health = &self.health_check;
+
+        if health.interval == 0 {
+            anyhow::bail!(
+                "[health_check] interval is 0: it is the number of seconds between two \
+                 rounds of checks, so it has to be at least 1"
+            );
+        }
+        if health.timeout == 0 {
+            anyhow::bail!(
+                "[health_check] timeout is 0: no probe could ever finish, so every backend \
+                 would be marked unhealthy and taken out of rotation"
+            );
+        }
+        if health.threshold == 0 {
+            anyhow::bail!(
+                "[health_check] threshold is 0: one failed probe would empty the pool. \
+                 It is the number of consecutive failures that takes a backend out, so it \
+                 has to be at least 1"
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn holds_credentials(&self) -> bool {
         self.iroh
             .as_ref()
@@ -433,6 +468,11 @@ impl ProxyConfig {
     /// differently depending on when it was made. An error here is not fatal for
     /// a reload — the caller keeps the routes it already has.
     pub fn build_routes(&self) -> anyhow::Result<Vec<Route>> {
+        // Both a cold start and a reload come through this function, so the
+        // health check is validated here rather than only at startup: an edit
+        // that sets `interval = 0` is as wrong as one written by hand.
+        self.validate_health_check()?;
+
         // Refused rather than ignored: silently dropping the key would turn
         // every host it used to forward into a 404, which is a routing change
         // nobody asked for. A reload keeps the routes it already has, so a
@@ -468,6 +508,33 @@ impl ProxyConfig {
             // the client gets a 502 that looks like a backend being down.
             if route_config.backends.is_empty() {
                 anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
+            }
+
+            // A port no flow can arrive on, or an empty list that says "every
+            // port" by accident: either one is a route that never matches, and
+            // the operator has no way to notice — the client just gets refused.
+            if let Some(ports) = &route_config.client_ports {
+                if ports.is_empty() {
+                    anyhow::bail!(
+                        "{label}: client_ports is empty; leave it out to match every port"
+                    );
+                }
+                if ports.contains(&0) {
+                    anyhow::bail!(
+                        "{label}: client_ports contains port 0; no flow ever arrives from \
+                         port 0, so that entry can never match"
+                    );
+                }
+            }
+
+            // A UDP flow with a zero idle timeout is closed as soon as it is
+            // opened: the tunnel is set up and torn down before the first
+            // datagram crosses it. Leave it out for the server default.
+            if route_config.idle_timeout_secs == Some(0) {
+                anyhow::bail!(
+                    "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
+                     is opened; leave it out for the default"
+                );
             }
 
             // Every declared mode has to be able to dial these backends, so each
@@ -1235,6 +1302,103 @@ backends = ["https://caddy:443"]
         assert!(
             error.contains("https://"),
             "the message has to name the offending backend, got: {error}"
+        );
+    }
+
+    /// `0` was clamped with `max(1)` on the way in, which is how a typo turned
+    /// into a probe storm, or into every backend being taken out of rotation.
+    #[test]
+    fn build_routes_refuses_a_zero_health_check_number() {
+        for (key, why) in [
+            ("interval", "interval is 0"),
+            ("timeout", "timeout is 0"),
+            ("threshold", "threshold is 0"),
+        ] {
+            let config = parse(&format!(
+                r#"
+[health_check]
+{key} = 0
+
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#
+            ));
+
+            let error = config.build_routes().unwrap_err().to_string();
+            assert!(error.contains(why), "{key}: unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn build_routes_accepts_the_health_check_defaults() {
+        // Nothing in the file: the defaults have to pass the same check.
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        assert!(config.build_routes().is_ok());
+    }
+
+    /// Port 0 is not a port a flow arrives from, so a route naming it is dead
+    /// the moment it loads — and nothing would ever say so.
+    #[test]
+    fn build_routes_refuses_a_client_port_no_flow_can_arrive_on() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.iakl.top"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+client_ports = [0]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(error.contains("port 0"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn build_routes_refuses_an_empty_client_ports_list() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.iakl.top"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+client_ports = []
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("client_ports is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A zero idle timeout closes a UDP flow as soon as it is opened.
+    #[test]
+    fn build_routes_refuses_a_zero_idle_timeout() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "turn.iakl.top"
+mode = "udp"
+backends = ["10.0.0.5:3478"]
+idle_timeout_secs = 0
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("idle_timeout_secs"),
+            "unexpected error: {error}"
         );
     }
 
