@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import ServiceManager from "../components/ServiceManager.vue";
 import { useI18n } from "vue-i18n";
 import AppToggle from "../components/base/AppToggle.vue";
@@ -76,7 +77,24 @@ async function saveAutoStart() {
   }
 }
 
+/**
+ * The version the running bundle was actually stamped with, read from the app instead of being
+ * typed in here. A hardcoded string is a version bump that has to be remembered every release —
+ * and the one thing that silently disagrees with tauri.conf.json when it is forgotten.
+ */
+const appVersion = ref("");
+
+async function loadAppVersion() {
+  try {
+    appVersion.value = await getVersion();
+  } catch {
+    // Outside a Tauri window (a plain `vite dev`, say) there is nothing to read.
+    appVersion.value = "";
+  }
+}
+
 loadSettings();
+loadAppVersion();
 </script>
 
 <template>
@@ -348,7 +366,7 @@ loadSettings();
       <div class="about-info">
         <div class="about-item">
           <span class="about-label">{{ t('common.version') }}</span>
-          <span class="about-value">v0.2.0</span>
+          <span class="about-value">{{ appVersion ? "v" + appVersion : "—" }}</span>
         </div>
         <div class="about-item">
           <span class="about-label">{{ t('settings.builtWith') }}</span>
