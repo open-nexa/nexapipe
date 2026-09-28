@@ -49,7 +49,8 @@
 .PARAMETER Version
     Package version, e.g. 0.2.0 or 0.2.0-rc.1. CI derives it from the v* tag and syncs
     it into tauri.conf.json; locally it is injected through the override config instead,
-    so the working tree stays clean. Without it the version from tauri.conf.json is used.
+    so the working tree stays clean. Default: the version in src-tauri/Cargo.toml, which
+    has to match tauri.conf.json (the script refuses when it does not).
 
 .PARAMETER NoBundle
     Build the exe only, skip packaging (--no-bundle). Fastest way to check a Rust change.
@@ -311,6 +312,32 @@ if ($NoBundle) {
 if ($DebugBuild) { $tauriArgs += '--debug' }
 $tauriArgs += @('--config', $OverrideFile)
 
+# Where the version came from, for the build plan below.
+$versionSource = '-Version parameter'
+if (-not $Version) {
+    # Nothing passed, so the Rust package decides. src-tauri/Cargo.toml is what
+    # `cargo build` stamps into the binary, tauri.conf.json is what the bundler
+    # stamps into the installer - they have to agree. A Cargo.toml left at 0.1.0
+    # behind a config at 0.1.1 is exactly how a v0.1.1 release once shipped a
+    # bundle that still called itself 0.1.0. Read both and refuse on a mismatch
+    # rather than silently picking one.
+    $cargoToml    = [IO.Path]::Combine($SrcTauriDir, 'Cargo.toml')
+    $tauriConf    = [IO.Path]::Combine($SrcTauriDir, 'tauri.conf.json')
+    $Version      = ([regex]::Match((Get-Content -LiteralPath $cargoToml -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+    $confVersion  = (Get-Content -LiteralPath $tauriConf -Raw | ConvertFrom-Json).version
+    if (-not $Version) {
+        Stop-Script "cannot read a package version from $cargoToml - pass -Version explicitly"
+    }
+    if ("$confVersion" -ne "$Version") {
+        Stop-Script "version mismatch: src-tauri/Cargo.toml says '$Version' but tauri.conf.json says '$confVersion'. Make them agree, or pass -Version to override both."
+    }
+    $versionSource = 'src-tauri/Cargo.toml'
+}
+# Same version grammar CI enforces when it derives the version from the v* tag.
+if ($Version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+    Stop-Script "invalid version '$Version' (expected <major>.<minor>.<patch>, optionally with a -rc.1 style suffix)"
+}
+
 $override = @{
     build  = @{ beforeBuildCommand = $beforeBuild }
     bundle = @{
@@ -330,7 +357,7 @@ $overrideJson = $override | ConvertTo-Json -Depth 4
 
 Write-Step 'Build plan'
 Write-Host "  working dir : $DesktopDir"
-Write-Host "  version     : $(if ($Version) { $Version } else { '(from tauri.conf.json)' })"
+Write-Host "  version     : $Version (from $versionSource)"
 Write-Host "  frontend    : $(if ($beforeBuild) { $beforeBuild } else { '(frontend build skipped)' })"
 Write-Host "  override    : $OverrideFile"
 Write-Host "  updater sign: $signingEnabled"
