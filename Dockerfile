@@ -10,6 +10,11 @@ COPY crates ./crates
 # the build context as well.
 COPY third_party ./third_party
 
+# The client crate lists both `lib` and `cdylib` as its crate types, and cargo builds the
+# cdylib slot even when the client is only a dependency here. musl turns crt-static on by
+# default, which leaves rustc unable to produce one, so expect this and move on:
+#   warning: dropping unsupported crate type `cdylib` for target `...-unknown-linux-musl`
+# The binary links the rlib, which is built either way; nothing is missing.
 RUN cargo build --release -p nexapipe
 
 FROM alpine:3.24
