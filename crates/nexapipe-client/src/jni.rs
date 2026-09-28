@@ -2246,11 +2246,30 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     tun_fd: jint,
     proxy_domains: JString,
 ) -> jint {
+    // Unwinding out of an extern "system" frame is a native crash on Android,
+    // not a Java exception, and the body below builds a smoltcp stack and
+    // spawns its pumps — a long chain with plenty that can panic. Every other
+    // entry point here already catches one.
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        start_tun_proxy(env, _class, tun_fd, proxy_domains)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            jni_log!("[DEBUG:jni] Panic occurred during nativeStartTunProxy");
+            -1
+        }
+    }
+}
+
+/// The body of `nativeStartTunProxy`, split out so the catch has something to
+/// wrap and nothing else inside it has to care.
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+fn start_tun_proxy(mut env: JNIEnv, _class: JClass, tun_fd: jint, proxy_domains: JString) -> jint {
     if env.exception_check().unwrap_or(false) {
         jni_log!("JNI exception pending before nativeStartTunProxy");
         env.exception_clear().unwrap();
