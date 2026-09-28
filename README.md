@@ -971,8 +971,9 @@ Notes:
   `[patch.crates-io]`; keep `third_party/` in the build context (Docker already
   does). Platform code stays behind cargo features (`jni`, `local-proxy`,
   `tun-proxy`, `uniffi`).
-- CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
-  multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a
+- CI (`.github/workflows/ci.yml`) runs the test suite on Linux and macOS; the
+  desktop crate is `cargo check`ed on Linux, macOS and Windows. `release.yml`
+  covers multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a
   GitHub **pre-release**, so it never takes over "latest".
 - Inline comments are in English.
 

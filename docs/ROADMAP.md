@@ -51,8 +51,9 @@ The gap is not architectural, it is maturity:
   rotating every device using that client.
 - Platform coverage has real holes: no IPv6 inside the TUN, no UDP on desktop
   TUN, a single Android ABI.
-- Release hygiene is missing: no CHANGELOG, no container image, no package
-  manager distribution, and no documented way to run your own relay.
+- Release hygiene is missing: no CHANGELOG, no published container image (the
+  Dockerfiles build locally only), no package manager distribution, and no
+  documented way to run your own relay.
 
 Until those are addressed, "you do not need to rent a server" is a claim that
 benefits a narrow audience, because the fallback path (relay) is undocumented
@@ -217,10 +218,10 @@ with TOTP as a human second factor rather than the device identity itself.
 - Distribution is download-only: GitHub release archives, a signed APK and
   desktop bundles. No container image publication, no systemd unit in the docs,
   no Homebrew / winget / scoop packages, no documented self-hosted relay.
-- Engineering hygiene: no CHANGELOG; CI runs the test suite on Linux runners only
-  (Windows and macOS are `cargo check`); the Android lint baseline runs with
-  `continue-on-error`; no fuzzing, no benchmarks; the vendored smoltcp patch needs
-  long-term tracking.
+- Engineering hygiene: no CHANGELOG; the test suite runs on Linux and macOS
+  runners, while Windows is `cargo check` only; the Android lint baseline still
+  pins 26 historical findings; no fuzzing, no benchmarks; the vendored smoltcp
+  patch needs long-term tracking.
 
 ### 4.5 Protocols and transport (P1/P2)
 

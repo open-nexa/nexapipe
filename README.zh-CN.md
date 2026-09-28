@@ -400,6 +400,31 @@ domains = ["app.example.com"]
 `[local_proxy]` 层级的 `server_ticket` 与 `server_node_id` 仍然可用但已废弃 ——
 优先使用 `[[local_proxy.nodes]]`。
 
+### `[peers]` —— 允许哪些 Node ID 连接
+
+这是最先执行的一道检查：在 QUIC 握手期间、连接被接受之前生效的客户端公钥
+白名单。名单外的对端只会收到一个应用错误码为 `5` 的关闭帧，此外什么都没有 ——
+不打开任何流，也不占用任何配额。
+
+```toml
+[peers]
+# 客户端的 Node ID，与应用中显示的完全一致。没有通配符形式：
+# 这些是 ed25519 公钥，不是主机名。
+allow = [
+  "a1b2c3d4e5f6...",
+  "0f1e2d3c4b5a...",
+]
+```
+
+它不是第二重因子，也不替代 2FA：它回答的是*这个 Node ID 是否该出现在这里*，
+而 2FA 回答的是*它是谁* —— 所以它是给关闭了 2FA 的服务端准备的开关，两者
+可以叠加使用。
+
+- **缺省或省略该键** —— 任何能连到端点的对端都继续进入下一道检查。
+- **写错会在启动时失败** —— 不是合法 Node ID 的条目是错误，不会被静默跳过。
+- **`allow = []` 会被拒绝** —— 那会把运维者自己锁在服务端之外。
+- **目前仅启动时读取**，与 `[iroh]` 一样。
+
 ### `[log]`
 
 轮转日志文件加控制台输出。`file`、`dir`、`file_name`、`access_log`、
@@ -854,7 +879,8 @@ TUN 栈由 Android 与桌面端共用，只有它基于 fd 的入口是 `cfg(tar
 - workspace 锁定 edition 2024，并通过 `[patch.crates-io]` 内置 smoltcp；请把
   `third_party/` 留在构建上下文中（Docker 已经这么做了）。平台相关代码始终放在
   cargo feature 之后（`jni`、`local-proxy`、`tun-proxy`、`uniffi`）。
-- CI（`.github/workflows/ci.yml`）只跑 Linux；`release.yml` 在打 tag 时覆盖多平台
+- CI（`.github/workflows/ci.yml`）在 Linux 与 macOS 上跑测试；桌面端 crate 在
+  Linux、macOS、Windows 上做 `cargo check`。`release.yml` 在打 tag 时覆盖多平台
   构建。含连字符的 tag（`v0.2.0-rc.1`）会作为 GitHub **pre-release** 发布，因此
   永远不会占据 "latest"。
 - 行内注释使用英文。
