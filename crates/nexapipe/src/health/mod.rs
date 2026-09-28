@@ -6,6 +6,25 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Duration, sleep};
 
+/// A fraction of `interval` to wait before the first round of probes, so
+/// checkers that start together do not stay in lockstep for the life of the
+/// process.
+///
+/// Derived from the clock instead of a random number: it is a scheduling
+/// detail, not a security property, and this way it costs no dependency and no
+/// shared state. Two checkers get different values because time has moved on
+/// between them.
+fn startup_jitter(interval: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.subsec_nanos() as u128)
+        .unwrap_or(0);
+
+    let span = interval.as_nanos().max(1);
+    let jitter = (nanos % span).min(u64::MAX as u128) as u64;
+    Duration::from_nanos(jitter)
+}
+
 pub struct HealthChecker {
     backend_pool: Arc<BackendPool>,
     client: Arc<HttpClient>,
@@ -52,6 +71,16 @@ impl HealthChecker {
             self.timeout,
             self.failure_threshold
         );
+
+        // Every checker is spawned as soon as the config is loaded, so without
+        // this one server sends a probe per route at the same instant — and
+        // then again every `interval`, forever, because nothing ever moves them
+        // apart. Waiting a random part of the first interval spreads them.
+        let jitter = startup_jitter(self.interval);
+        if !jitter.is_zero() {
+            tracing::debug!("Health checker waiting {:?} before its first round", jitter);
+            sleep(jitter).await;
+        }
 
         loop {
             // Paused, not cancelled: `[health_check] enabled = false` on a
@@ -324,6 +353,35 @@ mod tests {
         );
         probes.stop_stale(&HashMap::new());
         assert!(probes.is_empty(), "a removed route stops being probed");
+    }
+
+    /// Every checker starts when the config loads, so the first round is the
+    /// one that lands on every backend at once. The jitter only has to be
+    /// somewhere inside the interval — not zero, not the whole thing.
+    #[test]
+    fn the_first_round_is_spread_over_the_interval() {
+        let interval = Duration::from_secs(10);
+        let jitter = startup_jitter(interval);
+        assert!(
+            jitter < interval,
+            "{jitter:?} must stay inside {interval:?}"
+        );
+
+        // Two checkers built back to back must not agree, or the spreading
+        // would have done nothing.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(startup_jitter(interval).as_nanos());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(seen.len() > 1, "every checker waited the same {seen:?}");
+    }
+
+    #[test]
+    fn a_zero_interval_waiting_is_not_a_jitter() {
+        // Reachable only through a direct call, but the guard is what keeps
+        // `run()` from sleeping on an interval that is already zero.
+        assert!(startup_jitter(Duration::ZERO).is_zero());
     }
 
     #[tokio::test]
