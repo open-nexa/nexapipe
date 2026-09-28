@@ -672,10 +672,12 @@ live too, for connections opened after the reload. The TOTP parameters
 (`algorithm`, `time_step`, `digits`) are read once at startup and need a restart;
 see `config.toml.2fa.example`.
 
-Those secrets are the *only* credential gating the iroh listener, so with
-`[auth] enabled = true` the server **refuses to start** when `config.toml` is
-readable or writable by another account (`chmod 600 config.toml`); with `[auth]`
-off it logs the same warning and starts. A client with no credentials against a
+Those secrets are the *only* credential gating the iroh listener, so the server
+**refuses to start** when `config.toml` holds a credential — a TOTP seed, an
+`[iroh] secret_key`, or a `relay_auth_token` — and is readable or writable by
+another account (`chmod 600 config.toml`). A config holding none of them logs the
+same warning and starts, which is what a Docker bind mount arrives as. A client
+with no credentials against a
 server that requires them is refused too: the QUIC handshake succeeds, and the
 server closes the connection once the handshake deadline (5 s) passes.
 

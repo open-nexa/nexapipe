@@ -623,9 +623,10 @@ TOTP 握手。
 （`algorithm`、`time_step`、`digits`）在启动时只读取一次，需要重启。见
 `config.toml.2fa.example`。
 
-这些密钥是**唯一**把守 iroh 监听器的凭证，因此当 `[auth] enabled = true` 时，只要
-`config.toml` 可被其属主之外的任何账号读取或写入，服务端就**拒绝启动**
-（`chmod 600 config.toml`）；`[auth]` 关闭时它记录同样的警告后照常启动。没有凭证的
+这些密钥是**唯一**把守 iroh 监听器的凭证，因此只要 `config.toml` 里存着凭证 ——
+TOTP 种子、`[iroh] secret_key` 或 `relay_auth_token` —— 而它又可被其属主之外的
+任何账号读取或写入，服务端就**拒绝启动**（`chmod 600 config.toml`）。三者都没有的
+配置只记录同样的警告后照常启动，Docker bind mount 拿到的正是这种文件。没有凭证的
 客户端面对要求凭证的服务端同样会被拒绝：QUIC 握手成功，而服务端在握手期限（5 秒）内
 没有收到 `AUTH_START` 时会关闭连接。
 
