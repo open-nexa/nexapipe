@@ -1,6 +1,7 @@
 use crate::auth::ClientAcl;
 use crate::config::RouteMode;
 use crate::lb::{BackendPool, LoadBalancingStrategy};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -198,6 +199,24 @@ impl Route {
         &self.backend_pool
     }
 
+    /// What makes this the same route across a reload, for the two things that
+    /// hang off it: its backend pool and the health probe watching that pool.
+    ///
+    /// A host alone does not identify a route — two may share one and differ in
+    /// path or in the modes they serve, and each carries its own pool. The
+    /// backends are part of the key because a pool *is* its backends: change
+    /// them and the old pool is no longer the one traffic goes through, even
+    /// though the route looks the same.
+    pub async fn pool_key(&self) -> String {
+        format!(
+            "{}|{}|{:?}|{:?}",
+            self.host_pattern,
+            self.path_pattern,
+            self.modes,
+            self.backend_pool.backends().await
+        )
+    }
+
     pub fn path_rewrite(&self) -> &Option<String> {
         &self.path_rewrite
     }
@@ -377,9 +396,40 @@ impl RouteConfig {
         self.routes.read().await.clone()
     }
 
+    /// Swaps the routing table, keeping the pool of every route that is still
+    /// the route it was.
+    ///
+    /// A reload builds brand-new `Route`s from the file, and a brand-new
+    /// `BackendPool` with each. Everything that was handed a pool earlier —
+    /// above all the health probe, which holds its `Arc` and runs until the
+    /// process ends — would then be left holding a pool the routing table no
+    /// longer hands out: the probe would keep marking backends up and down
+    /// where no traffic can see it, and the live pool would go unprobed, so a
+    /// backend that died would stay in rotation until the next restart.
+    ///
+    /// Carrying the old pool over also keeps its health state. An edit to an
+    /// unrelated route is not a reason to decide that every backend is healthy
+    /// again.
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
         let mut routes = self.routes.write().await;
-        *routes = new_routes;
+
+        let mut previous: HashMap<String, Arc<BackendPool>> = HashMap::new();
+        for route in routes.iter() {
+            previous.insert(route.pool_key().await, route.backend_pool().clone());
+        }
+
+        let mut updated = Vec::with_capacity(new_routes.len());
+        for mut route in new_routes {
+            let key = route.pool_key().await;
+            // `remove`, not `get`: two routes can share a key, and each keeps
+            // its own pool rather than ending up sharing one.
+            if let Some(pool) = previous.remove(&key) {
+                route.backend_pool = pool;
+            }
+            updated.push(route);
+        }
+
+        *routes = updated;
         tracing::info!("Routes updated successfully");
     }
 }
@@ -1024,6 +1074,107 @@ mod tests {
                 .expect("the folded host reaches the L4 route")
                 .backend,
             "10.0.0.50:5432"
+        );
+    }
+
+    /// A reload keeps the pool of a route that did not change, which is what
+    /// lets the health probe already running keep watching the pool traffic
+    /// actually goes through.
+    #[tokio::test]
+    async fn a_reload_keeps_the_pool_of_a_route_that_did_not_change() {
+        let config = RouteConfig::new(vec![http_route(
+            "fn.iroh.iakl.top",
+            &["http://10.0.0.5:8080"],
+        )]);
+        let before = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        // A reload of the very same table, which is what an edit to a second
+        // route — or to any other section — looks like from here.
+        config
+            .update_routes(vec![http_route(
+                "fn.iroh.iakl.top",
+                &["http://10.0.0.5:8080"],
+            )])
+            .await;
+
+        let after = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged route must keep the pool it had, so its health probe stays attached"
+        );
+    }
+
+    /// The counterpart: a route that now points elsewhere is a different pool,
+    /// because a pool *is* the backends it dials.
+    #[tokio::test]
+    async fn a_route_that_changed_backends_gets_a_new_pool() {
+        let config = RouteConfig::new(vec![http_route(
+            "fn.iroh.iakl.top",
+            &["http://10.0.0.5:8080"],
+        )]);
+        let before = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        config
+            .update_routes(vec![http_route(
+                "fn.iroh.iakl.top",
+                &["http://10.0.0.9:8080"],
+            )])
+            .await;
+
+        let after = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "new backends mean a new pool, and the old probe has to be stopped"
+        );
+    }
+
+    /// Two routes on one host, differing only in path, are not the same route
+    /// and must not be treated as one — sharing a key would leave one of them
+    /// without a health probe.
+    #[tokio::test]
+    async fn routes_sharing_a_host_are_still_different_routes() {
+        let mut route = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+        let same_host_other_path = {
+            let mut other = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+            other.path_pattern = "/api".to_string();
+            other
+        };
+
+        assert_ne!(
+            route.pool_key().await,
+            same_host_other_path.pool_key().await
+        );
+
+        route.path_pattern = "/api".to_string();
+        assert_eq!(
+            route.pool_key().await,
+            same_host_other_path.pool_key().await
         );
     }
 }

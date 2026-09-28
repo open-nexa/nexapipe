@@ -4,8 +4,9 @@ use crate::auth::AuthConfig;
 use crate::config::{HealthCheckConfig, IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
-use crate::health::HealthChecker;
+use crate::health::{HealthChecker, HealthProbes};
 use crate::http;
+use crate::lb::BackendPool;
 use crate::log;
 use crate::passthrough;
 use crate::routes::RouteConfig;
@@ -30,29 +31,26 @@ use tokio::net::TcpListener;
 pub type HttpClient =
     legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
 
-/// One background `GET /health` probe per `http` route.
+/// One background `GET /health` probe per `http` route, kept in step with the
+/// routes that are live.
 ///
-/// Called again after a reload, so it only starts checkers for routes it has not
-/// seen before: a probe runs until the process ends, and re-starting one per
-/// reload would pile up tasks that all poke the same backend. The trade-off is
-/// that a route deleted from the config keeps being probed — harmless, because
-/// its pool is no longer reachable from the routing table, but it does keep
-/// logging if that backend really is gone.
-pub async fn spawn_health_checks(
+/// Called at startup and again after every reload, and it reconciles rather
+/// than only adding: a probe whose route was deleted, or whose backends
+/// changed, is stopped, because it is watching a pool the routing table no
+/// longer hands out. What is left running is a probe whose pool is still the
+/// live one — which is what keeps a reload from silently unhooking health
+/// checks from the pool traffic actually uses.
+pub async fn sync_health_checks(
     config: &Arc<RouteConfig>,
     http_client: &Arc<HttpClient>,
-    seen: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+    probes: &tokio::sync::Mutex<HealthProbes>,
     health: &HealthCheckConfig,
     enabled: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Backends that cannot answer a probe are a supported deployment, not an
-    // error, so the whole loop is skipped rather than configured around.
-    if !health.enabled {
-        tracing::debug!("Health checks disabled, no probes started");
-        return;
-    }
-
-    let mut seen = seen.lock().await;
+    // Which routes want a probe right now, and on which pool. Taken before the
+    // lock on the probes, because none of it depends on them.
+    let mut wanted: std::collections::HashMap<String, Arc<BackendPool>> =
+        std::collections::HashMap::new();
 
     for route in config.routes().await {
         // Only an http:// backend answers `GET /health`. A passthrough backend is
@@ -73,29 +71,37 @@ pub async fn spawn_health_checks(
             continue;
         }
 
-        let key = format!(
-            "{}|{:?}",
-            route.host_pattern(),
-            route.backend_pool().backends().await
-        );
-        if !seen.insert(key) {
+        wanted.insert(route.pool_key().await, route.backend_pool().clone());
+    }
+
+    let mut probes = probes.lock().await;
+
+    // Before anything is started: a probe is only worth keeping if the route it
+    // belongs to still wants a probe on that same pool.
+    probes.stop_stale(&wanted);
+
+    // Backends that cannot answer a probe are a supported deployment, not an
+    // error, so nothing is started rather than configured around it.
+    if !health.enabled {
+        tracing::debug!("Health checks disabled, no probes started");
+        return;
+    }
+
+    for (key, backend_pool) in wanted {
+        if probes.contains(&key) {
             continue;
         }
 
-        let backend_pool = route.backend_pool().clone();
-        let http_client_clone = http_client.clone();
         let health_checker = HealthChecker::new(
-            backend_pool,
-            http_client_clone,
+            backend_pool.clone(),
+            http_client.clone(),
             std::time::Duration::from_secs(health.interval.max(1)),
             std::time::Duration::from_secs(health.timeout.max(1)),
             health.threshold,
             &health.path,
             enabled.clone(),
         );
-        tokio::spawn(async move {
-            health_checker.run().await;
-        });
+        probes.spawn(key, backend_pool, health_checker);
     }
 }
 
@@ -133,15 +139,15 @@ pub async fn run_proxy(
 
     let http_client = Arc::new(http::create_http_client());
 
-    let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let health_probes = Arc::new(tokio::sync::Mutex::new(HealthProbes::new()));
     let health_enabled = Arc::new(std::sync::atomic::AtomicBool::new(health_check.enabled));
     // Shared by both accept loops: a shutdown has to wait for the work they
     // spawned, not for a fixed number of seconds.
     let in_flight = Arc::new(InFlight::new());
-    spawn_health_checks(
+    sync_health_checks(
         &config,
         &http_client,
-        &health_seen,
+        &health_probes,
         &health_check,
         &health_enabled,
     )
@@ -161,7 +167,7 @@ pub async fn run_proxy(
         config_path.to_string(),
         config.clone(),
         http_client.clone(),
-        health_seen,
+        health_probes,
         health_enabled,
         auth_state.clone(),
     ));

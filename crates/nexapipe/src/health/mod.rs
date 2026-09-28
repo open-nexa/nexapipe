@@ -54,9 +54,10 @@ impl HealthChecker {
         );
 
         loop {
-            // Paused, not cancelled: the task is owned by nobody after spawn,
-            // so `[health_check] enabled = false` on a reload stops the probing
-            // without having to reach into every checker.
+            // Paused, not cancelled: `[health_check] enabled = false` on a
+            // reload stops the probing without having to reach into every
+            // checker. Being cancelled is a different question — that is what
+            // `HealthProbes::stop_stale` does when the route itself is gone.
             if self.enabled.load(Ordering::Relaxed) {
                 self.check_all_backends().await;
             }
@@ -164,6 +165,64 @@ impl HealthChecker {
     }
 }
 
+/// The probes the process has running, and the pool each one is watching.
+///
+/// Keyed by a route's [`crate::routes::Route::pool_key`], and the pool is
+/// kept beside the handle because that is what separates the two things a
+/// reload can find: the route is still there (same pool, leave the probe
+/// alone) or the route was rebuilt (new pool, and a probe on the old one is
+/// now marking backends up and down where no traffic can see it, while
+/// nothing probes the pool traffic actually goes through).
+pub struct HealthProbes {
+    running: HashMap<String, (Arc<BackendPool>, tokio::task::JoinHandle<()>)>,
+}
+
+impl HealthProbes {
+    pub fn new() -> Self {
+        Self {
+            running: HashMap::new(),
+        }
+    }
+
+    /// Whether a probe for this route is already running.
+    pub fn contains(&self, key: &str) -> bool {
+        self.running.contains_key(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    /// Stops every probe whose route is gone, or whose pool has been replaced.
+    ///
+    /// A route deleted from the config has no reason to keep being probed, and
+    /// one that changed its backends gets a new pool and therefore a new
+    /// probe — the old task would otherwise outlive the process's interest in
+    /// it, since nothing else owns it.
+    pub fn stop_stale(&mut self, wanted: &HashMap<String, Arc<BackendPool>>) {
+        for (key, (pool, handle)) in self.running.iter() {
+            let still_wanted = wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool));
+            if !still_wanted {
+                handle.abort();
+            }
+        }
+        self.running
+            .retain(|key, (pool, _)| wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool)));
+    }
+
+    /// Starts a probe and keeps its handle, so it can be stopped later.
+    pub fn spawn(&mut self, key: String, pool: Arc<BackendPool>, checker: HealthChecker) {
+        let handle = tokio::spawn(async move { checker.run().await });
+        self.running.insert(key, (pool, handle));
+    }
+}
+
+impl Default for HealthProbes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +264,50 @@ mod tests {
             .find(|(u, _)| u == url)
             .map(|(_, h)| h)
             .unwrap_or(false)
+    }
+
+    /// A probe is only worth keeping while its route still wants one on that
+    /// same pool: a route that was rebuilt gets a new pool, and a probe left
+    /// behind on the old one would keep marking backends up and down where no
+    /// traffic can see it, while nothing probes the pool traffic uses.
+    #[tokio::test]
+    async fn a_probe_is_only_kept_while_its_route_keeps_the_same_pool() {
+        let pool = pool();
+        let mut probes = HealthProbes::new();
+        probes.spawn(
+            "key".to_string(),
+            pool.clone(),
+            checker(pool.clone(), 1, Arc::new(AtomicBool::new(false))),
+        );
+        assert!(probes.contains("key"));
+
+        // The route is unchanged: same key, same pool, probe stays.
+        let mut wanted = HashMap::new();
+        wanted.insert("key".to_string(), pool.clone());
+        probes.stop_stale(&wanted);
+        assert!(probes.contains("key"), "an unchanged route keeps its probe");
+
+        // Same key, but the backends changed and with them the pool: the probe
+        // is now watching a pool the routing table no longer hands out.
+        let rebuilt = Arc::new(BackendPool::new(
+            vec!["http://10.0.0.9:8080".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        wanted.insert("key".to_string(), rebuilt);
+        probes.stop_stale(&wanted);
+        assert!(
+            probes.is_empty(),
+            "a rebuilt pool means the old probe is stopped"
+        );
+
+        // A route deleted from the config has no reason to be probed either.
+        probes.spawn(
+            "key".to_string(),
+            pool.clone(),
+            checker(pool.clone(), 1, Arc::new(AtomicBool::new(false))),
+        );
+        probes.stop_stale(&HashMap::new());
+        assert!(probes.is_empty(), "a removed route stops being probed");
     }
 
     #[tokio::test]

@@ -1,10 +1,10 @@
 use crate::auth::AuthConfig;
 use crate::config::ProxyConfig;
 use crate::conn::AuthState;
-use crate::proxy::{HttpClient, spawn_health_checks};
+use crate::health::HealthProbes;
+use crate::proxy::{HttpClient, sync_health_checks};
 use crate::routes::RouteConfig;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
@@ -34,9 +34,9 @@ pub struct ConfigWatcher {
     config_path: String,
     route_config: Arc<RouteConfig>,
     http_client: Arc<HttpClient>,
-    /// Health checks already running, keyed by host + backends. A probe cannot
-    /// be stopped, so a reload only starts the ones it has not started yet.
-    health_seen: Arc<Mutex<HashSet<String>>>,
+    /// Health probes already running, and the pool each one is watching, so a
+    /// reload can tell a route that was rebuilt from one that is still here.
+    health_probes: Arc<Mutex<HealthProbes>>,
     /// Whether probing is on right now. Shared with every `HealthChecker`, which
     /// pauses instead of exiting: a spawned probe has no owner left to cancel it.
     health_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -77,7 +77,7 @@ impl ConfigWatcher {
         config_path: String,
         route_config: Arc<RouteConfig>,
         http_client: Arc<HttpClient>,
-        health_seen: Arc<Mutex<HashSet<String>>>,
+        health_probes: Arc<Mutex<HealthProbes>>,
         health_enabled: Arc<std::sync::atomic::AtomicBool>,
         auth: Option<AuthState>,
     ) -> Self {
@@ -85,7 +85,7 @@ impl ConfigWatcher {
             config_path,
             route_config,
             http_client,
-            health_seen,
+            health_probes,
             health_enabled,
             auth,
             plaintext: std::sync::OnceLock::new(),
@@ -156,10 +156,10 @@ impl ConfigWatcher {
             new_config.health_check.enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
-        spawn_health_checks(
+        sync_health_checks(
             &self.route_config,
             &self.http_client,
-            &self.health_seen,
+            &self.health_probes,
             &new_config.health_check,
             &self.health_enabled,
         )
