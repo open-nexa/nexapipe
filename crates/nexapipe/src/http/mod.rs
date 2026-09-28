@@ -616,4 +616,56 @@ mod tests {
         let read = read_body_limited(body_of(0), 0).await.unwrap();
         assert!(read.is_empty());
     }
+
+    #[test]
+    fn legacy_request_parser_keeps_the_request_line_and_headers() {
+        let raw = b"GET /index.html HTTP/1.1\r\nHost: app.example.com\r\nX-Empty:\r\n\r\n";
+        let req = parse_http_request_legacy(raw).unwrap();
+
+        assert_eq!(req.method(), http::Method::GET);
+        assert_eq!(req.uri().path(), "/index.html");
+        assert_eq!(req.headers()["host"], "app.example.com");
+        // A header with no value is still a header.
+        assert_eq!(req.headers()["x-empty"], "");
+    }
+
+    #[test]
+    fn legacy_request_parser_stops_at_the_blank_line() {
+        let raw = b"POST /api HTTP/1.1\r\nHost: a\r\n\r\nnot-a-header";
+        let req = parse_http_request_legacy(raw).unwrap();
+
+        assert_eq!(req.method(), http::Method::POST);
+        assert_eq!(req.headers().len(), 1);
+    }
+
+    #[test]
+    fn legacy_request_parser_rejects_a_request_line_without_a_target() {
+        assert!(parse_http_request_legacy(b"GET\r\nHost: a\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn legacy_response_parser_splits_status_headers_and_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello";
+        let res = parse_http_response_legacy(raw).unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/plain");
+        assert_eq!(res.body().as_slice(), b"hello".as_slice());
+    }
+
+    #[test]
+    fn legacy_response_parser_leaves_no_body_when_there_is_none() {
+        let res = parse_http_response_legacy(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.body().is_empty());
+    }
+
+    #[test]
+    fn legacy_response_parser_falls_back_to_500_without_a_status_code() {
+        let res = parse_http_response_legacy(b"HTTP/1.1\r\n\r\n").unwrap();
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(res.body().is_empty());
+    }
 }

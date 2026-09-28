@@ -146,3 +146,116 @@ where
         Err(_) => Ok(false),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    /// Two in-memory pipes: `copy_both_ways` gets one end of each, and the test
+    /// plays the client and the backend from the other ends.
+    fn pair() -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (client_end, client_side) = duplex(1024);
+        let (backend_end, backend_side) = duplex(1024);
+        (client_end, backend_end, client_side, backend_side)
+    }
+
+    #[tokio::test]
+    async fn copies_bytes_in_both_directions() {
+        let (mut client_end, mut backend_end, client_side, backend_side) = pair();
+        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+
+        client_end.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        backend_end.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        backend_end.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        client_end.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        drop(client_end);
+        drop(backend_end);
+        copy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn half_closes_the_backend_when_the_client_stops() {
+        let (mut client_end, mut backend_end, client_side, backend_side) = pair();
+        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+
+        client_end.write_all(b"hello").await.unwrap();
+        drop(client_end);
+
+        // The client's end of stream has to reach the backend as one: everything
+        // it sent, then a clean EOF rather than a dropped connection.
+        let mut seen = Vec::new();
+        backend_end.read_to_end(&mut seen).await.unwrap();
+        assert_eq!(seen, b"hello");
+
+        copy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn returns_when_the_far_end_disappears() {
+        let (mut client_end, _backend_end, client_side, backend_side) = pair();
+        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+
+        // The backend is gone mid-flow. What matters is that the copy comes
+        // back: a tunnel that keeps a task (and its stream) alive after the far
+        // end vanished would leak one per abandoned connection.
+        drop(_backend_end);
+        let returned = tokio::time::timeout(Duration::from_secs(5), copy).await;
+        assert!(returned.is_ok(), "copy_both_ways never returned");
+
+        let mut rest = Vec::new();
+        let _ = client_end.read_to_end(&mut rest).await;
+    }
+
+    #[tokio::test]
+    async fn read_more_appends_the_chunk_it_read() {
+        let (mut writer, mut reader) = duplex(1024);
+        writer.write_all(b"abc").await.unwrap();
+
+        let mut buf = Vec::new();
+        let more = read_more(&mut reader, &mut buf, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(more);
+        assert_eq!(buf, b"abc");
+    }
+
+    #[tokio::test]
+    async fn read_more_reports_eof() {
+        let (writer, mut reader) = duplex(1024);
+        drop(writer);
+
+        let mut buf = Vec::new();
+        let more = read_more(&mut reader, &mut buf, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!more);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_more_reports_a_silent_peer_as_false() {
+        let (_writer, mut reader) = duplex(1024);
+
+        // Nothing is ever written, so this is the timeout path: a peer that goes
+        // quiet is not an error, the caller decides whether what arrived so far
+        // is enough.
+        let mut buf = Vec::new();
+        let more = read_more(&mut reader, &mut buf, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(!more);
+        assert!(buf.is_empty());
+    }
+}
