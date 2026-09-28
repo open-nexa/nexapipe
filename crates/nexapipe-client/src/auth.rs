@@ -239,6 +239,27 @@ impl TwoFactorAuth {
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Result<(), ClientError> {
+        // Four round trips against a server this client may be meeting for the
+        // first time. The server's own deadline covers the first stream only, so
+        // a server that answers the challenge and then goes quiet is covered by
+        // nothing on either side — and in `Enrollment::exchange` this runs while
+        // the endpoint's lock is held, which would stall every other caller.
+        let handshake = self.authenticate_on_inner(conn, send, recv);
+        match tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(ClientError::ConnectionFailed(format!(
+                "the server did not finish the 2FA handshake within {}s",
+                AUTH_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    async fn authenticate_on_inner(
+        &self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<(), ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
 
         // Step 1: Send AUTH_START
@@ -266,21 +287,10 @@ impl TwoFactorAuth {
             .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send message: {}", e)))?;
 
         // Step 2: Receive AUTH_CHALLENGE
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
+        let nonce = match read_message(recv)
             .await
-            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE length", e))?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf)
-            .await
-            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE body", e))?;
-
-        let challenge_msg = AuthMessage::from_bytes(&msg_buf)
-            .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
-
-        let nonce = match challenge_msg {
+            .map_err(|e| self.read_failure(conn, "the AUTH_CHALLENGE could not be read", e))?
+        {
             AuthMessage::Challenge { nonce } => nonce,
             _ => return Err(ClientError::Other("Expected AUTH_CHALLENGE".to_string())),
         };
@@ -320,19 +330,9 @@ impl TwoFactorAuth {
         })?;
 
         // Step 4: Receive AUTH_OK or AUTH_FAILED
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await.map_err(|e| {
-            self.read_failure(conn, "failed to read the authentication result length", e)
+        let result_msg = read_message(recv).await.map_err(|e| {
+            self.read_failure(conn, "the authentication result could not be read", e)
         })?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf).await.map_err(|e| {
-            self.read_failure(conn, "failed to read the authentication result body", e)
-        })?;
-
-        let result_msg = AuthMessage::from_bytes(&msg_buf)
-            .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
 
         match result_msg {
             AuthMessage::Ok => Ok(()),
@@ -522,6 +522,13 @@ fn message_name(message: &auth_protocol::AuthMessage) -> &'static str {
 /// prefix is read before anything is known about the peer, so it is not
 /// trusted until it is in range.
 const MAX_AUTH_MESSAGE: usize = 64 * 1024;
+
+/// How long the client waits for the server to finish the handshake.
+///
+/// Comfortably longer than the server's own five-second wait for the first
+/// stream: that one covers a client that never speaks, while this covers a
+/// server that answers and then stalls, which nothing else on either side does.
+const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Generate a new secret for client setup
 pub fn generate_secret() -> String {
