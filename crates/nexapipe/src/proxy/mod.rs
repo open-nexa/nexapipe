@@ -627,6 +627,10 @@ async fn proxy_handler(
     let response = match http::proxy_request(&client, req, config.clone()).await {
         Ok(resp) => resp,
         Err(e) => {
+            // The detail goes to the log, not to the client: `e` is an
+            // internal one — a backend URL that would not parse, the address
+            // of the backend that did not answer — and a proxy sitting in
+            // front of a private network is not the place to publish those.
             tracing::error!("Proxy request failed: {}", e);
             let duration = start.elapsed();
             log::log_access(
@@ -639,7 +643,7 @@ async fn proxy_handler(
             );
             return Ok(http::create_error_response(
                 hyper::StatusCode::BAD_GATEWAY,
-                &format!("Proxy error: {}", e),
+                "Bad Gateway",
             ));
         }
     };
