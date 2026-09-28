@@ -348,7 +348,7 @@ loadSettings();
       <div class="about-info">
         <div class="about-item">
           <span class="about-label">{{ t('common.version') }}</span>
-          <span class="about-value">v0.1.0</span>
+          <span class="about-value">v0.2.0</span>
         </div>
         <div class="about-item">
           <span class="about-label">{{ t('settings.builtWith') }}</span>
