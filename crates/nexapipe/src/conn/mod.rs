@@ -639,7 +639,12 @@ async fn enroll_client(
             if let Some(client) = cfg.clients.get_mut(client_id) {
                 client.record_failure(max_attempts, lockout_duration);
             }
-            if let Err(e) = save_auth_state(auth.path(), &cfg) {
+            let snapshot = cfg.clone();
+            if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                save_auth_state(path, &snapshot)
+            })
+            .await
+            {
                 tracing::warn!(
                     "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
                     client_id,
@@ -683,8 +688,13 @@ async fn enroll_client(
     // Persisted before anything is promised to the client: a secret that is
     // live in memory but missing from disk is a secret that silently reverts
     // on the next restart, which would put the old one back in service.
-    if let Err(e) =
-        crate::config::ProxyConfig::complete_enrollment(auth.path(), client_id, &secret)
+    let enrollment_path = auth.path().to_string();
+    let enrolled_client = client_id.to_string();
+    let issued_secret = secret.clone();
+    if let Err(e) = blocking_config_write(enrollment_path, move |path| {
+        crate::config::ProxyConfig::complete_enrollment(path, &enrolled_client, &issued_secret)
+    })
+    .await
     {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
@@ -717,7 +727,12 @@ async fn enroll_client(
         if let Some(client) = cfg.clients.get_mut(client_id) {
             client.record_success();
         }
-        if let Err(e) = save_auth_state(auth.path(), &cfg) {
+        let snapshot = cfg.clone();
+        if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+            save_auth_state(path, &snapshot)
+        })
+        .await
+        {
             tracing::warn!(
                 "2FA: failed to persist the cleared counter for '{}' to {}: {}",
                 client_id,
@@ -765,6 +780,33 @@ fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+/// Runs a write against the config file without occupying a worker.
+///
+/// These writes happen while the auth write lock is held, and that is not
+/// incidental: the lock is what keeps two connections from persisting
+/// overlapping views of the lockout counters, so the IO cannot be moved out
+/// from under it. What can be moved is the *thread* it blocks. `std::fs` plus a
+/// TOML parse is a syscall and some CPU on whichever thread calls it, and on a
+/// tokio worker that stalls every task scheduled behind it — one handshake's
+/// write becomes a delay on all of them, and a slow or contended mount turns
+/// into handshakes timing out for a reason that has nothing to do with the
+/// network. `spawn_blocking` hands it to a thread built for it and leaves the
+/// worker free.
+///
+/// The lock is still held across the await, so this does not change who can
+/// write when — only who waits for the disk.
+async fn blocking_config_write<T, F>(path: String, write: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // Named apart from the `path` the closure takes, which it moves.
+    let failed_path = path.clone();
+    tokio::task::spawn_blocking(move || write(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
 }
 
 /// Writes one length-prefixed AUTH_* message.
@@ -963,7 +1005,12 @@ async fn perform_authentication(
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
                 }
-                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                let snapshot = cfg.clone();
+                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                    save_auth_state(path, &snapshot)
+                })
+                .await
+                {
                     tracing::warn!(
                         "2FA: failed to persist auth state for '{}' to {}: {}",
                         client_id,
@@ -986,7 +1033,12 @@ async fn perform_authentication(
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
-                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                let snapshot = cfg.clone();
+                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                    save_auth_state(path, &snapshot)
+                })
+                .await
+                {
                     tracing::warn!(
                         "2FA: failed to persist lockout for '{}' to {}: {}",
                         client_id,
