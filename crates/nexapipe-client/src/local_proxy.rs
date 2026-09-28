@@ -262,6 +262,18 @@ fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>)
 /// times, discarding the stale pooled connection on each failure so the retry
 /// gets a fresh connection.
 ///
+/// "Discarding" is the whole point, and it is what the retry buys: a
+/// connection whose path died still looks open to QUIC (`close_reason()` stays
+/// `None` until the idle timeout expires), so handing one back to the pool
+/// hands it to the next attempt — the pool is last-in-first-out — and the
+/// request fails [`OPEN_ATTEMPTS`] times on the same dead connection. Dropping
+/// the last handle closes it for real, and the next attempt dials again.
+///
+/// The cost is that a timeout is retried like any other failure, so one
+/// request can now wait [`OPEN_ATTEMPTS`] × [`STREAM_OPERATION_TIMEOUT`]
+/// before it gives up. Not retrying was worse: a half-open connection then
+/// stayed broken for every later request too.
+///
 /// Shared with [`crate::l4`]: the L4 tunnel needs the same recovery, and the
 /// preface it passes as `initial_data` is written by exactly this code path.
 pub(crate) async fn open_stream_with_retry(
@@ -287,12 +299,23 @@ pub(crate) async fn open_stream_with_retry(
                     e
                 );
                 last_err = Some(anyhow::anyhow!(e).into());
-                endpoint_group.return_connection(host, pooled_conn).await;
+                drop(pooled_conn);
                 continue;
             }
             Err(_) => {
-                endpoint_group.return_connection(host, pooled_conn).await;
-                return Err(ClientError::TimeoutError);
+                jni_log!(
+                    "[DEBUG:local-proxy] open_bi timed out (attempt {}/{}), retrying on a fresh connection",
+                    _attempt,
+                    OPEN_ATTEMPTS
+                );
+                // A stream that never opened is a connection that does not
+                // work, whether or not QUIC has noticed it yet — the same
+                // stale-connection case as the branch above, so it gets the
+                // same treatment rather than ending the loop on the first
+                // attempt.
+                last_err = Some(ClientError::TimeoutError);
+                drop(pooled_conn);
+                continue;
             }
         };
 
@@ -306,7 +329,9 @@ pub(crate) async fn open_stream_with_retry(
                 e
             );
             last_err = Some(e.into());
-            endpoint_group.return_connection(host, pooled_conn).await;
+            // Same reasoning as the `open_bi` failures: a connection that
+            // could not take the first bytes is not one to hand back.
+            drop(pooled_conn);
             continue;
         }
 
