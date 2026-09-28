@@ -559,7 +559,11 @@ impl fmt::Display for IpcReadError {
 ///
 /// `code` names what was being validated, because "not loopback" is the same
 /// fact with two different fixes depending on which address it was.
-fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
+///
+/// Shared by both start paths: `start_proxy` calls it before the request is
+/// handed to either runner, and the service repeats it on its own side because
+/// a service binary built before that call existed may still be installed.
+pub fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(code, format!("{addr:?} is not a host:port address ({e})"))
     })?;
@@ -582,7 +586,9 @@ fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
 /// (`routing::configure_interface` walks [`TUN_BASE_CANDIDATES`]), which is *after* this
 /// validation runs — so an address inside any candidate block is accepted, and `retarget`
 /// later moves it into the block that took. See `proxy::tun_proxy` for the block policy.
-fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
+///
+/// Shared by both start paths, like [`require_loopback`].
+pub fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,

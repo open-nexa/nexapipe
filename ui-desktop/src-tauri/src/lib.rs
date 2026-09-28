@@ -177,6 +177,23 @@ async fn start_proxy(
         ));
     }
 
+    // Anything the caller spells out is checked before the request is handed to
+    // either runner. Absent means "take the default", and both defaults are
+    // loopback / TUN addresses by construction — they are re-checked below in
+    // case they ever stop being.
+    //
+    // What is at stake: `local_addr` fronts a proxy with nothing authenticating
+    // in front of it, so binding it anywhere but loopback publishes an open
+    // proxy to everyone who can reach the machine. That is the one thing the
+    // service side refuses on purpose, and until now only the service side
+    // refused it — the in-process path took the address as it came.
+    if let Some(addr) = local_addr.as_deref() {
+        service::runner::require_loopback(addr, codes::SERVICE_LOCAL_ADDR_NOT_LOOPBACK)?;
+    }
+    if let Some(addr) = dns_addr.as_deref() {
+        service::runner::require_tun_subnet(addr)?;
+    }
+
     if use_service {
         match IpcClient::start_proxy(StartProxyRequest {
             nodes: nodes.clone(),
@@ -260,6 +277,13 @@ async fn start_proxy(
     let local_addr = local_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
     let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
+
+    // The in-process path is the one that had no validation at all, so it
+    // re-checks after the defaults have been substituted: the caller's values
+    // were already refused above, and this catches a default that stops being
+    // loopback or leaves the TUN block.
+    service::runner::require_loopback(&local_addr, codes::SERVICE_LOCAL_ADDR_NOT_LOOPBACK)?;
+    service::runner::require_tun_subnet(&dns_addr)?;
 
     let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
 
