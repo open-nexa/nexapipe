@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 #[cfg(feature = "tracing")]
 use tracing;
@@ -60,6 +62,16 @@ pub struct LocalProxy {
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
     stopped: Arc<AtomicBool>,
+    /// Wakes the accept loop the moment the proxy is stopped, so it does not
+    /// have to give up on `accept()` every 100 ms to find out.
+    stop_notify: Arc<Notify>,
+    /// The per-connection tasks, so stopping the proxy ends them.
+    ///
+    /// A handler holds a pooled connection for as long as its peer keeps the
+    /// socket open, which is not this process's decision: without this a
+    /// "stopped" proxy would still be holding connections out of the pool, and
+    /// a `close_all` could not return them.
+    connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl LocalProxy {
@@ -88,12 +100,11 @@ impl LocalProxy {
         };
         #[cfg(feature = "tracing")]
         tracing::info!("Local proxy listening on: {}", listen_addr);
-        Ok(Self {
-            listener: Arc::new(listener),
+        Ok(Self::shared(
+            Arc::new(listener),
             endpoint_group,
-            proxy_domains: Arc::new(proxy_domains),
-            stopped: Arc::new(AtomicBool::new(false)),
-        })
+            proxy_domains,
+        ))
     }
 
     pub async fn new_with_single_pool(
@@ -105,12 +116,27 @@ impl LocalProxy {
         let endpoint_group = EndpointGroup::new_with_single_pool(conn_pool).await;
         #[cfg(feature = "tracing")]
         tracing::info!("Local proxy listening on: {}", listen_addr);
-        Ok(Self {
-            listener: Arc::new(listener),
-            endpoint_group: Arc::new(endpoint_group),
+        Ok(Self::shared(
+            Arc::new(listener),
+            Arc::new(endpoint_group),
+            proxy_domains,
+        ))
+    }
+
+    /// The one place the two constructors' shared fields are filled in.
+    fn shared(
+        listener: Arc<TcpListener>,
+        endpoint_group: Arc<EndpointGroup>,
+        proxy_domains: Vec<String>,
+    ) -> Self {
+        Self {
+            listener,
+            endpoint_group,
             proxy_domains: Arc::new(proxy_domains),
             stopped: Arc::new(AtomicBool::new(false)),
-        })
+            stop_notify: Arc::new(Notify::new()),
+            connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     pub async fn run(&self) -> Result<(), ClientError> {
@@ -118,6 +144,7 @@ impl LocalProxy {
         let listener = self.listener.clone();
         let proxy_domains = self.proxy_domains.clone();
         let endpoint_group = self.endpoint_group.clone();
+        let stop_notify = self.stop_notify.clone();
 
         loop {
             if stopped.load(Ordering::Acquire) {
@@ -126,17 +153,33 @@ impl LocalProxy {
                 break;
             }
 
-            match tokio::time::timeout(tokio::time::Duration::from_millis(100), listener.accept())
-                .await
-            {
-                Ok(Ok((stream, addr))) => {
+            // `accept()` is cancel safe: a connection it has taken is never
+            // handed to another task, so losing this race only means the
+            // socket stays in the backlog until the loop comes back for it.
+            //
+            // `notify_one` — not `notify_waiters` — because a stop that lands
+            // in the gap between the flag check and the `notified()` future
+            // being created must still be remembered: `notify_one` stores a
+            // permit for a waiter that has not arrived yet, `notify_waiters`
+            // wakes only the ones already parked and would be lost.
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                _ = stop_notify.notified() => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!("Local proxy stopping");
+                    break;
+                }
+            };
+
+            match accepted {
+                Ok((stream, addr)) => {
                     #[cfg(feature = "tracing")]
                     tracing::debug!("New connection from: {}", addr);
 
                     let proxy_domains_clone = proxy_domains.clone();
                     let endpoint_group_clone = endpoint_group.clone();
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         if let Err(e) = handle_local_connection(
                             stream,
                             proxy_domains_clone,
@@ -148,8 +191,9 @@ impl LocalProxy {
                             tracing::error!("Failed to handle local connection: {}", e);
                         }
                     });
+                    self.track_connection(handle);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -157,18 +201,42 @@ impl LocalProxy {
                     tracing::error!("Local proxy accept error: {}", e);
                     break;
                 }
-                Err(_) => {
-                    continue;
-                }
             }
         }
         Ok(())
+    }
+
+    /// Remember a connection task so [`Self::stop`] can end it.
+    fn track_connection(&self, handle: JoinHandle<()>) {
+        let Ok(mut connections) = self.connections.lock() else {
+            return;
+        };
+        // A busy proxy would otherwise keep every handle it ever spawned:
+        // finished tasks are dropped here as they are noticed, and the rest in
+        // `abort_connections`.
+        connections.retain(|h| !h.is_finished());
+        connections.push(handle);
+    }
+
+    fn abort_connections(&self) {
+        let Ok(mut connections) = self.connections.lock() else {
+            return;
+        };
+        for handle in connections.drain(..) {
+            handle.abort();
+        }
     }
 
     pub fn stop(&self) {
         #[cfg(feature = "tracing")]
         tracing::info!("Stopping local proxy");
         self.stopped.store(true, Ordering::Release);
+        self.stop_notify.notify_one();
+        // The handlers outlive `run()`: each one holds a pooled connection
+        // until its peer closes the socket, which is not a decision this
+        // process gets to make. Aborting is what lets a `close_all()` after
+        // `run()` actually return those connections.
+        self.abort_connections();
     }
 
     pub async fn close_all(&self) {
@@ -1206,4 +1274,114 @@ pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LoadBalancingStrategy;
+    use iroh::Endpoint;
+    use iroh::endpoint::presets;
+
+    /// A proxy listening on an ephemeral port, with no backends behind it.
+    ///
+    /// Enough for the accept loop, which in these tests never gets as far as
+    /// dialling one. Built through `shared` rather than `new` because the test
+    /// needs the address `new` keeps to itself.
+    async fn listening_proxy() -> (LocalProxy, std::net::SocketAddr) {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            Vec::new(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a group with no backend still builds");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback listener needs no network");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        (
+            LocalProxy::shared(Arc::new(listener), Arc::new(group), Vec::new()),
+            addr,
+        )
+    }
+
+    fn spawn_run(proxy: &LocalProxy) -> JoinHandle<Result<(), ClientError>> {
+        let proxy = proxy.clone();
+        tokio::spawn(async move { proxy.run().await })
+    }
+
+    /// `stop()` has to reach a loop that is parked in `accept()`, not one that
+    /// happens to look at a flag on the way past: with nothing to wake it, the
+    /// task stays on the listener for as long as the process lives.
+    #[tokio::test]
+    async fn stop_wakes_a_loop_that_is_waiting_for_a_connection() {
+        let (proxy, _addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // Long enough that the loop is definitely inside `accept()`.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        proxy.stop();
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), runner)
+                .await
+                .is_ok(),
+            "run() never returned after stop()"
+        );
+    }
+
+    /// The handlers outlive `run()`, so a proxy that only stops the loop would
+    /// leave them holding pooled connections. Stopping has to end them too.
+    #[tokio::test]
+    async fn stop_ends_the_connections_it_accepted() {
+        let (proxy, addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // A client that connects and then says nothing: the handler parks in
+        // its first read, which is the state that used to survive stop().
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the proxy is listening");
+
+        let tracked = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if proxy.connections.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(tracked.is_ok(), "the accepted connection was never tracked");
+
+        proxy.stop();
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), runner)
+                .await
+                .is_ok(),
+            "run() never returned after stop()"
+        );
+        assert!(
+            proxy.connections.lock().unwrap().is_empty(),
+            "stop() must drop the handles it aborted"
+        );
+
+        // Aborting the handler drops its socket, so the peer sees EOF instead
+        // of waiting out the handler's read timeout.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(tokio::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the client read never returned")
+            .expect("the client read failed");
+        assert_eq!(read, 0, "the handler kept its socket open after stop()");
+    }
 }
