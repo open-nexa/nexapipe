@@ -166,13 +166,67 @@ cargo run -p nexapipe -- --generate-secret
 ### Docker
 
 ```bash
+mkdir -p config && cp config.toml.example config/config.toml   # config.toml is gitignored
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-`docker-compose.yaml` mounts your `config.toml` and a `logs/` volume, and points
-`NEXAPIPE_LOG_DIR` at it. `host.docker.internal` is configured, so backends
-running on the Docker host are reachable.
+`docker-compose.yaml` mounts a `config/` directory — the one holding your
+`config.toml` — and a `logs/` volume, and points `NEXAPIPE_LOG_DIR` at it.
+`host.docker.internal` is configured, so backends running on the Docker host are
+reachable. Moving an existing deployment over is one command:
+`mkdir -p config && mv config.toml config/config.toml`.
+
+#### Editing the config file
+
+The file is re-read every 5 seconds, so an edit needs no restart — but **run
+anything that writes it inside the container**:
+
+```bash
+# The image's own binary, against the file the server is actually reading.
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --registration
+```
+
+Running the same command on the host against the bind-mounted file is where it
+goes wrong:
+
+- **Keep the mount a directory.** A single-file bind mount is pinned to the
+  inode the path had when the container started, so anything that replaces the
+  file — `sed -i`, an editor with atomic save, `mv` — leaves the container
+  reading the copy that was swapped out: the change never arrives and nothing is
+  logged. `docker compose restart` does not help, because it does not rebuild
+  the mount; `docker compose up -d --force-recreate` does. The compose file
+  mounts `./config:/app/config` for exactly this reason — a directory mount is
+  resolved by name on every lookup, so it always sees the current file. Putting
+  `./config.toml:/app/config/config.toml` back reintroduces the trap.
+- **Two writers, no lock.** The server rewrites the whole file to persist the
+  `failed_attempts` / `locked_until` / `last_used` counters whenever a 2FA
+  attempt happens (`save_auth_state`). Every write on both sides is a
+  read-modify-write with no locking, so an overlapping host edit and flush lose
+  one of them. A `pending_enrollment` token is the worst case: the server never
+  writes it back, so losing the race costs you the invite and prints nothing.
+- **The host binary is not the server's binary.** `--generate-invite` derives the
+  endpoint from `[iroh] secret_key`, so a host copy of the config without that
+  key — or a `nexapipe` built from another commit — issues an invite pointing at
+  an endpoint nobody is running.
+- **Mode and ownership change under you.** A rewrite from the host can land the
+  file at `0644` or with a different owner. A config holding a credential is then
+  refused at startup, and a reload cannot turn 2FA on until it is `0600` again.
+
+The mount is read-write on purpose: the server writes the 2FA counters back into
+the file, so a `:ro` mount would cost a lockout its persistence and log an error
+on every attempt.
+
+Editing with an editor is fine as long as it saves in place — the default for
+`vim` and for a shell `>` redirect. Whatever you changed, confirm the server
+took it instead of assuming it did:
+
+```bash
+docker compose logs -f --tail=50 nexapipe | grep -i reload
+# Detected config change, reloading...  →  Config reloaded: 3 routes now live
+# Config not reloaded, keeping the current routes: ... → refused, old routes still serve
+```
 
 ---
 

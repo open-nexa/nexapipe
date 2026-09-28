@@ -151,13 +151,58 @@ cargo run -p nexapipe -- --generate-secret
 ### Docker
 
 ```bash
+mkdir -p config && cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-`docker-compose.yaml` 挂载你的 `config.toml` 和一个 `logs/` 卷，并把
-`NEXAPIPE_LOG_DIR` 指向该挂载点。`host.docker.internal` 已配置好，因此运行在
-Docker 宿主机上的后端可以被访问到。
+`docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）
+和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向该挂载点。`host.docker.internal`
+已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
+`mkdir -p config && mv config.toml config/config.toml`。
+
+#### 修改配置文件
+
+配置文件每 5 秒重新读取一次，改动无需重启 —— 但**凡是会写入这个文件的操作，
+都建议在容器内执行**：
+
+```bash
+# 用镜像自带的二进制，操作服务端真正在读的那份文件
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --registration
+```
+
+在宿主机上直接对这个挂载文件执行同样的命令，问题出在这几处：
+
+- **挂载必须是目录。** 单文件 bind mount 锁定的是容器启动时该路径对应的 inode，
+  凡是"写临时文件再 rename"的操作 —— `sed -i`、开了 atomic save 的编辑器、`mv` ——
+  都会让容器继续读那个被换走的文件：改动永远进不来，而且**不报任何错**。
+  `docker compose restart` 也没用，它不重建挂载；要 `docker compose up -d --force-recreate`。
+  compose 里写的 `./config:/app/config` 正是为此 —— 目录挂载每次按名字解析，
+  永远看得到当前那个文件；改回 `./config.toml:/app/config/config.toml` 就又把坑请回来了。
+- **两个写者，没有锁。** 每次发生 2FA 尝试时，服务端都会重写整个文件，把
+  `failed_attempts` / `locked_until` / `last_used` 落盘（`save_auth_state`）。
+  两边的每次写入都是无锁的"读—改—写"，宿主机上的编辑和服务端的落盘一旦重叠，
+  就会丢掉其中一次。最坏的情况是 `pending_enrollment` 令牌：服务端从不把它写回，
+  所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
+- **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
+  `[iroh] secret_key` 推导，宿主机上那份配置若缺这个键 —— 或者 `nexapipe`
+  是另一个提交编出来的 —— 生成的邀请码会指向一个没人在跑的端点。
+- **权限与属主会被改掉。** 从宿主机重写后，文件可能变成 `0644` 或换了属主：
+  持有凭据的配置随后会在启动时被拒绝，而且权限不恢复到 `0600`，reload 就无法
+  把 2FA 打开。
+
+挂载刻意是**可写**的：服务端要把 2FA 计数写回这个文件，挂成 `:ro` 会让锁定期
+失去持久化，并且每次尝试都打一条错误日志。
+
+用编辑器改没问题，前提是**原地保存**（`vim` 的默认行为，以及 shell 的 `>`
+重定向）。改什么都别假设生效了，去日志里确认一次：
+
+```bash
+docker compose logs -f --tail=50 nexapipe | grep -i reload
+# Detected config change, reloading...  →  Config reloaded: 3 routes now live
+# Config not reloaded, keeping the current routes: ... → 被拒绝，旧路由继续服务
+```
 
 ---
 
