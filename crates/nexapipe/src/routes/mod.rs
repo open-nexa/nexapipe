@@ -16,7 +16,10 @@ use tokio::sync::RwLock;
 /// every input go through here, so a config written with uppercase letters
 /// keeps working too.
 pub(crate) fn normalize_host(host: &str) -> String {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    // Every trailing dot, not just one: a name may arrive carrying more than
+    // the single dot of a fully-qualified spelling, and leaving one behind
+    // makes it a different string than the route it names.
+    let host = host.trim_end_matches('.');
     // An IPv6 literal is bracketed in a `Host` header — that is how its port is
     // told apart from the address — and may be written the same way in a
     // config. The brackets are not part of the name, so both sides lose them
@@ -98,6 +101,10 @@ pub(crate) fn host_pattern_error(pattern: &str) -> Option<String> {
         )),
     }
 }
+
+/// The most a path is allowed to add to [`Route::priority`], so that length
+/// breaks ties between two routes instead of deciding the winner outright.
+const PATH_LENGTH_TIE_BREAK: u32 = 99;
 
 /// The extra knobs only `tcp` / `udp` routes have.
 ///
@@ -219,20 +226,26 @@ impl Route {
         self.matches_host(host) && path_matches
     }
 
+    /// How specific this route is; `best_match` keeps the highest.
+    ///
+    /// Tiers, not a sum: each one is worth strictly more than everything below
+    /// it can add up to. They used to be one number, so a `path_pattern` longer
+    /// than 101 characters outweighed an exact host — a route written for `*`
+    /// with a long path outranked the route written for the host itself, and
+    /// nothing in the logs said so.
     pub fn priority(&self) -> u32 {
-        let mut priority = 0;
+        let host = u32::from(!self.host_pattern.starts_with('*'));
+        // Naming the ports it serves makes an L4 route more specific than one
+        // that takes every port for the same host. Without this tier,
+        // "port 443" and "any port" scored the same and the first one declared
+        // won for good, leaving the other route unreachable.
+        let ports = u32::from(self.l4.client_ports.is_some());
+        let path = u32::from(!self.path_is_prefix);
+        // Longest path wins between two otherwise equal routes, which is the
+        // point of a prefix match — but only as a tie-break, so it is capped.
+        let length = (self.path_pattern.len() as u32).min(PATH_LENGTH_TIE_BREAK);
 
-        if !self.host_pattern.starts_with('*') {
-            priority += 100;
-        }
-
-        if !self.path_is_prefix {
-            priority += 10;
-        }
-
-        priority += self.path_pattern.len() as u32;
-
-        priority
+        host * 10_000 + ports * 1_000 + path * 100 + length
     }
 
     pub fn host_pattern(&self) -> &str {
@@ -1299,6 +1312,96 @@ mod tests {
         // What the routing table is asked about, brackets dropped.
         assert_eq!(normalize_host(host_without_port("[::1]:8080")), "::1");
         assert_eq!(normalize_host("[::1]"), "::1");
+    }
+
+    /// A name may carry more than one trailing dot. Stripping a single one left
+    /// `a.example.com..` as `a.example.com.`, which is a different string than
+    /// the route it names.
+    #[test]
+    fn every_trailing_dot_is_dropped() {
+        assert_eq!(normalize_host("a.example.com"), "a.example.com");
+        assert_eq!(normalize_host("a.example.com."), "a.example.com");
+        assert_eq!(normalize_host("a.example.com.."), "a.example.com");
+        assert_eq!(normalize_host("A.Example.COM.."), "a.example.com");
+    }
+
+    /// The tiers: an exact host outranks a wildcard no matter how long the
+    /// wildcard's path is. They used to be one sum, so a path of 102 characters
+    /// outweighed the host.
+    #[test]
+    fn an_exact_host_beats_any_path_length() {
+        let long_path = "/".to_string() + &"x".repeat(200);
+        let exact = Route::new(
+            "api.example.com",
+            "/",
+            true,
+            vec!["a".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+        let wildcard_with_a_long_path = Route::new(
+            "*.example.com",
+            &long_path,
+            true,
+            vec!["b".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+
+        assert!(exact.priority() > wildcard_with_a_long_path.priority());
+    }
+
+    /// Two tcp routes for one host: the one that names its ports wins for those
+    /// ports, and the other one stays reachable for everything else. With no
+    /// tie-break the first declared won for good and the second never matched.
+    #[tokio::test]
+    async fn a_route_that_names_its_ports_wins_over_one_that_takes_them_all() {
+        let every_port = Route::new(
+            "ssh.example.com",
+            "/",
+            true,
+            vec!["fallback:22".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Tcp,
+            None,
+        );
+        // Declared second on purpose: declaration order must not decide it.
+        let only_443 = Route::new(
+            "ssh.example.com",
+            "/",
+            true,
+            vec!["tls-backend:443".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Tcp,
+            None,
+        )
+        .with_l4_options(L4Options {
+            client_ports: Some(vec![443]),
+            idle_timeout: None,
+        });
+
+        let config = RouteConfig::new(vec![every_port, only_443]);
+
+        assert_eq!(
+            config
+                .get_l4_backend("ssh.example.com", 443, RouteMode::Tcp)
+                .await
+                .expect("port 443 has a route")
+                .backend,
+            "tls-backend:443"
+        );
+        // The catch-all is not shadowed: a port it was the only answer for
+        // still reaches it.
+        assert_eq!(
+            config
+                .get_l4_backend("ssh.example.com", 22, RouteMode::Tcp)
+                .await
+                .expect("port 22 falls to the catch-all")
+                .backend,
+            "fallback:22"
+        );
     }
 
     /// The end-to-end shape of the same thing: a request for an IPv6 literal
