@@ -2,8 +2,9 @@
 //!
 //! These tests are about the config *loading* path, which is easy to break in a
 //! way the compiler accepts: when the `[auth]` table cannot be read, the server
-//! gets `None` and quietly runs with 2FA disabled, which is the worst possible
-//! outcome for a security feature.
+//! used to get `None` and quietly run with 2FA disabled, which is the worst
+//! possible outcome for a security feature. It refuses to start now, and the
+//! last test here pins that.
 
 use nexapipe::auth::OtpAuthUri;
 use nexapipe::config::ProxyConfig;
@@ -65,6 +66,56 @@ fn reports_a_broken_auth_section() {
     assert!(
         error.to_string().contains("auth config"),
         "unexpected error: {error:#}"
+    );
+}
+
+/// The same broken table stops the server instead of turning 2FA off.
+///
+/// Regression: the startup path logged the error and carried on with no 2FA at
+/// all, so `enable = true` and a broken section were the same deployment — one
+/// silently unauthenticated, the other only one line of log louder.
+#[test]
+fn a_broken_auth_section_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         mode = \"http\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [auth]\n\
+         enabled = \"not a boolean\"\n",
+    )
+    .unwrap();
+
+    let output = duct::cmd(
+        env!("CARGO_BIN_EXE_nexapipe"),
+        ["--config", path.to_str().unwrap()],
+    )
+    .stdin_null()
+    .stdout_capture()
+    .stderr_capture()
+    .unchecked()
+    .run()
+    .expect("run nexapipe");
+
+    // Both streams: the CLI prints through tracing, which decides on its own
+    // which one a refusal lands on.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "a server with a broken [auth] must not start:\n{text}"
+    );
+    assert!(
+        text.contains("auth config"),
+        "the refusal names the section that broke:\n{text}"
     );
 }
 

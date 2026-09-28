@@ -234,7 +234,18 @@ impl Route {
     /// with a long path outranked the route written for the host itself, and
     /// nothing in the logs said so.
     pub fn priority(&self) -> u32 {
-        let host = u32::from(!self.host_pattern.starts_with('*'));
+        // Three tiers, not two: the bare `*` matches everything, so it has to
+        // lose to a `*.suffix` wildcard, which loses to an exact name. Two
+        // tiers put the catch-all and a wildcard in the same one, and a tie
+        // goes to whichever was declared first — the declaration-order outcome
+        // this function exists to rule out.
+        let host = if self.host_pattern == "*" {
+            0
+        } else if self.host_pattern.starts_with('*') {
+            1
+        } else {
+            2
+        };
         // Naming the ports it serves makes an L4 route more specific than one
         // that takes every port for the same host. Without this tier,
         // "port 443" and "any port" scored the same and the first one declared
@@ -287,11 +298,17 @@ impl Route {
     /// them and the old pool is no longer the one traffic goes through, even
     /// though the route looks the same.
     pub async fn pool_key(&self) -> String {
+        // The strategy is part of what a pool *is*: a pool that hands requests
+        // out round-robin and one that picks at random are not the same object,
+        // and reusing the first for a route that now asks for the second makes
+        // an edit to the config do nothing — silently, and with nothing in the
+        // logs to suggest why.
         format!(
-            "{}|{}|{:?}|{:?}",
+            "{}|{}|{:?}|{:?}|{:?}",
             self.host_pattern,
             self.path_pattern,
             self.modes,
+            self.backend_pool.strategy(),
             self.backend_pool.backends().await
         )
     }
@@ -1257,6 +1274,26 @@ mod tests {
         );
     }
 
+    /// A pool is its backends *and* the way it picks between them, so a reload
+    /// that changes only the strategy has to be a new pool. Keyed without it,
+    /// the old pool was reused and the edit did nothing, with no log line to
+    /// say why the traffic still went out the same way.
+    #[tokio::test]
+    async fn changing_only_the_strategy_is_a_different_pool() {
+        let round_robin = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+        let random = Route::new(
+            "fn.iroh.iakl.top",
+            "/",
+            true,
+            vec!["http://10.0.0.5:8080".to_string()],
+            LoadBalancingStrategy::Random,
+            RouteMode::Http,
+            None,
+        );
+
+        assert_ne!(round_robin.pool_key().await, random.pool_key().await);
+    }
+
     /// The dot is what makes a wildcard a wildcard over *labels*. Without it
     /// the match is a bare `ends_with`, and a host that merely ends in the same
     /// letters — belonging to somebody else — is in.
@@ -1401,6 +1438,45 @@ mod tests {
                 .expect("port 22 falls to the catch-all")
                 .backend,
             "fallback:22"
+        );
+    }
+
+    /// A `*.suffix` wildcard is more specific than the bare `*`, so it wins in
+    /// either declaration order. Two tiers put them level and the winner was
+    /// whichever came first in the file — the thing tiers are for.
+    #[tokio::test]
+    async fn a_wildcard_host_beats_the_catch_all_in_either_order() {
+        let catch_all = http_route("*", &["http://10.0.0.1:8080"]);
+        let wildcard = http_route("*.example.com", &["http://10.0.0.2:8080"]);
+
+        let catch_all_first = RouteConfig::new(vec![catch_all.clone(), wildcard.clone()]);
+        assert_eq!(
+            catch_all_first
+                .get_backend("api.example.com", "/")
+                .await
+                .expect("the wildcard has a route")
+                .url,
+            "http://10.0.0.2:8080"
+        );
+
+        let wildcard_first = RouteConfig::new(vec![wildcard, catch_all]);
+        assert_eq!(
+            wildcard_first
+                .get_backend("api.example.com", "/")
+                .await
+                .expect("the wildcard has a route")
+                .url,
+            "http://10.0.0.2:8080"
+        );
+
+        // The catch-all is not shadowed: it still answers everything else.
+        assert_eq!(
+            wildcard_first
+                .get_backend("elsewhere.test", "/")
+                .await
+                .expect("the catch-all has a route")
+                .url,
+            "http://10.0.0.1:8080"
         );
     }
 

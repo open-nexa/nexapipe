@@ -248,21 +248,29 @@ async fn run_server_mode(
     // Load 2FA auth config
     let auth_config = match ProxyConfig::load_with_auth(config_path) {
         Ok((_, auth_cfg)) => {
+            // The secrets in here are the whole credential, so a permissive
+            // mode is fatal while they are live: every account on the host
+            // could authenticate as every client. So are the endpoint's
+            // secret key and a relay token, which is why a config carrying
+            // either is refused too even with `[auth]` off. One with none of
+            // them is a fixture of Docker deployments and only gets the
+            // warning.
+            //
+            // Outside the `[auth]` block below: the credentials that make a
+            // permissive mode fatal are not all in that section, so a file
+            // without one has to be checked as well — otherwise a config
+            // holding a secret key started unchallenged simply because 2FA
+            // was off.
+            let holds_credentials = auth_cfg.as_ref().is_some_and(|cfg| cfg.enabled)
+                || proxy_config.holds_credentials();
+            if let Err(e) =
+                nexapipe::config::check_config_permissions(config_path, holds_credentials)
+            {
+                tracing::error!("{}", e);
+                std::process::exit(1);
+            }
+
             if let Some(ref cfg) = auth_cfg {
-                // The secrets in here are the whole credential, so a permissive
-                // mode is fatal while they are live: every account on the host
-                // could authenticate as every client. So are the endpoint's
-                // secret key and a relay token, which is why a config carrying
-                // either is refused too even with `[auth]` off. One with none of
-                // them is a fixture of Docker deployments and only gets the
-                // warning.
-                let holds_credentials = cfg.enabled || proxy_config.holds_credentials();
-                if let Err(e) =
-                    nexapipe::config::check_config_permissions(config_path, holds_credentials)
-                {
-                    tracing::error!("{}", e);
-                    std::process::exit(1);
-                }
                 if cfg.enabled {
                     tracing::info!(
                         "2FA authentication enabled with {} clients",
@@ -274,9 +282,15 @@ async fn run_server_mode(
             }
             auth_cfg
         }
+        // Fatal, unlike the same error on a reload: by now the file has been
+        // read and the routes have been built, so the only thing left that can
+        // fail is `[auth]` itself — a misspelled key, an unknown one, an empty
+        // enrollment token. Degrading to "no 2FA" was the bug this whole
+        // section exists to close: `enable = true` used to be exactly as
+        // silent as a typo, and the only difference was one line of log.
         Err(e) => {
-            tracing::warn!("Failed to load auth config: {}", e);
-            None
+            tracing::error!("{}", e);
+            std::process::exit(1);
         }
     };
 

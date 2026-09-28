@@ -6,6 +6,7 @@ import android.util.Base64
 import android.util.Log
 import java.security.GeneralSecurityException
 import java.security.KeyStore
+import java.security.ProviderException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -62,6 +63,14 @@ class SecretStore {
      * own endpoint. Losing the ciphertext on such a device is a smaller
      * failure than losing the credential, and the file holding it is excluded
      * from backups either way.
+     *
+     * Every path that touches the keystore also catches [ProviderException] and
+     * [IllegalStateException], neither of which is a [GeneralSecurityException]:
+     * they are how AndroidKeyStore reports a Keymaster that cannot be reached,
+     * a key it cannot use or a keystore that is not unlocked yet. Left to
+     * escape, one of them turns a device with a broken keystore into a crash at
+     * startup — `SettingsManager.init` seals on its migration path — instead of
+     * the plaintext fallback this class exists to provide.
      */
     fun seal(plain: String): String {
         if (plain.isEmpty()) return plain
@@ -78,6 +87,12 @@ class SecretStore {
             MARKER + Base64.encodeToString(nonce + body, Base64.NO_WRAP)
         } catch (e: GeneralSecurityException) {
             Log.e(TAG, "Could not seal a credential, storing it in plaintext", e)
+            plain
+        } catch (e: ProviderException) {
+            Log.e(TAG, "The keystore failed, storing a credential in plaintext", e)
+            plain
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "The keystore is not ready, storing a credential in plaintext", e)
             plain
         }
     }
@@ -116,6 +131,12 @@ class SecretStore {
         } catch (e: GeneralSecurityException) {
             Log.w(TAG, "Could not unseal a credential, treating it as unset")
             ""
+        } catch (e: ProviderException) {
+            Log.w(TAG, "The keystore failed, treating a credential as unset", e)
+            ""
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "The keystore is not ready, treating a credential as unset", e)
+            ""
         }
     }
 
@@ -126,6 +147,12 @@ class SecretStore {
             store.getKey(ALIAS, null) as? SecretKey
         } catch (e: GeneralSecurityException) {
             Log.w(TAG, "The credential key could not be loaded", e)
+            null
+        } catch (e: ProviderException) {
+            Log.w(TAG, "The keystore failed while loading the credential key", e)
+            null
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "The keystore is not ready, the credential key is unavailable", e)
             null
         } ?: generate()
         cachedKey = resolved
@@ -151,6 +178,12 @@ class SecretStore {
         }
     } catch (e: GeneralSecurityException) {
         Log.e(TAG, "Could not create the credential key", e)
+        null
+    } catch (e: ProviderException) {
+        Log.e(TAG, "The keystore failed while creating the credential key", e)
+        null
+    } catch (e: IllegalStateException) {
+        Log.e(TAG, "The keystore is not ready, the credential key was not created", e)
         null
     }
 }

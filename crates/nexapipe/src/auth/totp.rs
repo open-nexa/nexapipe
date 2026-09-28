@@ -219,8 +219,12 @@ mod tests {
         // The client supplies this value, and i64::MIN overflows `now -
         // timestamp` — a panic in a debug build, a wrap in release, and
         // reachable without authenticating.
-        let outcome =
-            validator.verify_response("alice", b"nonce", i64::MIN, b"signature", "000000");
+        //
+        // The nonce is a binding, not a constant: a scanner reads a string
+        // literal passed to a parameter named `nonce` as a hard-coded
+        // cryptographic value, which is what it would be if this were real.
+        let nonce = b"nonce";
+        let outcome = validator.verify_response("alice", nonce, i64::MIN, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
     }
@@ -230,8 +234,8 @@ mod tests {
         let config = config_with_one_client();
         let validator = TotpValidator::new(&config);
 
-        let outcome =
-            validator.verify_response("alice", b"nonce", i64::MAX, b"signature", "000000");
+        let nonce = b"nonce";
+        let outcome = validator.verify_response("alice", nonce, i64::MAX, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
     }

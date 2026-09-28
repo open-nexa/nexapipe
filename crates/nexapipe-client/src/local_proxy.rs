@@ -367,7 +367,10 @@ pub(crate) async fn open_stream_with_retry(
                     e
                 );
                 last_err = Some(anyhow::anyhow!(e).into());
-                drop(pooled_conn);
+                // Closed rather than dropped: another handle is held by the
+                // path watcher, so dropping this one would leave the
+                // connection open until that task got around to it.
+                pooled_conn.discard(b"the connection could not open a stream");
                 continue;
             }
             Err(_) => {
@@ -382,7 +385,7 @@ pub(crate) async fn open_stream_with_retry(
                 // same treatment rather than ending the loop on the first
                 // attempt.
                 last_err = Some(ClientError::TimeoutError);
-                drop(pooled_conn);
+                pooled_conn.discard(b"the connection never opened a stream");
                 continue;
             }
         };
@@ -399,7 +402,7 @@ pub(crate) async fn open_stream_with_retry(
             last_err = Some(e.into());
             // Same reasoning as the `open_bi` failures: a connection that
             // could not take the first bytes is not one to hand back.
-            drop(pooled_conn);
+            pooled_conn.discard(b"the connection would not take the first bytes");
             continue;
         }
 
@@ -412,6 +415,23 @@ pub(crate) async fn open_stream_with_retry(
             host, OPEN_ATTEMPTS
         ))
     }))
+}
+
+/// Ends the tasks it holds when it is dropped.
+///
+/// Dropping a `JoinHandle` detaches its task instead of cancelling it, so a
+/// handler that spawns the two halves of a tunnel and is then aborted by
+/// [`LocalProxy::stop`] used to leave both halves running: still holding the
+/// client socket and the pooled connection the stop was meant to release.
+/// The guard dies with the aborted future, and what it does is immediate.
+struct TunnelTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for TunnelTasks {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 pub(crate) async fn handle_local_connection<S>(
@@ -617,6 +637,15 @@ where
             }
         });
 
+        // Lives until this handler returns, and dies with it if it is aborted
+        // first — which is the only moment that matters: `stop()` cancels the
+        // task running this function, and the two halves above have to go with
+        // it or the tunnel outlives the proxy it belongs to.
+        let _tasks = TunnelTasks(vec![
+            client_task.abort_handle(),
+            backend_task.abort_handle(),
+        ]);
+
         tokio::select! {
             _ = &mut client_task => (),
             _ = &mut backend_task => (),
@@ -798,6 +827,12 @@ where
 
                 let mut client_task = tokio::spawn(client_to_iroh);
                 let mut backend_task = tokio::spawn(iroh_to_client);
+                // See the CONNECT branch: this dies with the handler, and with
+                // it both halves of the WebSocket tunnel.
+                let _tasks = TunnelTasks(vec![
+                    client_task.abort_handle(),
+                    backend_task.abort_handle(),
+                ]);
 
                 let (closed_direction, close_reason) = tokio::select! {
                     result = &mut client_task => {
@@ -932,6 +967,12 @@ where
     );
     let client_task = tokio::spawn(client_to_backend);
     let mut backend_task = tokio::spawn(backend_to_client);
+    // See the CONNECT branch: the client half is aborted below on the normal
+    // path, and both go when the proxy is stopped mid-request.
+    let _tasks = TunnelTasks(vec![
+        client_task.abort_handle(),
+        backend_task.abort_handle(),
+    ]);
 
     // Wait for the backend response to be fully relayed back to the client
     // (bounded for streaming/long-lived responses). We must NOT wait for the

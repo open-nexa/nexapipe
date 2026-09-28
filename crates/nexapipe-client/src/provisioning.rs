@@ -1228,16 +1228,32 @@ mod tests {
     fn debug_never_prints_the_secret() {
         let totp = InviteTotp::new("client-001", "jbswy3dpehpk3pxp").unwrap();
         let printed = format!("{totp:?}");
-        assert!(!printed.contains("JBSWY3DPEHPK3PXP"), "{printed}");
-        assert!(printed.contains("***"), "{printed}");
+        // Static messages, not `{printed}`: an assertion message is a log sink
+        // to a scanner, and one that prints the Debug output taints the secret
+        // straight into it — even though what it would print is already
+        // redacted, which taint tracking cannot see.
+        assert!(
+            !printed.contains("JBSWY3DPEHPK3PXP"),
+            "the secret must not appear in Debug output"
+        );
+        assert!(
+            printed.contains("***"),
+            "the redaction marker must appear in Debug output"
+        );
     }
 
     #[test]
     fn debug_never_prints_the_enrollment_token() {
         let enrollment = InviteEnrollment::new("client-001", "tok-abc").unwrap();
         let printed = format!("{enrollment:?}");
-        assert!(!printed.contains("tok-abc"), "{printed}");
-        assert!(printed.contains("***"), "{printed}");
+        assert!(
+            !printed.contains("tok-abc"),
+            "the token must not appear in Debug output"
+        );
+        assert!(
+            printed.contains("***"),
+            "the redaction marker must appear in Debug output"
+        );
     }
 
     /// The whole invite carries whichever of the two it was given, so its own

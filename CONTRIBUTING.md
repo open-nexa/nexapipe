@@ -84,18 +84,20 @@ Other house rules:
 Bounded, real, and each one is useful on its own. Comments welcome before you
 start — say which one you are taking.
 
-**1. Strip hop-by-hop headers when forwarding** — the request-header loop in
-`proxy_to_backend_streaming` (`crates/nexapipe/src/http/mod.rs`) copies every
-header the client sent, so `Connection`, `Transfer-Encoding`, `Upgrade` and the
-rest of the RFC 7230 §6.1 set reach the backend, and `expect: 100-continue` is
-passed through although nothing here ever answers a `100`. Drop that set and
-decide what to do with `expect`. *Medium, and the RFC is the whole spec.*
+**1. Drop the hop-by-hop headers a `Connection` header names** —
+`forwards_request_header` (`crates/nexapipe/src/http/mod.rs`) drops the fixed
+RFC 7230 §6.1 set, which is half of what the RFC asks for: a request that says
+`Connection: x-trace` also makes `x-trace` hop-by-hop, and that one is still
+forwarded. Parse the `Connection` value and drop what it names, on the way out
+as well as on the fixed set. *Small, and the RFC is the whole spec.*
 
-**2. Per-client authorization** — an authenticated client can reach every route.
-Add an optional `allow_hosts` per client and enforce it in the HTTP lookup
-(`crates/nexapipe/src/routes/`) and the L4 lookup
-(`crates/nexapipe/src/l4/mod.rs`). It does not need to become a full ACL engine;
-"different people reach different backends" is enough. *Medium.*
+**2. Refuse a DNS compression pointer that points forward** — `parse_dns_query`
+in `crates/nexapipe-client/src/tun_proxy.rs` (and its twin in
+`ui-desktop/src-tauri/src/proxy/dns.rs`) follows a `0xC0` pointer to any offset
+in the packet that is in range and does not loop. RFC 1035 §4.1.4 only allows a
+pointer to an *earlier* name, and a question pointing forward can name a domain
+that is not there at all. Refuse it the way an out-of-range pointer is already
+refused. *Small; the two copies have to stay in step.*
 
 **3. Per-device credentials** — 2FA is one symmetric secret shared by every
 device enrolled under a `client_id`, so a single device cannot be revoked and

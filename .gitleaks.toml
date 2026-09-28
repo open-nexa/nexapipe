@@ -1,9 +1,15 @@
 # Gitleaks configuration.
 #
-# The rules are gitleaks' defaults: this file exists only to name the findings
-# that are fixtures rather than credentials, so the scan can run as a gate
-# instead of an advisory. Anything not named here still fails the job.
+# Gitleaks finds this file on its own — the action passes no `--config` — and
+# a config that is given replaces the built-in rules. `[extend]` below is what
+# keeps them: without it this file was the whole of the rule set, and since it
+# only names allow-listed findings, the scan ran no rules at all and could not
+# have failed. Then, and only then, the allowlist is what turns the scan into a
+# gate: anything not named here fails the job.
 title = "NexaPipe"
+
+[extend]
+useDefault = true
 
 [allowlist]
 description = "Test fixtures that look like credentials"

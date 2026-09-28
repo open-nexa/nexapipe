@@ -43,6 +43,17 @@ impl PooledConnection {
         &self.conn
     }
 
+    /// Closes the connection instead of just letting go of it.
+    ///
+    /// Dropping one handle does not close a connection: it closes when the
+    /// last one goes, and a path watcher holds one for as long as it lives, so
+    /// a caller that has decided the connection is dead has to say so or it
+    /// stays open — still in the pool's address space, still counted, and
+    /// still handed to whatever asks next.
+    pub fn discard(self, reason: &'static [u8]) {
+        self.conn.close(0u32.into(), reason);
+    }
+
     pub fn pool_index(&self) -> usize {
         self.pool_index
     }

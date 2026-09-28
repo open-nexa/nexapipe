@@ -8,6 +8,7 @@ use ::http::Request;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod allow_list;
@@ -821,6 +822,14 @@ fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
 ///
 /// The lock is still held across the await, so this does not change who can
 /// write when — only who waits for the disk.
+///
+/// Detached, and gated by [`config_write_gate`] rather than by the auth lock
+/// alone: the caller is bounded by a deadline, and a deadline that fires while
+/// a write is on the disk drops not only the result but the lock the write was
+/// running under — while the write itself keeps going, because a blocking task
+/// cannot be un-spawned. Two writes to one file then overlap and one of them
+/// is lost. The gate is taken *inside* the detached task, so it is held for as
+/// long as the write takes and not for as long as the caller is patient.
 async fn blocking_config_write<T, F>(path: String, write: F) -> anyhow::Result<T>
 where
     F: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
@@ -828,9 +837,31 @@ where
 {
     // Named apart from the `path` the closure takes, which it moves.
     let failed_path = path.clone();
-    tokio::task::spawn_blocking(move || write(&path))
+    let (done, wait) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let _gate = config_write_gate().lock().await;
+        let result = tokio::task::spawn_blocking(move || write(&path)).await;
+        // A caller that timed out is not an error worth reporting: the write
+        // it asked for has happened, which is what the gate is for.
+        let _ = done.send(result);
+    });
+
+    let result = wait
         .await
-        .map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
+        .map_err(|_| anyhow::anyhow!("the write to {failed_path} was abandoned"))?;
+    result.map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
+}
+
+/// Serialises writes to the config file, independently of the caller.
+///
+/// A `static` because it has to outlive the task that asked for the write: the
+/// auth lock is released when a handshake is cancelled, and this is what keeps
+/// that cancellation from letting the next write start on top of a running
+/// one.
+fn config_write_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Writes one length-prefixed AUTH_* message.
@@ -1397,8 +1428,47 @@ pub async fn handle_incoming(
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrollmentVerdict, constant_time_eq, enrollment_verdict, find_headers_end};
+    use super::{
+        EnrollmentVerdict, blocking_config_write, constant_time_eq, enrollment_verdict,
+        find_headers_end,
+    };
     use crate::auth::{AuthConfig, ClientAuth};
+
+    /// A write whose caller gave up still happens, and happens *first*.
+    ///
+    /// The abandoned write is slow on purpose, so the only way the second one
+    /// can end up last in the file is for it to have waited: without the gate
+    /// the two overlap and whichever reaches the disk last wins, which is a
+    /// lockout counter or an issued secret quietly disappearing.
+    #[tokio::test]
+    async fn an_abandoned_write_still_lands_before_the_next_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "start\n").expect("seed the file");
+        let slow_path = path.to_string_lossy().into_owned();
+        let fast_path = slow_path.clone();
+
+        let abandoned = tokio::spawn(async move {
+            let _ = blocking_config_write(slow_path, |path| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(path, "slow\n").map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .await;
+        });
+
+        // Give it a start, then walk away the way a cancelled handshake does.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        abandoned.abort();
+
+        blocking_config_write(fast_path, |path| {
+            std::fs::write(path, "fast\n").map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .await
+        .expect("the second write runs");
+
+        let on_disk = std::fs::read_to_string(&path).expect("read the file");
+        assert_eq!(on_disk, "fast\n", "the slow write was ordered before it");
+    }
 
     /// The marker only ever appears once a read has brought in its last byte,
     /// and the scan starts where the previous read left off — three bytes back,

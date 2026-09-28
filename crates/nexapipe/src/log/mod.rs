@@ -15,8 +15,8 @@ use chrono::Local;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use tracing_subscriber::EnvFilter;
@@ -540,14 +540,28 @@ enum AccessTarget {
 ///
 /// Started with the first line rather than at `init`, so a proxy that never
 /// logs an access line never starts the thread.
-static ACCESS_WRITER: OnceLock<Sender<(FileSink, String)>> = OnceLock::new();
+static ACCESS_WRITER: OnceLock<SyncSender<(FileSink, String)>> = OnceLock::new();
+
+/// How many lines may be waiting for the writer thread.
+///
+/// Bounded because the queue is fed by request handlers and drained by one
+/// thread doing a write and a flush per line: unbounded, a disk slower than
+/// the traffic makes the queue the place memory goes, and the proxy dies of
+/// that long before it dies of the disk. A line refused here is dropped and
+/// counted — an access log that skips is worth more than an OOM.
+const ACCESS_LOG_QUEUE: usize = 4096;
+
+/// Lines dropped because the queue was full, and a warning every so often so
+/// the gap is visible instead of being something someone notices in the file.
+static DROPPED_ACCESS_LINES: AtomicU64 = AtomicU64::new(0);
+const DROPPED_LINES_PER_WARNING: u64 = 100;
 
 /// `None` when the writer thread could not be started, which the caller treats
 /// as "write it here instead": failing to spawn a thread must not lose the
 /// line, any more than failing to open the file must.
-fn access_writer() -> Option<&'static Sender<(FileSink, String)>> {
+fn access_writer() -> Option<&'static SyncSender<(FileSink, String)>> {
     if ACCESS_WRITER.get().is_none() {
-        let (sender, receiver) = channel::<(FileSink, String)>();
+        let (sender, receiver) = sync_channel::<(FileSink, String)>(ACCESS_LOG_QUEUE);
         match std::thread::Builder::new()
             .name("nexapipe-access-log".to_string())
             .spawn(move || {
@@ -690,11 +704,25 @@ pub fn log_access(
             // wait for the disk; a line is written within a millisecond of
             // being queued, so what can be lost is what the last one did.
             AccessTarget::File(sink) => match access_writer() {
-                Some(writer) => {
-                    if writer.send((sink, line)).is_err() {
+                Some(writer) => match writer.try_send((sink, line)) {
+                    Ok(()) => {}
+                    // The disk is behind the traffic. Waiting would put the
+                    // delay on the request that happened to be logging, which
+                    // is the thing the writer thread exists to prevent, so the
+                    // line goes and the count stands in for it.
+                    Err(TrySendError::Full(_)) => {
+                        let dropped = DROPPED_ACCESS_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if dropped.is_multiple_of(DROPPED_LINES_PER_WARNING) {
+                            tracing::warn!(
+                                "Access log: {} lines dropped, the writer cannot keep up",
+                                dropped
+                            );
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
                         eprintln!("nexapipe: access log writer is gone");
                     }
-                }
+                },
                 None => sink.write_line(&line),
             },
         }

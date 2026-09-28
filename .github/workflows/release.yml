@@ -388,7 +388,7 @@ jobs:
           cache-dependency-path: ui-desktop/package-lock.json
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           targets: ${{ matrix.target }}
 
@@ -703,7 +703,7 @@ jobs:
 
       - name: Set up Rust toolchain
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           targets: ${{ env.TARGET_TRIPLE }}
 

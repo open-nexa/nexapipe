@@ -126,7 +126,11 @@ async fn open(
                 // like. Handing it back would put it straight on top of the
                 // pool (it is last-in-first-out), so every remaining attempt
                 // would ask the same dead connection.
-                drop(pooled);
+                //
+                // Closed, not dropped: a watcher task holds another handle to
+                // it, so dropping this one would leave the connection open
+                // until that task noticed — holding a slot in the meantime.
+                pooled.discard(b"the server never answered the preface");
                 last_err = Some(e);
             }
         }

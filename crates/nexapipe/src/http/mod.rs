@@ -400,6 +400,16 @@ pub async fn proxy_to_backend_streaming(
 
     let mut builder = Request::builder().method(req.method()).uri(new_uri);
 
+    // A chunked body is sent as one buffer with a length of our own, so only a
+    // request whose `content-length` we could not read takes that path. One we
+    // could read is forwarded with the header it arrived with.
+    let declared_length = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let chunked = declared_length.is_none() && request_is_chunked(req);
+
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
         // routing works. The body below is read whole and sent as one buffer,
@@ -407,16 +417,18 @@ pub async fn proxy_to_backend_streaming(
         if !forwards_request_header(name.as_str()) {
             continue;
         }
+        // Dropped rather than overwritten: a second `content-length` on one
+        // request is what lets a proxy and a backend disagree about where the
+        // body ends, and an unreadable one is exactly the case that survives
+        // the filter above.
+        if chunked && name == "content-length" {
+            continue;
+        }
         builder = builder.header(name, value);
     }
 
     let mut full_body = body_data;
-    if let Some(content_length) = req
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-    {
+    if let Some(content_length) = declared_length {
         // Checked before the body is read, not after: `content_length` is the
         // size of the buffer this is about to fill.
         if content_length > MAX_REQUEST_BODY {
@@ -425,7 +437,7 @@ pub async fn proxy_to_backend_streaming(
             ));
         }
         read_remaining_request_body(recv, &mut full_body, content_length).await?;
-    } else if request_is_chunked(req) {
+    } else if chunked {
         // A chunked body declares no length, so without this branch the request
         // went out carrying only the bytes that happened to arrive with the
         // head — and `transfer-encoding` is not forwarded, so the backend was
@@ -548,6 +560,13 @@ pub async fn proxy_to_backend_streaming(
 /// CRLF from growing this buffer without bound.
 const MAX_CHUNK_HEADER: usize = 1024;
 
+/// How long the body may go without the peer sending anything.
+///
+/// An idle timeout, not a total one: it is rearmed on every read, so a large
+/// upload that trickles for minutes is fine while a stream that opens the
+/// request and then stops — holding a connection slot on the way — is not.
+const REQUEST_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How many bytes of a chunked body `input` decodes on its own.
 ///
 /// Returns the decoded bytes, how much of `input` was used up, and whether the
@@ -561,6 +580,15 @@ fn decode_chunks(input: &[u8], limit: usize) -> Result<(Vec<u8>, usize, bool), a
 
     loop {
         let Some(rel) = input[pos..].windows(2).position(|w| w == b"\r\n") else {
+            // Still waiting for the line, which is normal while the header is
+            // arriving — but only for so long. Without this the caller keeps
+            // appending every read to its buffer, and a peer that never sends
+            // a CRLF grows it without bound.
+            if input.len() - pos > MAX_CHUNK_HEADER {
+                return Err(anyhow::anyhow!(
+                    "chunk header longer than {MAX_CHUNK_HEADER} bytes"
+                ));
+            }
             return Ok((out, used, false));
         };
         if rel > MAX_CHUNK_HEADER {
@@ -587,12 +615,20 @@ fn decode_chunks(input: &[u8], limit: usize) -> Result<(Vec<u8>, usize, bool), a
             ));
         }
 
-        if out.len() + size > limit {
+        // Neither check may add: `size` comes from the client and
+        // `usize::from_str_radix` accepts values near `usize::MAX`, so
+        // `out.len() + size` and `size + 2` overflow — a panic in a debug
+        // build, and in release a bound that wraps and then lets the slice
+        // below run off the end.
+        if size > limit || out.len() > limit - size {
             return Err(anyhow::anyhow!(
                 "chunked request body is over the {limit} byte limit"
             ));
         }
-        if input.len() - after_header < size + 2 {
+        // What is left after the header, so "is there a whole chunk here" is a
+        // subtraction of two lengths instead of an addition that can wrap.
+        let remaining = input.len() - after_header;
+        if remaining < size || remaining - size < 2 {
             return Ok((out, used, false));
         }
 
@@ -639,14 +675,20 @@ async fn read_chunked_request_body(
             return Ok(());
         }
 
-        let n = recv
-            .read(&mut buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                anyhow::anyhow!("chunked request body ended before its terminating chunk")
-            })?;
+        let read = match tokio::time::timeout(REQUEST_BODY_READ_TIMEOUT, recv.read(&mut buf)).await
+        {
+            Ok(result) => result
+                .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "chunked request body went {}s without sending anything",
+                    REQUEST_BODY_READ_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let n = read.filter(|n| *n > 0).ok_or_else(|| {
+            anyhow::anyhow!("chunked request body ended before its terminating chunk")
+        })?;
         pending.extend_from_slice(&buf[..n]);
     }
 }
@@ -861,6 +903,36 @@ mod tests {
         let raw = chunked(&["hello"]);
         let err = decode_chunks(&raw, 4).unwrap_err();
         assert!(err.to_string().contains("over the 4 byte limit"));
+    }
+
+    #[test]
+    fn a_chunk_size_that_would_overflow_is_refused() {
+        // `usize::MAX`, spelled as a chunk size: the old `out.len() + size`
+        // wrapped to a small number in release and panicked in debug, so the
+        // limit looked satisfied and the slice below ran off the end.
+        let err = decode_chunks(b"ffffffffffffffff\r\nhello\r\n", 1024).unwrap_err();
+        assert!(err.to_string().contains("over the 1024 byte limit"));
+
+        // Same for the `size + 2` that checked for the trailing CRLF.
+        let err = decode_chunks(b"ffffffffffffffff\r\nhello", 1024).unwrap_err();
+        assert!(err.to_string().contains("over the 1024 byte limit"));
+    }
+
+    #[test]
+    fn a_chunk_header_that_never_ends_is_refused() {
+        // No CRLF anywhere, so the caller would keep buffering: a peer that
+        // sends a header and never terminates it grows it without bound.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&b"5;".repeat(MAX_CHUNK_HEADER));
+        let err = decode_chunks(&raw, 1024).unwrap_err();
+        assert!(err.to_string().contains("chunk header longer than"));
+
+        // A short header that is still arriving is fine — it is not an error
+        // to be waiting for the rest of one.
+        let (body, used, complete) = decode_chunks(b"5\r", 1024).unwrap();
+        assert!(body.is_empty());
+        assert_eq!(used, 0);
+        assert!(!complete);
     }
 
     #[test]
