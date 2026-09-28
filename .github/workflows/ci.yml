@@ -204,14 +204,14 @@ jobs:
       # Free for public repositories. If a repo ever becomes private, add
       # GITLEAKS_LICENSE (orgs need a paid licence) as a secret.
       #
-      # Advisory on purpose: gitleaks scans the whole history, so anything
-      # already committed (a stray keystore.properties, a 2FA seed in a test
-      # fixture) would turn every future PR red. Run it once, clean up whatever
-      # it reports, then drop continue-on-error.
+      # Scans the whole history, so a finding cannot be undone by deleting the
+      # line: it has to be named in `.gitleaks.toml` instead. That file lists
+      # the test fixtures that look like credentials and nothing else, which is
+      # what lets this run as a gate.
       - uses: gitleaks/gitleaks-action@v3
-        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   dependency-review:
     name: dependency review

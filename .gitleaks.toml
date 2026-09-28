@@ -1,0 +1,17 @@
+# Gitleaks configuration.
+#
+# The rules are gitleaks' defaults: this file exists only to name the findings
+# that are fixtures rather than credentials, so the scan can run as a gate
+# instead of an advisory. Anything not named here still fails the job.
+title = "NexaPipe"
+
+[allowlist]
+description = "Test fixtures that look like credentials"
+
+regexes = [
+    # `token_comparison_only_accepts_an_exact_match`
+    # (crates/nexapipe/src/conn/mod.rs) feeds a constant to the constant-time
+    # comparison and asserts on the boundaries. The constant has to be a real
+    # string of bytes, and calling it a secret is the point of the test.
+    '''^0123456789abcdef$''',
+]
