@@ -3,6 +3,7 @@ package com.nexa.pipe
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import androidx.core.content.edit
 import com.nexa.pipe.ui.NodeConfig
 import com.nexa.pipe.ui.NodeTwoFactor
 import kotlinx.serialization.encodeToString
@@ -17,9 +18,14 @@ class SettingsManager(context: Context) {
     // and kept here under its own endpoint ID instead.
     private val secretPrefs: SharedPreferences = context.getSharedPreferences("NexaPipeSecrets", Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
+    // Every credential written to `secretPrefs` goes through this, so the file
+    // holds ciphertext even though it is a plain preferences file.
+    private val secrets = SecretStore()
 
     init {
         migrateLegacyTwoFactor()
+        migrateRelayAuthToken()
+        migrateSecretsAtRest()
     }
 
     companion object {
@@ -28,6 +34,11 @@ class SettingsManager(context: Context) {
         const val KEY_NODES = "nodes"
         const val KEY_RELAY_MODE = "relay_mode"
         const val KEY_RELAY_URL = "relay_url"
+        // The relay bearer token. Kept in `secretPrefs`, not `prefs`: the relay
+        // is handed it verbatim, so it is a credential like the TOTP seeds, and
+        // only the secrets file is excluded from cloud backup and device
+        // transfer. Left in `prefs` it rode the very backup that is careful not
+        // to take the seeds.
         const val KEY_RELAY_AUTH_TOKEN = "relay_auth_token"
         // Prefix of the per-endpoint secret entries in `secretPrefs`.
         const val SECRET_PREFIX = "two_factor_secret_"
@@ -168,7 +179,7 @@ class SettingsManager(context: Context) {
                 if (enrollment.token.isBlank()) {
                     null
                 } else {
-                    editor.putString(ENROLLMENT_PREFIX + node.nodeId, enrollment.token)
+                    editor.putString(ENROLLMENT_PREFIX + node.nodeId, secrets.seal(enrollment.token))
                     node.copy(enrollment = enrollment.copy(token = ""))
                 }
             } ?: node
@@ -176,7 +187,7 @@ class SettingsManager(context: Context) {
             if (otp == null || otp.secret.isBlank()) {
                 stripped
             } else {
-                editor.putString(SECRET_PREFIX + node.nodeId, otp.secret)
+                editor.putString(SECRET_PREFIX + node.nodeId, secrets.seal(otp.secret))
                 stripped.copy(twoFactor = otp.copy(secret = ""))
             }
         }
@@ -190,14 +201,86 @@ class SettingsManager(context: Context) {
         if (stored.isEmpty()) return stored
         return stored.map { node ->
             val withToken = node.enrollment?.let { enrollment ->
-                val token = secretPrefs.getString(ENROLLMENT_PREFIX + node.nodeId, "") ?: ""
+                val token = secrets.unseal(secretPrefs.getString(ENROLLMENT_PREFIX + node.nodeId, ""))
                 node.copy(enrollment = enrollment.copy(token = token))
             } ?: node
             val otp = withToken.twoFactor ?: return@map withToken
-            val secret = secretPrefs.getString(SECRET_PREFIX + node.nodeId, "") ?: ""
+            val secret = secrets.unseal(secretPrefs.getString(SECRET_PREFIX + node.nodeId, ""))
             withToken.copy(twoFactor = otp.copy(secret = secret))
         }
     }
+
+    /**
+     * Moves a relay token that an older version wrote to [prefs] into
+     * [secretPrefs].
+     *
+     * Runs on every start but only does anything once: the key is removed from
+     * [prefs] whether or not the token is worth keeping, so a blank one — the
+     * value saved whenever a relay needs no token — does not leave the file
+     * marked as holding a credential.
+     */
+    private fun migrateRelayAuthToken() {
+        if (!prefs.contains(KEY_RELAY_AUTH_TOKEN)) {
+            return
+        }
+        val token = prefs.getString(KEY_RELAY_AUTH_TOKEN, "") ?: ""
+        prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
+        if (token.isBlank()) {
+            return
+        }
+        secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(token)) }
+        Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
+    }
+
+    /**
+     * Encrypts the credentials older versions left in [secretPrefs] as
+     * plaintext.
+     *
+     * Not required for correctness — [loadNodes] reads plaintext values too —
+     * but it is what takes the plaintext off the disk, and without it a
+     * credential nobody has edited since would stay readable forever.
+     *
+     * Each value is sealed and read back before it is written, so one that
+     * cannot be opened keeps its plaintext instead of becoming an
+     * undecryptable blob. A value that could not be sealed at all is left
+     * alone, and this runs again on the next start.
+     */
+    private fun migrateSecretsAtRest() {
+        val keys = secretPrefs.all.keys.toList()
+        if (keys.isEmpty()) return
+        val editor = secretPrefs.edit()
+        var sealed = 0
+        for (key in keys) {
+            if (!isCredentialKey(key)) continue
+            val plain = secretPrefs.getString(key, "") ?: ""
+            if (plain.isEmpty() || plain.startsWith(SecretStore.MARKER)) continue
+            val written = secrets.seal(plain)
+            // `seal` hands the value back untouched when it has no key, so
+            // this is both the "nothing was encrypted" and the "no key" case.
+            if (written == plain) continue
+            if (secrets.unseal(written) != plain) {
+                Log.e(TAG, "Left $key in plaintext: the sealed value did not read back")
+                continue
+            }
+            editor.putString(key, written)
+            sealed++
+        }
+        if (sealed > 0) {
+            editor.apply()
+            Log.i(TAG, "Encrypted $sealed stored credential(s)")
+        }
+    }
+
+    /**
+     * Whether [key] names a credential in [secretPrefs].
+     *
+     * The file also holds non-credentials — the migration flag, for one — and
+     * those must stay readable as they are.
+     */
+    private fun isCredentialKey(key: String): Boolean =
+        key == KEY_RELAY_AUTH_TOKEN ||
+            key.startsWith(SECRET_PREFIX) ||
+            key.startsWith(ENROLLMENT_PREFIX)
 
     private fun decodeNodes(): List<NodeConfig> {
         val jsonStr = prefs.getString(KEY_NODES, "")
@@ -214,11 +297,17 @@ class SettingsManager(context: Context) {
 
     /** Saves the relay configuration. */
     fun saveRelayConfig(relayMode: String, relayUrl: String, authToken: String) {
-        prefs.edit()
-            .putString(KEY_RELAY_MODE, relayMode)
-            .putString(KEY_RELAY_URL, relayUrl)
-            .putString(KEY_RELAY_AUTH_TOKEN, authToken)
-            .apply()
+        prefs.edit {
+            putString(KEY_RELAY_MODE, relayMode)
+            putString(KEY_RELAY_URL, relayUrl)
+        }
+        // The token is written to the secrets file, and dropped rather than
+        // stored blank, for the reasons given at [KEY_RELAY_AUTH_TOKEN].
+        if (authToken.isBlank()) {
+            secretPrefs.edit { remove(KEY_RELAY_AUTH_TOKEN) }
+        } else {
+            secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(authToken)) }
+        }
     }
 
     /** Loads the relay mode; defaults to "pinned" (pinned to aps1-1). */
@@ -233,6 +322,6 @@ class SettingsManager(context: Context) {
 
     /** Loads the bearer token for the custom relay, if it needs one. */
     fun loadRelayAuthToken(): String {
-        return prefs.getString(KEY_RELAY_AUTH_TOKEN, "") ?: ""
+        return secrets.unseal(secretPrefs.getString(KEY_RELAY_AUTH_TOKEN, ""))
     }
 }
