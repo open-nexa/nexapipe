@@ -364,21 +364,31 @@ where
 
     let client_to_backend = async {
         let mut buf = vec![0u8; 4096];
+        // A cursor into `pending`, compacted once per read rather than after
+        // every frame: draining moves every byte behind a frame down, so a
+        // segment carrying N datagrams cost N memmoves over the whole tail.
+        let mut offset = 0usize;
+
         loop {
             // Drain every complete frame before reading again: one segment can carry
             // several datagrams, and the bytes left over from the preface may already
             // hold one.
             loop {
-                match decode_frame(&pending) {
+                match decode_frame(&pending[offset..]) {
                     Frame::Incomplete => break,
                     Frame::Ready { payload, consumed } => {
                         if let Err(e) = socket_up.send(payload).await {
                             tracing::debug!("L4 UDP: backend send failed: {}", e);
                             return;
                         }
-                        pending.drain(..consumed);
+                        offset += consumed;
                     }
                 }
+            }
+
+            if offset > 0 {
+                pending.drain(..offset);
+                offset = 0;
             }
 
             match tokio::time::timeout(idle, reader.read(&mut buf)).await {
