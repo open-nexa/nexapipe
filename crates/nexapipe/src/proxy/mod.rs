@@ -441,11 +441,9 @@ pub async fn run_proxy(
                     }
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if shutdown_signal.is_shutdown_requested() {
-                    tracing::info!("Shutdown signal received, stopping proxy");
-                    break;
-                }
+            _ = shutdown_signal.requested() => {
+                tracing::info!("Shutdown signal received, stopping proxy");
+                break;
             }
         }
     }
@@ -543,11 +541,9 @@ async fn start_http_server(
                     }
                 });
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if shutdown_signal.is_shutdown_requested() {
-                    tracing::info!("Shutdown signal received, stopping HTTP server");
-                    break;
-                }
+            _ = shutdown_signal.requested() => {
+                tracing::info!("Shutdown signal received, stopping HTTP server");
+                break;
             }
         }
     }

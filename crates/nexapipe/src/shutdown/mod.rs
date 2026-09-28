@@ -4,6 +4,16 @@ use tokio::signal;
 
 pub struct ShutdownSignal {
     shutdown_requested: AtomicBool,
+    /// Tells every loop waiting for shutdown that it was asked for, so they
+    /// stop then instead of noticing it on their next poll.
+    ///
+    /// A `watch` rather than a `Notify`: `notify_waiters()` only reaches
+    /// waiters that are already parked, and a waiter parks on its *first
+    /// poll*, not when the future is created — so a request landing between
+    /// "am I shutting down?" and "park me" would wake nobody, and the loop
+    /// would sit there until a connection happened to arrive. `watch` carries
+    /// the value itself, so a waiter that arrives late still sees it.
+    requested: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for ShutdownSignal {
@@ -14,8 +24,10 @@ impl Default for ShutdownSignal {
 
 impl ShutdownSignal {
     pub fn new() -> Self {
+        let (requested, _) = tokio::sync::watch::channel(false);
         ShutdownSignal {
             shutdown_requested: AtomicBool::new(false),
+            requested,
         }
     }
 
@@ -24,9 +36,37 @@ impl ShutdownSignal {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Resolves as soon as shutdown is requested, and immediately if it already
+    /// was.
+    ///
+    /// Made for the `select!` in an accept loop, where the flag alone is not
+    /// enough: it would have to be polled on a timer, and shutdown would then
+    /// wait for the next tick.
+    ///
+    /// Safe to call any number of times and from any number of loops: each
+    /// call subscribes its own receiver, so one request wakes all of them.
+    pub async fn requested(&self) {
+        // `subscribe()` marks the current value as seen, so a request that has
+        // already happened is read in `borrow_and_update()` and one that
+        // happens later is caught by `changed()`. Neither can slip between the
+        // two steps.
+        let mut requested = self.requested.subscribe();
+        if *requested.borrow_and_update() {
+            return;
+        }
+        // Ends with an error only when the sender is dropped, which for a
+        // `ShutdownSignal` is the end of the process anyway.
+        let _ = requested.changed().await;
+    }
+
     pub fn request_shutdown(&self) {
         self.shutdown_requested
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // `send_modify` and not `send`: `send` refuses to update the value
+        // when nobody is subscribed yet, and the loops subscribe when they
+        // start waiting — so a request made before the first one did would
+        // leave the flag at `false` and the waiter would park forever.
+        self.requested.send_modify(|requested| *requested = true);
         tracing::info!("Shutdown requested");
     }
 }
@@ -134,6 +174,44 @@ pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request that lands before the wait must still be seen: a waiter that
+    /// subscribes after the fact would otherwise stay parked forever, and the
+    /// process would never shut down.
+    #[tokio::test]
+    async fn a_request_made_before_the_wait_still_wakes_it() {
+        let signal = ShutdownSignal::new();
+        signal.request_shutdown();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), signal.requested())
+            .await
+            .expect("a shutdown requested before the wait was never seen");
+    }
+
+    /// Every loop that waits has to be woken, not one of them: the accept loop,
+    /// the HTTP server and the local proxy all sit on the same signal.
+    #[tokio::test]
+    async fn one_request_wakes_every_waiter() {
+        let signal = Arc::new(ShutdownSignal::new());
+
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let signal = signal.clone();
+                tokio::spawn(async move { signal.requested().await })
+            })
+            .collect();
+
+        // Let all three reach their wait before the request goes out.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        signal.request_shutdown();
+
+        for waiter in waiters {
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("a waiter was never woken")
+                .expect("the waiter panicked");
+        }
+    }
 
     #[tokio::test]
     async fn the_count_follows_the_guards() {
