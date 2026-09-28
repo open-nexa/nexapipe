@@ -66,8 +66,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - name: Configure clippy
-        run: rustup component add clippy
+      # Pin the toolchain, as the fmt job does. Clippy runs with -D warnings, so
+      # a lint added by a new toolchain release turns this job red on a PR that
+      # changed no Rust at all.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy
@@ -89,6 +94,8 @@ jobs:
         os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
@@ -109,6 +116,8 @@ jobs:
           - "uniffi"
     steps:
       - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.features }}
