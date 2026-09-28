@@ -539,6 +539,68 @@ enum AuthFailure {
     Rejected(String),
 }
 
+/// What one `ENROLL_START` is worth.
+///
+/// Split out of [`enroll_client`] so the rule can be tested without a
+/// connection: acceptance is a question about the config and nothing else, and
+/// it is the question the whole invitation scheme rests on.
+#[derive(Debug, PartialEq)]
+enum EnrollmentVerdict {
+    /// The token matches, so the secret may be rotated.
+    Accept,
+    /// Refused. `counted` says whether this should move the client's lockout
+    /// counter along.
+    Refuse { counted: bool },
+}
+
+impl EnrollmentVerdict {
+    fn counted(&self) -> bool {
+        matches!(self, EnrollmentVerdict::Refuse { counted: true })
+    }
+}
+
+/// Decides one enrollment attempt against `cfg`.
+///
+/// A guess at a token that is actually outstanding is the only thing counted.
+/// It is an attempt to spend a credential — the thing a token has to withstand
+/// to be worth handing out — and it is what makes the link unguessable rather
+/// than merely unshared. Everything else is a guess at nothing: no such client,
+/// or one with no token pending. Counting those would let anyone who knows a
+/// client id lock that client out of its own authentication by sending it
+/// enrollment requests, which is a denial of service handed to a stranger.
+///
+/// A lockout outranks the token: the client is refused before the comparison
+/// runs, so a locked-out client cannot extend its own lockout by retrying, and
+/// a wrong code cannot be traded for extra attempts by going through
+/// enrollment.
+fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> EnrollmentVerdict {
+    let Some(client) = cfg.clients.get(client_id) else {
+        return EnrollmentVerdict::Refuse { counted: false };
+    };
+    if client.is_locked_out() {
+        return EnrollmentVerdict::Refuse { counted: false };
+    }
+    // An empty token is refused on both sides before the comparison runs.
+    // `constant_time_eq` answers true for two empty slices, so a config holding
+    // `pending_enrollment = ""` — what an operator naturally writes to "clear"
+    // the key — would accept any stranger's empty ENROLL_START and hand them a
+    // freshly generated secret, locking out every device already using this
+    // client id. The loader refuses that spelling too; this is the runtime half
+    // of the same rule, so a reload path that skips validation cannot revive it.
+    let Some(expected) = client
+        .pending_enrollment
+        .as_deref()
+        .filter(|expected| !expected.is_empty())
+    else {
+        return EnrollmentVerdict::Refuse { counted: false };
+    };
+
+    if !constant_time_eq(expected.as_bytes(), token.as_bytes()) {
+        return EnrollmentVerdict::Refuse { counted: true };
+    }
+    EnrollmentVerdict::Accept
+}
+
 /// Exchanges a one-time enrollment token for a freshly generated secret.
 ///
 /// This is what makes an enrollment invite worth handing out: the link carries
@@ -563,25 +625,29 @@ async fn enroll_client(
 
     let mut cfg = auth.config().write().await;
 
-    // Is there a client at all, and does it have this token outstanding? Asked
-    // before anything is mutated so the refusal paths stay a single read.
-    // An empty token is refused on both sides before the comparison runs.
-    // `constant_time_eq` answers true for two empty slices, so a config holding
-    // `pending_enrollment = ""` — what an operator naturally writes to "clear"
-    // the key — would accept any stranger's empty ENROLL_START and hand them a
-    // freshly generated secret, locking out every device already using this
-    // client id. The loader refuses that spelling too; this is the runtime half
-    // of the same rule, so a reload path that skips validation cannot revive it.
-    let accepted = cfg.clients.get(client_id).is_some_and(|client| {
-        !token.is_empty()
-            && client
-                .pending_enrollment
-                .as_deref()
-                .is_some_and(|expected| {
-                    !expected.is_empty() && constant_time_eq(expected.as_bytes(), token.as_bytes())
-                })
-    });
-    if !accepted {
+    // Drop a lockout that has run out before deciding anything, so an expired
+    // one does not read as live and its stale counter does not push the client
+    // straight back over the threshold.
+    if let Some(client) = cfg.clients.get_mut(client_id) {
+        client.refresh_lockout();
+    }
+
+    let verdict = enrollment_verdict(&cfg, client_id, token);
+    if !matches!(verdict, EnrollmentVerdict::Accept) {
+        if verdict.counted() {
+            let (max_attempts, lockout_duration) = (cfg.max_attempts, cfg.lockout_duration);
+            if let Some(client) = cfg.clients.get_mut(client_id) {
+                client.record_failure(max_attempts, lockout_duration);
+            }
+            if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                tracing::warn!(
+                    "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
+                    client_id,
+                    auth.path(),
+                    e
+                );
+            }
+        }
         drop(cfg);
         write_auth_message(
             send,
@@ -617,7 +683,8 @@ async fn enroll_client(
     // Persisted before anything is promised to the client: a secret that is
     // live in memory but missing from disk is a secret that silently reverts
     // on the next restart, which would put the old one back in service.
-    if let Err(e) = crate::config::ProxyConfig::complete_enrollment(auth.path(), client_id, &secret)
+    if let Err(e) =
+        crate::config::ProxyConfig::complete_enrollment(auth.path(), client_id, &secret)
     {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
@@ -636,6 +703,28 @@ async fn enroll_client(
         .await
         .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(reason));
+    }
+
+    // Presenting the token is proof the invite reached the right hands, so a
+    // counter left over from failed guesses is cleared: a client that just
+    // enrolled should not be one wrong code away from a lockout it did not
+    // earn. Only written when there is something to clear, as above.
+    let dirty = cfg
+        .clients
+        .get(client_id)
+        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+    if dirty {
+        if let Some(client) = cfg.clients.get_mut(client_id) {
+            client.record_success();
+        }
+        if let Err(e) = save_auth_state(auth.path(), &cfg) {
+            tracing::warn!(
+                "2FA: failed to persist the cleared counter for '{}' to {}: {}",
+                client_id,
+                auth.path(),
+                e
+            );
+        }
     }
     drop(cfg);
 
@@ -1232,7 +1321,26 @@ pub async fn handle_incoming(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{EnrollmentVerdict, constant_time_eq, enrollment_verdict};
+    use crate::auth::{AuthConfig, ClientAuth};
+
+    /// A config holding one client, with `token` left outstanding for it.
+    fn auth_with_pending(token: Option<&str>) -> AuthConfig {
+        let mut cfg = AuthConfig::default();
+        cfg.clients.insert(
+            "alice".to_string(),
+            ClientAuth {
+                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                created_at: "0".to_string(),
+                allow_hosts: None,
+                pending_enrollment: token.map(|t| t.to_string()),
+                last_used: None,
+                failed_attempts: 0,
+                locked_until: None,
+            },
+        );
+        cfg
+    }
 
     /// The comparison is what stands between a token and whoever copied the
     /// link, so it has to be right at the boundaries: equal, wrong at the first
@@ -1257,5 +1365,76 @@ mod tests {
         // Two empty tokens compare equal, which is why a client with no token
         // outstanding must not be enrolled at all rather than compared here.
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn an_outstanding_token_is_accepted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Accept
+        );
+    }
+
+    /// The token is a credential like any other: guessing at it has to cost
+    /// the same as guessing a TOTP code, or the link is a slower credential
+    /// with no ceiling on how many times it can be tried.
+    #[test]
+    fn a_wrong_token_is_refused_and_counted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcde0"),
+            EnrollmentVerdict::Refuse { counted: true }
+        );
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", ""),
+            EnrollmentVerdict::Refuse { counted: true }
+        );
+    }
+
+    /// A client with no token outstanding is refused without being counted:
+    /// counting it would let anyone who knows a client id lock that client out
+    /// of its own authentication by sending it enrollment requests.
+    #[test]
+    fn a_client_with_nothing_pending_is_refused_without_being_counted() {
+        let cfg = auth_with_pending(None);
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    #[test]
+    fn an_unknown_client_is_refused_without_being_counted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "bob", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    /// A locked-out client is refused before the token is looked at, so a
+    /// lockout cannot be walked around by enrolling — and retrying does not
+    /// push the lockout further out.
+    #[test]
+    fn a_locked_out_client_is_refused_even_with_the_right_token() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+        cfg.clients.get_mut("alice").unwrap().locked_until = Some(u64::MAX);
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    /// The runtime half of the empty-token rule: `constant_time_eq` answers
+    /// true for two empty slices, so a blank token on both sides has to be
+    /// refused on the way in rather than compared.
+    #[test]
+    fn a_blank_pending_token_is_never_accepted() {
+        let cfg = auth_with_pending(Some(""));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", ""),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
     }
 }
