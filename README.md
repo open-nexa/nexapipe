@@ -646,6 +646,11 @@ It only decides *which* route a flow matches, so one host can have `tcp` routes
 on different ports pointing at different backends. With no `client_ports`, every
 port matches.
 
+When two routes for one host both match a flow, the one that names its ports
+wins over the one that takes every port. Without that tie-break the first route
+declared won for good and the second never matched, whichever order they were
+written in.
+
 ### What it costs
 
 L4 flows are opaque: the access log records bytes rather than a request line, and
