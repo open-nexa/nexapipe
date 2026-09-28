@@ -262,6 +262,29 @@ fn strip_ipv6_brackets(host: &str) -> &str {
     host.trim_matches(['[', ']'])
 }
 
+/// The longest name a `host_name` may carry.
+///
+/// 253 is the DNS limit for a presentation-format name; a longer one cannot
+/// have been meant as a host, and nothing here needs to reason about it.
+const MAX_HOST_NAME_LEN: usize = 253;
+
+/// Whether `name` is a host name this proxy is willing to act on.
+///
+/// Printable ASCII, and nothing else. RFC 6066 sends `host_name` as ASCII, so
+/// an internationalised name arrives as its A-label and a name with non-ASCII
+/// bytes in it is malformed rather than an IDN in need of normalising — which
+/// also means there is no case where two different spellings of the same name
+/// could reach a route as two different hosts.
+///
+/// Control characters are the point of the check: a host name is written to
+/// the log on every path through [`resolve_backend`], and `\r\n` in it lets a
+/// client append lines of its own to the server's log.
+fn is_presentable_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOST_NAME_LEN
+        && name.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// Extract the SNI host name from a TLS `ClientHello`.
 ///
 /// Layout (RFC 8446 / RFC 6066), all lengths big-endian:
@@ -326,7 +349,14 @@ pub fn extract_sni(data: &[u8]) -> Option<String> {
             let name = sni.take(name_len)?;
 
             if name_type == NAME_TYPE_HOST {
-                return String::from_utf8(name.to_vec()).ok();
+                let name = String::from_utf8(name.to_vec()).ok()?;
+                // Nothing downstream — the allow list, the route match, the
+                // log lines — can say anything useful about a name that is not
+                // a name, and a log line is the one place it could do real
+                // damage: a `\r\n` in here appends whatever the client likes
+                // to the server's log. Refusing is what "no SNI" already
+                // means, so it costs a client nothing but a hang-up.
+                return is_presentable_host_name(&name).then_some(name);
             }
         }
     }
@@ -441,6 +471,46 @@ mod tests {
         assert_eq!(extract_sni(&[]), None);
         assert_eq!(extract_sni(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x00]), None);
         assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    /// Every path through `resolve_backend` writes the SNI to the log, so a
+    /// name carrying a newline would let a client append lines of its own to
+    /// it. It is dropped here instead of escaped on the way out: a name that
+    /// is not a name has no route to reach either.
+    #[test]
+    fn refuses_a_host_name_that_could_forge_a_log_line() {
+        for name in [
+            "app.test\r\n2FA: client 'x' enrolled",
+            "app.test\n",
+            "app\ttest",
+            "app test",
+            "app.test\u{7f}",
+        ] {
+            let hello = client_hello_with_sni(name, true);
+            assert_eq!(extract_sni(&hello), None, "{name:?}");
+        }
+    }
+
+    /// `host_name` is ASCII on the wire (RFC 6066), so an internationalised
+    /// name arrives as its A-label. Raw UTF-8 is malformed, and accepting it
+    /// would leave one host reachable under two spellings.
+    #[test]
+    fn refuses_a_host_name_that_is_not_ascii() {
+        let hello = client_hello_with_sni("caf\u{00e9}.test", true);
+        assert_eq!(extract_sni(&hello), None);
+    }
+
+    #[test]
+    fn refuses_a_host_name_past_the_dns_limit() {
+        let long = "a".repeat(MAX_HOST_NAME_LEN + 1);
+        let hello = client_hello_with_sni(&long, true);
+        assert_eq!(extract_sni(&hello), None);
+
+        let at_limit = "a".repeat(MAX_HOST_NAME_LEN);
+        assert_eq!(
+            extract_sni(&client_hello_with_sni(&at_limit, true)).as_deref(),
+            Some(at_limit.as_str())
+        );
     }
 
     #[test]
