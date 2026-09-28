@@ -174,16 +174,9 @@ impl ConfigWatcher {
         // malformed `[auth]` section must not block a route reload (serde
         // ignores unknown sections when building `ProxyConfig`, so it would
         // have reloaded before auth parsing existed). The file is read a
-        // second time; a change between the two reads simply schedules
-        // another reload through the mtime check.
-        let new_auth = match ProxyConfig::load_with_auth(&self.config_path) {
-            Ok((_, auth)) => auth,
-            Err(e) => {
-                tracing::error!("2FA clients not reloaded, keeping the current ones: {}", e);
-                None
-            }
-        };
-        self.reload_auth(new_auth).await;
+        // second time, inside `reload_auth` and under the auth lock — see
+        // there for why the read cannot happen out here.
+        self.reload_auth().await;
     }
 
     /// Applies the `[auth]` section of a freshly read config to the live 2FA
@@ -203,9 +196,29 @@ impl ConfigWatcher {
     /// in-memory lockout state wins over whatever the file says. Everything
     /// else — a new client from an invite, a rotated secret, a removed
     /// client — comes from the file.
-    async fn reload_auth(&self, new_auth: Option<AuthConfig>) {
+    async fn reload_auth(&self) {
         let Some(state) = &self.auth else {
             return;
+        };
+
+        // The lock is taken before the file is read, and held across both.
+        //
+        // Reading first and merging after would leave a window that an
+        // enrollment fits neatly inside: it spends a token by changing the
+        // live state and only then writing the change back, so a snapshot
+        // taken a moment earlier still carries the spent token and the
+        // pre-enrollment secret — and applying it afterwards puts both back,
+        // handing out a token that was already used and undoing the secret
+        // the enrollment just issued. Reading under the lock makes "read, then
+        // merge" one step nothing can land in the middle of.
+        let mut live = state.config().write().await;
+
+        let new_auth = match ProxyConfig::load_with_auth(&self.config_path) {
+            Ok((_, auth)) => auth,
+            Err(e) => {
+                tracing::error!("2FA clients not reloaded, keeping the current ones: {}", e);
+                None
+            }
         };
         let Some(new_auth) = new_auth else {
             // The section is gone while 2FA is live: treat that as a bad edit,
@@ -216,8 +229,6 @@ impl ConfigWatcher {
             );
             return;
         };
-
-        let mut live = state.config().write().await;
 
         // Before the clients table, because it is the only step that can decide
         // not to apply anything: refusing a change that would ungate the
@@ -700,6 +711,74 @@ mod tests {
         assert_eq!(
             ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None),
             None
+        );
+    }
+
+    /// A minimal config file carrying one `[auth.clients]` entry.
+    fn file_with(client_id: &str, secret: &str) -> String {
+        format!(
+            "[auth]\n\
+             [auth.clients.{client_id}]\n\
+             secret = \"{secret}\"\n\
+             created_at = \"1723756800\"\n"
+        )
+    }
+
+    /// A reload has to read the clients file *after* it owns the auth lock.
+    ///
+    /// An enrollment spends a token by changing the live state and then writing
+    /// the change out, so a snapshot taken before the lock is held — and
+    /// applied afterwards — would put the spent token back and roll the client's
+    /// secret back to what it was before the enrollment.
+    ///
+    /// The enrollment is reproduced by holding the lock the way it does and
+    /// rewriting the file while it is held: the reload then has to wait for the
+    /// lock and must come away with what the file says *now*, not with what it
+    /// said when the reload started.
+    #[tokio::test]
+    async fn a_reload_reads_the_clients_file_after_taking_the_auth_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        std::fs::write(&path, file_with("old", "OLDOLDOLDOLDOLDO")).expect("write the first file");
+        let state = AuthState::new(
+            config_with(&[("old", client("OLDOLDOLDOLDOLDO"))]),
+            path_str.clone(),
+        );
+
+        let watcher = ConfigWatcher::new(
+            path_str,
+            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(crate::http::create_http_client()),
+            Arc::new(Mutex::new(HealthProbes::new())),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Some(state.clone()),
+        );
+
+        let enrolled = state.clone();
+        let path_for_task = path.clone();
+        let holder = tokio::spawn(async move {
+            let _guard = enrolled.config().write().await;
+            std::fs::write(&path_for_task, file_with("new", "NEWNEWNEWNEWNEWN"))
+                .expect("write the second file");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+
+        // Long enough for the task above to have taken the lock and rewritten
+        // the file, which is the only thing that makes this a race.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        watcher.reload_auth().await;
+        holder.await.expect("the holder task ends");
+
+        let live = state.config().read().await;
+        assert!(
+            live.clients.contains_key("new"),
+            "the reload must merge the file as it reads once it holds the lock"
+        );
+        assert!(
+            !live.clients.contains_key("old"),
+            "a client the file no longer lists must not survive the reload"
         );
     }
 }
