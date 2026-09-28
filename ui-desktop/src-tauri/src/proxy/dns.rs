@@ -214,6 +214,10 @@ async fn forward_to_upstream(
     Ok(())
 }
 
+/// How many compression pointers one name may follow before it is declared
+/// unreadable. A real name needs one; more than that is a loop.
+const MAX_DNS_POINTER_JUMPS: usize = 4;
+
 /// Parsed DNS query
 #[derive(Debug)]
 struct DnsQuery {
@@ -239,6 +243,12 @@ fn parse_dns_query(data: &[u8]) -> Result<DnsQuery> {
     let mut offset = 12;
     let mut labels = Vec::new();
     let question_start = offset;
+    // Where the rest of the question sits once the name is over. It follows the
+    // terminating zero byte for an uncompressed name, but the two pointer bytes
+    // when the name jumped (RFC 1035 4.1.4): the labels those bytes point at
+    // live somewhere else, and reading on from them lands in another section.
+    let mut after_name: Option<usize> = None;
+    let mut jumps = 0usize;
 
     loop {
         if offset >= data.len() {
@@ -251,6 +261,36 @@ fn parse_dns_query(data: &[u8]) -> Result<DnsQuery> {
             break;
         }
 
+        // A compression pointer, not a length: the two top bits are set and the
+        // rest, with the byte after, is an offset into the message. Read as a
+        // length it gives a nonsense label, and from there a nonsense domain —
+        // which decides whether the name is proxied.
+        if label_len & 0xC0 == 0xC0 {
+            if offset + 1 >= data.len() {
+                return Err(anyhow::anyhow!("DNS compression pointer truncated"));
+            }
+            let target = ((label_len & 0x3F) << 8) | data[offset + 1] as usize;
+            if target >= data.len() {
+                return Err(anyhow::anyhow!("DNS compression pointer out of bounds"));
+            }
+            // A pointer to another pointer forever is a loop.
+            jumps += 1;
+            if jumps > MAX_DNS_POINTER_JUMPS {
+                return Err(anyhow::anyhow!("DNS compression pointer loops"));
+            }
+            if after_name.is_none() {
+                after_name = Some(offset + 2);
+            }
+            offset = target;
+            continue;
+        }
+
+        // The two remaining label types are reserved or unused; a name that
+        // uses one cannot be read as text.
+        if label_len & 0xC0 != 0 {
+            return Err(anyhow::anyhow!("unsupported DNS label type"));
+        }
+
         if offset + 1 + label_len > data.len() {
             return Err(anyhow::anyhow!("DNS label out of bounds"));
         }
@@ -261,12 +301,13 @@ fn parse_dns_query(data: &[u8]) -> Result<DnsQuery> {
         offset += 1 + label_len;
     }
 
-    if offset + 4 > data.len() {
+    let type_at = after_name.unwrap_or(offset);
+    if type_at + 4 > data.len() {
         return Err(anyhow::anyhow!("DNS query type/class truncated"));
     }
 
-    let qtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-    let question_end = offset + 4;
+    let qtype = u16::from_be_bytes([data[type_at], data[type_at + 1]]);
+    let question_end = type_at + 4;
 
     Ok(DnsQuery {
         id,

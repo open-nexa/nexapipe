@@ -1222,6 +1222,10 @@ pub async fn handle_dns_query(
     }
 }
 
+/// How many compression pointers one name may follow before the name is
+/// declared unreadable. A real name needs one; more than that is a loop.
+const MAX_DNS_POINTER_JUMPS: usize = 4;
+
 /// Parse a DNS query, returning (domain, QTYPE).
 /// QTYPE: 1=A, 28=AAAA. Returns None on parse failure.
 fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
@@ -1238,13 +1242,54 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
     // Parse the Question section's domain name (length-prefixed labels).
     let mut pos = 12;
     let mut labels: Vec<&str> = Vec::new();
+    let mut jumps = 0usize;
+    // Where QTYPE sits once the name is over. It follows the terminating zero
+    // byte for an uncompressed name, but the two pointer bytes when the name
+    // jumped: the labels those bytes point at are somewhere else entirely, so
+    // reading on from there would land inside another section.
+    let mut after_name: Option<usize> = None;
 
     while pos < payload.len() {
         let len = payload[pos] as usize;
+
         if len == 0 {
             pos += 1; // Skip the null terminator.
             break;
         }
+
+        // A compression pointer (RFC 1035 4.1.4): the two top bits are set and
+        // the rest, with the byte after, is an offset into the message — an
+        // earlier label list that this name continues with. Reading it as a
+        // length gives a nonsense label, and from there a nonsense domain: what
+        // decides whether the name is proxied was silently wrong. Rare in a
+        // query, legal, and some stacks do it.
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= payload.len() {
+                return None;
+            }
+            let offset = ((len & 0x3F) << 8) | payload[pos + 1] as usize;
+            if offset >= payload.len() {
+                return None;
+            }
+            // A pointer that points at another pointer forever is a loop; stop
+            // after a few hops rather than spin.
+            jumps += 1;
+            if jumps > MAX_DNS_POINTER_JUMPS {
+                return None;
+            }
+            if after_name.is_none() {
+                after_name = Some(pos + 2);
+            }
+            pos = offset;
+            continue;
+        }
+
+        // The remaining two label types (0x40, 0x80) are reserved or unused;
+        // a name using one cannot be read as text.
+        if len & 0xC0 != 0 {
+            return None;
+        }
+
         // Prevent out-of-bounds access.
         if pos + 1 + len > payload.len() {
             return None;
@@ -1254,9 +1299,9 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
         pos += 1 + len;
     }
 
-    // pos points right after the null byte. QTYPE is the 2 bytes immediately following it.
-    let qtype = if pos + 2 <= payload.len() {
-        u16::from_be_bytes([payload[pos], payload[pos + 1]])
+    let qtype_pos = after_name.unwrap_or(pos);
+    let qtype = if qtype_pos + 2 <= payload.len() {
+        u16::from_be_bytes([payload[qtype_pos], payload[qtype_pos + 1]])
     } else {
         0
     };
@@ -1384,5 +1429,76 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dns_query;
+
+    /// A query packet: 12 bytes of header, then the question.
+    fn query(name: &[u8], qtype: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(name);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        packet
+    }
+
+    /// A query whose QNAME is partly compressed: `www` in the question, then a
+    /// pointer to the `example.com` written further along. The pointer ends the
+    /// name where it stands, so QTYPE follows its two bytes — not the labels it
+    /// points at.
+    fn query_with_partly_compressed_name(qtype: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(&[0x03, b'w', b'w', b'w']); // offset 12..16
+        packet.extend_from_slice(&[0xC0, 24]); // pointer at 16..18 -> offset 24
+        packet.extend_from_slice(&qtype.to_be_bytes()); // 18..20
+        packet.extend_from_slice(&1u16.to_be_bytes()); // 20..22
+        packet.extend_from_slice(&[0, 0]); // 22..24, filler
+        packet.extend_from_slice(&[0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e']);
+        packet.extend_from_slice(&[0x03, b'c', b'o', b'm', 0x00]);
+        packet
+    }
+
+    #[test]
+    fn reads_an_uncompressed_name() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let (domain, qtype) = parse_dns_query(&query(&name, 1)).unwrap();
+        assert_eq!(domain, "example.com");
+        assert_eq!(qtype, 1);
+    }
+
+    /// The bug: read as a length, the pointer's 0xC0 became a 192-byte label
+    /// (out of bounds, so `None`) or, with a smaller value, a garbage one — and
+    /// the routing decision that follows the name was silently wrong.
+    #[test]
+    fn follows_a_compression_pointer_to_the_rest_of_the_name() {
+        let (domain, qtype) = parse_dns_query(&query_with_partly_compressed_name(1)).unwrap();
+        assert_eq!(domain, "www.example.com");
+        assert_eq!(qtype, 1);
+    }
+
+    /// QTYPE follows the pointer, not the labels it points at: reading on from
+    /// the pointed-to name's terminator would land in the tail of the packet.
+    #[test]
+    fn reads_the_qtype_where_the_pointer_ended() {
+        let (_, qtype) = parse_dns_query(&query_with_partly_compressed_name(28)).unwrap();
+        assert_eq!(qtype, 28);
+    }
+
+    #[test]
+    fn refuses_a_pointer_that_loops() {
+        // 0xC00C points at offset 12, which is this very pointer.
+        let name = [0xC0, 0x0C];
+        assert!(parse_dns_query(&query(&name, 1)).is_none());
+    }
+
+    #[test]
+    fn refuses_a_pointer_outside_the_packet() {
+        let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
+        assert!(parse_dns_query(&query(&name, 1)).is_none());
     }
 }
