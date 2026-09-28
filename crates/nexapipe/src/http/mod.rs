@@ -2,7 +2,7 @@ use crate::routes::{BackendInfo, RouteConfig};
 use ::http::{Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::io::Write;
@@ -32,6 +32,15 @@ pub fn create_http_client() -> HttpClient {
 }
 
 const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
+
+/// The largest request body this proxy will read into memory.
+///
+/// `content-length` is whatever the client says it is, and the request is
+/// buffered whole before it is forwarded, so taking the declaration at face
+/// value lets a client choose how much this process allocates — one stream at a
+/// time, and a peer can open many. Well past any ordinary upload; a deployment
+/// that needs to push larger bodies should stream them instead of raising this.
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 pub async fn proxy_request(
     client: &HttpClient,
@@ -102,7 +111,7 @@ pub async fn proxy_request(
     .parse::<http::Uri>()
     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
-    let body = req.into_body().collect().await?.to_bytes();
+    let body = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
 
     let mut builder = Request::builder().method(method).uri(new_uri);
 
@@ -135,10 +144,38 @@ pub async fn proxy_request(
         && let Some(encodings) = accept_encoding
         && encodings.contains("gzip")
     {
-        return Ok(compress_response(response, "gzip").await);
+        return compress_response(response, "gzip").await;
     }
 
     Ok(response.map(http_body_util::BodyExt::boxed_unsync))
+}
+
+/// Reads a request body into memory, refusing one larger than `limit`.
+///
+/// The size is not known up front — a chunked request says nothing about how
+/// much is coming — so the limit has to be enforced while reading rather than
+/// by checking a `content-length` header the client is free to understate.
+async fn read_body_limited<B>(body: B, limit: usize) -> anyhow::Result<bytes::Bytes>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let mut body = body;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        let frame = frame.map_err(|e| anyhow::anyhow!("failed to read the request body: {}", e))?;
+        // Anything that is not a data frame — trailers — carries no body bytes.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if bytes.len() + data.len() > limit {
+            return Err(anyhow::anyhow!(
+                "request body is over the {limit} byte limit"
+            ));
+        }
+        bytes.extend_from_slice(&data);
+    }
+    Ok(bytes.into())
 }
 
 fn should_compress(content_type: Option<&str>) -> bool {
@@ -156,47 +193,66 @@ fn should_compress(content_type: Option<&str>) -> bool {
 async fn compress_response(
     response: Response<hyper::body::Incoming>,
     encoding: &str,
-) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
+) -> anyhow::Result<Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>>
+{
     let (parts, body) = response.into_parts();
+    let mut body = body;
+    let mut bytes: Vec<u8> = Vec::new();
 
-    if let Some(content_length) = parts.headers.get("content-length")
-        && let Ok(content_length_str) = content_length.to_str()
-        && let Ok(len) = content_length_str.parse::<usize>()
-        && len > MAX_COMPRESS_SIZE
-    {
-        tracing::debug!("Response too large for compression: {} bytes", len);
-        return Response::from_parts(parts, http_body_util::BodyExt::boxed_unsync(body));
-    }
-
-    let bytes = body.collect().await.unwrap().to_bytes();
-
-    if bytes.len() > MAX_COMPRESS_SIZE {
-        tracing::debug!("Response too large for compression: {} bytes", bytes.len());
-        return Response::from_parts(
-            parts,
-            http_body_util::BodyExt::boxed_unsync(Full::new(bytes).map_err(|_| unreachable!())),
-        );
+    // Read only as far as the limit, so the decision to compress is made with
+    // the size known rather than after the whole body has been collected. How
+    // large a response is cannot be asked up front: a chunked one declares no
+    // length at all, and a backend is free to send past the one it declared.
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        let frame =
+            frame.map_err(|e| anyhow::anyhow!("failed to read the response body: {}", e))?;
+        // Anything that is not a data frame — trailers — carries no body bytes.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        bytes.extend_from_slice(&data);
+        if bytes.len() > MAX_COMPRESS_SIZE {
+            tracing::debug!(
+                "Response past {} bytes, forwarding the rest uncompressed",
+                MAX_COMPRESS_SIZE
+            );
+            // What has been read still goes out, ahead of the body handed on:
+            // dropping it would truncate the response. From here the rest is
+            // streamed rather than held, so a large response costs one frame.
+            let read = futures_util::stream::once(futures_util::future::ready(
+                Ok::<_, hyper::Error>(hyper::body::Frame::data(bytes::Bytes::from(bytes))),
+            ));
+            let rest =
+                http_body_util::BodyExt::into_data_stream(body).map_ok(hyper::body::Frame::data);
+            return Ok(Response::from_parts(
+                parts,
+                http_body_util::StreamBody::new(read.chain(rest)).boxed_unsync(),
+            ));
+        }
     }
 
     let compressed_bytes = {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&bytes).unwrap();
-        encoder.finish().unwrap()
+        encoder.write_all(&bytes)?;
+        encoder.finish()?
     };
 
     let mut new_parts = parts;
     new_parts.headers.remove("content-encoding");
     new_parts.headers.remove("content-length");
-    new_parts
-        .headers
-        .insert("content-encoding", encoding.parse().unwrap());
+    new_parts.headers.insert(
+        "content-encoding",
+        encoding
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid content-encoding {:?}: {}", encoding, e))?,
+    );
 
-    Response::from_parts(
+    Ok(Response::from_parts(
         new_parts,
         http_body_util::BodyExt::boxed_unsync(
             Full::new(compressed_bytes.into()).map_err(|_| unreachable!()),
         ),
-    )
+    ))
 }
 
 pub fn create_error_response(
@@ -290,6 +346,13 @@ pub async fn proxy_to_backend_streaming(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
     {
+        // Checked before the body is read, not after: `content_length` is the
+        // size of the buffer this is about to fill.
+        if content_length > MAX_REQUEST_BODY {
+            return Err(anyhow::anyhow!(
+                "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
+            ));
+        }
         read_remaining_request_body(recv, &mut full_body, content_length).await?;
     }
 
@@ -523,4 +586,34 @@ pub async fn send_response_legacy(
     send.finish()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body of `len` bytes, which is what the limit has to be checked against.
+    fn body_of(len: usize) -> Full<bytes::Bytes> {
+        Full::new(bytes::Bytes::from(vec![b'x'; len]))
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_limit_is_read_whole() {
+        let read = read_body_limited(body_of(10), 10).await.unwrap();
+        assert_eq!(read.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused() {
+        // One frame is enough to exceed it, so this is the case the old
+        // `collect()` could not catch without first holding all of it.
+        let err = read_body_limited(body_of(11), 10).await.unwrap_err();
+        assert!(err.to_string().contains("over the 10 byte limit"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_is_within_any_limit() {
+        let read = read_body_limited(body_of(0), 0).await.unwrap();
+        assert!(read.is_empty());
+    }
 }
