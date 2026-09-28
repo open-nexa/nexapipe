@@ -84,11 +84,12 @@ Other house rules:
 Bounded, real, and each one is useful on its own. Comments welcome before you
 start — say which one you are taking.
 
-**1. Allow-list client public keys** — any peer that learns the Node ID can
-complete the QUIC handshake. Add `endpoint_ids` under `[auth.clients.<id>]`,
-matched against `conn.remote_id()` in `handle_connection`
-(`crates/nexapipe/src/conn/mod.rs`). This is the single change that turns "knows
-the Node ID" into "is a registered device". *Medium.*
+**1. Strip hop-by-hop headers when forwarding** — the request-header loop in
+`proxy_to_backend_streaming` (`crates/nexapipe/src/http/mod.rs`) copies every
+header the client sent, so `Connection`, `Transfer-Encoding`, `Upgrade` and the
+rest of the RFC 7230 §6.1 set reach the backend, and `expect: 100-continue` is
+passed through although nothing here ever answers a `100`. Drop that set and
+decide what to do with `expect`. *Medium, and the RFC is the whole spec.*
 
 **2. Per-client authorization** — an authenticated client can reach every route.
 Add an optional `allow_hosts` per client and enforce it in the HTTP lookup
@@ -112,16 +113,16 @@ fixes both. *Hard, and the largest item here.*
 proxy-to-backend hop is always plaintext. Accepting them lets an operator keep
 that hop encrypted when the backend is on another host. *Medium.*
 
-**6. Screenshots and a short demo** — the repo has no images at all. A
-screenshot of the Android flow (scan invite → reach a service) and one of the
-desktop app would do more for the project than several of the items above.
-*Easy, and no Rust required.*
+**6. A short demo** — `screenshots/` holds a few stills and the README links
+them, but there is no end-to-end walkthrough: one recording of the Android flow
+(scan invite → reach a service) and one of the desktop app would do more for the
+project than several of the items above. *Easy, and no Rust required.*
 
 ## Labels
 
 Mostly so that `good first issue` actually means something. That label is
 reserved for work that has a defined outcome, does not need project-wide context
-to start, and has someone willing to answer questions on it — like the seven
+to start, and has someone willing to answer questions on it — like the six
 listed above.
 
 | Label | Means |
