@@ -205,9 +205,17 @@ impl ClientAuth {
         self.last_used = Some(unix_now());
     }
 
-    /// Decode the Base32 secret into bytes
+    /// Decode the Base32 secret into bytes.
+    ///
+    /// The stored spelling is normalised first. An invite puts the secret
+    /// through `otpauth::normalize_secret`, which tolerates lower case and `=`
+    /// padding, so a secret written either of those ways in the config has to
+    /// work as well — otherwise it fails to decode here and the client is stuck
+    /// at "Invalid Base32 secret" with nothing saying the spelling is why.
     pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret)
+        let secret = crate::auth::otpauth::normalize_secret(&self.secret)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret)
             .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
     }
 
@@ -299,6 +307,26 @@ mod tests {
             failed_attempts: 0,
             locked_until: None,
         }
+    }
+
+    #[test]
+    fn a_secret_decodes_the_way_an_invite_writes_it() {
+        // An invite hands the secret through `normalize_secret`, which drops
+        // the padding and folds the case. A config written either of those ways
+        // has to decode too, or the client is stuck at "Invalid Base32 secret"
+        // with nothing pointing at the spelling.
+        let mut lower = client();
+        lower.secret = "jbswy3dpehpk3pxp".to_string();
+        let mut padded = client();
+        padded.secret = "my======".to_string();
+        let mut plain = client();
+        plain.secret = "JBSWY3DPEHPK3PXP".to_string();
+
+        assert_eq!(
+            lower.decode_secret().unwrap(),
+            plain.decode_secret().unwrap()
+        );
+        assert_eq!(padded.decode_secret().unwrap(), b"f");
     }
 
     /// `Debug` is what a log line uses, and the whole config — this struct
