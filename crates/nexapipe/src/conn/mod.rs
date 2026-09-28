@@ -316,6 +316,21 @@ pub async fn handle_bidi_stream(
     }
 }
 
+/// How long dialing a backend for a WebSocket upgrade may take.
+///
+/// The HTTP path gets its connect timeout from the client builder and the TCP
+/// and TLS tunnels have their own; this was the one dial in the server with no
+/// deadline at all, so a backend that drops SYN kept the stream — and the
+/// request slot behind it — until the client gave up.
+const WS_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+/// How long the backend may take to answer the upgrade.
+///
+/// Covers the handshake only: the session that follows is a pipe and has no
+/// duration to bound. A backend that accepts the connection and then never
+/// sends a byte would otherwise look exactly like one that is still thinking.
+const WS_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 /// Returns the status the client was answered with: 101 once the tunnel is up,
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
 /// handshake response only — once both directions are piped the session has no
@@ -340,9 +355,13 @@ async fn handle_websocket_stream(
         .map(|h| h.to_string())
         .unwrap_or_else(|| host.to_string());
 
-    let mut backend_stream = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+    let mut backend_stream = tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
+    .map_err(|e| anyhow::anyhow!("failed to connect to backend: {e}"))?;
 
     let path = req
         .uri()
@@ -375,32 +394,49 @@ async fn handle_websocket_stream(
     let mut trailing_ws_data = Vec::new();
     let mut read_buf = [0u8; 8192];
 
-    loop {
-        match backend_stream.read(&mut read_buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                response_buf.extend_from_slice(&read_buf[..n]);
+    let read_handshake = async {
+        loop {
+            match backend_stream.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    response_buf.extend_from_slice(&read_buf[..n]);
 
-                if let Some(pos) = find_headers_end(&response_buf) {
-                    let headers_end = pos + 4;
-                    if response_buf.len() > headers_end {
-                        trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
+                    if let Some(pos) = find_headers_end(&response_buf) {
+                        let headers_end = pos + 4;
+                        if response_buf.len() > headers_end {
+                            trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
+                        }
+                        response_buf.truncate(headers_end);
+                        break;
                     }
-                    response_buf.truncate(headers_end);
-                    break;
-                }
 
-                if response_buf.len() > 64 * 1024 {
-                    tracing::warn!("WebSocket handshake response too large");
-                    break;
+                    if response_buf.len() > 64 * 1024 {
+                        tracing::warn!("WebSocket handshake response too large");
+                        break;
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::debug!("Failed to read from backend stream: {}", e);
-                return Err(e.into());
+                Err(e) => {
+                    tracing::debug!("Failed to read from backend stream: {}", e);
+                    return Err(anyhow::anyhow!(
+                        "failed to read the handshake response: {}",
+                        e
+                    ));
+                }
             }
         }
-    }
+        Ok(())
+    };
+
+    tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, read_handshake)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "backend {}:{} did not answer the WebSocket handshake within {:?}",
+                host,
+                port,
+                WS_HANDSHAKE_TIMEOUT
+            )
+        })??;
 
     let response = http::parse_http_response_legacy(&response_buf)?;
     let handshake_bytes = response_buf.len() + trailing_ws_data.len();

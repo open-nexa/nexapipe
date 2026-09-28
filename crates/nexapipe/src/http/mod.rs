@@ -18,10 +18,21 @@ pub type HttpClient = hyper_util::client::legacy::Client<
     Full<bytes::Bytes>,
 >;
 
+/// How long dialing a backend may take. Matches `l4` and `passthrough`.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a backend may take to answer with a status line.
+///
+/// This ends once the response head arrives: streaming the body can legitimately
+/// run far longer. A backend that accepts the connection and then never answers
+/// would otherwise hold the stream, and the request slot behind it, forever.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn create_http_client() -> HttpClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
+    http_connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
 
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .pool_max_idle_per_host(100)
@@ -131,7 +142,17 @@ pub async fn proxy_request(
         backend_port
     );
 
-    let response = client.request(proxied_req).await?;
+    let response = match tokio::time::timeout(RESPONSE_TIMEOUT, client.request(proxied_req)).await {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("backend request failed: {}", e))?,
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "backend {}:{} did not respond within {:?}",
+                backend_host,
+                backend_port,
+                RESPONSE_TIMEOUT
+            ));
+        }
+    };
 
     let content_encoding = response.headers().get("content-encoding");
     let content_type = response
