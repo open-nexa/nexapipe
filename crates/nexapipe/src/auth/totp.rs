@@ -75,8 +75,12 @@ impl<'a> TotpValidator<'a> {
             .decode_secret()
             .map_err(|_| AuthError::InvalidSecret)?;
 
+        // `timestamp` arrives from the client, so the subtraction is attacker
+        // controlled: `now - i64::MIN` overflows, which panics in a debug build
+        // and wraps in release. `abs_diff` cannot overflow — the distance
+        // between two i64 values always fits in a u64.
         let now = current_timestamp();
-        if (now - timestamp).abs() > TIMESTAMP_WINDOW_SECS {
+        if now.abs_diff(timestamp) > TIMESTAMP_WINDOW_SECS as u64 {
             return Err(AuthError::StaleTimestamp);
         }
 
@@ -174,3 +178,53 @@ impl std::fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::config::ClientAuth;
+    use std::collections::HashMap;
+
+    fn config_with_one_client() -> AuthConfig {
+        let client = ClientAuth {
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            created_at: String::new(),
+            allow_hosts: None,
+            pending_enrollment: None,
+            last_used: None,
+            failed_attempts: 0,
+            locked_until: None,
+        };
+
+        AuthConfig {
+            enabled: true,
+            clients: HashMap::from([("alice".to_string(), client)]),
+            ..AuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_timestamp_at_the_bottom_of_the_range_is_refused_rather_than_fatal() {
+        let config = config_with_one_client();
+        let validator = TotpValidator::new(&config);
+
+        // The client supplies this value, and i64::MIN overflows `now -
+        // timestamp` — a panic in a debug build, a wrap in release, and
+        // reachable without authenticating.
+        let outcome =
+            validator.verify_response("alice", b"nonce", i64::MIN, b"signature", "000000");
+
+        assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
+    }
+
+    #[test]
+    fn a_timestamp_at_the_top_of_the_range_is_refused_rather_than_fatal() {
+        let config = config_with_one_client();
+        let validator = TotpValidator::new(&config);
+
+        let outcome =
+            validator.verify_response("alice", b"nonce", i64::MAX, b"signature", "000000");
+
+        assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
+    }
+}
