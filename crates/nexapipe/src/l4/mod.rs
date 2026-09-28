@@ -415,7 +415,12 @@ where
             };
 
             frame.clear();
-            if encode_frame(&buf[..n], &mut frame).is_err() {
+            if let Err(e) = encode_frame(&buf[..n], &mut frame) {
+                // A datagram too large for a frame. There is no way to report it
+                // on a stream of datagrams, so it is dropped — but silently
+                // dropping is how a 65 508 byte datagram becomes unreachable
+                // with nothing in the logs to explain it.
+                tracing::debug!("L4 UDP: dropped a {} byte datagram: {}", n, e);
                 continue;
             }
             if let Err(e) = writer.write_all(&frame).await {
