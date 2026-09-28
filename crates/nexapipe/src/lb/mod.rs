@@ -81,6 +81,10 @@ impl BackendPool {
         }
 
         if healthy_backends.is_empty() {
+            // Still handed out, and deliberately: a route whose backends are all
+            // down keeps answering 502 rather than going dark, and the client
+            // gets an error it can act on instead of a hang. Callers that need
+            // to tell this from a healthy pool ask `healthy_count`.
             tracing::warn!("No healthy backends available, falling back to all backends");
             return if let Some(b) = self.backends.first() {
                 b.read().await.url.clone()
@@ -128,23 +132,49 @@ impl BackendPool {
         result
     }
 
+    /// How many backends are healthy right now.
+    ///
+    /// `select_backend` never returns nothing — a pool with no healthy backend
+    /// still hands one out, so a dead route answers 502 instead of going dark —
+    /// so this is the only way a caller can tell that case from a pool that is
+    /// actually serving traffic.
+    pub async fn healthy_count(&self) -> usize {
+        let mut count = 0;
+        for backend in &self.backends {
+            if backend.read().await.is_healthy() {
+                count += 1;
+            }
+        }
+        count
+    }
+
     pub async fn set_backend_health(&self, url: &str, healthy: bool) {
+        // Every entry carrying this URL, not the first: a pool is allowed to
+        // name the same backend twice, and stopping at the first left the rest
+        // healthy forever — so the pool reported a backend as up while half its
+        // entries were down and the balancer kept picking them.
+        let mut matched = false;
         for backend in &self.backends {
             let mut status = backend.write().await;
-            if status.url == url {
-                if healthy {
-                    status.mark_healthy();
-                } else {
-                    status.mark_unhealthy();
-                }
-                tracing::debug!(
-                    "Backend {} health status: {} (failures: {})",
-                    url,
-                    healthy,
-                    status.consecutive_failures()
-                );
-                return;
+            if status.url != url {
+                continue;
             }
+            matched = true;
+            if healthy {
+                status.mark_healthy();
+            } else {
+                status.mark_unhealthy();
+            }
+            tracing::debug!(
+                "Backend {} health status: {} (failures: {})",
+                url,
+                healthy,
+                status.consecutive_failures()
+            );
+        }
+
+        if !matched {
+            tracing::debug!("set_backend_health: no backend named {url} in this pool");
         }
     }
 
@@ -155,5 +185,51 @@ impl BackendPool {
             result.push((status.url.clone(), status.healthy));
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(backends: &[&str]) -> BackendPool {
+        BackendPool::new(
+            backends.iter().map(|b| b.to_string()).collect(),
+            LoadBalancingStrategy::RoundRobin,
+        )
+    }
+
+    #[tokio::test]
+    async fn every_entry_carrying_a_url_is_marked_not_just_the_first() {
+        let pool = pool(&["http://a:80", "http://a:80"]);
+        assert_eq!(pool.healthy_count().await, 2);
+
+        pool.set_backend_health("http://a:80", false).await;
+
+        assert_eq!(
+            pool.get_backend_statuses().await,
+            vec![
+                ("http://a:80".to_string(), false),
+                ("http://a:80".to_string(), false),
+            ],
+            "the second entry stayed healthy, so the balancer kept picking a backend the pool had already given up on"
+        );
+        assert_eq!(pool.healthy_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pool_with_no_healthy_backend_says_so_and_still_answers() {
+        let pool = pool(&["http://a:80", "http://b:80"]);
+        pool.set_backend_health("http://a:80", false).await;
+        pool.set_backend_health("http://b:80", false).await;
+
+        // select_backend still hands one out — a route with a dead backend
+        // answers 502 rather than going dark — so the count is the only way to
+        // tell this pool from one that is serving traffic.
+        assert_eq!(pool.healthy_count().await, 0);
+        assert!(
+            !pool.select_backend().await.is_empty(),
+            "a pool with no healthy backend still has to name one"
+        );
     }
 }
