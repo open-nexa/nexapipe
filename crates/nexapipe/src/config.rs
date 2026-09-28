@@ -35,7 +35,7 @@ pub struct ServerConfig {
     pub key_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
@@ -48,6 +48,34 @@ pub struct IrohConfig {
     /// If provided, the endpoint will have the same Node ID across restarts.
     /// Can be generated using `nexapipe --generate-secret` command.
     pub secret_key: Option<String>,
+}
+
+/// `Some(_)` becomes `Some("<redacted>")` for a `Debug` view.
+///
+/// Keeping the `Option` shape is the point: whether a credential is configured
+/// at all is something an operator needs to see in a log, and it is not the
+/// credential.
+pub(crate) fn redacted(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| "<redacted>")
+}
+
+/// Handwritten so the endpoint's credentials never reach a log line.
+///
+/// `ProxyConfig` is logged at debug level whenever it is parsed — including on
+/// every hot reload, where the logger is already installed — and a derived
+/// `Debug` would put the ed25519 private key and the relay bearer token on that
+/// line. Reading the log would then be enough to own this endpoint's identity
+/// permanently, which is worse than losing one client's TOTP seed.
+impl std::fmt::Debug for IrohConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohConfig")
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field("relay_auth_token", &redacted(&self.relay_auth_token))
+            .field("bind_port", &self.bind_port)
+            .field("secret_key", &redacted(&self.secret_key))
+            .finish()
+    }
 }
 
 /// How a route talks to its backends.
@@ -136,12 +164,25 @@ pub struct LocalProxyNode {
 }
 
 /// Client-side 2FA credentials used by local-proxy mode.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct LocalProxyTwoFactorConfig {
     pub enabled: Option<bool>,
     pub client_id: String,
     pub secret: String,
     pub algorithm: Option<String>,
+}
+
+/// Handwritten for the same reason as [`IrohConfig`]'s: this is the client side
+/// of a TOTP secret, and the whole config is logged when it is parsed.
+impl std::fmt::Debug for LocalProxyTwoFactorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalProxyTwoFactorConfig")
+            .field("enabled", &self.enabled)
+            .field("client_id", &self.client_id)
+            .field("secret", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -786,6 +827,20 @@ impl ProxyConfig {
                     let mut clients = HashMap::new();
                     if let Some(clients_toml) = auth_toml.clients {
                         for (id, client_toml) in clients_toml {
+                            // An empty token compares equal to an empty
+                            // ENROLL_START — see `conn::enroll_client` — so
+                            // `pending_enrollment = ""` would hand a fresh
+                            // secret to anybody who asks. Refused at load time
+                            // rather than read as "no enrollment outstanding":
+                            // the way to close an enrollment is to delete the
+                            // key, and a blank one is a typo with a wide door
+                            // behind it.
+                            if client_toml.pending_enrollment.as_deref() == Some("") {
+                                anyhow::bail!(
+                                    "[auth.clients.{id}]: pending_enrollment is empty; delete the \
+                                     key instead of setting it to \"\""
+                                );
+                            }
                             clients.insert(
                                 id,
                                 crate::auth::ClientAuth {
@@ -1566,6 +1621,52 @@ domains = ["fn.iroh.iakl.top"]
         assert_eq!(client.secret, "NEWSECRETVALUE");
         // The token has to go with it, or the same link enrolls a second device.
         assert_eq!(client.pending_enrollment, None);
+    }
+
+    /// A blank enrollment token is refused instead of read as "no enrollment
+    /// outstanding".
+    ///
+    /// `constant_time_eq` calls two empty slices equal, so a config carrying
+    /// `pending_enrollment = ""` would accept any stranger's empty ENROLL_START
+    /// and hand them a freshly generated secret, locking out every device that
+    /// was using the client id. Blanking the key is the natural way to "clear"
+    /// it, so it has to fail loudly rather than quietly mean "closed".
+    #[test]
+    fn a_blank_enrollment_token_is_refused() {
+        let (_dir, path) = scratch_config(
+            "default_backend = \"http://127.0.0.1:15666\"\n\
+             \n\
+             [auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.client-001]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             pending_enrollment = \"\"\n",
+        );
+
+        let err = ProxyConfig::load_with_auth(&path).expect_err("a blank token must not load");
+        assert!(err.to_string().contains("pending_enrollment"), "{err}");
+    }
+
+    /// The endpoint credentials have to stay out of `Debug`, because the whole
+    /// config is logged at debug level whenever it is parsed — including on
+    /// every hot reload, where the logger is already installed.
+    #[test]
+    fn a_parsed_iroh_config_prints_no_credentials() {
+        let iroh = IrohConfig {
+            relay_url: Some("https://relay.example".to_string()),
+            relay_mode: Some("custom".to_string()),
+            relay_auth_token: Some("bearer-secret".to_string()),
+            bind_port: Some(1234),
+            secret_key: Some("ed25519-private-key".to_string()),
+        };
+
+        let rendered = format!("{iroh:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("bearer-secret"), "{rendered}");
+        assert!(!rendered.contains("ed25519-private-key"), "{rendered}");
+        // Whether a key is configured is still worth knowing.
+        assert!(rendered.contains("relay_mode"), "{rendered}");
     }
 
     /// A token for a client that does not exist would leave a section with no

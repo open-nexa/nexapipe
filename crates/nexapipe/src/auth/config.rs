@@ -96,7 +96,7 @@ impl Default for AuthConfig {
 }
 
 /// Client authentication information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientAuth {
     /// Base32-encoded secret key
     pub secret: String,
@@ -128,6 +128,30 @@ pub struct ClientAuth {
     /// Lockout expiry time (Unix timestamp)
     #[serde(default)]
     pub locked_until: Option<u64>,
+}
+
+/// Handwritten so `secret` and `pending_enrollment` stay out of logs.
+///
+/// The whole config — this struct included — is logged at debug level whenever
+/// it is parsed, and both fields are live credentials: the seed is half of a
+/// client's second factor, and the token is the whole of it until someone
+/// spends it. `Serialize` still round-trips both, which is what the config file
+/// needs; only the `Debug` view is redacted.
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAuth")
+            .field("secret", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("allow_hosts", &self.allow_hosts)
+            .field(
+                "pending_enrollment",
+                &crate::config::redacted(&self.pending_enrollment),
+            )
+            .field("last_used", &self.last_used)
+            .field("failed_attempts", &self.failed_attempts)
+            .field("locked_until", &self.locked_until)
+            .finish()
+    }
 }
 
 fn default_created_at() -> String {
@@ -275,6 +299,22 @@ mod tests {
             failed_attempts: 0,
             locked_until: None,
         }
+    }
+
+    /// `Debug` is what a log line uses, and the whole config — this struct
+    /// included — is logged whenever it is parsed. Both redacted fields are
+    /// live credentials: the seed is half of a second factor, and the token is
+    /// the whole of one until somebody spends it.
+    #[test]
+    fn a_client_prints_no_credentials() {
+        let mut c = client();
+        c.secret = "JBSWY3DPEHPK3PXP".to_string();
+        c.pending_enrollment = Some("deadbeef".to_string());
+
+        let rendered = format!("{c:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("JBSWY3DPEHPK3PXP"), "{rendered}");
+        assert!(!rendered.contains("deadbeef"), "{rendered}");
     }
 
     #[test]

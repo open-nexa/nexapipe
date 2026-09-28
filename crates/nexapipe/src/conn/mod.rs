@@ -493,11 +493,21 @@ async fn enroll_client(
 
     // Is there a client at all, and does it have this token outstanding? Asked
     // before anything is mutated so the refusal paths stay a single read.
+    // An empty token is refused on both sides before the comparison runs.
+    // `constant_time_eq` answers true for two empty slices, so a config holding
+    // `pending_enrollment = ""` — what an operator naturally writes to "clear"
+    // the key — would accept any stranger's empty ENROLL_START and hand them a
+    // freshly generated secret, locking out every device already using this
+    // client id. The loader refuses that spelling too; this is the runtime half
+    // of the same rule, so a reload path that skips validation cannot revive it.
     let accepted = cfg.clients.get(client_id).is_some_and(|client| {
-        client
-            .pending_enrollment
-            .as_deref()
-            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
+        !token.is_empty()
+            && client
+                .pending_enrollment
+                .as_deref()
+                .is_some_and(|expected| {
+                    !expected.is_empty() && constant_time_eq(expected.as_bytes(), token.as_bytes())
+                })
     });
     if !accepted {
         drop(cfg);
