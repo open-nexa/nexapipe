@@ -90,7 +90,8 @@ Options:
   --version <x.y.z>      Package version. CI derives it from the v* tag and syncs it
                          into tauri.conf.json; locally it is injected through the
                          override config instead, so the working tree stays clean.
-                         Without this flag the version from tauri.conf.json is used.
+                         Default: the version in src-tauri/Cargo.toml, which has to
+                         match tauri.conf.json (the script refuses when it does not).
   --no-bundle            Build the binary only, skip packaging.
   --debug                Use the debug cargo profile (much faster Rust build).
   --skip-type-check      Frontend build runs "npx vite build", skipping vue-tsc.
@@ -160,10 +161,7 @@ esac
 CARGO_PROFILE="release"
 if $DEBUG_BUILD; then CARGO_PROFILE="debug"; fi
 
-# Same version grammar CI enforces when it derives the version from the v* tag.
-if [[ -n "$VERSION" ]] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-    die "invalid --version '$VERSION' (expected <major>.<minor>.<patch>, optionally with a -rc.1 style suffix)"
-fi
+# The version is resolved further down, once $SRC_TAURI_DIR exists.
 
 # ---------------------------------------------------------------------------
 # Paths (all derived from the script location, so any cwd works)
@@ -391,9 +389,32 @@ fi
 if $DEBUG_BUILD; then TAURI_ARGS+=(--debug); fi
 TAURI_ARGS+=(--config "$OVERRIDE_FILE")
 
+# Where the version came from, for the build plan below.
+VERSION_SOURCE="--version"
+if [[ -z "$VERSION" ]]; then
+    # Nothing passed, so the Rust package decides. src-tauri/Cargo.toml is what
+    # `cargo build` stamps into the binary, tauri.conf.json is what the bundler
+    # stamps into the .deb — they have to agree. A Cargo.toml left at 0.1.0 behind
+    # a config at 0.1.1 is exactly how a v0.1.1 release once shipped a bundle that
+    # still called itself 0.1.0. Read both and refuse on a mismatch rather than
+    # silently picking one.
+    VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SRC_TAURI_DIR/Cargo.toml" | head -n 1)"
+    CONF_VERSION="$(node -e 'const fs=require("node:fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j.version ?? ""))' "$SRC_TAURI_DIR/tauri.conf.json" 2>/dev/null)"
+    [[ -n "$VERSION" ]] || die "cannot read a package version from $SRC_TAURI_DIR/Cargo.toml — pass --version explicitly"
+    if [[ "$CONF_VERSION" != "$VERSION" ]]; then
+        die "version mismatch: src-tauri/Cargo.toml says '$VERSION' but tauri.conf.json says '${CONF_VERSION:-(none)}'. Make them agree, or pass --version to override both."
+    fi
+    VERSION_SOURCE="src-tauri/Cargo.toml"
+fi
+
+# Same version grammar CI enforces when it derives the version from the v* tag.
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid version '$VERSION' (expected <major>.<minor>.<patch>, optionally with a -rc.1 style suffix)"
+fi
+
 step "Build plan"
 printf '  %-18s %s\n' "working dir:"  "$DESKTOP_DIR"
-printf '  %-18s %s\n' "version:"      "${VERSION:-(from tauri.conf.json)}"
+printf '  %-18s %s\n' "version:"      "$VERSION (from $VERSION_SOURCE)"
 printf '  %-18s %s\n' "frontend cmd:" "${BEFORE_BUILD:-(frontend build skipped)}"
 printf '  %-18s %s\n' "override:"     "$OVERRIDE_FILE"
 printf '  %-18s %s\n' "bundles:"      "$($NO_BUNDLE && echo '(none, --no-bundle)' || echo "$BUNDLES")"

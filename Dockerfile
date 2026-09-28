@@ -21,6 +21,9 @@ WORKDIR /app
 # Default location of the log files; docker-compose mounts a volume on top.
 RUN mkdir -p /app/logs
 
+# Where docker-compose mounts the config directory.
+RUN mkdir -p /app/config
+
 COPY --from=builder /app/target/release/nexapipe /usr/local/bin/nexapipe
 
 # iroh carries every authenticated client, so nothing has to be published for
@@ -32,7 +35,9 @@ COPY --from=builder /app/target/release/nexapipe /usr/local/bin/nexapipe
 # config.toml is **not** copied in: it holds the 2FA secrets under
 # [auth.clients], which are the whole credential for the iroh listener. It is
 # mounted at run time (see docker-compose.yaml) so it never lands in an image
-# layer.
+# layer. The mount is a *directory* — /app/config — because a single-file bind
+# mount is pinned to one inode and stops following the file the moment anything
+# replaces it.
 
 ENTRYPOINT ["nexapipe"]
-CMD ["--config", "/app/config.toml"]
+CMD ["--config", "/app/config/config.toml"]

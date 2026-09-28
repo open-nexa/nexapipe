@@ -4,8 +4,9 @@ use crate::auth::AuthConfig;
 use crate::config::{HealthCheckConfig, IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
-use crate::health::HealthChecker;
+use crate::health::{HealthChecker, HealthProbes};
 use crate::http;
+use crate::lb::BackendPool;
 use crate::log;
 use crate::passthrough;
 use crate::routes::RouteConfig;
@@ -13,7 +14,7 @@ use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
 use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
@@ -30,29 +31,26 @@ use tokio::net::TcpListener;
 pub type HttpClient =
     legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
 
-/// One background `GET /health` probe per `http` route.
+/// One background `GET /health` probe per `http` route, kept in step with the
+/// routes that are live.
 ///
-/// Called again after a reload, so it only starts checkers for routes it has not
-/// seen before: a probe runs until the process ends, and re-starting one per
-/// reload would pile up tasks that all poke the same backend. The trade-off is
-/// that a route deleted from the config keeps being probed — harmless, because
-/// its pool is no longer reachable from the routing table, but it does keep
-/// logging if that backend really is gone.
-pub async fn spawn_health_checks(
+/// Called at startup and again after every reload, and it reconciles rather
+/// than only adding: a probe whose route was deleted, or whose backends
+/// changed, is stopped, because it is watching a pool the routing table no
+/// longer hands out. What is left running is a probe whose pool is still the
+/// live one — which is what keeps a reload from silently unhooking health
+/// checks from the pool traffic actually uses.
+pub async fn sync_health_checks(
     config: &Arc<RouteConfig>,
     http_client: &Arc<HttpClient>,
-    seen: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+    probes: &tokio::sync::Mutex<HealthProbes>,
     health: &HealthCheckConfig,
     enabled: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Backends that cannot answer a probe are a supported deployment, not an
-    // error, so the whole loop is skipped rather than configured around.
-    if !health.enabled {
-        tracing::debug!("Health checks disabled, no probes started");
-        return;
-    }
-
-    let mut seen = seen.lock().await;
+    // Which routes want a probe right now, and on which pool. Taken before the
+    // lock on the probes, because none of it depends on them.
+    let mut wanted: std::collections::HashMap<String, Arc<BackendPool>> =
+        std::collections::HashMap::new();
 
     for route in config.routes().await {
         // Only an http:// backend answers `GET /health`. A passthrough backend is
@@ -73,29 +71,37 @@ pub async fn spawn_health_checks(
             continue;
         }
 
-        let key = format!(
-            "{}|{:?}",
-            route.host_pattern(),
-            route.backend_pool().backends().await
-        );
-        if !seen.insert(key) {
+        wanted.insert(route.pool_key().await, route.backend_pool().clone());
+    }
+
+    let mut probes = probes.lock().await;
+
+    // Before anything is started: a probe is only worth keeping if the route it
+    // belongs to still wants a probe on that same pool.
+    probes.stop_stale(&wanted);
+
+    // Backends that cannot answer a probe are a supported deployment, not an
+    // error, so nothing is started rather than configured around it.
+    if !health.enabled {
+        tracing::debug!("Health checks disabled, no probes started");
+        return;
+    }
+
+    for (key, backend_pool) in wanted {
+        if probes.contains(&key) {
             continue;
         }
 
-        let backend_pool = route.backend_pool().clone();
-        let http_client_clone = http_client.clone();
         let health_checker = HealthChecker::new(
-            backend_pool,
-            http_client_clone,
+            backend_pool.clone(),
+            http_client.clone(),
             std::time::Duration::from_secs(health.interval.max(1)),
             std::time::Duration::from_secs(health.timeout.max(1)),
             health.threshold,
             &health.path,
             enabled.clone(),
         );
-        tokio::spawn(async move {
-            health_checker.run().await;
-        });
+        probes.spawn(key, backend_pool, health_checker);
     }
 }
 
@@ -133,22 +139,35 @@ pub async fn run_proxy(
 
     let http_client = Arc::new(http::create_http_client());
 
-    let health_seen = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let health_probes = Arc::new(tokio::sync::Mutex::new(HealthProbes::new()));
     let health_enabled = Arc::new(std::sync::atomic::AtomicBool::new(health_check.enabled));
     // Shared by both accept loops: a shutdown has to wait for the work they
     // spawned, not for a fixed number of seconds.
     let in_flight = Arc::new(InFlight::new());
-    spawn_health_checks(
+    sync_health_checks(
         &config,
         &http_client,
-        &health_seen,
+        &health_probes,
         &health_check,
         &health_enabled,
     )
     .await;
 
-    // 2FA state: the shared config plus the file its lockout counters persist to.
-    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
+    // 2FA state: the shared config plus the file its lockout counters persist
+    // to.
+    //
+    // Built even when the config carries no `[auth]` section. Leaving it absent
+    // would give the watcher nothing to reload into, so a deployment that
+    // started without 2FA could never turn it on while running — and adding the
+    // section to a live server is exactly what someone enabling it for the
+    // first time does. The default config is `enabled = false` with no clients,
+    // so until the file says otherwise this behaves like the no-2FA case:
+    // `conn::handle_connection` reads `enabled` per connection and skips the
+    // handshake while it is false.
+    let auth_state = Some(conn::AuthState::new(
+        auth_config.unwrap_or_default(),
+        config_path,
+    ));
 
     // The watcher needs three things to apply a reload: it rebuilds the routes,
     // restarts whatever health checks the new routes need, swaps in the
@@ -161,7 +180,7 @@ pub async fn run_proxy(
         config_path.to_string(),
         config.clone(),
         http_client.clone(),
-        health_seen,
+        health_probes,
         health_enabled,
         auth_state.clone(),
     ));
@@ -386,13 +405,18 @@ pub async fn run_proxy(
         conn_limiter.max()
     );
 
+    // Kept, rather than spawned and forgotten: the drain below counts work that
+    // is still running, and a listener that has not stopped accepting yet is
+    // still able to add to it. Its handle is the only way to know it has
+    // stopped.
+    let mut http_server = None;
     if let Some(http_listener) = http_listener {
         let config_clone = config.clone();
         let http_client_clone = http_client.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
         let in_flight_clone = in_flight.clone();
 
-        tokio::spawn(async move {
+        http_server = Some(tokio::spawn(async move {
             if let Err(e) = start_http_server(
                 http_listener,
                 config_clone,
@@ -404,7 +428,7 @@ pub async fn run_proxy(
             {
                 tracing::error!("HTTP server failed: {}", e);
             }
-        });
+        }));
     }
 
     loop {
@@ -417,14 +441,23 @@ pub async fn run_proxy(
                         let auth_state_clone = auth_state.clone();
                         let limiter_clone = conn_limiter.clone();
                         let in_flight_clone = in_flight.clone();
+                        // Counted out here, not in the task's first line: a
+                        // guard taken inside would leave a window in which the
+                        // connection is accepted but not yet counted, and a
+                        // shutdown landing in it sees zero and closes while
+                        // this connection is still being set up.
+                        let guard = in_flight_clone.enter();
                         tokio::spawn(async move {
-                            let _connection = in_flight_clone.enter();
+                            // Handed on rather than dropped here: it stands for
+                            // the connection, and the task that serves it is
+                            // what decides when that is over.
                             conn::handle_incoming(
                                 incoming,
                                 config_clone,
                                 http_client_clone,
                                 auth_state_clone,
                                 limiter_clone,
+                                guard,
                             )
                             .await;
                         });
@@ -435,12 +468,23 @@ pub async fn run_proxy(
                     }
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if shutdown_signal.is_shutdown_requested() {
-                    tracing::info!("Shutdown signal received, stopping proxy");
-                    break;
-                }
+            _ = shutdown_signal.requested() => {
+                tracing::info!("Shutdown signal received, stopping proxy");
+                break;
             }
+        }
+    }
+
+    // The plaintext listener is its own task: it shares the shutdown signal, so
+    // it leaves its accept loop on its own, but "on its own" says nothing about
+    // when. Waiting for the handle is what makes the count below mean
+    // something — until it returns, that loop can still accept a connection and
+    // add to what is being drained.
+    if let Some(handle) = http_server {
+        match handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => tracing::error!("HTTP server task panicked: {e}"),
+            Err(e) => tracing::error!("HTTP server task was cancelled: {e}"),
         }
     }
 
@@ -465,19 +509,47 @@ async fn start_http_server(
     shutdown_signal: Arc<ShutdownSignal>,
     in_flight: Arc<InFlight>,
 ) -> anyhow::Result<()> {
+    // Refusals since the last accepted connection. A listener that has run out
+    // of file descriptors fails again the moment it is asked, so without a
+    // pause this loop would spend the rest of the process writing log lines.
+    let mut refused_in_a_row = 0u32;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, addr) = result?;
+                let (stream, addr) = match result {
+                    Ok(accepted) => {
+                        refused_in_a_row = 0;
+                        accepted
+                    }
+                    Err(e) => {
+                        // One accept failure used to propagate and take the
+                        // listener down for good, while the iroh side carried
+                        // on serving: the port went quiet with nothing in the
+                        // log to say it had. A refusal is one connection, not
+                        // a verdict on the listener.
+                        refused_in_a_row += 1;
+                        tracing::error!("Plaintext listener failed to accept a connection: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            (refused_in_a_row.min(20) as u64) * 50,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
                 tracing::debug!("New connection on the plaintext listener from: {}", addr);
 
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 let remote_addr_str = addr.to_string();
                 let in_flight_clone = in_flight.clone();
+                // Counted here rather than in the task's first line, for the
+                // same reason as the iroh accept loop: an accepted connection
+                // that is not counted yet is one a shutdown cannot see.
+                let guard = in_flight_clone.enter();
 
                 tokio::spawn(async move {
-                    let _connection = in_flight_clone.enter();
+                    let _connection = guard;
                     // The listener speaks HTTP, but a client may also open a
                     // TLS session straight at it. One peeked byte tells the two
                     // apart — a request line can never start with 0x16 — and a
@@ -493,7 +565,16 @@ async fn start_http_server(
                         return;
                     }
 
-                    let http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
+                    // The timer is not on by default, and without it hyper has no
+                    // header read timeout: a client that opens a socket and
+                    // sends nothing holds the connection open for as long as it
+                    // likes. This is the listener an operator may expose.
+                    let mut http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
+                    http_builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Some(crate::conn::HEAD_READ_TIMEOUT));
+
                     let service = service_fn(move |req: hyper::Request<Incoming>| {
                         proxy_handler(req, config_clone.clone(), client_clone.clone(), remote_addr_str.clone())
                     });
@@ -504,11 +585,9 @@ async fn start_http_server(
                     }
                 });
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if shutdown_signal.is_shutdown_requested() {
-                    tracing::info!("Shutdown signal received, stopping HTTP server");
-                    break;
-                }
+            _ = shutdown_signal.requested() => {
+                tracing::info!("Shutdown signal received, stopping HTTP server");
+                break;
             }
         }
     }
@@ -588,6 +667,10 @@ async fn proxy_handler(
     let response = match http::proxy_request(&client, req, config.clone()).await {
         Ok(resp) => resp,
         Err(e) => {
+            // The detail goes to the log, not to the client: `e` is an
+            // internal one — a backend URL that would not parse, the address
+            // of the backend that did not answer — and a proxy sitting in
+            // front of a private network is not the place to publish those.
             tracing::error!("Proxy request failed: {}", e);
             let duration = start.elapsed();
             log::log_access(
@@ -600,7 +683,7 @@ async fn proxy_handler(
             );
             return Ok(http::create_error_response(
                 hyper::StatusCode::BAD_GATEWAY,
-                &format!("Proxy error: {}", e),
+                "Bad Gateway",
             ));
         }
     };

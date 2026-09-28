@@ -73,7 +73,7 @@ No approval is needed for read-only work: answering questions, reading files, se
 
 ## Commit & Pull Request Guidelines
 
-- The agent does **not** create commits (see Git Safety Rules). Hand the owner a ready-to-use commit message instead and let them commit.
+- The agent does **not** create commits on its own initiative (see Git Safety Rules). The one exception is an explicit instruction in the current task — "commit it" means commit; a passing verification run does not. Otherwise, hand the owner a ready-to-use commit message and let them commit.
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
 - Keep one logical change per commit.
 - Pull requests: describe what and why, link related issues, and add screenshots/videos for UI or VPN behavior changes.

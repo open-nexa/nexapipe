@@ -1,6 +1,6 @@
 [package]
 name = "nexa"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -41,6 +41,20 @@ bytes = "1"
 lazy_static = "1.4"
 parking_lot = "0.12"
 fastrand = "2"
+# The IPC token is the only thing standing between an elevated service and any
+# local process, so it is drawn from the OS CSPRNG rather than `fastrand` —
+# which is a fast non-cryptographic generator seeded from time and ASLR.
+getrandom = "0.3"
+# The IPC handshake answers a challenge with HMAC-SHA256(token, nonces) instead
+# of sending the token, so both sides prove they hold it without revealing it.
+hmac = "0.13"
+sha2 = "0.11"
+# Credentials (TOTP secrets, enrollment tokens, relay bearers) are encrypted at
+# rest with AES-256-GCM under a master key the OS keychain holds.
+aes-gcm = "0.10"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# The master key is wiped when it goes out of scope rather than left in freed memory.
+zeroize = "1"
 tun = { version = "0.8", features = ["async"] }
 libc = "0.2"
 nexapipe-client = { path = "../../crates/nexapipe-client", features = [

@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -22,6 +23,19 @@ use tokio::net::TcpListener;
 /// it), and anything that fails there would otherwise be visible only in this process's log —
 /// which is written under LocalSystem's profile and nobody can read. The desktop asks for it and
 /// shows it, exactly like it does for a process-mode start.
+/// How long a caller has to answer the challenge before it is dropped.
+///
+/// Only the unauthenticated part of the exchange is bounded: once a caller has proved itself it
+/// may sit idle indefinitely, because the desktop keeps one connection open for the lifetime of
+/// the app and an idle timeout there would break the thing this protects.
+///
+/// Kept longer than the client's own 5s wait for the challenge on purpose. The two are measuring
+/// different things — the client waits to be spoken to, this side waits to be answered — but if
+/// this one were the shorter of the pair, an honest caller that was merely slow would be dropped
+/// by a service it is still waiting on, which surfaces as a broken service rather than as a
+/// refusal.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn startup_error_slot() -> &'static Arc<tokio::sync::RwLock<Option<AppError>>> {
     static SLOT: std::sync::OnceLock<Arc<tokio::sync::RwLock<Option<AppError>>>> =
         std::sync::OnceLock::new();
@@ -110,9 +124,45 @@ impl ServiceRunner {
         let mut reader = BufReader::new(stream);
         let mut line = Vec::new();
 
+        // And this process speaks first, so a caller never hands anything to a
+        // peer that has not identified itself — see `IpcResponse::Challenge`.
+        let service_nonce = crate::service::ipc_token::random_nonce()?;
+        Self::write_response(
+            reader.get_mut(),
+            &IpcResponse::Challenge {
+                nonce: service_nonce.clone(),
+            },
+        )
+        .await?;
+
         loop {
             line.clear();
-            match Self::read_ipc_line(&mut reader, &mut line).await {
+
+            // Unauthenticated reads are the only ones with a deadline: a caller that connects,
+            // takes the challenge and then says nothing would otherwise hold this task — and its
+            // socket — for as long as it likes, which is a few dozen connections away from an
+            // elevated process that answers nobody.
+            let read = if authenticated {
+                Self::read_ipc_line(&mut reader, &mut line).await
+            } else {
+                match tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    Self::read_ipc_line(&mut reader, &mut line),
+                )
+                .await
+                {
+                    Ok(read) => read,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Dropping an IPC client that did not authenticate within {:?}",
+                            HANDSHAKE_TIMEOUT
+                        );
+                        break;
+                    }
+                }
+            };
+
+            match read {
                 // Peer gone, nothing left to answer.
                 Ok(0) => {
                     tracing::debug!("Client disconnected");
@@ -153,15 +203,16 @@ impl ServiceRunner {
             };
 
             if !authenticated {
-                let presented = match &msg {
-                    IpcMessage::Auth(token) => token.clone(),
+                let (caller_nonce, presented) = match &msg {
+                    IpcMessage::Auth { nonce, mac } => (nonce.clone(), mac.clone()),
                     other => {
                         // Obeyed nothing, answered once, connection closed.
                         tracing::warn!(
                             "Refusing an IPC client that spoke before authenticating: {:?}",
                             std::mem::discriminant(other)
                         );
-                        let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
+                        let response =
+                            IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
                         Self::write_response(reader.get_mut(), &response).await?;
                         break;
                     }
@@ -169,29 +220,47 @@ impl ServiceRunner {
 
                 // Every published token is a candidate: the service cannot tell which account
                 // dialled it, so which one happens to be found first says nothing about which
-                // one the caller holds.
+                // one the caller holds. The answer is bound to both nonces, so a recorded one
+                // is worth nothing on the next connection.
                 let known = crate::service::ipc_token::read_tokens()?;
-                if crate::service::ipc_token::token_matches_any(&known, &presented) {
-                    authenticated = true;
-                    tracing::debug!("IPC client authenticated");
-                } else if known.is_empty() {
-                    // No token published yet means no desktop session has asked for the
-                    // service, so there is nobody to answer.
-                    tracing::warn!("Refusing an IPC call with no token on file");
-                    let response = IpcResponse::Error(AppError::with_detail(
-                        codes::SERVICE_IPC_TOKEN,
-                        "no desktop session has published an IPC token",
-                    ));
-                    Self::write_response(reader.get_mut(), &response).await?;
-                    break;
-                } else {
-                    tracing::warn!("Refusing an IPC client that presented a wrong token");
-                    let response = IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
-                    Self::write_response(reader.get_mut(), &response).await?;
-                    break;
-                }
+                let matched = crate::service::ipc_token::token_for_auth(
+                    &known,
+                    &service_nonce,
+                    &caller_nonce,
+                    &presented,
+                );
 
-                Self::write_response(reader.get_mut(), &IpcResponse::Ok).await?;
+                let token = match matched {
+                    Some(token) => {
+                        authenticated = true;
+                        tracing::debug!("IPC client authenticated");
+                        token
+                    }
+                    None if known.is_empty() => {
+                        // No token published yet means no desktop session has asked for the
+                        // service, so there is nobody to answer.
+                        tracing::warn!("Refusing an IPC call with no token on file");
+                        let response = IpcResponse::Error(AppError::with_detail(
+                            codes::SERVICE_IPC_TOKEN,
+                            "no desktop session has published an IPC token",
+                        ));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!("Refusing an IPC client that answered the challenge wrong");
+                        let response =
+                            IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                };
+
+                // The caller proved itself; now this side proves itself back, so a caller
+                // that connected to something else on the port finds out.
+                let proof =
+                    crate::service::ipc_token::proof_mac(&token, &service_nonce, &caller_nonce);
+                Self::write_response(reader.get_mut(), &IpcResponse::AuthOk { mac: proof }).await?;
                 continue;
             }
 
@@ -227,8 +296,14 @@ impl ServiceRunner {
                 IpcMessage::GetStartupError => {
                     IpcResponse::StartupError(startup_error_slot().read().await.clone())
                 }
-                // Handled above, when the caller introduced itself.
-                IpcMessage::Auth(_) => IpcResponse::Ok,
+                // Handled above, when the caller introduced itself. A second
+                // handshake on a connection that already has one is refused
+                // rather than answered: there is nothing it could establish, and
+                // answering it would make this side sign arbitrary nonces for
+                // whoever is on the other end.
+                IpcMessage::Auth { .. } => {
+                    IpcResponse::Error(AppError::new(codes::SERVICE_UNAUTHORIZED))
+                }
             };
 
             Self::write_response(reader.get_mut(), &response).await?;
@@ -559,7 +634,11 @@ impl fmt::Display for IpcReadError {
 ///
 /// `code` names what was being validated, because "not loopback" is the same
 /// fact with two different fixes depending on which address it was.
-fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
+///
+/// Shared by both start paths: `start_proxy` calls it before the request is
+/// handed to either runner, and the service repeats it on its own side because
+/// a service binary built before that call existed may still be installed.
+pub fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(code, format!("{addr:?} is not a host:port address ({e})"))
     })?;
@@ -582,7 +661,9 @@ fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
 /// (`routing::configure_interface` walks [`TUN_BASE_CANDIDATES`]), which is *after* this
 /// validation runs — so an address inside any candidate block is accepted, and `retarget`
 /// later moves it into the block that took. See `proxy::tun_proxy` for the block policy.
-fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
+///
+/// Shared by both start paths, like [`require_loopback`].
+pub fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
@@ -630,6 +711,52 @@ mod tests {
             buf.len() <= MAX_IPC_LINE,
             "the oversized line must never be buffered"
         );
+    }
+
+    /// A caller that takes the challenge and then says nothing must not be able to hold a task
+    /// and a socket open for as long as it likes: this process runs elevated, so a handful of
+    /// such connections is enough to leave it answering nobody.
+    ///
+    /// The clock is paused rather than waited out, so the service's own deadline is what is
+    /// exercised — and the test finishes when the runtime advances to it, not ten seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_authenticates_is_dropped() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("the client connects");
+        let (mut server, _) = listener.accept().await.expect("the service accepts");
+
+        let manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::ProxyManager>>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        let handler =
+            tokio::spawn(async move { ServiceRunner::handle_client(&mut server, manager).await });
+
+        // The service speaks first. Take the challenge and then send nothing at all.
+        let mut challenge = Vec::new();
+        BufReader::new(&mut client)
+            .read_until(b'\n', &mut challenge)
+            .await
+            .expect("the challenge is readable");
+        assert!(!challenge.is_empty(), "the service opens with a challenge");
+
+        // Nothing more is ever written. The drop has to be a close the caller can see, not a
+        // silently abandoned task.
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .await
+            .expect("a dropped client is closed, not reset");
+
+        handler
+            .await
+            .expect("the handler ends")
+            .expect("dropping an unauthenticated client is not an error");
     }
 
     /// The reply has to end the line it is written on: `IpcClient::exchange` reads a *line*, so

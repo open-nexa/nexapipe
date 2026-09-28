@@ -1,4 +1,5 @@
-﻿pub mod error;
+﻿pub mod credentials;
+pub mod error;
 mod proxy;
 pub mod service;
 pub mod status;
@@ -177,6 +178,23 @@ async fn start_proxy(
         ));
     }
 
+    // Anything the caller spells out is checked before the request is handed to
+    // either runner. Absent means "take the default", and both defaults are
+    // loopback / TUN addresses by construction — they are re-checked below in
+    // case they ever stop being.
+    //
+    // What is at stake: `local_addr` fronts a proxy with nothing authenticating
+    // in front of it, so binding it anywhere but loopback publishes an open
+    // proxy to everyone who can reach the machine. That is the one thing the
+    // service side refuses on purpose, and until now only the service side
+    // refused it — the in-process path took the address as it came.
+    if let Some(addr) = local_addr.as_deref() {
+        service::runner::require_loopback(addr, codes::SERVICE_LOCAL_ADDR_NOT_LOOPBACK)?;
+    }
+    if let Some(addr) = dns_addr.as_deref() {
+        service::runner::require_tun_subnet(addr)?;
+    }
+
     if use_service {
         match IpcClient::start_proxy(StartProxyRequest {
             nodes: nodes.clone(),
@@ -260,6 +278,13 @@ async fn start_proxy(
     let local_addr = local_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
     let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
+
+    // The in-process path is the one that had no validation at all, so it
+    // re-checks after the defaults have been substituted: the caller's values
+    // were already refused above, and this catches a default that stops being
+    // loopback or leaves the TUN block.
+    service::runner::require_loopback(&local_addr, codes::SERVICE_LOCAL_ADDR_NOT_LOOPBACK)?;
+    service::runner::require_tun_subnet(&dns_addr)?;
 
     let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
 
@@ -793,6 +818,79 @@ async fn clear_logs() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Turns what the frontend names into one of the keys [`credentials`] knows.
+///
+/// The frontend sends a kind and, for per-node credentials, a node id: letting it
+/// spell the whole key would let it write entries nothing can ever read back, and
+/// would make the two sides agree by convention rather than by construction.
+fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppError> {
+    let kind = match kind {
+        "totp" => credentials::CredentialKind::TotpSecret,
+        "enrollment" => credentials::CredentialKind::EnrollmentToken,
+        "relay" => credentials::CredentialKind::RelayToken,
+        other => {
+            return Err(AppError::with_detail(
+                codes::CREDENTIALS_STORE_FAILED,
+                format!("{other:?} is not a credential kind"),
+            ))
+        }
+    };
+
+    // A per-node credential with no node named belongs to no node.
+    let node_id = node_id.unwrap_or_default();
+    if node_id.trim().is_empty() && !matches!(kind, credentials::CredentialKind::RelayToken) {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            format!("a {} credential needs a node id", kind.as_str()),
+        ));
+    }
+
+    Ok(credentials::secret_key(kind, &node_id))
+}
+
+/// One credential, decrypted. `None` when it was never stored.
+#[tauri::command]
+async fn get_credential(kind: String, node_id: Option<String>) -> Result<Option<String>, AppError> {
+    let key = credential_kind(&kind, node_id)?;
+    credentials::get(&key)
+}
+
+/// Writes one credential.
+#[tauri::command]
+async fn put_credential(
+    kind: String,
+    value: String,
+    node_id: Option<String>,
+) -> Result<(), AppError> {
+    let key = credential_kind(&kind, node_id)?;
+    credentials::put(&key, &value)
+}
+
+/// Forgets one credential: what "this server has no 2FA" and "the token has been
+/// spent" look like on this side.
+#[tauri::command]
+async fn delete_credential(kind: String, node_id: Option<String>) -> Result<(), AppError> {
+    let key = credential_kind(&kind, node_id)?;
+    credentials::remove(&key)
+}
+
+/// Forgets every credential, for a reset that also forgets the nodes they belong to.
+#[tauri::command]
+async fn clear_credentials() -> Result<(), AppError> {
+    for key in credentials::keys()? {
+        credentials::remove(&key)?;
+    }
+    Ok(())
+}
+
+/// Where the master key ended up: `"keychain"`, or `"file"` when no keychain would
+/// take it and the weaker fallback is in use. Reported so the UI can say so
+/// rather than let the two look alike.
+#[tauri::command]
+async fn credential_store_status() -> Result<String, AppError> {
+    Ok(credentials::status()?.as_str().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _guard = init_tracing("nexa.log");
@@ -831,7 +929,12 @@ pub fn run() {
             is_service_running,
             get_startup_error,
             get_logs,
-            clear_logs
+            clear_logs,
+            get_credential,
+            put_credential,
+            delete_credential,
+            clear_credentials,
+            credential_store_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

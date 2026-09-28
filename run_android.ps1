@@ -128,7 +128,6 @@ $RequiredSymbols = @(
     'Java_com_nexa_pipe_IrohProxy_nativeStartIroh',
     'Java_com_nexa_pipe_IrohProxy_nativeStartProxy',
     'Java_com_nexa_pipe_IrohProxy_nativePreconnect',
-    'Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy',
     'Java_com_nexa_pipe_IrohProxy_nativeStopProxy',
     'Java_com_nexa_pipe_IrohProxy_nativeAddNode',
     'Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy',

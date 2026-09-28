@@ -84,17 +84,20 @@ Other house rules:
 Bounded, real, and each one is useful on its own. Comments welcome before you
 start — say which one you are taking.
 
-**1. Allow-list client public keys** — any peer that learns the Node ID can
-complete the QUIC handshake. Add `endpoint_ids` under `[auth.clients.<id>]`,
-matched against `conn.remote_id()` in `handle_connection`
-(`crates/nexapipe/src/conn/mod.rs`). This is the single change that turns "knows
-the Node ID" into "is a registered device". *Medium.*
+**1. Drop the hop-by-hop headers a `Connection` header names** —
+`forwards_request_header` (`crates/nexapipe/src/http/mod.rs`) drops the fixed
+RFC 7230 §6.1 set, which is half of what the RFC asks for: a request that says
+`Connection: x-trace` also makes `x-trace` hop-by-hop, and that one is still
+forwarded. Parse the `Connection` value and drop what it names, on the way out
+as well as on the fixed set. *Small, and the RFC is the whole spec.*
 
-**2. Per-client authorization** — an authenticated client can reach every route.
-Add an optional `allow_hosts` per client and enforce it in the HTTP lookup
-(`crates/nexapipe/src/routes/`) and the L4 lookup
-(`crates/nexapipe/src/l4/mod.rs`). It does not need to become a full ACL engine;
-"different people reach different backends" is enough. *Medium.*
+**2. Refuse a DNS compression pointer that points forward** — `parse_dns_query`
+in `crates/nexapipe-client/src/tun_proxy.rs` (and its twin in
+`ui-desktop/src-tauri/src/proxy/dns.rs`) follows a `0xC0` pointer to any offset
+in the packet that is in range and does not loop. RFC 1035 §4.1.4 only allows a
+pointer to an *earlier* name, and a question pointing forward can name a domain
+that is not there at all. Refuse it the way an out-of-range pointer is already
+refused. *Small; the two copies have to stay in step.*
 
 **3. Per-device credentials** — 2FA is one symmetric secret shared by every
 device enrolled under a `client_id`, so a single device cannot be revoked and
@@ -112,16 +115,16 @@ fixes both. *Hard, and the largest item here.*
 proxy-to-backend hop is always plaintext. Accepting them lets an operator keep
 that hop encrypted when the backend is on another host. *Medium.*
 
-**6. Screenshots and a short demo** — the repo has no images at all. A
-screenshot of the Android flow (scan invite → reach a service) and one of the
-desktop app would do more for the project than several of the items above.
-*Easy, and no Rust required.*
+**6. A short demo** — `screenshots/` holds a few stills and the README links
+them, but there is no end-to-end walkthrough: one recording of the Android flow
+(scan invite → reach a service) and one of the desktop app would do more for the
+project than several of the items above. *Easy, and no Rust required.*
 
 ## Labels
 
 Mostly so that `good first issue` actually means something. That label is
 reserved for work that has a defined outcome, does not need project-wide context
-to start, and has someone willing to answer questions on it — like the seven
+to start, and has someone willing to answer questions on it — like the six
 listed above.
 
 | Label | Means |

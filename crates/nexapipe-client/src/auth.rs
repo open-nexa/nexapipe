@@ -86,6 +86,35 @@ impl TwoFactorConfig {
     }
 }
 
+/// Decodes a client-side Base32 secret.
+///
+/// The spelling is normalised first, because `base32` 0.5's `Rfc4648` alphabet
+/// decodes upper case only: a secret written in lower case — a hand-copied
+/// config, an app that stores what it was handed — decoded before the upgrade
+/// and is rejected now, with an error that names neither the spelling nor the
+/// case. Whitespace and `=` padding are dropped too; both are presentation
+/// rather than part of the secret, and grouping it is common enough that
+/// refusing it would only look pedantic.
+fn decode_base32(secret_base32: &str) -> Result<Vec<u8>, ClientError> {
+    let normalized: String = secret_base32
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    // An empty string decodes to an empty key, which would then generate codes
+    // from nothing and fail every handshake with no hint as to why. It is a
+    // missing secret, not a short one.
+    if normalized.is_empty() {
+        return Err(ClientError::InvalidConfig(
+            "Invalid Base32 secret".to_string(),
+        ));
+    }
+
+    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &normalized)
+        .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))
+}
+
 /// Client-side 2FA authenticator
 #[derive(Debug, Clone)]
 pub struct TwoFactorAuth {
@@ -103,8 +132,7 @@ impl TwoFactorAuth {
         secret_base32: &str,
         algorithm: TotpAlgorithm,
     ) -> Result<Self, ClientError> {
-        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
-            .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))?;
+        let secret = decode_base32(secret_base32)?;
 
         Ok(Self {
             client_id: client_id.to_string(),
@@ -123,8 +151,7 @@ impl TwoFactorAuth {
         time_step: u32,
         digits: u32,
     ) -> Result<Self, ClientError> {
-        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
-            .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))?;
+        let secret = decode_base32(secret_base32)?;
 
         Ok(Self {
             client_id: client_id.to_string(),
@@ -158,12 +185,17 @@ impl TwoFactorAuth {
     /// Sign a server challenge: HMAC-SHA256(secret, nonce || timestamp_le).
     ///
     /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`.
-    pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Vec<u8> {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+    ///
+    /// Fallible in the type only: HMAC takes a key of any length — a long one is
+    /// hashed, a short one is zero-padded — so this has never failed. It is
+    /// returned rather than `expect`ed because it runs inside a handshake, where
+    /// a panic would kill the connection with nothing to report.
+    pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Result<Vec<u8>, ClientError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
         mac.update(nonce);
         mac.update(&timestamp.to_le_bytes());
-        mac.finalize().into_bytes().to_vec()
+        Ok(mac.finalize().into_bytes().to_vec())
     }
 
     /// Turn a failed handshake read into an error that says what happened.
@@ -239,6 +271,27 @@ impl TwoFactorAuth {
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Result<(), ClientError> {
+        // Four round trips against a server this client may be meeting for the
+        // first time. The server's own deadline covers the first stream only, so
+        // a server that answers the challenge and then goes quiet is covered by
+        // nothing on either side — and in `Enrollment::exchange` this runs while
+        // the endpoint's lock is held, which would stall every other caller.
+        let handshake = self.authenticate_on_inner(conn, send, recv);
+        match tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(ClientError::ConnectionFailed(format!(
+                "the server did not finish the 2FA handshake within {}s",
+                AUTH_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    async fn authenticate_on_inner(
+        &self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<(), ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
 
         // Step 1: Send AUTH_START
@@ -266,21 +319,10 @@ impl TwoFactorAuth {
             .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send message: {}", e)))?;
 
         // Step 2: Receive AUTH_CHALLENGE
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
+        let nonce = match read_message(recv)
             .await
-            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE length", e))?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf)
-            .await
-            .map_err(|e| self.read_failure(conn, "failed to read the AUTH_CHALLENGE body", e))?;
-
-        let challenge_msg = AuthMessage::from_bytes(&msg_buf)
-            .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
-
-        let nonce = match challenge_msg {
+            .map_err(|e| self.read_failure(conn, "the AUTH_CHALLENGE could not be read", e))?
+        {
             AuthMessage::Challenge { nonce } => nonce,
             _ => return Err(ClientError::Other("Expected AUTH_CHALLENGE".to_string())),
         };
@@ -295,7 +337,7 @@ impl TwoFactorAuth {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let signature = self.sign_challenge(&nonce, response_timestamp);
+        let signature = self.sign_challenge(&nonce, response_timestamp)?;
 
         let response_msg = AuthMessage::Response {
             client_id: self.client_id.clone(),
@@ -320,19 +362,9 @@ impl TwoFactorAuth {
         })?;
 
         // Step 4: Receive AUTH_OK or AUTH_FAILED
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await.map_err(|e| {
-            self.read_failure(conn, "failed to read the authentication result length", e)
+        let result_msg = read_message(recv).await.map_err(|e| {
+            self.read_failure(conn, "the authentication result could not be read", e)
         })?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf).await.map_err(|e| {
-            self.read_failure(conn, "failed to read the authentication result body", e)
-        })?;
-
-        let result_msg = AuthMessage::from_bytes(&msg_buf)
-            .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))?;
 
         match result_msg {
             AuthMessage::Ok => Ok(()),
@@ -405,6 +437,21 @@ impl Enrollment {
     /// long as it lives, but an app that wants to survive a restart has to
     /// persist [`TwoFactorAuth::secret_base32`] and drop the token.
     pub async fn exchange(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
+        // The same deadline the handshake below gets, and for the same reason:
+        // a server that takes the ENROLL_START and never answers leaves this
+        // future pending forever, and callers hold the endpoint's lock while
+        // they wait for it.
+        let exchange = self.exchange_inner(conn);
+        match tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, exchange).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(ClientError::ConnectionFailed(format!(
+                "the server did not answer the enrollment within {}s",
+                AUTH_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    async fn exchange_inner(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
         use crate::auth::auth_protocol::AuthMessage;
 
         let (mut send, mut recv) = conn
@@ -523,6 +570,13 @@ fn message_name(message: &auth_protocol::AuthMessage) -> &'static str {
 /// trusted until it is in range.
 const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 
+/// How long the client waits for the server to finish the handshake.
+///
+/// Comfortably longer than the server's own five-second wait for the first
+/// stream: that one covers a client that never speaks, while this covers a
+/// server that answers and then stalls, which nothing else on either side does.
+const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Generate a new secret for client setup
 pub fn generate_secret() -> String {
     Secret::generate_secret().to_encoded().to_string()
@@ -629,5 +683,31 @@ mod tests {
         .unwrap();
         assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXP");
         assert_eq!(auth.algorithm_name(), "sha256");
+    }
+
+    /// `base32` 0.5 decodes upper case only, so a secret that is correct but
+    /// written in lower case — a hand-copied config, an app that stores what
+    /// it was handed — used to decode and would now be rejected.
+    #[test]
+    fn a_secret_decodes_in_any_spelling() {
+        for spelling in [
+            "JBSWY3DPEHPK3PXP",
+            "jbswy3dpehpk3pxp",
+            "JbSwY3dPeHpK3pXp",
+            "JBSW Y3DP EHPK 3PXP",
+            "jbswy3dpehpk3pxp==",
+        ] {
+            let auth = TwoFactorAuth::new("client-001", spelling, TotpAlgorithm::SHA1)
+                .unwrap_or_else(|e| panic!("{spelling:?} should decode: {e}"));
+            assert_eq!(auth.secret_base32(), "JBSWY3DPEHPK3PXP", "{spelling:?}");
+        }
+    }
+
+    /// The other half of the same guard: something that is not Base32 at all
+    /// is still refused, in whatever spelling.
+    #[test]
+    fn a_secret_that_is_not_base32_is_still_refused() {
+        assert!(TwoFactorAuth::new("client-001", "not-base32!", TotpAlgorithm::SHA1).is_err());
+        assert!(TwoFactorAuth::new("client-001", "", TotpAlgorithm::SHA1).is_err());
     }
 }

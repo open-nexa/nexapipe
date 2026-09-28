@@ -23,6 +23,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -56,6 +57,12 @@ class NexaVpnService : VpnService() {
     // @Volatile: written from the main thread (onStartCommand/onRevoke) and
     // read from IO coroutines (reconnect logic).
     @Volatile private var isRunning = false
+    // Set for good by stopVPN(), cleared by startVPN(): the service is on its
+    // way out, so an establish that is already running must not publish
+    // anything. Cancelling the scope cannot stop it — the native call chain
+    // blocks in Rust and has no suspension point a cancellation could hit — so
+    // the cooperation has to be explicit.
+    @Volatile private var isStopping = false
     private var allowedDomains = mutableSetOf<String>()
 
     private var connectivityManager: ConnectivityManager? = null
@@ -104,6 +111,13 @@ class NexaVpnService : VpnService() {
         super.onDestroy()
         stopVPN()
         unregisterNetworkCallback()
+        // Cancel the scope last: it is what would otherwise keep a slow
+        // establish alive past the service. nativeStartTunProxy blocks for
+        // tens of seconds, so this alone does not stop one that is already
+        // inside it — that is what the isStopping checks are for — but it does
+        // stop everything that was still waiting to run (a debounced
+        // reconnect, a warm-up) from running against a dead service.
+        serviceScope.cancel()
     }
 
     fun startVPN(domains: Set<String>) {
@@ -112,6 +126,11 @@ class NexaVpnService : VpnService() {
         // A new session begins: clear the stale "revoked" marker from a
         // previous session (consumed by VpnViewModel.syncVpnServiceState()).
         wasRevoked = false
+
+        // A new session clears the teardown marker: the same service instance
+        // is reused when the user stops and starts again without the process
+        // being recreated, and an establish must be allowed to run then.
+        isStopping = false
 
         val prepareIntent = prepare(this)
         if (prepareIntent != null) {
@@ -185,8 +204,11 @@ class NexaVpnService : VpnService() {
         // keep the main thread free.
         serviceScope.launch {
             stopVPN()
-            stopSelf()
+            // Notified before stopping: stopSelf() runs onDestroy(), which
+            // cancels this scope, and the UI would otherwise wait for a signal
+            // that the shutdown it triggered cut off.
             notifyVpnRevoked()
+            stopSelf()
         }
     }
 
@@ -195,6 +217,9 @@ class NexaVpnService : VpnService() {
         isUserStarted = false
         tunProxyStarted = false
         isServiceActive = false
+        // First, so an establish that is already running sees it however far
+        // it gets.
+        isStopping = true
         // Cancel an in-flight reconnect so it cannot race with this manual
         // disconnect.
         reconnectJob?.cancel()
@@ -230,7 +255,11 @@ class NexaVpnService : VpnService() {
             if (!establishVpnInternal()) {
                 Log.d(TAG, "VPN establishment failed")
                 isRunning = false
-                shutdownService()
+                // Nothing left to shut down when the service is already going
+                // away: startForeground() after stopSelf() is what throws
+                // ForegroundServiceDidNotStartInTimeException, and the service
+                // is being stopped anyway.
+                if (!isStopping) shutdownService()
             }
         }
     }
@@ -242,6 +271,14 @@ class NexaVpnService : VpnService() {
      *         isRunning state).
      */
     private suspend fun establishVpnInternal(): Boolean {
+        // A teardown that landed while this was still queued: none of what
+        // follows would outlive the service, so do not even ask Android for a
+        // TUN slot.
+        if (isStopping) {
+            Log.d(TAG, "Establish skipped: the service is stopping")
+            return false
+        }
+
         // Mutual-exclusion guard: Android allows only one active VpnService
         // TUN per user. If a foreign VPN app (e.g. Clash) currently owns the
         // slot, establish() would silently revoke it — refuse instead of
@@ -322,6 +359,18 @@ class NexaVpnService : VpnService() {
                 try {
                     ParcelFileDescriptor.adoptFd(fd).close()
                 } catch (_: Exception) {}
+                tunProxyStarted = false
+                return false
+            }
+
+            // The service can be stopped while the call above blocks in Rust;
+            // cancelling the scope never reached it, so ask again here. A
+            // notification published now would belong to a service that is
+            // gone, and the TUN proxy would outlive it.
+            if (isStopping) {
+                Log.d(TAG, "Service stopped during establish; discarding the TUN proxy")
+                runCatching { IrohProxy.nativeStopTunProxy() }
+                    .onFailure { Log.e(TAG, "nativeStopTunProxy after stop failed: ${it.message}") }
                 tunProxyStarted = false
                 return false
             }

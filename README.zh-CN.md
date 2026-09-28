@@ -141,8 +141,9 @@ Ticket (for clients):                 endpoint:...
 ```
 
 把 **Node ID**（稳定，但需要发现机制）或 **Ticket**（包含地址，地址变化时它也会变）
-交给客户端。设置 `[iroh] secret_key` 可以让 Node ID —— 以及随之而来的 Ticket ——
-在重启后保持不变：
+交给客户端。设置 `[iroh] secret_key` 可以让 Node ID —— 以及所有以 Node ID 为前提的
+东西 —— 在重启后保持不变。Ticket 不同：它固化的是打印时的那组地址，`secret_key`
+拦不住它过期，端点搬家后必须重新生成：
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -151,13 +152,58 @@ cargo run -p nexapipe -- --generate-secret
 ### Docker
 
 ```bash
+mkdir -p config && cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-`docker-compose.yaml` 挂载你的 `config.toml` 和一个 `logs/` 卷，并把
-`NEXAPIPE_LOG_DIR` 指向该挂载点。`host.docker.internal` 已配置好，因此运行在
-Docker 宿主机上的后端可以被访问到。
+`docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）
+和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向该挂载点。`host.docker.internal`
+已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
+`mkdir -p config && mv config.toml config/config.toml`。
+
+#### 修改配置文件
+
+配置文件每 5 秒重新读取一次，改动无需重启 —— 但**凡是会写入这个文件的操作，
+都建议在容器内执行**：
+
+```bash
+# 用镜像自带的二进制，操作服务端真正在读的那份文件
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --registration
+```
+
+在宿主机上直接对这个挂载文件执行同样的命令，问题出在这几处：
+
+- **挂载必须是目录。** 单文件 bind mount 锁定的是容器启动时该路径对应的 inode，
+  凡是"写临时文件再 rename"的操作 —— `sed -i`、开了 atomic save 的编辑器、`mv` ——
+  都会让容器继续读那个被换走的文件：改动永远进不来，而且**不报任何错**。
+  `docker compose restart` 也没用，它不重建挂载；要 `docker compose up -d --force-recreate`。
+  compose 里写的 `./config:/app/config` 正是为此 —— 目录挂载每次按名字解析，
+  永远看得到当前那个文件；改回 `./config.toml:/app/config/config.toml` 就又把坑请回来了。
+- **两个写者，没有锁。** 每次发生 2FA 尝试时，服务端都会重写整个文件，把
+  `failed_attempts` / `locked_until` / `last_used` 落盘（`save_auth_state`）。
+  两边的每次写入都是无锁的"读—改—写"，宿主机上的编辑和服务端的落盘一旦重叠，
+  就会丢掉其中一次。最坏的情况是 `pending_enrollment` 令牌：服务端从不把它写回，
+  所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
+- **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
+  `[iroh] secret_key` 推导，宿主机上那份配置若缺这个键 —— 或者 `nexapipe`
+  是另一个提交编出来的 —— 生成的邀请码会指向一个没人在跑的端点。
+- **权限与属主会被改掉。** 从宿主机重写后，文件可能变成 `0644` 或换了属主：
+  持有凭据的配置随后会在启动时被拒绝，而且权限不恢复到 `0600`，reload 就无法
+  把 2FA 打开。
+
+挂载刻意是**可写**的：服务端要把 2FA 计数写回这个文件，挂成 `:ro` 会让锁定期
+失去持久化，并且每次尝试都打一条错误日志。
+
+用编辑器改没问题，前提是**原地保存**（`vim` 的默认行为，以及 shell 的 `>`
+重定向）。改什么都别假设生效了，去日志里确认一次：
+
+```bash
+docker compose logs -f --tail=50 nexapipe | grep -i reload
+# Detected config change, reloading...  →  Config reloaded: 3 routes now live
+# Config not reloaded, keeping the current routes: ... → 被拒绝，旧路由继续服务
+```
 
 ---
 
@@ -193,6 +239,9 @@ Docker 宿主机上的后端可以被访问到。
 `[auth.clients]` 表无需重启；解析或校验失败的配置会被报告并忽略，因此一次只写了一
 半的编辑不会把代理搞 down。其余配置在启动时只读取一次，需要重启：
 `[server] listen_addr`、`[iroh]`、`[peers]`、`[auth]` 的 TOTP 参数，以及 `[log]`。
+
+`[auth]` 这一段也可以在原本没有的情况下出现：启动时没有该段的服务端，同样会在后续
+重载时拾取它的 `clients` 与 `enabled = true`，因此第一次开启 2FA 不需要重启。
 
 有两处改动在运行中的服务端上被刻意做成单向的：`[auth] enabled = true` 会被配置
 监视器拾取，但把 2FA 关掉会被拒绝（要禁用请重启）；而 `enabled = true` 与暴露的明文
@@ -248,6 +297,11 @@ domains = ["app.example.com"]
 它和其它路由一样具备负载均衡与健康检查。旧的顶层 `default_backend` 已**移除**：仍然
 写着它的配置会在启动时被拒绝，而不是被静默忽略，这样已有配置不会在无人察觉的情况下
 从"转发"变成"404"。
+
+通配符只有两种写法：单独的 `*`，或以 `*.` 开头。那个点是标签边界 —— 少了它，
+`*.example.com` 会连 `notexample.com` 一起匹配，而后一个域名只是恰好以同样的字母
+结尾，属于别人。`*example.com` 这类写法会在启动时被拒绝，`host_pattern` 与客户端的
+`allow_hosts` 一视同仁。
 
 ### `[server]` —— 直接入口（默认关闭）
 
@@ -377,6 +431,10 @@ path = "/health"   # 追加到后端 URL 之后
 重载配置会暂停已经在跑的检查；其余四个键在检查器启动时读取，改动需要重启，或对重载
 中出现的新路由立即生效。
 
+`interval`、`timeout`、`threshold` 都至少为 `1`：写 `0` 过去会被静默改成 `1`，而三者
+各自的含义都不是任何人想要的 —— 每秒一轮探测、永远无法完成的探测、或一次失败就摘空
+后端池。写 `0` 的配置在加载时会被拒绝。
+
 ### `[local_proxy]` —— 客户端模式
 
 ```toml
@@ -394,6 +452,31 @@ domains = ["app.example.com"]
 同一个域名可以出现在多个节点上，这正是跨多台服务器做负载均衡的方式。
 `[local_proxy]` 层级的 `server_ticket` 与 `server_node_id` 仍然可用但已废弃 ——
 优先使用 `[[local_proxy.nodes]]`。
+
+### `[peers]` —— 允许哪些 Node ID 连接
+
+这是最先执行的一道检查：在 QUIC 握手期间、连接被接受之前生效的客户端公钥
+白名单。名单外的对端只会收到一个应用错误码为 `5` 的关闭帧，此外什么都没有 ——
+不打开任何流，也不占用任何配额。
+
+```toml
+[peers]
+# 客户端的 Node ID，与应用中显示的完全一致。没有通配符形式：
+# 这些是 ed25519 公钥，不是主机名。
+allow = [
+  "a1b2c3d4e5f6...",
+  "0f1e2d3c4b5a...",
+]
+```
+
+它不是第二重因子，也不替代 2FA：它回答的是*这个 Node ID 是否该出现在这里*，
+而 2FA 回答的是*它是谁* —— 所以它是给关闭了 2FA 的服务端准备的开关，两者
+可以叠加使用。
+
+- **缺省或省略该键** —— 任何能连到端点的对端都继续进入下一道检查。
+- **写错会在启动时失败** —— 不是合法 Node ID 的条目是错误，不会被静默跳过。
+- **`allow = []` 会被拒绝** —— 那会把运维者自己锁在服务端之外。
+- **目前仅启动时读取**，与 `[iroh]` 一样。
 
 ### `[log]`
 
@@ -518,6 +601,10 @@ client_ports = [15432, 16432]       # 这条路由应答的端口
 它只决定*哪条*路由与一条流匹配，因此同一个主机可以在不同端口上有 `tcp` 路由、指向
 不同后端。不写 `client_ports` 时，所有端口都匹配。
 
+同一主机上两条路由都能匹配一条流时，**写了 `client_ports` 的那条胜出**（胜过"收所有
+端口"的那条）。没有这个优先级规则时，先声明的路由会永久胜出、后写的那条永远匹配不上，
+与书写顺序无关地失效。
+
 ### 代价
 
 L4 流是不透明的：访问日志记录的是字节数而不是请求行，也没有健康检查。并发按 QUIC
@@ -589,13 +676,15 @@ TOTP 握手。
    ```
 
 新增和变更的 `[auth.clients]` 条目会被配置监视器即时拾取，新增客户端无需重启；
-`[auth] enabled = true` 同样即时生效（对重载之后新建的连接）。TOTP 参数
+`[auth] enabled = true` 同样即时生效（对重载之后新建的连接）—— 启动时完全没有
+`[auth]` 段的服务端也是如此。TOTP 参数
 （`algorithm`、`time_step`、`digits`）在启动时只读取一次，需要重启。见
 `config.toml.2fa.example`。
 
-这些密钥是**唯一**把守 iroh 监听器的凭证，因此当 `[auth] enabled = true` 时，只要
-`config.toml` 可被其属主之外的任何账号读取或写入，服务端就**拒绝启动**
-（`chmod 600 config.toml`）；`[auth]` 关闭时它记录同样的警告后照常启动。没有凭证的
+这些密钥是**唯一**把守 iroh 监听器的凭证，因此只要 `config.toml` 里存着凭证 ——
+TOTP 种子、`[iroh] secret_key` 或 `relay_auth_token` —— 而它又可被其属主之外的
+任何账号读取或写入，服务端就**拒绝启动**（`chmod 600 config.toml`）。三者都没有的
+配置只记录同样的警告后照常启动，Docker bind mount 拿到的正是这种文件。没有凭证的
 客户端面对要求凭证的服务端同样会被拒绝：QUIC 握手成功，而服务端在握手期限（5 秒）内
 没有收到 `AUTH_START` 时会关闭连接。
 
@@ -659,6 +748,8 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 - **吊销即轮换。** 没有按设备吊销：`--generate-2fa client-001 --force` 会就地重写
   `config.toml`，所有用旧密钥注册过的设备都必须重新扫描；删除
   `[auth.clients.client-001]` 这一段则一次性吊销所有人。
+- 两种吊销都只作用于**之后建立的连接**：握手里拿到的授权是当时的快照，已经通过认证的
+  连接会一直用到它自己结束，轮换或删除都不会把它掐断。要立刻断开，重启服务端。
 
 ### 邀请一个尚不存在的客户端（`--create-client`）
 
@@ -849,7 +940,8 @@ TUN 栈由 Android 与桌面端共用，只有它基于 fd 的入口是 `cfg(tar
 - workspace 锁定 edition 2024，并通过 `[patch.crates-io]` 内置 smoltcp；请把
   `third_party/` 留在构建上下文中（Docker 已经这么做了）。平台相关代码始终放在
   cargo feature 之后（`jni`、`local-proxy`、`tun-proxy`、`uniffi`）。
-- CI（`.github/workflows/ci.yml`）只跑 Linux；`release.yml` 在打 tag 时覆盖多平台
+- CI（`.github/workflows/ci.yml`）在 Linux 与 macOS 上跑测试；桌面端 crate 在
+  Linux、macOS、Windows 上做 `cargo check`。`release.yml` 在打 tag 时覆盖多平台
   构建。含连字符的 tag（`v0.2.0-rc.1`）会作为 GitHub **pre-release** 发布，因此
   永远不会占据 "latest"。
 - 行内注释使用英文。

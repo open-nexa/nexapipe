@@ -35,413 +35,6 @@
     </issue>
 
     <issue
-        id="GradleDependency"
-        message="A newer version of androidx.core:core-ktx than 1.17.0 is available: 1.19.1"
-        errorLine1="coreKtx = &quot;1.17.0&quot;"
-        errorLine2="          ~~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="5"
-            column="11"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-runtime-compose than 2.10.0 is available: 2.11.0"
-        errorLine1="lifecycleRuntimeKtx = &quot;2.10.0&quot;"
-        errorLine2="                      ~~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="9"
-            column="23"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.10.0 is available: 2.11.0"
-        errorLine1="lifecycleRuntimeKtx = &quot;2.10.0&quot;"
-        errorLine2="                      ~~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="9"
-            column="23"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-viewmodel-compose than 2.10.0 is available: 2.11.0"
-        errorLine1="lifecycleRuntimeKtx = &quot;2.10.0&quot;"
-        errorLine2="                      ~~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="9"
-            column="23"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.activity:activity-compose than 1.12.4 is available: 1.13.0"
-        errorLine1="activityCompose = &quot;1.12.4&quot;"
-        errorLine2="                  ~~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="10"
-            column="19"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.camera:camera-camera2 than 1.4.2 is available: 1.6.2"
-        errorLine1="cameraX = &quot;1.4.2&quot;"
-        errorLine2="          ~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="12"
-            column="11"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.camera:camera-core than 1.4.2 is available: 1.6.2"
-        errorLine1="cameraX = &quot;1.4.2&quot;"
-        errorLine2="          ~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="12"
-            column="11"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.camera:camera-lifecycle than 1.4.2 is available: 1.6.2"
-        errorLine1="cameraX = &quot;1.4.2&quot;"
-        errorLine2="          ~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="12"
-            column="11"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.camera:camera-view than 1.4.2 is available: 1.6.2"
-        errorLine1="cameraX = &quot;1.4.2&quot;"
-        errorLine2="          ~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="12"
-            column="11"/>
-    </issue>
-
-    <issue
-        id="NewerVersionAvailable"
-        message="A newer version of org.jetbrains.kotlinx:kotlinx-coroutines-android than 1.7.3 is available: 1.11.0"
-        errorLine1="    implementation(&quot;org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3&quot;)"
-        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="build.gradle.kts"
-            line="168"
-            column="20"/>
-    </issue>
-
-    <issue
-        id="NewerVersionAvailable"
-        message="A newer version of com.google.zxing:core than 3.5.3 is available: 3.5.4"
-        errorLine1="zxing = &quot;3.5.3&quot;"
-        errorLine2="        ~~~~~~~">
-        <location
-            file="$HOME/rust/nexapipe/ui-android/gradle/libs.versions.toml"
-            line="13"
-            column="9"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="        Toast.makeText(context, context.getString(R.string.copied_toast, label), Toast.LENGTH_SHORT)"
-        errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="82"
-            column="33"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="            context.getString(R.string.two_factor_imported, config.clientId),"
-        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="114"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                message = context.getString(R.string.domain_removed, domain),"
-        errorLine2="                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="125"
-            column="27"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                actionLabel = context.getString(R.string.action_undo),"
-        errorLine2="                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="126"
-            column="31"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                                        context.getString(R.string.clipboard_label_endpoint_id)"
-        errorLine2="                                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="169"
-            column="41"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                                    context.getString(R.string.clipboard_label_endpoint_id)"
-        errorLine2="                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="270"
-            column="37"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                                            context.getString(R.string.clipboard_label_domain)"
-        errorLine2="                                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="600"
-            column="45"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                        context.getString(R.string.endpoint_id_updated),"
-        errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="638"
-            column="25"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                        error = context.getString(R.string.error_endpoint_id_empty)"
-        errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="875"
-            column="33"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                        error = context.getString(R.string.error_endpoint_id_exists, newId)"
-        errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/EndpointDetailScreen.kt"
-            line="877"
-            column="33"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                    cameraError = e.message ?: context.getString(R.string.scanner_camera_error)"
-        errorLine2="                                               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/QrScannerDialog.kt"
-            line="205"
-            column="48"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                        context.getString(R.string.two_factor_export_copied),"
-        errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/TwoFactorExportDialog.kt"
-            line="107"
-            column="25"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="            ?: return context.getString(R.string.invite_ticket_unsupported)"
-        errorLine2="                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="167"
-            column="23"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="            context.getString(R.string.invite_imported, invite.name ?: nodeId.take(8)),"
-        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="216"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                    context.getString(R.string.invite_conflict_2fa_current_client)"
-        errorLine2="                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="237"
-            column="21"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                add(context.getString(R.string.invite_conflict_2fa, client))"
-        errorLine2="                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="239"
-            column="21"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                add(context.getString(R.string.invite_conflict_relay))"
-        errorLine2="                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="244"
-            column="21"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="        add(context.getString(R.string.invite_summary_node, invite.target.value))"
-        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="251"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="        invite.name?.let { add(context.getString(R.string.invite_summary_name, it)) }"
-        errorLine2="                               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="252"
-            column="32"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="            context.getString("
-        errorLine2="            ^">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="254"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                    context.getString(R.string.invite_value_none)"
-        errorLine2="                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="257"
-            column="21"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                otp != null -> context.getString("
-        errorLine2="                               ^">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="264"
-            column="32"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                invite.enrollment != null -> context.getString("
-        errorLine2="                                             ^">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="269"
-            column="46"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                else -> context.getString(R.string.invite_summary_2fa_none)"
-        errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="273"
-            column="25"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="        invite.relay?.let { add(context.getString(R.string.invite_summary_relay, it)) }"
-        errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="276"
-            column="33"/>
-    </issue>
-
-    <issue
-        id="LocalContextGetResourceValueCall"
-        message="Querying resource values using LocalContext.current is not configuration-aware and may return stale values if the Configuration changes"
-        errorLine1="                        error = context.getString(R.string.invite_paste_empty)"
-        errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/nexa/pipe/ui/VpnControlScreen.kt"
-            line="1024"
-            column="33"/>
-    </issue>
-
-    <issue
         id="Typos"
         message="Did you mean &quot;SHA! &quot; instead of &quot;SHA1 &quot;?"
         errorLine1="    &lt;string name=&quot;two_factor_sha1&quot;>SHA1 (default)&lt;/string>"
@@ -481,7 +74,7 @@
         errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/vpn/NexaVpnService.kt"
-            line="588"
+            line="637"
             column="13"/>
     </issue>
 
@@ -492,7 +85,7 @@
         errorLine2="                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/vpn/NexaVpnService.kt"
-            line="612"
+            line="661"
             column="27"/>
     </issue>
 
@@ -660,7 +253,7 @@
         errorLine2="            ^">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="63"
+            line="74"
             column="13"/>
     </issue>
 
@@ -671,7 +264,7 @@
         errorLine2="            ^">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="63"
+            line="74"
             column="13"/>
     </issue>
 
@@ -682,7 +275,7 @@
         errorLine2="        ~~~~~~~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="84"
+            line="95"
             column="9"/>
     </issue>
 
@@ -693,7 +286,7 @@
         errorLine2="        ~~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="122"
+            line="133"
             column="9"/>
     </issue>
 
@@ -704,18 +297,18 @@
         errorLine2="        ~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="184"
+            line="195"
             column="9"/>
     </issue>
 
     <issue
         id="UseKtx"
         message="Use the KTX extension function `SharedPreferences.edit` instead?"
-        errorLine1="        prefs.edit()"
+        errorLine1="        prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()"
         errorLine2="        ~~~~~~~~~~~~">
         <location
             file="src/main/java/com/nexa/pipe/SettingsManager.kt"
-            line="217"
+            line="227"
             column="9"/>
     </issue>
 

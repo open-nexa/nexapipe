@@ -1,6 +1,7 @@
 use crate::auth::ClientAcl;
 use crate::config::RouteMode;
 use crate::lb::{BackendPool, LoadBalancingStrategy};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -15,22 +16,95 @@ use tokio::sync::RwLock;
 /// every input go through here, so a config written with uppercase letters
 /// keeps working too.
 pub(crate) fn normalize_host(host: &str) -> String {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    // Every trailing dot, not just one: a name may arrive carrying more than
+    // the single dot of a fully-qualified spelling, and leaving one behind
+    // makes it a different string than the route it names.
+    let host = host.trim_end_matches('.');
+    // An IPv6 literal is bracketed in a `Host` header — that is how its port is
+    // told apart from the address — and may be written the same way in a
+    // config. The brackets are not part of the name, so both sides lose them
+    // here and a pattern spelled `[::1]` matches a request for `[::1]:8080`.
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     host.to_ascii_lowercase()
+}
+
+/// The host a `Host` header names, with the port taken off.
+///
+/// `split(':')` is wrong for IPv6 twice over: `[::1]:8080` yields `[`, and a
+/// bare `::1` yields the empty string. Either way the host matches no route
+/// and every request to it 404s. A bracketed literal keeps its brackets here;
+/// [`normalize_host`] drops them.
+pub(crate) fn host_without_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        match host.find(']') {
+            // Up to and including the closing bracket: a port can only follow
+            // it, and the colons inside belong to the address.
+            Some(end) => &host[..=end],
+            // A bracket that is never closed is not a port separator, so
+            // nothing is taken off.
+            None => host,
+        }
+    } else {
+        host.split(':').next().unwrap_or(host)
+    }
 }
 
 /// Whether a (already folded) host matches a (already folded) pattern.
 ///
 /// The one host-matching rule, shared by route patterns and
 /// [`ClientAcl`] allowlists so the two can never drift apart: an exact
-/// name, or a `*.suffix` wildcard.
+/// name, a `*.suffix` wildcard, or the bare `*` catch-all.
+///
+/// The dot is load-bearing. Without it a wildcard is a bare `ends_with`, so
+/// `*.example.com` would also match `notexample.com` — a host that merely
+/// ends in the same letters, belonging to somebody else entirely.
 pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        host.ends_with(suffix)
-    } else {
-        pattern == host
+    match pattern.strip_prefix('*') {
+        None => pattern == host,
+        // `*` on its own is the catch-all: how "send everything here" is
+        // spelled now that there is no default backend.
+        Some("") => true,
+        // A `*` followed by anything but a dot matches nothing. Those are
+        // refused when the config is loaded, so reaching here means the
+        // pattern came from somewhere that skipped the check — and the one
+        // thing it must not do is quietly match more than it says.
+        Some(rest) => rest
+            .strip_prefix('.')
+            .and_then(|suffix| host.strip_suffix(suffix))
+            // The label boundary: the apex itself is not under the wildcard,
+            // which is what DNS means by `*.example.com`.
+            .is_some_and(|prefix| prefix.ends_with('.')),
     }
 }
+
+/// Why `pattern` cannot be matched with, or `None` when it can.
+///
+/// Checked when a config is loaded rather than left to the matcher, because the
+/// failure mode of a loose wildcard is silent: `allow_hosts = ["*iakl.top"]`
+/// looks like it names one domain and in fact authorizes every host ending in
+/// those letters, `eviliakl.top` included. Refusing to start is the only
+/// answer an operator can see.
+pub(crate) fn host_pattern_error(pattern: &str) -> Option<String> {
+    if pattern.is_empty() {
+        return Some("is empty; name the host, or use \"*\" for every host".to_string());
+    }
+
+    // Not a wildcard at all, so there is nothing a `*` could get wrong.
+    let rest = pattern.strip_prefix('*')?;
+    match rest.strip_prefix('.') {
+        None if rest.is_empty() => None,
+        Some(suffix) if !suffix.is_empty() => None,
+        _ => Some(format!(
+            "\"{pattern}\" has to be \"*\" or start with \"*.\": the dot is what marks the \
+             label boundary, and without it the pattern also matches any host that merely \
+             ends in the same letters"
+        )),
+    }
+}
+
+/// The most a path is allowed to add to [`Route::priority`], so that length
+/// breaks ties between two routes instead of deciding the winner outright.
+const PATH_LENGTH_TIE_BREAK: u32 = 99;
 
 /// The extra knobs only `tcp` / `udp` routes have.
 ///
@@ -152,20 +226,37 @@ impl Route {
         self.matches_host(host) && path_matches
     }
 
+    /// How specific this route is; `best_match` keeps the highest.
+    ///
+    /// Tiers, not a sum: each one is worth strictly more than everything below
+    /// it can add up to. They used to be one number, so a `path_pattern` longer
+    /// than 101 characters outweighed an exact host — a route written for `*`
+    /// with a long path outranked the route written for the host itself, and
+    /// nothing in the logs said so.
     pub fn priority(&self) -> u32 {
-        let mut priority = 0;
+        // Three tiers, not two: the bare `*` matches everything, so it has to
+        // lose to a `*.suffix` wildcard, which loses to an exact name. Two
+        // tiers put the catch-all and a wildcard in the same one, and a tie
+        // goes to whichever was declared first — the declaration-order outcome
+        // this function exists to rule out.
+        let host = if self.host_pattern == "*" {
+            0
+        } else if self.host_pattern.starts_with('*') {
+            1
+        } else {
+            2
+        };
+        // Naming the ports it serves makes an L4 route more specific than one
+        // that takes every port for the same host. Without this tier,
+        // "port 443" and "any port" scored the same and the first one declared
+        // won for good, leaving the other route unreachable.
+        let ports = u32::from(self.l4.client_ports.is_some());
+        let path = u32::from(!self.path_is_prefix);
+        // Longest path wins between two otherwise equal routes, which is the
+        // point of a prefix match — but only as a tie-break, so it is capped.
+        let length = (self.path_pattern.len() as u32).min(PATH_LENGTH_TIE_BREAK);
 
-        if !self.host_pattern.starts_with('*') {
-            priority += 100;
-        }
-
-        if !self.path_is_prefix {
-            priority += 10;
-        }
-
-        priority += self.path_pattern.len() as u32;
-
-        priority
+        host * 10_000 + ports * 1_000 + path * 100 + length
     }
 
     pub fn host_pattern(&self) -> &str {
@@ -196,6 +287,30 @@ impl Route {
 
     pub fn backend_pool(&self) -> &Arc<BackendPool> {
         &self.backend_pool
+    }
+
+    /// What makes this the same route across a reload, for the two things that
+    /// hang off it: its backend pool and the health probe watching that pool.
+    ///
+    /// A host alone does not identify a route — two may share one and differ in
+    /// path or in the modes they serve, and each carries its own pool. The
+    /// backends are part of the key because a pool *is* its backends: change
+    /// them and the old pool is no longer the one traffic goes through, even
+    /// though the route looks the same.
+    pub async fn pool_key(&self) -> String {
+        // The strategy is part of what a pool *is*: a pool that hands requests
+        // out round-robin and one that picks at random are not the same object,
+        // and reusing the first for a route that now asks for the second makes
+        // an edit to the config do nothing — silently, and with nothing in the
+        // logs to suggest why.
+        format!(
+            "{}|{}|{:?}|{:?}|{:?}",
+            self.host_pattern,
+            self.path_pattern,
+            self.modes,
+            self.backend_pool.strategy(),
+            self.backend_pool.backends().await
+        )
     }
 
     pub fn path_rewrite(&self) -> &Option<String> {
@@ -377,9 +492,40 @@ impl RouteConfig {
         self.routes.read().await.clone()
     }
 
+    /// Swaps the routing table, keeping the pool of every route that is still
+    /// the route it was.
+    ///
+    /// A reload builds brand-new `Route`s from the file, and a brand-new
+    /// `BackendPool` with each. Everything that was handed a pool earlier —
+    /// above all the health probe, which holds its `Arc` and runs until the
+    /// process ends — would then be left holding a pool the routing table no
+    /// longer hands out: the probe would keep marking backends up and down
+    /// where no traffic can see it, and the live pool would go unprobed, so a
+    /// backend that died would stay in rotation until the next restart.
+    ///
+    /// Carrying the old pool over also keeps its health state. An edit to an
+    /// unrelated route is not a reason to decide that every backend is healthy
+    /// again.
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
         let mut routes = self.routes.write().await;
-        *routes = new_routes;
+
+        let mut previous: HashMap<String, Arc<BackendPool>> = HashMap::new();
+        for route in routes.iter() {
+            previous.insert(route.pool_key().await, route.backend_pool().clone());
+        }
+
+        let mut updated = Vec::with_capacity(new_routes.len());
+        for mut route in new_routes {
+            let key = route.pool_key().await;
+            // `remove`, not `get`: two routes can share a key, and each keeps
+            // its own pool rather than ending up sharing one.
+            if let Some(pool) = previous.remove(&key) {
+                route.backend_pool = pool;
+            }
+            updated.push(route);
+        }
+
+        *routes = updated;
         tracing::info!("Routes updated successfully");
     }
 }
@@ -1024,6 +1170,329 @@ mod tests {
                 .expect("the folded host reaches the L4 route")
                 .backend,
             "10.0.0.50:5432"
+        );
+    }
+
+    /// A reload keeps the pool of a route that did not change, which is what
+    /// lets the health probe already running keep watching the pool traffic
+    /// actually goes through.
+    #[tokio::test]
+    async fn a_reload_keeps_the_pool_of_a_route_that_did_not_change() {
+        let config = RouteConfig::new(vec![http_route(
+            "fn.iroh.iakl.top",
+            &["http://10.0.0.5:8080"],
+        )]);
+        let before = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        // A reload of the very same table, which is what an edit to a second
+        // route — or to any other section — looks like from here.
+        config
+            .update_routes(vec![http_route(
+                "fn.iroh.iakl.top",
+                &["http://10.0.0.5:8080"],
+            )])
+            .await;
+
+        let after = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged route must keep the pool it had, so its health probe stays attached"
+        );
+    }
+
+    /// The counterpart: a route that now points elsewhere is a different pool,
+    /// because a pool *is* the backends it dials.
+    #[tokio::test]
+    async fn a_route_that_changed_backends_gets_a_new_pool() {
+        let config = RouteConfig::new(vec![http_route(
+            "fn.iroh.iakl.top",
+            &["http://10.0.0.5:8080"],
+        )]);
+        let before = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        config
+            .update_routes(vec![http_route(
+                "fn.iroh.iakl.top",
+                &["http://10.0.0.9:8080"],
+            )])
+            .await;
+
+        let after = config
+            .routes()
+            .await
+            .first()
+            .expect("one route")
+            .backend_pool()
+            .clone();
+
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "new backends mean a new pool, and the old probe has to be stopped"
+        );
+    }
+
+    /// Two routes on one host, differing only in path, are not the same route
+    /// and must not be treated as one — sharing a key would leave one of them
+    /// without a health probe.
+    #[tokio::test]
+    async fn routes_sharing_a_host_are_still_different_routes() {
+        let mut route = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+        let same_host_other_path = {
+            let mut other = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+            other.path_pattern = "/api".to_string();
+            other
+        };
+
+        assert_ne!(
+            route.pool_key().await,
+            same_host_other_path.pool_key().await
+        );
+
+        route.path_pattern = "/api".to_string();
+        assert_eq!(
+            route.pool_key().await,
+            same_host_other_path.pool_key().await
+        );
+    }
+
+    /// A pool is its backends *and* the way it picks between them, so a reload
+    /// that changes only the strategy has to be a new pool. Keyed without it,
+    /// the old pool was reused and the edit did nothing, with no log line to
+    /// say why the traffic still went out the same way.
+    #[tokio::test]
+    async fn changing_only_the_strategy_is_a_different_pool() {
+        let round_robin = http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]);
+        let random = Route::new(
+            "fn.iroh.iakl.top",
+            "/",
+            true,
+            vec!["http://10.0.0.5:8080".to_string()],
+            LoadBalancingStrategy::Random,
+            RouteMode::Http,
+            None,
+        );
+
+        assert_ne!(round_robin.pool_key().await, random.pool_key().await);
+    }
+
+    /// The dot is what makes a wildcard a wildcard over *labels*. Without it
+    /// the match is a bare `ends_with`, and a host that merely ends in the same
+    /// letters — belonging to somebody else — is in.
+    #[test]
+    fn a_wildcard_stops_at_the_label_boundary() {
+        assert!(host_matches("*.example.com", "api.example.com"));
+        assert!(host_matches("*.example.com", "a.b.example.com"));
+
+        assert!(
+            !host_matches("*.example.com", "notexample.com"),
+            "a host that merely ends in the same letters is not under the wildcard"
+        );
+        assert!(
+            !host_matches("*.example.com", "example.com"),
+            "the apex is not under its own wildcard, the way DNS reads it"
+        );
+        assert!(host_matches("*", "anything.at.all"), "`*` is the catch-all");
+    }
+
+    /// A `*` with anything but a dot after it matches nothing: it is refused
+    /// when the config loads, and whatever slipped past the check must not
+    /// quietly match more than it says.
+    #[test]
+    fn a_wildcard_without_its_dot_matches_nothing() {
+        assert!(!host_matches("*iakl.top", "eviliakl.top"));
+        assert!(!host_matches("*iakl.top", "iakl.top"));
+    }
+
+    #[test]
+    fn a_loose_wildcard_is_refused_when_the_config_loads() {
+        assert!(host_pattern_error("*").is_none());
+        assert!(host_pattern_error("*.example.com").is_none());
+        assert!(host_pattern_error("example.com").is_none());
+
+        let why = host_pattern_error("*iakl.top").expect("*iakl.top must be refused");
+        assert!(why.contains("label boundary"), "{why}");
+        assert!(
+            host_pattern_error("").is_some(),
+            "an empty pattern names nothing"
+        );
+    }
+
+    /// An IPv6 literal carries colons of its own, so splitting on the first one
+    /// does not leave a host behind — it leaves `[`, and every request to that
+    /// host 404s.
+    #[test]
+    fn a_host_header_keeps_an_ipv6_literal_whole() {
+        assert_eq!(host_without_port("[::1]:8080"), "[::1]");
+        assert_eq!(host_without_port("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(host_without_port("api.example.com:8080"), "api.example.com");
+        assert_eq!(host_without_port("api.example.com"), "api.example.com");
+
+        // What the routing table is asked about, brackets dropped.
+        assert_eq!(normalize_host(host_without_port("[::1]:8080")), "::1");
+        assert_eq!(normalize_host("[::1]"), "::1");
+    }
+
+    /// A name may carry more than one trailing dot. Stripping a single one left
+    /// `a.example.com..` as `a.example.com.`, which is a different string than
+    /// the route it names.
+    #[test]
+    fn every_trailing_dot_is_dropped() {
+        assert_eq!(normalize_host("a.example.com"), "a.example.com");
+        assert_eq!(normalize_host("a.example.com."), "a.example.com");
+        assert_eq!(normalize_host("a.example.com.."), "a.example.com");
+        assert_eq!(normalize_host("A.Example.COM.."), "a.example.com");
+    }
+
+    /// The tiers: an exact host outranks a wildcard no matter how long the
+    /// wildcard's path is. They used to be one sum, so a path of 102 characters
+    /// outweighed the host.
+    #[test]
+    fn an_exact_host_beats_any_path_length() {
+        let long_path = "/".to_string() + &"x".repeat(200);
+        let exact = Route::new(
+            "api.example.com",
+            "/",
+            true,
+            vec!["a".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+        let wildcard_with_a_long_path = Route::new(
+            "*.example.com",
+            &long_path,
+            true,
+            vec!["b".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+
+        assert!(exact.priority() > wildcard_with_a_long_path.priority());
+    }
+
+    /// Two tcp routes for one host: the one that names its ports wins for those
+    /// ports, and the other one stays reachable for everything else. With no
+    /// tie-break the first declared won for good and the second never matched.
+    #[tokio::test]
+    async fn a_route_that_names_its_ports_wins_over_one_that_takes_them_all() {
+        let every_port = Route::new(
+            "ssh.example.com",
+            "/",
+            true,
+            vec!["fallback:22".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Tcp,
+            None,
+        );
+        // Declared second on purpose: declaration order must not decide it.
+        let only_443 = Route::new(
+            "ssh.example.com",
+            "/",
+            true,
+            vec!["tls-backend:443".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Tcp,
+            None,
+        )
+        .with_l4_options(L4Options {
+            client_ports: Some(vec![443]),
+            idle_timeout: None,
+        });
+
+        let config = RouteConfig::new(vec![every_port, only_443]);
+
+        assert_eq!(
+            config
+                .get_l4_backend("ssh.example.com", 443, RouteMode::Tcp)
+                .await
+                .expect("port 443 has a route")
+                .backend,
+            "tls-backend:443"
+        );
+        // The catch-all is not shadowed: a port it was the only answer for
+        // still reaches it.
+        assert_eq!(
+            config
+                .get_l4_backend("ssh.example.com", 22, RouteMode::Tcp)
+                .await
+                .expect("port 22 falls to the catch-all")
+                .backend,
+            "fallback:22"
+        );
+    }
+
+    /// A `*.suffix` wildcard is more specific than the bare `*`, so it wins in
+    /// either declaration order. Two tiers put them level and the winner was
+    /// whichever came first in the file — the thing tiers are for.
+    #[tokio::test]
+    async fn a_wildcard_host_beats_the_catch_all_in_either_order() {
+        let catch_all = http_route("*", &["http://10.0.0.1:8080"]);
+        let wildcard = http_route("*.example.com", &["http://10.0.0.2:8080"]);
+
+        let catch_all_first = RouteConfig::new(vec![catch_all.clone(), wildcard.clone()]);
+        assert_eq!(
+            catch_all_first
+                .get_backend("api.example.com", "/")
+                .await
+                .expect("the wildcard has a route")
+                .url,
+            "http://10.0.0.2:8080"
+        );
+
+        let wildcard_first = RouteConfig::new(vec![wildcard, catch_all]);
+        assert_eq!(
+            wildcard_first
+                .get_backend("api.example.com", "/")
+                .await
+                .expect("the wildcard has a route")
+                .url,
+            "http://10.0.0.2:8080"
+        );
+
+        // The catch-all is not shadowed: it still answers everything else.
+        assert_eq!(
+            wildcard_first
+                .get_backend("elsewhere.test", "/")
+                .await
+                .expect("the catch-all has a route")
+                .url,
+            "http://10.0.0.1:8080"
+        );
+    }
+
+    /// The end-to-end shape of the same thing: a request for an IPv6 literal
+    /// reaches the route written for that address.
+    #[tokio::test]
+    async fn a_request_for_an_ipv6_literal_reaches_its_route() {
+        let config = RouteConfig::new(vec![http_route("::1", &["http://10.0.0.5:8080"])]);
+
+        assert_eq!(
+            config
+                .get_backend(host_without_port("[::1]:8080"), "/")
+                .await
+                .expect("the literal host reaches the route")
+                .url,
+            "http://10.0.0.5:8080"
         );
     }
 }

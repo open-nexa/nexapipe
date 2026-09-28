@@ -75,12 +75,16 @@ impl<'a> TotpValidator<'a> {
             .decode_secret()
             .map_err(|_| AuthError::InvalidSecret)?;
 
+        // `timestamp` arrives from the client, so the subtraction is attacker
+        // controlled: `now - i64::MIN` overflows, which panics in a debug build
+        // and wraps in release. `abs_diff` cannot overflow — the distance
+        // between two i64 values always fits in a u64.
         let now = current_timestamp();
-        if (now - timestamp).abs() > TIMESTAMP_WINDOW_SECS {
+        if now.abs_diff(timestamp) > TIMESTAMP_WINDOW_SECS as u64 {
             return Err(AuthError::StaleTimestamp);
         }
 
-        let expected = hmac_signature(&secret, nonce, timestamp);
+        let expected = hmac_signature(&secret, nonce, timestamp)?;
         if !constant_time_eq(signature, &expected) {
             return Err(AuthError::ChallengeMismatch);
         }
@@ -108,11 +112,19 @@ impl<'a> TotpValidator<'a> {
 ///
 /// Keep in sync with `TwoFactorAuth::sign_challenge` in
 /// `crates/nexapipe-client/src/auth.rs`.
-pub(crate) fn hmac_signature(secret: &[u8], nonce: &[u8], timestamp: i64) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+pub(crate) fn hmac_signature(
+    secret: &[u8],
+    nonce: &[u8],
+    timestamp: i64,
+) -> Result<Vec<u8>, AuthError> {
+    // Fallible in the type only: HMAC takes a key of any length — a long one is
+    // hashed, a short one is zero-padded — so this has never failed. It is
+    // returned rather than `expect`ed because it runs inside a handshake, where
+    // a panic would drop the connection with nothing to report.
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::InvalidSecret)?;
     mac.update(nonce);
     mac.update(&timestamp.to_le_bytes());
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Length-safe constant-time comparison: an HMAC-SHA256 tag is never secret
@@ -174,3 +186,64 @@ impl std::fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::config::ClientAuth;
+    use std::collections::HashMap;
+
+    fn config_with_one_client() -> AuthConfig {
+        let client = ClientAuth {
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            created_at: String::new(),
+            allow_hosts: None,
+            pending_enrollment: None,
+            last_used: None,
+            failed_attempts: 0,
+            locked_until: None,
+        };
+
+        AuthConfig {
+            enabled: true,
+            clients: HashMap::from([("alice".to_string(), client)]),
+            ..AuthConfig::default()
+        }
+    }
+
+    /// The nonce a test signs over, minted the way the connection layer mints
+    /// its challenge (`conn::perform_authentication` draws 32 random bytes).
+    ///
+    /// These two tests never reach the signature check, so a literal would do
+    /// — but a constant sitting in a nonce slot is exactly what CWE-798 is
+    /// about, and it would be the one place in the tree where the challenge is
+    /// the same twice.
+    fn fresh_nonce() -> Vec<u8> {
+        (0..32).map(|_| rand::random::<u8>()).collect()
+    }
+
+    #[test]
+    fn a_timestamp_at_the_bottom_of_the_range_is_refused_rather_than_fatal() {
+        let config = config_with_one_client();
+        let validator = TotpValidator::new(&config);
+
+        let nonce = fresh_nonce();
+
+        // i64::MIN overflows `now - timestamp` — a panic in a debug build, a
+        // wrap in release, and reachable without authenticating.
+        let outcome = validator.verify_response("alice", &nonce, i64::MIN, b"signature", "000000");
+
+        assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
+    }
+
+    #[test]
+    fn a_timestamp_at_the_top_of_the_range_is_refused_rather_than_fatal() {
+        let config = config_with_one_client();
+        let validator = TotpValidator::new(&config);
+
+        let nonce = fresh_nonce();
+        let outcome = validator.verify_response("alice", &nonce, i64::MAX, b"signature", "000000");
+
+        assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
+    }
+}

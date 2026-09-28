@@ -30,7 +30,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
+use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
     encode_frame,
@@ -364,21 +364,31 @@ where
 
     let client_to_backend = async {
         let mut buf = vec![0u8; 4096];
+        // A cursor into `pending`, compacted once per read rather than after
+        // every frame: draining moves every byte behind a frame down, so a
+        // segment carrying N datagrams cost N memmoves over the whole tail.
+        let mut offset = 0usize;
+
         loop {
             // Drain every complete frame before reading again: one segment can carry
             // several datagrams, and the bytes left over from the preface may already
             // hold one.
             loop {
-                match decode_frame(&pending) {
+                match decode_frame(&pending[offset..]) {
                     Frame::Incomplete => break,
                     Frame::Ready { payload, consumed } => {
                         if let Err(e) = socket_up.send(payload).await {
                             tracing::debug!("L4 UDP: backend send failed: {}", e);
                             return;
                         }
-                        pending.drain(..consumed);
+                        offset += consumed;
                     }
                 }
+            }
+
+            if offset > 0 {
+                pending.drain(..offset);
+                offset = 0;
             }
 
             match tokio::time::timeout(idle, reader.read(&mut buf)).await {
@@ -415,7 +425,12 @@ where
             };
 
             frame.clear();
-            if encode_frame(&buf[..n], &mut frame).is_err() {
+            if let Err(e) = encode_frame(&buf[..n], &mut frame) {
+                // A datagram too large for a frame. There is no way to report it
+                // on a stream of datagrams, so it is dropped — but silently
+                // dropping is how a 65 508 byte datagram becomes unreachable
+                // with nothing in the logs to explain it.
+                tracing::debug!("L4 UDP: dropped a {} byte datagram: {}", n, e);
                 continue;
             }
             if let Err(e) = writer.write_all(&frame).await {
@@ -520,6 +535,11 @@ async fn read_preface<S>(
 where
     S: AsyncRead + Unpin,
 {
+    // One deadline for the whole preface: a per-read timeout is restarted by
+    // every byte, and a peer dribbling this out one byte at a time would hold
+    // the flow open for as long as it liked.
+    let deadline = tokio::time::Instant::now() + PREFACE_TIMEOUT;
+
     loop {
         match Preface::decode(&buf) {
             Ok(Some((preface, len))) => {
@@ -535,7 +555,7 @@ where
         // cannot make this loop buffer without bound.
         debug_assert!(buf.len() < MAX_PREFACE_LEN);
 
-        if !read_more(reader, &mut buf, PREFACE_TIMEOUT)
+        if !read_more_by(reader, &mut buf, deadline)
             .await
             .map_err(PrefaceFailure::Io)?
         {

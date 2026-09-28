@@ -152,21 +152,26 @@ pub async fn run_local_proxy(
     let local_proxy =
         Arc::new(LocalProxy::new(&listen_addr, proxy_domains, Arc::new(endpoint_group)).await?);
 
-    let local_proxy_clone = local_proxy.clone();
-    tokio::spawn(async move {
-        loop {
-            if shutdown_signal.is_shutdown_requested() {
-                tracing::info!("Shutdown signal received, stopping local proxy");
-                local_proxy_clone.stop();
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    });
+    // Waits for the notice instead of polling for it, and is aborted once
+    // `run()` is over: the watcher used to keep running — waking ten times a
+    // second — for the rest of the process, long after the listener it watched
+    // had stopped.
+    let stopper = {
+        let local_proxy = local_proxy.clone();
+        let shutdown_signal = shutdown_signal.clone();
+        tokio::spawn(async move {
+            shutdown_signal.requested().await;
+            tracing::info!("Shutdown signal received, stopping local proxy");
+            local_proxy.stop();
+        })
+    };
 
-    local_proxy.run().await?;
+    let result = local_proxy.run().await;
+    // Whatever brought `run()` back, there is nothing left to stop.
+    stopper.abort();
     local_proxy.close_all().await;
 
+    result?;
     Ok(())
 }
 

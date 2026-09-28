@@ -62,12 +62,44 @@ struct Inner {
     ip_to_domain: HashMap<u32, String>,
     /// The direction that keeps a domain's address stable across queries.
     domain_to_ip: HashMap<String, u32>,
+    /// When each address was last asked for, on a clock that only ever moves
+    /// forward. Every flow that reaches an address goes through
+    /// [`IpMapping::lookup_domain`], so "not asked for in a long time" is the
+    /// closest thing this mapping has to "nothing is using it".
+    used_at: HashMap<u32, u64>,
+    /// The clock behind [`Self::used_at`].
+    clock: u64,
     /// Next address to hand out; wraps around the pool.
     next: u32,
     /// First address of the pool (wrap-around lower bound).
     first: u32,
     /// Last address of the pool (wrap-around upper bound).
     last: u32,
+}
+
+impl Inner {
+    /// Number of addresses in the pool, both bounds included.
+    fn pool_len(&self) -> usize {
+        (self.last - self.first + 1) as usize
+    }
+
+    /// Records that `ip` is being used right now.
+    fn touch(&mut self, ip: u32) {
+        self.clock += 1;
+        self.used_at.insert(ip, self.clock);
+    }
+
+    /// The address that has been quiet for the longest.
+    ///
+    /// Only asked for when the pool is full, which is a few hundred addresses
+    /// at most, so the scan is cheaper than keeping the addresses sorted.
+    fn quietest_address(&self) -> u32 {
+        self.ip_to_domain
+            .keys()
+            .copied()
+            .min_by_key(|ip| self.used_at.get(ip).copied().unwrap_or(0))
+            .unwrap_or(self.first)
+    }
 }
 
 impl Default for IpMapping {
@@ -92,6 +124,8 @@ impl IpMapping {
             inner: Mutex::new(Inner {
                 ip_to_domain: HashMap::new(),
                 domain_to_ip: HashMap::new(),
+                used_at: HashMap::new(),
+                clock: 0,
                 next: u32::from(first),
                 first: u32::from(first),
                 last: u32::from(last),
@@ -109,33 +143,51 @@ impl IpMapping {
         let mut inner = self.locked();
 
         if let Some(&ip) = inner.domain_to_ip.get(&key) {
+            inner.touch(ip);
             return Ipv4Addr::from(ip);
         }
 
-        let ip = inner.next;
-        inner.next = if ip >= inner.last {
-            inner.first
+        // Before the pool is full the cursor always points at a free address,
+        // because it only ever moves forward. Once it is full, take the
+        // quietest address rather than whatever the cursor happens to have
+        // reached: evicting a name that still has flows on the address is what
+        // makes those flows' packets answer to the new name — traffic from one
+        // domain arriving on another's route.
+        let ip = if inner.ip_to_domain.len() < inner.pool_len() {
+            let ip = inner.next;
+            inner.next = if ip >= inner.last {
+                inner.first
+            } else {
+                ip + 1
+            };
+            ip
         } else {
-            ip + 1
+            inner.quietest_address()
         };
 
-        // The pool can be exhausted, and reusing an address a second name still
-        // claims would make the reverse lookup ambiguous — two domains, one
-        // address, whichever asked last wins, and packets land on the wrong
-        // route. So the previous owner is evicted: DNS answers live for 60 s, so
-        // its next query (or the one after) simply allocates a fresh address.
         if let Some(previous) = inner.ip_to_domain.insert(ip, key.clone()) {
             inner.domain_to_ip.remove(&previous);
         }
         inner.domain_to_ip.insert(key, ip);
+        inner.touch(ip);
 
         Ipv4Addr::from(ip)
     }
 
     /// The domain an address was handed out for, or `None` for an address this
     /// mapping never issued (which includes `.1`/`.2`/`.3`, the fixed ones).
+    ///
+    /// Also what marks the address as still in use: every flow has to look its
+    /// destination up here, so an address that keeps being asked for is not one
+    /// to hand to somebody else.
     pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<String> {
-        self.locked().ip_to_domain.get(&u32::from(*ip)).cloned()
+        let mut inner = self.locked();
+        let address = u32::from(*ip);
+        let domain = inner.ip_to_domain.get(&address).cloned();
+        if domain.is_some() {
+            inner.touch(address);
+        }
+        domain
     }
 
     /// Number of live mappings.
@@ -255,6 +307,27 @@ mod tests {
             mapping.allocate(&format!("host{i}.test"));
         }
         assert_eq!(mapping.allocate("late.test"), first);
+    }
+
+    /// The reason recycling looks at last use rather than the cursor: the
+    /// address the cursor reaches may still be carrying traffic, and its flows
+    /// would then be answered as the domain that took it over.
+    #[test]
+    fn recycling_takes_the_address_nothing_has_used_lately() {
+        let mapping =
+            IpMapping::with_range(Ipv4Addr::new(10, 0, 1, 16), Ipv4Addr::new(10, 0, 1, 17));
+        let busy = mapping.allocate("busy.test");
+        let quiet = mapping.allocate("quiet.test");
+
+        // `busy.test` keeps opening flows; `quiet.test` resolved once and has
+        // not been heard from since.
+        for _ in 0..3 {
+            assert_eq!(mapping.lookup_domain(&busy).as_deref(), Some("busy.test"));
+        }
+
+        let third = mapping.allocate("third.test");
+        assert_eq!(third, quiet, "the quiet address is the one recycled");
+        assert_eq!(mapping.lookup_domain(&busy).as_deref(), Some("busy.test"));
     }
 
     #[test]

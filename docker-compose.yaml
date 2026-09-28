@@ -4,10 +4,26 @@ services:
     container_name: nexapipe
     restart: unless-stopped
     volumes:
-      # `config.toml` is gitignored (it is the operator's live config), so create it first with
-      # `cp config.toml.2fa.example config.toml`. A missing host path makes Docker create an
-      # empty *directory* there and the server then fails to read it.
-      - ./config.toml:/app/config.toml
+      # The whole directory is mounted, not the file inside it. A single-file
+      # bind mount is pinned to the inode the path had when the container
+      # started, so anything that replaces the file — `sed -i`, an editor with
+      # atomic save, `mv` — leaves the container reading the copy that was
+      # swapped out, silently and forever. A directory mount is resolved by
+      # name on every lookup, so it always sees the current file.
+      #
+      # Create it first: `mkdir -p config`, then
+      # `cp config.toml.example config/config.toml`
+      # (`config.toml` is gitignored: it is the operator's live config), or
+      # `mv config.toml config/config.toml` for a deployment that already has
+      # one. Start from `config.toml.2fa.example` instead for 2FA — and mind
+      # its file mode, a config holding secrets is refused when it is not
+      # `0600`. A missing directory makes Docker create an empty one and the
+      # server then fails to read the file.
+      #
+      # Mounted read-write on purpose: the server writes the 2FA counters
+      # (`failed_attempts`, `locked_until`, `last_used`) back into this file, so
+      # a `:ro` mount costs a lockout its persistence and an error per attempt.
+      - ./config:/app/config
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
       - ./logs:/app/logs

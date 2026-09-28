@@ -21,6 +21,7 @@ const {
   setNodeTwoFactor,
   clearNodeTwoFactor,
   hasTwoFactor,
+  resetConfig,
 } = useConfigStore();
 
 const { t } = useI18n();
@@ -186,10 +187,12 @@ function loadExampleConfig() {
 }
 
 function clearConfig() {
-  localAddr.value = "127.0.0.1:8080";
-  dnsAddr.value = "198.18.0.254:53";
-  upstreamDns.value = "223.5.5.5:53";
-  loadBalancing.value = "round_robin";
+  // Reset the whole config rather than these four fields: every node carries a
+  // ticket and, once 2FA is set up, a TOTP secret, and resetting only the
+  // scalars left all of that in storage under a button that says clear. The
+  // deep watch above pulls the scalars back from the store, and the store
+  // persists on its own, so the credentials are gone from disk too.
+  resetConfig();
 }
 </script>
 

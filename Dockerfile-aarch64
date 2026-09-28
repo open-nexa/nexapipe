@@ -25,6 +25,9 @@ WORKDIR /app
 # Default location of the log files; docker-compose mounts a volume on top.
 RUN mkdir -p /app/logs
 
+# Where docker-compose mounts the config directory.
+RUN mkdir -p /app/config
+
 COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/nexapipe /usr/local/bin/nexapipe
 
 # The proxy listens for HTTP (and TLS passthrough) on [server] listen_addr and
@@ -32,5 +35,10 @@ COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/nexapipe /usr
 # container only connects out to.
 EXPOSE 8080
 
+# config.toml is **not** copied in either: it holds the 2FA secrets under
+# [auth.clients]. It is mounted at run time (see docker-compose.yaml), as the
+# directory /app/config — a single-file bind mount is pinned to one inode and
+# stops following the file as soon as anything replaces it.
+
 ENTRYPOINT ["nexapipe"]
-CMD ["--config", "/app/config.toml"]
+CMD ["--config", "/app/config/config.toml"]

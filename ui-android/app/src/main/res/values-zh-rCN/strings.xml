@@ -191,7 +191,6 @@
     <string name="error_endpoint_not_found">找不到端点：%1$s</string>
     <string name="error_no_domain_mappings">尚未配置任何域名映射，请先添加带域名的端点。</string>
     <string name="error_invalid_proxy_config">代理配置无效</string>
-    <string name="error_proxy_ports">无法在端口 %1$d..%2$d 上启动代理</string>
     <string name="error_no_backend_reachable">没有可用的后端（%1$s）。请确认端点 ID 是否正确、服务器是否在线。</string>
     <string name="error_preconnect_failed">后端可达性检查失败（nativePreconnect 返回 %1$d）。详情见日志。</string>
     <string name="error_cause">原因：%1$s。</string>
@@ -200,4 +199,5 @@
     <string name="error_unknown">未知错误</string>
     <string name="error_connection_failed">连接失败</string>
     <string name="error_all_attempts_failed">所有连接尝试均失败</string>
+    <string name="credential_protection_warning">此设备无法加密凭据（密钥库不可用），凭据将以未加密方式存储。</string>
 </resources>

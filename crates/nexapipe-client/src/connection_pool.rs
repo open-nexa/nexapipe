@@ -154,6 +154,12 @@ impl PooledConnection {
     fn is_live(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// True if this connection has been sitting in the pool unused for at least
+    /// `timeout`.
+    fn is_idle_for(&self, timeout: tokio::time::Duration) -> bool {
+        self.created_at.elapsed() >= timeout
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +167,13 @@ pub struct IrohConnectionPool {
     inner: Arc<IrohConnectionPoolInner>,
 }
 
+/// Lock order, observed everywhere: `connections`, then `link_kind`, then
+/// `ep` — and never nested.
+///
+/// Nesting is what makes a pool that dials while another task shuts it down
+/// deadlock-prone: `link_kind` is also taken by the per-connection path
+/// watcher, and `ep` by every dial, so holding one while waiting for another
+/// turns a slow shutdown into a stall for every request.
 struct IrohConnectionPoolInner {
     connections: Mutex<Vec<PooledConnection>>,
     ep: Arc<Mutex<Option<Endpoint>>>,
@@ -320,6 +333,21 @@ impl IrohConnectionPool {
             })
     }
 
+    /// The endpoint to dial from, cloned out of the mutex.
+    ///
+    /// A copy, not a guard: the QUIC handshake — and the 2FA stream that
+    /// follows it — runs for up to [`CONNECTION_TIMEOUT`], and `close_all`
+    /// needs the very same lock to close the endpoint. Holding the guard
+    /// across the handshake made shutdown lose that race, and the loser is not
+    /// the one you want: the JNI layer gives `close_all` eight seconds
+    /// (`CLOSE_ALL_TIMEOUT` in `jni.rs`) and then moves on, so the endpoint
+    /// stayed open for the rest of the process. `Endpoint` is a handle over
+    /// shared state, so cloning costs nothing and still dials from the
+    /// endpoint this pool was built with.
+    async fn endpoint(&self) -> Option<Endpoint> {
+        self.inner.ep.lock().await.clone()
+    }
+
     /// Test-only: whether this pool has credentials configured.
     #[cfg(test)]
     pub(crate) async fn has_two_factor(&self) -> bool {
@@ -438,9 +466,8 @@ impl IrohConnectionPool {
 
         // Drop stale connections before handing one out: anything already closed
         // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
-        connections.retain(|pooled| {
-            pooled.created_at.elapsed() < CONNECTION_IDLE_TIMEOUT && pooled.is_live()
-        });
+        connections
+            .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
 
         if let Some(pooled) = connections.pop() {
             return Ok(pooled.conn);
@@ -448,12 +475,11 @@ impl IrohConnectionPool {
 
         drop(connections);
 
-        let ep = self.inner.ep.lock().await;
-        let ep = ep.as_ref().ok_or_else(|| {
+        let ep = self.endpoint().await.ok_or_else(|| {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self.connect_and_auth(ep, CONNECTION_TIMEOUT).await?;
+        let conn = self.connect_and_auth(&ep, CONNECTION_TIMEOUT).await?;
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
 
         Ok(conn)
@@ -496,13 +522,12 @@ impl IrohConnectionPool {
         }
 
         let conn = {
-            let ep = self.inner.ep.lock().await;
-            let Some(ep) = ep.as_ref() else {
+            let Some(ep) = self.endpoint().await else {
                 return false;
             };
             match tokio::time::timeout(
                 PRECONNECT_TIMEOUT,
-                self.connect_and_auth(ep, PRECONNECT_CONNECT_TIMEOUT),
+                self.connect_and_auth(&ep, PRECONNECT_CONNECT_TIMEOUT),
             )
             .await
             {
@@ -557,12 +582,29 @@ impl IrohConnectionPool {
                 conn,
                 created_at: std::time::Instant::now(),
             });
+            return;
         }
+
+        // The pool is full, so this one is closed on the spot. Dropping the
+        // handle would close it just as surely, but silently: the peer would
+        // see a connection that vanished with no reason attached, which is
+        // indistinguishable from a crash on this side.
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            "Connection pool is full ({}), closing the connection that came back",
+            MAX_CONNECTIONS
+        );
+        conn.close(0u32.into(), b"connection pool full");
     }
 
     pub async fn close_all(&self) {
-        let mut connections = self.inner.connections.lock().await;
-        connections.clear();
+        // Scoped, not held: `endpoint.close()` below is awaited, and keeping
+        // `connections` across it would make every request wait on the
+        // endpoint's goodbye.
+        {
+            let mut connections = self.inner.connections.lock().await;
+            connections.clear();
+        }
         // Every connection is gone, so the last observed kind describes nothing any more.
         // Leaving it would let the UI keep showing "direct" for a backend it cannot reach.
         *self.inner.link_kind.lock().await = LinkKind::Unknown;
@@ -597,14 +639,16 @@ impl IrohConnectionPool {
     /// it would tear down a running tunnel and break every later dial with "Endpoint is
     /// closed".
     pub async fn drop_connections(&self) {
-        let mut connections = self.inner.connections.lock().await;
-        // Close before clearing: `close()` only marks the connection, so doing it while the
-        // pool still owns them is what stops a concurrent `get_connection` from handing one
-        // out in between.
-        for pooled in connections.iter() {
-            pooled.conn.close(0u32.into(), b"network changed");
+        {
+            let mut connections = self.inner.connections.lock().await;
+            // Close before clearing: `close()` only marks the connection, so doing it while the
+            // pool still owns them is what stops a concurrent `get_connection` from handing one
+            // out in between.
+            for pooled in connections.iter() {
+                pooled.conn.close(0u32.into(), b"network changed");
+            }
+            connections.clear();
         }
-        connections.clear();
         // Nothing is connected any more, so the last observed kind describes nothing.
         // Leaving it would let a UI keep showing "direct" for a backend it cannot reach.
         *self.inner.link_kind.lock().await = LinkKind::Unknown;
@@ -706,7 +750,12 @@ fn spawn_cleanup_task(inner: Weak<IrohConnectionPoolInner>) {
             };
             let mut connections = inner.connections.lock().await;
             let before = connections.len();
-            connections.retain(|pooled| pooled.is_live());
+            // Idle as well as closed: `get_connection` already dropped stale
+            // entries before handing one out, but nothing else ever ran, so a
+            // pool that stopped being used kept its connections — and the
+            // sockets, and the NAT mappings on both sides — until then.
+            connections
+                .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
             let removed = before - connections.len();
             if removed > 0 {
                 #[cfg(feature = "tracing")]

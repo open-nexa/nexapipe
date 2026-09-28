@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
 
 #[cfg(feature = "tracing")]
 use tracing;
@@ -46,7 +48,69 @@ fn debug_log_enabled() -> bool {
     false
 }
 
+/// Headers whose value is a credential, and so never belongs in a log.
+const SENSITIVE_HEADERS: [&str; 5] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+/// The headers of a request, with the values that carry credentials replaced.
+///
+/// Logging them whole put `Authorization` and `Cookie` into logcat on every
+/// request. Names and non-sensitive values are still what makes a dump useful
+/// when debugging, so only the values are dropped.
+fn redacted_headers(headers: &::http::HeaderMap) -> String {
+    let mut out = String::from("{");
+    for (name, value) in headers {
+        if SENSITIVE_HEADERS.contains(&name.as_str().to_lowercase().as_str()) {
+            out.push_str(&format!("{}: <redacted>, ", name));
+        } else {
+            out.push_str(&format!("{}: {:?}, ", name, value));
+        }
+    }
+    out.push('}');
+    out
+}
+
 const STREAM_BUF_SIZE: usize = 128 * 1024;
+
+/// Largest request header the local proxy collects, before it gives up on a
+/// peer that never ends one. Same order as the server's own head limit, and
+/// far above any real request: what it bounds is a client that keeps the
+/// connection open and dribbles bytes into it.
+const MAX_REQUEST_HEADER: usize = 64 * 1024;
+
+/// Whether what has been read of a request is over [`MAX_REQUEST_HEADER`].
+///
+/// The cap is on the header, not on the request: a small header followed by a
+/// body of any size is an ordinary upload, so what is measured is what precedes
+/// the terminator. Until one arrives, everything read so far is header as far as
+/// anyone can tell — which is the case that bounds a peer that never ends one.
+fn header_over_limit(request: &[u8], header_end: Option<usize>) -> bool {
+    header_end.unwrap_or(request.len()) > MAX_REQUEST_HEADER
+}
+
+/// How long the accept loop waits after an error before trying again, and how
+/// many it takes before it concludes the listener is not coming back.
+const ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(100);
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 10;
+
+/// How many connections are served at once.
+///
+/// Each one holds a [`STREAM_BUF_SIZE`] buffer (sometimes two), so this is what
+/// turns an unbounded number of connections into a bounded amount of memory.
+/// The same figure the server's `accept_bi` uses, which is not a coincidence:
+/// a caller is one connection either way.
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// One line per this many refused connections. A refusal is the caller's
+/// problem to retry, not a per-connection event worth a log line — and logging
+/// every one would let a caller that opens connections in a loop write to the
+/// log as fast as it can connect.
+const REJECTED_LOG_EVERY: usize = 100;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Number of attempts for opening a fresh iroh bi-stream for a new request.
 /// If the pooled connection is stale (already closed by the peer), `open_bi` or
@@ -60,6 +124,22 @@ pub struct LocalProxy {
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
     stopped: Arc<AtomicBool>,
+    /// Wakes the accept loop the moment the proxy is stopped, so it does not
+    /// have to give up on `accept()` every 100 ms to find out.
+    stop_notify: Arc<Notify>,
+    /// The per-connection tasks, so stopping the proxy ends them.
+    ///
+    /// A handler holds a pooled connection for as long as its peer keeps the
+    /// socket open, which is not this process's decision: without this a
+    /// "stopped" proxy would still be holding connections out of the pool, and
+    /// a `close_all` could not return them.
+    connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// How many of [`MAX_CONCURRENT_CONNECTIONS`] are still free.
+    ///
+    /// Held here rather than in the accept loop so both constructors get one;
+    /// the permits themselves move into the connection tasks, which is what
+    /// releases them.
+    permits: Arc<Semaphore>,
 }
 
 impl LocalProxy {
@@ -88,12 +168,11 @@ impl LocalProxy {
         };
         #[cfg(feature = "tracing")]
         tracing::info!("Local proxy listening on: {}", listen_addr);
-        Ok(Self {
-            listener: Arc::new(listener),
+        Ok(Self::shared(
+            Arc::new(listener),
             endpoint_group,
-            proxy_domains: Arc::new(proxy_domains),
-            stopped: Arc::new(AtomicBool::new(false)),
-        })
+            proxy_domains,
+        ))
     }
 
     pub async fn new_with_single_pool(
@@ -105,12 +184,28 @@ impl LocalProxy {
         let endpoint_group = EndpointGroup::new_with_single_pool(conn_pool).await;
         #[cfg(feature = "tracing")]
         tracing::info!("Local proxy listening on: {}", listen_addr);
-        Ok(Self {
-            listener: Arc::new(listener),
-            endpoint_group: Arc::new(endpoint_group),
+        Ok(Self::shared(
+            Arc::new(listener),
+            Arc::new(endpoint_group),
+            proxy_domains,
+        ))
+    }
+
+    /// The one place the two constructors' shared fields are filled in.
+    fn shared(
+        listener: Arc<TcpListener>,
+        endpoint_group: Arc<EndpointGroup>,
+        proxy_domains: Vec<String>,
+    ) -> Self {
+        Self {
+            listener,
+            endpoint_group,
             proxy_domains: Arc::new(proxy_domains),
             stopped: Arc::new(AtomicBool::new(false)),
-        })
+            stop_notify: Arc::new(Notify::new()),
+            connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+        }
     }
 
     pub async fn run(&self) -> Result<(), ClientError> {
@@ -118,6 +213,19 @@ impl LocalProxy {
         let listener = self.listener.clone();
         let proxy_domains = self.proxy_domains.clone();
         let endpoint_group = self.endpoint_group.clone();
+        let stop_notify = self.stop_notify.clone();
+        let permits = self.permits.clone();
+
+        // Refused connections are counted, but only reported every so often: a
+        // line each would let a caller that loops over connect() write to the
+        // log as fast as it can open sockets.
+        let mut rejected = 0usize;
+
+        // Accept errors that are not fatal: a moment with no file descriptors
+        // left, say. Counting them keeps the loop from spinning on a listener
+        // that is genuinely broken, which is the case the old single-error exit
+        // was there for.
+        let mut consecutive_accept_errors = 0usize;
 
         loop {
             if stopped.load(Ordering::Acquire) {
@@ -126,17 +234,64 @@ impl LocalProxy {
                 break;
             }
 
-            match tokio::time::timeout(tokio::time::Duration::from_millis(100), listener.accept())
-                .await
-            {
-                Ok(Ok((stream, addr))) => {
+            // `accept()` is cancel safe: a connection it has taken is never
+            // handed to another task, so losing this race only means the
+            // socket stays in the backlog until the loop comes back for it.
+            //
+            // `notify_one` — not `notify_waiters` — because a stop that lands
+            // in the gap between the flag check and the `notified()` future
+            // being created must still be remembered: `notify_one` stores a
+            // permit for a waiter that has not arrived yet, `notify_waiters`
+            // wakes only the ones already parked and would be lost.
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                _ = stop_notify.notified() => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!("Local proxy stopping");
+                    break;
+                }
+            };
+
+            match accepted {
+                Ok((stream, addr)) => {
+                    consecutive_accept_errors = 0;
+
+                    // Refused rather than queued. A caller made to wait would hold
+                    // its socket — and the 128 KiB buffer that comes with it — for
+                    // as long as the queue takes, which is the memory this cap
+                    // exists to bound in the first place.
+                    let permit = match permits.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            rejected = rejected.wrapping_add(1);
+                            if rejected % REJECTED_LOG_EVERY == 1 {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "Refusing a local proxy connection from {}: {} are already \
+                                     being served ({} refused so far)",
+                                    addr,
+                                    MAX_CONCURRENT_CONNECTIONS,
+                                    rejected
+                                );
+                            }
+                            // Dropped here, which closes it: no bytes read, no
+                            // buffer ever allocated for it.
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     #[cfg(feature = "tracing")]
                     tracing::debug!("New connection from: {}", addr);
 
                     let proxy_domains_clone = proxy_domains.clone();
                     let endpoint_group_clone = endpoint_group.clone();
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
+                        // Released when the task ends, however it ends: this is
+                        // what makes the permit a cap on live connections rather
+                        // than on connections ever accepted.
+                        let _permit = permit;
                         if let Err(e) = handle_local_connection(
                             stream,
                             proxy_domains_clone,
@@ -148,27 +303,66 @@ impl LocalProxy {
                             tracing::error!("Failed to handle local connection: {}", e);
                         }
                     });
+                    self.track_connection(handle);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
                     #[cfg(feature = "tracing")]
                     tracing::error!("Local proxy accept error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    continue;
+
+                    // Transient ones — out of file descriptors under a burst of
+                    // connections — used to end the loop, leaving the listener
+                    // open and nothing accepting from it. Back off and go round
+                    // again instead, but not forever.
+                    consecutive_accept_errors += 1;
+                    if consecutive_accept_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            "Local proxy accept failed {} times in a row, giving up",
+                            consecutive_accept_errors
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             }
         }
         Ok(())
     }
 
+    /// Remember a connection task so [`Self::stop`] can end it.
+    fn track_connection(&self, handle: JoinHandle<()>) {
+        let Ok(mut connections) = self.connections.lock() else {
+            return;
+        };
+        // A busy proxy would otherwise keep every handle it ever spawned:
+        // finished tasks are dropped here as they are noticed, and the rest in
+        // `abort_connections`.
+        connections.retain(|h| !h.is_finished());
+        connections.push(handle);
+    }
+
+    fn abort_connections(&self) {
+        let Ok(mut connections) = self.connections.lock() else {
+            return;
+        };
+        for handle in connections.drain(..) {
+            handle.abort();
+        }
+    }
+
     pub fn stop(&self) {
         #[cfg(feature = "tracing")]
         tracing::info!("Stopping local proxy");
         self.stopped.store(true, Ordering::Release);
+        self.stop_notify.notify_one();
+        // The handlers outlive `run()`: each one holds a pooled connection
+        // until its peer closes the socket, which is not a decision this
+        // process gets to make. Aborting is what lets a `close_all()` after
+        // `run()` actually return those connections.
+        self.abort_connections();
     }
 
     pub async fn close_all(&self) {
@@ -262,6 +456,18 @@ fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>)
 /// times, discarding the stale pooled connection on each failure so the retry
 /// gets a fresh connection.
 ///
+/// "Discarding" is the whole point, and it is what the retry buys: a
+/// connection whose path died still looks open to QUIC (`close_reason()` stays
+/// `None` until the idle timeout expires), so handing one back to the pool
+/// hands it to the next attempt — the pool is last-in-first-out — and the
+/// request fails [`OPEN_ATTEMPTS`] times on the same dead connection. Dropping
+/// the last handle closes it for real, and the next attempt dials again.
+///
+/// The cost is that a timeout is retried like any other failure, so one
+/// request can now wait [`OPEN_ATTEMPTS`] × [`STREAM_OPERATION_TIMEOUT`]
+/// before it gives up. Not retrying was worse: a half-open connection then
+/// stayed broken for every later request too.
+///
 /// Shared with [`crate::l4`]: the L4 tunnel needs the same recovery, and the
 /// preface it passes as `initial_data` is written by exactly this code path.
 pub(crate) async fn open_stream_with_retry(
@@ -287,12 +493,26 @@ pub(crate) async fn open_stream_with_retry(
                     e
                 );
                 last_err = Some(anyhow::anyhow!(e).into());
-                endpoint_group.return_connection(host, pooled_conn).await;
+                // Closed rather than dropped: another handle is held by the
+                // path watcher, so dropping this one would leave the
+                // connection open until that task got around to it.
+                pooled_conn.discard(b"the connection could not open a stream");
                 continue;
             }
             Err(_) => {
-                endpoint_group.return_connection(host, pooled_conn).await;
-                return Err(ClientError::TimeoutError);
+                jni_log!(
+                    "[DEBUG:local-proxy] open_bi timed out (attempt {}/{}), retrying on a fresh connection",
+                    _attempt,
+                    OPEN_ATTEMPTS
+                );
+                // A stream that never opened is a connection that does not
+                // work, whether or not QUIC has noticed it yet — the same
+                // stale-connection case as the branch above, so it gets the
+                // same treatment rather than ending the loop on the first
+                // attempt.
+                last_err = Some(ClientError::TimeoutError);
+                pooled_conn.discard(b"the connection never opened a stream");
+                continue;
             }
         };
 
@@ -306,7 +526,9 @@ pub(crate) async fn open_stream_with_retry(
                 e
             );
             last_err = Some(e.into());
-            endpoint_group.return_connection(host, pooled_conn).await;
+            // Same reasoning as the `open_bi` failures: a connection that
+            // could not take the first bytes is not one to hand back.
+            pooled_conn.discard(b"the connection would not take the first bytes");
             continue;
         }
 
@@ -319,6 +541,23 @@ pub(crate) async fn open_stream_with_retry(
             host, OPEN_ATTEMPTS
         ))
     }))
+}
+
+/// Ends the tasks it holds when it is dropped.
+///
+/// Dropping a `JoinHandle` detaches its task instead of cancelling it, so a
+/// handler that spawns the two halves of a tunnel and is then aborted by
+/// [`LocalProxy::stop`] used to leave both halves running: still holding the
+/// client socket and the pooled connection the stop was meant to release.
+/// The guard dies with the aborted future, and what it does is immediate.
+struct TunnelTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for TunnelTasks {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 pub(crate) async fn handle_local_connection<S>(
@@ -370,6 +609,14 @@ where
         header_end = Some(pos + 4);
     }
 
+    // The same cap as the loop below, applied to the first read: a header that
+    // arrives whole in one read never enters the loop, and would otherwise
+    // escape the limit entirely.
+    if header_over_limit(&request_buf, header_end) {
+        jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+        return Ok(());
+    }
+
     while header_end.is_none() {
         let n = match tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
@@ -399,6 +646,14 @@ where
             .position(|w| w == b"\r\n\r\n")
         {
             header_end = Some(search_start + pos + 4);
+        }
+
+        // A peer that keeps sending without ever ending its headers grows this
+        // buffer without bound — one read every 30s is enough, because each
+        // read is what resets the timeout above.
+        if header_over_limit(&request_buf, header_end) {
+            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+            return Ok(());
         }
     }
 
@@ -524,6 +779,15 @@ where
             }
         });
 
+        // Lives until this handler returns, and dies with it if it is aborted
+        // first — which is the only moment that matters: `stop()` cancels the
+        // task running this function, and the two halves above have to go with
+        // it or the tunnel outlives the proxy it belongs to.
+        let _tasks = TunnelTasks(vec![
+            client_task.abort_handle(),
+            backend_task.abort_handle(),
+        ]);
+
         tokio::select! {
             _ = &mut client_task => (),
             _ = &mut backend_task => (),
@@ -568,10 +832,10 @@ where
     if is_websocket_request_static(&request) {
         jni_log!("[DEBUG:local-proxy] WebSocket request, rewriting to absolute URI");
         jni_log!(
-            "[DEBUG:local-proxy] WebSocket request details: uri={}, host={}, headers={:?}",
+            "[DEBUG:local-proxy] WebSocket request details: uri={}, host={}, headers={}",
             request.uri(),
             host,
-            request.headers()
+            redacted_headers(request.headers())
         );
 
         // Find the first line (request line)
@@ -631,20 +895,33 @@ where
                                 return "client_eof";
                             }
                             Ok(n) => {
-                                jni_log!(
-                                    "[DEBUG:local-proxy] WS client->iroh: {}",
-                                    websocket_frame_preview(&buf[..n])
-                                );
-                                ws_buffer.extend_from_slice(&buf[..n]);
-                                let mut frames = Vec::new();
-                                parse_websocket_frames(&mut ws_buffer, &mut frames);
-                                for (opcode, payload) in frames {
-                                    if opcode == 1 || opcode == 8 {
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
-                                            opcode,
-                                            String::from_utf8_lossy(&payload)
-                                        );
+                                // Payload, not metadata: it costs a preview to
+                                // build and it is the user's traffic, so it is
+                                // only worth it while debugging.
+                                if debug_log_enabled() {
+                                    jni_log!(
+                                        "[DEBUG:local-proxy] WS client->iroh: {}",
+                                        websocket_frame_preview(&buf[..n])
+                                    );
+                                }
+                                // The buffer only feeds the dumps above, and it
+                                // only empties once a whole frame is in it: a
+                                // client that sends a frame header and then
+                                // nothing would grow it forever, logs or no
+                                // logs. So the decode is part of what is
+                                // switched off with them.
+                                if debug_log_enabled() {
+                                    ws_buffer.extend_from_slice(&buf[..n]);
+                                    let mut frames = Vec::new();
+                                    parse_websocket_frames(&mut ws_buffer, &mut frames);
+                                    for (opcode, payload) in frames {
+                                        if opcode == 1 || opcode == 8 {
+                                            jni_log!(
+                                                "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
+                                                opcode,
+                                                String::from_utf8_lossy(&payload)
+                                            );
+                                        }
                                     }
                                 }
                                 if let Err(e) = send.write_all(&buf[..n]).await {
@@ -673,10 +950,12 @@ where
                                 if first {
                                     first = false;
                                     let p = &buf[..std::cmp::min(n, 200)];
-                                    jni_log!(
-                                        "[DEBUG:local-proxy] WS first response: {}",
-                                        String::from_utf8_lossy(p)
-                                    );
+                                    if debug_log_enabled() {
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS first response: {}",
+                                            String::from_utf8_lossy(p)
+                                        );
+                                    }
                                 }
                                 if debug_log_enabled() {
                                     jni_log!(
@@ -684,7 +963,7 @@ where
                                         websocket_frame_preview(&buf[..n])
                                     );
                                 }
-                                if n <= 1024 {
+                                if n <= 1024 && debug_log_enabled() {
                                     jni_log!(
                                         "[DEBUG:local-proxy] WS iroh->client decoded: {}",
                                         String::from_utf8_lossy(&buf[..n])
@@ -705,6 +984,12 @@ where
 
                 let mut client_task = tokio::spawn(client_to_iroh);
                 let mut backend_task = tokio::spawn(iroh_to_client);
+                // See the CONNECT branch: this dies with the handler, and with
+                // it both halves of the WebSocket tunnel.
+                let _tasks = TunnelTasks(vec![
+                    client_task.abort_handle(),
+                    backend_task.abort_handle(),
+                ]);
 
                 let (closed_direction, close_reason) = tokio::select! {
                     result = &mut client_task => {
@@ -801,7 +1086,7 @@ where
                     if !response_sent {
                         response_sent = true;
                         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
-                        if !debug_preview.is_empty() {
+                        if !debug_preview.is_empty() && debug_log_enabled() {
                             jni_log!(
                                 "[DEBUG:local-proxy] Response preview: {}",
                                 String::from_utf8_lossy(&debug_preview)
@@ -821,7 +1106,7 @@ where
                 "[DEBUG:local-proxy] Response sent (late): {} bytes",
                 total_bytes
             );
-            if !debug_preview.is_empty() {
+            if !debug_preview.is_empty() && debug_log_enabled() {
                 jni_log!(
                     "[DEBUG:local-proxy] Response preview: {}",
                     String::from_utf8_lossy(&debug_preview)
@@ -834,11 +1119,17 @@ where
     // Regular HTTP request-response handling
     jni_log!("[DEBUG:local-proxy] Detected HTTP request, using request-response mode");
     jni_log!(
-        "[DEBUG:local-proxy] Request headers: {:?}",
-        request.headers()
+        "[DEBUG:local-proxy] Request headers: {}",
+        redacted_headers(request.headers())
     );
     let client_task = tokio::spawn(client_to_backend);
     let mut backend_task = tokio::spawn(backend_to_client);
+    // See the CONNECT branch: the client half is aborted below on the normal
+    // path, and both go when the proxy is stopped mid-request.
+    let _tasks = TunnelTasks(vec![
+        client_task.abort_handle(),
+        backend_task.abort_handle(),
+    ]);
 
     // Wait for the backend response to be fully relayed back to the client
     // (bounded for streaming/long-lived responses). We must NOT wait for the
@@ -1181,4 +1472,234 @@ pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LoadBalancingStrategy;
+    use iroh::Endpoint;
+    use iroh::endpoint::presets;
+
+    /// A proxy listening on an ephemeral port, with no backends behind it.
+    ///
+    /// Enough for the accept loop, which in these tests never gets as far as
+    /// dialling one. Built through `shared` rather than `new` because the test
+    /// needs the address `new` keeps to itself.
+    async fn listening_proxy() -> (LocalProxy, std::net::SocketAddr) {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            Vec::new(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a group with no backend still builds");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback listener needs no network");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        (
+            LocalProxy::shared(Arc::new(listener), Arc::new(group), Vec::new()),
+            addr,
+        )
+    }
+
+    fn spawn_run(proxy: &LocalProxy) -> JoinHandle<Result<(), ClientError>> {
+        let proxy = proxy.clone();
+        tokio::spawn(async move { proxy.run().await })
+    }
+
+    /// The cap is what turns memory into a bounded quantity: every connection
+    /// allocates a `STREAM_BUF_SIZE` buffer, so an accept loop that takes every
+    /// caller lets anything on the loopback interface spend this process's
+    /// memory one connection at a time.
+    ///
+    /// The refused socket is closed without a byte being read — it must not be
+    /// queued, because a queued caller holds the buffer while it waits.
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_refused() {
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let (proxy, addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // Hold the whole budget open. A connection that has sent nothing sits in
+        // the handler waiting for a request, which is the state being counted.
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_CONNECTIONS);
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.expect("the caller connects"));
+        }
+
+        // `track_connection` runs straight after each accept, so the number of
+        // tracked handles is the number being served. Waiting for it to reach the
+        // cap is what makes the next connection a refusal rather than a race.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proxy.connections.lock().unwrap().len() < MAX_CONCURRENT_CONNECTIONS {
+            assert!(
+                Instant::now() < deadline,
+                "the accept loop took only {} of {} connections",
+                proxy.connections.lock().unwrap().len(),
+                MAX_CONCURRENT_CONNECTIONS
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // One over the budget: closed immediately, with nothing read from it.
+        let mut extra = TcpStream::connect(addr).await.expect("the caller connects");
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut buf))
+            .await
+            .expect("a refusal closes the socket instead of leaving it open");
+        assert_eq!(
+            closed.expect("a refusal is a close, not an error"),
+            0,
+            "a connection beyond the cap must be closed, not queued"
+        );
+
+        // And the budget is released: once a caller hangs up, its slot comes back.
+        drop(held.pop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut probe = TcpStream::connect(addr).await.expect("the caller connects");
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(200), probe.read(&mut buf)).await {
+                // A timeout means the connection was accepted and is waiting for
+                // a request: the slot came back.
+                Err(_) => break,
+                Ok(Ok(0)) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no slot was released after a connection ended"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Ok(n)) => panic!("nothing is ever sent to a fresh connection, got {n} bytes"),
+                Ok(Err(e)) => panic!("a fresh connection is not reset: {e}"),
+            }
+        }
+
+        proxy.stop();
+        runner.abort();
+    }
+
+    /// `stop()` has to reach a loop that is parked in `accept()`, not one that
+    /// happens to look at a flag on the way past: with nothing to wake it, the
+    /// task stays on the listener for as long as the process lives.
+    #[tokio::test]
+    async fn stop_wakes_a_loop_that_is_waiting_for_a_connection() {
+        let (proxy, _addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // Long enough that the loop is definitely inside `accept()`.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        proxy.stop();
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), runner)
+                .await
+                .is_ok(),
+            "run() never returned after stop()"
+        );
+    }
+
+    /// The handlers outlive `run()`, so a proxy that only stops the loop would
+    /// leave them holding pooled connections. Stopping has to end them too.
+    #[tokio::test]
+    async fn stop_ends_the_connections_it_accepted() {
+        let (proxy, addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // A client that connects and then says nothing: the handler parks in
+        // its first read, which is the state that used to survive stop().
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the proxy is listening");
+
+        let tracked = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if proxy.connections.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(tracked.is_ok(), "the accepted connection was never tracked");
+
+        proxy.stop();
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), runner)
+                .await
+                .is_ok(),
+            "run() never returned after stop()"
+        );
+        assert!(
+            proxy.connections.lock().unwrap().is_empty(),
+            "stop() must drop the handles it aborted"
+        );
+
+        // Aborting the handler drops its socket, so the peer sees EOF instead
+        // of waiting out the handler's read timeout.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(tokio::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the client read never returned")
+            .expect("the client read failed");
+        assert_eq!(read, 0, "the handler kept its socket open after stop()");
+    }
+
+    /// The cap is on the header, not on the whole request: a short header
+    /// followed by a body larger than the cap is an ordinary upload, and used
+    /// to be refused for being one.
+    #[test]
+    fn the_header_limit_ignores_the_body() {
+        let mut request = b"POST /upload HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'x', MAX_REQUEST_HEADER * 4));
+
+        let header_end = header_terminator(&request);
+
+        assert!(!header_over_limit(&request, header_end));
+    }
+
+    /// A header that arrives whole in one read never enters the read loop, so
+    /// the first read is measured as well — otherwise the cap only ever applied
+    /// to a header split across two.
+    #[test]
+    fn an_oversized_header_is_refused_even_when_it_is_complete() {
+        let mut request = b"GET / HTTP/1.1\r\nX-Pad: ".to_vec();
+        request.extend(std::iter::repeat_n(b'a', MAX_REQUEST_HEADER));
+        request.extend_from_slice(b"\r\n\r\n");
+
+        let header_end = header_terminator(&request).expect("the terminator is written above");
+
+        assert!(header_over_limit(&request, Some(header_end)));
+    }
+
+    /// Until a terminator arrives, everything read is header as far as anyone
+    /// can tell — which is the case that bounds a peer that never ends one.
+    #[test]
+    fn a_header_that_never_ends_is_still_capped() {
+        let request: Vec<u8> = std::iter::repeat_n(b'a', MAX_REQUEST_HEADER + 1).collect();
+
+        assert!(header_over_limit(&request, None));
+        assert!(!header_over_limit(&request[..MAX_REQUEST_HEADER], None));
+    }
+
+    /// Where the header ends in `request`, if it ends at all.
+    fn header_terminator(request: &[u8]) -> Option<usize> {
+        request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+    }
 }

@@ -204,10 +204,6 @@ reviews:
         Imperative mood, descriptive, ideally under 72 characters. A scope prefix
         matching the area is encouraged, e.g. "fix(l4): ...", "feat(desktop): ...",
         "docs: ...".
-    # `description` only takes a mode in this schema version; the expectations are
-    # encoded as custom checks below so they can reference what the diff touches.
-    description:
-      mode: "warning"
     custom_checks:
       - name: "Wire format parity"
         mode: "warning"

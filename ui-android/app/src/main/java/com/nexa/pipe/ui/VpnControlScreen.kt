@@ -36,6 +36,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.R
+import com.nexa.pipe.SecretStore
 import com.nexa.pipe.locale.AppLanguage
 import com.nexa.pipe.locale.AppLocale
 import com.nexa.pipe.locale.label
@@ -67,6 +68,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
     val relayAuthToken by viewModel.relayAuthToken.collectAsState()
+    val credentialProtection by viewModel.credentialProtection.collectAsState()
 
     // The endpoints traffic is actually going through right now, each with the kind of path it
     // is using. Empty until the native side reports a connection, which is also what hides the
@@ -522,6 +524,34 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = lastErrorMessage ?: "",
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
+            // Below the error card rather than inside it: a failed connect and a
+            // device that cannot encrypt are two different problems, and one
+            // must not look like the other's explanation.
+            //
+            // Shown only when the fallback actually happened. Storing a credential
+            // in plaintext is deliberate — refusing to store it would cut the
+            // user off from their own endpoint — but it was silent, which is what
+            // made a device with a broken keystore look like a working one.
+            AnimatedVisibility(visible = credentialProtection != SecretStore.Protection.Sealed) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(12.dp)
+                    ) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = stringResource(R.string.credential_protection_warning),
                             color = MaterialTheme.colorScheme.onErrorContainer,
                             style = MaterialTheme.typography.bodySmall
                         )

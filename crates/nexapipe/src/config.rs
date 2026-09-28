@@ -2,6 +2,7 @@ use crate::routes::{L4Options, Route};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -35,7 +36,7 @@ pub struct ServerConfig {
     pub key_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
@@ -48,6 +49,34 @@ pub struct IrohConfig {
     /// If provided, the endpoint will have the same Node ID across restarts.
     /// Can be generated using `nexapipe --generate-secret` command.
     pub secret_key: Option<String>,
+}
+
+/// `Some(_)` becomes `Some("<redacted>")` for a `Debug` view.
+///
+/// Keeping the `Option` shape is the point: whether a credential is configured
+/// at all is something an operator needs to see in a log, and it is not the
+/// credential.
+pub(crate) fn redacted(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| "<redacted>")
+}
+
+/// Handwritten so the endpoint's credentials never reach a log line.
+///
+/// `ProxyConfig` is logged at debug level whenever it is parsed — including on
+/// every hot reload, where the logger is already installed — and a derived
+/// `Debug` would put the ed25519 private key and the relay bearer token on that
+/// line. Reading the log would then be enough to own this endpoint's identity
+/// permanently, which is worse than losing one client's TOTP seed.
+impl std::fmt::Debug for IrohConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohConfig")
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field("relay_auth_token", &redacted(&self.relay_auth_token))
+            .field("bind_port", &self.bind_port)
+            .field("secret_key", &redacted(&self.secret_key))
+            .finish()
+    }
 }
 
 /// How a route talks to its backends.
@@ -136,12 +165,25 @@ pub struct LocalProxyNode {
 }
 
 /// Client-side 2FA credentials used by local-proxy mode.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct LocalProxyTwoFactorConfig {
     pub enabled: Option<bool>,
     pub client_id: String,
     pub secret: String,
     pub algorithm: Option<String>,
+}
+
+/// Handwritten for the same reason as [`IrohConfig`]'s: this is the client side
+/// of a TOTP secret, and the whole config is logged when it is parsed.
+impl std::fmt::Debug for LocalProxyTwoFactorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalProxyTwoFactorConfig")
+            .field("enabled", &self.enabled)
+            .field("client_id", &self.client_id)
+            .field("secret", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -210,12 +252,14 @@ pub struct LogConfig {
 /// backends.
 ///
 /// A switch rather than a behaviour everyone gets, because a probe is only
-/// meaningful if the backend answers it. Plenty of backends — a static file
-/// server, a device's web UI, anything that 404s or hangs on an unknown path —
-/// cannot answer `GET /health` at all, and before this section existed a single
-/// failed probe was enough to take such a backend out of rotation for good. Set
-/// `enabled = false` for those: every backend stays in the pool and traffic is
-/// simply forwarded, which is what the proxy did before health checks existed.
+/// meaningful if the backend answers it. Plenty of backends — a device's web UI
+/// that answers 5xx on an unknown path, or one that does not speak HTTP and so
+/// times out — cannot answer a probe at all, and before this section existed a
+/// single failed probe was enough to take such a backend out of rotation for
+/// good. Set `enabled = false` for those: every backend stays in the pool and
+/// traffic is simply forwarded, which is what the proxy did before health checks
+/// existed. A backend that 404s, or answers any 2xx, is already counted healthy,
+/// so having no dedicated health endpoint is not on its own a reason to opt out.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct HealthCheckConfig {
@@ -372,6 +416,53 @@ impl ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Whether this config puts a credential in the file it was read from.
+    ///
+    /// The 2FA seeds are the obvious one and live in `[auth]`, but this file also
+    /// carries `[iroh] secret_key` — the endpoint's private key, which is what
+    /// makes a Node ID yours — and `relay_auth_token`, a bearer token. Either one
+    /// is worth refusing a permissive mode over, on a server with `[auth]` off.
+    /// Refuses the `[health_check]` numbers that would otherwise be rewritten
+    /// on the way in.
+    ///
+    /// Each of them was clamped with `max(1)`, which turns a typo into
+    /// behaviour nobody asked for: `interval = 0` is one round of probes per
+    /// second, per route; `timeout = 0` is a probe that can never succeed, so
+    /// every backend is taken out of rotation; and `threshold = 0` means a
+    /// single lost probe empties the pool, the opposite of what the knob is
+    /// for. All three are seconds nobody would write on purpose.
+    fn validate_health_check(&self) -> anyhow::Result<()> {
+        let health = &self.health_check;
+
+        if health.interval == 0 {
+            anyhow::bail!(
+                "[health_check] interval is 0: it is the number of seconds between two \
+                 rounds of checks, so it has to be at least 1"
+            );
+        }
+        if health.timeout == 0 {
+            anyhow::bail!(
+                "[health_check] timeout is 0: no probe could ever finish, so every backend \
+                 would be marked unhealthy and taken out of rotation"
+            );
+        }
+        if health.threshold == 0 {
+            anyhow::bail!(
+                "[health_check] threshold is 0: one failed probe would empty the pool. \
+                 It is the number of consecutive failures that takes a backend out, so it \
+                 has to be at least 1"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn holds_credentials(&self) -> bool {
+        self.iroh
+            .as_ref()
+            .is_some_and(|iroh| iroh.secret_key.is_some() || iroh.relay_auth_token.is_some())
+    }
+
     /// Turns the `[[routes]]` table into the objects the proxy actually routes
     /// with, rejecting anything that cannot work.
     ///
@@ -380,6 +471,11 @@ impl ProxyConfig {
     /// differently depending on when it was made. An error here is not fatal for
     /// a reload — the caller keeps the routes it already has.
     pub fn build_routes(&self) -> anyhow::Result<Vec<Route>> {
+        // Both a cold start and a reload come through this function, so the
+        // health check is validated here rather than only at startup: an edit
+        // that sets `interval = 0` is as wrong as one written by hand.
+        self.validate_health_check()?;
+
         // Refused rather than ignored: silently dropping the key would turn
         // every host it used to forward into a 404, which is a routing change
         // nobody asked for. A reload keeps the routes it already has, so a
@@ -402,6 +498,47 @@ impl ProxyConfig {
             let host_pattern = route_config.host_pattern.clone();
             let path_pattern = route_config.path_pattern.clone();
             let label = format!("route {host_pattern}");
+
+            // Refused rather than matched loosely: a wildcard without its dot
+            // silently covers hosts that merely end in the same letters, so a
+            // config using one is a config that routes more than it says.
+            if let Some(why) = crate::routes::host_pattern_error(&host_pattern) {
+                anyhow::bail!("{label}: host_pattern {why}");
+            }
+
+            // A route with no backends matches and then has nothing to send
+            // the request to: `select_backend` answers with an empty string and
+            // the client gets a 502 that looks like a backend being down.
+            if route_config.backends.is_empty() {
+                anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
+            }
+
+            // A port no flow can arrive on, or an empty list that says "every
+            // port" by accident: either one is a route that never matches, and
+            // the operator has no way to notice — the client just gets refused.
+            if let Some(ports) = &route_config.client_ports {
+                if ports.is_empty() {
+                    anyhow::bail!(
+                        "{label}: client_ports is empty; leave it out to match every port"
+                    );
+                }
+                if ports.contains(&0) {
+                    anyhow::bail!(
+                        "{label}: client_ports contains port 0; no flow ever arrives from \
+                         port 0, so that entry can never match"
+                    );
+                }
+            }
+
+            // A UDP flow with a zero idle timeout is closed as soon as it is
+            // opened: the tunnel is set up and torn down before the first
+            // datagram crosses it. Leave it out for the server default.
+            if route_config.idle_timeout_secs == Some(0) {
+                anyhow::bail!(
+                    "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
+                     is opened; leave it out for the default"
+                );
+            }
 
             // Every declared mode has to be able to dial these backends, so each
             // one is checked: the `http` rules and the L4 rules disagree (a URL
@@ -557,10 +694,19 @@ fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
 /// fail: this process would speak plaintext at a TLS port. Saying so at startup
 /// beats serving 502s, and either fix is a one-line config change.
 pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::Result<()> {
-    // Passthrough only needs a host and a port; the scheme carries no meaning
-    // because those bytes are never interpreted.
+    // Passthrough only needs a host and a port — the scheme carries no meaning
+    // because those bytes are never interpreted — but it still has to name one.
+    // Checked with the function the route will dial it with, so what starts is
+    // what runs: an address that only fails at connect time turns every
+    // connection into a 502 with nothing at startup to explain it.
     if mode == RouteMode::Passthrough {
-        return Ok(());
+        return match crate::passthrough::parse_backend_addr(backend) {
+            Some((host, port)) if !host.is_empty() && port != 0 => Ok(()),
+            _ => anyhow::bail!(
+                "{label}: backend \"{backend}\" is not an address a passthrough route can dial; \
+                 expected host:port, for example \"10.0.0.5:443\" or \"[::1]:443\""
+            ),
+        };
     }
 
     // An L4 backend is an address to dial, not a URL to fetch, so it is checked
@@ -642,8 +788,52 @@ fn validate_l4_backend(label: &str, backend: &str) -> anyhow::Result<()> {
 
 // ===== 2FA authentication config =====
 
-/// Authentication config in TOML format
+/// Refuses TOTP parameters the validator cannot honour as written.
+///
+/// `window` is the one that was quietly wrong: it is handed to the TOTP library
+/// as a `u8`, so anything above 255 was truncated by the cast — `window = 300`
+/// became 44, which widens a code's validity from ±5 minutes to ±22 minutes,
+/// and `window = 256` became 0. The other two only failed later, inside the
+/// library, at the first login and with nothing to say which knob was wrong.
+fn validate_totp_parameters(time_step: u32, digits: u32, window: u32) -> anyhow::Result<()> {
+    if time_step == 0 {
+        anyhow::bail!(
+            "[auth] time_step is 0: a code would cover no time at all, and the step is what \
+             the counter is divided by"
+        );
+    }
+    if !(6..=8).contains(&digits) {
+        anyhow::bail!("[auth] digits is {digits}: a code is 6, 7 or 8 digits long");
+    }
+    if window > u8::MAX as u32 {
+        anyhow::bail!(
+            "[auth] window is {window}, above the {max} the TOTP library's field holds: larger \
+             values were silently truncated, so 300 came out as 44",
+            max = u8::MAX
+        );
+    }
+    if window > 10 {
+        // Legal, but wide enough to be worth saying out loud: `window` counts
+        // steps in *both* directions, so 10 already means a code stays valid
+        // for ten minutes either side of now.
+        tracing::warn!(
+            "[auth] window is {window}: a code stays valid for {} minutes either side of now",
+            window * time_step / 60
+        );
+    }
+    Ok(())
+}
+
+/// Authentication config in TOML format.
+///
+/// Unknown keys are refused here, and only here. This is the one section where
+/// a typo is a security change rather than a lost setting: `enable = true`
+/// instead of `enabled` left 2FA off with nothing in the log to say so, since
+/// serde drops what it does not recognise and the default for `enabled` is
+/// false. Every other section stays lenient, the way a config that has carried
+/// a stray key for years expects.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthTomlConfig {
     pub enabled: Option<bool>,
     pub issuer: Option<String>,
@@ -656,7 +846,13 @@ pub struct AuthTomlConfig {
     pub clients: Option<HashMap<String, ClientAuthToml>>,
 }
 
+/// One `[auth.clients.<id>]` entry.
+///
+/// Unknown keys are refused for the same reason as in [`AuthTomlConfig`]: a
+/// misspelled `allow_host` is not "no restriction", but that is what it
+/// quietly became.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuthToml {
     pub secret: String,
     pub created_at: Option<String>,
@@ -715,43 +911,50 @@ pub fn warn_world_readable_config(_path: &str) {}
 /// refuses for the same reason, and a warning that only turns up in a rotated
 /// log is how a permissive mode survives for years.
 ///
-/// With `[auth]` disabled none of it authenticates anybody, and a 0644 config is
-/// a fixture of Docker deployments: those keep the warning.
+/// The same file also carries `[iroh] secret_key` and `relay_auth_token`, which
+/// are credentials whether or not `[auth]` is on, so a config holding any of the
+/// three is refused. One holding none — no 2FA, no key, no token — keeps only
+/// the warning, because a 0644 config is a fixture of Docker bind mounts.
 ///
 /// `mode` is passed in rather than read from the file so the rule can be tested
 /// everywhere, including on the platforms with no file modes to inspect.
-pub(crate) fn world_readable_refusal(path: &str, mode: u32, auth_enabled: bool) -> Option<String> {
-    (mode & 0o077 != 0 && auth_enabled).then(|| {
+pub(crate) fn world_readable_refusal(
+    path: &str,
+    mode: u32,
+    holds_credentials: bool,
+) -> Option<String> {
+    (mode & 0o077 != 0 && holds_credentials).then(|| {
         format!(
-            "{path} is readable or writable by other accounts (mode {mode:o}) and holds the 2FA \
-             secrets: with [auth] enabled those secrets are the only credential gating the iroh \
-             listener, so every account on this host can authenticate as every client. Run \
-             `chmod 600 {path}`, or disable [auth]"
+            "{path} is readable or writable by other accounts (mode {mode:o}) and holds \
+             credentials: every account on this host can read them, and the 2FA secrets are the \
+             only credential gating the iroh listener, so any of them can authenticate as every \
+             client. Run `chmod 600 {path}`, or move the credentials out of this file"
         )
     })
 }
 
 /// Checks the config file's permissions before its secrets become live.
 ///
-/// Refuses when `[auth]` is enabled and the file is not private, warns
-/// otherwise. A file that cannot be stat'ed is not this function's problem: the
-/// caller has already read it to get here.
+/// Refuses when the file is not private and holds a credential — a TOTP seed,
+/// the endpoint's secret key or a relay token — and warns otherwise. A file that
+/// cannot be stat'ed is not this function's problem: the caller has already read
+/// it to get here.
 #[cfg(unix)]
-pub fn check_config_permissions(path: &str, auth_enabled: bool) -> anyhow::Result<()> {
+pub fn check_config_permissions(path: &str, holds_credentials: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let Ok(metadata) = std::fs::metadata(path) else {
         return Ok(());
     };
     let mode = metadata.permissions().mode();
-    if let Some(refusal) = world_readable_refusal(path, mode, auth_enabled) {
+    if let Some(refusal) = world_readable_refusal(path, mode, holds_credentials) {
         anyhow::bail!(refusal);
     }
     if mode & 0o077 != 0 {
         tracing::error!(
-            "{path} is readable or writable by other accounts (mode {mode:o}); [auth] is not \
-             enabled, so nothing in it authenticates anybody yet — run `chmod 600 {path}` before \
-             enabling it"
+            "{path} is readable or writable by other accounts (mode {mode:o}); nothing in it \
+             authenticates anybody yet — run `chmod 600 {path}` before adding [auth], a \
+             [iroh] secret_key or a relay token"
         );
     }
     Ok(())
@@ -759,7 +962,7 @@ pub fn check_config_permissions(path: &str, auth_enabled: bool) -> anyhow::Resul
 
 /// No file modes to inspect outside Unix, so there is nothing to refuse.
 #[cfg(not(unix))]
-pub fn check_config_permissions(_path: &str, _auth_enabled: bool) -> anyhow::Result<()> {
+pub fn check_config_permissions(_path: &str, _holds_credentials: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -786,6 +989,30 @@ impl ProxyConfig {
                     let mut clients = HashMap::new();
                     if let Some(clients_toml) = auth_toml.clients {
                         for (id, client_toml) in clients_toml {
+                            // An empty token compares equal to an empty
+                            // ENROLL_START — see `conn::enroll_client` — so
+                            // `pending_enrollment = ""` would hand a fresh
+                            // secret to anybody who asks. Refused at load time
+                            // rather than read as "no enrollment outstanding":
+                            // the way to close an enrollment is to delete the
+                            // key, and a blank one is a typo with a wide door
+                            // behind it.
+                            if client_toml.pending_enrollment.as_deref() == Some("") {
+                                anyhow::bail!(
+                                    "[auth.clients.{id}]: pending_enrollment is empty; delete the \
+                                     key instead of setting it to \"\""
+                                );
+                            }
+                            // An allow-hosts entry is a host pattern, and a
+                            // loose one authorizes more than it names: the same
+                            // refusal a route's `host_pattern` gets.
+                            for host in client_toml.allow_hosts.iter().flatten() {
+                                if let Some(why) = crate::routes::host_pattern_error(host) {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"
+                                    );
+                                }
+                            }
                             clients.insert(
                                 id,
                                 crate::auth::ClientAuth {
@@ -812,15 +1039,20 @@ impl ProxyConfig {
                         _ => crate::auth::TotpAlgorithm::SHA1,
                     };
 
+                    let time_step = auth_toml.time_step.unwrap_or(30);
+                    let digits = auth_toml.digits.unwrap_or(6);
+                    let window = auth_toml.window.unwrap_or(1);
+                    validate_totp_parameters(time_step, digits, window)?;
+
                     Some(crate::auth::AuthConfig {
                         enabled: auth_toml.enabled.unwrap_or(false),
                         issuer: auth_toml
                             .issuer
                             .unwrap_or_else(|| crate::auth::DEFAULT_ISSUER.to_string()),
                         algorithm,
-                        time_step: auth_toml.time_step.unwrap_or(30),
-                        digits: auth_toml.digits.unwrap_or(6),
-                        window: auth_toml.window.unwrap_or(1),
+                        time_step,
+                        digits,
+                        window,
                         clients,
                         max_attempts: auth_toml.max_attempts.unwrap_or(5),
                         lockout_duration: auth_toml.lockout_duration.unwrap_or(300),
@@ -853,6 +1085,17 @@ impl ProxyConfig {
         secret: &str,
         force: bool,
     ) -> anyhow::Result<ClientSecretWrite> {
+        with_config_lock(path, || {
+            Self::write_client_secret_unlocked(path, client_id, secret, force)
+        })
+    }
+
+    fn write_client_secret_unlocked(
+        path: &str,
+        client_id: &str,
+        secret: &str,
+        force: bool,
+    ) -> anyhow::Result<ClientSecretWrite> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -869,8 +1112,7 @@ impl ProxyConfig {
         }
         client.insert("secret", toml_edit::value(secret));
 
-        fs::write(path, doc.to_string())
-            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))?;
+        write_config_file(path, &doc.to_string())?;
 
         Ok(if replaced {
             ClientSecretWrite::Replaced
@@ -893,6 +1135,16 @@ impl ProxyConfig {
         client_id: &str,
         token: &str,
     ) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::write_pending_enrollment_unlocked(path, client_id, token)
+        })
+    }
+
+    fn write_pending_enrollment_unlocked(
+        path: &str,
+        client_id: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -911,7 +1163,7 @@ impl ProxyConfig {
 
         client.insert("pending_enrollment", toml_edit::value(token));
 
-        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+        write_config_file(path, &doc.to_string())
     }
 
     /// Spends the token: writes the issued `secret` and drops
@@ -921,6 +1173,16 @@ impl ProxyConfig {
     /// token still beside it would leave the window open for a second device to
     /// trade the same link for the same credential.
     pub fn complete_enrollment(path: &str, client_id: &str, secret: &str) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::complete_enrollment_unlocked(path, client_id, secret)
+        })
+    }
+
+    fn complete_enrollment_unlocked(
+        path: &str,
+        client_id: &str,
+        secret: &str,
+    ) -> anyhow::Result<()> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -934,8 +1196,167 @@ impl ProxyConfig {
         client.insert("secret", toml_edit::value(secret));
         client.remove("pending_enrollment");
 
-        fs::write(path, doc.to_string()).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+        write_config_file(path, &doc.to_string())
     }
+}
+
+/// Runs `work` while holding an exclusive lock on the config file at `path`.
+///
+/// Every read-modify-write of the config goes through this. `write_config_file`
+/// makes a single write atomic, but it says nothing about two writers that both
+/// read first: the second one's write is built from the contents it read before
+/// the first one landed, so one of the two edits is lost. The three callers are
+/// in this binary — a CLI command, the enrollment flow and the 2FA counter
+/// writeback — and any two of them can coincide.
+///
+/// The lock is advisory: a writer that does not take it still races. That is
+/// acceptable, because every writer of this file is this program.
+pub fn with_config_lock<T>(
+    path: &str,
+    work: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = ConfigLock::acquire(path)?;
+    work()
+}
+
+/// The lock file sits *beside* the config rather than being the config itself.
+///
+/// Writes go through [`write_config_file`], which is a temp file and a rename,
+/// and a rename swaps the directory entry for a different inode — so a lock
+/// taken on the config path would stay behind on a file that was replaced
+/// underneath it, and every writer would hold a different lock. A separate file
+/// is never renamed, so it stays the one thing everybody contends for.
+struct ConfigLock {
+    file: fs::File,
+}
+
+impl ConfigLock {
+    fn acquire(path: &str) -> anyhow::Result<Self> {
+        let lock_path = format!("{path}.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            // The lock file is a lock, not a document: whatever it already
+            // holds is nobody's data, and truncating a file another process may
+            // be about to open buys nothing.
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| anyhow::anyhow!("cannot open {lock_path}: {e}"))?;
+
+        // Beside a file that holds TOTP secrets, so it is created the way the
+        // config itself is checked for: private to its owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("cannot set the mode of {lock_path}: {e}"))?;
+        }
+
+        // `File::lock`, standard since 1.89: `flock(2)` on Unix and
+        // `LockFileEx` on Windows, which is the pair writing by hand would have
+        // meant two `unsafe` blocks to reach.
+        file.lock()
+            .map_err(|e| anyhow::anyhow!("cannot lock {lock_path}: {e}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // Released on close regardless; unlocking explicitly keeps the pairing
+        // visible, and the error has nowhere to go from a `Drop`.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Replaces the file at `path` with `contents` in one step.
+///
+/// Written next to the target and renamed over it, rather than truncated in
+/// place: a process killed in the middle of `fs::write` leaves a short file,
+/// and a short config is one the proxy cannot start from again. A rename is a
+/// single directory entry swap, so anything reading the file sees either the
+/// old contents or the new ones.
+///
+/// The replacement is created `0600`, because what it holds is TOTP secrets and
+/// enrollment tokens: a new file takes the umask, and the file it replaces was
+/// checked at startup for being private.
+pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
+    let target = Path::new(path);
+    let directory = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let temp = directory.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let write = || -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", temp.display()))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", temp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("cannot set the mode of {}: {e}", temp.display()))?;
+        }
+        Ok(())
+    };
+
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+
+    // A rename cannot replace a file that is itself a mount point, which is
+    // what a bind-mounted single config file is. Falling back to writing in
+    // place is the lesser evil: it loses the atomicity, not the write.
+    if let Err(rename) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+
+        // Writing in place keeps whatever mode the target already has, so the
+        // mode is tightened *before* anything is written: a target that is
+        // world-readable would otherwise hold the secrets that way for as long
+        // as the write leaves it. A mode that cannot be set is an error rather
+        // than something to log past — a config of secrets at 0644 is worse
+        // than one that was not written.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if target.exists() {
+                fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("cannot set the mode of {path}: {e}"))?;
+            }
+        }
+
+        let written = fs::write(target, contents)
+            .map_err(|e| anyhow::anyhow!("cannot write {path}: {e} (rename failed: {rename})"));
+
+        // Covers a target that did not exist: the write above creates it under
+        // the process umask, which is not what a file of secrets should inherit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if written.is_ok() {
+                fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("cannot set the mode of {path}: {e}"))?;
+            }
+        }
+
+        return written;
+    }
+
+    Ok(())
 }
 
 /// What [`ProxyConfig::write_client_secret`] did to the config file.
@@ -975,6 +1396,17 @@ mod tests {
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")
+    }
+
+    /// Writes `source` to a throwaway file and loads it the way a start does.
+    ///
+    /// `load_with_auth` takes a path rather than a string — it is also what
+    /// checks the file's permissions — so parsing a snippet needs a real file.
+    fn load_from(source: &str) -> anyhow::Result<(ProxyConfig, Option<crate::auth::AuthConfig>)> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, source).expect("write the config");
+        ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
     }
 
     /// `build_routes` is what both a cold start and a config reload use, so a
@@ -1062,6 +1494,157 @@ backends = ["https://caddy:443"]
         assert!(
             error.contains("https://"),
             "the message has to name the offending backend, got: {error}"
+        );
+    }
+
+    /// `0` was clamped with `max(1)` on the way in, which is how a typo turned
+    /// into a probe storm, or into every backend being taken out of rotation.
+    #[test]
+    fn build_routes_refuses_a_zero_health_check_number() {
+        for (key, why) in [
+            ("interval", "interval is 0"),
+            ("timeout", "timeout is 0"),
+            ("threshold", "threshold is 0"),
+        ] {
+            let config = parse(&format!(
+                r#"
+[health_check]
+{key} = 0
+
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#
+            ));
+
+            let error = config.build_routes().unwrap_err().to_string();
+            assert!(error.contains(why), "{key}: unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn build_routes_accepts_the_health_check_defaults() {
+        // Nothing in the file: the defaults have to pass the same check.
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        assert!(config.build_routes().is_ok());
+    }
+
+    /// Port 0 is not a port a flow arrives from, so a route naming it is dead
+    /// the moment it loads — and nothing would ever say so.
+    #[test]
+    fn build_routes_refuses_a_client_port_no_flow_can_arrive_on() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.iakl.top"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+client_ports = [0]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(error.contains("port 0"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn build_routes_refuses_an_empty_client_ports_list() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.iakl.top"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+client_ports = []
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("client_ports is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A zero idle timeout closes a UDP flow as soon as it is opened.
+    #[test]
+    fn build_routes_refuses_a_zero_idle_timeout() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "turn.iakl.top"
+mode = "udp"
+backends = ["10.0.0.5:3478"]
+idle_timeout_secs = 0
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("idle_timeout_secs"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn build_routes_rejects_a_passthrough_backend_with_no_address() {
+        // Passthrough copies bytes, so its backend was never checked at all:
+        // this one dials nothing and only failed once a connection arrived.
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "passthrough"
+backends = [""]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("passthrough"),
+            "the message has to say which route cannot dial it, got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_routes_accepts_an_ipv6_passthrough_backend() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "passthrough"
+backends = ["[::1]:443"]
+"#,
+        );
+
+        config
+            .build_routes()
+            .expect("an IPv6 literal is an address a passthrough route can dial");
+    }
+
+    #[test]
+    fn build_routes_rejects_a_route_with_no_backends() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "http"
+backends = []
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("no backends"),
+            "the message has to say what is missing, got: {error}"
         );
     }
 
@@ -1345,6 +1928,55 @@ domains = ["fn.iroh.iakl.top"]
         (dir, path.to_string_lossy().into_owned())
     }
 
+    /// Two writers that both read before either writes lose one of the two
+    /// edits: the second one's document is built from contents the first one has
+    /// already replaced. The lock is what sequences them — and it has to be a
+    /// lock *on the file*, because a process-wide mutex would serialize these
+    /// two threads while doing nothing for the CLI and the server, which are
+    /// different processes.
+    #[test]
+    fn a_second_writer_sees_the_first_one_s_edit() {
+        let (_dir, path) = scratch_config("counter = 0\n");
+
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                with_config_lock(&path, || {
+                    // Reads, then sits on the lock long enough that an unlocked
+                    // second writer would have read the old value too.
+                    let content = fs::read_to_string(&path)?;
+                    assert_eq!(content.trim(), "counter = 0");
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    write_config_file(&path, "counter = 1\n")
+                })
+                .expect("the first writer succeeds")
+            })
+        };
+
+        // Let the first one take the lock before the second asks for it.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let seen = with_config_lock(&path, || {
+            let content = fs::read_to_string(&path)?;
+            write_config_file(&path, "counter = 2\n")?;
+            Ok(content)
+        })
+        .expect("the second writer succeeds");
+
+        first.join().expect("the first writer ends");
+
+        assert!(
+            seen.contains("counter = 1"),
+            "the second writer must read the first one's edit, got {seen:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path)
+                .expect("the config is still there")
+                .trim(),
+            "counter = 2"
+        );
+    }
+
     /// The client the server would see after a write, read back through the
     /// very loader `--generate-2fa` and the server share.
     fn secret_of(path: &str, client_id: &str) -> Option<String> {
@@ -1471,11 +2103,21 @@ domains = ["fn.iroh.iakl.top"]
         assert!(world_readable_refusal("config.toml", 0o602, true).is_some());
     }
 
-    /// With `[auth]` off nothing in the file authenticates anybody, and 0644 is
+    /// A file holding no credential at all — no 2FA, no key, no relay token — is
     /// how a Docker bind mount arrives: warn, do not refuse.
     #[test]
-    fn a_permissive_config_is_only_warned_about_with_2fa_off() {
+    fn a_permissive_config_with_no_credentials_is_only_warned_about() {
         assert_eq!(world_readable_refusal("config.toml", 0o644, false), None);
+    }
+
+    /// The endpoint key and the relay token are credentials whether or not
+    /// `[auth]` is on, so a config carrying either is worth refusing a
+    /// permissive mode over.
+    #[test]
+    fn a_key_or_a_relay_token_makes_the_config_hold_credentials() {
+        assert!(parse("[iroh]\nsecret_key = \"00\"\n").holds_credentials());
+        assert!(parse("[iroh]\nrelay_auth_token = \"t\"\n").holds_credentials());
+        assert!(!parse("").holds_credentials());
     }
 
     /// A refusal that does not say how to fix it is a support ticket.
@@ -1503,12 +2145,13 @@ domains = ["fn.iroh.iakl.top"]
         let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
 
         chmod(&path, 0o600);
-        check_config_permissions(&path, true).expect("0600 starts with 2FA on");
+        check_config_permissions(&path, true).expect("0600 starts with credentials in the file");
 
         chmod(&path, 0o644);
-        let err = check_config_permissions(&path, true).expect_err("0644 is fatal with 2FA on");
+        let err = check_config_permissions(&path, true)
+            .expect_err("0644 is fatal with credentials in it");
         assert!(err.to_string().contains("chmod 600"), "{err}");
-        check_config_permissions(&path, false).expect("0644 still starts with 2FA off");
+        check_config_permissions(&path, false).expect("0644 still starts with none in it");
     }
 
     /// A file the caller could not even stat has already failed to be read; the
@@ -1566,6 +2209,52 @@ domains = ["fn.iroh.iakl.top"]
         assert_eq!(client.secret, "NEWSECRETVALUE");
         // The token has to go with it, or the same link enrolls a second device.
         assert_eq!(client.pending_enrollment, None);
+    }
+
+    /// A blank enrollment token is refused instead of read as "no enrollment
+    /// outstanding".
+    ///
+    /// `constant_time_eq` calls two empty slices equal, so a config carrying
+    /// `pending_enrollment = ""` would accept any stranger's empty ENROLL_START
+    /// and hand them a freshly generated secret, locking out every device that
+    /// was using the client id. Blanking the key is the natural way to "clear"
+    /// it, so it has to fail loudly rather than quietly mean "closed".
+    #[test]
+    fn a_blank_enrollment_token_is_refused() {
+        let (_dir, path) = scratch_config(
+            "default_backend = \"http://127.0.0.1:15666\"\n\
+             \n\
+             [auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.client-001]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             pending_enrollment = \"\"\n",
+        );
+
+        let err = ProxyConfig::load_with_auth(&path).expect_err("a blank token must not load");
+        assert!(err.to_string().contains("pending_enrollment"), "{err}");
+    }
+
+    /// The endpoint credentials have to stay out of `Debug`, because the whole
+    /// config is logged at debug level whenever it is parsed — including on
+    /// every hot reload, where the logger is already installed.
+    #[test]
+    fn a_parsed_iroh_config_prints_no_credentials() {
+        let iroh = IrohConfig {
+            relay_url: Some("https://relay.example".to_string()),
+            relay_mode: Some("custom".to_string()),
+            relay_auth_token: Some("bearer-secret".to_string()),
+            bind_port: Some(1234),
+            secret_key: Some("ed25519-private-key".to_string()),
+        };
+
+        let rendered = format!("{iroh:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("bearer-secret"), "{rendered}");
+        assert!(!rendered.contains("ed25519-private-key"), "{rendered}");
+        // Whether a key is configured is still worth knowing.
+        assert!(rendered.contains("relay_mode"), "{rendered}");
     }
 
     /// A token for a client that does not exist would leave a section with no
@@ -1652,5 +2341,84 @@ domains = ["fn.iroh.iakl.top"]
             .expect_err("an empty list must not be read as either case");
 
         assert!(err.to_string().contains("[peers] allow = []"), "{err}");
+    }
+
+    /// A wildcard with no dot after it is a bare `ends_with`, so it covers any
+    /// host ending in the same letters — `eviliakl.top` for `*iakl.top`. The
+    /// only useful thing to do with one is refuse to start.
+    #[test]
+    fn a_route_wildcard_without_a_label_boundary_is_refused() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "*iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        let err = config
+            .build_routes()
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("label boundary"), "{err}");
+    }
+
+    /// The same rule for an `allow_hosts` entry, which is a host pattern and
+    /// would otherwise authorize more hosts than it names.
+    #[test]
+    fn an_allow_hosts_wildcard_without_a_label_boundary_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        // No `enabled = true`: with 2FA on, a 0644 file is refused for its
+        // permissions before the pattern is ever looked at, and the file mode
+        // is not something this test should depend on.
+        std::fs::write(
+            &path,
+            r#"
+[auth]
+
+[auth.clients.device]
+secret = "JBSWY3DPEHPK3PXP"
+allow_hosts = ["*iakl.top"]
+"#,
+        )
+        .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("label boundary"), "{err}");
+    }
+
+    /// `window` is handed to the TOTP library as a `u8`, so 300 was truncated
+    /// to 44 by the cast: a code valid for ±22 minutes instead of ±30 seconds.
+    #[test]
+    fn a_window_that_does_not_fit_is_refused() {
+        let err = load_from("[auth]\nwindow = 300\n").expect_err("300 does not fit a u8");
+        assert!(err.to_string().contains("window is 300"), "{err}");
+
+        // And a sane window still loads.
+        let (_, auth) = load_from("[auth]\nwindow = 1\n").expect("a normal window loads");
+        assert_eq!(auth.expect("auth section present").window, 1);
+    }
+
+    #[test]
+    fn a_digit_count_no_code_has_is_refused() {
+        let err = load_from("[auth]\ndigits = 4\n").expect_err("a code is not 4 digits");
+        assert!(err.to_string().contains("digits is 4"), "{err}");
+    }
+
+    #[test]
+    fn a_time_step_of_zero_is_refused() {
+        let err = load_from("[auth]\ntime_step = 0\n").expect_err("0 covers no time at all");
+        assert!(err.to_string().contains("time_step"), "{err}");
+    }
+
+    /// Why `[auth]` is the one section that refuses keys it does not know:
+    /// `enable = true` for `enabled` used to leave 2FA off, and the log said
+    /// nothing, because serde drops what it does not recognise and the default
+    /// for `enabled` is false.
+    #[test]
+    fn an_unknown_auth_key_is_refused_rather_than_ignored() {
+        let err = load_from("[auth]\nenable = true\n").expect_err("a typo must not disable 2FA");
+        assert!(err.to_string().contains("enable"), "{err}");
     }
 }

@@ -1,0 +1,23 @@
+# Gitleaks configuration.
+#
+# Gitleaks finds this file on its own — the action passes no `--config` — and
+# a config that is given replaces the built-in rules. `[extend]` below is what
+# keeps them: without it this file was the whole of the rule set, and since it
+# only names allow-listed findings, the scan ran no rules at all and could not
+# have failed. Then, and only then, the allowlist is what turns the scan into a
+# gate: anything not named here fails the job.
+title = "NexaPipe"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures that look like credentials"
+
+regexes = [
+    # `token_comparison_only_accepts_an_exact_match`
+    # (crates/nexapipe/src/conn/mod.rs) feeds a constant to the constant-time
+    # comparison and asserts on the boundaries. The constant has to be a real
+    # string of bytes, and calling it a secret is the point of the test.
+    '''^0123456789abcdef$''',
+]

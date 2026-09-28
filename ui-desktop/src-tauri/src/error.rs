@@ -92,6 +92,15 @@ pub mod codes {
     /// On the service side it usually means no desktop session has published a
     /// token yet, so there is nobody privileged callers should be answering to.
     pub const SERVICE_IPC_TOKEN: &str = "service.ipc_token";
+    /// The peer on the IPC port does not speak this handshake: it never opened
+    /// with a challenge — an older service waits for the caller to speak first —
+    /// or it answered with something that is not a proof.
+    ///
+    /// Deliberately not a fallback to the older handshake. A caller that can be
+    /// talked into speaking first is a caller that hands a credential to whatever
+    /// is listening, which is the thing the handshake replaced. The fix is
+    /// reinstalling the service, and that is what the UI says.
+    pub const SERVICE_PROTOCOL_MISMATCH: &str = "service.protocol_mismatch";
     /// An IPC message that exceeded the channel's line limit, or that does not
     /// parse as an [`crate::service::ipc::IpcMessage`].
     pub const SERVICE_MALFORMED_REQUEST: &str = "service.malformed_request";
@@ -100,6 +109,14 @@ pub mod codes {
     pub const SERVICE_LOCAL_ADDR_NOT_LOOPBACK: &str = "service.local_addr_not_loopback";
     /// `dns_addr` outside the TUN network the built-in DNS server answers on.
     pub const SERVICE_DNS_ADDR_OUTSIDE_TUN: &str = "service.dns_addr_outside_tun";
+
+    // -- credential store -------------------------------------------------------------------
+    /// The encrypted credential store could not be read, written or decrypted.
+    ///
+    /// Covers a missing OS keychain *and* a value that does not decrypt, because
+    /// from the caller's point of view they are the same event: the credential is
+    /// not available, and the fix is to supply it again rather than to retry.
+    pub const CREDENTIALS_STORE_FAILED: &str = "credentials.store_failed";
 
     // -- invite -----------------------------------------------------------------------------
     /// A `nexapipe://` invite could not be read.

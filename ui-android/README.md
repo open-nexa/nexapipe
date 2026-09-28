@@ -138,7 +138,7 @@ start), `-SkipRust`, `-SkipInstall`, `-SkipLaunch`, `-NoLog`, `-Check`
 | `nativeClearNodeTwoFactor()` | Drop every per-endpoint credential before re-reading them. |
 | `nativeSetTwoFactor(id, secret, alg)` | TOTP credentials shared by *every* endpoint; per-endpoint ones win. |
 | `nativeStartIroh()` | Bring up the endpoint; returns the Node ID. |
-| `nativeStartProxy(port)` | Start the local proxy and the endpoint group. |
+| `nativeStartProxy()` | Build the endpoint group. Binds nothing: on Android every app shares loopback, so a local proxy port would hand any of them the user's authenticated tunnel. Traffic enters through the TUN fd. |
 | `nativePreconnect()` | Warm up one connection per configured backend. |
 | `nativeStartTunProxy(fd, domains)` | Hand the detached TUN fd to Rust. |
 | `nativeStopTunProxy()` / `nativeStopProxy()` / `nativeDestroy()` | Teardown. |

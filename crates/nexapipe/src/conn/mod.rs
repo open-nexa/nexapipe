@@ -1,13 +1,17 @@
-use crate::auth::{AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator};
+use crate::auth::{
+    AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
+};
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
 use crate::passthrough;
 use crate::routes::{BackendInfo, RouteConfig};
+use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod allow_list;
@@ -53,6 +57,29 @@ const AUTH_RESULT_GRACE: tokio::time::Duration = tokio::time::Duration::from_mil
 /// instead of the auth stream would otherwise make the server allocate up to
 /// 4 GiB before reading anything.
 const MAX_AUTH_MESSAGE: usize = 64 * 1024;
+
+/// How long the whole request head may take to arrive.
+///
+/// The head arrives before anything is known about the peer: no route has been
+/// matched, no credential checked, no backend involved. The 64 KiB limit below
+/// bounds how many bytes a peer may send, not how long it may take to send
+/// them, so without this a peer that dribbles a byte at a time holds a stream —
+/// and the task serving it — indefinitely.
+///
+/// One deadline rather than a per-read idle timeout: an idle timeout resets on
+/// every byte, so a peer that sends just often enough to stay busy defeats it,
+/// which is exactly the shape of a slow read. A real client sends its head in
+/// the first read or two.
+pub(crate) const HEAD_READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// Streams one connection may have in flight at once.
+///
+/// Every accepted bi-stream spawns a task, and `accept_bi` accepts them as fast
+/// as the peer opens them, so without a cap here the task count is the peer's
+/// choice. `FlowLimiter` covers L4 flows only; HTTP, WebSocket and passthrough
+/// streams take this one. Sized to match the L4 default so the two read as one
+/// policy on how much a single connection may ask for.
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 256;
 
 /// Application error codes the server closes a connection with when 2FA fails.
 ///
@@ -103,8 +130,17 @@ impl AuthState {
     }
 }
 
-fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+/// Finds the end of a header block, scanning from `from`.
+///
+/// `from` is what keeps a head that arrives in many small reads off O(n²):
+/// the bytes before it were already scanned on an earlier read, so without it
+/// every read rescanned the whole buffer, and a head delivered one segment at
+/// a time cost a full pass per segment.
+fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
+    buf.get(from..)?
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| from + pos)
 }
 
 pub async fn handle_bidi_stream(
@@ -117,14 +153,21 @@ pub async fn handle_bidi_stream(
     acl: Option<Arc<ClientAcl>>,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
+    // Doubling on demand, so a head that fits in one read never pays for a
+    // bigger buffer while a large one still gets there in a few reallocs.
+    // Pre-allocating the 64 KB limit would take that much from every stream.
     let mut buf = Vec::with_capacity(8192);
     let mut read_buf = [0u8; 8192];
     let mut body_data = Vec::new();
+    // How much of `buf` has already been scanned for the end of the headers.
+    let mut searched = 0usize;
 
+    let head_deadline = tokio::time::Instant::now() + HEAD_READ_TIMEOUT;
     loop {
-        match recv.read(&mut read_buf).await {
-            Ok(None) => break,
-            Ok(Some(n)) => {
+        let read = tokio::time::timeout_at(head_deadline, recv.read(&mut read_buf)).await;
+        match read {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(n))) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
                 // An L4 tunnel says so in its first byte, so it is recognised
@@ -162,7 +205,7 @@ pub async fn handle_bidi_stream(
                     .await;
                 }
 
-                if let Some(pos) = find_headers_end(&buf) {
+                if let Some(pos) = find_headers_end(&buf, searched) {
                     let headers_end = pos + 4;
                     if buf.len() > headers_end {
                         body_data.extend_from_slice(&buf[headers_end..]);
@@ -171,14 +214,30 @@ pub async fn handle_bidi_stream(
                     break;
                 }
 
+                // The marker can straddle two reads, so the last three bytes
+                // are looked at again; everything before them cannot start a
+                // marker that was not already ruled out.
+                searched = buf.len().saturating_sub(3);
+
                 if buf.len() > 64 * 1024 {
                     tracing::warn!("Request headers too large");
                     break;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::debug!("Failed to read from iroh stream: {}", e);
                 return Err(e.into());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "No complete request head from {} within {}s",
+                    peer,
+                    HEAD_READ_TIMEOUT.as_secs()
+                );
+                return Err(anyhow::anyhow!(
+                    "no request head within {}s",
+                    HEAD_READ_TIMEOUT.as_secs()
+                ));
             }
         }
     }
@@ -191,7 +250,7 @@ pub async fn handle_bidi_stream(
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h));
+        .map(crate::routes::host_without_port);
 
     let path = request
         .uri()
@@ -212,21 +271,36 @@ pub async fn handle_bidi_stream(
         // client can read beats closing the stream mid-request.
         tracing::warn!("No route for host={:?}, answering 404", host);
         let mut send = send;
-        let _ = send
+        let written = send
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             .await;
         let _ = send.finish();
-        // Unroutable hosts are logged too: "which hosts are people asking for
-        // that I do not serve" is a routing question, and without the line the
-        // answer is invisible.
-        crate::log::log_access(
-            peer,
-            request.method().as_str(),
-            request.uri().path(),
-            404,
-            0,
-            0,
-        );
+        match written {
+            Ok(()) => {
+                // Unroutable hosts are logged too: "which hosts are people
+                // asking for that I do not serve" is a routing question, and
+                // without the line the answer is invisible.
+                crate::log::log_access(
+                    peer,
+                    request.method().as_str(),
+                    request.uri().path(),
+                    404,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => {
+                // Nothing reached the client, so there is no response to put in
+                // the access log — a 404 there would claim one was delivered.
+                // The host is still named above, which is what the log line
+                // exists for.
+                tracing::debug!(
+                    "No route for host={:?}, and the 404 could not be written: {}",
+                    host,
+                    e
+                );
+            }
+        }
         return Ok(());
     };
 
@@ -244,21 +318,24 @@ pub async fn handle_bidi_stream(
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
-    let outcome = if http::is_websocket_request_static(&request) {
-        tracing::debug!("WebSocket request detected");
-        handle_websocket_stream(send, recv, &request, &backend_info.url).await
-    } else {
-        let mut send = send;
-        http::proxy_to_backend_streaming(
-            client,
-            &request,
-            &backend_info.url,
-            body_data,
-            &mut send,
-            &mut recv,
-        )
-        .await
-    };
+    let outcome: Result<http::ProxySummary, http::ProxyFailure> =
+        if http::is_websocket_request_static(&request) {
+            tracing::debug!("WebSocket request detected");
+            handle_websocket_stream(send, recv, &request, &backend_info.url)
+                .await
+                .map_err(http::ProxyFailure::from)
+        } else {
+            let mut send = send;
+            http::proxy_to_backend_streaming(
+                client,
+                &request,
+                &backend_info.url,
+                body_data,
+                &mut send,
+                &mut recv,
+            )
+            .await
+        };
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
@@ -273,12 +350,42 @@ pub async fn handle_bidi_stream(
             );
             Ok(())
         }
-        Err(e) => {
-            crate::log::log_access(peer, &method, &request_target, 502, elapsed_ms, 0);
-            Err(e)
+        Err(failure) => {
+            // What the client was actually told, when it was told anything. A
+            // failure after the head went out is not a 502 — the backend
+            // answered and part of the answer arrived — and logging it as one
+            // sends whoever reads the log looking for a broken backend.
+            let (status, bytes_sent) = match failure.partial {
+                Some(partial) => (partial.status, partial.bytes_sent),
+                None => (502, 0),
+            };
+            crate::log::log_access(
+                peer,
+                &method,
+                &request_target,
+                status,
+                elapsed_ms,
+                bytes_sent,
+            );
+            Err(failure.error)
         }
     }
 }
+
+/// How long dialing a backend for a WebSocket upgrade may take.
+///
+/// The HTTP path gets its connect timeout from the client builder and the TCP
+/// and TLS tunnels have their own; this was the one dial in the server with no
+/// deadline at all, so a backend that drops SYN kept the stream — and the
+/// request slot behind it — until the client gave up.
+const WS_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+/// How long the backend may take to answer the upgrade.
+///
+/// Covers the handshake only: the session that follows is a pipe and has no
+/// duration to bound. A backend that accepts the connection and then never
+/// sends a byte would otherwise look exactly like one that is still thinking.
+const WS_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Returns the status the client was answered with: 101 once the tunnel is up,
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
@@ -304,9 +411,13 @@ async fn handle_websocket_stream(
         .map(|h| h.to_string())
         .unwrap_or_else(|| host.to_string());
 
-    let mut backend_stream = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to connect to backend: {}", e))?;
+    let mut backend_stream = tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
+    .map_err(|e| anyhow::anyhow!("failed to connect to backend: {e}"))?;
 
     let path = req
         .uri()
@@ -338,33 +449,55 @@ async fn handle_websocket_stream(
     let mut response_buf = Vec::with_capacity(8192);
     let mut trailing_ws_data = Vec::new();
     let mut read_buf = [0u8; 8192];
+    // See the request loop: the handshake response arrives in reads of its
+    // own, and the marker is only ever in the part that has not been scanned.
+    let mut searched = 0usize;
 
-    loop {
-        match backend_stream.read(&mut read_buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                response_buf.extend_from_slice(&read_buf[..n]);
+    let read_handshake = async {
+        loop {
+            match backend_stream.read(&mut read_buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    response_buf.extend_from_slice(&read_buf[..n]);
 
-                if let Some(pos) = find_headers_end(&response_buf) {
-                    let headers_end = pos + 4;
-                    if response_buf.len() > headers_end {
-                        trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
+                    if let Some(pos) = find_headers_end(&response_buf, searched) {
+                        let headers_end = pos + 4;
+                        if response_buf.len() > headers_end {
+                            trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
+                        }
+                        response_buf.truncate(headers_end);
+                        break;
                     }
-                    response_buf.truncate(headers_end);
-                    break;
-                }
 
-                if response_buf.len() > 64 * 1024 {
-                    tracing::warn!("WebSocket handshake response too large");
-                    break;
+                    searched = response_buf.len().saturating_sub(3);
+
+                    if response_buf.len() > 64 * 1024 {
+                        tracing::warn!("WebSocket handshake response too large");
+                        break;
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::debug!("Failed to read from backend stream: {}", e);
-                return Err(e.into());
+                Err(e) => {
+                    tracing::debug!("Failed to read from backend stream: {}", e);
+                    return Err(anyhow::anyhow!(
+                        "failed to read the handshake response: {}",
+                        e
+                    ));
+                }
             }
         }
-    }
+        Ok(())
+    };
+
+    tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, read_handshake)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "backend {}:{} did not answer the WebSocket handshake within {:?}",
+                host,
+                port,
+                WS_HANDSHAKE_TIMEOUT
+            )
+        })??;
 
     let response = http::parse_http_response_legacy(&response_buf)?;
     let handshake_bytes = response_buf.len() + trailing_ws_data.len();
@@ -467,6 +600,68 @@ enum AuthFailure {
     Rejected(String),
 }
 
+/// What one `ENROLL_START` is worth.
+///
+/// Split out of [`enroll_client`] so the rule can be tested without a
+/// connection: acceptance is a question about the config and nothing else, and
+/// it is the question the whole invitation scheme rests on.
+#[derive(Debug, PartialEq)]
+enum EnrollmentVerdict {
+    /// The token matches, so the secret may be rotated.
+    Accept,
+    /// Refused. `counted` says whether this should move the client's lockout
+    /// counter along.
+    Refuse { counted: bool },
+}
+
+impl EnrollmentVerdict {
+    fn counted(&self) -> bool {
+        matches!(self, EnrollmentVerdict::Refuse { counted: true })
+    }
+}
+
+/// Decides one enrollment attempt against `cfg`.
+///
+/// A guess at a token that is actually outstanding is the only thing counted.
+/// It is an attempt to spend a credential — the thing a token has to withstand
+/// to be worth handing out — and it is what makes the link unguessable rather
+/// than merely unshared. Everything else is a guess at nothing: no such client,
+/// or one with no token pending. Counting those would let anyone who knows a
+/// client id lock that client out of its own authentication by sending it
+/// enrollment requests, which is a denial of service handed to a stranger.
+///
+/// A lockout outranks the token: the client is refused before the comparison
+/// runs, so a locked-out client cannot extend its own lockout by retrying, and
+/// a wrong code cannot be traded for extra attempts by going through
+/// enrollment.
+fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> EnrollmentVerdict {
+    let Some(client) = cfg.clients.get(client_id) else {
+        return EnrollmentVerdict::Refuse { counted: false };
+    };
+    if client.is_locked_out() {
+        return EnrollmentVerdict::Refuse { counted: false };
+    }
+    // An empty token is refused on both sides before the comparison runs.
+    // `constant_time_eq` answers true for two empty slices, so a config holding
+    // `pending_enrollment = ""` — what an operator naturally writes to "clear"
+    // the key — would accept any stranger's empty ENROLL_START and hand them a
+    // freshly generated secret, locking out every device already using this
+    // client id. The loader refuses that spelling too; this is the runtime half
+    // of the same rule, so a reload path that skips validation cannot revive it.
+    let Some(expected) = client
+        .pending_enrollment
+        .as_deref()
+        .filter(|expected| !expected.is_empty())
+    else {
+        return EnrollmentVerdict::Refuse { counted: false };
+    };
+
+    if !constant_time_eq(expected.as_bytes(), token.as_bytes()) {
+        return EnrollmentVerdict::Refuse { counted: true };
+    }
+    EnrollmentVerdict::Accept
+}
+
 /// Exchanges a one-time enrollment token for a freshly generated secret.
 ///
 /// This is what makes an enrollment invite worth handing out: the link carries
@@ -491,15 +686,34 @@ async fn enroll_client(
 
     let mut cfg = auth.config().write().await;
 
-    // Is there a client at all, and does it have this token outstanding? Asked
-    // before anything is mutated so the refusal paths stay a single read.
-    let accepted = cfg.clients.get(client_id).is_some_and(|client| {
-        client
-            .pending_enrollment
-            .as_deref()
-            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()))
-    });
-    if !accepted {
+    // Drop a lockout that has run out before deciding anything, so an expired
+    // one does not read as live and its stale counter does not push the client
+    // straight back over the threshold.
+    if let Some(client) = cfg.clients.get_mut(client_id) {
+        client.refresh_lockout();
+    }
+
+    let verdict = enrollment_verdict(&cfg, client_id, token);
+    if !matches!(verdict, EnrollmentVerdict::Accept) {
+        if verdict.counted() {
+            let (max_attempts, lockout_duration) = (cfg.max_attempts, cfg.lockout_duration);
+            if let Some(client) = cfg.clients.get_mut(client_id) {
+                client.record_failure(max_attempts, lockout_duration);
+            }
+            let snapshot = cfg.counter_snapshot();
+            if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                save_auth_state(path, &snapshot)
+            })
+            .await
+            {
+                tracing::warn!(
+                    "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
+                    client_id,
+                    auth.path(),
+                    e
+                );
+            }
+        }
         drop(cfg);
         write_auth_message(
             send,
@@ -535,7 +749,13 @@ async fn enroll_client(
     // Persisted before anything is promised to the client: a secret that is
     // live in memory but missing from disk is a secret that silently reverts
     // on the next restart, which would put the old one back in service.
-    if let Err(e) = crate::config::ProxyConfig::complete_enrollment(auth.path(), client_id, &secret)
+    let enrollment_path = auth.path().to_string();
+    let enrolled_client = client_id.to_string();
+    let issued_secret = secret.clone();
+    if let Err(e) = blocking_config_write(enrollment_path, move |path| {
+        crate::config::ProxyConfig::complete_enrollment(path, &enrolled_client, &issued_secret)
+    })
+    .await
     {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
@@ -554,6 +774,33 @@ async fn enroll_client(
         .await
         .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(reason));
+    }
+
+    // Presenting the token is proof the invite reached the right hands, so a
+    // counter left over from failed guesses is cleared: a client that just
+    // enrolled should not be one wrong code away from a lockout it did not
+    // earn. Only written when there is something to clear, as above.
+    let dirty = cfg
+        .clients
+        .get(client_id)
+        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+    if dirty {
+        if let Some(client) = cfg.clients.get_mut(client_id) {
+            client.record_success();
+        }
+        let snapshot = cfg.counter_snapshot();
+        if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+            save_auth_state(path, &snapshot)
+        })
+        .await
+        {
+            tracing::warn!(
+                "2FA: failed to persist the cleared counter for '{}' to {}: {}",
+                client_id,
+                auth.path(),
+                e
+            );
+        }
     }
     drop(cfg);
 
@@ -594,6 +841,63 @@ fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+/// Runs a write against the config file without occupying a worker.
+///
+/// These writes happen while the auth write lock is held, and that is not
+/// incidental: the lock is what keeps two connections from persisting
+/// overlapping views of the lockout counters, so the IO cannot be moved out
+/// from under it. What can be moved is the *thread* it blocks. `std::fs` plus a
+/// TOML parse is a syscall and some CPU on whichever thread calls it, and on a
+/// tokio worker that stalls every task scheduled behind it — one handshake's
+/// write becomes a delay on all of them, and a slow or contended mount turns
+/// into handshakes timing out for a reason that has nothing to do with the
+/// network. `spawn_blocking` hands it to a thread built for it and leaves the
+/// worker free.
+///
+/// The lock is still held across the await, so this does not change who can
+/// write when — only who waits for the disk.
+///
+/// Detached, and gated by [`config_write_gate`] rather than by the auth lock
+/// alone: the caller is bounded by a deadline, and a deadline that fires while
+/// a write is on the disk drops not only the result but the lock the write was
+/// running under — while the write itself keeps going, because a blocking task
+/// cannot be un-spawned. Two writes to one file then overlap and one of them
+/// is lost. The gate is taken *inside* the detached task, so it is held for as
+/// long as the write takes and not for as long as the caller is patient.
+async fn blocking_config_write<T, F>(path: String, write: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // Named apart from the `path` the closure takes, which it moves.
+    let failed_path = path.clone();
+    let (done, wait) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let _gate = config_write_gate().lock().await;
+        let result = tokio::task::spawn_blocking(move || write(&path)).await;
+        // A caller that timed out is not an error worth reporting: the write
+        // it asked for has happened, which is what the gate is for.
+        let _ = done.send(result);
+    });
+
+    let result = wait
+        .await
+        .map_err(|_| anyhow::anyhow!("the write to {failed_path} was abandoned"))?;
+    result.map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
+}
+
+/// Serialises writes to the config file, independently of the caller.
+///
+/// A `static` because it has to outlive the task that asked for the write: the
+/// auth lock is released when a handshake is cancelled, and this is what keeps
+/// that cancellation from letting the next write start on top of a running
+/// one.
+fn config_write_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Writes one length-prefixed AUTH_* message.
@@ -663,6 +967,20 @@ async fn perform_authentication(
     let start_msg = AuthMessage::from_bytes(&start_bytes).map_err(|_| {
         AuthFailure::NotStarted("the first stream is not an AUTH_START".to_string())
     })?;
+
+    // Checked before the id is used for anything, because the first thing it is
+    // used for is being printed: the log line for a refusal, a lockout or an
+    // unknown client all carry it, and a peer that names itself with a trailing
+    // CRLF writes the rest of that line itself. This is before any secret has
+    // been checked, so it is reachable by anyone who can open a stream.
+    if let AuthMessage::Start { client_id, .. } | AuthMessage::EnrollStart { client_id, .. } =
+        &start_msg
+        && !is_presentable_client_id(client_id)
+    {
+        return Err(AuthFailure::Rejected(
+            "client id is not printable ASCII".to_string(),
+        ));
+    }
 
     // Enrollment, when the client asked for it: the token is exchanged for a
     // freshly generated secret ahead of the ordinary handshake, on the same
@@ -792,7 +1110,12 @@ async fn perform_authentication(
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
                 }
-                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                let snapshot = cfg.counter_snapshot();
+                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                    save_auth_state(path, &snapshot)
+                })
+                .await
+                {
                     tracing::warn!(
                         "2FA: failed to persist auth state for '{}' to {}: {}",
                         client_id,
@@ -815,7 +1138,12 @@ async fn perform_authentication(
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
-                if let Err(e) = save_auth_state(auth.path(), &cfg) {
+                let snapshot = cfg.counter_snapshot();
+                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                    save_auth_state(path, &snapshot)
+                })
+                .await
+                {
                     tracing::warn!(
                         "2FA: failed to persist lockout for '{}' to {}: {}",
                         client_id,
@@ -963,6 +1291,13 @@ pub async fn handle_connection(
     // one that does not fit instead of blocking inside `open_bi`.
     let limiter = Arc::new(l4::FlowLimiter::new(l4::DEFAULT_MAX_FLOWS_PER_CONNECTION));
 
+    // A second counter covering every stream, not just L4 flows: `accept_bi`
+    // below spawns a task per stream whatever the stream turns out to be, and
+    // the limiter above is only consulted once the bytes say "L4".
+    let stream_slots = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    ));
+
     let paths = conn.paths();
     if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
         tracing::info!(
@@ -1049,12 +1384,28 @@ pub async fn handle_connection(
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
+                // Refused rather than queued: waiting for a slot would only move
+                // the unbounded growth into a backlog this loop cannot see, and
+                // the peer has to learn that its stream was not served.
+                let Ok(permit) = stream_slots.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        "Connection {} already has {} streams in flight, closing this one",
+                        peer_id,
+                        MAX_CONCURRENT_STREAMS_PER_CONNECTION
+                    );
+                    let mut send = send;
+                    let _ = send.finish();
+                    continue;
+                };
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
                 let acl_clone = client_acl.clone();
                 tokio::spawn(async move {
+                    // Held for the life of the task and released by its Drop, so
+                    // a slot frees however the stream ends.
+                    let _permit = permit;
                     if let Err(e) = handle_bidi_stream(
                         send,
                         recv,
@@ -1084,12 +1435,19 @@ pub async fn handle_connection(
     tracing::info!("Connection closed for peer: {}", peer_id);
 }
 
+/// `in_flight` is the guard the accept loop took for this connection. It has to
+/// travel all the way into the task that serves the connection: the drain at
+/// shutdown counts these, and a guard dropped when the accept returns would
+/// make it count only connections still being accepted — every established
+/// one, including WebSocket sessions and L4 flows, would be invisible to it and
+/// cut off the moment the process decided to stop.
 pub async fn handle_incoming(
     incoming: Incoming,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     auth_state: Option<AuthState>,
     limiter: Arc<ConnectionLimiter>,
+    in_flight: InFlightGuard,
 ) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -1110,8 +1468,11 @@ pub async fn handle_incoming(
                 };
                 tokio::spawn(async move {
                     // Held for as long as the connection is served, and released
-                    // by the guard's Drop however this task ends.
+                    // by the guard's Drop however this task ends: the limiter
+                    // one for the peer's allowance, the in-flight one so a
+                    // shutdown knows this connection is still here.
                     let _guard = guard;
+                    let _in_flight = in_flight;
                     handle_connection(conn, config, client, auth_state).await;
                 });
             }
@@ -1127,7 +1488,104 @@ pub async fn handle_incoming(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{
+        EnrollmentVerdict, blocking_config_write, constant_time_eq, enrollment_verdict,
+        find_headers_end,
+    };
+    use crate::auth::{AuthConfig, ClientAuth};
+
+    /// A write whose caller gave up still happens, and happens *first*.
+    ///
+    /// The abandoned write is slow on purpose, so the only way the second one
+    /// can end up last in the file is for it to have waited: without the gate
+    /// the two overlap and whichever reaches the disk last wins, which is a
+    /// lockout counter or an issued secret quietly disappearing.
+    #[tokio::test]
+    async fn an_abandoned_write_still_lands_before_the_next_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "start\n").expect("seed the file");
+        let slow_path = path.to_string_lossy().into_owned();
+        let fast_path = slow_path.clone();
+
+        let abandoned = tokio::spawn(async move {
+            let _ = blocking_config_write(slow_path, |path| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(path, "slow\n").map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .await;
+        });
+
+        // Give it a start, then walk away the way a cancelled handshake does.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        abandoned.abort();
+
+        blocking_config_write(fast_path, |path| {
+            std::fs::write(path, "fast\n").map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .await
+        .expect("the second write runs");
+
+        let on_disk = std::fs::read_to_string(&path).expect("read the file");
+        assert_eq!(on_disk, "fast\n", "the slow write was ordered before it");
+    }
+
+    /// The marker only ever appears once a read has brought in its last byte,
+    /// and the scan starts where the previous read left off — three bytes back,
+    /// because a marker split across two reads has to still be found.
+    #[test]
+    fn a_header_marker_split_across_reads_is_still_found() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+        // Everything up to the last three bytes has been scanned already.
+        let mut buf = Vec::new();
+        let mut searched = 0;
+        let mut found = None;
+        for chunk in head.chunks(7) {
+            buf.extend_from_slice(chunk);
+            if let Some(pos) = find_headers_end(&buf, searched) {
+                found = Some(pos);
+                break;
+            }
+            searched = buf.len().saturating_sub(3);
+        }
+
+        assert_eq!(
+            found.map(|pos| pos + 4),
+            Some(head.len()),
+            "the marker was missed when it arrived in pieces"
+        );
+    }
+
+    #[test]
+    fn a_buffer_without_the_marker_is_not_a_head() {
+        assert_eq!(
+            find_headers_end(b"GET / HTTP/1.1\r\nHost: a.test\r\n", 0),
+            None
+        );
+        // Nothing to scan: a read that brought no bytes cannot have completed
+        // the marker either.
+        assert_eq!(find_headers_end(b"", 0), None);
+        assert_eq!(find_headers_end(b"\r\n", 40), None);
+    }
+
+    /// A config holding one client, with `token` left outstanding for it.
+    fn auth_with_pending(token: Option<&str>) -> AuthConfig {
+        let mut cfg = AuthConfig::default();
+        cfg.clients.insert(
+            "alice".to_string(),
+            ClientAuth {
+                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                created_at: "0".to_string(),
+                allow_hosts: None,
+                pending_enrollment: token.map(|t| t.to_string()),
+                last_used: None,
+                failed_attempts: 0,
+                locked_until: None,
+            },
+        );
+        cfg
+    }
 
     /// The comparison is what stands between a token and whoever copied the
     /// link, so it has to be right at the boundaries: equal, wrong at the first
@@ -1152,5 +1610,76 @@ mod tests {
         // Two empty tokens compare equal, which is why a client with no token
         // outstanding must not be enrolled at all rather than compared here.
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn an_outstanding_token_is_accepted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Accept
+        );
+    }
+
+    /// The token is a credential like any other: guessing at it has to cost
+    /// the same as guessing a TOTP code, or the link is a slower credential
+    /// with no ceiling on how many times it can be tried.
+    #[test]
+    fn a_wrong_token_is_refused_and_counted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcde0"),
+            EnrollmentVerdict::Refuse { counted: true }
+        );
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", ""),
+            EnrollmentVerdict::Refuse { counted: true }
+        );
+    }
+
+    /// A client with no token outstanding is refused without being counted:
+    /// counting it would let anyone who knows a client id lock that client out
+    /// of its own authentication by sending it enrollment requests.
+    #[test]
+    fn a_client_with_nothing_pending_is_refused_without_being_counted() {
+        let cfg = auth_with_pending(None);
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    #[test]
+    fn an_unknown_client_is_refused_without_being_counted() {
+        let cfg = auth_with_pending(Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "bob", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    /// A locked-out client is refused before the token is looked at, so a
+    /// lockout cannot be walked around by enrolling — and retrying does not
+    /// push the lockout further out.
+    #[test]
+    fn a_locked_out_client_is_refused_even_with_the_right_token() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+        cfg.clients.get_mut("alice").unwrap().locked_until = Some(u64::MAX);
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    /// The runtime half of the empty-token rule: `constant_time_eq` answers
+    /// true for two empty slices, so a blank token on both sides has to be
+    /// refused on the way in rather than compared.
+    #[test]
+    fn a_blank_pending_token_is_never_accepted() {
+        let cfg = auth_with_pending(Some(""));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", ""),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
     }
 }

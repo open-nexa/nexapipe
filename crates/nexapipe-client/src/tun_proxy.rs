@@ -61,13 +61,17 @@ use crate::jni_log;
 /// Desktop/server builds log through `tracing`; builds without either the `jni`
 /// or the `tracing` feature get a no-op.
 ///
+/// At `debug`, not `info`: these are the per-packet and per-flow lines of the
+/// data path, and one of them names the domain every TCP and UDP flow is for.
+/// A default-level desktop build logged every site a user visited.
+///
 /// The format arguments are still *evaluated* (borrowed) inside the no-op's dead
 /// branch, so the optimiser removes the call but `unused_variables` does not fire
 /// on variables that only ever appear inside a log statement.
 #[cfg(all(not(feature = "jni"), feature = "tracing"))]
 macro_rules! jni_log {
     ($($arg:tt)*) => {
-        ::tracing::info!($($arg)*)
+        ::tracing::debug!($($arg)*)
     };
 }
 
@@ -137,6 +141,14 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 /// first.
 const UDP_FLOW_IDLE: Duration = Duration::from_secs(50);
 
+/// How often a TCP flow looks at the stop flag while it is copying bytes.
+///
+/// A flow is not one of the tasks `stop()` aborts, so this is how it finds out
+/// the proxy is gone — and it has to, because it is holding a pooled connection
+/// until it does. Cheap either way: one timer per flow, and a second is far
+/// sooner than the alternative.
+const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Datagrams that may be waiting for one UDP flow's tunnel to accept them.
 ///
 /// A flow is created when its first datagram arrives and the tunnel takes a
@@ -149,6 +161,16 @@ const UDP_FLOW_QUEUE: usize = 256;
 /// Datagrams on their way from the proxy to the application (DNS replies and
 /// every UDP flow's inbound traffic) queue here for the single TUN writer.
 const TUN_WRITE_QUEUE: usize = 1024;
+
+/// How many UDP flows may be open at once.
+///
+/// One flow per (client address, destination), and each one holds a tunnel
+/// open — a stream, and a pooled connection, on the server — plus a 65 KiB
+/// read buffer and a queue 256 datagrams deep. Nothing bounded how many an
+/// application could start: a peer that sent one datagram each from a few
+/// thousand source ports, or a leak of flows whose idle timer had not run out
+/// yet, was answered with as many tunnels as it cared to open.
+const MAX_UDP_FLOWS: usize = 32;
 
 /// Buffer size for the byte-copying TCP paths.
 const COPY_BUF_SIZE: usize = 16 * 1024;
@@ -278,6 +300,42 @@ fn start_stack_services(
     Ok((sink, stream))
 }
 
+/// The two dups of the TUN fd, closed unless the pumps take them over.
+///
+/// Android hands the fd over and it is closed straight after being dup'ed, so
+/// every step between the dups and the pumps taking ownership can fail with
+/// both dups still open — leaked for the life of the process, and the VPN
+/// cannot be brought up again while they are. Each half is taken out as it is
+/// handed to a pump; whatever is left here when this drops is closed.
+#[cfg(target_os = "android")]
+struct TunFds {
+    read: Option<RawFd>,
+    write: Option<RawFd>,
+}
+
+#[cfg(target_os = "android")]
+impl Drop for TunFds {
+    fn drop(&mut self) {
+        for fd in [self.read.take(), self.write.take()].into_iter().flatten() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Stops the tasks a partly built proxy already has running.
+///
+/// Not optional: dropping a `JoinHandle` detaches its task instead of
+/// cancelling it, so without this a task started before the failure keeps
+/// polling a stack and an endpoint group belonging to a proxy that was never
+/// finished — and `stopped` is the only signal it listens for.
+#[cfg(target_os = "android")]
+fn stop_started_tasks(tasks: &[JoinHandle<()>], stopped: &AtomicBool) {
+    stopped.store(true, Ordering::Release);
+    for task in tasks {
+        task.abort();
+    }
+}
+
 impl TunProxy {
     /// Create and start the TUN proxy (Android).
     ///
@@ -312,6 +370,15 @@ impl TunProxy {
         // Close the original fd — we now hold two dups.
         unsafe { libc::close(tun_fd) };
 
+        // From here the dups are ours to lose: the original is already closed,
+        // so every remaining step that can fail would leak both for the life of
+        // the process — and with them the VPN, which cannot be brought up
+        // again on a device whose TUN fd is still open.
+        let mut fds = TunFds {
+            read: Some(fd_read),
+            write: Some(fd_write),
+        };
+
         set_nonblocking(fd_read)?;
         set_nonblocking(fd_write)?;
 
@@ -325,7 +392,7 @@ impl TunProxy {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
         // 2. Build the stack and every service task; we get back the packet halves.
-        let (stack_sink, stack_stream) = start_stack_services(
+        let (stack_sink, stack_stream) = match start_stack_services(
             endpoint_group,
             proxy_domains,
             custom_dns_servers,
@@ -336,12 +403,30 @@ impl TunProxy {
             },
             stopped.clone(),
             &mut tasks,
-        )?;
+        ) {
+            Ok(halves) => halves,
+            Err(e) => {
+                // It can have spawned part of the stack before failing, and
+                // those tasks are not reachable from anywhere else. The dups
+                // are closed by `fds` dropping.
+                stop_started_tasks(&tasks, &stopped);
+                return Err(e);
+            }
+        };
 
         // 3. TUN → Stack pump (read fd → Stack Sink).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fd_read) };
-            let async_fd = AsyncFd::new(file)?;
+            let file = unsafe { std::fs::File::from_raw_fd(fds.read.take().expect("still held")) };
+            // A failure here has to stop what `start_stack_services` already
+            // spawned: dropping a `JoinHandle` detaches its task rather than
+            // cancelling it, and `stopped` is the only signal those tasks hear.
+            let async_fd = match AsyncFd::new(file) {
+                Ok(async_fd) => async_fd,
+                Err(e) => {
+                    stop_started_tasks(&tasks, &stopped);
+                    return Err(e.into());
+                }
+            };
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
@@ -390,8 +475,14 @@ impl TunProxy {
 
         // 4. Stack → TUN pump (Stack Stream → write fd).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fd_write) };
-            let async_fd = AsyncFd::new(file)?;
+            let file = unsafe { std::fs::File::from_raw_fd(fds.write.take().expect("still held")) };
+            let async_fd = match AsyncFd::new(file) {
+                Ok(async_fd) => async_fd,
+                Err(e) => {
+                    stop_started_tasks(&tasks, &stopped);
+                    return Err(e.into());
+                }
+            };
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
@@ -733,9 +824,24 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
         let _ = tokio::time::timeout(Duration::from_secs(5), app_write.shutdown()).await;
     };
 
+    // The third branch: this flow is not one of the tasks `stop()` knows about,
+    // so nothing aborts it — and a flow that outlives the proxy keeps a pooled
+    // connection checked out of a group nobody can close. Watching the flag is
+    // what returns it. Polled, because there is nothing to await on a bool, and
+    // a wake-up per flow is far cheaper than a connection stuck until the app
+    // gives up on it.
+    //
+    // No idle timeout on top of that, unlike the UDP flows: a TCP connection
+    // may legitimately sit quiet for minutes, and only the applications at
+    // either end can say when it is finished.
     tokio::select! {
         _ = app_to_tunnel => (),
         _ = tunnel_to_app => (),
+        _ = async {
+            while !ctx.stopped.load(Ordering::Acquire) {
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
+        } => (),
     }
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,
@@ -796,6 +902,8 @@ async fn run_udp_demux(
     ctx: TunContext,
 ) {
     let table: FlowTable = Arc::new(Mutex::new(HashMap::new()));
+    // One log line per episode of being full, not one per dropped datagram.
+    let warned_full = AtomicBool::new(false);
 
     while !ctx.stopped.load(Ordering::Acquire) {
         let Some((payload, client_addr, dst_addr)) = socket.next().await else {
@@ -860,7 +968,30 @@ async fn run_udp_demux(
             Some(sender) => sender,
             None => {
                 let (sender, receiver) = mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
-                lock_flows(&table).insert(key, sender.clone());
+                let mut flows = lock_flows(&table);
+
+                if flows.len() >= MAX_UDP_FLOWS {
+                    // A flow that has ended is still in the table until its
+                    // task gets to `release_flow`, so the count is not the
+                    // number of live flows — look again before refusing.
+                    flows.retain(|_, sender| !sender.is_closed());
+                }
+                if flows.len() >= MAX_UDP_FLOWS {
+                    drop(flows);
+                    if !warned_full.swap(true, Ordering::Relaxed) {
+                        jni_log!(
+                            "[tun-proxy] {} UDP flows are open, dropping datagrams until one ends",
+                            MAX_UDP_FLOWS
+                        );
+                    }
+                    // UDP is allowed to lose datagrams, and the alternative is
+                    // a tunnel per source port.
+                    continue;
+                }
+
+                warned_full.store(false, Ordering::Relaxed);
+                flows.insert(key, sender.clone());
+                drop(flows);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
@@ -1117,18 +1248,21 @@ pub async fn handle_dns_query(
             return Some(build_empty_dns_response(query));
         }
         let virtual_ip = ip_mapping.allocate(&domain);
-        jni_log!("[tun-proxy] DNS: '{}' -> {}", domain, virtual_ip);
+        // The name is deliberately left out: this runs for every name the
+        // device resolves, so logging it turns logcat into a record of where
+        // the user goes. What debugging needs is the decision, not the name.
+        jni_log!("[tun-proxy] DNS: proxying a query -> {}", virtual_ip);
         Some(build_dns_response(query, virtual_ip, qtype))
     } else {
         // Forward to the real DNS.
-        jni_log!(
-            "[tun-proxy] DNS: '{}' -> forwarding to real DNS (qtype={})",
-            domain,
-            qtype
-        );
+        jni_log!("[tun-proxy] DNS: forwarding a query (qtype={})", qtype);
         forward_dns_query(query, dns_servers).await
     }
 }
+
+/// How many compression pointers one name may follow before the name is
+/// declared unreadable. A real name needs one; more than that is a loop.
+const MAX_DNS_POINTER_JUMPS: usize = 4;
 
 /// Parse a DNS query, returning (domain, QTYPE).
 /// QTYPE: 1=A, 28=AAAA. Returns None on parse failure.
@@ -1146,13 +1280,54 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
     // Parse the Question section's domain name (length-prefixed labels).
     let mut pos = 12;
     let mut labels: Vec<&str> = Vec::new();
+    let mut jumps = 0usize;
+    // Where QTYPE sits once the name is over. It follows the terminating zero
+    // byte for an uncompressed name, but the two pointer bytes when the name
+    // jumped: the labels those bytes point at are somewhere else entirely, so
+    // reading on from there would land inside another section.
+    let mut after_name: Option<usize> = None;
 
     while pos < payload.len() {
         let len = payload[pos] as usize;
+
         if len == 0 {
             pos += 1; // Skip the null terminator.
             break;
         }
+
+        // A compression pointer (RFC 1035 4.1.4): the two top bits are set and
+        // the rest, with the byte after, is an offset into the message — an
+        // earlier label list that this name continues with. Reading it as a
+        // length gives a nonsense label, and from there a nonsense domain: what
+        // decides whether the name is proxied was silently wrong. Rare in a
+        // query, legal, and some stacks do it.
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= payload.len() {
+                return None;
+            }
+            let offset = ((len & 0x3F) << 8) | payload[pos + 1] as usize;
+            if offset >= payload.len() {
+                return None;
+            }
+            // A pointer that points at another pointer forever is a loop; stop
+            // after a few hops rather than spin.
+            jumps += 1;
+            if jumps > MAX_DNS_POINTER_JUMPS {
+                return None;
+            }
+            if after_name.is_none() {
+                after_name = Some(pos + 2);
+            }
+            pos = offset;
+            continue;
+        }
+
+        // The remaining two label types (0x40, 0x80) are reserved or unused;
+        // a name using one cannot be read as text.
+        if len & 0xC0 != 0 {
+            return None;
+        }
+
         // Prevent out-of-bounds access.
         if pos + 1 + len > payload.len() {
             return None;
@@ -1162,9 +1337,9 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16)> {
         pos += 1 + len;
     }
 
-    // pos points right after the null byte. QTYPE is the 2 bytes immediately following it.
-    let qtype = if pos + 2 <= payload.len() {
-        u16::from_be_bytes([payload[pos], payload[pos + 1]])
+    let qtype_pos = after_name.unwrap_or(pos);
+    let qtype = if qtype_pos + 2 <= payload.len() {
+        u16::from_be_bytes([payload[qtype_pos], payload[qtype_pos + 1]])
     } else {
         0
     };
@@ -1233,6 +1408,11 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
 /// Iterates over all configured DNS servers, **preferring IPv4**, binding the socket by address family
 /// (IPv4→0.0.0.0:0, IPv6→[::]:0). Each server has its own 800ms timeout, with an overall 3s cap.
 ///
+/// A name that was resolved recently is answered from a cache instead, for as
+/// long as the answer's own records say it is good — see [`remember_answer`].
+/// The transaction ID of the query asking now is written into the answer before
+/// it goes out.
+///
 /// Fix: the system DNS list often starts with IPv6 servers (e.g. 2408:8888::8), which made binding
 /// 0.0.0.0:0 then connect() fail, and the old code only tried dns_servers[0] with no fallback.
 pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
@@ -1241,6 +1421,53 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
         return None;
     }
 
+    // Every name the device looks up comes through here, and a lookup the
+    // resolver has already answered does not need another round trip to a
+    // server — which on a phone is a radio wake-up, not a LAN packet.
+    let key = parse_dns_query(query).map(|(domain, qtype)| (domain.to_lowercase(), qtype));
+    if let Some(key) = &key
+        && let Some(answer) = cached_answer(key, query)
+    {
+        return Some(answer);
+    }
+
+    let answer = forward_dns_query_uncached(query, dns_servers).await;
+
+    if let (Some(key), Some(answer)) = (key, &answer) {
+        remember_answer(key.clone(), answer);
+    }
+
+    answer
+}
+
+/// Whether `response` is an answer to `query` rather than to something else.
+///
+/// A UDP socket hands back whatever arrives first, and the answer is believed
+/// without this on a path where DNS is interfered with — a reply that races the
+/// real one wins, is cached under the name that was asked for, and every app on
+/// the device is told that address for as long as its TTL says. The 16-bit ID
+/// is the only thing tying a response to a query, so it and the question are
+/// both required to match.
+fn answer_matches_query(response: &[u8], query: &[u8]) -> bool {
+    if response.len() < 12 || query.len() < 12 {
+        return false;
+    }
+    if response[0..2] != query[0..2] {
+        return false;
+    }
+    // QR: a query is the wrong kind of packet to be answering with.
+    if response[2] & 0x80 == 0 {
+        return false;
+    }
+    match (parse_dns_query(response), parse_dns_query(query)) {
+        (Some((answered, answered_type)), Some((asked, asked_type))) => {
+            answered.eq_ignore_ascii_case(&asked) && answered_type == asked_type
+        }
+        _ => false,
+    }
+}
+
+async fn forward_dns_query_uncached(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
     // Prefer IPv4: try IPv4 DNS first (faster and more reliable), then IPv6.
     let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
     ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) goes first
@@ -1262,8 +1489,17 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
                 sock.connect(**dns_server).await.ok()?;
                 sock.send(query).await.ok()?;
                 let mut buf = vec![0u8; 4096];
-                let n = sock.recv(&mut buf).await.ok()?;
-                Some(buf[..n].to_vec())
+                // Keep reading: the first datagram to arrive is not necessarily
+                // an answer to this query, and believing one that is not is how
+                // a forged address gets cached under the name asked for. The
+                // enclosing timeout is what ends the wait.
+                loop {
+                    let n = sock.recv(&mut buf).await.ok()?;
+                    let response = buf[..n].to_vec();
+                    if answer_matches_query(&response, query) {
+                        return Some(response);
+                    }
+                }
             })
             .await;
 
@@ -1292,5 +1528,365 @@ pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Opti
             );
             None
         }
+    }
+}
+
+// ============================================================
+// DNS answer cache
+// ============================================================
+
+/// How long an answer may be kept when the records disagree, or carry a TTL
+/// nobody would wait for. Bounded on both sides: a `0` TTL is a record the
+/// server wanted re-asked, and one that never expires would pin an address to
+/// a name for as long as the process lives.
+const DNS_CACHE_MIN_TTL: Duration = Duration::from_secs(1);
+const DNS_CACHE_MAX_TTL: Duration = Duration::from_secs(300);
+
+/// Answers kept before the oldest are dropped to make room. A phone resolves a
+/// few dozen names; this is a few hundred, so a busy app cannot grow it.
+const DNS_CACHE_MAX_ENTRIES: usize = 512;
+
+/// A name and the record type asked for, which together are what an answer is
+/// for. Lower-cased, because DNS names are case-insensitive.
+type CacheKey = (String, u16);
+
+struct CachedAnswer {
+    response: Vec<u8>,
+    expires_at: tokio::time::Instant,
+}
+
+static DNS_CACHE: std::sync::LazyLock<Mutex<HashMap<CacheKey, CachedAnswer>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_cache() -> MutexGuard<'static, HashMap<CacheKey, CachedAnswer>> {
+    DNS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The answer already held for `key`, with the transaction ID of the query
+/// asking now.
+///
+/// `None` when there is none, or when the one there has expired.
+fn cached_answer(key: &CacheKey, query: &[u8]) -> Option<Vec<u8>> {
+    let cache = lock_cache();
+    let entry = cache.get(key)?;
+    if entry.expires_at <= tokio::time::Instant::now() {
+        return None;
+    }
+
+    // The answer was fetched with a different ID, and a resolver drops a reply
+    // whose ID does not match the question it sent — so without this a cached
+    // answer looks to the application exactly like no answer at all.
+    let mut response = entry.response.clone();
+    if response.len() >= 2 && query.len() >= 2 {
+        response[0] = query[0];
+        response[1] = query[1];
+    }
+    Some(response)
+}
+
+/// Stores `response` for `key`, for as long as its own records say it is good.
+fn remember_answer(key: CacheKey, response: &[u8]) {
+    let Some(ttl) = answer_ttl(response) else {
+        // Nothing to keep: an answer with no records, or one the server
+        // refused, is either a negative answer (which a resolver may want to
+        // re-ask at any moment) or unreadable.
+        return;
+    };
+
+    let mut cache = lock_cache();
+    let now = tokio::time::Instant::now();
+    cache.retain(|_, entry| entry.expires_at > now);
+
+    // No room and nothing expired: the whole table is dropped rather than
+    // picking a victim one record at a time, which for a cache this size is
+    // not worth the bookkeeping.
+    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+
+    cache.insert(
+        key,
+        CachedAnswer {
+            response: response.to_vec(),
+            expires_at: now + ttl,
+        },
+    );
+}
+
+/// How long the records in `response` may be served from the cache: the
+/// shortest TTL among the answers, since one expired record makes the answer
+/// wrong. `None` when the response has no answers to read a TTL from, or is
+/// an error.
+fn answer_ttl(response: &[u8]) -> Option<Duration> {
+    if response.len() < 12 {
+        return None;
+    }
+
+    // RCODE is the low four bits of the flags: anything but 0 is a refusal or
+    // a failure, which is not something to keep answering with.
+    if response[3] & 0x0F != 0 {
+        return None;
+    }
+
+    let answers = u16::from_be_bytes([response[6], response[7]]) as usize;
+    if answers == 0 {
+        return None;
+    }
+
+    // Skip the header and the question — one name plus QTYPE and QCLASS.
+    let mut pos = skip_dns_name(response, 12)? + 4;
+
+    let mut shortest: Option<u32> = None;
+    for _ in 0..answers {
+        pos = skip_dns_name(response, pos)?;
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2).
+        if pos + 10 > response.len() {
+            return None;
+        }
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10 + rdlength;
+
+        shortest = Some(match shortest {
+            Some(seen) => seen.min(ttl),
+            None => ttl,
+        });
+    }
+
+    shortest.map(|ttl| {
+        let bounded = (ttl as u64).clamp(DNS_CACHE_MIN_TTL.as_secs(), DNS_CACHE_MAX_TTL.as_secs());
+        Duration::from_secs(bounded)
+    })
+}
+
+/// The offset just past the name starting at `pos`, following a compression
+/// pointer if the name ends in one.
+fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *payload.get(pos)? as usize;
+        match len {
+            0 => return Some(pos + 1),
+            // A pointer ends the name, and is two bytes long.
+            0xC0.. => return Some(pos + 2),
+            _ => pos += 1 + len,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        answer_matches_query, answer_ttl, cached_answer, parse_dns_query, remember_answer,
+    };
+    use std::time::Duration;
+
+    /// A query packet: 12 bytes of header, then the question.
+    fn query(name: &[u8], qtype: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(name);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        packet
+    }
+
+    /// A query whose QNAME is partly compressed: `www` in the question, then a
+    /// pointer to the `example.com` written further along. The pointer ends the
+    /// name where it stands, so QTYPE follows its two bytes — not the labels it
+    /// points at.
+    fn query_with_partly_compressed_name(qtype: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(&[0x03, b'w', b'w', b'w']); // offset 12..16
+        packet.extend_from_slice(&[0xC0, 24]); // pointer at 16..18 -> offset 24
+        packet.extend_from_slice(&qtype.to_be_bytes()); // 18..20
+        packet.extend_from_slice(&1u16.to_be_bytes()); // 20..22
+        packet.extend_from_slice(&[0, 0]); // 22..24, filler
+        packet.extend_from_slice(&[0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e']);
+        packet.extend_from_slice(&[0x03, b'c', b'o', b'm', 0x00]);
+        packet
+    }
+
+    #[test]
+    fn reads_an_uncompressed_name() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let (domain, qtype) = parse_dns_query(&query(&name, 1)).unwrap();
+        assert_eq!(domain, "example.com");
+        assert_eq!(qtype, 1);
+    }
+
+    /// The bug: read as a length, the pointer's 0xC0 became a 192-byte label
+    /// (out of bounds, so `None`) or, with a smaller value, a garbage one — and
+    /// the routing decision that follows the name was silently wrong.
+    #[test]
+    fn follows_a_compression_pointer_to_the_rest_of_the_name() {
+        let (domain, qtype) = parse_dns_query(&query_with_partly_compressed_name(1)).unwrap();
+        assert_eq!(domain, "www.example.com");
+        assert_eq!(qtype, 1);
+    }
+
+    /// QTYPE follows the pointer, not the labels it points at: reading on from
+    /// the pointed-to name's terminator would land in the tail of the packet.
+    #[test]
+    fn reads_the_qtype_where_the_pointer_ended() {
+        let (_, qtype) = parse_dns_query(&query_with_partly_compressed_name(28)).unwrap();
+        assert_eq!(qtype, 28);
+    }
+
+    #[test]
+    fn refuses_a_pointer_that_loops() {
+        // 0xC00C points at offset 12, which is this very pointer.
+        let name = [0xC0, 0x0C];
+        assert!(parse_dns_query(&query(&name, 1)).is_none());
+    }
+
+    #[test]
+    fn refuses_a_pointer_outside_the_packet() {
+        let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
+        assert!(parse_dns_query(&query(&name, 1)).is_none());
+    }
+
+    /// What a forwarded answer is checked against: a UDP socket hands over
+    /// whatever arrived first, and an answer that is not for this query would
+    /// otherwise be cached under the name that was asked for.
+    #[test]
+    fn an_answer_matches_when_its_id_and_question_do() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let q = query(&name, 1);
+        let mut response = q.clone();
+        response[2] = 0x81; // QR: this is an answer, not another query.
+
+        assert!(answer_matches_query(&response, &q));
+        // The query is not an answer to itself.
+        assert!(!answer_matches_query(&q, &q));
+    }
+
+    #[test]
+    fn an_answer_for_another_id_is_not_taken() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let q = query(&name, 1);
+        let mut response = q.clone();
+        response[2] = 0x81;
+        response[1] ^= 0xff;
+
+        assert!(!answer_matches_query(&response, &q));
+    }
+
+    #[test]
+    fn an_answer_for_another_name_or_type_is_not_taken() {
+        let asked = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let other = [0x04, b'e', b'v', b'i', b'l', 0x03, b'c', b'o', b'm', 0x00];
+        let q = query(&asked, 1);
+
+        // Same ID, different question: the forged answer that races the real
+        // one on a path where DNS is interfered with.
+        let mut forged = query(&other, 1);
+        forged[0] = q[0];
+        forged[1] = q[1];
+        forged[2] = 0x81;
+        assert!(!answer_matches_query(&forged, &q));
+
+        // Same name, wrong record type.
+        let mut wrong_type = query(&asked, 28);
+        wrong_type[0] = q[0];
+        wrong_type[1] = q[1];
+        wrong_type[2] = 0x81;
+        assert!(!answer_matches_query(&wrong_type, &q));
+    }
+
+    /// An answer with two A records: the same header and question, then two
+    /// records whose TTLs differ, so the cache has to keep the shorter one.
+    fn answer(ttls: &[u32]) -> Vec<u8> {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let mut packet = vec![0xAA, 0xBB, 0x81, 0x80, 0x00, 0x01];
+        packet.extend_from_slice(&(ttls.len() as u16).to_be_bytes()); // ANCOUNT
+        packet.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT + ARCOUNT
+        packet.extend_from_slice(&name);
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+
+        for ttl in ttls {
+            packet.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to the question
+            packet.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+            packet.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+            packet.extend_from_slice(&ttl.to_be_bytes());
+            packet.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+            packet.extend_from_slice(&[10, 0, 0, 1]); // RDATA
+        }
+        packet
+    }
+
+    #[test]
+    fn the_cache_keeps_the_shortest_ttl_in_the_answer() {
+        assert_eq!(
+            answer_ttl(&answer(&[300, 60])),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            answer_ttl(&answer(&[60, 300])),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    /// A TTL nobody would wait for, and one that never expires: both are
+    /// bounded, or the cache would re-ask constantly / pin a name forever.
+    #[test]
+    fn ttls_outside_the_bounds_are_clamped() {
+        assert_eq!(answer_ttl(&answer(&[0])), Some(Duration::from_secs(1)));
+        assert_eq!(
+            answer_ttl(&answer(&[u32::MAX])),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    /// Nothing to keep: an answer with no records, or one the server refused.
+    #[test]
+    fn an_answer_with_no_records_is_not_cached() {
+        assert_eq!(answer_ttl(&answer(&[])), None);
+
+        let mut refused = answer(&[60]);
+        refused[3] = 0x83; // RCODE = NXDOMAIN
+        assert_eq!(answer_ttl(&refused), None);
+    }
+
+    /// The answer is fetched once and served to many queries, each with its own
+    /// transaction ID — a resolver drops a reply whose ID does not match the
+    /// question it sent.
+    #[test]
+    fn a_cached_answer_is_served_with_the_asking_query_id() {
+        let name = [
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ];
+        let fetched = query(&name, 1); // ID 0x1234
+        let asking = {
+            let mut other = fetched.clone();
+            other[0] = 0xAB;
+            other[1] = 0xCD;
+            other
+        };
+
+        remember_answer(("example.com".to_string(), 1), &answer(&[60]));
+
+        let served = cached_answer(&("example.com".to_string(), 1), &asking)
+            .expect("the answer was remembered with a 60s TTL");
+        assert_eq!(&served[..2], &[0xAB, 0xCD]);
+
+        // A different record type is a different question, even for one name.
+        assert!(cached_answer(&("example.com".to_string(), 28), &asking).is_none());
     }
 }

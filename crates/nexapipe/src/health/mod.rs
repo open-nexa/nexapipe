@@ -6,6 +6,25 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Duration, sleep};
 
+/// A fraction of `interval` to wait before the first round of probes, so
+/// checkers that start together do not stay in lockstep for the life of the
+/// process.
+///
+/// Derived from the clock instead of a random number: it is a scheduling
+/// detail, not a security property, and this way it costs no dependency and no
+/// shared state. Two checkers get different values because time has moved on
+/// between them.
+fn startup_jitter(interval: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.subsec_nanos() as u128)
+        .unwrap_or(0);
+
+    let span = interval.as_nanos().max(1);
+    let jitter = (nanos % span).min(u64::MAX as u128) as u64;
+    Duration::from_nanos(jitter)
+}
+
 pub struct HealthChecker {
     backend_pool: Arc<BackendPool>,
     client: Arc<HttpClient>,
@@ -53,10 +72,21 @@ impl HealthChecker {
             self.failure_threshold
         );
 
+        // Every checker is spawned as soon as the config is loaded, so without
+        // this one server sends a probe per route at the same instant — and
+        // then again every `interval`, forever, because nothing ever moves them
+        // apart. Waiting a random part of the first interval spreads them.
+        let jitter = startup_jitter(self.interval);
+        if !jitter.is_zero() {
+            tracing::debug!("Health checker waiting {:?} before its first round", jitter);
+            sleep(jitter).await;
+        }
+
         loop {
-            // Paused, not cancelled: the task is owned by nobody after spawn,
-            // so `[health_check] enabled = false` on a reload stops the probing
-            // without having to reach into every checker.
+            // Paused, not cancelled: `[health_check] enabled = false` on a
+            // reload stops the probing without having to reach into every
+            // checker. Being cancelled is a different question — that is what
+            // `HealthProbes::stop_stale` does when the route itself is gone.
             if self.enabled.load(Ordering::Relaxed) {
                 self.check_all_backends().await;
             }
@@ -128,12 +158,28 @@ impl HealthChecker {
     async fn check_backend(&self, url: &str) -> bool {
         let health_url = format!("{}{}", url, self.health_path);
 
-        let request = hyper::Request::builder()
+        // `health_path` comes from the config, and a character the URI parser
+        // rejects used to panic here — which took the whole probe loop down
+        // with it and left every backend on this route marked healthy for the
+        // rest of the run, with nothing in the log saying why. A backend whose
+        // check cannot be built is not one that answered, so it fails.
+        let request = match hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(&health_url)
             .header("host", "health-check")
             .body(http_body_util::Full::new(bytes::Bytes::new()))
-            .unwrap();
+        {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::error!(
+                    "Health check for {} cannot be built from path {:?}: {}",
+                    url,
+                    self.health_path,
+                    e
+                );
+                return false;
+            }
+        };
 
         match tokio::time::timeout(self.timeout, self.client.request(request)).await {
             Ok(Ok(response)) => {
@@ -161,6 +207,64 @@ impl HealthChecker {
                 false
             }
         }
+    }
+}
+
+/// The probes the process has running, and the pool each one is watching.
+///
+/// Keyed by a route's [`crate::routes::Route::pool_key`], and the pool is
+/// kept beside the handle because that is what separates the two things a
+/// reload can find: the route is still there (same pool, leave the probe
+/// alone) or the route was rebuilt (new pool, and a probe on the old one is
+/// now marking backends up and down where no traffic can see it, while
+/// nothing probes the pool traffic actually goes through).
+pub struct HealthProbes {
+    running: HashMap<String, (Arc<BackendPool>, tokio::task::JoinHandle<()>)>,
+}
+
+impl HealthProbes {
+    pub fn new() -> Self {
+        Self {
+            running: HashMap::new(),
+        }
+    }
+
+    /// Whether a probe for this route is already running.
+    pub fn contains(&self, key: &str) -> bool {
+        self.running.contains_key(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    /// Stops every probe whose route is gone, or whose pool has been replaced.
+    ///
+    /// A route deleted from the config has no reason to keep being probed, and
+    /// one that changed its backends gets a new pool and therefore a new
+    /// probe — the old task would otherwise outlive the process's interest in
+    /// it, since nothing else owns it.
+    pub fn stop_stale(&mut self, wanted: &HashMap<String, Arc<BackendPool>>) {
+        for (key, (pool, handle)) in self.running.iter() {
+            let still_wanted = wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool));
+            if !still_wanted {
+                handle.abort();
+            }
+        }
+        self.running
+            .retain(|key, (pool, _)| wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool)));
+    }
+
+    /// Starts a probe and keeps its handle, so it can be stopped later.
+    pub fn spawn(&mut self, key: String, pool: Arc<BackendPool>, checker: HealthChecker) {
+        let handle = tokio::spawn(async move { checker.run().await });
+        self.running.insert(key, (pool, handle));
+    }
+}
+
+impl Default for HealthProbes {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -205,6 +309,79 @@ mod tests {
             .find(|(u, _)| u == url)
             .map(|(_, h)| h)
             .unwrap_or(false)
+    }
+
+    /// A probe is only worth keeping while its route still wants one on that
+    /// same pool: a route that was rebuilt gets a new pool, and a probe left
+    /// behind on the old one would keep marking backends up and down where no
+    /// traffic can see it, while nothing probes the pool traffic uses.
+    #[tokio::test]
+    async fn a_probe_is_only_kept_while_its_route_keeps_the_same_pool() {
+        let pool = pool();
+        let mut probes = HealthProbes::new();
+        probes.spawn(
+            "key".to_string(),
+            pool.clone(),
+            checker(pool.clone(), 1, Arc::new(AtomicBool::new(false))),
+        );
+        assert!(probes.contains("key"));
+
+        // The route is unchanged: same key, same pool, probe stays.
+        let mut wanted = HashMap::new();
+        wanted.insert("key".to_string(), pool.clone());
+        probes.stop_stale(&wanted);
+        assert!(probes.contains("key"), "an unchanged route keeps its probe");
+
+        // Same key, but the backends changed and with them the pool: the probe
+        // is now watching a pool the routing table no longer hands out.
+        let rebuilt = Arc::new(BackendPool::new(
+            vec!["http://10.0.0.9:8080".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        wanted.insert("key".to_string(), rebuilt);
+        probes.stop_stale(&wanted);
+        assert!(
+            probes.is_empty(),
+            "a rebuilt pool means the old probe is stopped"
+        );
+
+        // A route deleted from the config has no reason to be probed either.
+        probes.spawn(
+            "key".to_string(),
+            pool.clone(),
+            checker(pool.clone(), 1, Arc::new(AtomicBool::new(false))),
+        );
+        probes.stop_stale(&HashMap::new());
+        assert!(probes.is_empty(), "a removed route stops being probed");
+    }
+
+    /// Every checker starts when the config loads, so the first round is the
+    /// one that lands on every backend at once. The jitter only has to be
+    /// somewhere inside the interval — not zero, not the whole thing.
+    #[test]
+    fn the_first_round_is_spread_over_the_interval() {
+        let interval = Duration::from_secs(10);
+        let jitter = startup_jitter(interval);
+        assert!(
+            jitter < interval,
+            "{jitter:?} must stay inside {interval:?}"
+        );
+
+        // Two checkers built back to back must not agree, or the spreading
+        // would have done nothing.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(startup_jitter(interval).as_nanos());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(seen.len() > 1, "every checker waited the same {seen:?}");
+    }
+
+    #[test]
+    fn a_zero_interval_waiting_is_not_a_jitter() {
+        // Reachable only through a direct call, but the guard is what keeps
+        // `run()` from sleeping on an interval that is already zero.
+        assert!(startup_jitter(Duration::ZERO).is_zero());
     }
 
     #[tokio::test]
@@ -257,6 +434,27 @@ mod tests {
         assert!(
             !healthy(&pool, DEAD_BACKEND).await,
             "enabling the check starts probing again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_health_path_that_cannot_be_a_uri_fails_the_probe() {
+        // A character the URI parser rejects used to panic here, which took the
+        // probe loop down and left every backend on the route marked healthy
+        // for the rest of the run.
+        let checker = HealthChecker::new(
+            pool(),
+            Arc::new(http::create_http_client()),
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+            1,
+            "/health check",
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        assert!(
+            !checker.check_backend(DEAD_BACKEND).await,
+            "a check that cannot be built is not one that was answered"
         );
     }
 }

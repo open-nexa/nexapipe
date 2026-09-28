@@ -15,8 +15,9 @@ use chrono::Local;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
@@ -521,6 +522,68 @@ struct AccessLogger {
     file: Option<FileSink>,
 }
 
+/// Where a finished access line goes: stdout, or the log file.
+enum AccessTarget {
+    Stdout,
+    File(FileSink),
+}
+
+/// The thread that writes access lines, and the queue in front of it.
+///
+/// `log_access` runs on a tokio worker, on the critical path of the very
+/// request it is logging, and `FileSink::write_line` is a `write` plus a
+/// `flush` behind a mutex every connection shares. Done inline, one request's
+/// line made every other request wait behind the disk — and a slow or
+/// contended mount turned into latency on connections that never asked for an
+/// access log. One writer thread takes the syscalls off the workers and, being
+/// the only writer, keeps the lines in the order they were queued.
+///
+/// Started with the first line rather than at `init`, so a proxy that never
+/// logs an access line never starts the thread.
+static ACCESS_WRITER: OnceLock<SyncSender<(FileSink, String)>> = OnceLock::new();
+
+/// How many lines may be waiting for the writer thread.
+///
+/// Bounded because the queue is fed by request handlers and drained by one
+/// thread doing a write and a flush per line: unbounded, a disk slower than
+/// the traffic makes the queue the place memory goes, and the proxy dies of
+/// that long before it dies of the disk. A line refused here is dropped and
+/// counted — an access log that skips is worth more than an OOM.
+const ACCESS_LOG_QUEUE: usize = 4096;
+
+/// Lines dropped because the queue was full, and a warning every so often so
+/// the gap is visible instead of being something someone notices in the file.
+static DROPPED_ACCESS_LINES: AtomicU64 = AtomicU64::new(0);
+const DROPPED_LINES_PER_WARNING: u64 = 100;
+
+/// `None` when the writer thread could not be started, which the caller treats
+/// as "write it here instead": failing to spawn a thread must not lose the
+/// line, any more than failing to open the file must.
+fn access_writer() -> Option<&'static SyncSender<(FileSink, String)>> {
+    if ACCESS_WRITER.get().is_none() {
+        let (sender, receiver) = sync_channel::<(FileSink, String)>(ACCESS_LOG_QUEUE);
+        match std::thread::Builder::new()
+            .name("nexapipe-access-log".to_string())
+            .spawn(move || {
+                // Ends when the last sender is dropped, which for the one
+                // stored in the `OnceLock` is never: this thread runs for the
+                // life of the process.
+                while let Ok((sink, line)) = receiver.recv() {
+                    sink.write_line(&line);
+                }
+            }) {
+            Ok(_) => {
+                // A racing caller loses here and drops its sender, which ends
+                // the thread it just spawned.
+                let _ = ACCESS_WRITER.set(sender);
+            }
+            Err(e) => eprintln!("nexapipe: no access log writer thread: {e}"),
+        }
+    }
+
+    ACCESS_WRITER.get()
+}
+
 /// `None` until [`init`] ran, so embedders keep the stdout-only behaviour.
 static ACCESS_LOGGER: Mutex<Option<AccessLogger>> = Mutex::new(None);
 
@@ -596,6 +659,24 @@ pub fn log_access(
     duration_ms: u64,
     bytes_sent: usize,
 ) {
+    // Decided before anything is formatted: a proxy with the access log turned
+    // off used to build the line for every request and then drop it, paying for
+    // a `Local::now()` and an allocation per request to log nothing.
+    let target = {
+        let logger = ACCESS_LOGGER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match logger.as_ref() {
+            // Not configured (library embedder): keep printing to stdout.
+            None => Some(AccessTarget::Stdout),
+            Some(logger) if !logger.enabled => None,
+            Some(logger) => Some(match &logger.file {
+                Some(sink) => AccessTarget::File(sink.clone()),
+                None => AccessTarget::Stdout,
+            }),
+        }
+    };
+
     // One string for both sinks: the line on disk and the tracing event must
     // agree, or redacting the file only moves the leak next door.
     let uri = if redacting() {
@@ -604,28 +685,45 @@ pub fn log_access(
         uri.to_string()
     };
 
-    let line = format!(
-        "{} - - [{}] \"{} {}\" {} {} {}ms",
-        remote_addr,
-        Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
-        method,
-        uri,
-        status,
-        bytes_sent,
-        duration_ms
-    );
+    if let Some(target) = target {
+        let line = format!(
+            "{} - - [{}] \"{} {}\" {} {} {}ms",
+            remote_addr,
+            Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
+            method,
+            uri,
+            status,
+            bytes_sent,
+            duration_ms
+        );
 
-    {
-        let logger = ACCESS_LOGGER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match logger.as_ref() {
-            // Not configured (library embedder): keep printing to stdout.
-            None => println!("{}", line),
-            Some(logger) if !logger.enabled => {}
-            Some(logger) => match &logger.file {
-                Some(sink) => sink.write_line(&line),
-                None => println!("{}", line),
+        match target {
+            AccessTarget::Stdout => println!("{}", line),
+            // Queued for the writer thread. Anything still queued when the
+            // process goes away is lost — the price of not making the request
+            // wait for the disk; a line is written within a millisecond of
+            // being queued, so what can be lost is what the last one did.
+            AccessTarget::File(sink) => match access_writer() {
+                Some(writer) => match writer.try_send((sink, line)) {
+                    Ok(()) => {}
+                    // The disk is behind the traffic. Waiting would put the
+                    // delay on the request that happened to be logging, which
+                    // is the thing the writer thread exists to prevent, so the
+                    // line goes and the count stands in for it.
+                    Err(TrySendError::Full(_)) => {
+                        let dropped = DROPPED_ACCESS_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if dropped.is_multiple_of(DROPPED_LINES_PER_WARNING) {
+                            tracing::warn!(
+                                "Access log: {} lines dropped, the writer cannot keep up",
+                                dropped
+                            );
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        eprintln!("nexapipe: access log writer is gone");
+                    }
+                },
+                None => sink.write_line(&line),
             },
         }
     }
@@ -735,6 +833,45 @@ mod tests {
             .into_iter()
             .filter(|name| name != active)
             .collect()
+    }
+
+    /// The line is written by a thread of its own, so this waits for it — but
+    /// what it is really checking is that the path from `log_access` through
+    /// the queue to `FileSink` still ends up on disk, redacted and complete.
+    #[test]
+    fn an_access_line_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::new(dir.path(), "access.log", Rotation::Daily, 0, 14).unwrap();
+        init_access_logger(true, Some(sink));
+
+        log_access(
+            "203.0.113.9",
+            "GET",
+            "/api/v1/items?token=hunter2",
+            200,
+            12,
+            512,
+        );
+
+        let path = dir.path().join("access.log");
+        for _ in 0..200 {
+            if let Ok(contents) = fs::read_to_string(&path)
+                && !contents.is_empty()
+            {
+                assert!(
+                    contents.contains("token=<redacted>"),
+                    "the query value was not redacted: {contents}"
+                );
+                assert!(
+                    contents.contains("\"GET /api/v1/items?token=<redacted>\" 200 512 12ms"),
+                    "unexpected line: {contents}"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        panic!("the access line never reached {}", path.display());
     }
 
     #[test]

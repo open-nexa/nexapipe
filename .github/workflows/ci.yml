@@ -54,7 +54,7 @@ jobs:
       # use whatever rustfmt the runner image happens to ship, so a format change
       # in a new rustfmt release would fail a PR that touched no Rust at all.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           components: rustfmt
       - name: cargo fmt --check
@@ -66,8 +66,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - name: Configure clippy
-        run: rustup component add clippy
+      # Pin the toolchain, as the fmt job does. Clippy runs with -D warnings, so
+      # a lint added by a new toolchain release turns this job red on a PR that
+      # changed no Rust at all.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy
@@ -86,9 +91,11 @@ jobs:
         # passes on the Linux runner is a test that breaks the maintainer's
         # machine. Architecture variants do not change which cfg branch runs,
         # so one runner per OS is enough.
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
@@ -109,6 +116,8 @@ jobs:
           - "uniffi"
     steps:
       - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.features }}
@@ -145,7 +154,7 @@ jobs:
           echo "NDK: $NDK_DIR"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           targets: aarch64-linux-android
 
@@ -195,14 +204,14 @@ jobs:
       # Free for public repositories. If a repo ever becomes private, add
       # GITLEAKS_LICENSE (orgs need a paid licence) as a secret.
       #
-      # Advisory on purpose: gitleaks scans the whole history, so anything
-      # already committed (a stray keystore.properties, a 2FA seed in a test
-      # fixture) would turn every future PR red. Run it once, clean up whatever
-      # it reports, then drop continue-on-error.
+      # Scans the whole history, so a finding cannot be undone by deleting the
+      # line: it has to be named in `.gitleaks.toml` instead. That file lists
+      # the test fixtures that look like credentials and nothing else, which is
+      # what lets this run as a gate.
       - uses: gitleaks/gitleaks-action@v3
-        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   dependency-review:
     name: dependency review
@@ -239,7 +248,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
@@ -269,7 +278,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-          - os: macos-14
+          - os: macos-15
           - os: windows-latest
 
     defaults:
@@ -297,7 +306,7 @@ jobs:
             file
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -337,7 +346,7 @@ jobs:
             file
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           components: clippy
 
@@ -369,7 +378,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -382,7 +391,7 @@ jobs:
         working-directory: ui-desktop/src-tauri
         run: cargo audit
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
@@ -417,7 +426,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -486,7 +495,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -508,12 +517,15 @@ jobs:
           yes | "$SM" --licenses > /dev/null 2>&1 || true
           "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
 
-      # Gating, not observing: `app/lint-baseline.xml` records the pre-existing
-      # findings (26 LocalContextGetResourceValueCall errors among them — Toast,
-      # log and dialog-summary strings built outside a composable scope, where
-      # stringResource() cannot be used), so a red job here means a *new* one.
-      # Fixing a recorded finding means refreshing the baseline with
-      # `./gradlew :app:updateLintBaseline` in the same change.
+      # Gating, not observing: `app/lint-baseline.xml` records what lint reports
+      # today, and `warningsAsErrors` in app/build.gradle.kts is what makes the
+      # job care — Android lint reports most of what it finds (unused resources,
+      # a newer library, a resource read outside a composable scope) as a
+      # warning, which `abortOnError` passes. So a red job here means a *new*
+      # finding, error or warning alike. Fixing a recorded one means refreshing
+      # the baseline with `./gradlew :app:updateLintBaseline` in the same change
+      # — and doing that periodically is worth it on its own, because an entry
+      # whose check no longer fires is a problem the file claims is still there.
       - name: lintDebug
         id: lint
         run: |

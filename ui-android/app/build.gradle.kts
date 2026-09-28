@@ -119,18 +119,55 @@ android {
         }
     }
 
-    // The 26 pre-existing LocalContextGetResourceValueCall findings are recorded
-    // in lint-baseline.xml, which is what lets CI gate on lint at all: a new
-    // finding fails the job, a recorded one does not. They are not ignored for
-    // convenience — the call sites are Toast, log and dialog-summary strings
-    // built outside a composable scope, where stringResource() cannot be used,
-    // and switching the app language recreates the Activity, so the stale-value
-    // risk the lint describes does not apply here.
+    // The android.jar a host unit test runs against has method stubs that throw
+    // "not mocked" instead of doing anything. That makes any class unusable in a
+    // test the moment it logs while being constructed — `SecretStore` logs the
+    // one thing its tests exist to pin down — so the stubs return their default
+    // value instead. Nothing in these tests reads what the stubs return; they
+    // only have to not throw.
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
+
+    // Everything lint reports today is recorded in lint-baseline.xml, which is
+    // what lets CI gate on lint at all. `abortOnError` alone is not a gate: it
+    // fails on errors and passes warnings, and most of what Android lint emits
+    // — unused resources, a newer library version, a call that reads a resource
+    // outside a composable scope — is a warning. `warningsAsErrors` is what
+    // makes a *new* one fail the job while a recorded one stays quiet.
     //
-    // After fixing some of them, refresh the file with:
+    // The 26 LocalContextGetResourceValueCall findings the file used to carry
+    // were dropped by `updateLintBaseline`: the check stopped firing on those
+    // call sites, so the entries matched nothing and the file was recording
+    // problems that no longer existed. They were not fixed and then ignored for
+    // convenience — Toast, log and dialog-summary strings are built outside a
+    // composable scope, where stringResource() cannot be used, and switching the
+    // app language recreates the Activity, so the stale-value risk the lint
+    // describes does not apply here.
+    //
+    // Version nags are the one kind of finding the baseline cannot hold.
+    // `gradle/libs.versions.toml` and `gradle/wrapper/gradle-wrapper.properties`
+    // live outside this module, so lint records them under an absolute
+    // `$HOME/...` path — `$HOME/rust/nexapipe/...` here, `$HOME/work/
+    // nexapipe/nexapipe/...` on a runner — and the entry matches nothing as
+    // soon as the checkout is anywhere else. Baseline or not, a new release of
+    // any dependency outside our control would fail the job. Bumping them is a
+    // change of its own, not something a pull request about unrelated code
+    // should be forced to carry.
+    //
+    // After fixing something the file records, refresh it in the same change:
     //   ./gradlew :app:updateLintBaseline
     lint {
         baseline = file("lint-baseline.xml")
+        warningsAsErrors = true
+        disable +=
+            setOf(
+                "GradleDependency",
+                "NewerVersionAvailable",
+                "AndroidGradlePluginVersion",
+            )
     }
 }
 

@@ -13,7 +13,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more};
+use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -120,6 +120,11 @@ async fn read_tls_record<R>(
 where
     R: AsyncRead + Unpin,
 {
+    // One deadline for the whole record, not one per read: a peer that dribbles
+    // a byte at a time restarts a per-read timeout forever, and holding this
+    // stream open is the whole cost of the attack.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     loop {
         let Some(record_end) = first_record_end(&buf) else {
             if buf.len() > MAX_HANDSHAKE_LEN {
@@ -128,7 +133,7 @@ where
                     "TLS ClientHello header not received",
                 ));
             }
-            if !read_more(reader, &mut buf, timeout).await? {
+            if !read_more_by(reader, &mut buf, deadline).await? {
                 return Ok(buf);
             }
             continue;
@@ -143,7 +148,7 @@ where
                 "TLS record larger than a ClientHello can be",
             ));
         }
-        if !read_more(reader, &mut buf, timeout).await? {
+        if !read_more_by(reader, &mut buf, deadline).await? {
             return Ok(buf);
         }
     }
@@ -210,7 +215,11 @@ async fn resolve_backend(
 /// The scheme carries no meaning here — passthrough copies bytes and never
 /// speaks TLS itself — so it is accepted and ignored, which keeps the backend
 /// list in the same shape as the HTTP routes.
-fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
+///
+/// Public because the config check uses it too: the route is dialled with this
+/// function, so validating with anything else is how a backend passes at
+/// startup and fails on the first connection.
+pub fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
     let backend = backend.trim();
     if backend.is_empty() {
         return None;
@@ -220,7 +229,24 @@ fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
         let url = url::Url::parse(backend).ok()?;
         let host = url.host_str()?.to_string();
         let port = url.port_or_known_default()?;
-        return Some((host, port));
+        return Some((strip_ipv6_brackets(&host).to_string(), port));
+    }
+
+    // A bracketed IPv6 literal: the colons inside the address come before the
+    // one that separates the port, so the brackets have to go first.
+    if let Some(rest) = backend.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            // An unclosed bracket is not a host name anyone can resolve.
+            return None;
+        };
+        if host.is_empty() {
+            return None;
+        }
+        return match tail.strip_prefix(':') {
+            Some(port) => port.parse().ok().map(|p| (host.to_string(), p)),
+            // No port: the TLS port, the same default a bare host gets.
+            None => Some((host.to_string(), 443)),
+        };
     }
 
     match backend.rsplit_once(':') {
@@ -229,6 +255,39 @@ fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
         // passthrough route ever points at.
         _ => Some((backend.to_string(), 443)),
     }
+}
+
+/// Drops the brackets around an IPv6 literal.
+///
+/// Both forms a config can use keep them — `Url::host_str()` hands back
+/// `[::1]`, and so does splitting `[::1]:443` on the colon — and leaving them
+/// on makes the resolver look for a host actually called `[::1]`, which no
+/// backend ever is. The L4 path already did this.
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.trim_matches(['[', ']'])
+}
+
+/// The longest name a `host_name` may carry.
+///
+/// 253 is the DNS limit for a presentation-format name; a longer one cannot
+/// have been meant as a host, and nothing here needs to reason about it.
+const MAX_HOST_NAME_LEN: usize = 253;
+
+/// Whether `name` is a host name this proxy is willing to act on.
+///
+/// Printable ASCII, and nothing else. RFC 6066 sends `host_name` as ASCII, so
+/// an internationalised name arrives as its A-label and a name with non-ASCII
+/// bytes in it is malformed rather than an IDN in need of normalising — which
+/// also means there is no case where two different spellings of the same name
+/// could reach a route as two different hosts.
+///
+/// Control characters are the point of the check: a host name is written to
+/// the log on every path through [`resolve_backend`], and `\r\n` in it lets a
+/// client append lines of its own to the server's log.
+fn is_presentable_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOST_NAME_LEN
+        && name.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 /// Extract the SNI host name from a TLS `ClientHello`.
@@ -288,14 +347,31 @@ pub fn extract_sni(data: &[u8]) -> Option<String> {
         let ext_data = extensions.take(ext_len)?;
 
         if ext_type == EXT_SERVER_NAME {
-            let mut sni = Cursor::new(ext_data);
-            sni.skip(2)?; // server_name_list length
-            let name_type = sni.u8()?;
-            let name_len = sni.u16()? as usize;
-            let name = sni.take(name_len)?;
+            let mut list = Cursor::new(ext_data);
+            list.skip(2)?; // server_name_list length
 
-            if name_type == NAME_TYPE_HOST {
-                return String::from_utf8(name.to_vec()).ok();
+            // Every entry, not the first one: RFC 6066 allows a list, and a
+            // client that puts an entry of another type first still has its
+            // host name behind it. Stopping at a type this proxy does not
+            // read turned such a hello into "no SNI".
+            while list.remaining() >= 3 {
+                let name_type = list.u8()?;
+                let name_len = list.u16()? as usize;
+                let name = list.take(name_len)?;
+
+                if name_type != NAME_TYPE_HOST {
+                    continue;
+                }
+
+                let name = String::from_utf8(name.to_vec()).ok()?;
+                // Nothing downstream — the allow list, the route match, the
+                // log lines — can say anything useful about a name that is not
+                // a name, and a log line is the one place it could do real
+                // damage: a `\r\n` in here appends whatever the client likes
+                // to the server's log. Refusing is what "no SNI" already
+                // means, so it costs a client nothing but a hang-up — and no
+                // later entry is taken as a second guess.
+                return is_presentable_host_name(&name).then_some(name);
             }
         }
     }
@@ -362,6 +438,13 @@ mod tests {
             ext_body.extend_from_slice(sni_bytes);
         }
 
+        client_hello_with_extension_body(&ext_body)
+    }
+
+    /// Wraps a ready-made extensions block into a full `ClientHello`, for the
+    /// cases the single-SNI helper cannot spell (several entries, another
+    /// entry type).
+    fn client_hello_with_extension_body(ext_body: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // client_version
         body.extend_from_slice(&[0u8; 32]); // random
@@ -371,7 +454,7 @@ mod tests {
         body.push(1); // compression_methods length
         body.push(0); // null compression
         body.extend_from_slice(&(ext_body.len() as u16).to_be_bytes());
-        body.extend_from_slice(&ext_body);
+        body.extend_from_slice(ext_body);
 
         let mut handshake = vec![HANDSHAKE_CLIENT_HELLO];
         handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 3-byte length
@@ -386,6 +469,29 @@ mod tests {
     #[test]
     fn extracts_sni_from_client_hello() {
         let hello = client_hello_with_sni("fn.iroh.iakl.top", true);
+        assert_eq!(extract_sni(&hello).as_deref(), Some("fn.iroh.iakl.top"));
+    }
+
+    /// The list RFC 6066 allows: an entry of a type this proxy does not read
+    /// comes first, and the host name behind it used to be invisible.
+    #[test]
+    fn reads_the_host_name_behind_another_kind_of_entry() {
+        let mut entry = Vec::new();
+        // Type 1 is not host_name; the bytes are opaque here.
+        entry.push(1);
+        entry.extend_from_slice(&3u16.to_be_bytes());
+        entry.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        entry.push(NAME_TYPE_HOST);
+        entry.extend_from_slice(&("fn.iroh.iakl.top".len() as u16).to_be_bytes());
+        entry.extend_from_slice(b"fn.iroh.iakl.top");
+
+        let mut ext_body = Vec::new();
+        ext_body.extend_from_slice(&0u16.to_be_bytes()); // ext type: server_name
+        ext_body.extend_from_slice(&((2 + entry.len()) as u16).to_be_bytes());
+        ext_body.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+        ext_body.extend_from_slice(&entry);
+
+        let hello = client_hello_with_extension_body(&ext_body);
         assert_eq!(extract_sni(&hello).as_deref(), Some("fn.iroh.iakl.top"));
     }
 
@@ -410,6 +516,46 @@ mod tests {
         assert_eq!(extract_sni(&[]), None);
         assert_eq!(extract_sni(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x00]), None);
         assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    /// Every path through `resolve_backend` writes the SNI to the log, so a
+    /// name carrying a newline would let a client append lines of its own to
+    /// it. It is dropped here instead of escaped on the way out: a name that
+    /// is not a name has no route to reach either.
+    #[test]
+    fn refuses_a_host_name_that_could_forge_a_log_line() {
+        for name in [
+            "app.test\r\n2FA: client 'x' enrolled",
+            "app.test\n",
+            "app\ttest",
+            "app test",
+            "app.test\u{7f}",
+        ] {
+            let hello = client_hello_with_sni(name, true);
+            assert_eq!(extract_sni(&hello), None, "{name:?}");
+        }
+    }
+
+    /// `host_name` is ASCII on the wire (RFC 6066), so an internationalised
+    /// name arrives as its A-label. Raw UTF-8 is malformed, and accepting it
+    /// would leave one host reachable under two spellings.
+    #[test]
+    fn refuses_a_host_name_that_is_not_ascii() {
+        let hello = client_hello_with_sni("caf\u{00e9}.test", true);
+        assert_eq!(extract_sni(&hello), None);
+    }
+
+    #[test]
+    fn refuses_a_host_name_past_the_dns_limit() {
+        let long = "a".repeat(MAX_HOST_NAME_LEN + 1);
+        let hello = client_hello_with_sni(&long, true);
+        assert_eq!(extract_sni(&hello), None);
+
+        let at_limit = "a".repeat(MAX_HOST_NAME_LEN);
+        assert_eq!(
+            extract_sni(&client_hello_with_sni(&at_limit, true)).as_deref(),
+            Some(at_limit.as_str())
+        );
     }
 
     #[test]
@@ -479,5 +625,26 @@ mod tests {
         assert!(is_tls_handshake(0x16));
         assert!(!is_tls_handshake(b'G'));
         assert!(!is_tls_handshake(0x17));
+    }
+
+    #[test]
+    fn an_ipv6_backend_loses_its_brackets() {
+        // With the brackets left on, the resolver is asked for a host called
+        // "[::1]" and every connection to this backend fails.
+        assert_eq!(
+            parse_backend_addr("[::1]:443"),
+            Some(("::1".to_string(), 443))
+        );
+        assert_eq!(
+            parse_backend_addr("https://[::1]:8443"),
+            Some(("::1".to_string(), 8443))
+        );
+        assert_eq!(parse_backend_addr("[::1]"), Some(("::1".to_string(), 443)));
+    }
+
+    #[test]
+    fn a_backend_with_no_address_is_refused() {
+        assert_eq!(parse_backend_addr(""), None);
+        assert_eq!(parse_backend_addr("   "), None);
     }
 }

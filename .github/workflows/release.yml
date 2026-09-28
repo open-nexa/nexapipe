@@ -381,14 +381,14 @@ jobs:
             xdg-utils
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: ui-desktop/package-lock.json
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           targets: ${{ matrix.target }}
 
@@ -627,7 +627,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -703,7 +703,7 @@ jobs:
 
       - name: Set up Rust toolchain
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           targets: ${{ env.TARGET_TRIPLE }}
 
@@ -715,7 +715,7 @@ jobs:
 
       - name: Cache cargo artifacts
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -772,7 +772,7 @@ jobs:
           MISSING=0
           for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
                     nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
-                    nativeStartProxyLegacy nativeStopProxy nativeAddNode nativeStartTunProxy \
+                    nativeStopProxy nativeAddNode nativeStartTunProxy \
                     nativeStopTunProxy nativeDestroy; do
             if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
               echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"

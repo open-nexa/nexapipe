@@ -1,6 +1,6 @@
 [package]
 name = "nexapipe-client"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Iroh-based proxy client library supporting multiple platforms"
 keywords = ["iroh", "proxy", "p2p", "quinn"]
@@ -34,7 +34,7 @@ log = { version = "0.4", optional = true }
 android_logger = { version = "0.14", optional = true }
 once_cell = "1.19"
 fastrand = "2.1"
-nexapipe-proto = { version = "0.1.0", path = "../nexapipe-proto" }
+nexapipe-proto.workspace = true
 netstack-smoltcp = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support

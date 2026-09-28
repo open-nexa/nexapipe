@@ -157,7 +157,10 @@ Ticket (for clients):                 endpoint:...
 
 Give clients either the **Node ID** (stable, but it needs discovery) or the
 **Ticket** (carries addresses, so it changes when they do). Set
-`[iroh] secret_key` to keep both stable across restarts:
+`[iroh] secret_key` to keep the Node ID stable across restarts — and with it
+everything the Node ID is used for. A ticket is a different matter: it embeds
+the addresses it was printed with, so a `secret_key` does not stop it going
+stale, and it has to be regenerated when the endpoint moves.
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -166,13 +169,67 @@ cargo run -p nexapipe -- --generate-secret
 ### Docker
 
 ```bash
+mkdir -p config && cp config.toml.example config/config.toml   # config.toml is gitignored
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-`docker-compose.yaml` mounts your `config.toml` and a `logs/` volume, and points
-`NEXAPIPE_LOG_DIR` at it. `host.docker.internal` is configured, so backends
-running on the Docker host are reachable.
+`docker-compose.yaml` mounts a `config/` directory — the one holding your
+`config.toml` — and a `logs/` volume, and points `NEXAPIPE_LOG_DIR` at it.
+`host.docker.internal` is configured, so backends running on the Docker host are
+reachable. Moving an existing deployment over is one command:
+`mkdir -p config && mv config.toml config/config.toml`.
+
+#### Editing the config file
+
+The file is re-read every 5 seconds, so an edit needs no restart — but **run
+anything that writes it inside the container**:
+
+```bash
+# The image's own binary, against the file the server is actually reading.
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --registration
+```
+
+Running the same command on the host against the bind-mounted file is where it
+goes wrong:
+
+- **Keep the mount a directory.** A single-file bind mount is pinned to the
+  inode the path had when the container started, so anything that replaces the
+  file — `sed -i`, an editor with atomic save, `mv` — leaves the container
+  reading the copy that was swapped out: the change never arrives and nothing is
+  logged. `docker compose restart` does not help, because it does not rebuild
+  the mount; `docker compose up -d --force-recreate` does. The compose file
+  mounts `./config:/app/config` for exactly this reason — a directory mount is
+  resolved by name on every lookup, so it always sees the current file. Putting
+  `./config.toml:/app/config/config.toml` back reintroduces the trap.
+- **Two writers, no lock.** The server rewrites the whole file to persist the
+  `failed_attempts` / `locked_until` / `last_used` counters whenever a 2FA
+  attempt happens (`save_auth_state`). Every write on both sides is a
+  read-modify-write with no locking, so an overlapping host edit and flush lose
+  one of them. A `pending_enrollment` token is the worst case: the server never
+  writes it back, so losing the race costs you the invite and prints nothing.
+- **The host binary is not the server's binary.** `--generate-invite` derives the
+  endpoint from `[iroh] secret_key`, so a host copy of the config without that
+  key — or a `nexapipe` built from another commit — issues an invite pointing at
+  an endpoint nobody is running.
+- **Mode and ownership change under you.** A rewrite from the host can land the
+  file at `0644` or with a different owner. A config holding a credential is then
+  refused at startup, and a reload cannot turn 2FA on until it is `0600` again.
+
+The mount is read-write on purpose: the server writes the 2FA counters back into
+the file, so a `:ro` mount would cost a lockout its persistence and log an error
+on every attempt.
+
+Editing with an editor is fine as long as it saves in place — the default for
+`vim` and for a shell `>` redirect. Whatever you changed, confirm the server
+took it instead of assuming it did:
+
+```bash
+docker compose logs -f --tail=50 nexapipe | grep -i reload
+# Detected config change, reloading...  →  Config reloaded: 3 routes now live
+# Config not reloaded, keeping the current routes: ... → refused, old routes still serve
+```
 
 ---
 
@@ -211,6 +268,10 @@ that fails to parse or validate is reported and ignored, so a half-saved edit
 cannot take the proxy down. The rest is read once at startup and needs a restart:
 `[server] listen_addr`, `[iroh]`, `[peers]`, the `[auth]` TOTP parameters and
 `[log]`.
+
+An `[auth]` section can appear where there was none, too: a server started
+without one still picks up its `clients` — and `enabled = true` — from a later
+reload, so enabling 2FA for the first time does not need a restart.
 
 Two changes are deliberately one-way on a running server: `[auth] enabled = true`
 is picked up by the watcher, but turning 2FA *off* is refused (restart to
@@ -270,6 +331,12 @@ load-balanced and health-checked like any other route. The old top-level
 `default_backend` has been **removed**: a config that still names it is refused
 at startup rather than silently ignored, so an existing config cannot quietly
 start answering 404 where it used to forward.
+
+A wildcard has to be `*` on its own or start with `*.`: the dot is what marks
+the label boundary, and without it `*.example.com` would also match
+`notexample.com` — a host that merely ends in the same letters and belongs to
+somebody else. A pattern like `*example.com` is refused at startup, in
+`host_pattern` and in a client's `allow_hosts` alike.
 
 ### `[server]` — direct ingress (off by default)
 
@@ -407,6 +474,11 @@ static file server, a device's admin UI. Every backend then stays in the pool an
 traffic is simply forwarded. `enabled` is live: a reload pauses the checks that
 are already running. The other four keys are read when a checker starts, so
 changing them takes effect on restart or for routes added by a reload.
+
+`interval`, `timeout` and `threshold` must each be at least `1`: `0` used to be
+clamped silently, and each of the three then meant something nobody would ask for
+— a probe round every second, a probe that can never finish, or a single failure
+emptying the pool. A config that says `0` is refused at load.
 
 ### `[local_proxy]` — client mode
 
@@ -586,6 +658,11 @@ It only decides *which* route a flow matches, so one host can have `tcp` routes
 on different ports pointing at different backends. With no `client_ports`, every
 port matches.
 
+When two routes for one host both match a flow, the one that names its ports
+wins over the one that takes every port. Without that tie-break the first route
+declared won for good and the second never matched, whichever order they were
+written in.
+
 ### What it costs
 
 L4 flows are opaque: the access log records bytes rather than a request line, and
@@ -662,14 +739,17 @@ handshake before any traffic is proxied.
 
 New and changed `[auth.clients]` entries are picked up live by the config watcher,
 so adding a client needs no restart, and `[auth] enabled = true` is picked up
-live too, for connections opened after the reload. The TOTP parameters
+live too, for connections opened after the reload — including on a server that
+was started with no `[auth]` section at all. The TOTP parameters
 (`algorithm`, `time_step`, `digits`) are read once at startup and need a restart;
 see `config.toml.2fa.example`.
 
-Those secrets are the *only* credential gating the iroh listener, so with
-`[auth] enabled = true` the server **refuses to start** when `config.toml` is
-readable or writable by another account (`chmod 600 config.toml`); with `[auth]`
-off it logs the same warning and starts. A client with no credentials against a
+Those secrets are the *only* credential gating the iroh listener, so the server
+**refuses to start** when `config.toml` holds a credential — a TOTP seed, an
+`[iroh] secret_key`, or a `relay_auth_token` — and is readable or writable by
+another account (`chmod 600 config.toml`). A config holding none of them logs the
+same warning and starts, which is what a Docker bind mount arrives as. A client
+with no credentials against a
 server that requires them is refused too: the QUIC handshake succeeds, and the
 server closes the connection once the handshake deadline (5 s) passes.
 
@@ -687,6 +767,11 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - `--generate-2fa` on a client that already has a secret prints **that** secret
   instead of a new one. Add `--force` to rotate it: every device enrolled with
   the old secret has to scan again.
+- Both ways of revoking apply to **connections made afterwards**: the
+  authorization a handshake carries is a snapshot of that moment, and a
+  connection that already authenticated runs until it ends — rotating the secret
+  or deleting the client does not cut it off. Restart the server to disconnect
+  those immediately.
 - The write edits `config.toml` in place, keeping comments and formatting. If the
   file cannot be read or written, the secret is only printed.
 - `algorithm`, `time_step` and `digits` are read when the QR code is generated,
@@ -965,8 +1050,9 @@ Notes:
   `[patch.crates-io]`; keep `third_party/` in the build context (Docker already
   does). Platform code stays behind cargo features (`jni`, `local-proxy`,
   `tun-proxy`, `uniffi`).
-- CI (`.github/workflows/ci.yml`) is Linux-only; `release.yml` covers
-  multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a
+- CI (`.github/workflows/ci.yml`) runs the test suite on Linux and macOS; the
+  desktop crate is `cargo check`ed on Linux, macOS and Windows. `release.yml`
+  covers multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a
   GitHub **pre-release**, so it never takes over "latest".
 - Inline comments are in English.
 

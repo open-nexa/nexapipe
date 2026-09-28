@@ -15,10 +15,10 @@
 #
 # This file is the 2FA one; the sibling `config.toml.example` writes out every
 # other section (relay modes, all four route modes, `[log]`) at length and leaves
-# `[auth]` off. `[[routes]]`, `default_backend` and `[auth.clients]` are reread
-# every 5 s and take effect without a restart; `[auth] enabled = true` is picked
-# up live too (but turning it off is not), while `[server]`, `[iroh]`, `[peers]`,
-# the `[auth]` TOTP parameters and `[log]` need a restart.
+# `[auth]` off. `[[routes]]` and `[auth.clients]` are reread every 5 s and take
+# effect without a restart; `[auth] enabled = true` is picked up live too (but
+# turning it off is not), while `[server]`, `[iroh]`, `[peers]`, the `[auth]`
+# TOTP parameters and `[log]` need a restart.
 
 # ===== Server Configuration =====
 
@@ -141,10 +141,13 @@ issuer = "NexaPipe"
 # instead of the secret. The first device to connect trades it for a freshly
 # generated secret, and the server burns the token and stores that secret in the
 # same write, so a copy of the link stops being a credential the moment it is
-# used. Two consequences: enrollment rotates this client's secret, so devices
-# already using it have to scan again; and generating another `--registration`
-# invite replaces the outstanding token, which is how a link that never arrived
-# gets revoked. Never write the key by hand — let the command own it.
+# used. Until then it is one: an unspent link hands out this client's secret to
+# whoever holds it, so deliver it to the device over a channel you already
+# trust and do not leave it sitting in a chat log or a ticket. Two consequences:
+# enrollment rotates this client's secret, so devices already using it have to
+# scan again; and generating another `--registration` invite replaces the
+# outstanding token, which is how a link that never arrived gets revoked. Never
+# write the key by hand — let the command own it.
 #
 # Warning: changing algorithm, time_step or digits here does NOT change what the
 # app does once it has scanned the code. Those values are only read when the
@@ -205,7 +208,10 @@ listen_addr = "127.0.0.1:8080"
 proxy_domains = ["example.com", "api.example.com"]
 
 # One entry per endpoint this client proxies to; `domains` steers those hosts
-# here. Use `server_ticket` instead when the endpoint's addresses move.
+# here. A Node ID is the one to reach for when the endpoint's addresses move: it
+# is resolved live. A ticket carries the addresses it was printed with, so it
+# goes stale under exactly those conditions — use one only to give a client a
+# first contact with no relay or DNS to lean on.
 [[local_proxy.nodes]]
 server_node_id = "your-server-node-id"
 domains = ["example.com", "api.example.com"]

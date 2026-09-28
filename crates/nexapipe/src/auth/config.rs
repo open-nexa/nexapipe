@@ -96,7 +96,7 @@ impl Default for AuthConfig {
 }
 
 /// Client authentication information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientAuth {
     /// Base32-encoded secret key
     pub secret: String,
@@ -130,8 +130,73 @@ pub struct ClientAuth {
     pub locked_until: Option<u64>,
 }
 
+/// Handwritten so `secret` and `pending_enrollment` stay out of logs.
+///
+/// The whole config — this struct included — is logged at debug level whenever
+/// it is parsed, and both fields are live credentials: the seed is half of a
+/// client's second factor, and the token is the whole of it until someone
+/// spends it. `Serialize` still round-trips both, which is what the config file
+/// needs; only the `Debug` view is redacted.
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAuth")
+            .field("secret", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("allow_hosts", &self.allow_hosts)
+            .field(
+                "pending_enrollment",
+                &crate::config::redacted(&self.pending_enrollment),
+            )
+            .field("last_used", &self.last_used)
+            .field("failed_attempts", &self.failed_attempts)
+            .field("locked_until", &self.locked_until)
+            .finish()
+    }
+}
+
 fn default_created_at() -> String {
     unix_now().to_string()
+}
+
+impl AuthConfig {
+    /// A copy carrying only the counters the config file is written back to.
+    ///
+    /// The whole config used to be cloned on every attempt worth counting, and
+    /// a clone copies every client's secret and enrollment token with it — once
+    /// per wrong code, from any peer that can name a client id. Only
+    /// `failed_attempts`, `locked_until` and `last_used` are persisted, so only
+    /// those travel. Extend this alongside `save_auth_state`, or a field added
+    /// there is silently written as empty.
+    pub fn counter_snapshot(&self) -> AuthConfig {
+        AuthConfig {
+            enabled: self.enabled,
+            issuer: String::new(),
+            algorithm: self.algorithm.clone(),
+            time_step: self.time_step,
+            digits: self.digits,
+            window: self.window,
+            clients: self
+                .clients
+                .iter()
+                .map(|(id, client)| {
+                    (
+                        id.clone(),
+                        ClientAuth {
+                            secret: String::new(),
+                            created_at: String::new(),
+                            allow_hosts: None,
+                            pending_enrollment: None,
+                            last_used: client.last_used,
+                            failed_attempts: client.failed_attempts,
+                            locked_until: client.locked_until,
+                        },
+                    )
+                })
+                .collect(),
+            max_attempts: self.max_attempts,
+            lockout_duration: self.lockout_duration,
+        }
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -181,9 +246,17 @@ impl ClientAuth {
         self.last_used = Some(unix_now());
     }
 
-    /// Decode the Base32 secret into bytes
+    /// Decode the Base32 secret into bytes.
+    ///
+    /// The stored spelling is normalised first. An invite puts the secret
+    /// through `otpauth::normalize_secret`, which tolerates lower case and `=`
+    /// padding, so a secret written either of those ways in the config has to
+    /// work as well — otherwise it fails to decode here and the client is stuck
+    /// at "Invalid Base32 secret" with nothing saying the spelling is why.
     pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret)
+        let secret = crate::auth::otpauth::normalize_secret(&self.secret)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret)
             .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
     }
 
@@ -275,6 +348,42 @@ mod tests {
             failed_attempts: 0,
             locked_until: None,
         }
+    }
+
+    #[test]
+    fn a_secret_decodes_the_way_an_invite_writes_it() {
+        // An invite hands the secret through `normalize_secret`, which drops
+        // the padding and folds the case. A config written either of those ways
+        // has to decode too, or the client is stuck at "Invalid Base32 secret"
+        // with nothing pointing at the spelling.
+        let mut lower = client();
+        lower.secret = "jbswy3dpehpk3pxp".to_string();
+        let mut padded = client();
+        padded.secret = "my======".to_string();
+        let mut plain = client();
+        plain.secret = "JBSWY3DPEHPK3PXP".to_string();
+
+        assert_eq!(
+            lower.decode_secret().unwrap(),
+            plain.decode_secret().unwrap()
+        );
+        assert_eq!(padded.decode_secret().unwrap(), b"f");
+    }
+
+    /// `Debug` is what a log line uses, and the whole config — this struct
+    /// included — is logged whenever it is parsed. Both redacted fields are
+    /// live credentials: the seed is half of a second factor, and the token is
+    /// the whole of one until somebody spends it.
+    #[test]
+    fn a_client_prints_no_credentials() {
+        let mut c = client();
+        c.secret = "JBSWY3DPEHPK3PXP".to_string();
+        c.pending_enrollment = Some("deadbeef".to_string());
+
+        let rendered = format!("{c:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("JBSWY3DPEHPK3PXP"), "{rendered}");
+        assert!(!rendered.contains("deadbeef"), "{rendered}");
     }
 
     #[test]

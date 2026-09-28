@@ -69,7 +69,9 @@ fn accepts_a_signed_current_response() {
 
     let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(&nonce, timestamp);
+    let signature = client
+        .sign_challenge(&nonce, timestamp)
+        .expect("HMAC takes a key of any length");
     let code = client.generate_code().unwrap();
 
     let outcome = TotpValidator::new(&config).verify_response(
@@ -96,7 +98,9 @@ fn rejects_a_response_signed_over_a_different_nonce() {
 
     let timestamp = now();
     let signed_over = fresh_nonce();
-    let signature = client.sign_challenge(&signed_over, timestamp);
+    let signature = client
+        .sign_challenge(&signed_over, timestamp)
+        .expect("HMAC takes a key of any length");
     let code = client.generate_code().unwrap();
 
     let outcome = TotpValidator::new(&config).verify_response(
@@ -118,7 +122,9 @@ fn rejects_a_stale_timestamp() {
 
     let stale = now() - 120;
     let nonce = fresh_nonce();
-    let signature = client.sign_challenge(&nonce, stale);
+    let signature = client
+        .sign_challenge(&nonce, stale)
+        .expect("HMAC takes a key of any length");
     let code = client.generate_code().unwrap();
 
     let outcome =
@@ -136,7 +142,9 @@ fn reports_a_wrong_code_as_a_counted_failure() {
 
     let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(&nonce, timestamp);
+    let signature = client
+        .sign_challenge(&nonce, timestamp)
+        .expect("HMAC takes a key of any length");
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
@@ -159,7 +167,9 @@ fn locks_out_after_max_attempts() {
 
     let nonce = fresh_nonce();
     let timestamp = now();
-    let signature = client.sign_challenge(&nonce, timestamp);
+    let signature = client
+        .sign_challenge(&nonce, timestamp)
+        .expect("HMAC takes a key of any length");
     let code = client.generate_code().unwrap();
 
     for _ in 0..3 {
