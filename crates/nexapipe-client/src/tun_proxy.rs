@@ -137,6 +137,14 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 /// first.
 const UDP_FLOW_IDLE: Duration = Duration::from_secs(50);
 
+/// How often a TCP flow looks at the stop flag while it is copying bytes.
+///
+/// A flow is not one of the tasks `stop()` aborts, so this is how it finds out
+/// the proxy is gone — and it has to, because it is holding a pooled connection
+/// until it does. Cheap either way: one timer per flow, and a second is far
+/// sooner than the alternative.
+const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Datagrams that may be waiting for one UDP flow's tunnel to accept them.
 ///
 /// A flow is created when its first datagram arrives and the tunnel takes a
@@ -278,6 +286,42 @@ fn start_stack_services(
     Ok((sink, stream))
 }
 
+/// The two dups of the TUN fd, closed unless the pumps take them over.
+///
+/// Android hands the fd over and it is closed straight after being dup'ed, so
+/// every step between the dups and the pumps taking ownership can fail with
+/// both dups still open — leaked for the life of the process, and the VPN
+/// cannot be brought up again while they are. Each half is taken out as it is
+/// handed to a pump; whatever is left here when this drops is closed.
+#[cfg(target_os = "android")]
+struct TunFds {
+    read: Option<RawFd>,
+    write: Option<RawFd>,
+}
+
+#[cfg(target_os = "android")]
+impl Drop for TunFds {
+    fn drop(&mut self) {
+        for fd in [self.read.take(), self.write.take()].into_iter().flatten() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Stops the tasks a partly built proxy already has running.
+///
+/// Not optional: dropping a `JoinHandle` detaches its task instead of
+/// cancelling it, so without this a task started before the failure keeps
+/// polling a stack and an endpoint group belonging to a proxy that was never
+/// finished — and `stopped` is the only signal it listens for.
+#[cfg(target_os = "android")]
+fn stop_started_tasks(tasks: &[JoinHandle<()>], stopped: &AtomicBool) {
+    stopped.store(true, Ordering::Release);
+    for task in tasks {
+        task.abort();
+    }
+}
+
 impl TunProxy {
     /// Create and start the TUN proxy (Android).
     ///
@@ -312,6 +356,15 @@ impl TunProxy {
         // Close the original fd — we now hold two dups.
         unsafe { libc::close(tun_fd) };
 
+        // From here the dups are ours to lose: the original is already closed,
+        // so every remaining step that can fail would leak both for the life of
+        // the process — and with them the VPN, which cannot be brought up
+        // again on a device whose TUN fd is still open.
+        let mut fds = TunFds {
+            read: Some(fd_read),
+            write: Some(fd_write),
+        };
+
         set_nonblocking(fd_read)?;
         set_nonblocking(fd_write)?;
 
@@ -325,7 +378,7 @@ impl TunProxy {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
         // 2. Build the stack and every service task; we get back the packet halves.
-        let (stack_sink, stack_stream) = start_stack_services(
+        let (stack_sink, stack_stream) = match start_stack_services(
             endpoint_group,
             proxy_domains,
             custom_dns_servers,
@@ -336,12 +389,30 @@ impl TunProxy {
             },
             stopped.clone(),
             &mut tasks,
-        )?;
+        ) {
+            Ok(halves) => halves,
+            Err(e) => {
+                // It can have spawned part of the stack before failing, and
+                // those tasks are not reachable from anywhere else. The dups
+                // are closed by `fds` dropping.
+                stop_started_tasks(&tasks, &stopped);
+                return Err(e);
+            }
+        };
 
         // 3. TUN → Stack pump (read fd → Stack Sink).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fd_read) };
-            let async_fd = AsyncFd::new(file)?;
+            let file = unsafe { std::fs::File::from_raw_fd(fds.read.take().expect("still held")) };
+            // A failure here has to stop what `start_stack_services` already
+            // spawned: dropping a `JoinHandle` detaches its task rather than
+            // cancelling it, and `stopped` is the only signal those tasks hear.
+            let async_fd = match AsyncFd::new(file) {
+                Ok(async_fd) => async_fd,
+                Err(e) => {
+                    stop_started_tasks(&tasks, &stopped);
+                    return Err(e.into());
+                }
+            };
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
@@ -390,8 +461,14 @@ impl TunProxy {
 
         // 4. Stack → TUN pump (Stack Stream → write fd).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fd_write) };
-            let async_fd = AsyncFd::new(file)?;
+            let file = unsafe { std::fs::File::from_raw_fd(fds.write.take().expect("still held")) };
+            let async_fd = match AsyncFd::new(file) {
+                Ok(async_fd) => async_fd,
+                Err(e) => {
+                    stop_started_tasks(&tasks, &stopped);
+                    return Err(e.into());
+                }
+            };
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
@@ -733,9 +810,24 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
         let _ = tokio::time::timeout(Duration::from_secs(5), app_write.shutdown()).await;
     };
 
+    // The third branch: this flow is not one of the tasks `stop()` knows about,
+    // so nothing aborts it — and a flow that outlives the proxy keeps a pooled
+    // connection checked out of a group nobody can close. Watching the flag is
+    // what returns it. Polled, because there is nothing to await on a bool, and
+    // a wake-up per flow is far cheaper than a connection stuck until the app
+    // gives up on it.
+    //
+    // No idle timeout on top of that, unlike the UDP flows: a TCP connection
+    // may legitimately sit quiet for minutes, and only the applications at
+    // either end can say when it is finished.
     tokio::select! {
         _ = app_to_tunnel => (),
         _ = tunnel_to_app => (),
+        _ = async {
+            while !ctx.stopped.load(Ordering::Acquire) {
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
+        } => (),
     }
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,

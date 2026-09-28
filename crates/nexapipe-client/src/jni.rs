@@ -1851,9 +1851,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
         let tun_proxy = {
             let mut guard = match state.lock() {
                 Ok(g) => g,
-                Err(_) => {
-                    jni_log!("[DEBUG:jni] Failed to lock state for tun_proxy cleanup");
-                    return 0;
+                Err(poisoned) => {
+                    // See the note on the lock below: the TUN fd is only closed by
+                    // the proxy this is about to take out, so abandoning the
+                    // cleanup because another thread once panicked leaves it open
+                    // for the life of the process.
+                    jni_log!(
+                        "[WARN:jni] State lock poisoned, recovering the guard to close the TUN proxy"
+                    );
+                    poisoned.into_inner()
                 }
             };
             guard.tun_proxy.take()
@@ -1874,9 +1880,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
     let (local_proxy, endpoint_group, conn_pool, proxy_task) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
-            Err(_) => {
-                jni_log!("[DEBUG:jni] Failed to lock state, aborting stop");
-                return 0;
+            Err(poisoned) => {
+                // A poisoned lock means some thread panicked while holding it,
+                // which is exactly when the resources it guards most need
+                // closing. Recovering the guard is the only way to reach them:
+                // returning here used to leave the local proxy, the endpoint
+                // group, the connection pool and the proxy task all in place,
+                // so the endpoint was never closed and a later start inherited
+                // half of a stopped one.
+                jni_log!("[WARN:jni] State lock poisoned, recovering the guard to finish the stop");
+                poisoned.into_inner()
             }
         };
         jni_log!(
@@ -2385,9 +2398,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(
     let tun_proxy = {
         let mut guard = match state.lock() {
             Ok(g) => g,
-            Err(_) => {
-                jni_log!("[DEBUG:jni] Failed to lock state for tun_proxy stop");
-                return 0;
+            Err(poisoned) => {
+                // The fd this takes out is closed only by dropping or shutting
+                // down the proxy, so the guard is recovered rather than the
+                // stop abandoned.
+                jni_log!(
+                    "[WARN:jni] State lock poisoned, recovering the guard to stop the TUN proxy"
+                );
+                poisoned.into_inner()
             }
         };
         guard.tun_proxy.take()
