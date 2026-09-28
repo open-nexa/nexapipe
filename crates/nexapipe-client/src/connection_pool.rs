@@ -154,6 +154,12 @@ impl PooledConnection {
     fn is_live(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// True if this connection has been sitting in the pool unused for at least
+    /// `timeout`.
+    fn is_idle_for(&self, timeout: tokio::time::Duration) -> bool {
+        self.created_at.elapsed() >= timeout
+    }
 }
 
 #[derive(Clone)]
@@ -460,9 +466,8 @@ impl IrohConnectionPool {
 
         // Drop stale connections before handing one out: anything already closed
         // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
-        connections.retain(|pooled| {
-            pooled.created_at.elapsed() < CONNECTION_IDLE_TIMEOUT && pooled.is_live()
-        });
+        connections
+            .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
 
         if let Some(pooled) = connections.pop() {
             return Ok(pooled.conn);
@@ -577,7 +582,19 @@ impl IrohConnectionPool {
                 conn,
                 created_at: std::time::Instant::now(),
             });
+            return;
         }
+
+        // The pool is full, so this one is closed on the spot. Dropping the
+        // handle would close it just as surely, but silently: the peer would
+        // see a connection that vanished with no reason attached, which is
+        // indistinguishable from a crash on this side.
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            "Connection pool is full ({}), closing the connection that came back",
+            MAX_CONNECTIONS
+        );
+        conn.close(0u32.into(), b"connection pool full");
     }
 
     pub async fn close_all(&self) {
@@ -733,7 +750,12 @@ fn spawn_cleanup_task(inner: Weak<IrohConnectionPoolInner>) {
             };
             let mut connections = inner.connections.lock().await;
             let before = connections.len();
-            connections.retain(|pooled| pooled.is_live());
+            // Idle as well as closed: `get_connection` already dropped stale
+            // entries before handing one out, but nothing else ever ran, so a
+            // pool that stopped being used kept its connections — and the
+            // sockets, and the NAT mappings on both sides — until then.
+            connections
+                .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
             let removed = before - connections.len();
             if removed > 0 {
                 #[cfg(feature = "tracing")]
