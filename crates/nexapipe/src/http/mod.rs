@@ -53,6 +53,39 @@ const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
 /// that needs to push larger bodies should stream them instead of raising this.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
+/// Whether a request header may be forwarded to the backend.
+///
+/// Two groups are dropped. Hop-by-hop headers describe one connection, not the
+/// message (RFC 7230 6.1): `connection: keep-alive` is about the client's link
+/// to this proxy, and forwarding it asks the backend to keep *its* link open
+/// for a request that arrived over a different one. `transfer-encoding` is in
+/// the same group and has to go: the body has already been read whole and is
+/// sent as a single buffer, so a leftover `chunked` would disagree with the
+/// framing on the wire.
+///
+/// `expect: 100-continue` is dropped for a different reason. The proxy reads
+/// the body before it ever asks the backend anything, so the client's
+/// expectation was answered by this process — and a backend told to expect
+/// more would wait for bytes that are already here.
+///
+/// The WebSocket handshake does not use this: it is the one request that
+/// *must* carry `upgrade` and `connection`, because switching protocols is
+/// exactly what it is asking the backend for.
+fn forwards_request_header(name: &str) -> bool {
+    ![
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "expect",
+    ]
+    .iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
+}
+
 pub async fn proxy_request(
     client: &HttpClient,
     req: Request<Incoming>,
@@ -127,7 +160,12 @@ pub async fn proxy_request(
     let mut builder = Request::builder().method(method).uri(new_uri);
 
     for (name, value) in headers_clone.iter() {
-        // Preserve the client's original Host header so backend virtual-host routing works
+        // Preserve the client's original Host header so backend virtual-host
+        // routing works; drop the rest that only meant something for the hop
+        // from the client to here.
+        if !forwards_request_header(name.as_str()) {
+            continue;
+        }
         builder = builder.header(name, value);
     }
 
@@ -356,7 +394,12 @@ pub async fn proxy_to_backend_streaming(
     let mut builder = Request::builder().method(req.method()).uri(new_uri);
 
     for (name, value) in req.headers() {
-        // Preserve the client's original Host header so backend virtual-host routing works
+        // Preserve the client's original Host header so backend virtual-host
+        // routing works. The body below is read whole and sent as one buffer,
+        // so `transfer-encoding` and friends must not claim otherwise.
+        if !forwards_request_header(name.as_str()) {
+            continue;
+        }
         builder = builder.header(name, value);
     }
 
@@ -512,8 +555,21 @@ async fn read_remaining_request_body(
 }
 
 pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, anyhow::Error> {
-    let response_str = String::from_utf8_lossy(response);
-    let mut lines = response_str.split("\r\n");
+    // The end of the header block is looked for in the bytes, never measured
+    // off a decoded string: `from_utf8_lossy` turns each invalid byte into
+    // U+FFFD, which is three bytes in UTF-8, so every offset computed from the
+    // decoded text drifts by two per bad byte and the body started — or ended
+    // — in the wrong place. A header with a single non-UTF-8 byte was enough
+    // to hand the caller a body sliced out of the middle of the headers.
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response: no end of headers"))?;
+    let body_start = header_end + 4;
+
+    // Only the head is decoded, so nothing below can produce an offset again.
+    let head = String::from_utf8_lossy(&response[..header_end]);
+    let mut lines = head.split("\r\n");
 
     let status_line = lines
         .next()
@@ -530,23 +586,13 @@ pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, 
 
     let mut builder = Response::builder().status(status_code);
 
-    let mut body_start = status_line.len() + 2;
     for line in lines {
-        if line.is_empty() {
-            body_start += 2;
-            break;
-        }
-        body_start += line.len() + 2;
         if let Some((name, value)) = line.split_once(':') {
             builder = builder.header(name.trim(), value.trim());
         }
     }
 
-    let body = if body_start < response.len() {
-        response[body_start..].to_vec()
-    } else {
-        Vec::new()
-    };
+    let body = response[body_start..].to_vec();
 
     Ok(builder.body(body)?)
 }
@@ -580,33 +626,6 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
     }
 
     Ok(builder.body(())?)
-}
-
-pub async fn send_response_legacy(
-    send: &mut iroh::endpoint::SendStream,
-    response: &Response<Vec<u8>>,
-) -> Result<(), anyhow::Error> {
-    let status = response.status();
-    let status_text = status.canonical_reason().unwrap_or("Unknown");
-
-    let mut response_buf = Vec::new();
-    response_buf
-        .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
-
-    for (name, value) in response.headers() {
-        response_buf.extend_from_slice(name.as_str().as_bytes());
-        response_buf.extend_from_slice(b": ");
-        response_buf.extend_from_slice(value.as_bytes());
-        response_buf.extend_from_slice(b"\r\n");
-    }
-
-    response_buf.extend_from_slice(b"\r\n");
-    response_buf.extend_from_slice(response.body());
-
-    send.write_all(&response_buf).await?;
-    send.finish()?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -688,5 +707,50 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(res.body().is_empty());
+    }
+
+    /// What the offset arithmetic used to get wrong: `from_utf8_lossy` turns
+    /// one invalid byte into a three-byte U+FFFD, so a header carrying binary
+    /// data shifted `body_start` and the body came out of the middle of the
+    /// headers — or was empty.
+    #[test]
+    fn legacy_response_parser_finds_the_body_behind_a_non_utf8_header() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nX-Binary: ".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        raw.extend_from_slice(b"\r\n\r\nbody-bytes");
+
+        let res = parse_http_response_legacy(&raw).unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.body().as_slice(), b"body-bytes".as_slice());
+    }
+
+    #[test]
+    fn legacy_response_parser_rejects_a_response_with_no_end_of_headers() {
+        // Truncated: there is no place where the body could start, and
+        // guessing one used to be how it silently returned an empty body.
+        assert!(parse_http_response_legacy(b"HTTP/1.1 200 OK\r\nX-A: 1\r\n").is_err());
+    }
+
+    #[test]
+    fn hop_by_hop_headers_do_not_reach_the_backend() {
+        for dropped in [
+            "connection",
+            "Proxy-Connection",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "upgrade",
+            "expect",
+        ] {
+            assert!(
+                !forwards_request_header(dropped),
+                "{dropped} belongs to this hop only"
+            );
+        }
+        for kept in ["host", "accept", "content-length", "sec-websocket-key"] {
+            assert!(forwards_request_header(kept), "{kept} is the message's own");
+        }
     }
 }
