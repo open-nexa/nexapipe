@@ -158,6 +158,16 @@ const UDP_FLOW_QUEUE: usize = 256;
 /// every UDP flow's inbound traffic) queue here for the single TUN writer.
 const TUN_WRITE_QUEUE: usize = 1024;
 
+/// How many UDP flows may be open at once.
+///
+/// One flow per (client address, destination), and each one holds a tunnel
+/// open — a stream, and a pooled connection, on the server — plus a 65 KiB
+/// read buffer and a queue 256 datagrams deep. Nothing bounded how many an
+/// application could start: a peer that sent one datagram each from a few
+/// thousand source ports, or a leak of flows whose idle timer had not run out
+/// yet, was answered with as many tunnels as it cared to open.
+const MAX_UDP_FLOWS: usize = 32;
+
 /// Buffer size for the byte-copying TCP paths.
 const COPY_BUF_SIZE: usize = 16 * 1024;
 
@@ -888,6 +898,8 @@ async fn run_udp_demux(
     ctx: TunContext,
 ) {
     let table: FlowTable = Arc::new(Mutex::new(HashMap::new()));
+    // One log line per episode of being full, not one per dropped datagram.
+    let warned_full = AtomicBool::new(false);
 
     while !ctx.stopped.load(Ordering::Acquire) {
         let Some((payload, client_addr, dst_addr)) = socket.next().await else {
@@ -952,7 +964,30 @@ async fn run_udp_demux(
             Some(sender) => sender,
             None => {
                 let (sender, receiver) = mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
-                lock_flows(&table).insert(key, sender.clone());
+                let mut flows = lock_flows(&table);
+
+                if flows.len() >= MAX_UDP_FLOWS {
+                    // A flow that has ended is still in the table until its
+                    // task gets to `release_flow`, so the count is not the
+                    // number of live flows — look again before refusing.
+                    flows.retain(|_, sender| !sender.is_closed());
+                }
+                if flows.len() >= MAX_UDP_FLOWS {
+                    drop(flows);
+                    if !warned_full.swap(true, Ordering::Relaxed) {
+                        jni_log!(
+                            "[tun-proxy] {} UDP flows are open, dropping datagrams until one ends",
+                            MAX_UDP_FLOWS
+                        );
+                    }
+                    // UDP is allowed to lose datagrams, and the alternative is
+                    // a tunnel per source port.
+                    continue;
+                }
+
+                warned_full.store(false, Ordering::Relaxed);
+                flows.insert(key, sender.clone());
+                drop(flows);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
