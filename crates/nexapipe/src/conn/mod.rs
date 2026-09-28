@@ -126,8 +126,17 @@ impl AuthState {
     }
 }
 
-fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+/// Finds the end of a header block, scanning from `from`.
+///
+/// `from` is what keeps a head that arrives in many small reads off O(n²):
+/// the bytes before it were already scanned on an earlier read, so without it
+/// every read rescanned the whole buffer, and a head delivered one segment at
+/// a time cost a full pass per segment.
+fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
+    buf.get(from..)?
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| from + pos)
 }
 
 pub async fn handle_bidi_stream(
@@ -140,9 +149,14 @@ pub async fn handle_bidi_stream(
     acl: Option<Arc<ClientAcl>>,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
+    // Doubling on demand, so a head that fits in one read never pays for a
+    // bigger buffer while a large one still gets there in a few reallocs.
+    // Pre-allocating the 64 KB limit would take that much from every stream.
     let mut buf = Vec::with_capacity(8192);
     let mut read_buf = [0u8; 8192];
     let mut body_data = Vec::new();
+    // How much of `buf` has already been scanned for the end of the headers.
+    let mut searched = 0usize;
 
     let head_deadline = tokio::time::Instant::now() + HEAD_READ_TIMEOUT;
     loop {
@@ -187,7 +201,7 @@ pub async fn handle_bidi_stream(
                     .await;
                 }
 
-                if let Some(pos) = find_headers_end(&buf) {
+                if let Some(pos) = find_headers_end(&buf, searched) {
                     let headers_end = pos + 4;
                     if buf.len() > headers_end {
                         body_data.extend_from_slice(&buf[headers_end..]);
@@ -195,6 +209,11 @@ pub async fn handle_bidi_stream(
                     buf.truncate(headers_end);
                     break;
                 }
+
+                // The marker can straddle two reads, so the last three bytes
+                // are looked at again; everything before them cannot start a
+                // marker that was not already ruled out.
+                searched = buf.len().saturating_sub(3);
 
                 if buf.len() > 64 * 1024 {
                     tracing::warn!("Request headers too large");
@@ -393,6 +412,9 @@ async fn handle_websocket_stream(
     let mut response_buf = Vec::with_capacity(8192);
     let mut trailing_ws_data = Vec::new();
     let mut read_buf = [0u8; 8192];
+    // See the request loop: the handshake response arrives in reads of its
+    // own, and the marker is only ever in the part that has not been scanned.
+    let mut searched = 0usize;
 
     let read_handshake = async {
         loop {
@@ -401,7 +423,7 @@ async fn handle_websocket_stream(
                 Ok(n) => {
                     response_buf.extend_from_slice(&read_buf[..n]);
 
-                    if let Some(pos) = find_headers_end(&response_buf) {
+                    if let Some(pos) = find_headers_end(&response_buf, searched) {
                         let headers_end = pos + 4;
                         if response_buf.len() > headers_end {
                             trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
@@ -409,6 +431,8 @@ async fn handle_websocket_stream(
                         response_buf.truncate(headers_end);
                         break;
                     }
+
+                    searched = response_buf.len().saturating_sub(3);
 
                     if response_buf.len() > 64 * 1024 {
                         tracing::warn!("WebSocket handshake response too large");
@@ -1373,8 +1397,47 @@ pub async fn handle_incoming(
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrollmentVerdict, constant_time_eq, enrollment_verdict};
+    use super::{EnrollmentVerdict, constant_time_eq, enrollment_verdict, find_headers_end};
     use crate::auth::{AuthConfig, ClientAuth};
+
+    /// The marker only ever appears once a read has brought in its last byte,
+    /// and the scan starts where the previous read left off — three bytes back,
+    /// because a marker split across two reads has to still be found.
+    #[test]
+    fn a_header_marker_split_across_reads_is_still_found() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+        // Everything up to the last three bytes has been scanned already.
+        let mut buf = Vec::new();
+        let mut searched = 0;
+        let mut found = None;
+        for chunk in head.chunks(7) {
+            buf.extend_from_slice(chunk);
+            if let Some(pos) = find_headers_end(&buf, searched) {
+                found = Some(pos);
+                break;
+            }
+            searched = buf.len().saturating_sub(3);
+        }
+
+        assert_eq!(
+            found.map(|pos| pos + 4),
+            Some(head.len()),
+            "the marker was missed when it arrived in pieces"
+        );
+    }
+
+    #[test]
+    fn a_buffer_without_the_marker_is_not_a_head() {
+        assert_eq!(
+            find_headers_end(b"GET / HTTP/1.1\r\nHost: a.test\r\n", 0),
+            None
+        );
+        // Nothing to scan: a read that brought no bytes cannot have completed
+        // the marker either.
+        assert_eq!(find_headers_end(b"", 0), None);
+        assert_eq!(find_headers_end(b"\r\n", 40), None);
+    }
 
     /// A config holding one client, with `token` left outstanding for it.
     fn auth_with_pending(token: Option<&str>) -> AuthConfig {
