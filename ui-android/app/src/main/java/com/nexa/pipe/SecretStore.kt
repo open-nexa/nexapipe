@@ -182,6 +182,17 @@ class SecretStore {
         }
     }
 
+    /**
+     * The credential key, generating it the first time there is none.
+     *
+     * A read that *throws* is not the same as a read that found no key, and the
+     * two must not reach [generate] together. On API 26, the lowest supported
+     * version, generating a key under an alias that already exists deletes that
+     * entry first, so a key generated because the keystore was momentarily
+     * unreachable replaces the key every stored credential is sealed under and
+     * makes all of them unreadable. Only a read that succeeded and came back
+     * empty means there is no key yet.
+     */
     private fun key(): SecretKey? {
         cachedKey?.let { return it }
         val store = keyStore ?: return null
@@ -189,13 +200,13 @@ class SecretStore {
             store.getKey(ALIAS, null) as? SecretKey
         } catch (e: GeneralSecurityException) {
             Log.w(TAG, "The credential key could not be loaded", e)
-            null
+            return null
         } catch (e: ProviderException) {
             Log.w(TAG, "The keystore failed while loading the credential key", e)
-            null
+            return null
         } catch (e: IllegalStateException) {
             Log.w(TAG, "The keystore is not ready, the credential key is unavailable", e)
-            null
+            return null
         } ?: generate()
         cachedKey = resolved
         return resolved
