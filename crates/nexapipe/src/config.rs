@@ -451,6 +451,13 @@ impl ProxyConfig {
                 anyhow::bail!("{label}: host_pattern {why}");
             }
 
+            // A route with no backends matches and then has nothing to send
+            // the request to: `select_backend` answers with an empty string and
+            // the client gets a 502 that looks like a backend being down.
+            if route_config.backends.is_empty() {
+                anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
+            }
+
             // Every declared mode has to be able to dial these backends, so each
             // one is checked: the `http` rules and the L4 rules disagree (a URL
             // to fetch versus an address to dial, and only the L4 one insists on
@@ -605,10 +612,19 @@ fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
 /// fail: this process would speak plaintext at a TLS port. Saying so at startup
 /// beats serving 502s, and either fix is a one-line config change.
 pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::Result<()> {
-    // Passthrough only needs a host and a port; the scheme carries no meaning
-    // because those bytes are never interpreted.
+    // Passthrough only needs a host and a port — the scheme carries no meaning
+    // because those bytes are never interpreted — but it still has to name one.
+    // Checked with the function the route will dial it with, so what starts is
+    // what runs: an address that only fails at connect time turns every
+    // connection into a 502 with nothing at startup to explain it.
     if mode == RouteMode::Passthrough {
-        return Ok(());
+        return match crate::passthrough::parse_backend_addr(backend) {
+            Some((host, port)) if !host.is_empty() && port != 0 => Ok(()),
+            _ => anyhow::bail!(
+                "{label}: backend \"{backend}\" is not an address a passthrough route can dial; \
+                 expected host:port, for example \"10.0.0.5:443\" or \"[::1]:443\""
+            ),
+        };
     }
 
     // An L4 backend is an address to dial, not a URL to fetch, so it is checked
@@ -1200,6 +1216,60 @@ backends = ["https://caddy:443"]
         assert!(
             error.contains("https://"),
             "the message has to name the offending backend, got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_routes_rejects_a_passthrough_backend_with_no_address() {
+        // Passthrough copies bytes, so its backend was never checked at all:
+        // this one dials nothing and only failed once a connection arrived.
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "passthrough"
+backends = [""]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("passthrough"),
+            "the message has to say which route cannot dial it, got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_routes_accepts_an_ipv6_passthrough_backend() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "passthrough"
+backends = ["[::1]:443"]
+"#,
+        );
+
+        config
+            .build_routes()
+            .expect("an IPv6 literal is an address a passthrough route can dial");
+    }
+
+    #[test]
+    fn build_routes_rejects_a_route_with_no_backends() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+mode = "http"
+backends = []
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("no backends"),
+            "the message has to say what is missing, got: {error}"
         );
     }
 

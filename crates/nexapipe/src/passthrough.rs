@@ -210,7 +210,11 @@ async fn resolve_backend(
 /// The scheme carries no meaning here — passthrough copies bytes and never
 /// speaks TLS itself — so it is accepted and ignored, which keeps the backend
 /// list in the same shape as the HTTP routes.
-fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
+///
+/// Public because the config check uses it too: the route is dialled with this
+/// function, so validating with anything else is how a backend passes at
+/// startup and fails on the first connection.
+pub fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
     let backend = backend.trim();
     if backend.is_empty() {
         return None;
@@ -220,7 +224,24 @@ fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
         let url = url::Url::parse(backend).ok()?;
         let host = url.host_str()?.to_string();
         let port = url.port_or_known_default()?;
-        return Some((host, port));
+        return Some((strip_ipv6_brackets(&host).to_string(), port));
+    }
+
+    // A bracketed IPv6 literal: the colons inside the address come before the
+    // one that separates the port, so the brackets have to go first.
+    if let Some(rest) = backend.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            // An unclosed bracket is not a host name anyone can resolve.
+            return None;
+        };
+        if host.is_empty() {
+            return None;
+        }
+        return match tail.strip_prefix(':') {
+            Some(port) => port.parse().ok().map(|p| (host.to_string(), p)),
+            // No port: the TLS port, the same default a bare host gets.
+            None => Some((host.to_string(), 443)),
+        };
     }
 
     match backend.rsplit_once(':') {
@@ -229,6 +250,16 @@ fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
         // passthrough route ever points at.
         _ => Some((backend.to_string(), 443)),
     }
+}
+
+/// Drops the brackets around an IPv6 literal.
+///
+/// Both forms a config can use keep them — `Url::host_str()` hands back
+/// `[::1]`, and so does splitting `[::1]:443` on the colon — and leaving them
+/// on makes the resolver look for a host actually called `[::1]`, which no
+/// backend ever is. The L4 path already did this.
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.trim_matches(['[', ']'])
 }
 
 /// Extract the SNI host name from a TLS `ClientHello`.
@@ -479,5 +510,26 @@ mod tests {
         assert!(is_tls_handshake(0x16));
         assert!(!is_tls_handshake(b'G'));
         assert!(!is_tls_handshake(0x17));
+    }
+
+    #[test]
+    fn an_ipv6_backend_loses_its_brackets() {
+        // With the brackets left on, the resolver is asked for a host called
+        // "[::1]" and every connection to this backend fails.
+        assert_eq!(
+            parse_backend_addr("[::1]:443"),
+            Some(("::1".to_string(), 443))
+        );
+        assert_eq!(
+            parse_backend_addr("https://[::1]:8443"),
+            Some(("::1".to_string(), 8443))
+        );
+        assert_eq!(parse_backend_addr("[::1]"), Some(("::1".to_string(), 443)));
+    }
+
+    #[test]
+    fn a_backend_with_no_address_is_refused() {
+        assert_eq!(parse_backend_addr(""), None);
+        assert_eq!(parse_backend_addr("   "), None);
     }
 }
