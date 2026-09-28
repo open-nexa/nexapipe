@@ -8,7 +8,7 @@ exclude = ["ui-desktop/src-tauri"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 # Vendor smoltcp 0.12.0 with a minimal patch guarding the unguarded
