@@ -290,11 +290,18 @@ async fn compress_response(
         }
     }
 
-    let compressed_bytes = {
+    // Compressing up to `MAX_COMPRESS_SIZE` bytes is straight CPU work, and it
+    // used to run on whichever worker happened to be serving this request: a
+    // tokio worker stalls every task scheduled behind it, so one compressible
+    // response became a delay on unrelated ones. `spawn_blocking` hands it to a
+    // thread built for it and leaves the worker free.
+    let compressed_bytes = tokio::task::spawn_blocking(move || {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&bytes)?;
-        encoder.finish()?
-    };
+        encoder.finish()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the gzip encoder did not run: {e}"))??;
 
     let mut new_parts = parts;
     new_parts.headers.remove("content-encoding");
@@ -479,7 +486,13 @@ pub async fn proxy_to_backend_streaming(
     // The header above is still written separately so that a slow producer
     // (SSE, long-poll) is not held back until 64 KiB accumulate.
     const RESPONSE_FLUSH_THRESHOLD: usize = 64 * 1024;
-    let mut out = Vec::with_capacity(RESPONSE_FLUSH_THRESHOLD + 32);
+    // Started small rather than at the threshold: the threshold is a latency
+    // bound, not an expected size, and most responses never come near it —
+    // reserving it up front took 64 KiB from every streamed response, most of
+    // which then went back unused. Growing costs the same few reallocs the
+    // large responses would have paid anyway.
+    const INITIAL_FLUSH_CAPACITY: usize = 8 * 1024;
+    let mut out = Vec::with_capacity(INITIAL_FLUSH_CAPACITY);
 
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
     while let Some(chunk) = body_stream.next().await {
