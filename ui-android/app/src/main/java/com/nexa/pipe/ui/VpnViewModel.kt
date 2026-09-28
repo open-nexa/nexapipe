@@ -11,6 +11,7 @@ import androidx.lifecycle.viewModelScope
 import com.nexa.pipe.IrohProxy
 import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.R
+import com.nexa.pipe.SecretStore
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.locale.AppStrings
 import com.nexa.pipe.vpn.NexaVpnService
@@ -97,6 +98,16 @@ class VpnViewModel : ViewModel() {
     val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
     // Bearer token for a custom relay that asks for one. Never logged.
     val relayAuthToken = kotlinx.coroutines.flow.MutableStateFlow("")
+
+    /**
+     * Whether the credentials on this device are actually encrypted at rest.
+     *
+     * Refreshed wherever a credential is written, which is the only moment the
+     * answer can change. `Sealed` before anything has been written is honest
+     * rather than optimistic: nothing is stored in plaintext yet.
+     */
+    val credentialProtection =
+        kotlinx.coroutines.flow.MutableStateFlow(SecretStore.Protection.Sealed)
 
     /**
      * Runtime link type per backend (endpoint ID -> direct/relay), reported by iroh and
@@ -284,6 +295,10 @@ class VpnViewModel : ViewModel() {
             relayMode.value = manager.loadRelayMode()
             relayUrl.value = manager.loadRelayUrl()
             relayAuthToken.value = manager.loadRelayAuthToken()
+            // Read after the load, because building a SettingsManager runs the
+            // migration that re-seals whatever older versions left in plaintext —
+            // on a device with a broken keystore that is the write that fails.
+            credentialProtection.value = manager.credentialProtection()
             addLog("Settings loaded: ${loadedNodes.size} nodes, relay=${relayMode.value}")
         }
     }
@@ -292,6 +307,7 @@ class VpnViewModel : ViewModel() {
         settingsManager?.let { manager ->
             manager.saveNodes(nodes.value)
             manager.saveRelayConfig(relayMode.value, relayUrl.value, relayAuthToken.value)
+            credentialProtection.value = manager.credentialProtection()
         }
     }
 
@@ -319,6 +335,9 @@ class VpnViewModel : ViewModel() {
         updated[index] = nodes.value[index].copy(enrollment = enrollment)
         nodes.value = updated
         settingsManager?.saveNodes(nodes.value)
+        // A token is a credential, so this write is one of the two places the
+        // answer can change without going through `saveSettings`.
+        settingsManager?.let { credentialProtection.value = it.credentialProtection() }
         addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
     }
 

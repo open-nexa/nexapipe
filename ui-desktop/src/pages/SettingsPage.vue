@@ -12,7 +12,25 @@ import { useLocale } from "../composables/useLocale";
 import type { ThemePreference } from "../stores/prefs";
 
 const { t } = useI18n();
-const { config, updateConfig } = useConfigStore();
+const { config, credentialProtection, updateConfig } = useConfigStore();
+
+/**
+ * Where the credential master key ended up, in the user's words.
+ *
+ * Both answers mean the credentials are encrypted — what differs is who holds the key — so this
+ * is information rather than a warning. `null` is not one of them: it means startup could not
+ * ask, and claiming the keychain case it cannot confirm would be worse than saying so.
+ */
+const credentialProtectionLabel = computed(() => {
+  switch (credentialProtection.value) {
+    case 'keychain':
+      return t('settings.credentialProtectionKeychain');
+    case 'file':
+      return t('settings.credentialProtectionFile');
+    default:
+      return t('settings.credentialProtectionUnknown');
+  }
+});
 // Toggling the backend changes where the status comes from, so the panel has to re-read it.
 const { refreshServiceRunning } = useProxyStore();
 
@@ -166,6 +184,31 @@ loadAppVersion();
       </div>
 
       <ServiceManager />
+    </div>
+
+    <div class="settings-section">
+      <div class="card-header">
+        <h2>{{ t('settings.security') }}</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('settings.credentialProtection') }}</span>
+              <span class="setting-hint">{{ t('settings.credentialProtectionHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <span class="protection-level">{{ credentialProtectionLabel }}</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -609,6 +652,14 @@ loadAppVersion();
 
 .setting-right {
   flex-shrink: 0;
+}
+
+/* A read-only answer, not a control: it says where the credential key is, and there is
+   nothing here to change. */
+.protection-level {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
 }
 
 .toggle {

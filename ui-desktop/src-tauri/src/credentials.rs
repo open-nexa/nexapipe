@@ -470,11 +470,12 @@ fn parse_key(hex: &str) -> Option<[u8; KEY_LEN]> {
     if hex.len() != KEY_LEN * 2 {
         return None;
     }
-    let mut key = [0u8; KEY_LEN];
-    for (slot, byte) in key.iter_mut().zip(unhex(hex)?) {
-        *slot = byte;
-    }
-    Some(key)
+
+    // Converted whole rather than copied into a zeroed buffer: a key made of
+    // zeroes is what a short conversion would silently leave behind, and the
+    // two are indistinguishable once the bytes are out of this function.
+    let bytes = unhex(hex)?;
+    <[u8; KEY_LEN]>::try_from(bytes).ok()
 }
 
 fn hex(bytes: &[u8]) -> String {

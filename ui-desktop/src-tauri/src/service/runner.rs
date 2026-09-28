@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -22,6 +23,19 @@ use tokio::net::TcpListener;
 /// it), and anything that fails there would otherwise be visible only in this process's log —
 /// which is written under LocalSystem's profile and nobody can read. The desktop asks for it and
 /// shows it, exactly like it does for a process-mode start.
+/// How long a caller has to answer the challenge before it is dropped.
+///
+/// Only the unauthenticated part of the exchange is bounded: once a caller has proved itself it
+/// may sit idle indefinitely, because the desktop keeps one connection open for the lifetime of
+/// the app and an idle timeout there would break the thing this protects.
+///
+/// Kept longer than the client's own 5s wait for the challenge on purpose. The two are measuring
+/// different things — the client waits to be spoken to, this side waits to be answered — but if
+/// this one were the shorter of the pair, an honest caller that was merely slow would be dropped
+/// by a service it is still waiting on, which surfaces as a broken service rather than as a
+/// refusal.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn startup_error_slot() -> &'static Arc<tokio::sync::RwLock<Option<AppError>>> {
     static SLOT: std::sync::OnceLock<Arc<tokio::sync::RwLock<Option<AppError>>>> =
         std::sync::OnceLock::new();
@@ -123,7 +137,32 @@ impl ServiceRunner {
 
         loop {
             line.clear();
-            match Self::read_ipc_line(&mut reader, &mut line).await {
+
+            // Unauthenticated reads are the only ones with a deadline: a caller that connects,
+            // takes the challenge and then says nothing would otherwise hold this task — and its
+            // socket — for as long as it likes, which is a few dozen connections away from an
+            // elevated process that answers nobody.
+            let read = if authenticated {
+                Self::read_ipc_line(&mut reader, &mut line).await
+            } else {
+                match tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    Self::read_ipc_line(&mut reader, &mut line),
+                )
+                .await
+                {
+                    Ok(read) => read,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Dropping an IPC client that did not authenticate within {:?}",
+                            HANDSHAKE_TIMEOUT
+                        );
+                        break;
+                    }
+                }
+            };
+
+            match read {
                 // Peer gone, nothing left to answer.
                 Ok(0) => {
                     tracing::debug!("Client disconnected");
@@ -672,6 +711,52 @@ mod tests {
             buf.len() <= MAX_IPC_LINE,
             "the oversized line must never be buffered"
         );
+    }
+
+    /// A caller that takes the challenge and then says nothing must not be able to hold a task
+    /// and a socket open for as long as it likes: this process runs elevated, so a handful of
+    /// such connections is enough to leave it answering nobody.
+    ///
+    /// The clock is paused rather than waited out, so the service's own deadline is what is
+    /// exercised — and the test finishes when the runtime advances to it, not ten seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_authenticates_is_dropped() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("the client connects");
+        let (mut server, _) = listener.accept().await.expect("the service accepts");
+
+        let manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::ProxyManager>>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        let handler =
+            tokio::spawn(async move { ServiceRunner::handle_client(&mut server, manager).await });
+
+        // The service speaks first. Take the challenge and then send nothing at all.
+        let mut challenge = Vec::new();
+        BufReader::new(&mut client)
+            .read_until(b'\n', &mut challenge)
+            .await
+            .expect("the challenge is readable");
+        assert!(!challenge.is_empty(), "the service opens with a challenge");
+
+        // Nothing more is ever written. The drop has to be a close the caller can see, not a
+        // silently abandoned task.
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .await
+            .expect("a dropped client is closed, not reset");
+
+        handler
+            .await
+            .expect("the handler ends")
+            .expect("dropping an unauthenticated client is not an error");
     }
 
     /// The reply has to end the line it is written on: `IpcClient::exchange` reads a *line*, so

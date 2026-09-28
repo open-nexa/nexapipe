@@ -195,6 +195,17 @@ class SettingsManager(context: Context) {
         prefs.edit().putString(KEY_NODES, json.encodeToString(persisted)).apply()
     }
 
+    /**
+     * What became of the last credential written to [secretPrefs].
+     *
+     * [SecretStore.Protection.Sealed] is the only answer that means the file
+     * holds ciphertext. The others mean a credential went down as plaintext,
+     * which the file being excluded from backups does not make harmless — it
+     * only stops it leaving the device. The UI asks, so the user can be told
+     * instead of finding out from a backup they assumed was encrypted.
+     */
+    fun credentialProtection(): SecretStore.Protection = secrets.protection()
+
     /** Loads the endpoints, re-attaching each secret and token from [secretPrefs]. */
     fun loadNodes(): List<NodeConfig> {
         val stored = decodeNodes()

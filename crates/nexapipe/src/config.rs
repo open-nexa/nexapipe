@@ -1085,6 +1085,17 @@ impl ProxyConfig {
         secret: &str,
         force: bool,
     ) -> anyhow::Result<ClientSecretWrite> {
+        with_config_lock(path, || {
+            Self::write_client_secret_unlocked(path, client_id, secret, force)
+        })
+    }
+
+    fn write_client_secret_unlocked(
+        path: &str,
+        client_id: &str,
+        secret: &str,
+        force: bool,
+    ) -> anyhow::Result<ClientSecretWrite> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -1124,6 +1135,16 @@ impl ProxyConfig {
         client_id: &str,
         token: &str,
     ) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::write_pending_enrollment_unlocked(path, client_id, token)
+        })
+    }
+
+    fn write_pending_enrollment_unlocked(
+        path: &str,
+        client_id: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -1152,6 +1173,16 @@ impl ProxyConfig {
     /// token still beside it would leave the window open for a second device to
     /// trade the same link for the same credential.
     pub fn complete_enrollment(path: &str, client_id: &str, secret: &str) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::complete_enrollment_unlocked(path, client_id, secret)
+        })
+    }
+
+    fn complete_enrollment_unlocked(
+        path: &str,
+        client_id: &str,
+        secret: &str,
+    ) -> anyhow::Result<()> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
         let mut doc: toml_edit::DocumentMut = content
@@ -1166,6 +1197,76 @@ impl ProxyConfig {
         client.remove("pending_enrollment");
 
         write_config_file(path, &doc.to_string())
+    }
+}
+
+/// Runs `work` while holding an exclusive lock on the config file at `path`.
+///
+/// Every read-modify-write of the config goes through this. `write_config_file`
+/// makes a single write atomic, but it says nothing about two writers that both
+/// read first: the second one's write is built from the contents it read before
+/// the first one landed, so one of the two edits is lost. The three callers are
+/// in this binary — a CLI command, the enrollment flow and the 2FA counter
+/// writeback — and any two of them can coincide.
+///
+/// The lock is advisory: a writer that does not take it still races. That is
+/// acceptable, because every writer of this file is this program.
+pub fn with_config_lock<T>(
+    path: &str,
+    work: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = ConfigLock::acquire(path)?;
+    work()
+}
+
+/// The lock file sits *beside* the config rather than being the config itself.
+///
+/// Writes go through [`write_config_file`], which is a temp file and a rename,
+/// and a rename swaps the directory entry for a different inode — so a lock
+/// taken on the config path would stay behind on a file that was replaced
+/// underneath it, and every writer would hold a different lock. A separate file
+/// is never renamed, so it stays the one thing everybody contends for.
+struct ConfigLock {
+    file: fs::File,
+}
+
+impl ConfigLock {
+    fn acquire(path: &str) -> anyhow::Result<Self> {
+        let lock_path = format!("{path}.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            // The lock file is a lock, not a document: whatever it already
+            // holds is nobody's data, and truncating a file another process may
+            // be about to open buys nothing.
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| anyhow::anyhow!("cannot open {lock_path}: {e}"))?;
+
+        // Beside a file that holds TOTP secrets, so it is created the way the
+        // config itself is checked for: private to its owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("cannot set the mode of {lock_path}: {e}"))?;
+        }
+
+        // `File::lock`, standard since 1.89: `flock(2)` on Unix and
+        // `LockFileEx` on Windows, which is the pair writing by hand would have
+        // meant two `unsafe` blocks to reach.
+        file.lock()
+            .map_err(|e| anyhow::anyhow!("cannot lock {lock_path}: {e}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // Released on close regardless; unlocking explicitly keeps the pairing
+        // visible, and the error has nowhere to go from a `Drop`.
+        let _ = self.file.unlock();
     }
 }
 
@@ -1804,6 +1905,55 @@ domains = ["fn.iroh.iakl.top"]
         let path = dir.path().join("config.toml");
         fs::write(&path, source).expect("write scratch config");
         (dir, path.to_string_lossy().into_owned())
+    }
+
+    /// Two writers that both read before either writes lose one of the two
+    /// edits: the second one's document is built from contents the first one has
+    /// already replaced. The lock is what sequences them — and it has to be a
+    /// lock *on the file*, because a process-wide mutex would serialize these
+    /// two threads while doing nothing for the CLI and the server, which are
+    /// different processes.
+    #[test]
+    fn a_second_writer_sees_the_first_one_s_edit() {
+        let (_dir, path) = scratch_config("counter = 0\n");
+
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                with_config_lock(&path, || {
+                    // Reads, then sits on the lock long enough that an unlocked
+                    // second writer would have read the old value too.
+                    let content = fs::read_to_string(&path)?;
+                    assert_eq!(content.trim(), "counter = 0");
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    write_config_file(&path, "counter = 1\n")
+                })
+                .expect("the first writer succeeds")
+            })
+        };
+
+        // Let the first one take the lock before the second asks for it.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let seen = with_config_lock(&path, || {
+            let content = fs::read_to_string(&path)?;
+            write_config_file(&path, "counter = 2\n")?;
+            Ok(content)
+        })
+        .expect("the second writer succeeds");
+
+        first.join().expect("the first writer ends");
+
+        assert!(
+            seen.contains("counter = 1"),
+            "the second writer must read the first one's edit, got {seen:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path)
+                .expect("the config is still there")
+                .trim(),
+            "counter = 2"
+        );
     }
 
     /// The client the server would see after a write, read back through the

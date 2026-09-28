@@ -18,9 +18,10 @@
  * the app awaits before it mounts. A payload written by version 1 does carry its secrets, and
  * the same call moves them into the store rather than leaving them in a file nothing protects.
  */
-import { reactive, watch } from 'vue';
+import { computed, reactive, watch } from 'vue';
 import {
   clearCredentials,
+  credentialStoreStatus,
   deleteCredential,
   getCredential,
   putCredential,
@@ -395,9 +396,27 @@ export async function initConfigStore(): Promise<void> {
     // an invite.
     console.error('[config] failed to load credentials:', error);
   }
+
+  try {
+    credentialProtection.level = await credentialStoreStatus();
+  } catch (error) {
+    // Leaves it `null`, and the settings page says the level is unknown rather than claiming
+    // the keychain case it cannot confirm.
+    console.error('[config] failed to read the credential store status:', error);
+  }
 }
 
 const config = reactive<ProxyConfig>(loadConfig());
+
+/**
+ * Where the credential store's master key ended up: `"keychain"`, or `"file"` when no keychain
+ * would take it — a headless Linux session with no Secret Service, a keychain that refused the
+ * app. The credentials are encrypted either way, so this is information rather than a warning:
+ * what changes is who holds the key, and the user is the one who should know.
+ *
+ * `null` until startup has asked. Read once there, because it cannot change while the app runs.
+ */
+const credentialProtection = reactive<{ level: string | null }>({ level: null });
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -615,6 +634,7 @@ export function useConfigStore() {
 
   return {
     config,
+    credentialProtection: computed(() => credentialProtection.level),
     updateConfig,
     removeNode,
     updateNode,

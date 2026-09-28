@@ -263,7 +263,14 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
-    const TOKEN: &str = "a-token-the-service-and-the-ui-both-hold";
+    /// The token a test authenticates with, minted the way the real one is.
+    ///
+    /// A literal would do — nothing here depends on the value — but a constant
+    /// sitting in the key slot is exactly what CWE-798 is about, and all these
+    /// tests need is a secret both ends agree on.
+    fn fresh_token() -> String {
+        crate::service::ipc_token::generate_token().expect("the OS has randomness")
+    }
 
     /// Runs the handshake against a stand-in peer.
     ///
@@ -272,12 +279,18 @@ mod tests {
     async fn handshake_against(answer: Answer) -> Result<(), AppError> {
         let (client_end, server_end) = tokio::io::duplex(4096);
         let service_nonce = crate::service::ipc_token::random_nonce().expect("a nonce");
+        let token = fresh_token();
 
-        let peer = tokio::spawn(peer_side(server_end, service_nonce.clone(), answer));
+        let peer = tokio::spawn(peer_side(
+            server_end,
+            service_nonce.clone(),
+            token.clone(),
+            answer,
+        ));
 
         let (read_half, mut write_half) = tokio::io::split(client_end);
         let mut reader = BufReader::new(read_half);
-        let result = IpcClient::handshake(&mut reader, &mut write_half, TOKEN).await;
+        let result = IpcClient::handshake(&mut reader, &mut write_half, &token).await;
 
         peer.abort();
         result
@@ -293,7 +306,12 @@ mod tests {
     }
 
     /// The service's half: challenge, read the answer, reply.
-    async fn peer_side(server_end: DuplexStream, service_nonce: String, answer: Answer) {
+    async fn peer_side(
+        server_end: DuplexStream,
+        service_nonce: String,
+        token: String,
+        answer: Answer,
+    ) {
         let (read_half, mut write_half) = tokio::io::split(server_end);
         let mut reader = BufReader::new(read_half);
 
@@ -320,12 +338,10 @@ mod tests {
         };
 
         let mac = match answer {
-            Answer::Proof => proof_mac(TOKEN, &service_nonce, &caller_nonce),
-            Answer::Forged => proof_mac(
-                "a-token-the-peer-does-not-hold",
-                &service_nonce,
-                &caller_nonce,
-            ),
+            Answer::Proof => proof_mac(&token, &service_nonce, &caller_nonce),
+            // A squatter holds nothing, so what it sends is a proof under some
+            // other secret nobody published — one more token, not a literal.
+            Answer::Forged => proof_mac(&fresh_token(), &service_nonce, &caller_nonce),
         };
         write_line(&mut write_half, &IpcResponse::AuthOk { mac }).await;
     }
@@ -375,7 +391,7 @@ mod tests {
         let handshake = tokio::spawn(async move {
             let (read_half, mut write_half) = tokio::io::split(client_end);
             let mut reader = BufReader::new(read_half);
-            IpcClient::handshake(&mut reader, &mut write_half, TOKEN).await
+            IpcClient::handshake(&mut reader, &mut write_half, &fresh_token()).await
         });
 
         // Held open and silent: the connection is alive, nothing arrives on it.
@@ -393,9 +409,11 @@ mod tests {
     /// connection is not an answer on the next, so it cannot be replayed.
     #[test]
     fn an_answer_is_bound_to_the_challenge_it_was_made_for() {
+        let token = fresh_token();
+
         assert_ne!(
-            auth_mac(TOKEN, "one-challenge", "caller"),
-            auth_mac(TOKEN, "another", "caller")
+            auth_mac(&token, "one-challenge", "caller"),
+            auth_mac(&token, "another", "caller")
         );
     }
 }

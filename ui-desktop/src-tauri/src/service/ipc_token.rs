@@ -330,7 +330,10 @@ fn reject_world_readable(path: &Path) -> Result<(), AppError> {
 /// directory name and not for the one secret that decides who may drive an
 /// elevated service: a token an attacker can predict is a token they can
 /// present.
-fn generate_token() -> Result<String, AppError> {
+///
+/// Public so a test in another module can hold a secret of the same shape
+/// without writing a literal into a key slot.
+pub fn generate_token() -> Result<String, AppError> {
     random_hex(TOKEN_BYTES)
 }
 
@@ -492,14 +495,24 @@ fn permissions(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_mac, ensure_token_at, proof_mac, proof_matches, random_nonce, read_token_at,
-        service_token_paths, token_for_auth,
+        auth_mac, ensure_token_at, generate_token, proof_mac, proof_matches, random_nonce,
+        read_token_at, service_token_paths, token_for_auth,
     };
     #[cfg(windows)]
     use super::profile_roots_from;
     #[cfg(not(windows))]
     use super::{unix_home_roots, unix_service_token_paths_from};
     use std::path::PathBuf;
+
+    /// A token for a test to authenticate with, minted the way the real one is.
+    ///
+    /// A literal would do — these tests only compare MACs against each other, so
+    /// the value itself is irrelevant — but a constant sitting in the key slot is
+    /// exactly what CWE-798 is about, and it would be the one place in the tree
+    /// where the secret that decides who may drive the service is written down.
+    fn fresh_token() -> String {
+        generate_token().expect("the OS has randomness")
+    }
 
     /// Every test gets its own file, so none of them can see the others' state.
     fn scratch(name: &str) -> PathBuf {
@@ -560,9 +573,11 @@ mod tests {
     /// its own answer, and the service would be signing its own nonce.
     #[test]
     fn the_two_directions_of_the_handshake_differ() {
+        let token = fresh_token();
+
         assert_ne!(
-            auth_mac("token", "server", "caller"),
-            proof_mac("token", "server", "caller")
+            auth_mac(&token, "server", "caller"),
+            proof_mac(&token, "server", "caller")
         );
     }
 
@@ -570,17 +585,19 @@ mod tests {
     /// the same one, and it may have several on file.
     #[test]
     fn an_answer_is_found_under_the_token_that_produced_it() {
-        let tokens = vec!["first".to_string(), "second".to_string()];
+        let first = fresh_token();
+        let second = fresh_token();
+        let tokens = vec![first, second.clone()];
 
         assert_eq!(
             token_for_auth(
                 &tokens,
                 "server",
                 "caller",
-                &auth_mac("second", "server", "caller")
+                &auth_mac(&second, "server", "caller")
             )
             .as_deref(),
-            Some("second")
+            Some(second.as_str())
         );
     }
 
@@ -589,8 +606,10 @@ mod tests {
     /// on the next connection.
     #[test]
     fn an_answer_does_not_carry_to_another_challenge() {
-        let tokens = vec!["token".to_string()];
-        let answered = auth_mac("token", "server", "caller");
+        let token = fresh_token();
+        let other = fresh_token();
+        let tokens = vec![token.clone()];
+        let answered = auth_mac(&token, "server", "caller");
 
         assert!(token_for_auth(&tokens, "server", "caller", &answered).is_some());
         assert!(token_for_auth(&tokens, "server", "other-caller", &answered).is_none());
@@ -599,31 +618,34 @@ mod tests {
             &tokens,
             "server",
             "caller",
-            &auth_mac("other", "server", "caller")
+            &auth_mac(&other, "server", "caller")
         )
         .is_none());
     }
 
     #[test]
     fn the_service_proof_is_checked_against_the_same_nonces() {
+        let token = fresh_token();
+        let other = fresh_token();
+
         assert!(proof_matches(
-            "token",
+            &token,
             "server",
             "caller",
-            &proof_mac("token", "server", "caller")
+            &proof_mac(&token, "server", "caller")
         ));
         // Not under another token, and not the caller's answer handed back.
         assert!(!proof_matches(
-            "token",
+            &token,
             "server",
             "caller",
-            &proof_mac("other", "server", "caller")
+            &proof_mac(&other, "server", "caller")
         ));
         assert!(!proof_matches(
-            "token",
+            &token,
             "server",
             "caller",
-            &auth_mac("token", "server", "caller")
+            &auth_mac(&token, "server", "caller")
         ));
     }
 

@@ -119,6 +119,18 @@ android {
         }
     }
 
+    // The android.jar a host unit test runs against has method stubs that throw
+    // "not mocked" instead of doing anything. That makes any class unusable in a
+    // test the moment it logs while being constructed — `SecretStore` logs the
+    // one thing its tests exist to pin down — so the stubs return their default
+    // value instead. Nothing in these tests reads what the stubs return; they
+    // only have to not throw.
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
+
     // Everything lint reports today is recorded in lint-baseline.xml, which is
     // what lets CI gate on lint at all. `abortOnError` alone is not a gate: it
     // fails on errors and passes warnings, and most of what Android lint emits

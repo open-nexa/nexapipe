@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "tracing")]
@@ -87,6 +87,20 @@ const MAX_REQUEST_HEADER: usize = 64 * 1024;
 /// many it takes before it concludes the listener is not coming back.
 const ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(100);
 const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 10;
+
+/// How many connections are served at once.
+///
+/// Each one holds a [`STREAM_BUF_SIZE`] buffer (sometimes two), so this is what
+/// turns an unbounded number of connections into a bounded amount of memory.
+/// The same figure the server's `accept_bi` uses, which is not a coincidence:
+/// a caller is one connection either way.
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// One line per this many refused connections. A refusal is the caller's
+/// problem to retry, not a per-connection event worth a log line — and logging
+/// every one would let a caller that opens connections in a loop write to the
+/// log as fast as it can connect.
+const REJECTED_LOG_EVERY: usize = 100;
 const STREAM_OPERATION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Number of attempts for opening a fresh iroh bi-stream for a new request.
 /// If the pooled connection is stale (already closed by the peer), `open_bi` or
@@ -110,6 +124,12 @@ pub struct LocalProxy {
     /// "stopped" proxy would still be holding connections out of the pool, and
     /// a `close_all` could not return them.
     connections: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// How many of [`MAX_CONCURRENT_CONNECTIONS`] are still free.
+    ///
+    /// Held here rather than in the accept loop so both constructors get one;
+    /// the permits themselves move into the connection tasks, which is what
+    /// releases them.
+    permits: Arc<Semaphore>,
 }
 
 impl LocalProxy {
@@ -174,6 +194,7 @@ impl LocalProxy {
             stopped: Arc::new(AtomicBool::new(false)),
             stop_notify: Arc::new(Notify::new()),
             connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         }
     }
 
@@ -183,6 +204,12 @@ impl LocalProxy {
         let proxy_domains = self.proxy_domains.clone();
         let endpoint_group = self.endpoint_group.clone();
         let stop_notify = self.stop_notify.clone();
+        let permits = self.permits.clone();
+
+        // Refused connections are counted, but only reported every so often: a
+        // line each would let a caller that loops over connect() write to the
+        // log as fast as it can open sockets.
+        let mut rejected = 0usize;
 
         // Accept errors that are not fatal: a moment with no file descriptors
         // left, say. Counting them keeps the loop from spinning on a listener
@@ -218,6 +245,32 @@ impl LocalProxy {
             match accepted {
                 Ok((stream, addr)) => {
                     consecutive_accept_errors = 0;
+
+                    // Refused rather than queued. A caller made to wait would hold
+                    // its socket — and the 128 KiB buffer that comes with it — for
+                    // as long as the queue takes, which is the memory this cap
+                    // exists to bound in the first place.
+                    let permit = match permits.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            rejected = rejected.wrapping_add(1);
+                            if rejected % REJECTED_LOG_EVERY == 1 {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "Refusing a local proxy connection from {}: {} are already \
+                                     being served ({} refused so far)",
+                                    addr,
+                                    MAX_CONCURRENT_CONNECTIONS,
+                                    rejected
+                                );
+                            }
+                            // Dropped here, which closes it: no bytes read, no
+                            // buffer ever allocated for it.
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     #[cfg(feature = "tracing")]
                     tracing::debug!("New connection from: {}", addr);
 
@@ -225,6 +278,10 @@ impl LocalProxy {
                     let endpoint_group_clone = endpoint_group.clone();
 
                     let handle = tokio::spawn(async move {
+                        // Released when the task ends, however it ends: this is
+                        // what makes the permit a cap on live connections rather
+                        // than on connections ever accepted.
+                        let _permit = permit;
                         if let Err(e) = handle_local_connection(
                             stream,
                             proxy_domains_clone,
@@ -1440,6 +1497,81 @@ mod tests {
     fn spawn_run(proxy: &LocalProxy) -> JoinHandle<Result<(), ClientError>> {
         let proxy = proxy.clone();
         tokio::spawn(async move { proxy.run().await })
+    }
+
+    /// The cap is what turns memory into a bounded quantity: every connection
+    /// allocates a `STREAM_BUF_SIZE` buffer, so an accept loop that takes every
+    /// caller lets anything on the loopback interface spend this process's
+    /// memory one connection at a time.
+    ///
+    /// The refused socket is closed without a byte being read — it must not be
+    /// queued, because a queued caller holds the buffer while it waits.
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_refused() {
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let (proxy, addr) = listening_proxy().await;
+        let runner = spawn_run(&proxy);
+
+        // Hold the whole budget open. A connection that has sent nothing sits in
+        // the handler waiting for a request, which is the state being counted.
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_CONNECTIONS);
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.expect("the caller connects"));
+        }
+
+        // `track_connection` runs straight after each accept, so the number of
+        // tracked handles is the number being served. Waiting for it to reach the
+        // cap is what makes the next connection a refusal rather than a race.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proxy.connections.lock().unwrap().len() < MAX_CONCURRENT_CONNECTIONS {
+            assert!(
+                Instant::now() < deadline,
+                "the accept loop took only {} of {} connections",
+                proxy.connections.lock().unwrap().len(),
+                MAX_CONCURRENT_CONNECTIONS
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // One over the budget: closed immediately, with nothing read from it.
+        let mut extra = TcpStream::connect(addr).await.expect("the caller connects");
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut buf))
+            .await
+            .expect("a refusal closes the socket instead of leaving it open");
+        assert_eq!(
+            closed.expect("a refusal is a close, not an error"),
+            0,
+            "a connection beyond the cap must be closed, not queued"
+        );
+
+        // And the budget is released: once a caller hangs up, its slot comes back.
+        drop(held.pop());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut probe = TcpStream::connect(addr).await.expect("the caller connects");
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(200), probe.read(&mut buf)).await {
+                // A timeout means the connection was accepted and is waiting for
+                // a request: the slot came back.
+                Err(_) => break,
+                Ok(Ok(0)) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no slot was released after a connection ended"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Ok(n)) => panic!("nothing is ever sent to a fresh connection, got {n} bytes"),
+                Ok(Err(e)) => panic!("a fresh connection is not reset: {e}"),
+            }
+        }
+
+        proxy.stop();
+        runner.abort();
     }
 
     /// `stop()` has to reach a loop that is parked in `accept()`, not one that

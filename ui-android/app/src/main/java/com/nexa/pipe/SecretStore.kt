@@ -45,6 +45,38 @@ class SecretStore {
         const val MARKER = "v1:"
     }
 
+    /**
+     * What became of the last credential this class was asked to protect.
+     *
+     * The fallback to plaintext is deliberate — refusing to store would cut the
+     * user off from their own endpoint — but it was silent, which left a device
+     * with a broken keystore looking exactly like a working one. This is what
+     * lets the rest of the app say so out loud instead.
+     */
+    enum class Protection {
+        /** Stored as ciphertext under a keystore key. */
+        Sealed,
+
+        /** No key at all: the keystore could not be opened, or none was created. */
+        NoKeystore,
+
+        /** There is a key, but this value could not be sealed with it. */
+        SealFailed,
+    }
+
+    /**
+     * The outcome of the last [seal].
+     *
+     * Per instance rather than per value, because the question the UI asks is
+     * "is this device protecting credentials at all", and one value that failed
+     * is enough to answer it — the next [seal] overwrites this, so a transient
+     * failure is not reported forever.
+     */
+    @Volatile
+    private var lastProtection: Protection = Protection.Sealed
+
+    fun protection(): Protection = lastProtection
+
     private val keyStore: KeyStore? = try {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     } catch (e: Exception) {
@@ -74,7 +106,10 @@ class SecretStore {
      */
     fun seal(plain: String): String {
         if (plain.isEmpty()) return plain
-        val key = key() ?: return plain
+        val key = key() ?: run {
+            lastProtection = Protection.NoKeystore
+            return plain
+        }
         return try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             // No GCMParameterSpec here on purpose: the keystore generates the
@@ -84,15 +119,22 @@ class SecretStore {
             cipher.init(Cipher.ENCRYPT_MODE, key)
             val nonce = cipher.iv
             val body = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
+            // Recorded on the way out, so a device whose keystore came back is
+            // not reported as unprotected by one failure from last week.
+            lastProtection = Protection.Sealed
             MARKER + Base64.encodeToString(nonce + body, Base64.NO_WRAP)
         } catch (e: GeneralSecurityException) {
             Log.e(TAG, "Could not seal a credential, storing it in plaintext", e)
+            lastProtection = Protection.SealFailed
             plain
         } catch (e: ProviderException) {
+            // Keymaster unreachable: the key is gone, not merely unusable once.
             Log.e(TAG, "The keystore failed, storing a credential in plaintext", e)
+            lastProtection = Protection.NoKeystore
             plain
         } catch (e: IllegalStateException) {
             Log.e(TAG, "The keystore is not ready, storing a credential in plaintext", e)
+            lastProtection = Protection.NoKeystore
             plain
         }
     }

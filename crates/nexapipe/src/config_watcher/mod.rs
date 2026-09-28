@@ -390,6 +390,14 @@ pub type SharedConfigWatcher = Arc<ConfigWatcher>;
 /// the operator removed. Everything else in the file, comments included,
 /// survives byte for byte, exactly like [`ProxyConfig::write_client_secret`].
 pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
+    // The whole read-modify-write runs under the lock, not just the write: two
+    // counter writebacks that both read first would each build their document
+    // from the file as it was before the other one landed, and one set of
+    // counters would be lost.
+    crate::config::with_config_lock(path, || save_auth_state_unlocked(path, config))
+}
+
+fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
     let content =
         std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
     let mut doc: toml_edit::DocumentMut = content

@@ -167,6 +167,12 @@
     "nodeFallback": "节点 {index}"
   },
   "settings": {
+    "security": "安全",
+    "credentialProtection": "凭据保护",
+    "credentialProtectionHint": "加密凭据所用的密钥保存在何处",
+    "credentialProtectionKeychain": "已加密，密钥由系统钥匙串保管",
+    "credentialProtectionFile": "已加密，钥匙串不可用，密钥保存在私有文件中",
+    "credentialProtectionUnknown": "未知",
     "tun": "TUN 设置",
     "tunDeviceName": "TUN 网卡名称",
     "tunDeviceNameHint": "虚拟网卡名称（macOS 上由系统自动分配，该平台会忽略此值）",
