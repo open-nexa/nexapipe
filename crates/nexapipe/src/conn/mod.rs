@@ -227,7 +227,7 @@ pub async fn handle_bidi_stream(
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h));
+        .map(crate::routes::host_without_port);
 
     let path = request
         .uri()

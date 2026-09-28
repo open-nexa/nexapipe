@@ -54,7 +54,7 @@ pub async fn proxy_request(
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h))
+        .map(crate::routes::host_without_port)
         .ok_or_else(|| anyhow::anyhow!("Missing host header"))?;
 
     let path = req

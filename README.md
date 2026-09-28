@@ -271,6 +271,12 @@ load-balanced and health-checked like any other route. The old top-level
 at startup rather than silently ignored, so an existing config cannot quietly
 start answering 404 where it used to forward.
 
+A wildcard has to be `*` on its own or start with `*.`: the dot is what marks
+the label boundary, and without it `*.example.com` would also match
+`notexample.com` — a host that merely ends in the same letters and belongs to
+somebody else. A pattern like `*example.com` is refused at startup, in
+`host_pattern` and in a client's `allow_hosts` alike.
+
 ### `[server]` — direct ingress (off by default)
 
 | Key | Default | Notes |

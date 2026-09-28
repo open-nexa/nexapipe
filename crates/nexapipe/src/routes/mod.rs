@@ -17,19 +17,85 @@ use tokio::sync::RwLock;
 /// keeps working too.
 pub(crate) fn normalize_host(host: &str) -> String {
     let host = host.strip_suffix('.').unwrap_or(host);
+    // An IPv6 literal is bracketed in a `Host` header — that is how its port is
+    // told apart from the address — and may be written the same way in a
+    // config. The brackets are not part of the name, so both sides lose them
+    // here and a pattern spelled `[::1]` matches a request for `[::1]:8080`.
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     host.to_ascii_lowercase()
+}
+
+/// The host a `Host` header names, with the port taken off.
+///
+/// `split(':')` is wrong for IPv6 twice over: `[::1]:8080` yields `[`, and a
+/// bare `::1` yields the empty string. Either way the host matches no route
+/// and every request to it 404s. A bracketed literal keeps its brackets here;
+/// [`normalize_host`] drops them.
+pub(crate) fn host_without_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        match host.find(']') {
+            // Up to and including the closing bracket: a port can only follow
+            // it, and the colons inside belong to the address.
+            Some(end) => &host[..=end],
+            // A bracket that is never closed is not a port separator, so
+            // nothing is taken off.
+            None => host,
+        }
+    } else {
+        host.split(':').next().unwrap_or(host)
+    }
 }
 
 /// Whether a (already folded) host matches a (already folded) pattern.
 ///
 /// The one host-matching rule, shared by route patterns and
 /// [`ClientAcl`] allowlists so the two can never drift apart: an exact
-/// name, or a `*.suffix` wildcard.
+/// name, a `*.suffix` wildcard, or the bare `*` catch-all.
+///
+/// The dot is load-bearing. Without it a wildcard is a bare `ends_with`, so
+/// `*.example.com` would also match `notexample.com` — a host that merely
+/// ends in the same letters, belonging to somebody else entirely.
 pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        host.ends_with(suffix)
-    } else {
-        pattern == host
+    match pattern.strip_prefix('*') {
+        None => pattern == host,
+        // `*` on its own is the catch-all: how "send everything here" is
+        // spelled now that there is no default backend.
+        Some("") => true,
+        // A `*` followed by anything but a dot matches nothing. Those are
+        // refused when the config is loaded, so reaching here means the
+        // pattern came from somewhere that skipped the check — and the one
+        // thing it must not do is quietly match more than it says.
+        Some(rest) => rest
+            .strip_prefix('.')
+            .and_then(|suffix| host.strip_suffix(suffix))
+            // The label boundary: the apex itself is not under the wildcard,
+            // which is what DNS means by `*.example.com`.
+            .is_some_and(|prefix| prefix.ends_with('.')),
+    }
+}
+
+/// Why `pattern` cannot be matched with, or `None` when it can.
+///
+/// Checked when a config is loaded rather than left to the matcher, because the
+/// failure mode of a loose wildcard is silent: `allow_hosts = ["*iakl.top"]`
+/// looks like it names one domain and in fact authorizes every host ending in
+/// those letters, `eviliakl.top` included. Refusing to start is the only
+/// answer an operator can see.
+pub(crate) fn host_pattern_error(pattern: &str) -> Option<String> {
+    if pattern.is_empty() {
+        return Some("is empty; name the host, or use \"*\" for every host".to_string());
+    }
+
+    // Not a wildcard at all, so there is nothing a `*` could get wrong.
+    let rest = pattern.strip_prefix('*')?;
+    match rest.strip_prefix('.') {
+        None if rest.is_empty() => None,
+        Some(suffix) if !suffix.is_empty() => None,
+        _ => Some(format!(
+            "\"{pattern}\" has to be \"*\" or start with \"*.\": the dot is what marks the \
+             label boundary, and without it the pattern also matches any host that merely \
+             ends in the same letters"
+        )),
     }
 }
 
@@ -1175,6 +1241,79 @@ mod tests {
         assert_eq!(
             route.pool_key().await,
             same_host_other_path.pool_key().await
+        );
+    }
+
+    /// The dot is what makes a wildcard a wildcard over *labels*. Without it
+    /// the match is a bare `ends_with`, and a host that merely ends in the same
+    /// letters — belonging to somebody else — is in.
+    #[test]
+    fn a_wildcard_stops_at_the_label_boundary() {
+        assert!(host_matches("*.example.com", "api.example.com"));
+        assert!(host_matches("*.example.com", "a.b.example.com"));
+
+        assert!(
+            !host_matches("*.example.com", "notexample.com"),
+            "a host that merely ends in the same letters is not under the wildcard"
+        );
+        assert!(
+            !host_matches("*.example.com", "example.com"),
+            "the apex is not under its own wildcard, the way DNS reads it"
+        );
+        assert!(host_matches("*", "anything.at.all"), "`*` is the catch-all");
+    }
+
+    /// A `*` with anything but a dot after it matches nothing: it is refused
+    /// when the config loads, and whatever slipped past the check must not
+    /// quietly match more than it says.
+    #[test]
+    fn a_wildcard_without_its_dot_matches_nothing() {
+        assert!(!host_matches("*iakl.top", "eviliakl.top"));
+        assert!(!host_matches("*iakl.top", "iakl.top"));
+    }
+
+    #[test]
+    fn a_loose_wildcard_is_refused_when_the_config_loads() {
+        assert!(host_pattern_error("*").is_none());
+        assert!(host_pattern_error("*.example.com").is_none());
+        assert!(host_pattern_error("example.com").is_none());
+
+        let why = host_pattern_error("*iakl.top").expect("*iakl.top must be refused");
+        assert!(why.contains("label boundary"), "{why}");
+        assert!(
+            host_pattern_error("").is_some(),
+            "an empty pattern names nothing"
+        );
+    }
+
+    /// An IPv6 literal carries colons of its own, so splitting on the first one
+    /// does not leave a host behind — it leaves `[`, and every request to that
+    /// host 404s.
+    #[test]
+    fn a_host_header_keeps_an_ipv6_literal_whole() {
+        assert_eq!(host_without_port("[::1]:8080"), "[::1]");
+        assert_eq!(host_without_port("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(host_without_port("api.example.com:8080"), "api.example.com");
+        assert_eq!(host_without_port("api.example.com"), "api.example.com");
+
+        // What the routing table is asked about, brackets dropped.
+        assert_eq!(normalize_host(host_without_port("[::1]:8080")), "::1");
+        assert_eq!(normalize_host("[::1]"), "::1");
+    }
+
+    /// The end-to-end shape of the same thing: a request for an IPv6 literal
+    /// reaches the route written for that address.
+    #[tokio::test]
+    async fn a_request_for_an_ipv6_literal_reaches_its_route() {
+        let config = RouteConfig::new(vec![http_route("::1", &["http://10.0.0.5:8080"])]);
+
+        assert_eq!(
+            config
+                .get_backend(host_without_port("[::1]:8080"), "/")
+                .await
+                .expect("the literal host reaches the route")
+                .url,
+            "http://10.0.0.5:8080"
         );
     }
 }

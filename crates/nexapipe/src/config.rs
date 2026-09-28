@@ -444,6 +444,13 @@ impl ProxyConfig {
             let path_pattern = route_config.path_pattern.clone();
             let label = format!("route {host_pattern}");
 
+            // Refused rather than matched loosely: a wildcard without its dot
+            // silently covers hosts that merely end in the same letters, so a
+            // config using one is a config that routes more than it says.
+            if let Some(why) = crate::routes::host_pattern_error(&host_pattern) {
+                anyhow::bail!("{label}: host_pattern {why}");
+            }
+
             // Every declared mode has to be able to dial these backends, so each
             // one is checked: the `http` rules and the L4 rules disagree (a URL
             // to fetch versus an address to dial, and only the L4 one insists on
@@ -840,6 +847,16 @@ impl ProxyConfig {
                                     "[auth.clients.{id}]: pending_enrollment is empty; delete the \
                                      key instead of setting it to \"\""
                                 );
+                            }
+                            // An allow-hosts entry is a host pattern, and a
+                            // loose one authorizes more than it names: the same
+                            // refusal a route's `host_pattern` gets.
+                            for host in client_toml.allow_hosts.iter().flatten() {
+                                if let Some(why) = crate::routes::host_pattern_error(host) {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"
+                                    );
+                                }
                             }
                             clients.insert(
                                 id,
@@ -1753,5 +1770,50 @@ domains = ["fn.iroh.iakl.top"]
             .expect_err("an empty list must not be read as either case");
 
         assert!(err.to_string().contains("[peers] allow = []"), "{err}");
+    }
+
+    /// A wildcard with no dot after it is a bare `ends_with`, so it covers any
+    /// host ending in the same letters — `eviliakl.top` for `*iakl.top`. The
+    /// only useful thing to do with one is refuse to start.
+    #[test]
+    fn a_route_wildcard_without_a_label_boundary_is_refused() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "*iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        let err = config
+            .build_routes()
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("label boundary"), "{err}");
+    }
+
+    /// The same rule for an `allow_hosts` entry, which is a host pattern and
+    /// would otherwise authorize more hosts than it names.
+    #[test]
+    fn an_allow_hosts_wildcard_without_a_label_boundary_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        // No `enabled = true`: with 2FA on, a 0644 file is refused for its
+        // permissions before the pattern is ever looked at, and the file mode
+        // is not something this test should depend on.
+        std::fs::write(
+            &path,
+            r#"
+[auth]
+
+[auth.clients.device]
+secret = "JBSWY3DPEHPK3PXP"
+allow_hosts = ["*iakl.top"]
+"#,
+        )
+        .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("label boundary"), "{err}");
     }
 }
