@@ -342,20 +342,30 @@ pub fn extract_sni(data: &[u8]) -> Option<String> {
         let ext_data = extensions.take(ext_len)?;
 
         if ext_type == EXT_SERVER_NAME {
-            let mut sni = Cursor::new(ext_data);
-            sni.skip(2)?; // server_name_list length
-            let name_type = sni.u8()?;
-            let name_len = sni.u16()? as usize;
-            let name = sni.take(name_len)?;
+            let mut list = Cursor::new(ext_data);
+            list.skip(2)?; // server_name_list length
 
-            if name_type == NAME_TYPE_HOST {
+            // Every entry, not the first one: RFC 6066 allows a list, and a
+            // client that puts an entry of another type first still has its
+            // host name behind it. Stopping at a type this proxy does not
+            // read turned such a hello into "no SNI".
+            while list.remaining() >= 3 {
+                let name_type = list.u8()?;
+                let name_len = list.u16()? as usize;
+                let name = list.take(name_len)?;
+
+                if name_type != NAME_TYPE_HOST {
+                    continue;
+                }
+
                 let name = String::from_utf8(name.to_vec()).ok()?;
                 // Nothing downstream — the allow list, the route match, the
                 // log lines — can say anything useful about a name that is not
                 // a name, and a log line is the one place it could do real
                 // damage: a `\r\n` in here appends whatever the client likes
                 // to the server's log. Refusing is what "no SNI" already
-                // means, so it costs a client nothing but a hang-up.
+                // means, so it costs a client nothing but a hang-up — and no
+                // later entry is taken as a second guess.
                 return is_presentable_host_name(&name).then_some(name);
             }
         }
@@ -423,6 +433,13 @@ mod tests {
             ext_body.extend_from_slice(sni_bytes);
         }
 
+        client_hello_with_extension_body(&ext_body)
+    }
+
+    /// Wraps a ready-made extensions block into a full `ClientHello`, for the
+    /// cases the single-SNI helper cannot spell (several entries, another
+    /// entry type).
+    fn client_hello_with_extension_body(ext_body: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // client_version
         body.extend_from_slice(&[0u8; 32]); // random
@@ -432,7 +449,7 @@ mod tests {
         body.push(1); // compression_methods length
         body.push(0); // null compression
         body.extend_from_slice(&(ext_body.len() as u16).to_be_bytes());
-        body.extend_from_slice(&ext_body);
+        body.extend_from_slice(ext_body);
 
         let mut handshake = vec![HANDSHAKE_CLIENT_HELLO];
         handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 3-byte length
@@ -447,6 +464,29 @@ mod tests {
     #[test]
     fn extracts_sni_from_client_hello() {
         let hello = client_hello_with_sni("fn.iroh.iakl.top", true);
+        assert_eq!(extract_sni(&hello).as_deref(), Some("fn.iroh.iakl.top"));
+    }
+
+    /// The list RFC 6066 allows: an entry of a type this proxy does not read
+    /// comes first, and the host name behind it used to be invisible.
+    #[test]
+    fn reads_the_host_name_behind_another_kind_of_entry() {
+        let mut entry = Vec::new();
+        // Type 1 is not host_name; the bytes are opaque here.
+        entry.push(1);
+        entry.extend_from_slice(&3u16.to_be_bytes());
+        entry.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        entry.push(NAME_TYPE_HOST);
+        entry.extend_from_slice(&("fn.iroh.iakl.top".len() as u16).to_be_bytes());
+        entry.extend_from_slice(b"fn.iroh.iakl.top");
+
+        let mut ext_body = Vec::new();
+        ext_body.extend_from_slice(&0u16.to_be_bytes()); // ext type: server_name
+        ext_body.extend_from_slice(&((2 + entry.len()) as u16).to_be_bytes());
+        ext_body.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+        ext_body.extend_from_slice(&entry);
+
+        let hello = client_hello_with_extension_body(&ext_body);
         assert_eq!(extract_sni(&hello).as_deref(), Some("fn.iroh.iakl.top"));
     }
 
