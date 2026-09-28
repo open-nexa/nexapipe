@@ -66,7 +66,7 @@ const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 /// every byte, so a peer that sends just often enough to stay busy defeats it,
 /// which is exactly the shape of a slow read. A real client sends its head in
 /// the first read or two.
-const HEAD_READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+pub(crate) const HEAD_READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Streams one connection may have in flight at once.
 ///

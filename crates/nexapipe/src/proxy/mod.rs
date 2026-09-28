@@ -14,7 +14,7 @@ use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
 use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
@@ -471,10 +471,34 @@ async fn start_http_server(
     shutdown_signal: Arc<ShutdownSignal>,
     in_flight: Arc<InFlight>,
 ) -> anyhow::Result<()> {
+    // Refusals since the last accepted connection. A listener that has run out
+    // of file descriptors fails again the moment it is asked, so without a
+    // pause this loop would spend the rest of the process writing log lines.
+    let mut refused_in_a_row = 0u32;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, addr) = result?;
+                let (stream, addr) = match result {
+                    Ok(accepted) => {
+                        refused_in_a_row = 0;
+                        accepted
+                    }
+                    Err(e) => {
+                        // One accept failure used to propagate and take the
+                        // listener down for good, while the iroh side carried
+                        // on serving: the port went quiet with nothing in the
+                        // log to say it had. A refusal is one connection, not
+                        // a verdict on the listener.
+                        refused_in_a_row += 1;
+                        tracing::error!("Plaintext listener failed to accept a connection: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            (refused_in_a_row.min(20) as u64) * 50,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
                 tracing::debug!("New connection on the plaintext listener from: {}", addr);
 
                 let config_clone = config.clone();
@@ -499,7 +523,16 @@ async fn start_http_server(
                         return;
                     }
 
-                    let http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
+                    // The timer is not on by default, and without it hyper has no
+                    // header read timeout: a client that opens a socket and
+                    // sends nothing holds the connection open for as long as it
+                    // likes. This is the listener an operator may expose.
+                    let mut http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
+                    http_builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Some(crate::conn::HEAD_READ_TIMEOUT));
+
                     let service = service_fn(move |req: hyper::Request<Incoming>| {
                         proxy_handler(req, config_clone.clone(), client_clone.clone(), remote_addr_str.clone())
                     });
