@@ -321,6 +321,23 @@ impl Tunnel {
         }
     }
 
+    /// Sends `parts` on one stream with a pause between them.
+    ///
+    /// One `write_all` can arrive in a single read, which is the easy case for
+    /// anything that reads a body. A pause forces the reader to hold on to
+    /// bytes it cannot use yet and pick them up on the next read, which is
+    /// where chunk framing is easy to get wrong.
+    async fn exchange_split(&self, parts: &[&[u8]]) -> Vec<u8> {
+        let (mut send, mut recv) = self.conn.open_bi().await.expect("open_bi");
+        for part in parts {
+            send.write_all(part).await.expect("write request");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        send.finish().expect("finish request");
+
+        recv.read_to_end(REPLY_LIMIT).await.unwrap_or_default()
+    }
+
     /// Sends `payload` on a fresh stream and reads the reply until the peer
     /// finishes it.
     async fn exchange(&self, payload: &[u8]) -> Vec<u8> {
@@ -441,6 +458,35 @@ async fn a_request_body_is_forwarded_with_the_request() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].request_line, "POST /upload HTTP/1.1");
     assert_eq!(seen[0].body, b"world");
+}
+
+#[tokio::test]
+async fn a_chunked_request_body_is_forwarded_whole() {
+    let backend = spawn_backend("done").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // No `content-length` anywhere: the body is framed, so a proxy that only
+    // ever reads a declared length would forward the head and drop the rest.
+    let reply = tunnel
+        .exchange_split(&[
+            b"POST /upload HTTP/1.1\r\nHost: app.test\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"5\r\nhello\r\n",
+            b"6\r\n world\r\n0\r\n\r\n",
+        ])
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "expected a 200, got {:?}",
+        status_of(&reply)
+    );
+
+    let seen = backend.seen();
+    assert_eq!(seen.len(), 1);
+    // De-chunked and given a length of its own: a backend that only knows
+    // `content-length` sees all of it.
+    assert_eq!(seen[0].body, b"hello world");
 }
 
 #[tokio::test]

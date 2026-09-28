@@ -425,6 +425,14 @@ pub async fn proxy_to_backend_streaming(
             ));
         }
         read_remaining_request_body(recv, &mut full_body, content_length).await?;
+    } else if request_is_chunked(req) {
+        // A chunked body declares no length, so without this branch the request
+        // went out carrying only the bytes that happened to arrive with the
+        // head — and `transfer-encoding` is not forwarded, so the backend was
+        // handed a body with no framing at all and no way to know it was
+        // truncated. Decode the chunks and send one buffer with a length.
+        read_chunked_request_body(recv, &mut full_body).await?;
+        builder = builder.header("content-length", full_body.len());
     }
 
     let proxied_req = builder.body(Full::new(full_body.into()))?;
@@ -531,6 +539,124 @@ pub async fn proxy_to_backend_streaming(
         status: status.as_u16(),
         bytes_sent,
     })
+}
+
+/// The longest line a chunk header may be.
+///
+/// A chunk size is a hex number with optional extensions, so anything past a
+/// few dozen bytes is malformed; the cap keeps a stream that never sends a
+/// CRLF from growing this buffer without bound.
+const MAX_CHUNK_HEADER: usize = 1024;
+
+/// How many bytes of a chunked body `input` decodes on its own.
+///
+/// Returns the decoded bytes, how much of `input` was used up, and whether the
+/// terminating zero chunk was seen. Bytes belonging to an incomplete chunk are
+/// *not* reported as used: the caller keeps them and hands them back with
+/// whatever it reads next. `limit` is how much body is still allowed.
+fn decode_chunks(input: &[u8], limit: usize) -> Result<(Vec<u8>, usize, bool), anyhow::Error> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut used = 0usize;
+
+    loop {
+        let Some(rel) = input[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Ok((out, used, false));
+        };
+        if rel > MAX_CHUNK_HEADER {
+            return Err(anyhow::anyhow!(
+                "chunk header longer than {MAX_CHUNK_HEADER} bytes"
+            ));
+        }
+
+        let size = parse_chunk_size(&input[pos..pos + rel])?;
+        let after_header = pos + rel + 2;
+
+        // The zero chunk ends the body. What follows is the trailer section,
+        // which is not forwarded: an empty one (the usual case) is consumed so
+        // the stream is left clean, and a real one is left untouched — this
+        // request owns the stream, so there is nothing after it to keep in
+        // step with.
+        if size == 0 {
+            let done = input.len() >= after_header + 2
+                && &input[after_header..after_header + 2] == b"\r\n";
+            return Ok((
+                out,
+                if done { after_header + 2 } else { after_header },
+                true,
+            ));
+        }
+
+        if out.len() + size > limit {
+            return Err(anyhow::anyhow!(
+                "chunked request body is over the {limit} byte limit"
+            ));
+        }
+        if input.len() - after_header < size + 2 {
+            return Ok((out, used, false));
+        }
+
+        out.extend_from_slice(&input[after_header..after_header + size]);
+        if &input[after_header + size..after_header + size + 2] != b"\r\n" {
+            return Err(anyhow::anyhow!("chunk data is not followed by CRLF"));
+        }
+
+        pos = after_header + size + 2;
+        used = pos;
+    }
+}
+
+/// The size a chunk header declares, in bytes.
+fn parse_chunk_size(header: &[u8]) -> Result<usize, anyhow::Error> {
+    let text = std::str::from_utf8(header)
+        .map_err(|_| anyhow::anyhow!("chunk header is not valid UTF-8"))?;
+    let digits = text.split(';').next().unwrap_or("").trim();
+    if digits.is_empty() {
+        return Err(anyhow::anyhow!("chunk header declares no size"));
+    }
+    usize::from_str_radix(digits, 16)
+        .map_err(|_| anyhow::anyhow!("{digits:?} is not a hexadecimal chunk size"))
+}
+
+/// Reads a chunked request body off an iroh stream, leaving the de-chunked
+/// bytes in `body`.
+///
+/// Whatever arrived with the head is already the start of the chunk stream, so
+/// it is handed to the decoder first and only then is more read.
+async fn read_chunked_request_body(
+    recv: &mut iroh::endpoint::RecvStream,
+    body: &mut Vec<u8>,
+) -> Result<(), anyhow::Error> {
+    let mut pending = std::mem::take(body);
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let (decoded, used, complete) =
+            decode_chunks(&pending, MAX_REQUEST_BODY.saturating_sub(body.len()))?;
+        body.extend_from_slice(&decoded);
+        pending.drain(..used);
+        if complete {
+            return Ok(());
+        }
+
+        let n = recv
+            .read(&mut buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("chunked request body ended before its terminating chunk")
+            })?;
+        pending.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// Whether the request body is framed as chunks.
+fn request_is_chunked(req: &Request<()>) -> bool {
+    req.headers()
+        .get("transfer-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_lowercase().contains("chunked"))
 }
 
 async fn read_remaining_request_body(
@@ -668,6 +794,101 @@ mod tests {
     async fn an_empty_body_is_within_any_limit() {
         let read = read_body_limited(body_of(0), 0).await.unwrap();
         assert!(read.is_empty());
+    }
+
+    /// A chunked body of one or more `chunks`, terminated the usual way.
+    fn chunked(chunks: &[&str]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for chunk in chunks {
+            raw.extend_from_slice(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes());
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        raw
+    }
+
+    #[test]
+    fn a_chunked_body_is_decoded_whole() {
+        let raw = chunked(&["hello", " world"]);
+        let (body, used, complete) = decode_chunks(&raw, 1024).unwrap();
+        assert_eq!(body, b"hello world");
+        assert!(complete);
+        assert_eq!(used, raw.len());
+    }
+
+    #[test]
+    fn a_chunk_header_may_carry_extensions() {
+        let raw = b"5;name=value\r\nhello\r\n0\r\n\r\n";
+        let (body, _, complete) = decode_chunks(raw, 1024).unwrap();
+        assert_eq!(body, b"hello");
+        assert!(complete);
+    }
+
+    #[test]
+    fn an_incomplete_chunk_is_left_for_the_next_read() {
+        // What a stream split mid-chunk looks like: the reader must keep the
+        // bytes it could not decode and hand them back with the next read.
+        let raw = chunked(&["hello", " world"]);
+        // Three bytes into the second chunk's data: its header arrived, the
+        // payload did not.
+        let split = 16;
+
+        let (first, used, complete) = decode_chunks(&raw[..split], 1024).unwrap();
+        assert_eq!(first, b"hello");
+        assert!(!complete);
+        assert!(used < split);
+
+        let mut pending = raw[used..split].to_vec();
+        pending.extend_from_slice(&raw[split..]);
+        let (body, _, complete) = decode_chunks(&pending, 1024).unwrap();
+        assert_eq!(body, b" world");
+        assert!(complete);
+    }
+
+    #[test]
+    fn the_body_ends_at_the_zero_chunk() {
+        // Trailers are not forwarded, so they must not be swallowed either:
+        // anything after the zero chunk is not part of what was decoded.
+        let mut raw = chunked(&["hello"]);
+        raw.extend_from_slice(b"X-Trailer: done\r\n\r\n");
+        let (body, used, complete) = decode_chunks(&raw, 1024).unwrap();
+        assert_eq!(body, b"hello");
+        assert!(complete);
+        assert_eq!(&raw[used..], b"X-Trailer: done\r\n\r\n");
+    }
+
+    #[test]
+    fn a_chunked_body_over_the_limit_is_refused() {
+        let raw = chunked(&["hello"]);
+        let err = decode_chunks(&raw, 4).unwrap_err();
+        assert!(err.to_string().contains("over the 4 byte limit"));
+    }
+
+    #[test]
+    fn a_chunk_header_that_is_not_hexadecimal_is_refused() {
+        let err = decode_chunks(b"zz\r\nhello\r\n0\r\n\r\n", 1024).unwrap_err();
+        assert!(err.to_string().contains("not a hexadecimal chunk size"));
+    }
+
+    #[test]
+    fn chunk_data_without_its_crlf_is_refused() {
+        let err = decode_chunks(b"5\r\nhelloXX\r\n0\r\n\r\n", 1024).unwrap_err();
+        assert!(err.to_string().contains("not followed by CRLF"));
+    }
+
+    #[test]
+    fn a_chunked_request_is_recognised_by_its_encoding() {
+        let chunked_req = Request::builder()
+            .header("transfer-encoding", "Chunked")
+            .body(())
+            .unwrap();
+        assert!(request_is_chunked(&chunked_req));
+
+        let plain = Request::builder()
+            .header("transfer-encoding", "gzip")
+            .body(())
+            .unwrap();
+        assert!(!request_is_chunked(&plain));
+        assert!(!request_is_chunked(&Request::builder().body(()).unwrap()));
     }
 
     #[test]
