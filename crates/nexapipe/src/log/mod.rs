@@ -554,6 +554,9 @@ const ACCESS_LOG_QUEUE: usize = 4096;
 /// Lines dropped because the queue was full, and a warning every so often so
 /// the gap is visible instead of being something someone notices in the file.
 static DROPPED_ACCESS_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// How many dropped lines the writer thread lets pass before it warns. The
+/// count is raised on the request path; the warning never is.
 const DROPPED_LINES_PER_WARNING: u64 = 100;
 
 /// `None` when the writer thread could not be started, which the caller treats
@@ -568,8 +571,22 @@ fn access_writer() -> Option<&'static SyncSender<(FileSink, String)>> {
                 // Ends when the last sender is dropped, which for the one
                 // stored in the `OnceLock` is never: this thread runs for the
                 // life of the process.
+                let mut warned_at = 0u64;
                 while let Ok((sink, line)) = receiver.recv() {
                     sink.write_line(&line);
+
+                    // Reported here rather than where the line is dropped: the
+                    // file layer writes and flushes synchronously, so warning
+                    // from a request handler would put the disk this thread
+                    // exists to hide back in front of the request that happened
+                    // to be logging.
+                    let dropped = DROPPED_ACCESS_LINES.load(Ordering::Relaxed);
+                    if dropped >= warned_at + DROPPED_LINES_PER_WARNING {
+                        warned_at = dropped;
+                        tracing::warn!(
+                            "Access log: {dropped} lines dropped, the writer cannot keep up"
+                        );
+                    }
                 }
             }) {
             Ok(_) => {
@@ -711,13 +728,11 @@ pub fn log_access(
                     // is the thing the writer thread exists to prevent, so the
                     // line goes and the count stands in for it.
                     Err(TrySendError::Full(_)) => {
-                        let dropped = DROPPED_ACCESS_LINES.fetch_add(1, Ordering::Relaxed) + 1;
-                        if dropped.is_multiple_of(DROPPED_LINES_PER_WARNING) {
-                            tracing::warn!(
-                                "Access log: {} lines dropped, the writer cannot keep up",
-                                dropped
-                            );
-                        }
+                        // Counted and nothing more. The writer thread raises
+                        // the warning when it next sees the count, so a slow
+                        // disk cannot reach back into the request that happened
+                        // to be the one logging.
+                        DROPPED_ACCESS_LINES.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         eprintln!("nexapipe: access log writer is gone");
