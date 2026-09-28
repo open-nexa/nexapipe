@@ -84,7 +84,7 @@ impl<'a> TotpValidator<'a> {
             return Err(AuthError::StaleTimestamp);
         }
 
-        let expected = hmac_signature(&secret, nonce, timestamp);
+        let expected = hmac_signature(&secret, nonce, timestamp)?;
         if !constant_time_eq(signature, &expected) {
             return Err(AuthError::ChallengeMismatch);
         }
@@ -112,11 +112,19 @@ impl<'a> TotpValidator<'a> {
 ///
 /// Keep in sync with `TwoFactorAuth::sign_challenge` in
 /// `crates/nexapipe-client/src/auth.rs`.
-pub(crate) fn hmac_signature(secret: &[u8], nonce: &[u8], timestamp: i64) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+pub(crate) fn hmac_signature(
+    secret: &[u8],
+    nonce: &[u8],
+    timestamp: i64,
+) -> Result<Vec<u8>, AuthError> {
+    // Fallible in the type only: HMAC takes a key of any length — a long one is
+    // hashed, a short one is zero-padded — so this has never failed. It is
+    // returned rather than `expect`ed because it runs inside a handshake, where
+    // a panic would drop the connection with nothing to report.
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::InvalidSecret)?;
     mac.update(nonce);
     mac.update(&timestamp.to_le_bytes());
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Length-safe constant-time comparison: an HMAC-SHA256 tag is never secret

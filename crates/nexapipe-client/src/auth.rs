@@ -158,12 +158,17 @@ impl TwoFactorAuth {
     /// Sign a server challenge: HMAC-SHA256(secret, nonce || timestamp_le).
     ///
     /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`.
-    pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Vec<u8> {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+    ///
+    /// Fallible in the type only: HMAC takes a key of any length — a long one is
+    /// hashed, a short one is zero-padded — so this has never failed. It is
+    /// returned rather than `expect`ed because it runs inside a handshake, where
+    /// a panic would kill the connection with nothing to report.
+    pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Result<Vec<u8>, ClientError> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
         mac.update(nonce);
         mac.update(&timestamp.to_le_bytes());
-        mac.finalize().into_bytes().to_vec()
+        Ok(mac.finalize().into_bytes().to_vec())
     }
 
     /// Turn a failed handshake read into an error that says what happened.
@@ -305,7 +310,7 @@ impl TwoFactorAuth {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let signature = self.sign_challenge(&nonce, response_timestamp);
+        let signature = self.sign_challenge(&nonce, response_timestamp)?;
 
         let response_msg = AuthMessage::Response {
             client_id: self.client_id.clone(),
