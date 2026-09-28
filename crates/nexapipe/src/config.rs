@@ -413,6 +413,18 @@ impl ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Whether this config puts a credential in the file it was read from.
+    ///
+    /// The 2FA seeds are the obvious one and live in `[auth]`, but this file also
+    /// carries `[iroh] secret_key` — the endpoint's private key, which is what
+    /// makes a Node ID yours — and `relay_auth_token`, a bearer token. Either one
+    /// is worth refusing a permissive mode over, on a server with `[auth]` off.
+    pub fn holds_credentials(&self) -> bool {
+        self.iroh
+            .as_ref()
+            .is_some_and(|iroh| iroh.secret_key.is_some() || iroh.relay_auth_token.is_some())
+    }
+
     /// Turns the `[[routes]]` table into the objects the proxy actually routes
     /// with, rejecting anything that cannot work.
     ///
@@ -829,43 +841,50 @@ pub fn warn_world_readable_config(_path: &str) {}
 /// refuses for the same reason, and a warning that only turns up in a rotated
 /// log is how a permissive mode survives for years.
 ///
-/// With `[auth]` disabled none of it authenticates anybody, and a 0644 config is
-/// a fixture of Docker deployments: those keep the warning.
+/// The same file also carries `[iroh] secret_key` and `relay_auth_token`, which
+/// are credentials whether or not `[auth]` is on, so a config holding any of the
+/// three is refused. One holding none — no 2FA, no key, no token — keeps only
+/// the warning, because a 0644 config is a fixture of Docker bind mounts.
 ///
 /// `mode` is passed in rather than read from the file so the rule can be tested
 /// everywhere, including on the platforms with no file modes to inspect.
-pub(crate) fn world_readable_refusal(path: &str, mode: u32, auth_enabled: bool) -> Option<String> {
-    (mode & 0o077 != 0 && auth_enabled).then(|| {
+pub(crate) fn world_readable_refusal(
+    path: &str,
+    mode: u32,
+    holds_credentials: bool,
+) -> Option<String> {
+    (mode & 0o077 != 0 && holds_credentials).then(|| {
         format!(
-            "{path} is readable or writable by other accounts (mode {mode:o}) and holds the 2FA \
-             secrets: with [auth] enabled those secrets are the only credential gating the iroh \
-             listener, so every account on this host can authenticate as every client. Run \
-             `chmod 600 {path}`, or disable [auth]"
+            "{path} is readable or writable by other accounts (mode {mode:o}) and holds \
+             credentials: every account on this host can read them, and the 2FA secrets are the \
+             only credential gating the iroh listener, so any of them can authenticate as every \
+             client. Run `chmod 600 {path}`, or move the credentials out of this file"
         )
     })
 }
 
 /// Checks the config file's permissions before its secrets become live.
 ///
-/// Refuses when `[auth]` is enabled and the file is not private, warns
-/// otherwise. A file that cannot be stat'ed is not this function's problem: the
-/// caller has already read it to get here.
+/// Refuses when the file is not private and holds a credential — a TOTP seed,
+/// the endpoint's secret key or a relay token — and warns otherwise. A file that
+/// cannot be stat'ed is not this function's problem: the caller has already read
+/// it to get here.
 #[cfg(unix)]
-pub fn check_config_permissions(path: &str, auth_enabled: bool) -> anyhow::Result<()> {
+pub fn check_config_permissions(path: &str, holds_credentials: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let Ok(metadata) = std::fs::metadata(path) else {
         return Ok(());
     };
     let mode = metadata.permissions().mode();
-    if let Some(refusal) = world_readable_refusal(path, mode, auth_enabled) {
+    if let Some(refusal) = world_readable_refusal(path, mode, holds_credentials) {
         anyhow::bail!(refusal);
     }
     if mode & 0o077 != 0 {
         tracing::error!(
-            "{path} is readable or writable by other accounts (mode {mode:o}); [auth] is not \
-             enabled, so nothing in it authenticates anybody yet — run `chmod 600 {path}` before \
-             enabling it"
+            "{path} is readable or writable by other accounts (mode {mode:o}); nothing in it \
+             authenticates anybody yet — run `chmod 600 {path}` before adding [auth], a \
+             [iroh] secret_key or a relay token"
         );
     }
     Ok(())
@@ -873,7 +892,7 @@ pub fn check_config_permissions(path: &str, auth_enabled: bool) -> anyhow::Resul
 
 /// No file modes to inspect outside Unix, so there is nothing to refuse.
 #[cfg(not(unix))]
-pub fn check_config_permissions(_path: &str, _auth_enabled: bool) -> anyhow::Result<()> {
+pub fn check_config_permissions(_path: &str, _holds_credentials: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -1679,11 +1698,21 @@ domains = ["fn.iroh.iakl.top"]
         assert!(world_readable_refusal("config.toml", 0o602, true).is_some());
     }
 
-    /// With `[auth]` off nothing in the file authenticates anybody, and 0644 is
+    /// A file holding no credential at all — no 2FA, no key, no relay token — is
     /// how a Docker bind mount arrives: warn, do not refuse.
     #[test]
-    fn a_permissive_config_is_only_warned_about_with_2fa_off() {
+    fn a_permissive_config_with_no_credentials_is_only_warned_about() {
         assert_eq!(world_readable_refusal("config.toml", 0o644, false), None);
+    }
+
+    /// The endpoint key and the relay token are credentials whether or not
+    /// `[auth]` is on, so a config carrying either is worth refusing a
+    /// permissive mode over.
+    #[test]
+    fn a_key_or_a_relay_token_makes_the_config_hold_credentials() {
+        assert!(parse("[iroh]\nsecret_key = \"00\"\n").holds_credentials());
+        assert!(parse("[iroh]\nrelay_auth_token = \"t\"\n").holds_credentials());
+        assert!(!parse("").holds_credentials());
     }
 
     /// A refusal that does not say how to fix it is a support ticket.
@@ -1711,12 +1740,13 @@ domains = ["fn.iroh.iakl.top"]
         let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
 
         chmod(&path, 0o600);
-        check_config_permissions(&path, true).expect("0600 starts with 2FA on");
+        check_config_permissions(&path, true).expect("0600 starts with credentials in the file");
 
         chmod(&path, 0o644);
-        let err = check_config_permissions(&path, true).expect_err("0644 is fatal with 2FA on");
+        let err = check_config_permissions(&path, true)
+            .expect_err("0644 is fatal with credentials in it");
         assert!(err.to_string().contains("chmod 600"), "{err}");
-        check_config_permissions(&path, false).expect("0644 still starts with 2FA off");
+        check_config_permissions(&path, false).expect("0644 still starts with none in it");
     }
 
     /// A file the caller could not even stat has already failed to be read; the

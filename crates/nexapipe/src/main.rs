@@ -249,12 +249,16 @@ async fn run_server_mode(
     let auth_config = match ProxyConfig::load_with_auth(config_path) {
         Ok((_, auth_cfg)) => {
             if let Some(ref cfg) = auth_cfg {
-                // The secrets in here are the whole credential, so a
-                // permissive mode is fatal while they are live: every account
-                // on the host could authenticate as every client. With `[auth]`
-                // off they authenticate nobody, and a 0644 config is a fixture
-                // of Docker deployments — those only get the warning.
-                if let Err(e) = nexapipe::config::check_config_permissions(config_path, cfg.enabled)
+                // The secrets in here are the whole credential, so a permissive
+                // mode is fatal while they are live: every account on the host
+                // could authenticate as every client. So are the endpoint's
+                // secret key and a relay token, which is why a config carrying
+                // either is refused too even with `[auth]` off. One with none of
+                // them is a fixture of Docker deployments and only gets the
+                // warning.
+                let holds_credentials = cfg.enabled || proxy_config.holds_credentials();
+                if let Err(e) =
+                    nexapipe::config::check_config_permissions(config_path, holds_credentials)
                 {
                     tracing::error!("{}", e);
                     std::process::exit(1);
