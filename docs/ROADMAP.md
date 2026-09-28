@@ -8,7 +8,7 @@ intend to fix it.
 | | |
 |---|---|
 | Last updated | 2026-09-27 |
-| Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#platform-policy). |
+| Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
 Roadmap items are labelled `P0` / `P1` / `P2` for severity, not for priority of
@@ -291,7 +291,7 @@ missing a feature — it is broken, and it gets fixed.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| R4 | **Management surface** | Loopback-only admin API for read-only state (routes, clients, connections, health, direct ratio), with write operations going through CLI subcommands (`client add|revoke|list`, `route list`, `status`); shares the hot-reload path; token-authenticated like the desktop IPC token |
+| R4 | **Management surface** | Loopback-only admin API for read-only state (routes, clients, connections, health, direct ratio), with write operations going through CLI subcommands (`client add\|revoke\|list`, `route list`, `status`); shares the hot-reload path; token-authenticated like the desktop IPC token |
 | R5 | **Per-device identity** | Move from "one client, one shared secret" to **per-device key pairs** issued by the server and revocable individually, with TOTP demoted to a human second factor; add a minimal audit log (who, when, which host) |
 | R6 | **Operations and distribution** | Self-hosted relay as a first-class deployment (derper + compose + docs, including relay authentication); systemd unit in the docs; publish a container image; land in at least two of Homebrew, winget and scoop |
 | R7 | **Instance metrics** | `/metrics` (and `/healthz`) behind a feature, plus request IDs and a tracing span per request: the access log answers "what happened", not "how is this instance doing". Gauges for connections, streams, backend health and the direct-vs-relayed ratio |
@@ -309,7 +309,7 @@ newcomer brings up a self-hosted relay from the docs without asking anyone.
 | R11 | **Android ABI coverage** | Ship `x86_64` alongside `arm64-v8a`, or at least document why not |
 | R12 | **Backend handling** | Configurable connect/read/idle timeouts towards backends, `least_conn` for the pool, and an explicit failure when every backend is unhealthy instead of falling back to the first — see [4.1](#41-backend-handling-p2) |
 
-Per [Platform policy](#platform-policy), no iOS work is planned in this phase. A
+Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
 
 **Done when:** Android and desktop both complete HTTP, TLS passthrough and UDP

@@ -141,8 +141,9 @@ Ticket (for clients):                 endpoint:...
 ```
 
 把 **Node ID**（稳定，但需要发现机制）或 **Ticket**（包含地址，地址变化时它也会变）
-交给客户端。设置 `[iroh] secret_key` 可以让 Node ID —— 以及随之而来的 Ticket ——
-在重启后保持不变：
+交给客户端。设置 `[iroh] secret_key` 可以让 Node ID —— 以及所有以 Node ID 为前提的
+东西 —— 在重启后保持不变。Ticket 不同：它固化的是打印时的那组地址，`secret_key`
+拦不住它过期，端点搬家后必须重新生成：
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -238,6 +239,9 @@ docker compose logs -f --tail=50 nexapipe | grep -i reload
 `[auth.clients]` 表无需重启；解析或校验失败的配置会被报告并忽略，因此一次只写了一
 半的编辑不会把代理搞 down。其余配置在启动时只读取一次，需要重启：
 `[server] listen_addr`、`[iroh]`、`[peers]`、`[auth]` 的 TOTP 参数，以及 `[log]`。
+
+`[auth]` 这一段也可以在原本没有的情况下出现：启动时没有该段的服务端，同样会在后续
+重载时拾取它的 `clients` 与 `enabled = true`，因此第一次开启 2FA 不需要重启。
 
 有两处改动在运行中的服务端上被刻意做成单向的：`[auth] enabled = true` 会被配置
 监视器拾取，但把 2FA 关掉会被拒绝（要禁用请重启）；而 `enabled = true` 与暴露的明文
@@ -672,7 +676,8 @@ TOTP 握手。
    ```
 
 新增和变更的 `[auth.clients]` 条目会被配置监视器即时拾取，新增客户端无需重启；
-`[auth] enabled = true` 同样即时生效（对重载之后新建的连接）。TOTP 参数
+`[auth] enabled = true` 同样即时生效（对重载之后新建的连接）—— 启动时完全没有
+`[auth]` 段的服务端也是如此。TOTP 参数
 （`algorithm`、`time_step`、`digits`）在启动时只读取一次，需要重启。见
 `config.toml.2fa.example`。
 
@@ -743,6 +748,8 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 - **吊销即轮换。** 没有按设备吊销：`--generate-2fa client-001 --force` 会就地重写
   `config.toml`，所有用旧密钥注册过的设备都必须重新扫描；删除
   `[auth.clients.client-001]` 这一段则一次性吊销所有人。
+- 两种吊销都只作用于**之后建立的连接**：握手里拿到的授权是当时的快照，已经通过认证的
+  连接会一直用到它自己结束，轮换或删除都不会把它掐断。要立刻断开，重启服务端。
 
 ### 邀请一个尚不存在的客户端（`--create-client`）
 

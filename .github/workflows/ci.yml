@@ -91,7 +91,7 @@ jobs:
         # passes on the Linux runner is a test that breaks the maintainer's
         # machine. Architecture variants do not change which cfg branch runs,
         # so one runner per OS is enough.
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v7
       - name: Set up Rust
@@ -278,7 +278,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-          - os: macos-14
+          - os: macos-15
           - os: windows-latest
 
     defaults:
@@ -517,12 +517,15 @@ jobs:
           yes | "$SM" --licenses > /dev/null 2>&1 || true
           "$SM" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"
 
-      # Gating, not observing: `app/lint-baseline.xml` records the pre-existing
-      # findings (26 LocalContextGetResourceValueCall errors among them — Toast,
-      # log and dialog-summary strings built outside a composable scope, where
-      # stringResource() cannot be used), so a red job here means a *new* one.
-      # Fixing a recorded finding means refreshing the baseline with
-      # `./gradlew :app:updateLintBaseline` in the same change.
+      # Gating, not observing: `app/lint-baseline.xml` records what lint reports
+      # today, and `warningsAsErrors` in app/build.gradle.kts is what makes the
+      # job care — Android lint reports most of what it finds (unused resources,
+      # a newer library, a resource read outside a composable scope) as a
+      # warning, which `abortOnError` passes. So a red job here means a *new*
+      # finding, error or warning alike. Fixing a recorded one means refreshing
+      # the baseline with `./gradlew :app:updateLintBaseline` in the same change
+      # — and doing that periodically is worth it on its own, because an entry
+      # whose check no longer fires is a problem the file claims is still there.
       - name: lintDebug
         id: lint
         run: |

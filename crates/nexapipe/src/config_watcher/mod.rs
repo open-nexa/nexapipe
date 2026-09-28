@@ -122,13 +122,15 @@ impl ConfigWatcher {
         }
     }
 
-    /// Re-reads the file and swaps the routing table, keeping the old one if the
-    /// new file is unusable.
+    /// Re-reads the file and applies what is live in it: the `[auth]` section
+    /// and the routing table, each keeping the old value if the new one is
+    /// unusable.
     ///
     /// A bad edit must not take the proxy down: the file is saved every time it
     /// is touched, so half-written and downright invalid configs are both normal
     /// here, and keeping the previous routes costs far less than dropping every
-    /// connection.
+    /// connection. The two halves fail independently: one refusing does not
+    /// stop the other from being applied.
     async fn reload_config(&self) {
         tracing::info!("Detected config change, reloading...");
 
@@ -139,6 +141,14 @@ impl ConfigWatcher {
                 return;
             }
         };
+
+        // Ahead of the routes, and on the same footing as them: a new
+        // `[auth.clients]` entry is a change an operator makes while the server
+        // runs — an invite was just generated, a device is about to connect —
+        // so it must not be lost to a route table that does not parse. The two
+        // are separate failure domains: either can fail and the other still
+        // applies.
+        self.reload_auth().await;
 
         let routes = match new_config.build_routes() {
             Ok(routes) => routes,
@@ -169,14 +179,6 @@ impl ConfigWatcher {
             "Config reloaded: {} routes now live",
             self.route_config.routes().await.len()
         );
-
-        // Best effort, and deliberately separate from the route parse above: a
-        // malformed `[auth]` section must not block a route reload (serde
-        // ignores unknown sections when building `ProxyConfig`, so it would
-        // have reloaded before auth parsing existed). The file is read a
-        // second time, inside `reload_auth` and under the auth lock — see
-        // there for why the read cannot happen out here.
-        self.reload_auth().await;
     }
 
     /// Applies the `[auth]` section of a freshly read config to the live 2FA
@@ -223,17 +225,22 @@ impl ConfigWatcher {
         let Some(new_auth) = new_auth else {
             // The section is gone while 2FA is live: treat that as a bad edit,
             // not as "disable everything", the same way an unparsable route
-            // table keeps the old routes.
-            tracing::warn!(
-                "Reloaded config has no [auth] section; keeping the current 2FA clients"
-            );
+            // table keeps the old routes. Worth saying out loud, but only when
+            // something is actually being kept — a server that runs with no
+            // `[auth]` at all reaches here on every reload, and a warning each
+            // time would be noise about a state nobody asked to leave.
+            if live.enabled || !live.clients.is_empty() {
+                tracing::warn!(
+                    "Reloaded config has no [auth] section; keeping the current 2FA clients"
+                );
+            }
             return;
         };
 
-        // Before the clients table, because it is the only step that can decide
-        // not to apply anything: refusing a change that would ungate the
-        // listener has to leave the clients where they were too, or the file
-        // gets half-applied.
+        // `enabled` first, because it is the only value here that can refuse
+        // itself. A refusal covers that value alone: the clients table below is
+        // still merged, so a reload that could not move the gate does not also
+        // drop the client the operator just added.
         if let Some(refusal) = ConfigWatcher::auth_enabled_refusal(
             &live,
             &new_auth,
@@ -549,6 +556,58 @@ mod tests {
         assert_eq!(client.pending_enrollment.as_deref(), Some("token"));
         assert_eq!(client.failed_attempts, 2, "the file's stale counter loses");
         assert_eq!(client.locked_until, Some(12345));
+    }
+
+    /// A server started with no `[auth]` section at all can still switch 2FA on
+    /// while it runs.
+    ///
+    /// Regression: the state used to be built only when the file already had an
+    /// `[auth]` table, and `reload_auth` returns early on a missing state, so
+    /// the one deployment that most needs a live switch — an operator adding
+    /// the section to a running server for the first time — could only get it
+    /// by restarting. `run_proxy` builds the state from the default config now,
+    /// which is `enabled = false` with no clients, and this is what that buys.
+    #[tokio::test]
+    async fn a_state_built_without_a_section_still_reloads_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n",
+        )
+        .unwrap();
+        // Private, because enabling 2FA is refused against a file anyone else
+        // can read — the secrets in it become live credentials.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = path.to_str().unwrap().to_string();
+
+        let state = AuthState::new(AuthConfig::default(), &path);
+        let watcher = ConfigWatcher::new(
+            path,
+            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(crate::http::create_http_client()),
+            Arc::new(Mutex::new(HealthProbes::new())),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Some(state.clone()),
+        );
+
+        assert!(!state.config().read().await.enabled);
+
+        watcher.reload_auth().await;
+
+        let live = state.config().read().await;
+        assert!(
+            live.enabled,
+            "2FA has to come on for a server that started without it"
+        );
+        assert!(
+            live.clients.contains_key("client-001"),
+            "and the client the section brought with it has to be live too"
+        );
     }
 
     /// The TOTP parameters are startup-only: the merge touches the clients

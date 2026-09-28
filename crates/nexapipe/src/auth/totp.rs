@@ -211,20 +211,27 @@ mod tests {
         }
     }
 
+    /// The nonce a test signs over, minted the way the connection layer mints
+    /// its challenge (`conn::perform_authentication` draws 32 random bytes).
+    ///
+    /// These two tests never reach the signature check, so a literal would do
+    /// — but a constant sitting in a nonce slot is exactly what CWE-798 is
+    /// about, and it would be the one place in the tree where the challenge is
+    /// the same twice.
+    fn fresh_nonce() -> Vec<u8> {
+        (0..32).map(|_| rand::random::<u8>()).collect()
+    }
+
     #[test]
     fn a_timestamp_at_the_bottom_of_the_range_is_refused_rather_than_fatal() {
         let config = config_with_one_client();
         let validator = TotpValidator::new(&config);
 
-        // The client supplies this value, and i64::MIN overflows `now -
-        // timestamp` — a panic in a debug build, a wrap in release, and
-        // reachable without authenticating.
-        //
-        // The nonce is a binding, not a constant: a scanner reads a string
-        // literal passed to a parameter named `nonce` as a hard-coded
-        // cryptographic value, which is what it would be if this were real.
-        let nonce = b"nonce";
-        let outcome = validator.verify_response("alice", nonce, i64::MIN, b"signature", "000000");
+        let nonce = fresh_nonce();
+
+        // i64::MIN overflows `now - timestamp` — a panic in a debug build, a
+        // wrap in release, and reachable without authenticating.
+        let outcome = validator.verify_response("alice", &nonce, i64::MIN, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
     }
@@ -234,8 +241,8 @@ mod tests {
         let config = config_with_one_client();
         let validator = TotpValidator::new(&config);
 
-        let nonce = b"nonce";
-        let outcome = validator.verify_response("alice", nonce, i64::MAX, b"signature", "000000");
+        let nonce = fresh_nonce();
+        let outcome = validator.verify_response("alice", &nonce, i64::MAX, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
     }

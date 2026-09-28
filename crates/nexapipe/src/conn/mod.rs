@@ -268,21 +268,36 @@ pub async fn handle_bidi_stream(
         // client can read beats closing the stream mid-request.
         tracing::warn!("No route for host={:?}, answering 404", host);
         let mut send = send;
-        let _ = send
+        let written = send
             .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             .await;
         let _ = send.finish();
-        // Unroutable hosts are logged too: "which hosts are people asking for
-        // that I do not serve" is a routing question, and without the line the
-        // answer is invisible.
-        crate::log::log_access(
-            peer,
-            request.method().as_str(),
-            request.uri().path(),
-            404,
-            0,
-            0,
-        );
+        match written {
+            Ok(()) => {
+                // Unroutable hosts are logged too: "which hosts are people
+                // asking for that I do not serve" is a routing question, and
+                // without the line the answer is invisible.
+                crate::log::log_access(
+                    peer,
+                    request.method().as_str(),
+                    request.uri().path(),
+                    404,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => {
+                // Nothing reached the client, so there is no response to put in
+                // the access log — a 404 there would claim one was delivered.
+                // The host is still named above, which is what the log line
+                // exists for.
+                tracing::debug!(
+                    "No route for host={:?}, and the 404 could not be written: {}",
+                    host,
+                    e
+                );
+            }
+        }
         return Ok(());
     };
 
@@ -300,21 +315,24 @@ pub async fn handle_bidi_stream(
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
-    let outcome = if http::is_websocket_request_static(&request) {
-        tracing::debug!("WebSocket request detected");
-        handle_websocket_stream(send, recv, &request, &backend_info.url).await
-    } else {
-        let mut send = send;
-        http::proxy_to_backend_streaming(
-            client,
-            &request,
-            &backend_info.url,
-            body_data,
-            &mut send,
-            &mut recv,
-        )
-        .await
-    };
+    let outcome: Result<http::ProxySummary, http::ProxyFailure> =
+        if http::is_websocket_request_static(&request) {
+            tracing::debug!("WebSocket request detected");
+            handle_websocket_stream(send, recv, &request, &backend_info.url)
+                .await
+                .map_err(http::ProxyFailure::from)
+        } else {
+            let mut send = send;
+            http::proxy_to_backend_streaming(
+                client,
+                &request,
+                &backend_info.url,
+                body_data,
+                &mut send,
+                &mut recv,
+            )
+            .await
+        };
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
@@ -329,9 +347,24 @@ pub async fn handle_bidi_stream(
             );
             Ok(())
         }
-        Err(e) => {
-            crate::log::log_access(peer, &method, &request_target, 502, elapsed_ms, 0);
-            Err(e)
+        Err(failure) => {
+            // What the client was actually told, when it was told anything. A
+            // failure after the head went out is not a 502 — the backend
+            // answered and part of the answer arrived — and logging it as one
+            // sends whoever reads the log looking for a broken backend.
+            let (status, bytes_sent) = match failure.partial {
+                Some(partial) => (partial.status, partial.bytes_sent),
+                None => (502, 0),
+            };
+            crate::log::log_access(
+                peer,
+                &method,
+                &request_target,
+                status,
+                elapsed_ms,
+                bytes_sent,
+            );
+            Err(failure.error)
         }
     }
 }

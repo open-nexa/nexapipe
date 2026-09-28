@@ -153,8 +153,21 @@ pub async fn run_proxy(
     )
     .await;
 
-    // 2FA state: the shared config plus the file its lockout counters persist to.
-    let auth_state = auth_config.map(|cfg| conn::AuthState::new(cfg, config_path));
+    // 2FA state: the shared config plus the file its lockout counters persist
+    // to.
+    //
+    // Built even when the config carries no `[auth]` section. Leaving it absent
+    // would give the watcher nothing to reload into, so a deployment that
+    // started without 2FA could never turn it on while running — and adding the
+    // section to a live server is exactly what someone enabling it for the
+    // first time does. The default config is `enabled = false` with no clients,
+    // so until the file says otherwise this behaves like the no-2FA case:
+    // `conn::handle_connection` reads `enabled` per connection and skips the
+    // handshake while it is false.
+    let auth_state = Some(conn::AuthState::new(
+        auth_config.unwrap_or_default(),
+        config_path,
+    ));
 
     // The watcher needs three things to apply a reload: it rebuilds the routes,
     // restarts whatever health checks the new routes need, swaps in the
@@ -392,13 +405,18 @@ pub async fn run_proxy(
         conn_limiter.max()
     );
 
+    // Kept, rather than spawned and forgotten: the drain below counts work that
+    // is still running, and a listener that has not stopped accepting yet is
+    // still able to add to it. Its handle is the only way to know it has
+    // stopped.
+    let mut http_server = None;
     if let Some(http_listener) = http_listener {
         let config_clone = config.clone();
         let http_client_clone = http_client.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
         let in_flight_clone = in_flight.clone();
 
-        tokio::spawn(async move {
+        http_server = Some(tokio::spawn(async move {
             if let Err(e) = start_http_server(
                 http_listener,
                 config_clone,
@@ -410,7 +428,7 @@ pub async fn run_proxy(
             {
                 tracing::error!("HTTP server failed: {}", e);
             }
-        });
+        }));
     }
 
     loop {
@@ -423,8 +441,14 @@ pub async fn run_proxy(
                         let auth_state_clone = auth_state.clone();
                         let limiter_clone = conn_limiter.clone();
                         let in_flight_clone = in_flight.clone();
+                        // Counted out here, not in the task's first line: a
+                        // guard taken inside would leave a window in which the
+                        // connection is accepted but not yet counted, and a
+                        // shutdown landing in it sees zero and closes while
+                        // this connection is still being set up.
+                        let guard = in_flight_clone.enter();
                         tokio::spawn(async move {
-                            let _connection = in_flight_clone.enter();
+                            let _connection = guard;
                             conn::handle_incoming(
                                 incoming,
                                 config_clone,
@@ -445,6 +469,19 @@ pub async fn run_proxy(
                 tracing::info!("Shutdown signal received, stopping proxy");
                 break;
             }
+        }
+    }
+
+    // The plaintext listener is its own task: it shares the shutdown signal, so
+    // it leaves its accept loop on its own, but "on its own" says nothing about
+    // when. Waiting for the handle is what makes the count below mean
+    // something — until it returns, that loop can still accept a connection and
+    // add to what is being drained.
+    if let Some(handle) = http_server {
+        match handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => tracing::error!("HTTP server task panicked: {e}"),
+            Err(e) => tracing::error!("HTTP server task was cancelled: {e}"),
         }
     }
 
@@ -503,9 +540,13 @@ async fn start_http_server(
                 let client_clone = client.clone();
                 let remote_addr_str = addr.to_string();
                 let in_flight_clone = in_flight.clone();
+                // Counted here rather than in the task's first line, for the
+                // same reason as the iroh accept loop: an accepted connection
+                // that is not counted yet is one a shutdown cannot see.
+                let guard = in_flight_clone.enter();
 
                 tokio::spawn(async move {
-                    let _connection = in_flight_clone.enter();
+                    let _connection = guard;
                     // The listener speaks HTTP, but a client may also open a
                     // TLS session straight at it. One peeked byte tells the two
                     // apart — a request line can never start with 0x16 — and a

@@ -561,7 +561,12 @@ fn enrollment_from_params(params: &QueryParams, version: u32) -> Result<Option<I
     if version < ENROLLMENT_INVITE_VERSION {
         bail!("the invite carries an enrollment token but is version {version}");
     }
-    if params.first("secret").is_some() {
+    // Both spellings, not just `secret`: `otpauth` is the parameter an app
+    // that copied an otpauth:// URI into the link would carry, and it is a
+    // secret by another name. Letting it through yields an invite holding a
+    // credential *and* a token for one that is about to be issued, which is
+    // two answers to "what does this client authenticate with".
+    if params.first("secret").is_some() || params.first("otpauth").is_some() {
         bail!("the invite carries both an enrollment token and a 2FA secret");
     }
     let Some(client_id) = params.first("client") else {

@@ -94,12 +94,21 @@ pub async fn proxy_request(
     Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
     anyhow::Error,
 > {
-    let host = req
+    // Answered, not raised: no `Host` means no route can match, which is the
+    // same answer as a host no route matches — and the caller maps an `Err`
+    // from here to a 502, which would blame a backend for a request that never
+    // got as far as choosing one.
+    let Some(host) = req
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(crate::routes::host_without_port)
-        .ok_or_else(|| anyhow::anyhow!("Missing host header"))?;
+    else {
+        return Ok(create_error_response(
+            StatusCode::NOT_FOUND,
+            "Missing host header",
+        ));
+    };
 
     let path = req
         .uri()
@@ -368,7 +377,58 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
 pub struct ProxySummary {
     pub status: u16,
     /// Response headers plus body payload, excluding chunk framing.
+    ///
+    /// What reached the client, counted at each successful write rather than
+    /// at each byte formatted: a partially streamed response reports the part
+    /// that was flushed, not the length it was going to be.
     pub bytes_sent: usize,
+}
+
+/// A proxied request that did not finish.
+///
+/// The streaming path writes as it goes, so by the time something fails the
+/// status line — and possibly half the body — is already on the wire. Reporting
+/// every failure as a 502 with zero bytes claims a response was never sent when
+/// the client is holding part of one, which is the worst possible thing for an
+/// access log to say about a request: it points the reader at the backend for a
+/// problem that happened after the backend answered. What had arrived when it
+/// broke is carried here instead, and is `None` only when nothing had.
+#[derive(Debug)]
+pub struct ProxyFailure {
+    pub error: anyhow::Error,
+    pub partial: Option<ProxySummary>,
+}
+
+impl From<anyhow::Error> for ProxyFailure {
+    fn from(error: anyhow::Error) -> Self {
+        ProxyFailure {
+            error,
+            partial: None,
+        }
+    }
+}
+
+impl From<::http::Error> for ProxyFailure {
+    fn from(error: ::http::Error) -> Self {
+        ProxyFailure::from(anyhow::anyhow!("{error}"))
+    }
+}
+
+impl ProxyFailure {
+    /// A failure that happened `written` bytes into a `status` response.
+    ///
+    /// Used on the paths where the count is of bytes the client actually
+    /// received: a buffer that was filled but never flushed has not arrived, so
+    /// it is not in here.
+    fn after(status: StatusCode, written: usize, error: anyhow::Error) -> Self {
+        ProxyFailure {
+            error,
+            partial: Some(ProxySummary {
+                status: status.as_u16(),
+                bytes_sent: written,
+            }),
+        }
+    }
 }
 
 pub async fn proxy_to_backend_streaming(
@@ -378,7 +438,7 @@ pub async fn proxy_to_backend_streaming(
     body_data: Vec<u8>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
-) -> Result<ProxySummary, anyhow::Error> {
+) -> Result<ProxySummary, ProxyFailure> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -432,9 +492,9 @@ pub async fn proxy_to_backend_streaming(
         // Checked before the body is read, not after: `content_length` is the
         // size of the buffer this is about to fill.
         if content_length > MAX_REQUEST_BODY {
-            return Err(anyhow::anyhow!(
+            return Err(ProxyFailure::from(anyhow::anyhow!(
                 "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
-            ));
+            )));
         }
         read_remaining_request_body(recv, &mut full_body, content_length).await?;
     } else if chunked {
@@ -494,8 +554,16 @@ pub async fn proxy_to_backend_streaming(
     }
     response_buf.extend_from_slice(b"\r\n");
 
-    let mut bytes_sent = response_buf.len();
-    send.write_all(&response_buf).await?;
+    // Counted once it is on the wire, not when it is formatted: `bytes_sent`
+    // is what the access log reports as delivered, and a header that failed to
+    // write reached nobody.
+    let mut bytes_sent = 0;
+    if let Err(e) = send.write_all(&response_buf).await {
+        return Err(ProxyFailure::from(anyhow::anyhow!(
+            "failed to write the response head: {e}"
+        )));
+    }
+    bytes_sent += response_buf.len();
 
     // Body chunks used to go out as one `write_all` per hyper chunk (plus three more per
     // chunk when the response is chunk-encoded). Each of those turns into its own QUIC
@@ -514,11 +582,13 @@ pub async fn proxy_to_backend_streaming(
     const INITIAL_FLUSH_CAPACITY: usize = 8 * 1024;
     let mut out = Vec::with_capacity(INITIAL_FLUSH_CAPACITY);
 
+    // Bytes the client has actually received, as opposed to `out`, which holds
+    // what is being coalesced and may still be lost: a body that died half way
+    // is reported as the half that arrived, not as the whole that was intended.
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
     while let Some(chunk) = body_stream.next().await {
         match chunk {
             Ok(data) => {
-                bytes_sent += data.len();
                 if use_chunked {
                     out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
                     out.extend_from_slice(&data);
@@ -527,13 +597,16 @@ pub async fn proxy_to_backend_streaming(
                     out.extend_from_slice(&data);
                 }
                 if out.len() >= RESPONSE_FLUSH_THRESHOLD {
-                    send.write_all(&out).await?;
+                    if let Err(e) = send.write_all(&out).await {
+                        return Err(ProxyFailure::after(status, bytes_sent, e.into()));
+                    }
+                    bytes_sent += out.len();
                     out.clear();
                 }
             }
             Err(e) => {
                 tracing::debug!("Streaming response read error: {}", e);
-                return Err(e.into());
+                return Err(ProxyFailure::after(status, bytes_sent, e.into()));
             }
         }
     }
@@ -542,10 +615,15 @@ pub async fn proxy_to_backend_streaming(
         out.extend_from_slice(b"0\r\n\r\n");
     }
     if !out.is_empty() {
-        send.write_all(&out).await?;
+        if let Err(e) = send.write_all(&out).await {
+            return Err(ProxyFailure::after(status, bytes_sent, e.into()));
+        }
+        bytes_sent += out.len();
     }
 
-    send.finish()?;
+    if let Err(e) = send.finish() {
+        return Err(ProxyFailure::after(status, bytes_sent, e.into()));
+    }
 
     Ok(ProxySummary {
         status: status.as_u16(),

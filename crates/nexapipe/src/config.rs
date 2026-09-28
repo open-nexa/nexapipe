@@ -251,12 +251,14 @@ pub struct LogConfig {
 /// backends.
 ///
 /// A switch rather than a behaviour everyone gets, because a probe is only
-/// meaningful if the backend answers it. Plenty of backends — a static file
-/// server, a device's web UI, anything that 404s or hangs on an unknown path —
-/// cannot answer `GET /health` at all, and before this section existed a single
-/// failed probe was enough to take such a backend out of rotation for good. Set
-/// `enabled = false` for those: every backend stays in the pool and traffic is
-/// simply forwarded, which is what the proxy did before health checks existed.
+/// meaningful if the backend answers it. Plenty of backends — a device's web UI
+/// that answers 5xx on an unknown path, or one that does not speak HTTP and so
+/// times out — cannot answer a probe at all, and before this section existed a
+/// single failed probe was enough to take such a backend out of rotation for
+/// good. Set `enabled = false` for those: every backend stays in the pool and
+/// traffic is simply forwarded, which is what the proxy did before health checks
+/// existed. A backend that 404s, or answers any 2xx, is already counted healthy,
+/// so having no dedicated health endpoint is not on its own a reason to opt out.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct HealthCheckConfig {

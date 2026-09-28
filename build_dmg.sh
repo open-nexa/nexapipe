@@ -332,8 +332,24 @@ while IFS= read -r mountpoint; do
     hdiutil detach "$mountpoint" >/dev/null 2>&1 \
         || warn "could not eject $mountpoint — detach it manually if the build fails"
 done < <(hdiutil info 2>/dev/null | awk -F'\t' -v root="$BUNDLE_DIR" '
-    /^image-path/ { img = $0; sub(/^image-path[[:space:]]*:[[:space:]]*/, "", img); next }
-    /^\/dev\/disk[0-9]+s/ && $3 != "" { if (index(img, root) == 1) print $3 }
+    /^image-path/ {
+        img = $0
+        sub(/^image-path[[:space:]]*:[[:space:]]*/, "", img)
+        sub(/[[:space:]]+$/, "", img)
+        next
+    }
+    # Every disk entry, not just the suffixed ones: a volume mounted on a whole
+    # /dev/diskN has no "s<n>" to match and was skipped entirely.
+    /^\/dev\/disk[0-9]+/ && $3 != "" {
+        # A whole path component, not a prefix: target-backup/ sits next to
+        # target/ and shares every character up to the separator.
+        r = root
+        sub(/\/+$/, "", r)
+        if (substr(img, 1, length(r)) == r) {
+            after = substr(img, length(r) + 1, 1)
+            if (after == "" || after == "/") print $3
+        }
+    }
 ')
 ok "no leftover dmg state"
 

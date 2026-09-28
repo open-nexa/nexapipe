@@ -323,7 +323,12 @@ object EndpointInviteCodec {
                 invalid("The invite carries an enrollment token but is version $version")
             )
         }
-        if (params["secret"] != null) {
+        // Both spellings: `otpauth` carries a secret of its own and is only
+        // consulted when `secret` is absent, so checking `secret` alone lets
+        // `?enroll=…&otpauth=otpauth://…` through as an invite that both has a
+        // credential and is about to be issued one. Keep this in step with
+        // `enrollment_from_params` in the client crate.
+        if (params["secret"] != null || params["otpauth"] != null) {
             return Result.failure(
                 invalid("The invite carries both an enrollment token and a 2FA secret")
             )

@@ -734,6 +734,18 @@ fn node_two_factor_for(node_id: &str) -> Option<(String, String, String)> {
         .and_then(|map| map.get(node_id).cloned())
 }
 
+/// Whether this node has credentials, i.e. whether it must not enroll.
+///
+/// Not `node_two_factor_for(..).is_some()`: an entry whose secret is blank is
+/// an entry that produces no `TwoFactorAuth`, so it authenticates with nothing
+/// and — read as "has credentials" — never enrolls either. The node then
+/// connects with no credential at all against a server that is asking for one.
+fn node_has_two_factor(node_id: &str) -> bool {
+    node_two_factor_for(node_id)
+        .map(|cfg| !cfg.1.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// A snapshot of the per-endpoint enrollment tokens, so the mutex is not held across the
 /// async calls that apply them.
 fn node_enrollment_snapshot() -> Vec<(String, (String, String))> {
@@ -1316,7 +1328,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
             // token again — every other device enrolled from the same code would be locked
             // out by it.
             for (node_id, (client_id, token)) in node_enrollment_snapshot() {
-                if node_two_factor_for(&node_id).is_some() {
+                if node_has_two_factor(&node_id) {
                     continue;
                 }
                 endpoint_group
@@ -1770,7 +1782,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxyLegacy(
                 if let Some(cfg) = &credentials {
                     pool.set_two_factor(two_factor_auth(cfg)).await;
                 }
-                if credentials.is_none() {
+                if !node_has_two_factor(&target_id) {
                     if let Some((client_id, token)) = node_enrollment_for(&target_id) {
                         pool.set_enrollment(Some(Enrollment::new(&client_id, &token)))
                             .await;

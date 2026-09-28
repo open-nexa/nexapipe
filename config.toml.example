@@ -7,11 +7,12 @@
 # This is the general example, with 2FA off. See config.toml.2fa.example for the
 # same file with TOTP authentication enabled.
 #
-# Reloading: the file is re-read every 5 seconds. `default_backend` and
-# `[[routes]]` are applied live; a config that fails to parse or validate is
-# reported and ignored, so a half-saved edit cannot take the proxy down. The
-# rest is read once at startup and needs a restart: `[server]`, `[iroh]`,
-# `[auth]`, `[log]`.
+# Reloading: the file is re-read every 5 seconds. `[[routes]]` is applied live;
+# a config that fails to parse or validate is reported and ignored, so a
+# half-saved edit cannot take the proxy down. `[auth]` and `[auth.clients]` are
+# applied live too — see the `[auth]` section below for what that does and does
+# not cover. The rest is read once at startup and needs a restart: `[server]`,
+# `[iroh]`, `[log]`.
 #
 # Every key is optional. What follows is "what it looks like when you use it",
 # not a minimal config.
@@ -187,8 +188,11 @@ backends = ["127.0.0.1:443"]
 # and `udp` routes are never probed: they cannot answer an HTTP request, and a
 # failed probe would only take a healthy backend out of rotation.
 #
-# Set `enabled = false` when your backends have no health endpoint - a static
-# file server, a device UI, anything that answers 404 or nothing on `{path}`.
+# Set `enabled = false` when your backends cannot answer a probe on `{path}` -
+# one that replies 5xx to an unknown path, or one that does not speak HTTP at
+# all and so times out. A backend that answers 404 is already counted healthy,
+# and so is any 2xx: a missing health endpoint is not on its own a reason to
+# turn the checks off.
 # Everything then stays in the pool and traffic is simply forwarded.
 [health_check]
 enabled = true
@@ -245,9 +249,11 @@ domains = ["app.example.com"]
 # every route. This is not a substitute for 2FA: it answers "may this Node ID be
 # here", where 2FA answers "who is it". Use both when you can.
 #
-# Take the Node ID from the client app, or from the server's own startup log.
-# A typo is a startup error rather than a silently skipped entry, and an empty
-# list is refused outright - it would lock you out of your own server.
+# Take each Node ID from the client app that owns it: this list names clients,
+# and the Node ID in the server's own startup log is the server's - putting it
+# here allows nobody. A typo is a startup error rather than a silently skipped
+# entry, and an empty list is refused outright - it would lock you out of your
+# own server.
 #
 # [peers]
 # allow = [

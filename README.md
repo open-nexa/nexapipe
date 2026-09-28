@@ -157,7 +157,10 @@ Ticket (for clients):                 endpoint:...
 
 Give clients either the **Node ID** (stable, but it needs discovery) or the
 **Ticket** (carries addresses, so it changes when they do). Set
-`[iroh] secret_key` to keep both stable across restarts:
+`[iroh] secret_key` to keep the Node ID stable across restarts — and with it
+everything the Node ID is used for. A ticket is a different matter: it embeds
+the addresses it was printed with, so a `secret_key` does not stop it going
+stale, and it has to be regenerated when the endpoint moves.
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -265,6 +268,10 @@ that fails to parse or validate is reported and ignored, so a half-saved edit
 cannot take the proxy down. The rest is read once at startup and needs a restart:
 `[server] listen_addr`, `[iroh]`, `[peers]`, the `[auth]` TOTP parameters and
 `[log]`.
+
+An `[auth]` section can appear where there was none, too: a server started
+without one still picks up its `clients` — and `enabled = true` — from a later
+reload, so enabling 2FA for the first time does not need a restart.
 
 Two changes are deliberately one-way on a running server: `[auth] enabled = true`
 is picked up by the watcher, but turning 2FA *off* is refused (restart to
@@ -732,7 +739,8 @@ handshake before any traffic is proxied.
 
 New and changed `[auth.clients]` entries are picked up live by the config watcher,
 so adding a client needs no restart, and `[auth] enabled = true` is picked up
-live too, for connections opened after the reload. The TOTP parameters
+live too, for connections opened after the reload — including on a server that
+was started with no `[auth]` section at all. The TOTP parameters
 (`algorithm`, `time_step`, `digits`) are read once at startup and need a restart;
 see `config.toml.2fa.example`.
 

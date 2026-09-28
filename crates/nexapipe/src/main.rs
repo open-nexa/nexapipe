@@ -729,7 +729,17 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     for warning in invite.client_warnings() {
         eprintln!("warning: {warning}");
     }
-    if two_factor_enabled && !auth_config.enabled {
+    // Both invite shapes, not just the one carrying a secret: with
+    // `enabled = false` the server never runs the handshake, so an enrollment
+    // token cannot be exchanged either — and that failure is silent, because
+    // nothing ever asks the app for a code.
+    if !auth_config.enabled && invite.enrollment.is_some() {
+        eprintln!(
+            "warning: [auth] enabled is false in {}, so the server never runs the 2FA \
+             handshake and the enrollment token in this invite can never be exchanged",
+            cli.config
+        );
+    } else if two_factor_enabled && !auth_config.enabled {
         eprintln!(
             "warning: [auth] enabled is false in {}, so the server will not ask for \
              these credentials even though the invite configures the app to send them",
