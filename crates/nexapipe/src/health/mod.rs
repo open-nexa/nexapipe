@@ -129,12 +129,28 @@ impl HealthChecker {
     async fn check_backend(&self, url: &str) -> bool {
         let health_url = format!("{}{}", url, self.health_path);
 
-        let request = hyper::Request::builder()
+        // `health_path` comes from the config, and a character the URI parser
+        // rejects used to panic here — which took the whole probe loop down
+        // with it and left every backend on this route marked healthy for the
+        // rest of the run, with nothing in the log saying why. A backend whose
+        // check cannot be built is not one that answered, so it fails.
+        let request = match hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(&health_url)
             .header("host", "health-check")
             .body(http_body_util::Full::new(bytes::Bytes::new()))
-            .unwrap();
+        {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::error!(
+                    "Health check for {} cannot be built from path {:?}: {}",
+                    url,
+                    self.health_path,
+                    e
+                );
+                return false;
+            }
+        };
 
         match tokio::time::timeout(self.timeout, self.client.request(request)).await {
             Ok(Ok(response)) => {
@@ -360,6 +376,27 @@ mod tests {
         assert!(
             !healthy(&pool, DEAD_BACKEND).await,
             "enabling the check starts probing again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_health_path_that_cannot_be_a_uri_fails_the_probe() {
+        // A character the URI parser rejects used to panic here, which took the
+        // probe loop down and left every backend on the route marked healthy
+        // for the rest of the run.
+        let checker = HealthChecker::new(
+            pool(),
+            Arc::new(http::create_http_client()),
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+            1,
+            "/health check",
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        assert!(
+            !checker.check_backend(DEAD_BACKEND).await,
+            "a check that cannot be built is not one that was answered"
         );
     }
 }
