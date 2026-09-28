@@ -54,6 +54,29 @@ const AUTH_RESULT_GRACE: tokio::time::Duration = tokio::time::Duration::from_mil
 /// 4 GiB before reading anything.
 const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 
+/// How long the whole request head may take to arrive.
+///
+/// The head arrives before anything is known about the peer: no route has been
+/// matched, no credential checked, no backend involved. The 64 KiB limit below
+/// bounds how many bytes a peer may send, not how long it may take to send
+/// them, so without this a peer that dribbles a byte at a time holds a stream —
+/// and the task serving it — indefinitely.
+///
+/// One deadline rather than a per-read idle timeout: an idle timeout resets on
+/// every byte, so a peer that sends just often enough to stay busy defeats it,
+/// which is exactly the shape of a slow read. A real client sends its head in
+/// the first read or two.
+const HEAD_READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// Streams one connection may have in flight at once.
+///
+/// Every accepted bi-stream spawns a task, and `accept_bi` accepts them as fast
+/// as the peer opens them, so without a cap here the task count is the peer's
+/// choice. `FlowLimiter` covers L4 flows only; HTTP, WebSocket and passthrough
+/// streams take this one. Sized to match the L4 default so the two read as one
+/// policy on how much a single connection may ask for.
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 256;
+
 /// Application error codes the server closes a connection with when 2FA fails.
 ///
 /// These travel in the CONNECTION_CLOSE frame, so a client can read them from
@@ -121,10 +144,12 @@ pub async fn handle_bidi_stream(
     let mut read_buf = [0u8; 8192];
     let mut body_data = Vec::new();
 
+    let head_deadline = tokio::time::Instant::now() + HEAD_READ_TIMEOUT;
     loop {
-        match recv.read(&mut read_buf).await {
-            Ok(None) => break,
-            Ok(Some(n)) => {
+        let read = tokio::time::timeout_at(head_deadline, recv.read(&mut read_buf)).await;
+        match read {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(n))) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
                 // An L4 tunnel says so in its first byte, so it is recognised
@@ -176,9 +201,20 @@ pub async fn handle_bidi_stream(
                     break;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::debug!("Failed to read from iroh stream: {}", e);
                 return Err(e.into());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "No complete request head from {} within {}s",
+                    peer,
+                    HEAD_READ_TIMEOUT.as_secs()
+                );
+                return Err(anyhow::anyhow!(
+                    "no request head within {}s",
+                    HEAD_READ_TIMEOUT.as_secs()
+                ));
             }
         }
     }
@@ -973,6 +1009,13 @@ pub async fn handle_connection(
     // one that does not fit instead of blocking inside `open_bi`.
     let limiter = Arc::new(l4::FlowLimiter::new(l4::DEFAULT_MAX_FLOWS_PER_CONNECTION));
 
+    // A second counter covering every stream, not just L4 flows: `accept_bi`
+    // below spawns a task per stream whatever the stream turns out to be, and
+    // the limiter above is only consulted once the bytes say "L4".
+    let stream_slots = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    ));
+
     let paths = conn.paths();
     if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
         tracing::info!(
@@ -1059,12 +1102,28 @@ pub async fn handle_connection(
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
+                // Refused rather than queued: waiting for a slot would only move
+                // the unbounded growth into a backlog this loop cannot see, and
+                // the peer has to learn that its stream was not served.
+                let Ok(permit) = stream_slots.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        "Connection {} already has {} streams in flight, closing this one",
+                        peer_id,
+                        MAX_CONCURRENT_STREAMS_PER_CONNECTION
+                    );
+                    let mut send = send;
+                    let _ = send.finish();
+                    continue;
+                };
                 let config_clone = config.clone();
                 let client_clone = client.clone();
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
                 let acl_clone = client_acl.clone();
                 tokio::spawn(async move {
+                    // Held for the life of the task and released by its Drop, so
+                    // a slot frees however the stream ends.
+                    let _permit = permit;
                     if let Err(e) = handle_bidi_stream(
                         send,
                         recv,
