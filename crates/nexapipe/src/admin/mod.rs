@@ -439,6 +439,14 @@ async fn health_json(routes: &Arc<RouteConfig>) -> serde_json::Value {
             .cmp(b["host_pattern"].as_str().unwrap_or_default())
     });
 
+    // A URL that any route reports as down is down, even where another route
+    // still has it in rotation. Counting it as both would make the two counts
+    // describe more backends than exist, and "up somewhere" is not what this
+    // endpoint is asked: it is asked what is in rotation and what is not.
+    for url in &down {
+        up.remove(url);
+    }
+
     serde_json::json!({
         "backends_up": up.len(),
         "backends_down": down.len(),
