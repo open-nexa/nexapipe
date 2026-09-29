@@ -13,6 +13,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -22,6 +23,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nexa.pipe.R
 import com.nexa.pipe.auth.CredentialGate
 import kotlinx.coroutines.delay
@@ -116,6 +119,22 @@ fun rememberCredentialUnlock(): CredentialUnlock {
         unlocked = true
         delay(remaining)
         unlocked = false
+    }
+
+    // The window is memory, and nothing re-checks what the device can do while
+    // it runs: a screen lock removed while this app was in the background would
+    // leave the surfaces open on a device that cannot confirm anybody. Coming
+    // back into view is the one moment worth asking again — a device that can
+    // still ask keeps the window it already had.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                CredentialGate.refreshCapability(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     return CredentialUnlock(

@@ -91,6 +91,18 @@ fun EndpointDetailScreen(
     // This endpoint's 2FA; a switched-off one when it has never been set here.
     val twoFactor = node.twoFactor ?: NodeTwoFactor(enabled = false)
 
+    // Whether opening this page put a stored secret in the field, and whether
+    // what is in it now is still that secret rather than something being typed.
+    //
+    // The gate is in front of reading a secret back, not in front of typing one
+    // in. Deciding it from the live field value locked the field the instant it
+    // stopped being empty, so a new secret could not be entered at all: the
+    // first character turned the mask on and every one after it was discarded.
+    // What was stored when the page opened is the thing worth hiding; anything
+    // typed afterwards is the user's own, and hiding it from them is pointless.
+    val storedSecretPresent = remember(nodeId) { node.twoFactor?.secret?.isNotBlank() == true }
+    var secretReplaced by remember(nodeId) { mutableStateOf(false) }
+
     fun updateTwoFactor(transform: (NodeTwoFactor) -> NodeTwoFactor) {
         viewModel.updateNodeTwoFactor(nodeId, transform(twoFactor))
     }
@@ -112,6 +124,9 @@ fun EndpointDetailScreen(
                 algorithm = config.algorithm
             )
         }
+        // The secret in the field now came from the camera, not from storage,
+        // so it is not something this page has to hide from them.
+        secretReplaced = true
         twoFactorImportWarning = config.warnings.firstOrNull()
         config.warnings.forEach { viewModel.addLog("2FA import: $it") }
         Toast.makeText(
@@ -403,15 +418,19 @@ fun EndpointDetailScreen(
                             )
 
                             Spacer(modifier = Modifier.height(8.dp))
-                            val secretLocked = twoFactor.secret.isNotBlank() && !credentialUnlock.unlocked
+                            val secretLocked =
+                                storedSecretPresent && !secretReplaced && !credentialUnlock.unlocked
                             OutlinedTextField(
-                                // A field with no secret in it has nothing to
-                                // disclose, so it stays editable: the door is
-                                // in front of reading one back, not in front
-                                // of typing one in.
+                                // Locked only while the field still holds the
+                                // secret this page opened with, and only until
+                                // the device confirms who is asking. A field
+                                // with nothing to disclose — one the user is
+                                // typing into — stays editable.
                                 value = if (secretLocked) SECRET_MASK else twoFactor.secret,
                                 onValueChange = { value ->
                                     if (secretLocked) return@OutlinedTextField
+                                    // Whatever is here from now on is theirs.
+                                    secretReplaced = true
                                     twoFactorImportWarning = null
                                     updateTwoFactor { current -> current.copy(secret = value) }
                                 },
