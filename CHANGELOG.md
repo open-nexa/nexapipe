@@ -10,10 +10,6 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
-
-Nothing yet.
-
 ## [0.3.0] — 2026-09-29
 
 0.2.0 was never tagged, so what was recorded against it ships here: one tag,
