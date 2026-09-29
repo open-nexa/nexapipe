@@ -135,6 +135,9 @@ impl Drop for FlowGuard {
 ///
 /// `initial` holds the bytes already read from `recv` (at least the first).
 /// `acl` is the authenticated client's host authorization, if any.
+// See the note on `conn::handle_bidi_stream`: the id is the eighth argument,
+// and it travels through here to reach the access log.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
@@ -143,6 +146,7 @@ pub async fn handle_iroh_stream(
     limiter: &Arc<FlowLimiter>,
     peer: &str,
     acl: Option<&ClientAcl>,
+    request_id: &str,
 ) -> anyhow::Result<()> {
     serve_stream(
         DuplexIroh::new(send, recv),
@@ -151,6 +155,7 @@ pub async fn handle_iroh_stream(
         limiter,
         peer,
         acl,
+        request_id,
     )
     .await
 }
@@ -167,6 +172,7 @@ pub async fn serve_stream<S>(
     limiter: &Arc<FlowLimiter>,
     peer: &str,
     acl: Option<&ClientAcl>,
+    request_id: &str,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -204,6 +210,13 @@ where
     let started = std::time::Instant::now();
     let target = format!("{}:{}", preface.host, preface.port);
 
+    // The span was opened by the caller with empty fields. A tunnel is not a
+    // request, so what goes in them is what the access log records for one:
+    // the protocol where a method would be, and the target where a URI would.
+    let span = tracing::Span::current();
+    span.record("method", preface.proto.name());
+    span.record("uri", target.as_str());
+
     let Some(route) = config
         .get_l4_backend(&preface.host, preface.port, mode)
         .await
@@ -220,7 +233,8 @@ where
         // counted alongside requests — a rate made of both would be a rate of
         // two different things.
         metrics::METRICS.record_l4_flow(preface.proto.name(), 404);
-        crate::log::log_access(peer, preface.proto.name(), &target, 404, 0, 0);
+        span.record("status", 404u64);
+        crate::log::log_access(request_id, peer, preface.proto.name(), &target, 404, 0, 0);
         return Ok(());
     };
 
@@ -236,7 +250,8 @@ where
             target
         );
         metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
-        crate::log::log_access(peer, preface.proto.name(), &target, 429, 0, 0);
+        span.record("status", 429u64);
+        crate::log::log_access(request_id, peer, preface.proto.name(), &target, 429, 0, 0);
         return Ok(());
     };
 
@@ -259,7 +274,9 @@ where
     match &result {
         Ok(()) => {
             metrics::METRICS.record_l4_flow(preface.proto.name(), 200);
+            span.record("status", 200u64);
             crate::log::log_access(
+                request_id,
                 peer,
                 preface.proto.name(),
                 &target,
@@ -271,7 +288,9 @@ where
         Err(e) => {
             tracing::debug!("L4 {} {} ended: {}", preface.proto.name(), target, e);
             metrics::METRICS.record_l4_flow(preface.proto.name(), 502);
+            span.record("status", 502u64);
             crate::log::log_access(
+                request_id,
                 peer,
                 preface.proto.name(),
                 &target,
@@ -657,7 +676,16 @@ mod tests {
         let config = config_with(&backend_addr.to_string(), "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -690,7 +718,16 @@ mod tests {
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -715,7 +752,16 @@ mod tests {
         let acl = ClientAcl::from_hosts(Some(&["elsewhere.test".to_string()]));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", Some(&acl)).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                Some(&acl),
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -748,7 +794,16 @@ mod tests {
         let acl = ClientAcl::from_hosts(Some(&["db.test".to_string()]));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", Some(&acl)).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                Some(&acl),
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -776,7 +831,16 @@ mod tests {
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -795,7 +859,16 @@ mod tests {
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -813,7 +886,16 @@ mod tests {
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -850,7 +932,16 @@ mod tests {
         let config = config_with("127.0.0.1:1", &backend_addr.to_string());
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -896,7 +987,16 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &limiter(), "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         client
@@ -924,7 +1024,16 @@ mod tests {
         let full = Arc::new(FlowLimiter::new(0));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
-            serve_stream(server, Vec::new(), &config, &full, "test", None).await
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &full,
+                "test",
+                None,
+                "test-request-id",
+            )
+            .await
         });
 
         let (mut client_read, mut client_write) = tokio::io::split(client);

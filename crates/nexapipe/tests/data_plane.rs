@@ -235,6 +235,10 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
                 // one stream drops the connection with it, and the reply it
                 // just wrote goes with it.
                 while let Ok((send, recv)) = conn.accept_bi().await {
+                    // One id per stream, the way the server does it: what the
+                    // reply carries has to be the id of this request, not a
+                    // constant, or a test that reads the header proves nothing.
+                    let request_id = nexapipe::log::next_request_id();
                     let _ = conn::handle_bidi_stream(
                         send,
                         recv,
@@ -243,6 +247,7 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
                         &limiter,
                         "data-plane-test",
                         None,
+                        &request_id,
                     )
                     .await;
                 }
@@ -408,6 +413,51 @@ async fn a_get_reaches_the_backend_and_the_reply_comes_back() {
     let seen = backend.seen();
     assert_eq!(seen.len(), 1, "the backend should have seen one request");
     assert_eq!(seen[0].request_line, "GET /hello HTTP/1.1");
+}
+
+/// The id on the reply is the one the access log records, so a client that
+/// reports a bad answer can name the line that goes with it. Two exchanges on
+/// one tunnel must not come back with the same id, or the header is a constant
+/// that identifies nothing.
+#[tokio::test]
+async fn the_reply_carries_the_request_id() {
+    let backend = spawn_backend("hello from the backend").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let first = tunnel
+        .exchange(b"GET /one HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let second = tunnel
+        .exchange(b"GET /two HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+
+    let id_of = |reply: &[u8]| -> String {
+        String::from_utf8_lossy(reply)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name.eq_ignore_ascii_case("x-request-id")).then(|| value.trim().to_string())
+            })
+            .unwrap_or_default()
+    };
+
+    assert!(
+        status_of(&first).starts_with("HTTP/1.1 200"),
+        "expected a 200, got {:?}",
+        status_of(&first)
+    );
+    assert_eq!(
+        id_of(&first).len(),
+        32,
+        "the reply carried no request id: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+    assert_ne!(
+        id_of(&first),
+        id_of(&second),
+        "both replies carried the same id"
+    );
 }
 
 #[tokio::test]

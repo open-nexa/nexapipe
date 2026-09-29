@@ -439,6 +439,7 @@ pub async fn proxy_to_backend_streaming(
     body_data: Vec<u8>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
+    request_id: &str,
 ) -> Result<ProxySummary, ProxyFailure> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
@@ -554,6 +555,12 @@ pub async fn proxy_to_backend_streaming(
         if name_lower == "transfer-encoding" {
             continue;
         }
+        // Dropped, not duplicated: the id we write below is the one our own
+        // access log records, and a second one from the backend would leave
+        // whoever reads the response guessing which to quote.
+        if name_lower == "x-request-id" {
+            continue;
+        }
         response_buf.extend_from_slice(name.as_str().as_bytes());
         response_buf.extend_from_slice(b": ");
         response_buf.extend_from_slice(value.as_bytes());
@@ -564,6 +571,12 @@ pub async fn proxy_to_backend_streaming(
     if use_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
+    // The id the caller gave this request, so a client can name the access log
+    // line that goes with the answer it got. Built by hand like the rest of
+    // this buffer: there is no `http::Response` here to hang a header on.
+    response_buf.extend_from_slice(b"x-request-id: ");
+    response_buf.extend_from_slice(request_id.as_bytes());
+    response_buf.extend_from_slice(b"\r\n");
     response_buf.extend_from_slice(b"\r\n");
 
     // Counted once it is on the wire, not when it is formatted: `bytes_sent`
