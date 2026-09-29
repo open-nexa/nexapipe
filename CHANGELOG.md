@@ -1,0 +1,106 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+One tag releases everything at once: the server archives, the desktop bundles
+and the signed Android APK come out of `.github/workflows/release.yml`.
+
+For what comes next, and for why some things are deliberately not planned, see
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+## [Unreleased]
+
+Nothing yet. The next minor release is v0.3.0; its scope is tracked in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+## [0.2.0] — unreleased
+
+Version bumped in `43bb68c`; no `v0.2.0` tag exists yet, so this entry describes
+what is on `main` rather than what has shipped.
+
+### Added
+
+- Health checks are configurable. `[health_check] enabled = false` turns probing
+  off, so a backend with no health endpoint is a supported deployment instead of
+  a source of log noise (#47).
+- CodeQL scanning, with a config in `.github/codeql/codeql-config.yml` (#47).
+- `docs/ROADMAP.md` — where the project stands, what is missing, and in what
+  order it is meant to be fixed (#47).
+- `third_party/smoltcp/PATCHES.md`, documenting the vendored smoltcp patch that
+  `third_party/` exists to carry (#48).
+- Android: a lint baseline with `warningsAsErrors`, so a *new* lint warning
+  fails CI while a recorded one stays quiet (#48).
+
+### Changed
+
+- Shutdown drains instead of sleeping. It counts the connections both accept
+  loops spawned and waits for them, with a bound so a stuck peer cannot hold the
+  process open (#47).
+- The iroh path is logged at startup, including the relay that actually took
+  effect (#47).
+- Release artifact names are unified across the server archives, the desktop
+  bundles and the APK, under one rule (`<product>-<version>-<platform>.<ext>`)
+  (#47).
+- Hardening across the server and the client: stricter config validation,
+  request handling and connection-lifecycle handling; secret scanning through
+  `.gitleaks.toml`; hardened Dockerfiles and per-platform build scripts (#50).
+
+### Fixed
+
+- A single failed health probe emptied a backend pool. `failure_threshold` was
+  stored and logged but never consulted; it is now the count that takes a
+  backend out of rotation (#47).
+- Android: the credential key is no longer regenerated when the keystore reports
+  an error. On API 26 generating a key under an existing alias deletes that
+  entry first, so one transient failure used to make every stored credential
+  unreadable (#51).
+
+### Removed
+
+- The top-level `default_backend`. A config that still names it is refused at
+  startup rather than silently ignored, so an existing config cannot quietly
+  start answering 404 where it used to forward. "Send everything here" is now
+  spelled as a catch-all route, `host_pattern = "*"` (#48).
+
+## [0.1.1] — 2026-09-27
+
+### Added
+
+- `[peers]` Node ID allow-list. A malformed entry is fatal rather than dropped:
+  a list whose whole purpose is to refuse strangers must not silently come out
+  shorter than it was written (#44).
+- 2FA can be enabled on a running server. `[auth] enabled` moves on a config
+  reload, taking effect for connections opened after it (#44).
+
+### Changed
+
+- The Rust tree is formatted with rustfmt, and the CI format check is now
+  blocking (#46).
+
+### Fixed
+
+- Line endings pinned with `.gitattributes`, so a checkout on another platform
+  stops producing diffs that are only line endings (#45).
+- The Chinese README re-synced with the English one (#45).
+
+## [0.1.0] — 2026-09-26
+
+The first tagged release, and the release that turned NexaPipe into a monorepo.
+
+### Added
+
+- The server, the client library and the L4 wire format (#1, `6d97ad0`).
+- 2FA (TOTP) authentication with diagnostics, unified relay configuration, and
+  per-platform packaging (#1).
+- One-time enrollment invites, so a leaked invite URL stops being a credential
+  forever: the first device to scan one trades it for a freshly generated secret
+  (#31).
+- Per-client host authorization (#15).
+- The Android and desktop apps, imported with their full git history from their
+  former standalone repos, with unified CI and release pipelines (#15).
+
+### Fixed
+
+- Release pipeline unblocked; comments and docs are English only (#33).

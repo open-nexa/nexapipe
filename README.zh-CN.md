@@ -32,7 +32,8 @@ NexaPipe 是一个 Rust workspace，由四部分组成：
 [2FA](#2fa-totp) · [端点邀请码](#端点邀请码) ·
 [安全边界](#安全边界) ·
 [客户端库](#使用客户端库) · [客户端应用](#客户端应用) ·
-[开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md)
+[开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) ·
+[变更日志](CHANGELOG.md)
 
 ---
 
@@ -350,8 +351,12 @@ domains = ["app.example.com"]
 
 写了 `relay_mode` 但不可用 —— 例如 `custom` 却没有 URL，或拼写无法识别 —— 会直接
 阻止启动，而不是悄悄回落。在不接受 `relay_url` 的模式旁写了 `relay_url` 会被忽略
-并记日志。`custom` 约束的是**本**端点：广播了 N0 中继的对端仍会经由该中继被拨号，
-Endpoint ID 发现也仍会查询 `dns.iroh.link` —— 在 iroh 1.0.1 中两者都没有开关。
+并记日志。
+
+**任何 `relay_mode` 都无法改变的**：Endpoint ID 发现仍然会查询 `dns.iroh.link`，
+而 `custom` 约束的是**本**端点 —— 广播了 N0 中继的对端仍会经由该中继被拨号。在
+iroh 1.x 中两者都没有开关。[仍然依赖第三方基础设施的部分](docs/iroh-boundaries.md)
+完整写明了这条边界，包括 `custom` 买到了什么、没买到什么。
 
 ### `[[routes]]` —— 路由
 
