@@ -618,6 +618,19 @@ no `=` (`?raw`) is a flag and is left alone; the path is not touched. Set
 /api/v1/items?token=hunter2&page=2   ->   /api/v1/items?token=<redacted>&page=<redacted>
 ```
 
+**Every request gets an id.** 32 hex digits, appended to its access line and
+returned to the client as `x-request-id`, so someone reporting a bad answer can
+name the exact line that goes with it:
+
+```text
+203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "GET /api/v1/items" 200 512 12ms id=3f9ac1…
+```
+
+The same id is a field on the `request` span wrapped around the request, so it
+turns up in `tracing` output too, alongside `method`, `uri` and `status`. An L4
+flow and a TLS passthrough are tunnels rather than requests: they get an id on
+the access line and the span, but there is no HTTP response to put a header on.
+
 ### `[acme]`
 
 Removed. Certificates belong to the backend now; the section is still parsed but

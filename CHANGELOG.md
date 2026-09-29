@@ -51,6 +51,11 @@ lives in `docs/releases/`, and only that directory reaches the site.
   a biometric nor a screen lock is refused rather than downgraded, and the way
   out is one tap away. Proxy start and stop are deliberately not gated: the VPN
   has to come back after a reboot with nobody present.
+- A request ID: 32 hex digits per request, one per entry point rather than one
+  per connection, appended to that request's access line and carried by a
+  `request` tracing span that also holds its method, URI and status. The access
+  log has always answered "what happened"; until now it could not say which of
+  its lines belonged to the response somebody is looking at.
 - `docs/iroh-boundaries.md` — what still depends on third-party infrastructure
   whatever `relay_mode` says. Two README sections oversold what a mode buys:
   `custom` constrains this endpoint only, and Endpoint ID discovery still
@@ -63,6 +68,14 @@ lives in `docs/releases/`, and only that directory reaches the site.
 
 - Hot-reload rules, previously scattered across the configuration sections, are
   one table in both READMEs: what a reload applies, and what needs a restart.
+- The access log line ends with `id=<hex>`. Appended rather than inserted, so
+  every field before it keeps the column it had and a script that splits on
+  spaces still finds the host, the status and the duration where it did.
+- HTTP responses carry `x-request-id`, the same id the access line records. A
+  backend that sends its own is dropped rather than duplicated, so there is one
+  id to quote and it is ours. An L4 flow and a TLS passthrough are tunnels
+  rather than requests: they get an id on the access line and the span, and
+  have no HTTP response to put a header on.
 
 ### Fixed
 
