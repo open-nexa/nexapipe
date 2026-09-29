@@ -57,7 +57,7 @@ pub async fn handle_iroh_stream(
     acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
     let handshake = read_tls_record(&mut recv, initial, HANDSHAKE_TIMEOUT).await?;
-    let Some((host, port)) = resolve_backend(config, &handshake, acl).await else {
+    let Some((host, port, _session)) = resolve_backend(config, &handshake, acl).await else {
         return Ok(());
     };
 
@@ -81,7 +81,11 @@ pub async fn handle_tcp_stream(
     config: &RouteConfig,
 ) -> anyhow::Result<()> {
     let handshake = read_tls_record(&mut client, initial, HANDSHAKE_TIMEOUT).await?;
-    let Some((host, port)) = resolve_backend(config, &handshake, None).await else {
+    // `_session` is the lease, and it is bound rather than discarded: it is held
+    // for the lifetime of this function, which is the lifetime of the copy — so
+    // the balancer sees the session while it is running, not only while it is
+    // being dialled.
+    let Some((host, port, _session)) = resolve_backend(config, &handshake, None).await else {
         return Ok(());
     };
 
@@ -169,11 +173,14 @@ fn first_record_end(buf: &[u8]) -> Option<usize> {
 /// Every case is logged, and every case hangs up the same way — a client
 /// cannot tell "not configured" from "not allowed", so it cannot probe which
 /// names exist behind the proxy.
+/// The third element is the lease, and callers must hold it for as long as they
+/// are copying: see [`crate::lb::BackendLease`]. Dropping it early tells the
+/// balancer this session is over while the bytes are still flowing.
 async fn resolve_backend(
     config: &RouteConfig,
     handshake: &[u8],
     acl: Option<&ClientAcl>,
-) -> Option<(String, u16)> {
+) -> Option<(String, u16, crate::lb::BackendLease)> {
     let Some(sni) = extract_sni(handshake) else {
         tracing::debug!("TLS passthrough: no SNI in ClientHello, closing");
         return None;
@@ -189,25 +196,29 @@ async fn resolve_backend(
         return None;
     }
 
-    let Some(backend) = config.get_passthrough_backend(&sni).await else {
+    // Either refusal hangs up, and the two are not the same event: no route is
+    // a name this proxy does not serve, whereas every backend behind the route
+    // being down is an outage. `get_passthrough_backend` logs the detail; either
+    // way there is nothing to copy bytes to, so nobody gets a TLS handshake.
+    let Some(backend) = config.get_passthrough_backend(&sni).await.backend() else {
         tracing::warn!(
-            "TLS passthrough: no `mode = \"passthrough\"` route for SNI '{}', closing",
+            "TLS passthrough: nothing to forward SNI '{}' to, closing",
             sni
         );
         return None;
     };
 
-    let Some((host, port)) = parse_backend_addr(&backend) else {
+    let Some((host, port)) = parse_backend_addr(backend.url()) else {
         tracing::error!(
             "TLS passthrough: cannot parse backend address '{}' for SNI '{}'",
-            backend,
+            backend.url(),
             sni
         );
         return None;
     };
 
     tracing::debug!("TLS passthrough: SNI '{}' -> {}:{}", sni, host, port);
-    Some((host, port))
+    Some((host, port, backend))
 }
 
 /// Accepts `host:port` or a full URL (`https://caddy:443`).
@@ -609,13 +620,17 @@ mod tests {
         // On-list: reaches the route's backend.
         let acl = ClientAcl::from_hosts(Some(&["*.iroh.iakl.top".to_string()]));
         assert_eq!(
-            resolve_backend(&config, &hello, Some(&acl)).await,
+            resolve_backend(&config, &hello, Some(&acl))
+                .await
+                .map(|(host, port, _lease)| (host, port)),
             Some(("caddy".to_string(), 443))
         );
 
         // No ACL (no 2FA behind the connection): the historical behaviour.
         assert_eq!(
-            resolve_backend(&config, &hello, None).await,
+            resolve_backend(&config, &hello, None)
+                .await
+                .map(|(host, port, _lease)| (host, port)),
             Some(("caddy".to_string(), 443))
         );
     }

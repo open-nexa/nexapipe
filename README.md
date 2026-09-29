@@ -312,8 +312,8 @@ What the short forms leave out, and what you get instead:
 | `[iroh] relay_mode` | `default`: N0 relays, home relay picked by latency |
 | `mode` | `http` |
 | `path_pattern` | `/`, prefix match |
-| `strategy` | `round_robin` |
-| `[health_check]` | enabled: `GET {backend}/health` every 10 s. A backend with no such endpoint is logged as failing, but **traffic still flows** — with nothing healthy the pool falls back to its first entry — so this is log noise, not an outage. Set `enabled = false` to silence it. |
+| `strategy` | `round_robin` (or `random`, or `least_conn` — fewest requests outstanding to that backend) |
+| `[health_check]` | enabled: `GET {backend}/health` every 10 s. A backend with no such endpoint is logged as failing, but **traffic still flows to a route with one backend** — there is nothing to choose between — so that is log noise, not an outage. A route with several, all down, answers 503 without dialling. Set `enabled = false` to silence it. |
 | `[log]` | rotating files under `./logs` plus console output, query values redacted |
 | `[auth]`, `[peers]` | no authentication — the server prints a warning banner at startup. Fine on a laptop; add `[peers] allow` (or 2FA) before this faces anything you care about. |
 
@@ -404,7 +404,7 @@ states the boundary in full, including what `custom` does and does not buy.
 host_pattern = "comfyui.example.com"
 path_pattern = "/"
 path_is_prefix = true
-strategy = "round_robin"          # or "random"
+strategy = "round_robin"          # or "random" or "least_conn"
 backends = ["http://192.0.2.20:18188"]
 mode = "http"                     # default
 # path_rewrite = "/api"

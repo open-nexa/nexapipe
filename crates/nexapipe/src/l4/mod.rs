@@ -30,7 +30,7 @@
 
 use crate::auth::ClientAcl;
 use crate::metrics;
-use crate::routes::RouteConfig;
+use crate::routes::{BackendLookup, RouteConfig};
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
@@ -217,24 +217,51 @@ where
     span.record("method", preface.proto.name());
     span.record("uri", target.as_str());
 
-    let Some(route) = config
+    let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)
-        .await
-    else {
-        let _ = write_status(&mut stream, Status::NoRoute).await;
+        .await;
+
+    let unhealthy = matches!(lookup, BackendLookup::Unavailable);
+    let Some(route) = lookup.backend() else {
+        // Both refusals end the flow, but with different statuses, because a
+        // client can act on the difference: no route is something the request
+        // named wrong, whereas a route whose every backend is down is an outage
+        // to retry later. Answering `NoRoute` for the second would tell every
+        // client its configuration is wrong at the moment it is correct.
+        let status = if unhealthy {
+            Status::BackendFailed
+        } else {
+            Status::NoRoute
+        };
+        // 404 and 503 are what the log and the metrics mean by those names; the
+        // wire carries its own vocabulary.
+        let logged_as = if unhealthy { 503 } else { 404 };
+        let _ = write_status(&mut stream, status).await;
         tracing::warn!(
-            "L4 {}: no `mode = {:?}` route for {}, closing",
+            "L4 {}: {} for {}, closing",
             preface.proto.name(),
-            mode,
+            if unhealthy {
+                "every backend behind the route is unhealthy"
+            } else {
+                "no route of this mode serves it"
+            },
             target
         );
         // A flow, not a request: this is a tunnel that stays open for as long
         // as the client wants, so it gets its own counter instead of being
         // counted alongside requests — a rate made of both would be a rate of
         // two different things.
-        metrics::METRICS.record_l4_flow(preface.proto.name(), 404);
-        span.record("status", 404u64);
-        crate::log::log_access(request_id, peer, preface.proto.name(), &target, 404, 0, 0);
+        metrics::METRICS.record_l4_flow(preface.proto.name(), logged_as);
+        span.record("status", logged_as as u64);
+        crate::log::log_access(
+            request_id,
+            peer,
+            preface.proto.name(),
+            &target,
+            logged_as,
+            0,
+            0,
+        );
         return Ok(());
     };
 

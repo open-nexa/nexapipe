@@ -694,7 +694,21 @@ pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrate
         Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => {
             crate::lb::LoadBalancingStrategy::RoundRobin
         }
-        None | Some(_) => crate::lb::LoadBalancingStrategy::RoundRobin,
+        Some("least_conn") | Some("LeastConn") | Some("leastconn") => {
+            crate::lb::LoadBalancingStrategy::LeastConn
+        }
+        // Unrecognised values keep meaning round-robin rather than failing to
+        // load, and they say so: a mistyped strategy is otherwise invisible —
+        // traffic still flows, just not the way the config claims — and there
+        // is nowhere else this could be reported.
+        None => crate::lb::LoadBalancingStrategy::RoundRobin,
+        Some(other) => {
+            tracing::warn!(
+                "Unknown load balancing strategy {other:?}; falling back to round_robin \
+                 (accepted: \"round_robin\", \"random\", \"least_conn\")"
+            );
+            crate::lb::LoadBalancingStrategy::RoundRobin
+        }
     }
 }
 
@@ -1707,6 +1721,24 @@ backends = []
             error.contains("no backends"),
             "the message has to say what is missing, got: {error}"
         );
+    }
+
+    #[test]
+    fn least_conn_is_a_strategy_a_config_can_ask_for() {
+        assert!(matches!(
+            get_strategy(&Some("least_conn".to_string())),
+            crate::lb::LoadBalancingStrategy::LeastConn
+        ));
+        assert!(matches!(
+            get_strategy(&Some("LeastConn".to_string())),
+            crate::lb::LoadBalancingStrategy::LeastConn
+        ));
+        // A typo is not one of them, and it must not silently become a strategy
+        // that ignores load either.
+        assert!(matches!(
+            get_strategy(&Some("least_conns".to_string())),
+            crate::lb::LoadBalancingStrategy::RoundRobin
+        ));
     }
 
     #[test]

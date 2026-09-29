@@ -6,7 +6,7 @@ use crate::http;
 use crate::l4;
 use crate::metrics;
 use crate::passthrough;
-use crate::routes::{BackendInfo, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
@@ -272,48 +272,64 @@ pub async fn handle_bidi_stream(
     // No `Host` header — HTTP/1.0, or a malformed request — means no route can
     // be matched, because every route, including a `host_pattern = "*"`
     // catch-all, is selected by host. There is nothing to serve it with.
-    let backend_info: Option<BackendInfo> = match host {
+    // Answered, not raised: no `Host` means nothing to look up, and it is worth
+    // no less here than in `http::proxy_request`.
+    let lookup: BackendLookup<BackendInfo> = match host {
         Some(h) => config.get_backend_with_acl(h, path, acl.as_deref()).await,
-        None => None,
+        None => BackendLookup::NoRoute,
     };
 
-    let Some(backend_info) = backend_info else {
-        // Nothing serves this host and there is no default backend. A 404 the
-        // client can read beats closing the stream mid-request.
-        tracing::warn!("No route for host={:?}, answering 404", host);
+    // Which refusal it is decides the status, and nothing else — the writing
+    // and the logging below are the same either way. 404: nothing serves this
+    // name. 503: the route is there and every backend behind it is down, which
+    // is not something the client can fix by asking again for a different host.
+    let unavailable = matches!(lookup, BackendLookup::Unavailable);
+    let status = if unavailable { 503 } else { 404 };
+    let headline = if unavailable {
+        "HTTP/1.1 503 Service Unavailable"
+    } else {
+        "HTTP/1.1 404 Not Found"
+    };
+
+    let Some(backend_info) = lookup.backend() else {
+        tracing::warn!(
+            "Refusing host={:?}: {}, answering {}",
+            host,
+            if unavailable {
+                "no healthy backend behind a route that matches"
+            } else {
+                "no route matches"
+            },
+            status
+        );
         let mut send = send;
         let written = send
-            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .write_all(
+                format!("{headline}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+            )
             .await;
         let _ = send.finish();
         match written {
             Ok(()) => {
-                // Unroutable hosts are logged too: "which hosts are people
-                // asking for that I do not serve" is a routing question, and
-                // without the line the answer is invisible.
-                //
-                // Counted only when the answer reached the client, for the same
-                // reason it is only logged then: a 404 nobody received is not a
-                // request this instance served.
-                metrics::METRICS.record_request(404, 0);
+                // Counted and logged for either status, and only when the answer
+                // reached the client: a refusal nobody received is not a request
+                // this instance served.
+                metrics::METRICS.record_request(status, 0);
                 crate::log::log_access(
                     request_id,
                     peer,
                     request.method().as_str(),
                     request.uri().path(),
-                    404,
+                    status,
                     0,
                     0,
                 );
             }
             Err(e) => {
-                // Nothing reached the client, so there is no response to put in
-                // the access log — a 404 there would claim one was delivered.
-                // The host is still named above, which is what the log line
-                // exists for.
                 tracing::debug!(
-                    "No route for host={:?}, and the 404 could not be written: {}",
+                    "Refusal for host={:?} ({}) could not be written: {}",
                     host,
+                    status,
                     e
                 );
             }

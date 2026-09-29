@@ -1,6 +1,6 @@
 use crate::auth::ClientAcl;
 use crate::config::RouteMode;
-use crate::lb::{BackendPool, LoadBalancingStrategy};
+use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -334,21 +334,112 @@ impl Route {
 }
 
 #[derive(Debug, Clone)]
+/// What looking up a backend can come back with.
+///
+/// Two of the three carry nothing, and they are not the same nothing:
+///
+/// - [`Self::NoRoute`] — this proxy does not serve that name. A **routing**
+///   answer: "forward this host" was never configured, so the fix is in
+///   `[[routes]]`.
+/// - [`Self::Unavailable`] — the name is served, and every backend behind it is
+///   currently unhealthy. An **operations** answer: routing is correct and
+///   something downstream is down.
+///
+/// Collapsing the second into the first would be the expensive mistake: the
+/// proxy would answer `404` for a healthy route whose backends died, and whoever
+/// is reading those codes goes looking in the one file that is already right.
+/// That is why this exists rather than `Option`.
+pub enum BackendLookup<T> {
+    NoRoute,
+    Unavailable,
+    Found(T),
+}
+
+impl<T> BackendLookup<T> {
+    /// The backend, and only when there is one to forward to.
+    ///
+    /// Both refusals map to `None`, so this is the first choice for anything
+    /// about the request. A caller that needs to answer them differently asks
+    /// [`Self::kind`].
+    pub fn backend(self) -> Option<T> {
+        match self {
+            BackendLookup::Found(value) => Some(value),
+            BackendLookup::NoRoute | BackendLookup::Unavailable => None,
+        }
+    }
+
+    /// Borrowed version of [`Self::backend`].
+    pub fn found(&self) -> Option<&T> {
+        match self {
+            BackendLookup::Found(value) => Some(value),
+            BackendLookup::NoRoute | BackendLookup::Unavailable => None,
+        }
+    }
+
+    pub fn is_found(&self) -> bool {
+        self.found().is_some()
+    }
+
+    /// `true` when this is a routing question rather than an outage — nothing
+    /// here serves that name.
+    ///
+    /// Ask for this one in a test rather than [`Self::is_not_found`] whenever
+    /// what is being pinned is "no route": the two refusals both mean "no
+    /// backend", and leaving them collapsed is how a test that used to say "no
+    /// route matches" quietly starts passing because the pool was marked down.
+    pub fn is_no_route(&self) -> bool {
+        matches!(self, BackendLookup::NoRoute)
+    }
+
+    /// `true` when there is nothing to forward to, for either reason.
+    pub fn is_not_found(&self) -> bool {
+        !self.is_found()
+    }
+
+    /// Which refusal this is, for a caller that answers them differently.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            BackendLookup::Found(_) => None,
+            BackendLookup::NoRoute => Some("no route matches"),
+            BackendLookup::Unavailable => Some("no healthy backend behind the route"),
+        }
+    }
+}
+
 pub struct BackendInfo {
     pub url: String,
     pub path_rewrite: Option<String>,
     pub path_pattern: String,
     pub path_is_prefix: bool,
+    /// Alive for exactly as long as this request is outstanding against that
+    /// backend: dropping it is what releases the backend's slot in the balancer,
+    /// so nothing reads this field — moving it along with the requests is the
+    /// whole point. See [`crate::lb::BackendLease`].
+    _lease: BackendLease,
 }
 
 /// What the L4 tunnel needs in order to serve one flow.
-#[derive(Debug, Clone)]
 pub struct L4RouteInfo {
     /// The address to dial, and the only address involved: the route decides
     /// it, the client cannot. See [`RouteConfig::get_l4_backend`].
     pub backend: String,
     /// `udp` routes only; `None` means the caller's own default.
     pub idle_timeout: Option<Duration>,
+    /// Held until this flow finishes, so the balancer knows the slot is still
+    /// taken. Nothing reads it; see [`BackendInfo::_lease`].
+    _lease: BackendLease,
+}
+
+// Hand-written rather than derived, because the lease it carries cannot be
+// cloned — it is a count of one — and a `Debug` that printed it would print a
+// different number every time someone looked.
+impl std::fmt::Debug for L4RouteInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L4RouteInfo")
+            .field("backend", &self.backend)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -363,13 +454,10 @@ impl RouteConfig {
         }
     }
 
-    /// Backend for an HTTP request, or `None` when nothing serves it.
-    ///
-    /// `None` means the caller must answer 404 — not pick some address at
-    /// random. There is no fallback: a host with no `http` route of its own is
-    /// a routing question the operator answers by adding one, and a
-    /// `host_pattern = "*"` route is how "send everything here" is spelled.
-    pub async fn get_backend(&self, host: &str, path: &str) -> Option<BackendInfo> {
+    /// Backend for an HTTP request. Callers answer
+    /// [`BackendLookup::NoRoute`] with `404` and [`BackendLookup::Unavailable`]
+    /// with `503` — see the enum for why the two are not one answer.
+    pub async fn get_backend(&self, host: &str, path: &str) -> BackendLookup<BackendInfo> {
         self.get_backend_with_acl(host, path, None).await
     }
 
@@ -384,10 +472,10 @@ impl RouteConfig {
         host: &str,
         path: &str,
         acl: Option<&ClientAcl>,
-    ) -> Option<BackendInfo> {
+    ) -> BackendLookup<BackendInfo> {
         if acl.is_some_and(|acl| !acl.allows(host)) {
             tracing::debug!("Host {host} is not allowed for this client, answering 404");
-            return None;
+            return BackendLookup::NoRoute;
         }
 
         tracing::debug!("Looking up backend for host={}, path={}", host, path);
@@ -403,30 +491,50 @@ impl RouteConfig {
 
         let Some(route) = matched_route else {
             tracing::debug!("No http route matched: host={host}, path={path} -> 404");
-            return None;
+            return BackendLookup::NoRoute;
         };
 
-        let backend_url = route.backend_pool().select_backend().await;
+        // A route matched, so this stopped being a routing question: every
+        // backend behind it is down, and dialling one anyway spends a whole
+        // connect timeout delivering the refusal the caller can write now.
+        let Some(lease) = route.backend_pool().select_backend().await else {
+            tracing::warn!(
+                "Route {}:{} matched host={host} path={path} but no backend is healthy -> 503",
+                route.host_pattern(),
+                route.path_pattern(),
+            );
+            return BackendLookup::Unavailable;
+        };
+
         tracing::debug!(
             "Selected backend: {} for host={}, path={}",
-            backend_url,
+            lease.url(),
             host,
             path,
         );
-        Some(BackendInfo {
-            url: backend_url,
+        BackendLookup::Found(BackendInfo {
+            url: lease.url().to_string(),
             path_rewrite: route.path_rewrite().clone(),
             path_pattern: route.path_pattern().to_string(),
             path_is_prefix: route.path_is_prefix(),
+            _lease: lease,
         })
     }
 
     /// Backend for a raw TLS passthrough connection, selected by SNI.
     ///
-    /// Only `mode = "passthrough"` routes take part, so the response is `None`
-    /// when nothing serves this name, which is the caller's cue to hang up
-    /// rather than guess at a backend.
-    pub async fn get_passthrough_backend(&self, sni: &str) -> Option<String> {
+    /// Only `mode = "passthrough"` routes take part, so [`BackendLookup::NoRoute`]
+    /// means nothing serves this name and the caller hangs up rather than
+    /// guessing at a backend. [`BackendLookup::Unavailable`] is reachable too: a
+    /// route may serve both `http` and `passthrough`, and then health probes run
+    /// against the pool both modes dial into.
+    ///
+    /// The lease comes back with it rather than only its address, because a TLS
+    /// session is exactly the load `least_conn` is counting: copying bytes to a
+    /// backend for as long as the client keeps the session open. Handing back a
+    /// bare `String` would release it on return and leave every passthrough
+    /// session invisible to the balancer.
+    pub async fn get_passthrough_backend(&self, sni: &str) -> BackendLookup<BackendLease> {
         let matched_route = {
             let routes = self.routes.read().await;
             best_match(&routes, RouteMode::Passthrough, |route| {
@@ -434,37 +542,53 @@ impl RouteConfig {
             })
         };
 
-        match matched_route {
-            Some(route) => {
-                let backend_url = route.backend_pool().select_backend().await;
-                tracing::debug!(
-                    "Passthrough route matched: sni={}, host={}, backend={}",
-                    sni,
-                    route.host_pattern(),
-                    backend_url
-                );
-                Some(backend_url)
-            }
-            None => None,
-        }
+        let Some(route) = matched_route else {
+            tracing::debug!("No passthrough route matched: sni={sni}, hanging up");
+            return BackendLookup::NoRoute;
+        };
+
+        // Nothing to copy toward, then: say so where the operator can read it,
+        // rather than letting it look like a name nothing serves.
+        let Some(lease) = route.backend_pool().select_backend().await else {
+            tracing::warn!(
+                "Passthrough route {} matched sni={sni} but no backend is healthy; refusing \
+                 rather than copying into a connection nobody answers",
+                route.host_pattern(),
+            );
+            return BackendLookup::Unavailable;
+        };
+
+        tracing::debug!(
+            "Passthrough route matched: sni={}, host={}, backend={}",
+            sni,
+            route.host_pattern(),
+            lease.url()
+        );
+        BackendLookup::Found(lease)
     }
 
     /// Backend for one L4 flow, selected by host and port.
     ///
     /// Only `mode`'s own routes take part — a `tcp` lookup never sees a `udp` route and
-    /// vice versa — and the response is `None` when nothing serves this host, which is
-    /// the caller's cue to answer `NoRoute` rather than guess.
+    /// vice versa — and [`BackendLookup::NoRoute`] means nothing serves this host.
     ///
     /// **There is no fallback.** A `tcp` or `udp` lookup sees only the routes of
     /// its own mode, so a host with none of them is refused: forwarding a
     /// mistyped or unconfigured domain to some other service is exactly the
     /// failure this lookup exists to prevent.
+    ///
+    /// The two refusals do **not** reach the client as the same status — see
+    /// [`BackendLookup`]. A route serving `http` alongside `tcp` is probed on the
+    /// pool both modes share, so an L4 flow can find a healthy route whose every
+    /// backend is down, and answering `NoRoute` for that would tell the client its
+    /// request was misconfigured when what actually happened is that there is
+    /// nothing to dial.
     pub async fn get_l4_backend(
         &self,
         host: &str,
         port: u16,
         mode: RouteMode,
-    ) -> Option<L4RouteInfo> {
+    ) -> BackendLookup<L4RouteInfo> {
         debug_assert!(mode.is_l4(), "get_l4_backend called with {mode:?}");
 
         let matched_route = {
@@ -472,19 +596,31 @@ impl RouteConfig {
             best_match(&routes, mode, |route| route.matches_l4(host, port))
         };
 
-        let route = matched_route?;
-        let backend = route.backend_pool().select_backend().await;
+        let Some(route) = matched_route else {
+            tracing::debug!("No l4 route matched: host={host}, port={port}, mode={mode:?}");
+            return BackendLookup::NoRoute;
+        };
+
+        let Some(lease) = route.backend_pool().select_backend().await else {
+            tracing::warn!(
+                "L4 route {} matched host={host} port={port} ({mode:?}) but no backend is healthy",
+                route.host_pattern(),
+            );
+            return BackendLookup::Unavailable;
+        };
+
         tracing::debug!(
             "L4 route matched: host={}, port={}, mode={:?}, route={}, backend={}",
             host,
             port,
             mode,
             route.host_pattern(),
-            backend
+            lease.url()
         );
-        Some(L4RouteInfo {
-            backend,
+        BackendLookup::Found(L4RouteInfo {
+            backend: lease.url().to_string(),
             idle_timeout: route.idle_timeout(),
+            _lease: lease,
         })
     }
 
@@ -573,6 +709,86 @@ fn best_match(
 mod tests {
     use super::*;
 
+    /// Health says which of several backends to send to, so a pool that has only
+    /// one has nothing to decide — and refusing is not "safer" there, it is answering
+    /// for every request to a route in order to report that nothing is up. See
+    /// [`crate::lb::BackendPool::select_backend`].
+    #[tokio::test]
+    async fn one_unhealthy_backend_is_still_the_answer() {
+        let route = http_route("api.iakl.top", &["http://10.0.0.5:8080"]);
+        route
+            .backend_pool()
+            .set_backend_health("http://10.0.0.5:8080", false)
+            .await;
+        let config = RouteConfig::new(vec![route]);
+
+        assert!(
+            config.get_backend("api.iakl.top", "/").await.is_found(),
+            "the one backend behind this route is the only path it has"
+        );
+    }
+
+    /// The same pool state, one more backend: now the health information means
+    /// something, and the lookup has to say "unavailable" rather than hand out a
+    /// backend it knows is down. 503 and 404 differ in which file the operator
+    /// opens.
+    #[tokio::test]
+    async fn unhealthy_backends_are_not_confused_with_a_missing_route() {
+        let route = http_route(
+            "api.iakl.top",
+            &["http://10.0.0.5:8080", "http://10.0.0.6:8080"],
+        );
+        let pool = route.backend_pool().clone();
+        pool.set_backend_health("http://10.0.0.5:8080", false).await;
+        pool.set_backend_health("http://10.0.0.6:8080", false).await;
+        let config = RouteConfig::new(vec![route]);
+
+        assert!(
+            matches!(
+                config.get_backend("api.iakl.top", "/").await,
+                BackendLookup::Unavailable
+            ),
+            "every backend is down, and the route that matched still exists"
+        );
+        assert!(
+            matches!(
+                config.get_backend("nope.iakl.top", "/").await,
+                BackendLookup::NoRoute
+            ),
+            "no route serves this host at all, which is a different answer"
+        );
+    }
+
+    /// A pool shared by `http` and another mode carries one health state, so the
+    /// tunnel and the TLS passthrough see the same refusal as a request does —
+    /// which is why all three lookups speak in [`BackendLookup`] rather than
+    /// `Option`.
+    #[tokio::test]
+    async fn the_same_refusal_reaches_the_tunnel_and_the_passthrough() {
+        // One route, three modes, one pool — exactly the shape a health probe
+        // marks through `http` and the other two dial into.
+        let route = http_route("fn.iroh.iakl.top", &["caddy:443", "caddy2:443"]).with_modes(vec![
+            RouteMode::Http,
+            RouteMode::Passthrough,
+            RouteMode::Tcp,
+        ]);
+        let pool = route.backend_pool().clone();
+        let config = RouteConfig::new(vec![route]);
+        pool.set_backend_health("caddy:443", false).await;
+        pool.set_backend_health("caddy2:443", false).await;
+
+        assert!(matches!(
+            config.get_passthrough_backend("fn.iroh.iakl.top").await,
+            BackendLookup::Unavailable
+        ));
+        assert!(matches!(
+            config
+                .get_l4_backend("fn.iroh.iakl.top", 443, RouteMode::Tcp)
+                .await,
+            BackendLookup::Unavailable
+        ));
+    }
+
     fn http_route(host: &str, backends: &[&str]) -> Route {
         Route::new(
             host,
@@ -609,13 +825,18 @@ mod tests {
         ]);
 
         assert_eq!(
-            config.get_passthrough_backend("fn.iroh.iakl.top").await,
+            config
+                .get_passthrough_backend("fn.iroh.iakl.top")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             Some("caddy:443".to_string())
         );
         assert_eq!(
             config
                 .get_backend("fn.iroh.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the http route serves this host")
                 .url,
             "http://10.0.0.5:8080"
@@ -623,10 +844,19 @@ mod tests {
         // A host that is only served over plain HTTP has no TLS backend, and
         // the default backend is not a passthrough fallback.
         assert_eq!(
-            config.get_passthrough_backend("mt.iroh.iakl.top").await,
+            config
+                .get_passthrough_backend("mt.iroh.iakl.top")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             None
         );
-        assert_eq!(config.get_passthrough_backend("unknown.test").await, None);
+        assert!(
+            config
+                .get_passthrough_backend("unknown.test")
+                .await
+                .is_no_route()
+        );
     }
 
     /// `modes = ["http", "tcp"]` in the form of a lookup: one route, two tables,
@@ -646,6 +876,7 @@ mod tests {
             config
                 .get_backend("fn.iroh.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the route serves this host as a request")
                 .url,
             "http://host.docker.internal:15666"
@@ -654,6 +885,7 @@ mod tests {
             config
                 .get_l4_backend("fn.iroh.iakl.top", 80, RouteMode::Tcp)
                 .await
+                .backend()
                 .expect("the same route serves this host as a tunnel")
                 .backend,
             "http://host.docker.internal:15666"
@@ -664,7 +896,7 @@ mod tests {
             config
                 .get_l4_backend("fn.iroh.iakl.top", 80, RouteMode::Udp)
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -696,13 +928,18 @@ mod tests {
             config
                 .get_backend("fn.iroh.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the http route serves this host")
                 .url,
             "http://10.0.0.5:8080"
         );
         // TLS session, routed by SNI.
         assert_eq!(
-            config.get_passthrough_backend("fn.iroh.iakl.top").await,
+            config
+                .get_passthrough_backend("fn.iroh.iakl.top")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             Some("caddy:443".to_string())
         );
         // TCP tunnel, and UDP tunnel.
@@ -710,6 +947,7 @@ mod tests {
             config
                 .get_l4_backend("fn.iroh.iakl.top", 443, RouteMode::Tcp)
                 .await
+                .backend()
                 .unwrap()
                 .backend,
             "caddy:443"
@@ -718,6 +956,7 @@ mod tests {
             config
                 .get_l4_backend("fn.iroh.iakl.top", 3478, RouteMode::Udp)
                 .await
+                .backend()
                 .unwrap()
                 .backend,
             "10.0.0.60:3478"
@@ -729,14 +968,14 @@ mod tests {
             config
                 .get_l4_backend("fn.iroh.iakl.top", 3478, RouteMode::Tcp)
                 .await
-                .is_some(),
+                .is_found(),
             "a tcp route with no client_ports serves every port"
         );
         assert!(
             config
                 .get_l4_backend("nothing.iroh.iakl.top", 443, RouteMode::Tcp)
                 .await
-                .is_none()
+                .is_no_route()
         );
         // The one thing HTTP does not share with the tunnels: it is the only
         // lookup with no route for this host either, so it says 404.
@@ -744,7 +983,7 @@ mod tests {
             config
                 .get_backend("nothing.iroh.iakl.top", "/")
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -756,12 +995,20 @@ mod tests {
         ]);
 
         assert_eq!(
-            config.get_passthrough_backend("anything.test").await,
+            config
+                .get_passthrough_backend("anything.test")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             Some("caddy:443".to_string())
         );
         // An exact host outranks the wildcard regardless of declaration order.
         assert_eq!(
-            config.get_passthrough_backend("other.iakl.top").await,
+            config
+                .get_passthrough_backend("other.iakl.top")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             Some("caddy-alt:443".to_string())
         );
     }
@@ -792,6 +1039,7 @@ mod tests {
         let tcp = config
             .get_l4_backend("db.iroh.iakl.top", 5432, RouteMode::Tcp)
             .await
+            .backend()
             .expect("the tcp route should answer");
         assert_eq!(tcp.backend, "10.0.0.50:5432");
 
@@ -800,7 +1048,7 @@ mod tests {
             config
                 .get_l4_backend("db.iroh.iakl.top", 5432, RouteMode::Udp)
                 .await
-                .is_none()
+                .is_no_route()
         );
         // ...and an HTTP route is not an L4 target in either mode, while the HTTP path
         // still serves it.
@@ -808,18 +1056,19 @@ mod tests {
             config
                 .get_l4_backend("web.iroh.iakl.top", 80, RouteMode::Tcp)
                 .await
-                .is_none()
+                .is_no_route()
         );
         assert!(
             config
                 .get_l4_backend("web.iroh.iakl.top", 80, RouteMode::Udp)
                 .await
-                .is_none()
+                .is_no_route()
         );
         assert_eq!(
             config
                 .get_backend("web.iroh.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the http route serves this host")
                 .url,
             "http://10.0.0.5:8080"
@@ -842,13 +1091,13 @@ mod tests {
             config
                 .get_l4_backend("typo.iroh.iakl.top", 5432, RouteMode::Tcp)
                 .await
-                .is_none()
+                .is_no_route()
         );
         assert!(
             config
                 .get_l4_backend("db.iroh.iakl.top", 5432, RouteMode::Udp)
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -875,6 +1124,7 @@ mod tests {
             config
                 .get_l4_backend("db.iroh.iakl.top", 5432, RouteMode::Tcp)
                 .await
+                .backend()
                 .unwrap()
                 .backend,
             "10.0.0.50:5432"
@@ -883,6 +1133,7 @@ mod tests {
             config
                 .get_l4_backend("db.iroh.iakl.top", 6432, RouteMode::Tcp)
                 .await
+                .backend()
                 .unwrap()
                 .backend,
             "10.0.0.51:6432"
@@ -892,7 +1143,7 @@ mod tests {
             config
                 .get_l4_backend("db.iroh.iakl.top", 9999, RouteMode::Tcp)
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -910,6 +1161,7 @@ mod tests {
                 config
                     .get_l4_backend("db.iroh.iakl.top", port, RouteMode::Tcp)
                     .await
+                    .backend()
                     .map(|r| r.backend),
                 Some("10.0.0.50:5432".to_string()),
                 "port {port}"
@@ -974,13 +1226,14 @@ mod tests {
             config
                 .get_backend("typo.iroh.iakl.top", "/")
                 .await
-                .is_none()
+                .is_no_route()
         );
         // The routed host is unaffected.
         assert_eq!(
             config
                 .get_backend("fn.iroh.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the http route serves this host")
                 .url,
             "http://10.0.0.5:8080"
@@ -1003,6 +1256,7 @@ mod tests {
             config
                 .get_backend("anything.test", "/")
                 .await
+                .backend()
                 .expect("the catch-all serves what no other route names")
                 .url,
             "http://10.0.0.9:9000"
@@ -1012,17 +1266,23 @@ mod tests {
             config
                 .get_backend("api.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the exact route serves this host")
                 .url,
             "http://10.0.0.5:8080"
         );
         // It is an `http` route, not a fallback for the other modes.
-        assert_eq!(config.get_passthrough_backend("anything.test").await, None);
+        assert!(
+            config
+                .get_passthrough_backend("anything.test")
+                .await
+                .is_no_route()
+        );
         assert!(
             config
                 .get_l4_backend("anything.test", 443, RouteMode::Tcp)
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -1044,6 +1304,7 @@ mod tests {
             config
                 .get_backend_with_acl("api.iakl.top", "/", Some(&acl))
                 .await
+                .backend()
                 .expect("an allowed host reaches its route")
                 .url,
             "http://10.0.0.5:8080"
@@ -1053,7 +1314,7 @@ mod tests {
             config
                 .get_backend_with_acl("admin.iakl.top", "/", Some(&acl))
                 .await
-                .is_none()
+                .is_no_route()
         );
         // So is an unrouted one: being on the allowlist does not conjure a
         // route for a host the server does not serve.
@@ -1061,7 +1322,7 @@ mod tests {
             config
                 .get_backend_with_acl("typo.iakl.top", "/", Some(&acl))
                 .await
-                .is_none()
+                .is_no_route()
         );
     }
 
@@ -1088,6 +1349,7 @@ mod tests {
             config
                 .get_backend_with_acl("other.iakl.top", "/", Some(&acl))
                 .await
+                .backend()
                 .expect("the allowlist names this host")
                 .url,
             "http://10.0.0.9:9000"
@@ -1100,9 +1362,9 @@ mod tests {
             config
                 .get_backend_with_acl("other.iakl.top", "/", Some(&narrow))
                 .await
-                .is_none()
+                .is_no_route()
         );
-        assert!(config.get_backend("other.iakl.top", "/").await.is_some());
+        assert!(config.get_backend("other.iakl.top", "/").await.is_found());
     }
 
     #[test]
@@ -1129,6 +1391,7 @@ mod tests {
                 config
                     .get_backend(host, "/")
                     .await
+                    .backend()
                     .unwrap_or_else(|| panic!("host {host} must reach its route"))
                     .url,
                 "http://10.0.0.5:8080",
@@ -1144,6 +1407,7 @@ mod tests {
             uppercase
                 .get_backend("api.iakl.top", "/")
                 .await
+                .backend()
                 .expect("the folded pattern matches the lowercase host")
                 .url,
             "http://10.0.0.7:8080"
@@ -1160,13 +1424,18 @@ mod tests {
         ]);
 
         assert_eq!(
-            config.get_passthrough_backend("FN.IROH.IAKL.TOP.").await,
+            config
+                .get_passthrough_backend("FN.IROH.IAKL.TOP.")
+                .await
+                .found()
+                .map(|lease| lease.url().to_string()),
             Some("caddy:443".to_string())
         );
         assert_eq!(
             config
                 .get_l4_backend("DB.Iroh.Iakl.Top.", 5432, RouteMode::Tcp)
                 .await
+                .backend()
                 .expect("the folded host reaches the L4 route")
                 .backend,
             "10.0.0.50:5432"
@@ -1425,6 +1694,7 @@ mod tests {
             config
                 .get_l4_backend("ssh.example.com", 443, RouteMode::Tcp)
                 .await
+                .backend()
                 .expect("port 443 has a route")
                 .backend,
             "tls-backend:443"
@@ -1435,6 +1705,7 @@ mod tests {
             config
                 .get_l4_backend("ssh.example.com", 22, RouteMode::Tcp)
                 .await
+                .backend()
                 .expect("port 22 falls to the catch-all")
                 .backend,
             "fallback:22"
@@ -1454,6 +1725,7 @@ mod tests {
             catch_all_first
                 .get_backend("api.example.com", "/")
                 .await
+                .backend()
                 .expect("the wildcard has a route")
                 .url,
             "http://10.0.0.2:8080"
@@ -1464,6 +1736,7 @@ mod tests {
             wildcard_first
                 .get_backend("api.example.com", "/")
                 .await
+                .backend()
                 .expect("the wildcard has a route")
                 .url,
             "http://10.0.0.2:8080"
@@ -1474,6 +1747,7 @@ mod tests {
             wildcard_first
                 .get_backend("elsewhere.test", "/")
                 .await
+                .backend()
                 .expect("the catch-all has a route")
                 .url,
             "http://10.0.0.1:8080"
@@ -1490,6 +1764,7 @@ mod tests {
             config
                 .get_backend(host_without_port("[::1]:8080"), "/")
                 .await
+                .backend()
                 .expect("the literal host reaches the route")
                 .url,
             "http://10.0.0.5:8080"

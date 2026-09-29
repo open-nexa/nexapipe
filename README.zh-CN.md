@@ -281,8 +281,8 @@ domains = ["app.example.com"]
 | `[iroh] relay_mode` | `default`：使用 N0 中继，按延迟挑选 home relay |
 | `mode` | `http` |
 | `path_pattern` | `/`，前缀匹配 |
-| `strategy` | `round_robin` |
-| `[health_check]` | 开启：每 10 秒 `GET {backend}/health`。后端没有这个端点时会被记为失败，但**流量照常转发** —— 没有任何健康后端时连接池会回退到第一个条目 —— 所以那只是日志噪音，不是故障。设 `enabled = false` 即可消停。 |
+| `strategy` | `round_robin`（或 `random`，或 `least_conn` —— 优先给当前在途请求最少的后端） |
+| `[health_check]` | 开启：每 10 秒 `GET {backend}/health`。后端没有这个端点时会被记为失败，但**只有一个后端的路由仍然照常转发** —— 那里没有第二个可挑的选项 —— 所以那只是日志噪音，不是故障；有多个后端且全部不健康时，直接回 503 且不再拨号。设 `enabled = false` 即可消停。 |
 | `[log]` | `./logs` 下的滚动日志 + 控制台输出，查询参数值会被脱敏 |
 | `[auth]`、`[peers]` | 不做任何认证 —— 启动时服务端会打印一条警告横幅。本机试用没问题；要拿去面对真正在意的服务时，至少加上 `[peers] allow`（或 2FA）。 |
 
@@ -365,7 +365,7 @@ domains = ["app.example.com"]
 host_pattern = "comfyui.example.com"
 path_pattern = "/"
 path_is_prefix = true
-strategy = "round_robin"          # 或 "random"
+strategy = "round_robin"          # 或 "random" / "least_conn"
 backends = ["http://192.0.2.20:18188"]
 mode = "http"                     # 默认
 # path_rewrite = "/api"

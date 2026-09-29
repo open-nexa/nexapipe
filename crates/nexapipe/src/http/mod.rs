@@ -1,4 +1,4 @@
-use crate::routes::{BackendInfo, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use ::http::{Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -126,15 +126,32 @@ pub async fn proxy_request(
     let method = req.method().clone();
 
     let backend_info: BackendInfo = match config.get_backend(host, path).await {
-        Some(info) => info,
-        None => {
-            // No route serves this host: saying 404 beats guessing at one.
+        BackendLookup::Found(info) => info,
+        // No route serves this host: saying 404 beats guessing at one.
+        BackendLookup::NoRoute => {
             return Ok(create_error_response(
                 hyper::StatusCode::NOT_FOUND,
                 &format!("No route for host {host}"),
             ));
         }
+        // The route is configured and every backend behind it is unhealthy. 503
+        // rather than 404, because the difference is which file the operator has
+        // to open: nothing here is misconfigured, something downstream is down.
+        BackendLookup::Unavailable => {
+            tracing::warn!("No healthy backend behind {host}{path}, answering 503");
+            return Ok(create_error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                &format!("No healthy backend for host {host}"),
+            ));
+        }
     };
+
+    // `backend_info` carries the lease (see `BackendInfo::_lease`), so the
+    // backend is counted as busy until this function returns — which is until
+    // the response head is in hand. A response whose body *then* streams is not
+    // counted for the whole stream, so `least_conn` sees a long-running transfer
+    // as finished; that skews a balance decision at worst, and it is the one path
+    // the lease cannot follow without owning the response body.
 
     let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
         if backend_info.path_is_prefix && path.starts_with(&backend_info.path_pattern) {

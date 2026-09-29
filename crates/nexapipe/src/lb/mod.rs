@@ -1,11 +1,16 @@
 use rand;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LoadBalancingStrategy {
     RoundRobin,
     Random,
+    /// Fewest requests outstanding to this backend wins; see
+    /// [`BackendPool::select_backend`] for what "outstanding" counts and what
+    /// happens to the ties.
+    LeastConn,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +56,70 @@ impl BackendStatus {
     }
 }
 
+/// One backend in the pool: its health, and how much work it has outstanding.
+///
+/// The two sit together because choosing between backends needs both, and not
+/// behind one lock because they are not read the same way: health changes twice
+/// an `interval` from one probe, while the load is touched on every flow. [`Self::in_flight`]
+/// is atomic so that releasing it — which happens in a `Drop`, with no chance
+/// to await anything — can always happen, and never waits behind a health probe.
+#[derive(Debug)]
+struct BackendEntry {
+    status: RwLock<BackendStatus>,
+    in_flight: AtomicUsize,
+}
+
+impl BackendEntry {
+    fn new(url: String) -> Self {
+        BackendEntry {
+            status: RwLock::new(BackendStatus::new(url)),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// A backend handed out for one flow.
+///
+/// Holding this is what makes `least_conn` true: `Drop` is where the backend's
+/// load goes back down, so the caller decides when the work counts as finished
+/// simply by deciding when to let go. A caller that releases early tells the
+/// balancer the work is over; there is no second, mandatory step to forget.
+///
+/// That freedom has a failure mode — see the tie-breaking note on
+/// [`BackendPool::select_backend`] for how the pick degrades rather than
+/// stampedes when a lease is released too early.
+pub struct BackendLease {
+    entry: Arc<BackendEntry>,
+    url: String,
+}
+
+impl BackendLease {
+    /// The address this flow is to be forwarded to.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+// Hand-written because the useful `Debug` for this is not its fields but what it
+// is: an address, and how much work the pool thinks that address has.
+impl std::fmt::Debug for BackendLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendLease")
+            .field("url", &self.url)
+            .field("outstanding", &self.entry.in_flight.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl Drop for BackendLease {
+    fn drop(&mut self) {
+        self.entry.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendPool {
-    backends: Vec<Arc<RwLock<BackendStatus>>>,
+    backends: Vec<Arc<BackendEntry>>,
     strategy: LoadBalancingStrategy,
     round_robin_index: Arc<RwLock<usize>>,
 }
@@ -62,7 +128,7 @@ impl BackendPool {
     pub fn new(backends: Vec<String>, strategy: LoadBalancingStrategy) -> Self {
         let backend_statuses = backends
             .into_iter()
-            .map(|url| Arc::new(RwLock::new(BackendStatus::new(url))))
+            .map(|url| Arc::new(BackendEntry::new(url)))
             .collect();
 
         BackendPool {
@@ -72,25 +138,54 @@ impl BackendPool {
         }
     }
 
-    pub async fn select_backend(&self) -> String {
+    /// A backend to send this flow to, or `None` when the pool has nothing left
+    /// to serve.
+    ///
+    /// One healthy backend is enough to get an answer, and the two unhappy cases
+    /// are deliberately answered differently:
+    ///
+    /// - **Nothing healthy, one backend in the pool.** Handed out anyway. With
+    ///   one candidate, health information buys nothing — there is no second
+    ///   choice for it to inform — and refusing would take down the only path
+    ///   this route has in order to report that the one path is unavailable.
+    /// - **Nothing healthy, several backends.** `None`: all of them being down
+    ///   *is* the answer, and dialling the first one regardless spends the whole
+    ///   connect timeout writing the same `502`/refusal the caller can write now,
+    ///   with nothing left to try afterwards.
+    ///
+    /// `None` from a **pool of one** therefore never happens, and from a pool of
+    /// several it is not routeable — which is why callers must not collapse it
+    /// into their own "no route" answer. See each caller in
+    /// `crate::routes::RouteConfig`.
+    pub async fn select_backend(&self) -> Option<BackendLease> {
         let mut healthy_backends = Vec::new();
         for (i, b) in self.backends.iter().enumerate() {
-            if b.read().await.is_healthy() {
+            if b.status.read().await.is_healthy() {
                 healthy_backends.push(i);
             }
         }
 
         if healthy_backends.is_empty() {
-            // Still handed out, and deliberately: a route whose backends are all
-            // down keeps answering 502 rather than going dark, and the client
-            // gets an error it can act on instead of a hang. Callers that need
-            // to tell this from a healthy pool ask `healthy_count`.
-            tracing::warn!("No healthy backends available, falling back to all backends");
-            return if let Some(b) = self.backends.first() {
-                b.read().await.url.clone()
-            } else {
-                String::new()
-            };
+            // A pool of one has nothing to choose between, so health is not
+            // information here — it is a single backend that is either up, or
+            // the only chance this request has.
+            if self.backends.len() == 1 {
+                let url = self.backends[0].status.read().await.url.clone();
+                tracing::warn!(
+                    "Backend {} is the only one behind this route and reports unhealthy; \
+                     forwarding anyway, because refusing would answer for every request to it",
+                    url
+                );
+                return Some(self.lease(0).await);
+            }
+
+            // Several, all down: the question has an answer now, and it does not
+            // improve by dialling one of them.
+            tracing::warn!(
+                "No healthy backend among {} behind this route; refusing without dialling one",
+                self.backends.len()
+            );
+            return None;
         }
 
         let idx = match self.strategy {
@@ -104,12 +199,63 @@ impl BackendPool {
                 let rand_idx = (rand::random::<u64>() % healthy_backends.len() as u64) as usize;
                 healthy_backends[rand_idx]
             }
+            LoadBalancingStrategy::LeastConn => {
+                // Fewest requests outstanding wins. "Outstanding" is counted
+                // from the moment a backend is chosen until the flow releases
+                // its [`BackendLease`], which is wherever that flow decides the
+                // work ended — response written by the HTTP paths, flow copied
+                // by the tunnels and passthrough. It counts requests, not
+                // sockets: an HTTP backend is reached through a pooled,
+                // keep-alive client, and how many connections that pool is
+                // holding open is not something this process can see.
+                //
+                // Ties rotate rather than taking the first index, because almost
+                // every tie is "nothing is happening right now" — an idle proxy
+                // is all zeroes — and taking the first index would then send
+                // every request to the first healthy backend, which is the load
+                // this strategy exists to spread. Rotating also means a lease
+                // released too early costs a little accuracy instead of all of
+                // it: worst case the balance degrades towards round-robin.
+                let least = healthy_backends
+                    .iter()
+                    .map(|i| self.backends[*i].in_flight.load(Ordering::Relaxed))
+                    .min()
+                    .unwrap_or(0);
+                let tied: Vec<usize> = healthy_backends
+                    .into_iter()
+                    .filter(|i| self.backends[*i].in_flight.load(Ordering::Relaxed) == least)
+                    .collect();
+
+                let mut index = self.round_robin_index.write().await;
+                let idx = tied[*index % tied.len()];
+                *index = (*index + 1) % tied.len();
+                idx
+            }
         };
 
-        let selected = &self.backends[idx];
-        let url = selected.read().await.url.clone();
-        tracing::debug!("Selected backend: {} (strategy={:?})", url, self.strategy);
-        url
+        let selected = self.lease(idx).await;
+        let outstanding = self.backends[idx].in_flight.load(Ordering::Relaxed);
+        tracing::debug!(
+            "Selected backend: {} (strategy={:?}, outstanding={})",
+            selected.url(),
+            self.strategy,
+            outstanding,
+        );
+        // Some, because reaching here means one was chosen; the `None`s above are
+        // the cases where no choice exists at all.
+        Some(selected)
+    }
+
+    /// Hands out one backend, counting it as outstanding from here until the
+    /// lease is dropped.
+    async fn lease(&self, idx: usize) -> BackendLease {
+        // Indexed rather than looked up: every index handed here came out of
+        // this same vector in the caller, and an out-of-range one panics here
+        // rather than being quietly read as "no backend available".
+        let entry = Arc::clone(&self.backends[idx]);
+        let url = entry.status.read().await.url.clone();
+        entry.in_flight.fetch_add(1, Ordering::Relaxed);
+        BackendLease { entry, url }
     }
 
     pub fn len(&self) -> usize {
@@ -127,21 +273,21 @@ impl BackendPool {
     pub async fn backends(&self) -> Vec<String> {
         let mut result = Vec::new();
         for b in &self.backends {
-            result.push(b.read().await.url.clone());
+            result.push(b.status.read().await.url.clone());
         }
         result
     }
 
     /// How many backends are healthy right now.
     ///
-    /// `select_backend` never returns nothing — a pool with no healthy backend
-    /// still hands one out, so a dead route answers 502 instead of going dark —
-    /// so this is the only way a caller can tell that case from a pool that is
-    /// actually serving traffic.
+    /// Reported rather than deduced from [`BackendPool::select_backend`], which
+    /// still answers from a pool of one that is down — deliberately, see there —
+    /// so "healthy" and "handed out" are not the same question and only this one
+    /// answers the healthy half of it.
     pub async fn healthy_count(&self) -> usize {
         let mut count = 0;
         for backend in &self.backends {
-            if backend.read().await.is_healthy() {
+            if backend.status.read().await.is_healthy() {
                 count += 1;
             }
         }
@@ -155,7 +301,7 @@ impl BackendPool {
         // entries were down and the balancer kept picking them.
         let mut matched = false;
         for backend in &self.backends {
-            let mut status = backend.write().await;
+            let mut status = backend.status.write().await;
             if status.url != url {
                 continue;
             }
@@ -181,7 +327,7 @@ impl BackendPool {
     pub async fn get_backend_statuses(&self) -> Vec<(String, bool)> {
         let mut result = Vec::new();
         for b in &self.backends {
-            let status = b.read().await;
+            let status = b.status.read().await;
             result.push((status.url.clone(), status.healthy));
         }
         result
@@ -197,6 +343,12 @@ mod tests {
             backends.iter().map(|b| b.to_string()).collect(),
             LoadBalancingStrategy::RoundRobin,
         )
+    }
+
+    /// Same pool with another strategy. Every test below is about one strategy's
+    /// choice, so which one it is should be the only thing spelled at its top.
+    fn pool_with(strategy: LoadBalancingStrategy, backends: &[&str]) -> BackendPool {
+        BackendPool::new(backends.iter().map(|b| b.to_string()).collect(), strategy)
     }
 
     #[tokio::test]
@@ -217,19 +369,120 @@ mod tests {
         assert_eq!(pool.healthy_count().await, 0);
     }
 
+    /// The one backend a route has is the one it serves, health or not: there is
+    /// no second candidate for that information to choose between, and refusing
+    /// would answer for every request to a route rather than let any through.
     #[tokio::test]
-    async fn a_pool_with_no_healthy_backend_says_so_and_still_answers() {
+    async fn a_pool_of_one_is_handed_out_though_it_is_unhealthy() {
+        let pool = pool(&["http://only:80"]);
+        pool.set_backend_health("http://only:80", false).await;
+        assert_eq!(pool.healthy_count().await, 0);
+
+        let lease = pool
+            .select_backend()
+            .await
+            .expect("a single backend is the only path this route has");
+        assert_eq!(lease.url(), "http://only:80");
+    }
+
+    /// Several backends, none healthy: the answer is known before any dialling
+    /// happens, so none is attempted. This is a behaviour change — it used to
+    /// hand out the first one and let the client wait out a connect timeout.
+    #[tokio::test]
+    async fn a_pool_with_several_unhealthy_backends_refuses_without_dialling() {
         let pool = pool(&["http://a:80", "http://b:80"]);
         pool.set_backend_health("http://a:80", false).await;
         pool.set_backend_health("http://b:80", false).await;
 
-        // select_backend still hands one out — a route with a dead backend
-        // answers 502 rather than going dark — so the count is the only way to
-        // tell this pool from one that is serving traffic.
         assert_eq!(pool.healthy_count().await, 0);
         assert!(
-            !pool.select_backend().await.is_empty(),
-            "a pool with no healthy backend still has to name one"
+            pool.select_backend().await.is_none(),
+            "every backend behind this route is down, so there is nothing to dial"
+        );
+    }
+
+    /// An empty pool refuses, which cannot come from a config: `build_routes`
+    /// rejects a route with no backends. Reached only by a pool built in code.
+    #[tokio::test]
+    async fn an_empty_pool_refuses() {
+        let pool = pool(&[]);
+        assert!(pool.select_backend().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn least_conn_sends_the_next_flow_to_whichever_backend_is_freer() {
+        let pool = pool_with(
+            LoadBalancingStrategy::LeastConn,
+            &["http://a:80", "http://b:80"],
+        );
+
+        let busy = pool
+            .select_backend()
+            .await
+            .expect("both backends are idle and healthy");
+        // Still held: this backend has one flow against the other one's none.
+        assert_eq!(busy.url(), "http://a:80");
+
+        let next = pool
+            .select_backend()
+            .await
+            .expect("a healthy backend remains");
+        assert_eq!(
+            next.url(),
+            "http://b:80",
+            "the first backend is still serving the flow it was handed out for"
+        );
+
+        // Now the scores are level, and the tie rotates — which is why this is
+        // `least_conn` and not "one backend until somebody finishes".
+        drop(busy);
+        assert_eq!(
+            pool.select_backend().await.unwrap().url(),
+            "http://a:80",
+            "A is free again while B still carries its flow, so A is next"
+        );
+    }
+
+    /// What keeps `least_conn` from being worse than `RoundRobin`: nearly every
+    /// tie is "nothing is running right now", and picking the lowest index would
+    /// then send everything to the first backend — the load this strategy exists
+    /// to spread.
+    #[tokio::test]
+    async fn least_conn_rotates_when_nothing_is_outstanding() {
+        let pool = pool_with(
+            LoadBalancingStrategy::LeastConn,
+            &["http://a:80", "http://b:80"],
+        );
+
+        let first = pool.select_backend().await.unwrap().url().to_string();
+        let second = pool.select_backend().await.unwrap().url().to_string();
+
+        assert_eq!(
+            (first.as_str(), second.as_str()),
+            ("http://a:80", "http://b:80"),
+            "both are idle, so the two picks should not land on the same backend"
+        );
+    }
+
+    /// A lease nobody held any more has to have been released, or every later
+    /// choice is made against a count that only ever grows.
+    #[tokio::test]
+    async fn dropping_a_lease_releases_the_backend() {
+        let pool = pool_with(
+            LoadBalancingStrategy::LeastConn,
+            &["http://a:80", "http://b:80"],
+        );
+
+        let first = pool.select_backend().await.unwrap();
+        drop(first);
+
+        assert_eq!(
+            pool.backends
+                .iter()
+                .map(|b| b.in_flight.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            vec![0, 0],
+            "a dropped lease is finished work"
         );
     }
 }

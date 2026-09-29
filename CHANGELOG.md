@@ -10,6 +10,45 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+M1 and M2 of the v0.4.0 plan (see `.workbuddy/plans/v0.4.0.md`, a working note,
+not part of the tree). Not yet released, so no version numbers have moved.
+
+### Added
+
+- `least_conn` as a third load-balancing strategy, alongside `round_robin` and
+  `random`: pick the healthy backend with the fewest requests outstanding to it,
+  under a lease released when the flow finishes. Ties rotate rather than taking
+  the first index, because a tie almost always means nothing is running — and
+  taking the first index would then send everything to one backend, which is the
+  load this strategy exists to spread. It counts requests, not sockets, because
+  how many connections the pooled HTTP client is holding open is not something
+  this process can see.
+### Changed
+
+- **A route whose backends are all unhealthy now depends on how many there are.**
+  One backend is still handed out, because with nothing to choose between the
+  health information buys nothing and refusing would answer for every request to
+  that route. Several, all down, refuse without dialling: the answer is already
+  known, so a connect timeout was only ever spent delivering this refusal late.
+- A refused HTTP request distinguishes why. No route serves the host: `404`, as
+  before. The route exists and nothing behind it is healthy: `503` — the route is
+  configured correctly and something downstream is down, which is a different
+  thing to open. An L4 flow says the same on the wire with `Status::BackendFailed`
+  rather than `NoRoute`, which would have told the client its request was
+  misconfigured at the moment it was correct.
+
+### Fixed
+
+- The DNS cache in the TUN proxy (`crates/nexapipe-client/src/tun_proxy.rs`)
+  answered more than it knew: entries were keyed without QCLASS, so one class was
+  served from another's answer; they were not keyed on the resolvers that
+  produced them; a hit rewrote only the transaction ID, so a long-lived answer
+  went back out with its full TTL again; and a zero TTL got a one-second floor
+  instead of not being cached. Those tests are now executed in CI, which had only
+  been compiling them.
+
 ## [0.3.0] — 2026-09-29
 
 A readable version of this release, with downloads, is published at
