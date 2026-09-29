@@ -10,7 +10,7 @@ lifecycleRuntimeKtx = "2.10.0"
 activityCompose = "1.12.4"
 composeBom = "2026.09.00"
 cameraX = "1.4.2"
-zxing = "3.5.3"
+zxing = "3.5.4"
 # 1.1.0 is the newest stable release of androidx.biometric; everything after it
 # is an alpha. It pulls `fragment` (1.2.5) and `appcompat` (1.2.0) transitively,
 # which is why the fragment version is pinned here rather than left to that.
