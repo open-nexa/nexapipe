@@ -117,18 +117,25 @@ impl PeerRegistry {
     /// stable between two calls that saw nothing change.
     pub fn snapshot(&self) -> Vec<PeerInfo> {
         let peers = read(&self.peers);
-        let mut out: Vec<PeerInfo> = peers
+        let mut entries: Vec<(EndpointId, Peer)> = peers
             .iter()
             .flat_map(|(endpoint_id, entries)| {
-                entries.iter().map(move |peer| PeerInfo {
-                    endpoint_id: *endpoint_id,
-                    connected_for: peer.since.elapsed(),
-                    path: peer.path,
-                })
+                entries.iter().map(move |peer| (*endpoint_id, *peer))
             })
             .collect();
-        out.sort_by_key(|info| info.connected_for);
-        out
+        // Ordered by when a connection was added, not by how long it has been
+        // open: `elapsed()` is read while this runs, so sorting by it puts the
+        // shortest-lived connection first and lets two calls a moment apart
+        // disagree about the order. `since` is fixed at insert time.
+        entries.sort_by_key(|(_, peer)| peer.since);
+        entries
+            .into_iter()
+            .map(|(endpoint_id, peer)| PeerInfo {
+                endpoint_id,
+                connected_for: peer.since.elapsed(),
+                path: peer.path,
+            })
+            .collect()
     }
 
     /// How many connections are being served, which is how many entries
@@ -246,6 +253,32 @@ mod tests {
 
         drop(first);
         assert!(registry.is_empty(), "the peer outlived its last connection");
+    }
+
+    /// The list is oldest first, and the order does not depend on when this
+    /// runs: `connected_for` is measured while the snapshot is taken, so
+    /// ordering by it would list a reconnect above the connection it follows.
+    #[test]
+    fn a_reconnect_is_listed_after_the_connection_it_follows() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let first = registry.insert(a, PathKind::Relay);
+        let second = registry.insert(a, PathKind::Direct);
+
+        let listed = registry.snapshot();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, PathKind::Relay, "the newer came first");
+        assert_eq!(listed[1].path, PathKind::Direct);
+        assert!(
+            listed[0].connected_for >= listed[1].connected_for,
+            "the older connection reports a shorter life: {:?} then {:?}",
+            listed[0].connected_for,
+            listed[1].connected_for
+        );
+
+        drop(first);
+        drop(second);
     }
 
     /// The path is updated in place, because a connection that starts relayed
