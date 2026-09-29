@@ -37,7 +37,7 @@ NexaPipe is a Rust workspace with four parts:
 [Security](#security-boundary) ·
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
 [Development](#development) · [Contributing](CONTRIBUTING.md) ·
-[Roadmap](docs/ROADMAP.md)
+[Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md)
 
 ---
 
@@ -388,9 +388,12 @@ Relay modes:
 A `relay_mode` that is present but unusable — `custom` with no URL, an
 unrecognised spelling — stops startup instead of quietly falling back. A
 `relay_url` next to a mode that does not take one is ignored and logged.
-`custom` constrains **this** endpoint only: a peer advertising an N0 relay is
-still dialled through it, and Endpoint ID discovery still queries
-`dns.iroh.link` — neither has a switch in iroh 1.0.1.
+
+**What no `relay_mode` changes:** Endpoint ID discovery still queries
+`dns.iroh.link`, and `custom` constrains this endpoint only — a peer advertising
+an N0 relay is still dialled through it. Neither has a switch in iroh 1.x.
+[What still depends on third-party infrastructure](docs/iroh-boundaries.md)
+states the boundary in full, including what `custom` does and does not buy.
 
 ### `[[routes]]` — routing
 
