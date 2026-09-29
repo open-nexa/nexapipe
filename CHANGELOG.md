@@ -14,8 +14,9 @@ For what comes next, and for why some things are deliberately not planned, see
 
 0.2.0 was never tagged, so what was recorded against it ships here: one tag,
 everything since 0.1.1, with those entries merged into this one. A readable
-version of this release, with downloads, lives in
-[docs/releases/v0.3.0.html](docs/releases/v0.3.0.html).
+version of this release, with downloads, is published at
+<https://yixinin.github.io/nexapipe/releases/v0.3.0.html>. The page itself
+lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Added
 

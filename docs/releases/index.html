@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexaPipe — releases</title>
+<meta name="description" content="Release notes and downloads for every NexaPipe version.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f7f8fa;
+    --panel-hover: #f0f2f5;
+    --border: #e4e7ec;
+    --text: #16181d;
+    --muted: #6b7280;
+    --accent: #1668dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-hover: #1e222b;
+      --border: #282d36;
+      --text: #e6e8eb;
+      --muted: #98a1ad;
+      --accent: #4d9dff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 0 20px 72px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.site { border-bottom: 1px solid var(--border); padding: 14px 0; margin-bottom: 40px; }
+  header.site .wrap {
+    padding-bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand { font-weight: 700; font-size: 17px; letter-spacing: -0.2px; }
+  .brand span { color: var(--muted); font-weight: 500; }
+  header.site nav { display: flex; gap: 18px; font-size: 14px; }
+  header.site nav a { color: var(--muted); }
+  header.site nav a:hover { color: var(--accent); }
+
+  h1 { font-size: 38px; line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 12px; }
+  .lede { font-size: 17px; color: var(--muted); margin: 0 0 32px; }
+  h2 { font-size: 20px; margin: 40px 0 12px; }
+  .hint { color: var(--muted); margin: 0 0 16px; font-size: 15px; }
+
+  ul.rows { list-style: none; margin: 0; padding: 0; }
+  ul.rows li { margin-bottom: 8px; }
+  ul.rows a.row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    text-decoration: none;
+  }
+  ul.rows a.row:hover { background: var(--panel-hover); text-decoration: none; }
+  ul.rows .name { font-weight: 600; display: block; }
+  ul.rows .file { color: var(--muted); font-size: 13px; display: block; }
+  ul.rows .get { color: var(--accent); font-size: 14px; font-weight: 600; white-space: nowrap; }
+
+  footer.site {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 14px;
+  }
+  @media (max-width: 560px) {
+    h1 { font-size: 32px; }
+    ul.rows a.row { flex-direction: column; align-items: flex-start; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <div class="brand">NexaPipe <span>releases</span></div>
+    <nav>
+      <a href="https://github.com/yixinin/nexapipe">GitHub</a>
+      <a href="https://github.com/yixinin/nexapipe/releases/latest">All releases</a>
+      <a href="https://github.com/yixinin/nexapipe/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/yixinin/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <h1>Releases</h1>
+  <p class="lede">One page per version, with the downloads for Linux, macOS, Windows and Android,
+    and the checksums to verify them. One tag ships the server archives, the desktop bundles and
+    the Android APK together.</p>
+
+  <h2>Versions</h2>
+  <p class="hint">Newest first. 0.2.0 was never tagged, so what was recorded against it ships inside 0.3.0.</p>
+  <ul class="rows">
+    <li><a class="row" href="v0.3.0.html">
+      <span><span class="name">0.3.0</span><span class="file">29 September 2026 &middot; health, metrics and live instance state behind a loopback listener</span></span>
+      <span class="get">Release notes</span></a></li>
+  </ul>
+
+  <footer class="site">
+    NexaPipe is licensed under the terms in <code>LICENSE</code>. &middot;
+    <a href="https://github.com/yixinin/nexapipe/blob/main/CHANGELOG.md">Changelog</a> &middot;
+    <a href="https://github.com/yixinin/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a> &middot;
+    <a href="https://github.com/yixinin/nexapipe/blob/main/docs/iroh-boundaries.md">iroh boundaries</a> &middot;
+    <a href="https://github.com/yixinin/nexapipe">Repository</a>
+  </footer>
+</div>
+
+</body>
+</html>
