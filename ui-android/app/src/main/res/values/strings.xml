@@ -168,6 +168,7 @@
     <string name="credential_lock_secret_subtitle">Show the 2FA secret of this endpoint</string>
     <string name="credential_lock_export_subtitle">Share this endpoint\'s 2FA configuration</string>
     <string name="credential_lock_relay_subtitle">Change where this device relays traffic</string>
+    <string name="credential_lock_two_factor_subtitle">Switch this endpoint\'s 2FA on or off</string>
     <string name="credential_lock_scan_secret_subtitle">Scan a 2FA QR code for this endpoint</string>
     <string name="credential_lock_scan_invite_subtitle">Scan an endpoint invite QR code</string>
     <string name="credential_lock_paste_invite_subtitle">Import an endpoint invite link</string>
@@ -175,6 +176,8 @@
     <string name="credential_lock_edit_id_subtitle">Change this endpoint ID</string>
     <string name="credential_lock_delete_subtitle">Delete this endpoint and its 2FA credentials</string>
     <string name="credential_lock_copy_domain_subtitle">Copy this domain</string>
+    <string name="credential_lock_add_domain_subtitle">Route another domain through this endpoint</string>
+    <string name="credential_lock_remove_domain_subtitle">Stop routing this domain through this endpoint</string>
     <string name="credential_lock_reveal">Show the secret</string>
     <string name="credential_lock_relay_action">Authenticate to change</string>
     <string name="credential_lock_unavailable_title">No screen lock on this device</string>

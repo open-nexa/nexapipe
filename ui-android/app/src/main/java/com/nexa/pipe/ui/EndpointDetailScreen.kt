@@ -89,6 +89,20 @@ fun EndpointDetailScreen(
     }
 
     /**
+     * Opens the add-domain dialog, behind the credential door.
+     *
+     * Adding a domain is a routing decision, not a list edit: what is typed
+     * here starts going through this endpoint — and with it, whatever this
+     * endpoint authenticates as.
+     */
+    fun addDomainConfirmed() {
+        credentialUnlock.requestIfLocked(
+            localizedContext,
+            R.string.credential_lock_add_domain_subtitle
+        ) { showAddDomainDialog = true }
+    }
+
+    /**
      * [copyToClipboard] behind the credential door.
      *
      * The clipboard is not private: anything on this device can read it back,
@@ -273,7 +287,7 @@ fun EndpointDetailScreen(
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = { showAddDomainDialog = true },
+                onClick = { addDomainConfirmed() },
                 icon = { Icon(Icons.Default.Add, contentDescription = null) },
                 text = { Text(stringResource(R.string.domain_add)) }
             )
@@ -414,7 +428,20 @@ fun EndpointDetailScreen(
                             Switch(
                                 checked = twoFactor.enabled,
                                 onCheckedChange = { enabled ->
-                                    updateTwoFactor { current -> current.copy(enabled = enabled) }
+                                    // Switching this off stops the endpoint
+                                    // from presenting a token at all, and
+                                    // switching it on hands this app's
+                                    // credentials to it — both are a change to
+                                    // how this endpoint authenticates, so both
+                                    // are asked for. The switch still shows
+                                    // what the state is; only moving it takes
+                                    // a confirmation.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_two_factor_subtitle
+                                    ) {
+                                        updateTwoFactor { current -> current.copy(enabled = enabled) }
+                                    }
                                 }
                             )
                         }
@@ -686,7 +713,7 @@ fun EndpointDetailScreen(
                                 textAlign = TextAlign.Center
                             )
                             Spacer(modifier = Modifier.height(16.dp))
-                            FilledTonalButton(onClick = { showAddDomainDialog = true }) {
+                            FilledTonalButton(onClick = { addDomainConfirmed() }) {
                                 Icon(
                                     Icons.Default.Add,
                                     contentDescription = null,
@@ -719,11 +746,17 @@ fun EndpointDetailScreen(
                                             R.string.credential_lock_copy_domain_subtitle
                                         )
                                     },
-                                    // A domain is configuration the user wrote
-                                    // themselves, and removing one is one tap
-                                    // away from being undone, so it is not
-                                    // gated — only what leaves the app is.
-                                    onRemove = { removeDomain(domain) }
+                                    // Removing changes where this domain goes
+                                    // as surely as adding does. The undo is a
+                                    // convenience for the user, not a reason
+                                    // to leave the door open: what is undone
+                                    // has already been done once.
+                                    onRemove = {
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_remove_domain_subtitle
+                                        ) { removeDomain(domain) }
+                                    }
                                 )
                                 if (index < node.domains.lastIndex) {
                                     HorizontalDivider(
