@@ -1,5 +1,5 @@
 use crate::auth::ClientAcl;
-use crate::config::RouteMode;
+use crate::config::{RouteMode, Timeouts};
 use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -445,13 +445,40 @@ impl std::fmt::Debug for L4RouteInfo {
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
     routes: Arc<RwLock<Vec<Route>>>,
+    /// How long to wait on a backend, resolved once at startup.
+    ///
+    /// Held here rather than threaded down to each stream handler because this
+    /// object is what every one of them already receives — routing and the
+    /// deadlines its choices are carried out under arrive together, so there is
+    /// no third thing for every call site in `conn` to remember to pass. It is
+    /// not part of the routing table and a reload leaves it alone: changing a
+    /// timeout takes a restart, like every key outside `[[routes]]`.
+    timeouts: Timeouts,
 }
 
 impl RouteConfig {
     pub fn new(routes: Vec<Route>) -> Self {
         Self {
             routes: Arc::new(RwLock::new(routes)),
+            timeouts: Timeouts::default(),
         }
+    }
+
+    /// A table whose flows wait on these deadlines rather than the defaults.
+    ///
+    /// The only construction that matters outside a test: defaults exist so a
+    /// table built anywhere else — the local proxy, the tests — behaves exactly
+    /// as it did before this field existed.
+    pub fn with_timeouts(routes: Vec<Route>, timeouts: Timeouts) -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(routes)),
+            timeouts,
+        }
+    }
+
+    /// The deadlines a flow reaching through this table waits on.
+    pub fn timeouts(&self) -> Timeouts {
+        self.timeouts
     }
 
     /// Backend for an HTTP request. Callers answer
@@ -642,6 +669,10 @@ impl RouteConfig {
     /// Carrying the old pool over also keeps its health state. An edit to an
     /// unrelated route is not a reason to decide that every backend is healthy
     /// again.
+    ///
+    /// `timeouts` is not touched: it was read once at startup, into the HTTP
+    /// client and into this table, and a reload is a routing change rather than a
+    /// restatement of how long a dial may take.
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
         let mut routes = self.routes.write().await;
 

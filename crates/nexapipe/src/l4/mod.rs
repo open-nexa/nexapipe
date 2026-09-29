@@ -45,10 +45,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 /// How long a client may take to spell out a complete preface.
+///
+/// Not `[timeouts]`: this waits on the client's own bytes, and every other wait
+/// in that section is a wait on a backend.
 const PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a backend connection may take to establish.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a UDP flow may sit idle before it is torn down, unless the route sets
 /// `idle_timeout_secs`. Kept well above a typical DNS or database keep-alive interval.
@@ -290,8 +290,9 @@ where
         peer
     );
 
+    let connect_timeout = config.timeouts().connect;
     let result = match preface.proto {
-        L4Proto::Tcp => serve_tcp(stream, &route.backend, leftover).await,
+        L4Proto::Tcp => serve_tcp(stream, &route.backend, leftover, connect_timeout).await,
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT);
             serve_udp(stream, &route.backend, leftover, idle).await
@@ -332,7 +333,12 @@ where
 }
 
 /// TCP: dial the backend, hand the client its status byte, then copy raw bytes.
-async fn serve_tcp<S>(mut stream: S, backend: &str, leftover: Vec<u8>) -> anyhow::Result<()>
+async fn serve_tcp<S>(
+    mut stream: S,
+    backend: &str,
+    leftover: Vec<u8>,
+    connect_timeout: Duration,
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -341,7 +347,7 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
-    let mut backend_stream = match connect(&host, port).await {
+    let mut backend_stream = match connect(&host, port, connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
@@ -513,8 +519,13 @@ where
     Ok(())
 }
 
-async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+/// Dials a backend within `[timeouts] connect_secs`.
+///
+/// One deadline for every tunnel and every passthrough, because they are the
+/// same action: one TCP dial toward one backend. They used to carry three copies
+/// of ten seconds, kept in step by whoever happened to look.
+async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
         .await
         .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
         .map_err(|e| anyhow::anyhow!("failed to connect to backend {host}:{port}: {e}"))?;

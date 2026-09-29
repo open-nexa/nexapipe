@@ -485,6 +485,35 @@ clamped silently, and each of the three then meant something nobody would ask fo
 — a probe round every second, a probe that can never finish, or a single failure
 emptying the pool. A config that says `0` is refused at load.
 
+### `[timeouts]` — waiting on a backend
+
+```toml
+[timeouts]
+connect_secs = 10     # default: 10 — dialing a backend
+response_secs = 30    # default: 30 — waiting for its answer
+```
+
+Both are seconds, both are optional, and the defaults are the deadlines this
+server always used, so writing the section changes nothing until you put a number
+in it. Neither one bounds how long a request may take: each covers **one step of
+talking to a backend**, and once a response head arrives, streaming its body can
+run as long as it needs to.
+
+| key | covers | raise it when |
+|---|---|---|
+| `connect_secs` | dialing. Every path that opens one connection toward one backend: HTTP requests (including the WebSocket upgrade), TLS passthrough and `tcp` tunnels. | the backend is across a slow or lossy link — too short a value there fails every request, and it fails looking like an outage. |
+| `response_secs` | waiting for the backend's answer: the status line, or for a WebSocket, the upgrade response. Ends as soon as the head arrives. | an API computes before it answers. A backend that never answers at all is what it limits. |
+
+`0` is refused at load, and so is anything past `3600`: the first is a deadline no
+backend can meet, and the second is not a slow backend but one that has stopped
+answering, with nothing left holding the request slot.
+
+Waits on the **client's** own bytes are deliberately not here — the L4 preface,
+the TLS `ClientHello`, the first byte on the plaintext listener. Those are
+protocol mechanics, not "how patient should I be with this backend".
+
+Read once at startup, so editing either takes a restart.
+
 ### `[admin]` — the auxiliary listener (off by default)
 
 ```toml
@@ -648,6 +677,7 @@ is one table:
 | `[[routes]]` | Applied. Backends are re-probed; connections already open keep the route they were authorized against. |
 | `[auth]` | Applied, including `enabled` — turning 2FA on gates connections opened after the reload. A file holding secrets has to be `0600` or the reload is refused. |
 | `[health_check]` | Applied. `enabled` pauses and resumes probing; the rest takes effect for routes added or changed by a reload. |
+| `[timeouts]` | Restart-only: read once at startup, like `[server] listen_addr`. |
 | `[peers] allow` | Restart-only for now. |
 | `[iroh]` | Restart-only: the endpoint is bound once. |
 | `[server] listen_addr` | Restart-only — moving a listener is a restart. |

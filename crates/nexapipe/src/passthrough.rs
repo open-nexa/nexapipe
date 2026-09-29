@@ -35,10 +35,10 @@ const NAME_TYPE_HOST: u8 = 0x00;
 const MAX_HANDSHAKE_LEN: usize = 16 * 1024;
 
 /// How long to wait for the rest of the `ClientHello` before giving up on it.
+///
+/// Not `[timeouts]`: this waits on the client's own bytes, and every key in that
+/// section is a wait on a backend.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a backend connection may take to establish.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// True when `first_byte` starts a TLS handshake record.
 pub fn is_tls_handshake(first_byte: u8) -> bool {
@@ -61,7 +61,7 @@ pub async fn handle_iroh_stream(
         return Ok(());
     };
 
-    let mut backend = connect(&host, port).await?;
+    let mut backend = connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
 
     let client = DuplexIroh::new(send, recv);
@@ -89,16 +89,21 @@ pub async fn handle_tcp_stream(
         return Ok(());
     };
 
-    let mut backend = connect(&host, port).await?;
+    let mut backend = connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
 
     copy_both_ways(client, backend, "TLS passthrough").await?;
     Ok(())
 }
 
-async fn connect(host: &str, port: u16) -> anyhow::Result<tokio::net::TcpStream> {
+/// One TCP dial toward one backend, under `[timeouts] connect_secs`.
+async fn connect(
+    host: &str,
+    port: u16,
+    connect_timeout: Duration,
+) -> anyhow::Result<tokio::net::TcpStream> {
     let stream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
+        connect_timeout,
         tokio::net::TcpStream::connect((host, port)),
     )
     .await

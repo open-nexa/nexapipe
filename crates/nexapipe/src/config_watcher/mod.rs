@@ -596,7 +596,9 @@ mod tests {
         let watcher = ConfigWatcher::new(
             path,
             Arc::new(RouteConfig::new(Vec::new())),
-            Arc::new(crate::http::create_http_client()),
+            Arc::new(crate::http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),
@@ -816,7 +818,9 @@ mod tests {
         let watcher = ConfigWatcher::new(
             path_str,
             Arc::new(RouteConfig::new(Vec::new())),
-            Arc::new(crate::http::create_http_client()),
+            Arc::new(crate::http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),

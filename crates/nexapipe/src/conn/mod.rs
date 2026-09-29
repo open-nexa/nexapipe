@@ -1,6 +1,7 @@
 use crate::auth::{
     AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
 };
+use crate::config::Timeouts;
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
@@ -362,13 +363,14 @@ pub async fn handle_bidi_stream(
     let outcome: Result<http::ProxySummary, http::ProxyFailure> =
         if http::is_websocket_request_static(&request) {
             tracing::debug!("WebSocket request detected");
-            handle_websocket_stream(send, recv, &request, &backend_info.url)
+            handle_websocket_stream(send, recv, &request, &backend_info.url, config.timeouts())
                 .await
                 .map_err(http::ProxyFailure::from)
         } else {
             let mut send = send;
             http::proxy_to_backend_streaming(
                 client,
+                config.timeouts(),
                 &request,
                 &backend_info.url,
                 body_data,
@@ -420,20 +422,12 @@ pub async fn handle_bidi_stream(
     }
 }
 
-/// How long dialing a backend for a WebSocket upgrade may take.
-///
-/// The HTTP path gets its connect timeout from the client builder and the TCP
-/// and TLS tunnels have their own; this was the one dial in the server with no
-/// deadline at all, so a backend that drops SYN kept the stream — and the
-/// request slot behind it — until the client gave up.
-const WS_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
-
-/// How long the backend may take to answer the upgrade.
-///
-/// Covers the handshake only: the session that follows is a pipe and has no
-/// duration to bound. A backend that accepts the connection and then never
-/// sends a byte would otherwise look exactly like one that is still thinking.
-const WS_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+// Both of these used to be constants, at exactly the values `[timeouts]`
+// defaults to. They are not the client's bytes or its own handshake, they are
+// the backend's: dialing it, and waiting for it to answer — which is what
+// `connect` and `response` already mean for a plain HTTP request. Leaving them
+// out would make the same two waits configurable for one kind of request and not
+// another, which nobody reading the config could guess.
 
 /// Returns the status the client was answered with: 101 once the tunnel is up,
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
@@ -444,6 +438,7 @@ async fn handle_websocket_stream(
     mut recv: iroh::endpoint::RecvStream,
     req: &Request<()>,
     backend_url: &str,
+    timeouts: Timeouts,
 ) -> anyhow::Result<http::ProxySummary> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
@@ -459,8 +454,10 @@ async fn handle_websocket_stream(
         .map(|h| h.to_string())
         .unwrap_or_else(|| host.to_string());
 
+    // Not the pooled HTTP client: a WebSocket holds one dedicated connection
+    // for the whole session, so this dial is its own, with the same deadline.
     let mut backend_stream = tokio::time::timeout(
-        WS_CONNECT_TIMEOUT,
+        timeouts.connect,
         tokio::net::TcpStream::connect((host, port)),
     )
     .await
@@ -536,14 +533,14 @@ async fn handle_websocket_stream(
         Ok(())
     };
 
-    tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, read_handshake)
+    tokio::time::timeout(timeouts.response, read_handshake)
         .await
         .map_err(|_| {
             anyhow::anyhow!(
                 "backend {}:{} did not answer the WebSocket handshake within {:?}",
                 host,
                 port,
-                WS_HANDSHAKE_TIMEOUT
+                timeouts.response
             )
         })??;
 

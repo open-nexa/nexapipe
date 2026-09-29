@@ -25,6 +25,13 @@ not part of the tree). Not yet released, so no version numbers have moved.
   load this strategy exists to spread. It counts requests, not sockets, because
   how many connections the pooled HTTP client is holding open is not something
   this process can see.
+- `[timeouts]`: `connect_secs` (default `10`) and `response_secs` (default `30`),
+  each covering one step of talking to a backend and neither bounding the whole
+  request — once a response head arrives, streaming its body can run as long as
+  it needs. `connect_secs` is the one deadline behind every dial in the server,
+  which used to be four copies of ten seconds. Read once at startup; `0` and
+  anything past `3600` are refused at load.
+
 ### Changed
 
 - **A route whose backends are all unhealthy now depends on how many there are.**

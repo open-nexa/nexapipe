@@ -154,7 +154,10 @@ pub async fn run_proxy(
     // start time, and the mode that does not scrape should not own it.
     crate::metrics::mark_start();
 
-    let http_client = Arc::new(http::create_http_client());
+    // Dialling a backend is bounded by `[timeouts] connect_secs`, read once here
+    // because it is a builder setting: the connector applies it to every dial,
+    // including the ones made later for a pooled connection the backend closed.
+    let http_client = Arc::new(http::create_http_client(config.timeouts().connect));
 
     let health_probes = Arc::new(tokio::sync::Mutex::new(HealthProbes::new()));
     let health_enabled = Arc::new(std::sync::atomic::AtomicBool::new(health_check.enabled));

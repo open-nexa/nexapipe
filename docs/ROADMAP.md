@@ -184,7 +184,7 @@ What follows is what is *missing*, i.e. capability work.
 
 | # | Gap | Where |
 |---|---|---|
-| C3 | **HTTP/1.1 only towards backends.** The backend client is `legacy::Client<HttpConnector>` with only `http1_*` configuration, `https://` backends are rejected at load time, and there is no retry, no circuit breaking and no configurable timeout (all timeouts are hardcoded constants). | `http/mod.rs:13-32`; constants in `l4/mod.rs:42-52`, `passthrough.rs:38`, `proxy/mod.rs:95` |
+| C3 | **Still open.** HTTP/1.1 only towards backends: the client is `legacy::Client<HttpConnector>` with only `http1_*` configuration, `https://` backends are rejected at load time, and there is no retry and no circuit breaking. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`, each optional and defaulted to the constant it replaced. | `http/mod.rs:13-32` |
 | C4 | **Partly closed in v0.4.0.** `least_conn` exists, and an all-unhealthy pool now refuses instead of falling back to the first — except a pool of one, which is still handed out because there is nothing to choose between. Still open: no retry, no circuit breaking, and `least_conn` counts requests rather than sockets (see the note at `http::proxy_request`). | `lb/mod.rs` |
 | C7 | **Narrower than it read.** `passthrough`, `tcp` and `udp` routes are never probed, but a route serving `http` *and* another mode shares one pool, so the other modes do inherit its health — and in v0.4.0 they answer `BackendFailed` / hang up when it is empty. What is missing is a probe for the modes that cannot answer `GET /health`. | `proxy/mod.rs:58-65` |
 
