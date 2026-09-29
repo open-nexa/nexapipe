@@ -3,7 +3,9 @@
 NexaPipe claims there is no server to rent, no control plane and no certificate
 to hold. That claim is true of the parts NexaPipe owns. It is not true of
 everything underneath: the transport is iroh, and iroh leans on infrastructure
-n0 operates in two places that **no NexaPipe configuration can switch off**.
+n0 operates in two places. One of them — Endpoint ID discovery — **no
+NexaPipe configuration can switch off**. The other, the relay, is what
+`relay_mode` is for.
 
 This page is the honest boundary. It exists because the alternative is a
 sovereignty story that sounds stronger than it is.
@@ -17,7 +19,7 @@ sovereignty story that sounds stronger than it is.
 
 | What | Who operates it | Can you turn it off? |
 |---|---|---|
-| Endpoint ID discovery | n0 (`dns.iroh.link`) | **No** — no switch in iroh 1.x |
+| Endpoint ID discovery | n0 (`dns.iroh.link`) | **No** — no switch NexaPipe exposes, though iroh 1.2.0 does have `clear_address_lookup()` |
 | Relay transport, `relay_mode = "default"` | n0 | Yes — `custom`, `pinned` or `disabled` |
 | A relay you run yourself | you | That is `relay_mode = "custom"` |
 | A relay a *peer* advertises | whoever the peer uses | Only with `disabled` — see below |
@@ -26,17 +28,23 @@ sovereignty story that sounds stronger than it is.
 ## 1. Endpoint ID discovery
 
 A Node ID is a public key, not an address. Turning one into "where do I send
-QUIC packets" is a lookup, and with the default discovery it is a DNS query to
-`dns.iroh.link`.
+QUIC packets" is a lookup, and with the default discovery that means asking
+n0's `dns.iroh.link` twice over: once as an HTTPS request through Pkarr, and
+once as a DNS query. Both go out concurrently and their answers are merged, so
+a result arrives when either one gets through.
 
 That happens regardless of `relay_mode`. Running your own relay does not remove
-it, and it has no configuration key in iroh 1.x.
+it. iroh 1.2.0 does have a way to switch it off —
+`endpoint::Builder::clear_address_lookup()` — but NexaPipe does not call it and
+exposes no setting that would, so as this ships there is no switch.
 
 What follows from that:
 
-- A Node ID on its own is not enough to connect when `dns.iroh.link` is
-  unreachable or filtered. Hand over a full ticket or an explicit address
-  instead — that is what `--generate-invite` produces.
+- A Node ID on its own is not enough to connect when both lookups are
+  unreachable. Filtering the DNS query alone does not stop discovery: the HTTPS
+  request goes to a different service and can still answer on its own. Hand
+  over a full ticket or an explicit address instead — that is what
+  `--generate-invite` produces.
 - The lookup lets a third party see that some host asked about some Node ID, and
   when. It does not reveal what was sent afterwards.
 - The Android client exposes DNS server overrides partly for this reason.

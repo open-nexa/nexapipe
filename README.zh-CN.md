@@ -354,8 +354,8 @@ domains = ["app.example.com"]
 并记日志。
 
 **任何 `relay_mode` 都无法改变的**：Endpoint ID 发现仍然会查询 `dns.iroh.link`，
-而 `custom` 约束的是**本**端点 —— 广播了 N0 中继的对端仍会经由该中继被拨号。在
-iroh 1.x 中两者都没有开关。[仍然依赖第三方基础设施的部分](docs/iroh-boundaries.md)
+而 `custom` 约束的是**本**端点 —— 广播了 N0 中继的对端仍会经由该中继被拨号。发现服务没有 NexaPipe
+暴露出来的开关 —— iroh 1.2.0 本身有 `clear_address_lookup()`，但 NexaPipe 没有调用它。[仍然依赖第三方基础设施的部分](docs/iroh-boundaries.md)
 完整写明了这条边界，包括 `custom` 买到了什么、没买到什么。
 
 ### `[[routes]]` —— 路由

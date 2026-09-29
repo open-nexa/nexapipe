@@ -224,7 +224,7 @@
     </div>
   </section>
 
-  <h2>Downloads</h2>
+  <h2 id="downloads">Downloads</h2>
   <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
 
   <h3 class="subhead">Desktop app &mdash; nexa</h3>
@@ -462,7 +462,7 @@ nexapipe status --json</pre>
       return {
         title: "No iOS build",
         sub: "iOS is not a supported platform and none is planned. See the roadmap.",
-        links: [{ href: "../ROADMAP.md", label: "Why", secondary: true }]
+        links: [{ href: "https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md", label: "Why", secondary: true }]
       };
     }
     if (/Windows/i.test(ua)) {
@@ -477,22 +477,29 @@ nexapipe status --json</pre>
       };
     }
     if (/Macintosh|Mac OS X/i.test(ua)) {
+      // A Mac's user agent says "Macintosh" on both chips, so which one is
+      // wanted cannot be read off it. Offer both rather than guessing: a
+      // guessed architecture is a download that installs and then refuses to
+      // run.
       return {
         title: "Download for macOS",
-        sub: "Apple silicon build offered. The Intel versions are in the list below.",
+        sub: "Whether this Mac is Apple silicon or Intel decides which one, and the browser does not say. Both are here; the server archives are in the list below.",
         links: [
-          { href: BASE + "nexa-0.3.0-macos-aarch64.dmg", label: "Desktop app" },
-          { href: BASE + "nexapipe-0.3.0-aarch64-apple-darwin.tar.gz", label: "Server archive", secondary: true }
+          { href: BASE + "nexa-0.3.0-macos-aarch64.dmg", label: "Apple silicon" },
+          { href: BASE + "nexa-0.3.0-macos-x86_64.dmg", label: "Intel", secondary: true }
         ]
       };
     }
     if (/Linux/i.test(ua)) {
+      // Unlike a Mac, a Linux browser usually does put the architecture in the
+      // user agent, so the same guess is worth making here that Windows gets.
+      var arm = /ARM|aarch64|armv/i.test(ua);
       return {
         title: "Download for Linux",
-        sub: "Debian package and a static server binary. rpm, AppImage and musl are below.",
+        sub: arm ? "Linux on arm64 detected." : "Debian package and a static server binary. rpm, AppImage and the arm64 builds are below.",
         links: [
-          { href: BASE + "nexa-0.3.0-linux-x86_64.deb", label: "Desktop app" },
-          { href: BASE + "nexapipe-0.3.0-x86_64-unknown-linux-musl.tar.gz", label: "Server archive", secondary: true }
+          { href: BASE + (arm ? "nexa-0.3.0-linux-aarch64.deb" : "nexa-0.3.0-linux-x86_64.deb"), label: "Desktop app" },
+          { href: BASE + (arm ? "nexapipe-0.3.0-aarch64-unknown-linux-musl.tar.gz" : "nexapipe-0.3.0-x86_64-unknown-linux-musl.tar.gz"), label: "Server archive", secondary: true }
         ]
       };
     }
