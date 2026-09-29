@@ -163,6 +163,17 @@
     <string name="relay_token_label">Relay auth token (optional)</string>
     <string name="relay_token_note">Only if the relay requires one. The server needs the same token.</string>
 
+    <!-- Credential lock: what stands in front of a saved credential -->
+    <string name="credential_lock_title">Confirm it is you</string>
+    <string name="credential_lock_secret_subtitle">Show the 2FA secret of this endpoint</string>
+    <string name="credential_lock_export_subtitle">Share this endpoint\'s 2FA configuration</string>
+    <string name="credential_lock_relay_subtitle">Change where this device relays traffic</string>
+    <string name="credential_lock_reveal">Show the secret</string>
+    <string name="credential_lock_relay_action">Authenticate to change</string>
+    <string name="credential_lock_unavailable_title">No screen lock on this device</string>
+    <string name="credential_lock_unavailable_body">NexaPipe asks Android to confirm it is you before it shows a credential, and this device has no PIN, pattern, password or biometric to confirm with. The credential stays sealed and keeps working — add a screen lock to see it.</string>
+    <string name="credential_lock_unavailable_action">Set up a screen lock</string>
+
     <!-- Permission guide -->
     <string name="permission_guide_title">Permission Guide</string>
     <string name="permission_enable_title">Enable Required Permissions</string>

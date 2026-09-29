@@ -91,6 +91,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     var selectedNodeId by remember { mutableStateOf<String?>(null) }
     var showRelaySettings by remember { mutableStateOf(false) }
     var showInviteScanner by remember { mutableStateOf(false) }
+    // The door in front of the relay configuration. Where the traffic is sent
+    // is decided here, so changing it is a credential-grade action even though
+    // the URL is not itself a secret.
+    val credentialUnlock = rememberCredentialUnlock()
     // An endpoint invite rewrites shared settings, so it is confirmed when it
     // would overwrite something that already works.
     var pendingInviteImport by remember { mutableStateOf<EndpointInvite?>(null) }
@@ -631,6 +635,32 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
 
                     AnimatedVisibility(visible = showRelaySettings) {
                         Column {
+                            // Where traffic is sent is decided here, so changing
+                            // it is a credential-grade action even though the
+                            // URL itself is not a secret: an unlocked phone is
+                            // enough to point this device at someone else's
+                            // relay. The invite import path is not gated — it
+                            // is one deliberate action with its own
+                            // confirmation, not a setting left lying around.
+                            val relayLocked = !credentialUnlock.unlocked
+                            if (relayLocked) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                NexaTonalButton(
+                                    text = stringResource(R.string.credential_lock_relay_action),
+                                    onClick = {
+                                        credentialUnlock.request(
+                                            localizedContext.getString(R.string.credential_lock_title),
+                                            localizedContext.getString(
+                                                R.string.credential_lock_relay_subtitle
+                                            )
+                                        )
+                                    },
+                                    icon = Icons.Default.Lock,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 stringResource(R.string.relay_mode_title),
@@ -654,7 +684,18 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                     RadioButton(
                                         selected = relayMode == mode,
                                         onClick = {
-                                            viewModel.updateRelayConfig(mode, relayUrl)
+                                            if (relayLocked) {
+                                                credentialUnlock.request(
+                                                    localizedContext.getString(R.string.credential_lock_title),
+                                                    localizedContext.getString(
+                                                        R.string.credential_lock_relay_subtitle
+                                                    )
+                                                ) {
+                                                    viewModel.updateRelayConfig(mode, relayUrl)
+                                                }
+                                            } else {
+                                                viewModel.updateRelayConfig(mode, relayUrl)
+                                            }
                                         }
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -670,12 +711,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayUrl,
                                     onValueChange = { newUrl ->
-                                        viewModel.updateRelayConfig(relayMode, newUrl)
+                                        if (!relayLocked) viewModel.updateRelayConfig(relayMode, newUrl)
                                     },
                                     label = { Text(stringResource(R.string.relay_url_label)) },
                                     placeholder = {
                                         Text(stringResource(R.string.relay_url_placeholder))
                                     },
+                                    enabled = !relayLocked,
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true
                                 )
@@ -683,10 +725,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayAuthToken,
                                     onValueChange = { newToken ->
-                                        viewModel.updateRelayConfig(relayMode, relayUrl, newToken)
+                                        if (!relayLocked) {
+                                            viewModel.updateRelayConfig(relayMode, relayUrl, newToken)
+                                        }
                                     },
                                     label = { Text(stringResource(R.string.relay_token_label)) },
                                     visualTransformation = PasswordVisualTransformation(),
+                                    enabled = !relayLocked,
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true
                                 )
@@ -774,6 +819,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 onDismiss = { showInviteScanner = false },
                 onResult = { scanned -> handleInviteText(scanned) }
             )
+        }
+
+        if (credentialUnlock.unavailable) {
+            CredentialUnavailableDialog(credentialUnlock)
         }
 
         pendingInviteImport?.let { invite ->

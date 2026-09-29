@@ -11,6 +11,11 @@ activityCompose = "1.12.4"
 composeBom = "2026.09.00"
 cameraX = "1.4.2"
 zxing = "3.5.3"
+# 1.1.0 is the newest stable release of androidx.biometric; everything after it
+# is an alpha. It pulls `fragment` (1.2.5) and `appcompat` (1.2.0) transitively,
+# which is why the fragment version is pinned here rather than left to that.
+biometric = "1.1.0"
+fragment = "1.9.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -37,6 +42,11 @@ androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", 
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
+# System authentication in front of the credential surfaces. BiometricPrompt
+# only takes a FragmentActivity or a Fragment, so MainActivity needs the
+# fragment library even though the app itself has no fragments.
+androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
+androidx-fragment = { group = "androidx.fragment", name = "fragment", version.ref = "fragment" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
