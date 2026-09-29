@@ -102,12 +102,30 @@ object CredentialGate {
     }
 
     /**
-     * Closes it again. Called when the window lapses and by nothing else: this
-     * is not a setting, and there is no way to ask for the surfaces to stay
-     * open.
+     * Closes it again. Called when the window lapses, and when the device turns
+     * out to have lost the ability to ask — see [refreshCapability]. Nothing
+     * else closes it: this is not a setting, and there is no way to ask for the
+     * surfaces to stay open.
      */
     fun lock() {
         windowEndsAt.value = 0L
+    }
+
+    /**
+     * Closes the window if the device can no longer ask who is using it.
+     *
+     * Called when the app returns to the foreground. The window is two minutes
+     * of memory and nothing re-checks it while it runs, so a screen lock
+     * removed while this app was in the background leaves it open on a device
+     * that cannot confirm anybody — which is the outcome [Capability.Unavailable]
+     * exists to prevent. Coming back into view is the one moment worth asking
+     * again, and it costs nothing: either the device can still ask, and the
+     * window it already had stands, or it cannot, and nothing should be open.
+     */
+    fun refreshCapability(context: Context) {
+        if (capability(context) != Capability.Available) {
+            lock()
+        }
     }
 
     /**
