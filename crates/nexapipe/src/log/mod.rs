@@ -668,7 +668,27 @@ fn redact_query(uri: &str) -> String {
     out
 }
 
+/// One id per request: 32 lowercase hex digits, 128 bits.
+///
+/// Random rather than a counter for two reasons — a counter publishes how many
+/// requests this process has served to anyone who can read the log, and it
+/// restarts at zero on every run, so two runs hand out the same ids. `rand`
+/// and `hex` are already dependencies, so this adds none.
+///
+/// Generated where the request enters, not where it is logged: the id is
+/// carried by the tracing span as well, and a span opened after the request
+/// has been parsed would miss the part where it was routed.
+pub fn next_request_id() -> String {
+    let hi: u64 = rand::random();
+    let lo: u64 = rand::random();
+    let mut out = String::with_capacity(32);
+    out.push_str(&hex::encode(hi.to_be_bytes()));
+    out.push_str(&hex::encode(lo.to_be_bytes()));
+    out
+}
+
 pub fn log_access(
+    request_id: &str,
     remote_addr: &str,
     method: &str,
     uri: &str,
@@ -703,15 +723,19 @@ pub fn log_access(
     };
 
     if let Some(target) = target {
+        // The id goes last, not first: everything before it keeps the column
+        // it had, so a script that splits this line on spaces still finds the
+        // host, the status and the duration where it always did.
         let line = format!(
-            "{} - - [{}] \"{} {}\" {} {} {}ms",
+            "{} - - [{}] \"{} {}\" {} {} {}ms id={}",
             remote_addr,
             Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
             method,
             uri,
             status,
             bytes_sent,
-            duration_ms
+            duration_ms,
+            request_id
         );
 
         match target {
@@ -859,7 +883,9 @@ mod tests {
         let sink = FileSink::new(dir.path(), "access.log", Rotation::Daily, 0, 14).unwrap();
         init_access_logger(true, Some(sink));
 
+        let id = next_request_id();
         log_access(
+            &id,
             "203.0.113.9",
             "GET",
             "/api/v1/items?token=hunter2",
@@ -880,6 +906,10 @@ mod tests {
                 assert!(
                     contents.contains("\"GET /api/v1/items?token=<redacted>\" 200 512 12ms"),
                     "unexpected line: {contents}"
+                );
+                assert!(
+                    contents.contains(&format!("id={id}")),
+                    "the request id is missing from the line: {contents}"
                 );
                 return;
             }

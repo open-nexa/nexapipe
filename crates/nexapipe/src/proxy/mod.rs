@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tracing::Instrument;
 
 /// Shared by the startup path and the config watcher, which spawns checkers for
 /// routes that appear in a reload.
@@ -668,8 +669,27 @@ async fn start_http_server(
                         .timer(TokioTimer::new())
                         .header_read_timeout(Some(crate::conn::HEAD_READ_TIMEOUT));
 
+                    // One id and one span per request. `service_fn` is called
+                    // once per request rather than once per connection, which
+                    // is what makes the two line up; the handler fills in
+                    // `method`, `uri` and `status` as it learns them.
                     let service = service_fn(move |req: hyper::Request<Incoming>| {
-                        proxy_handler(req, config_clone.clone(), client_clone.clone(), remote_addr_str.clone())
+                        let request_id = crate::log::next_request_id();
+                        let span = tracing::info_span!(
+                            "request",
+                            id = %request_id,
+                            method = tracing::field::Empty,
+                            uri = tracing::field::Empty,
+                            status = tracing::field::Empty,
+                        );
+                        proxy_handler(
+                            req,
+                            config_clone.clone(),
+                            client_clone.clone(),
+                            remote_addr_str.clone(),
+                            request_id,
+                        )
+                        .instrument(span)
                     });
 
                     let io = TokioIo::new(stream);
@@ -736,11 +756,25 @@ async fn is_tls_connection(stream: &tokio::net::TcpStream) -> bool {
     }
 }
 
+/// Put the request id on a response, so a client can name the exact line in
+/// the access log that goes with what it got.
+///
+/// It replaces rather than appends: the id we publish is the one our own log
+/// records, and a second `x-request-id` from a backend would leave whoever
+/// reads the response guessing which of the two to quote.
+fn with_request_id<T>(mut response: hyper::Response<T>, request_id: &str) -> hyper::Response<T> {
+    if let Ok(value) = ::http::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
 async fn proxy_handler(
     req: hyper::Request<Incoming>,
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     remote_addr: String,
+    request_id: String,
 ) -> Result<
     hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
     anyhow::Error,
@@ -749,11 +783,21 @@ async fn proxy_handler(
     let method = req.method().to_string();
     let uri = req.uri().to_string();
 
+    // Filled in on the span the caller opened around this handler, which was
+    // created before the request was read and so could not know these.
+    let span = tracing::Span::current();
+    span.record("method", method.as_str());
+    span.record("uri", uri.as_str());
+
     if http::is_websocket_request(&req) {
         tracing::debug!("WebSocket request detected");
-        return Ok(http::create_error_response(
-            hyper::StatusCode::UPGRADE_REQUIRED,
-            "WebSocket not supported via HTTP server",
+        span.record("status", 426u64);
+        return Ok(with_request_id(
+            http::create_error_response(
+                hyper::StatusCode::UPGRADE_REQUIRED,
+                "WebSocket not supported via HTTP server",
+            ),
+            &request_id,
         ));
     }
 
@@ -773,7 +817,9 @@ async fn proxy_handler(
                 hyper::StatusCode::BAD_GATEWAY.as_u16(),
                 duration.as_millis() as u64,
             );
+            span.record("status", 502u64);
             log::log_access(
+                &request_id,
                 &remote_addr,
                 &method,
                 &uri,
@@ -781,9 +827,9 @@ async fn proxy_handler(
                 duration.as_millis() as u64,
                 0,
             );
-            return Ok(http::create_error_response(
-                hyper::StatusCode::BAD_GATEWAY,
-                "Bad Gateway",
+            return Ok(with_request_id(
+                http::create_error_response(hyper::StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                &request_id,
             ));
         }
     };
@@ -791,6 +837,7 @@ async fn proxy_handler(
     let duration = start.elapsed();
     let status = response.status().as_u16();
     crate::metrics::METRICS.record_request(status, duration.as_millis() as u64);
+    span.record("status", status as u64);
     let content_length = response
         .headers()
         .get("content-length")
@@ -799,6 +846,7 @@ async fn proxy_handler(
         .unwrap_or(0);
 
     log::log_access(
+        &request_id,
         &remote_addr,
         &method,
         &uri,
@@ -807,7 +855,7 @@ async fn proxy_handler(
         content_length,
     );
 
-    Ok(response)
+    Ok(with_request_id(response, &request_id))
 }
 
 pub async fn run_local_proxy(

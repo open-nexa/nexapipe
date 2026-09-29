@@ -16,6 +16,7 @@ use peers::PeerRegistry;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::Instrument;
 
 pub mod allow_list;
 pub mod limits;
@@ -147,6 +148,10 @@ fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
         .map(|pos| from + pos)
 }
 
+// One more argument than clippy allows, and bundling them into a struct would
+// just move the list somewhere else while making every call site build one. The
+// id is last because it is the newest thing this stream carries.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_bidi_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
@@ -155,6 +160,7 @@ pub async fn handle_bidi_stream(
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
     acl: Option<Arc<ClientAcl>>,
+    request_id: &str,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
     // Doubling on demand, so a head that fits in one read never pays for a
@@ -188,6 +194,7 @@ pub async fn handle_bidi_stream(
                         limiter,
                         peer,
                         acl.as_deref(),
+                        request_id,
                     )
                     .await;
                 }
@@ -290,6 +297,7 @@ pub async fn handle_bidi_stream(
                 // request this instance served.
                 metrics::METRICS.record_request(404, 0);
                 crate::log::log_access(
+                    request_id,
                     peer,
                     request.method().as_str(),
                     request.uri().path(),
@@ -327,6 +335,14 @@ pub async fn handle_bidi_stream(
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
+    // Filled in on the span the caller opened, which was created before the
+    // head was read and so could not know these. `Span::current()` is that
+    // span because the caller instruments this future with it; when no
+    // subscriber cares, recording is a no-op rather than a cost.
+    let span = tracing::Span::current();
+    span.record("method", method.as_str());
+    span.record("uri", request_target.as_str());
+
     let outcome: Result<http::ProxySummary, http::ProxyFailure> =
         if http::is_websocket_request_static(&request) {
             tracing::debug!("WebSocket request detected");
@@ -342,6 +358,7 @@ pub async fn handle_bidi_stream(
                 body_data,
                 &mut send,
                 &mut recv,
+                request_id,
             )
             .await
         };
@@ -350,7 +367,9 @@ pub async fn handle_bidi_stream(
     match outcome {
         Ok(summary) => {
             metrics::METRICS.record_request(summary.status, elapsed_ms);
+            span.record("status", summary.status as u64);
             crate::log::log_access(
+                request_id,
                 peer,
                 &method,
                 &request_target,
@@ -370,7 +389,9 @@ pub async fn handle_bidi_stream(
                 None => (502, 0),
             };
             metrics::METRICS.record_request(status, elapsed_ms);
+            span.record("status", status as u64);
             crate::log::log_access(
+                request_id,
                 peer,
                 &method,
                 &request_target,
@@ -1482,6 +1503,20 @@ pub async fn handle_connection(
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
                 let acl_clone = client_acl.clone();
+                // One id per request, and one span wrapping it. Both are made
+                // here rather than inside the handler: `method`, `uri` and
+                // `status` are not known until the head has been read, and a
+                // span opened after that would not cover the part where the
+                // request is routed and admitted. The handler fills them in on
+                // `Span::current()` as it learns them.
+                let request_id = crate::log::next_request_id();
+                let span = tracing::info_span!(
+                    "request",
+                    id = %request_id,
+                    method = tracing::field::Empty,
+                    uri = tracing::field::Empty,
+                    status = tracing::field::Empty,
+                );
                 tokio::spawn(async move {
                     // Held for the life of the task and released by its Drop, so
                     // a slot frees however the stream ends.
@@ -1494,7 +1529,9 @@ pub async fn handle_connection(
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,
+                        &request_id,
                     )
+                    .instrument(span)
                     .await
                     {
                         tracing::error!("Failed to handle stream from {}: {}", peer_clone, e);
