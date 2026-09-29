@@ -4,10 +4,12 @@ use crate::auth::{
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
+use crate::metrics;
 use crate::passthrough;
 use crate::routes::{BackendInfo, RouteConfig};
 use crate::shutdown::InFlightGuard;
 use ::http::Request;
+use futures_util::StreamExt;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use std::sync::Arc;
@@ -280,6 +282,11 @@ pub async fn handle_bidi_stream(
                 // Unroutable hosts are logged too: "which hosts are people
                 // asking for that I do not serve" is a routing question, and
                 // without the line the answer is invisible.
+                //
+                // Counted only when the answer reached the client, for the same
+                // reason it is only logged then: a 404 nobody received is not a
+                // request this instance served.
+                metrics::METRICS.record_request(404, 0);
                 crate::log::log_access(
                     peer,
                     request.method().as_str(),
@@ -340,6 +347,7 @@ pub async fn handle_bidi_stream(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
         Ok(summary) => {
+            metrics::METRICS.record_request(summary.status, elapsed_ms);
             crate::log::log_access(
                 peer,
                 &method,
@@ -359,6 +367,7 @@ pub async fn handle_bidi_stream(
                 Some(partial) => (partial.status, partial.bytes_sent),
                 None => (502, 0),
             };
+            metrics::METRICS.record_request(status, elapsed_ms);
             crate::log::log_access(
                 peer,
                 &method,
@@ -583,6 +592,41 @@ fn get_connection_type(path: &iroh::endpoint::Path<'_>) -> &'static str {
         "Relay"
     } else {
         "Unknown"
+    }
+}
+
+/// Which metrics bucket a path belongs to.
+///
+/// The same three-way distinction [`get_connection_type`] makes for the log,
+/// as the type the counters are keyed by.
+fn path_kind(path: &iroh::endpoint::Path<'_>) -> metrics::PathKind {
+    if path.is_ip() {
+        metrics::PathKind::Direct
+    } else if path.is_relay() {
+        metrics::PathKind::Relay
+    } else {
+        metrics::PathKind::Unknown
+    }
+}
+
+/// Keeps one connection's place in the `connections_by_path` buckets up to
+/// date, for as long as the connection lives.
+///
+/// The ticket is created here and handed back by its `Drop` when this task
+/// ends, which is when the path stream ends, which is when the connection is
+/// gone: a connection that disappears without a clean close therefore still
+/// stops being counted.
+async fn track_connection_path(conn: Connection, initial: metrics::PathKind) {
+    let mut ticket = metrics::PathTicket::new(initial);
+
+    // Snapshots rather than individual path events: `paths_stream` yields the
+    // full current state on every change, so a burst of changes cannot leave
+    // the bucket one event behind the way a lagged event stream could.
+    let mut stream = conn.paths_stream();
+    while let Some(paths) = stream.next().await {
+        if let Some(path) = paths.iter().find(|p| p.is_selected()) {
+            ticket.set(path_kind(&path));
+        }
     }
 }
 
@@ -1299,14 +1343,26 @@ pub async fn handle_connection(
     ));
 
     let paths = conn.paths();
-    if let Some(selected_path) = paths.iter().find(|p| p.is_selected()) {
-        tracing::info!(
-            "Initial connection type: {}",
-            get_connection_type(&selected_path)
-        );
-    } else {
-        tracing::info!("Initial connection type: Unknown (no selected path)");
-    }
+    let selected_path = paths.iter().find(|p| p.is_selected());
+    let initial_kind = match &selected_path {
+        Some(path) => {
+            tracing::info!("Initial connection type: {}", get_connection_type(path));
+            path_kind(path)
+        }
+        None => {
+            tracing::info!("Initial connection type: Unknown (no selected path)");
+            metrics::PathKind::Unknown
+        }
+    };
+
+    // Counted here, where the connection is being served, rather than in the
+    // accept loop: a connection refused by the limiter never gets this far and
+    // should not appear as one that was served.
+    metrics::METRICS.connection_opened();
+    // A connection typically starts relayed and becomes direct once hole
+    // punching succeeds, so the bucket it belongs to is not decided once. The
+    // task owns the ticket and hands it back when the connection ends.
+    tokio::spawn(track_connection_path(conn.clone(), initial_kind));
 
     // ===== 2FA Authentication Handshake =====
     //

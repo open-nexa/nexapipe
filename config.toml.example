@@ -202,6 +202,35 @@ threshold = 3
 path = "/health"
 
 # ============================================================
+# [admin] - the auxiliary listener (off by default)
+# ============================================================
+# A second, loopback-only listener that answers questions about this instance
+# instead of forwarding traffic:
+#   GET /healthz  -> 200 "ok" for as long as the process is serving
+#   GET /metrics  -> instance metrics in Prometheus text format
+#                    (only while [metrics] enabled = true below)
+#
+# Absent means the listener is not bound at all, which is the default: an
+# instance nobody scrapes or supervises should not hold a port open.
+#
+# Loopback only, and there is no `expose` escape hatch: nothing here
+# authenticates, and the answer names your routes, clients and backends. Reach
+# it from another host with an SSH tunnel, not with a bind address.
+#
+# `listen_addr` is NOT hot-reloadable - moving a listener is a restart.
+# [admin]
+# listen_addr = "127.0.0.1:9090"
+
+# ============================================================
+# [metrics] - whether /metrics is served
+# ============================================================
+# Off by default, because the listener it hangs off is unauthenticated: nothing
+# is exposed until you ask for it here AND bind an [admin] address. Turning
+# this on without an [admin] section logs a warning and serves nothing.
+[metrics]
+enabled = false
+
+# ============================================================
 # [local_proxy] - client mode (delete the section on a server)
 # ============================================================
 

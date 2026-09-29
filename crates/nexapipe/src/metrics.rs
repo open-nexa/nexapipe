@@ -1,0 +1,508 @@
+//! Instance metrics: what this process is doing, in Prometheus text format.
+//!
+//! # Why the format is written by hand
+//!
+//! The exposition format is a handful of lines per metric — `# HELP`, `# TYPE`,
+//! then one `name{labels} value` per series — and everything behind it here is
+//! an atomic integer. A registry crate would add a dependency, a `Cargo.lock`
+//! change (CI builds with `--locked`) and an audit surface, to save the writing
+//! of a `String`.
+//!
+//! # What is counted where
+//!
+//! Requests are recorded at the five places that answer one — three in
+//! [`crate::conn`], two in [`crate::proxy`] — and **not** in
+//! [`crate::log::log_access`], which looks like the one funnel but is not: the
+//! L4 path calls it too, and what it counts there is a *flow*, a tunnel that
+//! stays open for as long as the client wants, not a request. Mixing the two
+//! would put long-lived flows in the same number as requests and leave both
+//! unreadable, so flows have their own counter.
+//!
+//! Backend health is **not** instrumented at all. The pools already know the
+//! answer, so it is read at exposition time from the live routing table; a
+//! counter maintained by the probes could only drift from it.
+//!
+//! # One process, one set of counters
+//!
+//! These are process-wide by nature — there is one instance behind one set of
+//! numbers — so they live in a `static` rather than being threaded through
+//! every call that might want to record something. That is the same shape
+//! [`crate::log`] uses for its access logger.
+use std::fmt::Write as _;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// When this process started, set by [`mark_start`].
+///
+/// `Instant` is monotonic, which is the point: a wall-clock reading would move
+/// backwards the moment someone corrects the system clock.
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// Records when the process started, so `nexapipe_uptime_seconds` has
+/// something to count from. Called once, while the proxy is starting up;
+/// before it runs the uptime is reported as zero rather than as a guess.
+pub fn mark_start() {
+    let _ = START.set(Instant::now());
+}
+
+/// Seconds since [`mark_start`], or zero if it has not run.
+pub fn uptime_seconds() -> u64 {
+    START
+        .get()
+        .map(|start| start.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+/// The counters of one running instance.
+pub struct Metrics {
+    /// Connections accepted since startup, whatever happened to them.
+    connections_total: AtomicU64,
+    /// Connections by the kind of path they were last seen using. The sum of
+    /// the three is the number of connections open right now, so there is no
+    /// separate active counter that could disagree with it.
+    direct: AtomicU64,
+    relayed: AtomicU64,
+    unknown: AtomicU64,
+    /// Requests answered, by status class: `[1xx, 2xx, 3xx, 4xx, 5xx, other]`.
+    requests: [AtomicU64; STATUS_CLASSES],
+    /// Milliseconds spent answering them, summed.
+    request_duration_ms: AtomicU64,
+    /// L4 flows by protocol and status class: `[tcp, udp][class]`.
+    flows: [[AtomicU64; STATUS_CLASSES]; L4_PROTOS],
+}
+
+/// Status classes a response can fall into: `1xx` through `5xx` plus `other`.
+const STATUS_CLASSES: usize = 6;
+
+/// The two L4 protocols: `tcp` and `udp`.
+const L4_PROTOS: usize = 2;
+
+/// Label for an L4 flow's protocol, in the order of [`Metrics::flows`].
+const L4_LABELS: [&str; L4_PROTOS] = ["tcp", "udp"];
+
+/// Label for a response's status class, in the order of [`Metrics::requests`].
+const CLASS_LABELS: [&str; STATUS_CLASSES] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// The metrics of this process.
+pub static METRICS: Metrics = Metrics::new();
+
+impl Metrics {
+    /// Every counter at zero.
+    ///
+    /// `const` so it can initialise the `static` above: no field may need code
+    /// to run, which is why the arrays are written out instead of built by a
+    /// loop.
+    pub const fn new() -> Self {
+        Self {
+            connections_total: AtomicU64::new(0),
+            direct: AtomicU64::new(0),
+            relayed: AtomicU64::new(0),
+            unknown: AtomicU64::new(0),
+            requests: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            request_duration_ms: AtomicU64::new(0),
+            flows: [
+                [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
+                [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
+            ],
+        }
+    }
+
+    /// Records one accepted connection.
+    pub fn connection_opened(&self) {
+        // Relaxed throughout: these are counters. Nothing is ordered by reading
+        // them, and a scrape that lands a millisecond early simply reports the
+        // number as it was a millisecond ago.
+        self.connections_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one answered request and how long it took.
+    ///
+    /// `status` is what the client was actually answered with, which is not
+    /// always what the backend replied: a failure after the head went out is
+    /// logged with the partial response's status, not as a 502.
+    pub fn record_request(&self, status: u16, duration_ms: u64) {
+        self.requests[status_class(status)].fetch_add(1, Ordering::Relaxed);
+        self.request_duration_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    /// Records one L4 flow that ended, with the status it was answered with.
+    /// `proto` is `"tcp"` or `"udp"`; anything else is counted as `tcp`, which
+    /// is the more useful wrong answer of the two.
+    pub fn record_l4_flow(&self, proto: &str, status: u16) {
+        let proto = match proto.to_ascii_lowercase().as_str() {
+            "udp" => 1,
+            _ => 0,
+        };
+        self.flows[proto][status_class(status)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Connections open right now.
+    ///
+    /// Derived from the path buckets rather than kept separately: two counts of
+    /// the same thing is one count waiting to disagree with the other.
+    pub fn connections_active(&self) -> u64 {
+        self.direct.load(Ordering::Relaxed)
+            + self.relayed.load(Ordering::Relaxed)
+            + self.unknown.load(Ordering::Relaxed)
+    }
+
+    /// Renders every metric in the Prometheus text exposition format.
+    ///
+    /// `view` carries what is read from live state rather than counted —
+    /// in-flight work and backend health — because those belong to objects this
+    /// module has no access to, and passing them in leaves the ownership where
+    /// it already is.
+    pub fn render(&self, view: &InstanceView) -> String {
+        let mut out = String::with_capacity(2048);
+
+        gauge(
+            &mut out,
+            "nexapipe_up",
+            "1 while this instance is serving.",
+            1,
+        );
+        gauge(
+            &mut out,
+            "nexapipe_uptime_seconds",
+            "Seconds since the process started.",
+            uptime_seconds(),
+        );
+        counter(
+            &mut out,
+            "nexapipe_connections_total",
+            "Connections accepted since startup.",
+            self.connections_total.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "nexapipe_connections_active",
+            "Connections open right now.",
+            self.connections_active(),
+        );
+
+        // One series per path kind under a single HELP and TYPE: that is what
+        // makes them one metric with a label instead of three metrics a
+        // dashboard has to be told about separately.
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_connections_by_path Connections by the kind of network path they \
+             currently use. Direct means hole punching succeeded; relayed means traffic crosses \
+             a relay server."
+        );
+        let _ = writeln!(out, "# TYPE nexapipe_connections_by_path gauge");
+        for (kind, label) in [
+            (PathKind::Direct, "direct"),
+            (PathKind::Relay, "relayed"),
+            (PathKind::Unknown, "unknown"),
+        ] {
+            let _ = writeln!(
+                out,
+                "nexapipe_connections_by_path{{kind=\"{label}\"}} {}",
+                self.bucket(kind).load(Ordering::Relaxed)
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_requests_total Requests answered, by status class."
+        );
+        let _ = writeln!(out, "# TYPE nexapipe_requests_total counter");
+        for (index, label) in CLASS_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "nexapipe_requests_total{{status_class=\"{label}\"}} {}",
+                self.requests[index].load(Ordering::Relaxed)
+            );
+        }
+
+        // A sum, not a histogram: the count to divide by is
+        // `nexapipe_requests_total`, and buckets would mean choosing boundaries
+        // for a traffic mix this process knows nothing about.
+        counter(
+            &mut out,
+            "nexapipe_request_duration_ms_total",
+            "Milliseconds spent answering requests, summed. Divide by nexapipe_requests_total \
+             for a mean.",
+            self.request_duration_ms.load(Ordering::Relaxed),
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_l4_flows_total L4 flows that ended, by protocol and status."
+        );
+        let _ = writeln!(out, "# TYPE nexapipe_l4_flows_total counter");
+        for (proto, classes) in L4_LABELS.iter().zip(self.flows.iter()) {
+            for (index, label) in CLASS_LABELS.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "nexapipe_l4_flows_total{{proto=\"{proto}\",status_class=\"{label}\"}} {}",
+                    classes[index].load(Ordering::Relaxed)
+                );
+            }
+        }
+
+        gauge(
+            &mut out,
+            "nexapipe_backends_up",
+            "Backends currently in rotation.",
+            view.backends_up as u64,
+        );
+        gauge(
+            &mut out,
+            "nexapipe_backends_down",
+            "Backends taken out of rotation by failed health checks.",
+            view.backends_down as u64,
+        );
+        gauge(
+            &mut out,
+            "nexapipe_in_flight",
+            "Connections the process is still holding, which a shutdown waits for.",
+            view.in_flight as u64,
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_build_info One series identifying the build."
+        );
+        let _ = writeln!(out, "# TYPE nexapipe_build_info gauge");
+        let _ = writeln!(
+            out,
+            "nexapipe_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        out
+    }
+
+    fn bucket(&self, kind: PathKind) -> &AtomicU64 {
+        match kind {
+            PathKind::Direct => &self.direct,
+            PathKind::Relay => &self.relayed,
+            PathKind::Unknown => &self.unknown,
+        }
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What is read from live state at exposition time rather than counted.
+pub struct InstanceView {
+    pub in_flight: usize,
+    pub backends_up: usize,
+    pub backends_down: usize,
+}
+
+/// How a connection reaches its peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathKind {
+    /// Hole punching succeeded: packets go straight to the peer's address.
+    Direct,
+    /// Traffic crosses a relay server.
+    Relay,
+    /// No path is selected yet, or it is neither of the above.
+    Unknown,
+}
+
+/// One connection's place in the `connections_by_path` buckets.
+///
+/// Held by the task that follows a connection's path events and given back by
+/// its `Drop`: a connection ends in more ways than it has returns — peer gone,
+/// stream error, task cancelled — and a `Drop` is the one thing that cannot be
+/// forgotten at any of them.
+pub struct PathTicket {
+    metrics: &'static Metrics,
+    kind: PathKind,
+}
+
+impl PathTicket {
+    /// Counts one connection on [`METRICS`].
+    pub fn new(kind: PathKind) -> Self {
+        Self::on(&METRICS, kind)
+    }
+
+    /// Counts one connection on `metrics`. Split out so a test can count on a
+    /// static of its own instead of sharing the process-wide one with whatever
+    /// else is running.
+    pub fn on(metrics: &'static Metrics, kind: PathKind) -> Self {
+        metrics.bucket(kind).fetch_add(1, Ordering::Relaxed);
+        Self { metrics, kind }
+    }
+
+    /// Moves the connection to another bucket, because the path it uses
+    /// changed. A connection typically starts relayed and becomes direct once
+    /// hole punching succeeds, and counting it in both buckets would report
+    /// two connections where there is one.
+    pub fn set(&mut self, kind: PathKind) {
+        if kind != self.kind {
+            self.metrics
+                .bucket(self.kind)
+                .fetch_sub(1, Ordering::Relaxed);
+            self.metrics.bucket(kind).fetch_add(1, Ordering::Relaxed);
+            self.kind = kind;
+        }
+    }
+}
+
+impl Drop for PathTicket {
+    fn drop(&mut self) {
+        self.metrics
+            .bucket(self.kind)
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Which of [`CLASS_LABELS`] a status belongs to.
+///
+/// `1xx` through `5xx` by the hundreds digit. Anything else — a status of `0`
+/// where nothing was answered at all, or a code outside the ranges HTTP
+/// defines — lands in `other` rather than being forced into a bucket it is not
+/// in.
+fn status_class(status: u16) -> usize {
+    match status / 100 {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        5 => 4,
+        _ => 5,
+    }
+}
+
+fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    let _ = writeln!(out, "{name} {value}");
+}
+
+fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(out, "{name} {value}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Counters for one test, so a test that moves a connection between buckets
+    /// cannot see what another test is doing.
+    static TEST_METRICS: Metrics = Metrics::new();
+
+    /// A status class has to survive the statuses the server can actually
+    /// produce, including the ones that are not HTTP: the L4 path answers with
+    /// a status byte of its own, and `0` is what a request nobody answered is
+    /// logged with.
+    #[test]
+    fn every_status_lands_in_a_class() {
+        assert_eq!(CLASS_LABELS[status_class(101)], "1xx");
+        assert_eq!(CLASS_LABELS[status_class(200)], "2xx");
+        assert_eq!(CLASS_LABELS[status_class(404)], "4xx");
+        assert_eq!(CLASS_LABELS[status_class(502)], "5xx");
+        assert_eq!(CLASS_LABELS[status_class(0)], "other");
+        assert_eq!(CLASS_LABELS[status_class(600)], "other");
+    }
+
+    /// The exposition format is line-based and a scraper is strict about it:
+    /// every metric needs a `# TYPE`, and a labelled one carries its label on
+    /// every series.
+    #[test]
+    fn every_metric_is_declared_before_it_is_used() {
+        let metrics = Metrics::new();
+        let view = InstanceView {
+            in_flight: 0,
+            backends_up: 0,
+            backends_down: 0,
+        };
+        let body = metrics.render(&view);
+
+        for name in [
+            "nexapipe_up",
+            "nexapipe_uptime_seconds",
+            "nexapipe_connections_total",
+            "nexapipe_connections_active",
+            "nexapipe_connections_by_path",
+            "nexapipe_requests_total",
+            "nexapipe_request_duration_ms_total",
+            "nexapipe_l4_flows_total",
+            "nexapipe_backends_up",
+            "nexapipe_backends_down",
+            "nexapipe_in_flight",
+            "nexapipe_build_info",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} ")),
+                "{name} has no # TYPE line in:\n{body}"
+            );
+        }
+
+        assert!(body.contains("nexapipe_connections_by_path{kind=\"direct\"} 0"));
+        assert!(body.contains("nexapipe_connections_by_path{kind=\"relayed\"} 0"));
+        assert!(body.contains("nexapipe_requests_total{status_class=\"2xx\"} 0"));
+        assert!(body.contains("nexapipe_l4_flows_total{proto=\"udp\",status_class=\"4xx\"} 0"));
+    }
+
+    /// A request is counted in its own class and nowhere else, which is the only
+    /// way "how many 5xx" stays a number someone can act on.
+    #[test]
+    fn a_request_is_counted_once_in_its_own_class() {
+        let metrics = Metrics::new();
+        metrics.record_request(200, 12);
+        metrics.record_request(502, 3);
+
+        assert_eq!(
+            metrics.requests[status_class(200)].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.requests[status_class(502)].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.requests[status_class(404)].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.request_duration_ms.load(Ordering::Relaxed), 15);
+    }
+
+    /// A connection that changes path stays counted once: relayed, then direct,
+    /// is one connection, not two — and it stops being counted when it ends,
+    /// however it ends.
+    #[test]
+    fn a_connection_that_changes_path_is_still_counted_once() {
+        let mut ticket = PathTicket::on(&TEST_METRICS, PathKind::Relay);
+        assert_eq!(TEST_METRICS.connections_active(), 1);
+
+        ticket.set(PathKind::Direct);
+        assert_eq!(TEST_METRICS.connections_active(), 1);
+
+        drop(ticket);
+        assert_eq!(TEST_METRICS.connections_active(), 0);
+    }
+}

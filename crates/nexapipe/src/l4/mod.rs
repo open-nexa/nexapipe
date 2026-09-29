@@ -29,6 +29,7 @@
 //! "backend down" from "connection full" without heuristics.
 
 use crate::auth::ClientAcl;
+use crate::metrics;
 use crate::routes::RouteConfig;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use nexapipe_proto::{
@@ -214,6 +215,11 @@ where
             mode,
             target
         );
+        // A flow, not a request: this is a tunnel that stays open for as long
+        // as the client wants, so it gets its own counter instead of being
+        // counted alongside requests — a rate made of both would be a rate of
+        // two different things.
+        metrics::METRICS.record_l4_flow(preface.proto.name(), 404);
         crate::log::log_access(peer, preface.proto.name(), &target, 404, 0, 0);
         return Ok(());
     };
@@ -229,6 +235,7 @@ where
             limiter.max(),
             target
         );
+        metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
         crate::log::log_access(peer, preface.proto.name(), &target, 429, 0, 0);
         return Ok(());
     };
@@ -250,16 +257,20 @@ where
     };
 
     match &result {
-        Ok(()) => crate::log::log_access(
-            peer,
-            preface.proto.name(),
-            &target,
-            200,
-            started.elapsed().as_millis() as u64,
-            0,
-        ),
+        Ok(()) => {
+            metrics::METRICS.record_l4_flow(preface.proto.name(), 200);
+            crate::log::log_access(
+                peer,
+                preface.proto.name(),
+                &target,
+                200,
+                started.elapsed().as_millis() as u64,
+                0,
+            )
+        }
         Err(e) => {
             tracing::debug!("L4 {} {} ended: {}", preface.proto.name(), target, e);
+            metrics::METRICS.record_l4_flow(preface.proto.name(), 502);
             crate::log::log_access(
                 peer,
                 preface.proto.name(),

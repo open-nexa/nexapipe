@@ -1,7 +1,11 @@
 pub mod local_proxy;
 
+use crate::admin;
 use crate::auth::AuthConfig;
-use crate::config::{HealthCheckConfig, IrohConfig, LocalProxyConfig, RouteMode, ServerConfig};
+use crate::config::{
+    AdminConfig, HealthCheckConfig, IrohConfig, LocalProxyConfig, MetricsConfig, RouteMode,
+    ServerConfig,
+};
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
 use crate::health::{HealthChecker, HealthProbes};
@@ -121,6 +125,11 @@ pub struct ProxyOptions {
     pub auth: Option<AuthConfig>,
     pub peers: Option<conn::allow_list::PeerAllowList>,
     pub health_check: HealthCheckConfig,
+    /// The auxiliary listener for `/healthz` and `/metrics`. `None` means it is
+    /// not bound.
+    pub admin: Option<AdminConfig>,
+    /// Whether `/metrics` is served on it.
+    pub metrics: MetricsConfig,
 }
 
 pub async fn run_proxy(
@@ -135,7 +144,14 @@ pub async fn run_proxy(
         auth: auth_config,
         peers: peer_allow_list,
         health_check,
+        admin: admin_config,
+        metrics: metrics_config,
     } = options;
+
+    // Read from for `nexapipe_uptime_seconds`. Taken here rather than in
+    // `main` so a `--local-proxy` run never sets it: there is one process-wide
+    // start time, and the mode that does not scrape should not own it.
+    crate::metrics::mark_start();
 
     let http_client = Arc::new(http::create_http_client());
 
@@ -397,6 +413,61 @@ pub async fn run_proxy(
         config_watcher.set_plaintext_listener(listener);
     }
 
+    // ===== Auxiliary listener =====
+    //
+    // `/healthz` and `/metrics`, and later the management endpoints. Bound here
+    // and never rebound: moving a listener is a restart, which is why
+    // `[admin] listen_addr` is the one setting a config reload does not apply.
+    let admin_listener = match admin_config.as_ref().and_then(|a| a.listen_addr.clone()) {
+        Some(addr) => {
+            let listener = TcpListener::bind(&addr).await?;
+            // Judged after the bind, like the plaintext listener: only the
+            // address the socket actually became says whether it is reachable.
+            let bound = listener.local_addr()?;
+            if !admin::may_bind_admin(bound) {
+                anyhow::bail!("{}", admin::non_loopback_refusal(bound));
+            }
+            tracing::info!("Admin listener on: {} (/healthz)", bound);
+            Some(listener)
+        }
+        None => {
+            // Only worth saying when someone asked for metrics and will now
+            // find nothing there: a deployment with no scraper needs no line
+            // telling it the listener it never configured is closed.
+            if metrics_config.enabled {
+                tracing::warn!(
+                    "[metrics] enabled = true but there is no [admin] listen_addr, so /metrics is \
+                     not served: add an [admin] section with a loopback address"
+                );
+            }
+            None
+        }
+    };
+
+    let mut admin_server = None;
+    if let Some(listener) = admin_listener {
+        if metrics_config.enabled {
+            tracing::info!("Metrics enabled, serving /metrics on the admin listener");
+        }
+        let config_clone = config.clone();
+        let shutdown_signal_clone = shutdown_signal.clone();
+        let in_flight_clone = in_flight.clone();
+
+        admin_server = Some(tokio::spawn(async move {
+            if let Err(e) = admin::serve_admin(
+                listener,
+                config_clone,
+                in_flight_clone,
+                metrics_config.enabled,
+                shutdown_signal_clone,
+            )
+            .await
+            {
+                tracing::error!("Admin listener failed: {}", e);
+            }
+        }));
+    }
+
     // One limiter for the whole endpoint: the per-peer cap only means anything
     // if every accepted connection counts against the same map.
     let conn_limiter = conn::limits::ConnectionLimiter::from_env();
@@ -485,6 +556,16 @@ pub async fn run_proxy(
             Ok(()) => {}
             Err(e) if e.is_panic() => tracing::error!("HTTP server task panicked: {e}"),
             Err(e) => tracing::error!("HTTP server task was cancelled: {e}"),
+        }
+    }
+
+    // Same reason for the admin listener: it has its own shutdown branch, and
+    // "it will stop" is not "it has stopped".
+    if let Some(handle) = admin_server {
+        match handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => tracing::error!("Admin listener task panicked: {e}"),
+            Err(e) => tracing::error!("Admin listener task was cancelled: {e}"),
         }
     }
 
@@ -673,6 +754,13 @@ async fn proxy_handler(
             // front of a private network is not the place to publish those.
             tracing::error!("Proxy request failed: {}", e);
             let duration = start.elapsed();
+            // Recorded where the answer is decided, not inside `log_access`:
+            // the L4 path calls that too, and what it counts there is a flow,
+            // not a request.
+            crate::metrics::METRICS.record_request(
+                hyper::StatusCode::BAD_GATEWAY.as_u16(),
+                duration.as_millis() as u64,
+            );
             log::log_access(
                 &remote_addr,
                 &method,
@@ -690,6 +778,7 @@ async fn proxy_handler(
 
     let duration = start.elapsed();
     let status = response.status().as_u16();
+    crate::metrics::METRICS.record_request(status, duration.as_millis() as u64);
     let content_length = response
         .headers()
         .get("content-length")

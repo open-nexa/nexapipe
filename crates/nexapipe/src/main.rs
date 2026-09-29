@@ -2,7 +2,7 @@ use clap::{Parser, ValueEnum};
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::{
-    ClientSecretWrite, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
+    AdminConfig, ClientSecretWrite, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
 };
 use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
@@ -229,6 +229,8 @@ async fn run_server_mode(
 ) {
     let server_config: Option<ServerConfig> = proxy_config.server.clone();
     let iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
+    let admin_config: Option<AdminConfig> = proxy_config.admin.clone();
+    let metrics_config = proxy_config.metrics;
 
     // Same builder the config watcher calls on a reload: a route that works
     // after a restart must work without one too. A bad config is fatal here,
@@ -322,6 +324,8 @@ async fn run_server_mode(
             auth: auth_config,
             peers: peer_allow_list,
             health_check: proxy_config.health_check.clone(),
+            admin: admin_config,
+            metrics: metrics_config,
         },
     )
     .await

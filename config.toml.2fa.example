@@ -201,6 +201,16 @@ strategy = "round_robin"
 # client_ports = [5432]    # tcp/udp only: which client ports this route matches
 # idle_timeout_secs = 60   # udp only: seconds of silence before a flow is closed
 
+# ===== Auxiliary listener (off by default) =====
+# Loopback only, nothing authenticates, so there is no `expose` here. Serves
+# `/healthz` always and `/metrics` when [metrics] enabled = true. `listen_addr`
+# is not hot-reloadable: moving a listener is a restart.
+# [admin]
+# listen_addr = "127.0.0.1:9090"
+#
+# [metrics]
+# enabled = true
+
 # ===== Client Local Proxy Configuration (client side) =====
 [local_proxy]
 enabled = true
