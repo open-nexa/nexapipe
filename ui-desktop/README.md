@@ -6,9 +6,10 @@ server over iroh/QUIC and forwards selected domains either through a local HTTP
 proxy or through a system TUN interface — no public IP required on the server
 side.
 
-This tree is part of the NexaPipe monorepo (`ui-desktop/`); its git history was
-preserved when it was imported from the former standalone repository,
-<https://github.com/open-nexa/nexa-desktop>.
+This tree is part of the NexaPipe monorepo (`ui-desktop/`), and bugs and feature
+requests for the app are filed in the monorepo's issue tracker,
+<https://github.com/open-nexa/nexapipe/issues>. Its git history was preserved
+when it was imported from the former standalone repository.
 
 ---
 
@@ -178,8 +179,6 @@ the UI can say exactly why TUN could not start.
   native size and applies Apple's icon grid (824/1024 content box, continuous
   corners). macOS caches Dock icons aggressively: after rebuilding, touch the
   bundle and, if the old icon persists, run `killall Dock`.
-- Design notes for the UI refactor live in
-  [`docs/ui-refactor-plan.md`](docs/ui-refactor-plan.md).
 
 ---
 

@@ -107,8 +107,8 @@ fixes both. *Hard, and the largest item here.*
 
 **4. Wire UDP on the desktop TUN** — Android carries UDP flows
 (`crates/nexapipe-client/src/tun_proxy.rs`); the desktop path in
-`crates/nexapipe/src/proxy/dns.rs` maps addresses but never opens a UDP flow.
-*Hard.*
+`ui-desktop/src-tauri/src/proxy/dns.rs` maps addresses but never opens a UDP
+flow. *Hard.*
 
 **5. `https://` backends in `http` mode** — they are rejected at startup
 (`validate_http_backend` in `crates/nexapipe/src/config.rs`), so the
@@ -136,6 +136,11 @@ listed above.
 | `needs-triage` | Nobody has looked at it yet |
 | `area:server` `area:client` `area:proto` `area:android` `area:desktop` | Which component |
 | `blocked:needs-decision` | Waiting on a maintainer call, not on code |
+
+GitHub issue forms cannot pick a label from a dropdown answer, so the templates
+only set the type (`bug` or `enhancement`); the `area:*` label is applied during
+triage, which is also when `needs-triage` comes off. A documentation issue is
+re-labelled `documentation`, whatever the template set.
 
 GitHub has no label file in the repository, so they are created through the API:
 

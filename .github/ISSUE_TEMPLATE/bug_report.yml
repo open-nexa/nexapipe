@@ -17,6 +17,8 @@ body:
         - Server (`crates/nexapipe`)
         - Client library (`crates/nexapipe-client`)
         - Wire format (`crates/nexapipe-proto`)
+        - Android app (`ui-android`)
+        - Desktop app (`ui-desktop`)
         - Website or documentation
         - Not sure
     validations:
@@ -25,17 +27,17 @@ body:
   - type: markdown
     attributes:
       value: |
-        The Android and desktop apps live in their own repositories
-        ([nexa-android](https://github.com/open-nexa/nexa-android),
-        [nexa-desktop](https://github.com/open-nexa/nexa-desktop)).
-        App-specific bugs belong there.
+        Everything lives in this repository — the server crates, `ui-android/` and
+        `ui-desktop/` — so app bugs are filed here too.
 
   - type: input
     id: version
     attributes:
       label: Version
-      description: Release tag, or the commit hash if you built from source.
-      placeholder: v0.1.0 / 96c9971
+      description: >
+        Release tag, or the commit hash if you built from source. For the apps,
+        the version shown in the app itself.
+      placeholder: v0.3.0 / 96c9971
     validations:
       required: true
 
@@ -43,8 +45,10 @@ body:
     id: platform
     attributes:
       label: Platform
-      description: OS and architecture of the machine running the server.
-      placeholder: Ubuntu 24.04 x86_64 / Windows 11 x86_64 / Docker on arm64
+      description: >
+        Where it runs: OS and architecture for the server, device and Android
+        version for the Android app, desktop OS for the desktop app.
+      placeholder: Ubuntu 24.04 x86_64 / Android 16 on Pixel 8 / Windows 11 x86_64
     validations:
       required: false
 
@@ -75,9 +79,20 @@ body:
       required: true
 
   - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recordings
+      description: |
+        Required for a UI problem in the Android or desktop app. Crop out anything
+        that shows an endpoint ID, an invite QR or a 2FA secret — this issue is
+        public.
+    validations:
+      required: false
+
+  - type: textarea
     id: config
     attributes:
-      label: Relevant config
+      label: Relevant config (server)
       description: |
         Only the section that matters. Remove every 2FA secret, relay URL and
         Node ID first — this issue is public.
@@ -90,8 +105,9 @@ body:
     attributes:
       label: Logs
       description: |
-        Run with `debug = true` if you can. Query strings are redacted in the
-        access log, but check the output anyway before pasting it.
+        Server: run with `debug = true` if you can. Query strings are redacted in
+        the access log, but check the output anyway before pasting it. Android:
+        `adb logcat`. Desktop: the log file in the app's data directory.
       render: shell
     validations:
       required: false
