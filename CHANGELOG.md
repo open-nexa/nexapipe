@@ -12,17 +12,15 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [0.3.0] — 2026-09-29
 
-0.2.0 was never tagged, so what was recorded against it ships here: one tag,
-everything since 0.1.1, with those entries merged into this one. A readable
-version of this release, with downloads, is published at
-<https://yixinin.github.io/nexapipe/releases/v0.3.0.html>. The page itself
+A readable version of this release, with downloads, is published at
+<https://open-nexa.github.io/nexapipe/releases/v0.3.0.html>. The page itself
 lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Added
 
 - An auxiliary listener, bound only when `[admin] listen_addr` is set and only
   ever on loopback: `GET /healthz` for liveness and, while `[metrics] enabled`
-  is true, `GET /metrics` in Prometheus text format (#52). A non-loopback bind
+  is true, `GET /metrics` in Prometheus text format. A non-loopback bind
   is refused at startup rather than warned about, and unlike `[server] expose`
   there is no escape hatch: what it answers names your routes, clients and
   backends.
@@ -30,7 +28,7 @@ lives in `docs/releases/`, and only that directory reaches the site.
   direct or relayed — read from iroh rather than guessed at a socket address,
   so "nothing to rent" is a number rather than a claim), requests by status
   class and the milliseconds they took, L4 flows by protocol and status,
-  backends in and out of rotation, work still in flight, and uptime (#52). The
+  backends in and out of rotation, work still in flight, and uptime. The
   exposition is written by hand, so no `prometheus` crate was added and
   `Cargo.lock` is untouched. `/metrics` with metrics off is `404` rather than an
   empty body, so a scraper can tell "disabled" from "no traffic yet".
@@ -57,11 +55,33 @@ lives in `docs/releases/`, and only that directory reaches the site.
   whatever `relay_mode` says. Two README sections oversold what a mode buys:
   `custom` constrains this endpoint only, and Endpoint ID discovery still
   queries `dns.iroh.link` in every mode. Both READMEs now point here instead of
-  repeating the caveat. The same pass corrected the iroh version there, which
-  was wrong twice over: it is declared `^1.0.1`, not pinned, and `Cargo.lock`
-  resolves 1.2.0.
-- This CHANGELOG, starting with a retrospective 0.2.0 entry distilled from the
-  commits since 0.1.1.
+  repeating the caveat.
+- This CHANGELOG. 0.2.0 shipped without one, so its entry below is
+  retrospective; 0.3.0 is the first release recorded in it as it happened.
+
+### Changed
+
+- Hot-reload rules, previously scattered across the configuration sections, are
+  one table in both READMEs: what a reload applies, and what needs a restart.
+
+### Fixed
+
+- Both READMEs quoted the iroh version wrongly in two ways at once: as pinned at
+  1.0.1, when it is declared `^1.0.1` and `Cargo.lock` resolves 1.2.0. The line
+  now defers to `docs/iroh-boundaries.md`, which states it correctly.
+
+## [0.2.0] — 2026-09-28
+
+A hardening release: a full review of the tree — server, client library, Android
+and desktop — produced a batch of security and correctness fixes, alongside
+configurable health checks, a draining shutdown, and access logs on the iroh
+tunnel path. It carries **breaking changes**: `default_backend` is removed, and
+the server now refuses some configs it used to "fix" silently.
+
+This entry is retrospective: 0.2.0 shipped before this file existed.
+
+### Added
+
 - Health checks are configurable. `[health_check] enabled = false` turns probing
   off, so a backend with no health endpoint is a supported deployment instead of
   a source of log noise (#47).
@@ -75,8 +95,6 @@ lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Changed
 
-- Hot-reload rules, previously scattered across the configuration sections, are
-  one table in both READMEs: what a reload applies, and what needs a restart.
 - Shutdown drains instead of sleeping. It counts the connections both accept
   loops spawned and waits for them, with a bound so a stuck peer cannot hold the
   process open (#47).
