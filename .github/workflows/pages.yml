@@ -1,0 +1,61 @@
+name: Pages
+
+# Publishes docs/releases/ as the project's GitHub Pages site: one hand-written
+# page per release, with the download links and the checksums on it.
+#
+# Only docs/releases/ is uploaded. The rest of docs/ — ROADMAP.md,
+# iroh-boundaries.md, security-review.md, security-remediation-plan.md — is
+# deliberately left out: it stays readable in the repository, and the site does
+# not become a second, quieter copy of it that can drift.
+#
+# One-time setup in Settings -> Pages -> Build and deployment -> Source:
+# "GitHub Actions". Until that is set, this workflow has nowhere to deploy to.
+# After it is set, every change under docs/releases/ publishes on its own.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/releases/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a deploy in flight: a half-uploaded artifact would replace a
+# working site with a broken one, and there is no rollback for that.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy release pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # pages: write to create the deployment, id-token: write to authenticate
+    # against Pages as this repository rather than with a personal token.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      # docs/releases/ is the site root, so index.html there is the site's home
+      # page and every vX.Y.Z.html sits next to it.
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/releases
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

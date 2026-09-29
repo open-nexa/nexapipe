@@ -37,7 +37,8 @@ NexaPipe is a Rust workspace with four parts:
 [Security](#security-boundary) ·
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
 [Development](#development) · [Contributing](CONTRIBUTING.md) ·
-[Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md)
+[Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md) ·
+[v0.3.0 notes](https://yixinin.github.io/nexapipe/releases/v0.3.0.html)
 
 ---
 
