@@ -160,6 +160,10 @@ pub async fn run_proxy(
     // Shared by both accept loops: a shutdown has to wait for the work they
     // spawned, not for a fixed number of seconds.
     let in_flight = Arc::new(InFlight::new());
+    // Every peer with a connection being served. Cheap to keep unconditionally:
+    // it is an empty map until a client connects, and `GET /v1/connections`
+    // reads it rather than the proxy having to be told to start collecting.
+    let peers = Arc::new(conn::peers::PeerRegistry::new());
     sync_health_checks(
         &config,
         &http_client,
@@ -415,9 +419,9 @@ pub async fn run_proxy(
 
     // ===== Auxiliary listener =====
     //
-    // `/healthz` and `/metrics`, and later the management endpoints. Bound here
-    // and never rebound: moving a listener is a restart, which is why
-    // `[admin] listen_addr` is the one setting a config reload does not apply.
+    // `/healthz`, `/metrics` and `/v1/*`. Bound here and never rebound: moving
+    // a listener is a restart, which is why `[admin] listen_addr` is the one
+    // setting a config reload does not apply.
     let admin_listener = match admin_config.as_ref().and_then(|a| a.listen_addr.clone()) {
         Some(addr) => {
             let listener = TcpListener::bind(&addr).await?;
@@ -427,7 +431,10 @@ pub async fn run_proxy(
             if !admin::may_bind_admin(bound) {
                 anyhow::bail!("{}", admin::non_loopback_refusal(bound));
             }
-            tracing::info!("Admin listener on: {} (/healthz)", bound);
+            tracing::info!(
+                "Admin listener on: {} (/healthz, /v1/* behind a token)",
+                bound
+            );
             Some(listener)
         }
         None => {
@@ -449,20 +456,23 @@ pub async fn run_proxy(
         if metrics_config.enabled {
             tracing::info!("Metrics enabled, serving /metrics on the admin listener");
         }
-        let config_clone = config.clone();
+
+        // Made here, and only because the listener is up: a deployment that
+        // never binds it should not find a credential on disk next to its
+        // config.
+        let token = admin::token::load_or_create(config_path);
+        let state = Arc::new(admin::AdminState::new(
+            config.clone(),
+            in_flight.clone(),
+            peers.clone(),
+            auth_state.clone(),
+            metrics_config.enabled,
+            token,
+        ));
         let shutdown_signal_clone = shutdown_signal.clone();
-        let in_flight_clone = in_flight.clone();
 
         admin_server = Some(tokio::spawn(async move {
-            if let Err(e) = admin::serve_admin(
-                listener,
-                config_clone,
-                in_flight_clone,
-                metrics_config.enabled,
-                shutdown_signal_clone,
-            )
-            .await
-            {
+            if let Err(e) = admin::serve_admin(listener, state, shutdown_signal_clone).await {
                 tracing::error!("Admin listener failed: {}", e);
             }
         }));
@@ -511,6 +521,7 @@ pub async fn run_proxy(
                         let http_client_clone = http_client.clone();
                         let auth_state_clone = auth_state.clone();
                         let limiter_clone = conn_limiter.clone();
+                        let peers_clone = peers.clone();
                         let in_flight_clone = in_flight.clone();
                         // Counted out here, not in the task's first line: a
                         // guard taken inside would leave a window in which the
@@ -529,6 +540,7 @@ pub async fn run_proxy(
                                 auth_state_clone,
                                 limiter_clone,
                                 guard,
+                                peers_clone,
                             )
                             .await;
                         });

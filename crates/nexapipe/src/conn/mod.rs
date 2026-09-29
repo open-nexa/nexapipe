@@ -12,12 +12,14 @@ use ::http::Request;
 use futures_util::StreamExt;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
+use peers::PeerRegistry;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod allow_list;
 pub mod limits;
+pub mod peers;
 
 use limits::ConnectionLimiter;
 
@@ -616,7 +618,12 @@ fn path_kind(path: &iroh::endpoint::Path<'_>) -> metrics::PathKind {
 /// ends, which is when the path stream ends, which is when the connection is
 /// gone: a connection that disappears without a clean close therefore still
 /// stops being counted.
-async fn track_connection_path(conn: Connection, initial: metrics::PathKind) {
+async fn track_connection_path(
+    conn: Connection,
+    initial: metrics::PathKind,
+    peer: iroh::EndpointId,
+    peers: Arc<PeerRegistry>,
+) {
     let mut ticket = metrics::PathTicket::new(initial);
 
     // Snapshots rather than individual path events: `paths_stream` yields the
@@ -625,7 +632,12 @@ async fn track_connection_path(conn: Connection, initial: metrics::PathKind) {
     let mut stream = conn.paths_stream();
     while let Some(paths) = stream.next().await {
         if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-            ticket.set(path_kind(&path));
+            let kind = path_kind(&path);
+            ticket.set(kind);
+            // The same fact, in the place that can say *which* peer it is
+            // about: a count can tell you two connections are relayed, not
+            // that they are these two.
+            peers.set_path(&peer, kind);
         }
     }
 }
@@ -1325,6 +1337,7 @@ pub async fn handle_connection(
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     auth_state: Option<AuthState>,
+    peers: Arc<PeerRegistry>,
 ) {
     let peer_id = conn.remote_id();
     let peer = peer_id.to_string();
@@ -1362,7 +1375,12 @@ pub async fn handle_connection(
     // A connection typically starts relayed and becomes direct once hole
     // punching succeeds, so the bucket it belongs to is not decided once. The
     // task owns the ticket and hands it back when the connection ends.
-    tokio::spawn(track_connection_path(conn.clone(), initial_kind));
+    tokio::spawn(track_connection_path(
+        conn.clone(),
+        initial_kind,
+        peer_id,
+        peers.clone(),
+    ));
 
     // ===== 2FA Authentication Handshake =====
     //
@@ -1436,6 +1454,12 @@ pub async fn handle_connection(
         }
     }
     // ===== Authentication Complete =====
+    //
+    // Listed from here, not from the top of the function: a peer that was
+    // refused its handshake never got a connection, and `GET /v1/connections`
+    // is asked "who is connected", not "who tried". The path may be corrected a
+    // moment later by the tracker above, which keeps following it.
+    let _peer = peers.insert(peer_id, initial_kind);
 
     loop {
         match conn.accept_bi().await {
@@ -1504,6 +1528,7 @@ pub async fn handle_incoming(
     auth_state: Option<AuthState>,
     limiter: Arc<ConnectionLimiter>,
     in_flight: InFlightGuard,
+    peers: Arc<PeerRegistry>,
 ) {
     match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -1529,7 +1554,7 @@ pub async fn handle_incoming(
                     // shutdown knows this connection is still here.
                     let _guard = guard;
                     let _in_flight = in_flight;
-                    handle_connection(conn, config, client, auth_state).await;
+                    handle_connection(conn, config, client, auth_state, peers).await;
                 });
             }
             Err(e) => {

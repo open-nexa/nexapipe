@@ -208,6 +208,9 @@ strategy = "round_robin"
 # [admin]
 # listen_addr = "127.0.0.1:9090"
 #
+# The token for /v1/* is generated on first start into <this file>.admin-token;
+# there is no key for it here. `nexapipe status` reads it from there.
+#
 # [metrics]
 # enabled = true
 

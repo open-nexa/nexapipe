@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::{
@@ -28,7 +28,11 @@ enum QrFormat {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    #[arg(short, long, default_value = "config.toml")]
+    // `global` so it can be written before or after a subcommand: `status`
+    // needs the config for the listener address, and `nexapipe --config X
+    // status` is the spelling an operator who already uses the flag will try
+    // first.
+    #[arg(short, long, default_value = "config.toml", global = true)]
     config: String,
 
     #[arg(long, help = "Run in client local proxy mode")]
@@ -141,6 +145,26 @@ struct Cli {
         help = "Endpoint ID to advertise (default: derived from [iroh] secret_key)"
     )]
     endpoint_id: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+/// The two things this binary does besides run: ask a running instance how it
+/// is, and — with the flags above — write credentials into a config.
+///
+/// A subcommand rather than another flag because it is a different kind of
+/// thing: the flags are all "do this to the config and exit", while `status`
+/// talks to a process that is already running.
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Ask the instance at [admin] listen_addr what it is doing
+    Status {
+        /// Print the whole answer as one JSON document instead of the grouped
+        /// reading, for anything that has to parse it
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -151,6 +175,18 @@ async fn main() {
         .expect("Failed to install ring as default CryptoProvider");
 
     let cli = Cli::parse();
+
+    // `status` is handled before anything that loads the config for a *start*:
+    // it is the only command that runs against another process, and it has to
+    // work while that process holds the config. It reads the same file, read
+    // only, for the address and the token.
+    if let Some(Commands::Status { json }) = &cli.command {
+        if let Err(e) = nexapipe::status::status(&cli.config, *json).await {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Handle --generate-secret flag
     if cli.generate_secret {

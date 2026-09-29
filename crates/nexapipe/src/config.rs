@@ -47,6 +47,12 @@ pub struct ServerConfig {
 /// **Loopback only, with no `expose`.** Nothing here should be reachable from
 /// the network: it names the routes, the clients and the backends, and the
 /// unauthenticated paths carry no credential check.
+///
+/// **There is deliberately no `token` key.** The token that guards `/v1/*` is
+/// generated on first start into a file next to this one; a key here would put
+/// a credential into the file operators copy around and commit, and writing it
+/// back would trip the watcher that reloads on the config's mtime. See
+/// [`crate::admin::token`].
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AdminConfig {
     /// Address of the auxiliary listener. **Absent means "do not bind it"**,
@@ -138,6 +144,21 @@ pub enum RouteMode {
 }
 
 impl RouteMode {
+    /// The spelling used in the config file and in `GET /v1/routes`.
+    ///
+    /// Deliberately not `Display` for now: the only two callers want a
+    /// `&'static str` — one to write JSON, one to log — and a `Display` impl
+    /// would invite formatting a mode into prose before anyone has decided how
+    /// it should read there.
+    pub fn name(self) -> &'static str {
+        match self {
+            RouteMode::Http => "http",
+            RouteMode::Passthrough => "passthrough",
+            RouteMode::Tcp => "tcp",
+            RouteMode::Udp => "udp",
+        }
+    }
+
     /// True for the two modes the L4 tunnel serves.
     pub fn is_l4(self) -> bool {
         matches!(self, RouteMode::Tcp | RouteMode::Udp)

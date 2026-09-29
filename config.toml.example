@@ -209,6 +209,12 @@ path = "/health"
 #   GET /healthz  -> 200 "ok" for as long as the process is serving
 #   GET /metrics  -> instance metrics in Prometheus text format
 #                    (only while [metrics] enabled = true below)
+#   GET /v1/*     -> the same instance as JSON, behind a token
+#
+# There is no `token` key here. The token is generated on first start into
+# <this file>.admin-token, readable only by this account; `nexapipe status`
+# reads it from there. A key here would put a credential into the file you
+# edit, copy and commit.
 #
 # Absent means the listener is not bound at all, which is the default: an
 # instance nobody scrapes or supervises should not hold a port open.

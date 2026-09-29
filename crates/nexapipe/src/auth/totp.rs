@@ -130,7 +130,11 @@ pub(crate) fn hmac_signature(
 /// Length-safe constant-time comparison: an HMAC-SHA256 tag is never secret
 /// in length (32 bytes), but comparing it byte-wise stops the first mismatch
 /// from leaking how many leading bytes were right.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Reused for the admin token, which is compared the same way for the same
+/// reason: a token guessed one byte at a time should not be told how far it
+/// got.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

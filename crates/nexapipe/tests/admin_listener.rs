@@ -1,10 +1,11 @@
-//! The auxiliary listener: `/healthz` and `/metrics`, over a real socket.
+//! The auxiliary listener, over a real socket.
 //!
-//! The point of these is the *shape* of the answer, which is what a scraper and
-//! a supervisor depend on and what no unit test of the counters can pin down:
-//! `/healthz` answers without a credential, `/metrics` is **absent** while
-//! `[metrics] enabled` is false rather than present and empty, and everything
-//! that has not been built yet is a 404.
+//! The point of these is the *shape* of the answer, which is what a scraper, a
+//! supervisor and `nexapipe status` depend on and what no unit test of the
+//! counters can pin down: `/healthz` answers without a credential, `/metrics`
+//! is **absent** while `[metrics] enabled` is false rather than present and
+//! empty, and `/v1/*` answers 503 when there is no token and 401 when the token
+//! is wrong — never the resource.
 //!
 //! The listener is driven in-process rather than through the binary: it is the
 //! same `serve_admin` the startup path spawns, and this way a test does not
@@ -12,6 +13,7 @@
 //! test may be between uses of.
 use nexapipe::admin;
 use nexapipe::config::{ProxyConfig, RouteMode};
+use nexapipe::conn::peers::PeerRegistry;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RouteConfig};
 use nexapipe::shutdown::{InFlight, ShutdownSignal};
@@ -33,7 +35,16 @@ struct Admin {
     shutdown: Arc<ShutdownSignal>,
 }
 
-async fn spawn_admin(routes: Vec<Route>, metrics_enabled: bool) -> Admin {
+async fn spawn_admin(routes: Vec<Route>, metrics_enabled: bool, token: Option<&str>) -> Admin {
+    spawn_admin_with_clients(routes, metrics_enabled, token, None).await
+}
+
+async fn spawn_admin_with_clients(
+    routes: Vec<Route>,
+    metrics_enabled: bool,
+    token: Option<&str>,
+    auth: Option<nexapipe::conn::AuthState>,
+) -> Admin {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind admin listener");
@@ -42,10 +53,19 @@ async fn spawn_admin(routes: Vec<Route>, metrics_enabled: bool) -> Admin {
 
     let config = Arc::new(RouteConfig::new(routes));
     let in_flight = Arc::new(InFlight::new());
+    let peers = Arc::new(PeerRegistry::new());
+    let state = Arc::new(admin::AdminState::new(
+        config,
+        in_flight,
+        peers,
+        auth,
+        metrics_enabled,
+        token.map(str::to_string),
+    ));
     let signal = shutdown.clone();
 
     tokio::spawn(async move {
-        let _ = admin::serve_admin(listener, config, in_flight, metrics_enabled, signal).await;
+        let _ = admin::serve_admin(listener, state, signal).await;
     });
 
     Admin { addr, shutdown }
@@ -53,11 +73,19 @@ async fn spawn_admin(routes: Vec<Route>, metrics_enabled: bool) -> Admin {
 
 impl Admin {
     async fn get(&self, path: &str) -> Reply {
+        self.get_with(path, None).await
+    }
+
+    async fn get_with(&self, path: &str, token: Option<&str>) -> Reply {
         let mut stream = TcpStream::connect(self.addr)
             .await
             .expect("connect to the admin listener");
+        let auth = match token {
+            Some(token) => format!("Authorization: Bearer {token}\r\n"),
+            None => String::new(),
+        };
         let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .await
@@ -101,6 +129,25 @@ fn http_route(host: &str, backends: Vec<String>) -> Route {
     )
 }
 
+/// An `[auth]` section with one enrolled client, loaded the way the server
+/// loads it, so `/v1/clients` is tested against the real shape.
+fn auth_with_secret(secret: &str) -> nexapipe::conn::AuthState {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[auth]\nenabled = true\n\n[auth.clients.alice]\nsecret = \"{secret}\"\n\
+             created_at = \"2026-09-29T00:00:00Z\"\n"
+        ),
+    )
+    .expect("write the config");
+    let path = path.to_string_lossy().into_owned();
+    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let auth = auth.expect("[auth] is present");
+    nexapipe::conn::AuthState::new(auth, path)
+}
+
 /// Liveness has to work without a credential — a supervisor should not need one
 /// — and it has to be the only thing that does while metrics are off.
 #[tokio::test]
@@ -108,6 +155,7 @@ async fn healthz_is_live_and_the_rest_is_absent_while_metrics_are_off() {
     let admin = spawn_admin(
         vec![http_route("app.test", vec!["http://127.0.0.1:1".into()])],
         false,
+        None,
     )
     .await;
 
@@ -120,11 +168,6 @@ async fn healthz_is_live_and_the_rest_is_absent_while_metrics_are_off() {
     let metrics = admin.get("/metrics").await;
     assert_eq!(metrics.status, 404, "{}", metrics.head);
 
-    // The management endpoints are not built yet, and an unknown path must not
-    // look like one that exists.
-    let unknown = admin.get("/v1/status").await;
-    assert_eq!(unknown.status, 404, "{}", unknown.head);
-
     admin.stop();
 }
 
@@ -136,6 +179,7 @@ async fn metrics_are_served_in_the_exposition_format_when_enabled() {
     let admin = spawn_admin(
         vec![http_route("app.test", vec!["http://127.0.0.1:1".into()])],
         true,
+        None,
     )
     .await;
 
@@ -174,7 +218,7 @@ async fn backends_are_counted_from_the_live_pools() {
     let route = http_route("app.test", vec![up.clone(), down.clone()]);
     route.backend_pool().set_backend_health(&down, false).await;
 
-    let admin = spawn_admin(vec![route], true).await;
+    let admin = spawn_admin(vec![route], true, None).await;
     let metrics = admin.get("/metrics").await;
 
     assert!(
@@ -206,7 +250,7 @@ async fn a_route_that_is_never_probed_is_not_counted_as_up() {
         None,
     );
 
-    let admin = spawn_admin(vec![route], true).await;
+    let admin = spawn_admin(vec![route], true, None).await;
     let metrics = admin.get("/metrics").await;
 
     assert!(
@@ -219,6 +263,228 @@ async fn a_route_that_is_never_probed_is_not_counted_as_up() {
         "{}",
         metrics.body
     );
+
+    admin.stop();
+}
+
+/// The whole management surface is behind one token, and the token is checked
+/// before anything else: a caller without it learns nothing about which paths
+/// exist, because every one of them is answered the same way.
+#[tokio::test]
+async fn every_v1_path_answers_401_without_the_token() {
+    let admin = spawn_admin(
+        vec![http_route("app.test", vec!["http://127.0.0.1:1".into()])],
+        true,
+        Some("s3cr3t"),
+    )
+    .await;
+
+    for path in [
+        "/v1/status",
+        "/v1/routes",
+        "/v1/clients",
+        "/v1/connections",
+        "/v1/health",
+        "/v1/anything",
+    ] {
+        let reply = admin.get(path).await;
+        assert_eq!(
+            reply.status, 401,
+            "{path} answered {}: {}",
+            reply.status, reply.head
+        );
+        assert!(
+            reply
+                .head
+                .to_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{path} did not send a challenge:\n{}",
+            reply.head
+        );
+    }
+
+    admin.stop();
+}
+
+/// A wrong token is answered exactly like no token: "unauthorized" is the whole
+/// answer, and it must not carry which part of the token was right.
+#[tokio::test]
+async fn a_wrong_token_is_answered_like_no_token() {
+    let admin = spawn_admin(Vec::new(), false, Some("s3cr3t")).await;
+
+    let wrong = admin.get_with("/v1/status", Some("s3cr3")).await;
+    assert_eq!(wrong.status, 401, "{}", wrong.head);
+    assert_eq!(wrong.body, "unauthorized");
+
+    let empty = admin.get_with("/v1/status", Some("")).await;
+    assert_eq!(empty.status, 401, "{}", empty.head);
+
+    admin.stop();
+}
+
+/// No token at all is 503, not 401: there is nothing the client could present,
+/// so a challenge would be a lie — and it is not 404 either, because the
+/// listener is up and the path does exist.
+#[tokio::test]
+async fn with_no_token_the_management_surface_is_unavailable() {
+    let admin = spawn_admin(Vec::new(), false, None).await;
+
+    let status = admin.get("/v1/status").await;
+    assert_eq!(status.status, 503, "{}", status.head);
+    assert!(status.body.contains("no admin token"), "{}", status.body);
+
+    // The unauthenticated half is untouched: liveness is liveness.
+    assert_eq!(admin.get("/healthz").await.status, 200);
+
+    admin.stop();
+}
+
+/// `/v1/status` is the one an operator reaches for first, so it has to say
+/// something about the instance rather than being an empty document: version,
+/// uptime and the counters are the least it can answer with.
+#[tokio::test]
+async fn status_reports_the_instance() {
+    let admin = spawn_admin(
+        vec![http_route("app.test", vec!["http://127.0.0.1:1".into()])],
+        true,
+        Some("s3cr3t"),
+    )
+    .await;
+
+    let status = admin.get_with("/v1/status", Some("s3cr3t")).await;
+    assert_eq!(status.status, 200, "{}", status.head);
+
+    let body: serde_json::Value = serde_json::from_str(&status.body).expect("valid JSON");
+    assert!(body["version"].is_string(), "{}", body);
+    assert!(body["uptime_seconds"].is_number(), "{}", body);
+    assert_eq!(body["connections"]["active"], 0);
+    assert_eq!(body["routes"], 1);
+    assert_eq!(body["peers"], 0);
+    assert!(body["backends"]["up"].is_number(), "{}", body);
+
+    admin.stop();
+}
+
+/// `/v1/routes` is the live table: what the reload put in it, with the modes a
+/// route serves spelled the way the config spells them.
+#[tokio::test]
+async fn routes_are_listed_with_their_modes_and_backends() {
+    let admin = spawn_admin(
+        vec![http_route("app.test", vec!["http://127.0.0.1:1".into()])],
+        false,
+        Some("s3cr3t"),
+    )
+    .await;
+
+    let reply = admin.get_with("/v1/routes", Some("s3cr3t")).await;
+    assert_eq!(reply.status, 200, "{}", reply.head);
+
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
+    let routes = body["routes"].as_array().expect("a routes array");
+    assert_eq!(routes.len(), 1, "{body}");
+    assert_eq!(routes[0]["host_pattern"], "app.test");
+    assert_eq!(routes[0]["modes"][0], "http");
+    assert_eq!(routes[0]["health_checked"], true);
+    assert_eq!(routes[0]["backends"][0]["url"], "http://127.0.0.1:1");
+
+    admin.stop();
+}
+
+/// The one thing `/v1/clients` must never do: it names the clients without
+/// handing out the secret that is half of their second factor. A management
+/// surface that leaks those turns a read-only endpoint into a credential store.
+#[tokio::test]
+async fn clients_are_listed_without_their_secrets() {
+    let secret = "JBSWY3DPEHPK3PXP";
+    let admin = spawn_admin_with_clients(
+        Vec::new(),
+        false,
+        Some("s3cr3t"),
+        Some(auth_with_secret(secret)),
+    )
+    .await;
+
+    let reply = admin.get_with("/v1/clients", Some("s3cr3t")).await;
+    assert_eq!(reply.status, 200, "{}", reply.head);
+
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
+    assert_eq!(body["enabled"], true);
+    let clients = body["clients"].as_array().expect("a clients array");
+    assert_eq!(clients.len(), 1, "{body}");
+    assert_eq!(clients[0]["id"], "alice");
+    assert_eq!(clients[0]["has_secret"], true);
+
+    // The test that matters: the secret is nowhere in the answer, not masked,
+    // not truncated, not under another name.
+    assert!(
+        !reply.body.contains(secret),
+        "the client secret leaked into /v1/clients:\n{}",
+        reply.body
+    );
+    assert!(
+        clients[0]["secret"].is_null(),
+        "a secret field exists:\n{}",
+        clients[0]
+    );
+
+    admin.stop();
+}
+
+/// `/v1/health` is about the pools, not the routes: it counts what is in
+/// rotation and what is not, read now rather than remembered.
+#[tokio::test]
+async fn health_reports_backend_pools() {
+    let up = "http://127.0.0.1:8080".to_string();
+    let down = "http://127.0.0.1:9090".to_string();
+    let route = http_route("app.test", vec![up, down.clone()]);
+    route.backend_pool().set_backend_health(&down, false).await;
+
+    let admin = spawn_admin(vec![route], false, Some("s3cr3t")).await;
+    let reply = admin.get_with("/v1/health", Some("s3cr3t")).await;
+    assert_eq!(reply.status, 200, "{}", reply.head);
+
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
+    assert_eq!(body["backends_up"], 1, "{body}");
+    assert_eq!(body["backends_down"], 1, "{body}");
+
+    admin.stop();
+}
+
+/// Nobody is connected in a process that has not accepted anything, and the
+/// answer is an empty list rather than a missing key: `nexapipe status` prints
+/// it without a special case.
+#[tokio::test]
+async fn connections_are_empty_when_nobody_is_connected() {
+    let admin = spawn_admin(Vec::new(), false, Some("s3cr3t")).await;
+
+    let reply = admin.get_with("/v1/connections", Some("s3cr3t")).await;
+    assert_eq!(reply.status, 200, "{}", reply.head);
+
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
+    assert_eq!(body["peers"].as_array().expect("a peers array").len(), 0);
+
+    admin.stop();
+}
+
+/// Only GET, and only on the paths that exist: the surface is read-only, so a
+/// POST is rejected outright rather than answered with something unchanged.
+#[tokio::test]
+async fn the_management_surface_rejects_anything_but_get() {
+    let admin = spawn_admin(Vec::new(), false, Some("s3cr3t")).await;
+
+    let mut stream = TcpStream::connect(admin.addr).await.expect("connect");
+    let request = "POST /v1/status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cr3t\r\n\
+                   Connection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.expect("read");
+
+    let status = raw
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("a status line");
+    assert_eq!(status, "405", "{raw}");
 
     admin.stop();
 }
@@ -252,6 +518,29 @@ fn the_admin_and_metrics_sections_round_trip_through_the_config_file() {
         !config.metrics.enabled,
         "metrics are off until they are asked for"
     );
+}
+
+/// The token is never the one written in the config, because there is no token
+/// key to write it in — `[admin]` is lenient about stray keys like every other
+/// section, so a `token` there is ignored rather than refused, and the
+/// generated file is the only source.
+#[test]
+fn a_token_in_the_config_is_never_the_token_that_is_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[admin]\nlisten_addr = \"127.0.0.1:9090\"\ntoken = \"from-the-config\"\n",
+    )
+    .unwrap();
+    // Proves the config was even read: a token key would not survive a parse
+    // that refused it, and then there would be nothing to show.
+    let config = ProxyConfig::from_file(path.to_str().unwrap()).expect("the config parses");
+    assert!(config.admin.is_some(), "[admin] was not read");
+
+    let token = admin::token::load_or_create(path.to_str().unwrap()).expect("a token is generated");
+    assert_ne!(token, "from-the-config");
+    assert_eq!(token.len(), 64, "32 random bytes, hex encoded: {token}");
 }
 
 /// The one address rule that has no escape hatch: unlike the plaintext

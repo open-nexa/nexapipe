@@ -14,4 +14,5 @@ pub mod proxy;
 pub mod qr;
 pub mod routes;
 pub mod shutdown;
+pub mod status;
 pub mod stream_util;
