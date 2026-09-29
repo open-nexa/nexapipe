@@ -88,6 +88,35 @@ fun EndpointDetailScreen(
             .show()
     }
 
+    /**
+     * Opens the add-domain dialog, behind the credential door.
+     *
+     * Adding a domain is a routing decision, not a list edit: what is typed
+     * here starts going through this endpoint — and with it, whatever this
+     * endpoint authenticates as.
+     */
+    fun addDomainConfirmed() {
+        credentialUnlock.requestIfLocked(
+            localizedContext,
+            R.string.credential_lock_add_domain_subtitle
+        ) { showAddDomainDialog = true }
+    }
+
+    /**
+     * [copyToClipboard] behind the credential door.
+     *
+     * The clipboard is not private: anything on this device can read it back,
+     * so copying the endpoint ID — what this device routes through and what a
+     * server identifies it by — is a disclosure, not a shortcut for the user's
+     * own typing. A domain is the other half of that sentence, naming what the
+     * endpoint serves.
+     */
+    fun copyConfirmed(text: String, label: String, subtitleRes: Int) {
+        credentialUnlock.requestIfLocked(localizedContext, subtitleRes) {
+            copyToClipboard(text, label)
+        }
+    }
+
     // This endpoint's 2FA; a switched-off one when it has never been set here.
     val twoFactor = node.twoFactor ?: NodeTwoFactor(enabled = false)
 
@@ -111,8 +140,22 @@ fun EndpointDetailScreen(
     val storedSecretPresent = node.twoFactor?.secret?.isNotBlank() == true
     var secretReplaced by remember(nodeId) { mutableStateOf(false) }
 
+    /**
+     * Writes [transform] over this endpoint's credentials.
+     *
+     * The record it runs on is read when the write happens, not captured from
+     * the composition that scheduled it. A write can now be deferred — the
+     * credential prompt stands between the tap and the update — and
+     * `VpnViewModel.collectIssuedCredential` can deliver an enrollment secret
+     * while it waits. Transforming the record this screen was last drawn with
+     * would write that older copy back over the node, taking the secret that
+     * just arrived with it.
+     */
     fun updateTwoFactor(transform: (NodeTwoFactor) -> NodeTwoFactor) {
-        viewModel.updateNodeTwoFactor(nodeId, transform(twoFactor))
+        val current = viewModel.nodes.value
+            .firstOrNull { it.nodeId == nodeId }?.twoFactor
+            ?: NodeTwoFactor(enabled = false)
+        viewModel.updateNodeTwoFactor(nodeId, transform(current))
     }
 
     /**
@@ -192,9 +235,10 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_copy_id)) },
                                 onClick = {
                                     menuExpanded = false
-                                    copyToClipboard(
+                                    copyConfirmed(
                                         nodeId,
-                                        localizedContext.getString(R.string.clipboard_label_endpoint_id)
+                                        localizedContext.getString(R.string.clipboard_label_endpoint_id),
+                                        R.string.credential_lock_copy_id_subtitle
                                     )
                                 },
                                 leadingIcon = {
@@ -209,7 +253,13 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_edit_id)) },
                                 onClick = {
                                     menuExpanded = false
-                                    showEditDialog = true
+                                    // Changing the ID re-points every domain
+                                    // on this endpoint at another backend, so
+                                    // it is not a label edit.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_edit_id_subtitle
+                                    ) { showEditDialog = true }
                                 },
                                 leadingIcon = {
                                     Icon(
@@ -223,7 +273,14 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_delete)) },
                                 onClick = {
                                     menuExpanded = false
-                                    showDeleteDialog = true
+                                    // Deleting takes the endpoint's 2FA
+                                    // credentials with it, so the door stands
+                                    // in front of the confirmation, not just
+                                    // behind it.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_delete_subtitle
+                                    ) { showDeleteDialog = true }
                                 },
                                 leadingIcon = {
                                     Icon(
@@ -244,7 +301,7 @@ fun EndpointDetailScreen(
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = { showAddDomainDialog = true },
+                onClick = { addDomainConfirmed() },
                 icon = { Icon(Icons.Default.Add, contentDescription = null) },
                 text = { Text(stringResource(R.string.domain_add)) }
             )
@@ -293,9 +350,10 @@ fun EndpointDetailScreen(
                         }
                         IconButton(
                             onClick = {
-                                copyToClipboard(
+                                copyConfirmed(
                                     node.nodeId,
-                                    localizedContext.getString(R.string.clipboard_label_endpoint_id)
+                                    localizedContext.getString(R.string.clipboard_label_endpoint_id),
+                                    R.string.credential_lock_copy_id_subtitle
                                 )
                             }
                         ) {
@@ -384,7 +442,20 @@ fun EndpointDetailScreen(
                             Switch(
                                 checked = twoFactor.enabled,
                                 onCheckedChange = { enabled ->
-                                    updateTwoFactor { current -> current.copy(enabled = enabled) }
+                                    // Switching this off stops the endpoint
+                                    // from presenting a token at all, and
+                                    // switching it on hands this app's
+                                    // credentials to it — both are a change to
+                                    // how this endpoint authenticates, so both
+                                    // are asked for. The switch still shows
+                                    // what the state is; only moving it takes
+                                    // a confirmation.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_two_factor_subtitle
+                                    ) {
+                                        updateTwoFactor { current -> current.copy(enabled = enabled) }
+                                    }
                                 }
                             )
                         }
@@ -509,7 +580,17 @@ fun EndpointDetailScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedButton(
-                                    onClick = { showTwoFactorScanner = true },
+                                    // A scan writes credentials into this
+                                    // endpoint, replacing whatever is there
+                                    // now — which is the other half of the
+                                    // disclosure the field is gated for. The
+                                    // camera is asked for only once confirmed.
+                                    onClick = {
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_scan_secret_subtitle
+                                        ) { showTwoFactorScanner = true }
+                                    },
                                     modifier = Modifier.weight(1f)
                                 ) {
                                     Icon(
@@ -646,7 +727,7 @@ fun EndpointDetailScreen(
                                 textAlign = TextAlign.Center
                             )
                             Spacer(modifier = Modifier.height(16.dp))
-                            FilledTonalButton(onClick = { showAddDomainDialog = true }) {
+                            FilledTonalButton(onClick = { addDomainConfirmed() }) {
                                 Icon(
                                     Icons.Default.Add,
                                     contentDescription = null,
@@ -673,12 +754,23 @@ fun EndpointDetailScreen(
                                 DomainRow(
                                     domain = domain,
                                     onCopy = {
-                                        copyToClipboard(
+                                        copyConfirmed(
                                             domain,
-                                            localizedContext.getString(R.string.clipboard_label_domain)
+                                            localizedContext.getString(R.string.clipboard_label_domain),
+                                            R.string.credential_lock_copy_domain_subtitle
                                         )
                                     },
-                                    onRemove = { removeDomain(domain) }
+                                    // Removing changes where this domain goes
+                                    // as surely as adding does. The undo is a
+                                    // convenience for the user, not a reason
+                                    // to leave the door open: what is undone
+                                    // has already been done once.
+                                    onRemove = {
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_remove_domain_subtitle
+                                        ) { removeDomain(domain) }
+                                    }
                                 )
                                 if (index < node.domains.lastIndex) {
                                     HorizontalDivider(
@@ -806,15 +898,22 @@ fun EndpointDetailScreen(
         )
     }
 
-    // A relock has to close what the unlock opened. The QR carries the secret
-    // in full, and the window closes without the dialog knowing: it lapses
-    // after two minutes, and coming back from the background closes it on a
-    // device that has lost the ability to ask. Clearing the flag rather than
-    // gating the dialog on `unlocked` keeps a later authentication from
-    // bringing it back on its own — exporting is something the user asks for.
+    // A relock has to close what the unlock opened, and every surface behind
+    // the door outlives the window that opened it: the window lapses after two
+    // minutes, and coming back from the background closes it on a device that
+    // has lost the ability to ask — neither of which the dialog sees. Anything
+    // left open would be a confirmation the user has not been asked for since.
+    // Clearing the flags rather than gating each dialog on `unlocked` keeps a
+    // later authentication from bringing one back on its own: all of these are
+    // things the user asks for, one tap at a time.
     LaunchedEffect(credentialUnlock.unlocked) {
         if (!credentialUnlock.unlocked) {
+            showEditDialog = false
+            showDeleteDialog = false
+            showAddDomainDialog = false
+            showTwoFactorScanner = false
             showTwoFactorExport = false
+            pendingTwoFactorImport = null
         }
     }
 

@@ -592,8 +592,25 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
 
                             EndpointsSection(
                                 nodes = nodes,
-                                onScanInvite = { showInviteScanner = true },
-                                onPasteInvite = { showInviteLinkDialog = true },
+                                // An invite carries a relay and the 2FA
+                                // credentials of an endpoint, so importing one
+                                // is credential-grade: what arrives rewrites
+                                // settings that already work, and it can carry
+                                // a secret of its own. Both entry points — the
+                                // camera and a pasted link — ask first, for
+                                // the same reason and in the same words.
+                                onScanInvite = {
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_scan_invite_subtitle
+                                    ) { showInviteScanner = true }
+                                },
+                                onPasteInvite = {
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_paste_invite_subtitle
+                                    ) { showInviteLinkDialog = true }
+                                },
                                 onOpenEndpoint = { selectedNodeId = it }
                             )
 
@@ -804,6 +821,20 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         viewModel.refreshPermissions(context)
                     }
                 )
+            }
+        }
+
+        // A relock has to close what the unlock opened. Both invite entry
+        // points — and the confirmation they lead to — outlive the window that
+        // opened them: it lapses after two minutes, and coming back from the
+        // background closes it on a device that has lost the ability to ask,
+        // neither of which the dialog sees. Left open, importing would be a
+        // confirmation nobody has been asked for since.
+        LaunchedEffect(credentialUnlock.unlocked) {
+            if (!credentialUnlock.unlocked) {
+                showInviteLinkDialog = false
+                showInviteScanner = false
+                pendingInviteImport = null
             }
         }
 

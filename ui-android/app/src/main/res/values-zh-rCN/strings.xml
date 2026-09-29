@@ -159,6 +159,16 @@
     <string name="credential_lock_secret_subtitle">显示该端点的两步验证密钥</string>
     <string name="credential_lock_export_subtitle">分享该端点的两步验证配置</string>
     <string name="credential_lock_relay_subtitle">更改本设备的流量中继设置</string>
+    <string name="credential_lock_two_factor_subtitle">开启或关闭该端点的两步验证</string>
+    <string name="credential_lock_scan_secret_subtitle">扫描该端点的两步验证二维码</string>
+    <string name="credential_lock_scan_invite_subtitle">扫描端点邀请二维码</string>
+    <string name="credential_lock_paste_invite_subtitle">导入端点邀请链接</string>
+    <string name="credential_lock_copy_id_subtitle">复制该端点 ID</string>
+    <string name="credential_lock_edit_id_subtitle">更改该端点 ID</string>
+    <string name="credential_lock_delete_subtitle">删除该端点及其两步验证凭据</string>
+    <string name="credential_lock_copy_domain_subtitle">复制该域名</string>
+    <string name="credential_lock_add_domain_subtitle">通过该端点路由另一个域名</string>
+    <string name="credential_lock_remove_domain_subtitle">停止通过该端点路由此域名</string>
     <string name="credential_lock_reveal">显示密钥</string>
     <string name="credential_lock_relay_action">验证后更改</string>
     <string name="credential_lock_unavailable_title">此设备未设置锁屏</string>

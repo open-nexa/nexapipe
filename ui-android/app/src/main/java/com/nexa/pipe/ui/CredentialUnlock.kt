@@ -58,9 +58,43 @@ class CredentialUnlock internal constructor(
     fun request(title: CharSequence, subtitle: CharSequence? = null, action: () -> Unit = { }) =
         onRequest(title, subtitle, action)
 
+    /**
+     * Runs [action] now when the door is already open, and asks for it first
+     * when it is not.
+     *
+     * One authentication covers every surface for [CredentialGate.UNLOCK_WINDOW_MS],
+     * so re-asking inside that window would only be friction: the device has
+     * already said who is using it, and a second confirmation says nothing the
+     * first one did not.
+     */
+    fun requestIfLocked(
+        title: CharSequence,
+        subtitle: CharSequence? = null,
+        action: () -> Unit,
+    ) {
+        if (unlocked) action() else request(title, subtitle, action)
+    }
+
     /** Closes the "this device cannot ask" dialog. */
     fun dismissUnavailable() = onDismissUnavailable()
 }
+
+/**
+ * [CredentialUnlock.requestIfLocked] for the common case.
+ *
+ * The title is the same on every surface, so only the subtitle — the one line
+ * that says what is about to be allowed — differs; [context] is the
+ * locale-wrapped one, so the prompt is in the language the screen is in.
+ */
+fun CredentialUnlock.requestIfLocked(
+    context: Context,
+    subtitleRes: Int,
+    action: () -> Unit,
+) = requestIfLocked(
+    context.getString(R.string.credential_lock_title),
+    context.getString(subtitleRes),
+    action
+)
 
 /**
  * Wires the credential door into a screen.
