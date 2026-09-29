@@ -207,7 +207,7 @@ dependencies {
     // Not for fragments — this app has none — but for FragmentActivity, which
     // is the only kind of activity BiometricPrompt will host itself in.
     implementation(libs.androidx.fragment)
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
