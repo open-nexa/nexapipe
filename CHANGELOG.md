@@ -47,6 +47,15 @@ version of this release, with downloads, lives in
   them grouped, or as one document with `--json`. It is a client of the same
   endpoints rather than a second reader of the config, so the running instance
   stays the one thing that decides what its state is.
+- A door in front of the credentials the Android app holds: the TOTP secret of
+  an endpoint, its `otpauth` export, and any change to the relay configuration
+  now ask Android to confirm the user first — a biometric where there is one,
+  the screen-lock credential otherwise — and stay shut for two minutes after
+  one confirmation. `SecretStore` already sealed them at rest; what was missing
+  was anything asking before handing them back. A device enrolled with neither
+  a biometric nor a screen lock is refused rather than downgraded, and the way
+  out is one tap away. Proxy start and stop are deliberately not gated: the VPN
+  has to come back after a reboot with nobody present.
 - `docs/iroh-boundaries.md` — what still depends on third-party infrastructure
   whatever `relay_mode` says. Two README sections oversold what a mode buys:
   `custom` constrains this endpoint only, and Endpoint ID discovery still

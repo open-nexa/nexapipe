@@ -202,6 +202,11 @@ dependencies {
     implementation(libs.androidx.camera.view)
     implementation(libs.zxing.core)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    // System authentication in front of the credential surfaces (R14).
+    implementation(libs.androidx.biometric)
+    // Not for fragments — this app has none — but for FragmentActivity, which
+    // is the only kind of activity BiometricPrompt will host itself in.
+    implementation(libs.androidx.fragment)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     testImplementation(libs.junit)

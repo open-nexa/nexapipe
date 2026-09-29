@@ -154,6 +154,17 @@
     <string name="relay_token_label">中继鉴权令牌（可选）</string>
     <string name="relay_token_note">仅当中继要求时才需要填写，且服务器必须使用相同的令牌。</string>
 
+    <!-- 凭据锁：挡在已保存凭据前面的那道门 -->
+    <string name="credential_lock_title">验证你的身份</string>
+    <string name="credential_lock_secret_subtitle">显示该端点的两步验证密钥</string>
+    <string name="credential_lock_export_subtitle">分享该端点的两步验证配置</string>
+    <string name="credential_lock_relay_subtitle">更改本设备的流量中继设置</string>
+    <string name="credential_lock_reveal">显示密钥</string>
+    <string name="credential_lock_relay_action">验证后更改</string>
+    <string name="credential_lock_unavailable_title">此设备未设置锁屏</string>
+    <string name="credential_lock_unavailable_body">显示凭据前，NexaPipe 会请 Android 确认是你本人，而此设备没有可用于确认的 PIN、图案、密码或生物特征。凭据仍然加密保存且照常工作——设置一个锁屏密码即可查看。</string>
+    <string name="credential_lock_unavailable_action">设置锁屏</string>
+
     <!-- 权限引导 -->
     <string name="permission_guide_title">权限引导</string>
     <string name="permission_enable_title">启用所需权限</string>

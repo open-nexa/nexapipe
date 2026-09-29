@@ -57,6 +57,9 @@ fun EndpointDetailScreen(
     val node = nodes.firstOrNull { it.nodeId == nodeId }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    // The door in front of this endpoint's credentials. Process-wide, so an
+    // unlock obtained anywhere counts here for the rest of its window.
+    val credentialUnlock = rememberCredentialUnlock()
 
     var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -400,9 +403,15 @@ fun EndpointDetailScreen(
                             )
 
                             Spacer(modifier = Modifier.height(8.dp))
+                            val secretLocked = twoFactor.secret.isNotBlank() && !credentialUnlock.unlocked
                             OutlinedTextField(
-                                value = twoFactor.secret,
+                                // A field with no secret in it has nothing to
+                                // disclose, so it stays editable: the door is
+                                // in front of reading one back, not in front
+                                // of typing one in.
+                                value = if (secretLocked) SECRET_MASK else twoFactor.secret,
                                 onValueChange = { value ->
+                                    if (secretLocked) return@OutlinedTextField
                                     twoFactorImportWarning = null
                                     updateTwoFactor { current -> current.copy(secret = value) }
                                 },
@@ -411,6 +420,29 @@ fun EndpointDetailScreen(
                                     Text(stringResource(R.string.two_factor_secret_placeholder))
                                 },
                                 visualTransformation = PasswordVisualTransformation(),
+                                trailingIcon = {
+                                    if (secretLocked) {
+                                        IconButton(
+                                            onClick = {
+                                                credentialUnlock.request(
+                                                    localizedContext.getString(R.string.credential_lock_title),
+                                                    localizedContext.getString(
+                                                        R.string.credential_lock_secret_subtitle
+                                                    )
+                                                )
+                                            }
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Lock,
+                                                contentDescription = stringResource(
+                                                    R.string.credential_lock_reveal
+                                                ),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                },
+                                readOnly = secretLocked,
                                 modifier = Modifier.fillMaxWidth(),
                                 singleLine = true
                             )
@@ -466,7 +498,24 @@ fun EndpointDetailScreen(
                                     )
                                 }
                                 OutlinedButton(
-                                    onClick = { showTwoFactorExport = true },
+                                    // The QR code carries the secret in full,
+                                    // so exporting is the same disclosure as
+                                    // showing the field and needs the same
+                                    // thing in front of it.
+                                    onClick = {
+                                        if (credentialUnlock.unlocked) {
+                                            showTwoFactorExport = true
+                                        } else {
+                                            credentialUnlock.request(
+                                                localizedContext.getString(R.string.credential_lock_title),
+                                                localizedContext.getString(
+                                                    R.string.credential_lock_export_subtitle
+                                                )
+                                            ) {
+                                                showTwoFactorExport = true
+                                            }
+                                        }
+                                    },
                                     enabled = twoFactor.clientId.isNotBlank() && twoFactor.secret.isNotBlank(),
                                     modifier = Modifier.weight(1f)
                                 ) {
@@ -738,7 +787,19 @@ fun EndpointDetailScreen(
             onDismiss = { showTwoFactorExport = false }
         )
     }
+
+    if (credentialUnlock.unavailable) {
+        CredentialUnavailableDialog(credentialUnlock)
+    }
 }
+
+/**
+ * Stands in for a secret the user has not authenticated to see.
+ *
+ * Deliberately longer than a real one and of a fixed length, so the field
+ * cannot be used to measure the credential behind it.
+ */
+private val SECRET_MASK = "•".repeat(16)
 
 /**
  * One domain row: a monogram so long lists scan visually, the domain itself
