@@ -91,16 +91,24 @@ fun EndpointDetailScreen(
     // This endpoint's 2FA; a switched-off one when it has never been set here.
     val twoFactor = node.twoFactor ?: NodeTwoFactor(enabled = false)
 
-    // Whether opening this page put a stored secret in the field, and whether
-    // what is in it now is still that secret rather than something being typed.
+    // Whether the endpoint already has a secret in storage, and whether what
+    // is in the field now is still that secret rather than something being
+    // typed.
     //
     // The gate is in front of reading a secret back, not in front of typing one
     // in. Deciding it from the live field value locked the field the instant it
     // stopped being empty, so a new secret could not be entered at all: the
     // first character turned the mask on and every one after it was discarded.
-    // What was stored when the page opened is the thing worth hiding; anything
-    // typed afterwards is the user's own, and hiding it from them is pointless.
-    val storedSecretPresent = remember(nodeId) { node.twoFactor?.secret?.isNotBlank() == true }
+    // What is in storage is the thing worth hiding; anything typed afterwards
+    // is the user's own, and hiding it from them is pointless.
+    //
+    // Read from the node on every recomposition rather than remembered, because
+    // a secret can arrive while this page is open: enrolling spends a token and
+    // `VpnViewModel.collectIssuedCredential` writes the issued secret into the
+    // same node, and a value remembered by node id would still say there was
+    // nothing to hide. Typing stays possible because `onValueChange` sets
+    // `secretReplaced` in the same breath it writes the character.
+    val storedSecretPresent = node.twoFactor?.secret?.isNotBlank() == true
     var secretReplaced by remember(nodeId) { mutableStateOf(false) }
 
     fun updateTwoFactor(transform: (NodeTwoFactor) -> NodeTwoFactor) {
@@ -796,6 +804,18 @@ fun EndpointDetailScreen(
                 }
             }
         )
+    }
+
+    // A relock has to close what the unlock opened. The QR carries the secret
+    // in full, and the window closes without the dialog knowing: it lapses
+    // after two minutes, and coming back from the background closes it on a
+    // device that has lost the ability to ask. Clearing the flag rather than
+    // gating the dialog on `unlocked` keeps a later authentication from
+    // bringing it back on its own — exporting is something the user asks for.
+    LaunchedEffect(credentialUnlock.unlocked) {
+        if (!credentialUnlock.unlocked) {
+            showTwoFactorExport = false
+        }
     }
 
     if (showTwoFactorExport) {
