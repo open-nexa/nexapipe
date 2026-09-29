@@ -36,6 +36,40 @@ pub struct ServerConfig {
     pub key_path: Option<String>,
 }
 
+/// The `[admin]` section: the auxiliary listener for liveness and metrics.
+///
+/// Separate from `[server]` on purpose. `[server] listen_addr` serves routes,
+/// so a request arriving there is matched against the routing table before
+/// anything else can look at it; this listener answers questions about the
+/// proxy itself, and has to keep answering them when routing is the thing that
+/// is broken.
+///
+/// **Loopback only, with no `expose`.** Nothing here should be reachable from
+/// the network: it names the routes, the clients and the backends, and the
+/// unauthenticated paths carry no credential check.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminConfig {
+    /// Address of the auxiliary listener. **Absent means "do not bind it"**,
+    /// and that is the default: an instance that is not being scraped or
+    /// supervised should not hold a port open for it.
+    pub listen_addr: Option<String>,
+}
+
+/// The `[metrics]` section: whether `/metrics` is served at all.
+///
+/// A config gate rather than a cargo feature because it is a runtime choice:
+/// the same binary is deployed with and without a scraper, and a feature would
+/// mean a second build-and-test combination in CI and in every release for a
+/// decision a deployment makes per host.
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+pub struct MetricsConfig {
+    /// Serve `/metrics` on the `[admin]` listener. Default: `false`.
+    ///
+    /// Off by default because the listener it hangs off is unauthenticated:
+    /// nothing is exposed until someone asks for it *and* binds the address.
+    pub enabled: bool,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
@@ -317,6 +351,12 @@ pub struct ProxyConfig {
     /// Probing of `http` backends. Absent means the defaults, i.e. enabled.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// The auxiliary listener for `/healthz` and `/metrics`. Absent means it is
+    /// not bound at all.
+    pub admin: Option<AdminConfig>,
+    /// Whether `/metrics` is served. Absent means it is not.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// The `[peers]` section: a server-side allow-list of client public keys.

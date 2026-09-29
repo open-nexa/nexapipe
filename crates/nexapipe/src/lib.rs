@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod config_watcher;
@@ -7,6 +8,7 @@ pub mod http;
 pub mod l4;
 pub mod lb;
 pub mod log;
+pub mod metrics;
 pub mod passthrough;
 pub mod proxy;
 pub mod qr;

@@ -483,6 +483,49 @@ clamped silently, and each of the three then meant something nobody would ask fo
 — a probe round every second, a probe that can never finish, or a single failure
 emptying the pool. A config that says `0` is refused at load.
 
+### `[admin]` — the auxiliary listener (off by default)
+
+```toml
+[admin]
+listen_addr = "127.0.0.1:9090"   # absent => the listener is not bound at all
+
+[metrics]
+enabled = true                   # serves /metrics on it; default: false
+```
+
+A second listener that answers questions about **this instance** instead of
+forwarding traffic:
+
+| Path | Purpose |
+|---|---|
+| `GET /healthz` | `200 ok` for as long as the process is serving. No authentication. |
+| `GET /metrics` | Instance metrics in Prometheus text format, only while `[metrics] enabled` is true. |
+
+`[metrics] enabled` is off by default because the listener it hangs off is
+unauthenticated: nothing is exposed until you ask for it *and* bind an address.
+Enabling it without an `[admin]` section logs a warning and serves nothing.
+With the listener up but metrics off, `/metrics` is **404, not empty** — a
+scraper pointed at a deployment that never enabled them has to be able to tell
+"disabled" from "no traffic yet".
+
+**Loopback only, and there is no `expose`.** `[server] expose` exists because
+the plaintext listener may sit behind something else that gates the port;
+nothing on *this* one should be reachable from the network, since it names your
+routes, clients and backends. A non-loopback bind is refused at startup. To
+scrape from another host, tunnel it (`ssh -L 9090:127.0.0.1:9090 …`).
+
+**`listen_addr` is not hot-reloadable** — moving a listener is a restart. Every
+other key in these two sections is read once, at startup.
+
+What `/metrics` reports: connections (total, active, and by whether the path is
+direct or relayed), requests by status class and the milliseconds they took,
+L4 flows by protocol and status, backends in and out of rotation, connections
+still in flight, and uptime. Backend health is read from the live pools when
+the page is rendered, so a reload that changes a pool shows up on the next
+scrape. Requests and flows are counted separately on purpose: an L4 flow is a
+tunnel that stays open for as long as the client wants, and counting it as a
+request would put two different units in the same number.
+
 ### `[local_proxy]` — client mode
 
 ```toml
