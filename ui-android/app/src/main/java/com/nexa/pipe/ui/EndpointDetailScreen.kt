@@ -88,6 +88,21 @@ fun EndpointDetailScreen(
             .show()
     }
 
+    /**
+     * [copyToClipboard] behind the credential door.
+     *
+     * The clipboard is not private: anything on this device can read it back,
+     * so copying the endpoint ID — what this device routes through and what a
+     * server identifies it by — is a disclosure, not a shortcut for the user's
+     * own typing. A domain is the other half of that sentence, naming what the
+     * endpoint serves.
+     */
+    fun copyConfirmed(text: String, label: String, subtitleRes: Int) {
+        credentialUnlock.requestIfLocked(localizedContext, subtitleRes) {
+            copyToClipboard(text, label)
+        }
+    }
+
     // This endpoint's 2FA; a switched-off one when it has never been set here.
     val twoFactor = node.twoFactor ?: NodeTwoFactor(enabled = false)
 
@@ -192,9 +207,10 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_copy_id)) },
                                 onClick = {
                                     menuExpanded = false
-                                    copyToClipboard(
+                                    copyConfirmed(
                                         nodeId,
-                                        localizedContext.getString(R.string.clipboard_label_endpoint_id)
+                                        localizedContext.getString(R.string.clipboard_label_endpoint_id),
+                                        R.string.credential_lock_copy_id_subtitle
                                     )
                                 },
                                 leadingIcon = {
@@ -209,7 +225,13 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_edit_id)) },
                                 onClick = {
                                     menuExpanded = false
-                                    showEditDialog = true
+                                    // Changing the ID re-points every domain
+                                    // on this endpoint at another backend, so
+                                    // it is not a label edit.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_edit_id_subtitle
+                                    ) { showEditDialog = true }
                                 },
                                 leadingIcon = {
                                     Icon(
@@ -223,7 +245,14 @@ fun EndpointDetailScreen(
                                 text = { Text(stringResource(R.string.endpoint_delete)) },
                                 onClick = {
                                     menuExpanded = false
-                                    showDeleteDialog = true
+                                    // Deleting takes the endpoint's 2FA
+                                    // credentials with it, so the door stands
+                                    // in front of the confirmation, not just
+                                    // behind it.
+                                    credentialUnlock.requestIfLocked(
+                                        localizedContext,
+                                        R.string.credential_lock_delete_subtitle
+                                    ) { showDeleteDialog = true }
                                 },
                                 leadingIcon = {
                                     Icon(
@@ -293,9 +322,10 @@ fun EndpointDetailScreen(
                         }
                         IconButton(
                             onClick = {
-                                copyToClipboard(
+                                copyConfirmed(
                                     node.nodeId,
-                                    localizedContext.getString(R.string.clipboard_label_endpoint_id)
+                                    localizedContext.getString(R.string.clipboard_label_endpoint_id),
+                                    R.string.credential_lock_copy_id_subtitle
                                 )
                             }
                         ) {
@@ -509,7 +539,17 @@ fun EndpointDetailScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedButton(
-                                    onClick = { showTwoFactorScanner = true },
+                                    // A scan writes credentials into this
+                                    // endpoint, replacing whatever is there
+                                    // now — which is the other half of the
+                                    // disclosure the field is gated for. The
+                                    // camera is asked for only once confirmed.
+                                    onClick = {
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_scan_secret_subtitle
+                                        ) { showTwoFactorScanner = true }
+                                    },
                                     modifier = Modifier.weight(1f)
                                 ) {
                                     Icon(
@@ -673,11 +713,16 @@ fun EndpointDetailScreen(
                                 DomainRow(
                                     domain = domain,
                                     onCopy = {
-                                        copyToClipboard(
+                                        copyConfirmed(
                                             domain,
-                                            localizedContext.getString(R.string.clipboard_label_domain)
+                                            localizedContext.getString(R.string.clipboard_label_domain),
+                                            R.string.credential_lock_copy_domain_subtitle
                                         )
                                     },
+                                    // A domain is configuration the user wrote
+                                    // themselves, and removing one is one tap
+                                    // away from being undone, so it is not
+                                    // gated — only what leaves the app is.
                                     onRemove = { removeDomain(domain) }
                                 )
                                 if (index < node.domains.lastIndex) {
