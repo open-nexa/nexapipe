@@ -824,6 +824,20 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             }
         }
 
+        // A relock has to close what the unlock opened. Both invite entry
+        // points — and the confirmation they lead to — outlive the window that
+        // opened them: it lapses after two minutes, and coming back from the
+        // background closes it on a device that has lost the ability to ask,
+        // neither of which the dialog sees. Left open, importing would be a
+        // confirmation nobody has been asked for since.
+        LaunchedEffect(credentialUnlock.unlocked) {
+            if (!credentialUnlock.unlocked) {
+                showInviteLinkDialog = false
+                showInviteScanner = false
+                pendingInviteImport = null
+            }
+        }
+
         if (showInviteLinkDialog) {
             InviteLinkDialog(
                 onDismiss = { showInviteLinkDialog = false },

@@ -140,8 +140,22 @@ fun EndpointDetailScreen(
     val storedSecretPresent = node.twoFactor?.secret?.isNotBlank() == true
     var secretReplaced by remember(nodeId) { mutableStateOf(false) }
 
+    /**
+     * Writes [transform] over this endpoint's credentials.
+     *
+     * The record it runs on is read when the write happens, not captured from
+     * the composition that scheduled it. A write can now be deferred — the
+     * credential prompt stands between the tap and the update — and
+     * `VpnViewModel.collectIssuedCredential` can deliver an enrollment secret
+     * while it waits. Transforming the record this screen was last drawn with
+     * would write that older copy back over the node, taking the secret that
+     * just arrived with it.
+     */
     fun updateTwoFactor(transform: (NodeTwoFactor) -> NodeTwoFactor) {
-        viewModel.updateNodeTwoFactor(nodeId, transform(twoFactor))
+        val current = viewModel.nodes.value
+            .firstOrNull { it.nodeId == nodeId }?.twoFactor
+            ?: NodeTwoFactor(enabled = false)
+        viewModel.updateNodeTwoFactor(nodeId, transform(current))
     }
 
     /**
@@ -884,15 +898,22 @@ fun EndpointDetailScreen(
         )
     }
 
-    // A relock has to close what the unlock opened. The QR carries the secret
-    // in full, and the window closes without the dialog knowing: it lapses
-    // after two minutes, and coming back from the background closes it on a
-    // device that has lost the ability to ask. Clearing the flag rather than
-    // gating the dialog on `unlocked` keeps a later authentication from
-    // bringing it back on its own — exporting is something the user asks for.
+    // A relock has to close what the unlock opened, and every surface behind
+    // the door outlives the window that opened it: the window lapses after two
+    // minutes, and coming back from the background closes it on a device that
+    // has lost the ability to ask — neither of which the dialog sees. Anything
+    // left open would be a confirmation the user has not been asked for since.
+    // Clearing the flags rather than gating each dialog on `unlocked` keeps a
+    // later authentication from bringing one back on its own: all of these are
+    // things the user asks for, one tap at a time.
     LaunchedEffect(credentialUnlock.unlocked) {
         if (!credentialUnlock.unlocked) {
+            showEditDialog = false
+            showDeleteDialog = false
+            showAddDomainDialog = false
+            showTwoFactorScanner = false
             showTwoFactorExport = false
+            pendingTwoFactorImport = null
         }
     }
 
