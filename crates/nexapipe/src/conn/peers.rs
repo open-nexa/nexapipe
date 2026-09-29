@@ -14,15 +14,22 @@
 //! `Drop` instead, the same way [`crate::shutdown::InFlightGuard`] reports a
 //! connection as no longer in flight.
 //!
-//! # Why it is not a counter
+//! # Why every connection is its own entry
 //!
-//! Two peers count as two entries even when they are the same key reconnecting:
-//! a peer that drops and comes back is a new connection, and the map is keyed
-//! by endpoint id because that is what an operator recognises — a Node ID they
-//! can compare against their client list.
+//! One peer can hold two connections at once: a reconnect that lands before the
+//! connection it replaces has finished going away. Each gets an entry of its
+//! own, with its own `connected_for`, because "how long has this one been open"
+//! is a question about a connection and not about a peer. The alternative —
+//! one entry per endpoint id, overwritten on the second `insert` — loses the
+//! first connection the moment the second ends, listing a peer that is still
+//! connected as no longer connected.
+//!
+//! Entries are still grouped by endpoint id, because that is what an operator
+//! recognises: a Node ID they can compare against their client list.
 use crate::metrics::PathKind;
 use iroh::EndpointId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -37,9 +44,12 @@ pub struct PeerInfo {
     pub path: PathKind,
 }
 
-/// What the registry keeps per peer.
+/// What the registry keeps per connection.
 #[derive(Debug, Clone, Copy)]
 struct Peer {
+    /// Tells two connections from the same peer apart, so ending one does not
+    /// end the other. Never reused.
+    id: u64,
     since: Instant,
     path: PathKind,
 }
@@ -50,7 +60,10 @@ struct Peer {
 /// listener and to every connection task without either outliving the other.
 #[derive(Debug, Clone, Default)]
 pub struct PeerRegistry {
-    peers: Arc<RwLock<HashMap<EndpointId, Peer>>>,
+    peers: Arc<RwLock<HashMap<EndpointId, Vec<Peer>>>>,
+    /// Hands out the ids that keep one connection's `Drop` from taking another
+    /// connection's entry with it.
+    next_id: Arc<AtomicU64>,
 }
 
 impl PeerRegistry {
@@ -66,57 +79,84 @@ impl PeerRegistry {
     /// listing it would make "who is connected" include peers that were turned
     /// away.
     pub fn insert(&self, endpoint_id: EndpointId, path: PathKind) -> PeerGuard {
+        // Starts at 1 so a default-initialised id is never a real one.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut peers = write(&self.peers);
-        peers.insert(
-            endpoint_id,
-            Peer {
-                since: Instant::now(),
-                path,
-            },
-        );
+        peers.entry(endpoint_id).or_default().push(Peer {
+            id,
+            since: Instant::now(),
+            path,
+        });
         PeerGuard {
             registry: self.clone(),
             endpoint_id,
+            id,
         }
     }
 
-    /// Moves a peer to another path, because hole punching succeeded or the
-    /// direct path was lost.
+    /// Moves a peer's connections to another path, because hole punching
+    /// succeeded or the direct path was lost.
+    ///
+    /// Every connection under the endpoint id moves together. Two connections
+    /// from one peer share a socket and therefore a fate — one does not punch
+    /// through while the other stays relayed — and the event that reports the
+    /// change does not say which connection it belongs to.
     ///
     /// A no-op for a peer that is not in the map: the task that follows path
     /// events outlives the handshake, so between a refused connection and its
     /// removal it can still be told about a path.
     pub fn set_path(&self, endpoint_id: &EndpointId, path: PathKind) {
-        if let Some(peer) = write(&self.peers).get_mut(endpoint_id) {
-            peer.path = path;
+        if let Some(peers) = write(&self.peers).get_mut(endpoint_id) {
+            for peer in peers.iter_mut() {
+                peer.path = path;
+            }
         }
     }
 
-    /// Every peer, in no particular order.
+    /// Every connection, oldest first within an endpoint id so the answer is
+    /// stable between two calls that saw nothing change.
     pub fn snapshot(&self) -> Vec<PeerInfo> {
         let peers = read(&self.peers);
-        peers
+        let mut out: Vec<PeerInfo> = peers
             .iter()
-            .map(|(endpoint_id, peer)| PeerInfo {
-                endpoint_id: *endpoint_id,
-                connected_for: peer.since.elapsed(),
-                path: peer.path,
+            .flat_map(|(endpoint_id, entries)| {
+                entries.iter().map(move |peer| PeerInfo {
+                    endpoint_id: *endpoint_id,
+                    connected_for: peer.since.elapsed(),
+                    path: peer.path,
+                })
             })
-            .collect()
+            .collect();
+        out.sort_by_key(|info| info.connected_for);
+        out
     }
 
-    /// How many peers are connected.
+    /// How many connections are being served, which is how many entries
+    /// [`Self::snapshot`] returns. One peer reconnecting while its old
+    /// connection is still going away counts twice.
     pub fn len(&self) -> usize {
-        read(&self.peers).len()
+        read(&self.peers).values().map(Vec::len).sum()
     }
 
     /// Whether anybody is connected.
     pub fn is_empty(&self) -> bool {
-        read(&self.peers).is_empty()
+        read(&self.peers).values().all(Vec::is_empty)
     }
 
-    fn remove(&self, endpoint_id: &EndpointId) {
-        write(&self.peers).remove(endpoint_id);
+    fn remove(&self, endpoint_id: &EndpointId, id: u64) {
+        let mut peers = write(&self.peers);
+        let empty = match peers.get_mut(endpoint_id) {
+            Some(entries) => {
+                entries.retain(|peer| peer.id != id);
+                entries.is_empty()
+            }
+            None => false,
+        };
+        // The key goes with its last connection, or `is_empty` would have to
+        // look inside every entry to answer.
+        if empty {
+            peers.remove(endpoint_id);
+        }
     }
 }
 
@@ -125,11 +165,12 @@ impl PeerRegistry {
 pub struct PeerGuard {
     registry: PeerRegistry,
     endpoint_id: EndpointId,
+    id: u64,
 }
 
 impl Drop for PeerGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.endpoint_id);
+        self.registry.remove(&self.endpoint_id, self.id);
     }
 }
 
@@ -176,6 +217,35 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].endpoint_id, b);
         assert_eq!(listed[0].path, PathKind::Direct);
+    }
+
+    /// A peer that reconnects before its old connection has finished going away
+    /// holds two connections at once, and ending the newer one must not take
+    /// the older with it. This is what per-connection entries are for: with one
+    /// entry per endpoint id, the second `insert` would overwrite the first and
+    /// that connection's `Drop` would remove it, listing a peer as gone while
+    /// it is still being served.
+    #[test]
+    fn a_second_connection_from_one_peer_does_not_end_the_first() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let first = registry.insert(a, PathKind::Relay);
+        let second = registry.insert(a, PathKind::Direct);
+        assert_eq!(registry.len(), 2, "one peer, two connections");
+
+        drop(second);
+        let listed = registry.snapshot();
+        assert_eq!(
+            listed.len(),
+            1,
+            "the first connection went away with the second"
+        );
+        assert_eq!(listed[0].endpoint_id, a);
+        assert_eq!(listed[0].path, PathKind::Relay);
+
+        drop(first);
+        assert!(registry.is_empty(), "the peer outlived its last connection");
     }
 
     /// The path is updated in place, because a connection that starts relayed
