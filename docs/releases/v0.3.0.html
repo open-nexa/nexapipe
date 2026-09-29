@@ -338,6 +338,7 @@ sha256sum -c --ignore-missing SHA256SUMS.txt</pre>
     <li><code>GET /metrics</code>, behind <code>[metrics] enabled = true</code>, serves Prometheus text format. It is written by hand, so no <code>prometheus</code> dependency was added and the lockfile is untouched. When metrics are off the path is a <code>404</code>, so a scraper can tell "disabled" from "no traffic yet".</li>
     <li>A management surface, <code>GET /v1/{status,routes,clients,connections,health}</code>, behind a bearer token that the server generates into <code>&lt;config&gt;.admin-token</code> on first start. There is deliberately no <code>token</code> key in the config: a credential in the file you edit, copy and commit is the thing this design avoids. No token means <code>503</code>, not an open door.</li>
     <li><code>nexapipe status</code> reads those same endpoints from the command line (<code>--json</code> for the raw shape), so the running server stays the single source of truth about its own state.</li>
+    <li>One id per request: 32 hex digits, generated at the entry point rather than per connection. It ends the request's access line and goes back to the client as <code>x-request-id</code>, so a bad answer can be reported with the line that produced it. The same id sits on a <code>request</code> span, with the method, URI and status filled in as they become known.</li>
   </ul>
 
   <table class="metrics">
@@ -400,6 +401,7 @@ nexapipe status --json</pre>
   <h3 class="subhead">Added</h3>
   <ul class="changelog">
     <li>The auxiliary listener and everything above it: <code>/healthz</code>, <code>/metrics</code>, the token-guarded <code>/v1/*</code> endpoints, and <code>nexapipe status</code>.</li>
+    <li>A request ID: 32 hex digits per request, on its access line, on the response, and on a <code>request</code> tracing span that also carries the method, URI and status.</li>
     <li>Android: a prompt in front of the credentials the app holds, described above.</li>
     <li><code>docs/iroh-boundaries.md</code> &mdash; what still touches third-party infrastructure whatever <code>relay_mode</code> says. The two READMEs now point at it instead of repeating a caveat.</li>
     <li><code>CHANGELOG.md</code>. 0.2.0 shipped without one, so its entry is retrospective; 0.3.0 is the first release written into it as it happened.</li>
@@ -408,6 +410,8 @@ nexapipe status --json</pre>
   <h3 class="subhead">Changed</h3>
   <ul class="changelog">
     <li>Hot-reload rules are one table in both READMEs: what a config reload applies, and what needs a restart. They used to be scattered across the configuration sections.</li>
+    <li>The access log line ends with <code>id=&lt;hex&gt;</code>. It is appended rather than inserted, so every field before it keeps its column and a script that splits on spaces finds the host, the status and the duration where it did.</li>
+    <li>HTTP responses carry <code>x-request-id</code>. A backend that sends its own is dropped rather than duplicated, so there is one id to quote and it is ours. L4 flows and TLS passthrough are tunnels, not requests: they get an id on the access line and the span, and have no HTTP response to put a header on.</li>
   </ul>
 
   <h3 class="subhead">Fixed</h3>

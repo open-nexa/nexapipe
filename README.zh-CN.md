@@ -560,6 +560,17 @@ allow = [
 /api/v1/items?token=hunter2&page=2   ->   /api/v1/items?token=<redacted>&page=<redacted>
 ```
 
+**每个请求都有一个 id。** 32 位十六进制，追加在该请求的访问日志行末尾，并作为
+`x-request-id` 返回给客户端 —— 谁要报一个异常的响应，就能直接指出对应的那一行：
+
+```text
+203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "GET /api/v1/items" 200 512 12ms id=3f9ac1…
+```
+
+同一个 id 也是包裹该请求的 `request` span 上的一个字段，因此 `tracing` 的输出里
+也带着它，连同 `method`、`uri`、`status`。L4 流量与 TLS 透传是隧道而非请求：它们
+的 id 出现在访问日志与 span 上，但没有 HTTP 响应可供加头。
+
 ### `[acme]`
 
 已移除。证书现在归后端所有；该配置节仍能解析但会被忽略，并在启动时报告。

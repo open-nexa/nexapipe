@@ -190,10 +190,10 @@ What follows is what is *missing*, i.e. capability work.
 
 ### 4.2 Observability beyond the access log (P1)
 
-The access log now covers every path. What it cannot answer is "how is this
-instance doing": there is no Prometheus or OpenTelemetry exporter, no `/metrics`,
-no `/healthz`, no request ID, and no tracing span carried across a request. The
-desktop UI shows no traffic, latency or per-node health view.
+The access log now covers every path, and `/metrics`, `/healthz`, a request ID
+and a span per request cover the instance: see R7. What is still missing is an
+OpenTelemetry exporter, and a desktop UI that shows no traffic, latency or
+per-node health view.
 
 ### 4.3 Identity and authorization (P1)
 
@@ -374,14 +374,18 @@ missing a feature — it is broken, and it gets fixed.
 | R4 | **Management surface** | Loopback-only admin API for read-only state (routes, clients, connections, health, direct ratio), with write operations going through CLI subcommands (`client add\|revoke\|list`, `route list`, `status`); shares the hot-reload path; token-authenticated like the desktop IPC token |
 | R5 | **Per-device identity** | Move from "one client, one shared secret" to **per-device key pairs** issued by the server and revocable individually, with TOTP demoted to a human second factor; add a minimal audit log (who, when, which host) |
 | R6 | **Operations and distribution** | Self-hosted relay as a first-class deployment (derper + compose + docs, including relay authentication); systemd unit in the docs; publish a container image; land in at least two of Homebrew, winget and scoop |
-| R7 | **Instance metrics** | `/metrics` (and `/healthz`) behind a feature, plus request IDs and a tracing span per request: the access log answers "what happened", not "how is this instance doing". Gauges for connections, streams, backend health and the direct-vs-relayed ratio |
+| R7 | **Instance metrics** | `/metrics` and `/healthz` on the auxiliary listener, gated by config rather than by a cargo feature (see the note below); a request ID on every access line and on every HTTP response as `x-request-id`; a tracing span per request. The access log answers "what happened", not "how is this instance doing". Gauges for connections, streams, backend health and the direct-vs-relayed ratio |
 | R8 | **Boundary documentation** | State plainly what still depends on third-party infrastructure today (Endpoint ID discovery, far-side relays) so the sovereignty story is not oversold |
 
 R14 and R15 carry high IDs because they were added after R13 was written; each
 sits in the phase its notes put it in, not later.
 
 **Progress.** R8 has shipped whole, as `docs/iroh-boundaries.md`. R7 has shipped
-whole: `/metrics` and `/healthz` on the auxiliary listener. R4 has shipped as far
+whole: `/metrics` and `/healthz` on the auxiliary listener, a request ID on every
+access line and on every HTTP response, and a span around every request. It is
+gated by config — `[admin] listen_addr` and `[metrics] enabled` — rather than by
+the cargo feature R7 asked for, which would have added a build and a test
+matrix to a choice nobody recompiles to make. R4 has shipped as far
 as reading goes — the `/v1/*` endpoints and `nexapipe status`; the write half
 (`client add|revoke`) still waits on R5's identity model. R14 has shipped on
 Android only: `auth/CredentialGate.kt` puts the OS prompt in front of the TOTP
@@ -485,7 +489,7 @@ side by side. The three fixed defects are recorded in
 | No IPv6 in the TUN | `crates/nexapipe-client/src/tun_proxy.rs:1178-1180` |
 | Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
-| Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. |
+| Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. The same release added what R7 asked for beside the gauges: a request ID per request (`log::next_request_id`, on the access line and as `x-request-id`) and a span around each one. |
 | CHANGELOG, image publication | *half closed in v0.3.0.* `CHANGELOG.md` exists at the repository root; image publication does not, and `.github/workflows/release.yml` still produces archives, desktop bundles and the APK only. |
 | iroh version and boundary conditions | `Cargo.toml:38` asks for `^1.0.1` and `Cargo.lock` resolves 1.2.0 — a caret range, not the pin an earlier note here claimed. The boundaries themselves are documented in `docs/iroh-boundaries.md`, linked from the `[iroh]` section of both READMEs. |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
