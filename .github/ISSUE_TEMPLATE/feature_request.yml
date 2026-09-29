@@ -17,10 +17,18 @@ body:
         - Server (`crates/nexapipe`)
         - Client library (`crates/nexapipe-client`)
         - Wire format (`crates/nexapipe-proto`)
+        - Android app (`ui-android`)
+        - Desktop app (`ui-desktop`)
         - Website or documentation
         - Not sure
     validations:
       required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        Everything lives in this repository — the server crates, `ui-android/` and
+        `ui-desktop/` — so app requests are filed here too.
 
   - type: textarea
     id: problem

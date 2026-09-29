@@ -22,6 +22,9 @@ two — a PR that is easy to review is a PR that gets merged.
 - [ ] `cargo ndk -t arm64-v8a check -p nexapipe-client --features jni,tun-proxy`
       (only if you touched the TUN or L4 client: a host build never compiles it)
 - [ ] `cd ui-desktop/src-tauri && cargo check` (only if you touched the desktop app)
+- [ ] `cd ui-android && ./gradlew :app:compileDebugKotlin` — `gradlew.bat` on Windows
+      (only if you touched the Android app: the Kotlin tree is not covered by the
+      workspace lint gate)
 - [ ] Tests added for new behaviour
 - [ ] README updated if behaviour visible to users changed
 
