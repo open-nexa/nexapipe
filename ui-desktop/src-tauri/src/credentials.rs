@@ -181,7 +181,7 @@ impl MasterKey {
 
     /// The uncached half of [`Self::load`]: where the key actually comes from.
     fn load_uncached(dir: &Path) -> Result<Self, AppError> {
-        if let Some(key) = Self::from_keychain() {
+        if let Some(key) = Self::from_keychain(dir) {
             return Ok(Self {
                 key,
                 source: KeySource::Keychain,
@@ -202,7 +202,10 @@ impl MasterKey {
     ///
     /// `None` when there is no usable keychain at all — not when the entry is
     /// merely missing, which is the ordinary first run and creates one.
-    fn from_keychain() -> Option<[u8; KEY_LEN]> {
+    ///
+    /// `dir` is where a key that predates a working keychain would be: see
+    /// [`Self::adopt_file_key`].
+    fn from_keychain(dir: &Path) -> Option<[u8; KEY_LEN]> {
         use keyring::Entry;
 
         let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) else {
@@ -222,8 +225,14 @@ impl MasterKey {
                 return None;
             }
             // The ordinary first run, and the one case in which minting a key is
-            // right: there is nothing there for it to overwrite.
-            Err(keyring::Error::NoEntry) => {}
+            // right: there is nothing there for it to overwrite. A key left in
+            // the fallback file by a build with no keychain backend is not a
+            // first run, so it is moved across first.
+            Err(keyring::Error::NoEntry) => {
+                if let Some(key) = Self::adopt_file_key(&entry, dir) {
+                    return Some(key);
+                }
+            }
             // Anything else — a locked keychain, access denied, a backend that
             // would not start — is not proof that no key exists. Minting one
             // here would replace a key that credentials are encrypted under,
@@ -243,14 +252,77 @@ impl MasterKey {
         Some(fresh)
     }
 
+    /// Moves a master key out of the fallback file and into the keychain.
+    ///
+    /// This is the upgrade path for an installation that ran without a keychain
+    /// backend — Linux, before this build — and so kept its master key in
+    /// [`FALLBACK_KEY_FILE`]. Every credential in the store is encrypted under
+    /// that one key, so minting a fresh keychain key here would not improve
+    /// anything: it would replace the key the whole store is sealed with, and
+    /// every entry would come back undecryptable, which is indistinguishable
+    /// from losing them. The key moves as it is; only its holder changes.
+    ///
+    /// `None` when there is no file key to move, or when the keychain would not
+    /// take it — either way the caller falls back to the file, which is exactly
+    /// where the key already is.
+    fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Option<[u8; KEY_LEN]> {
+        let key = Self::file_key(dir)?;
+
+        if entry.set_password(&hex(&key)).is_err() {
+            tracing::warn!(
+                "the keychain would not take the existing master key; it stays in {}",
+                dir.join(FALLBACK_KEY_FILE).display()
+            );
+            return None;
+        }
+
+        // Removed only once the keychain holds it, so there is no moment in which
+        // neither does. A build that predates this one cannot read the keychain
+        // and would mint a key of its own on the way down, so re-importing a node
+        // is the price of the weaker file no longer being there — the settings
+        // page says which of the two the key is in.
+        let path = dir.join(FALLBACK_KEY_FILE);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                "the master key is in the keychain but {} could not be removed: {e}",
+                path.display()
+            );
+        }
+        Some(key)
+    }
+
+    /// The fallback file's key, when the file holds one.
+    ///
+    /// `None` on a first run, which is every platform but a Linux install
+    /// upgraded from a build with no keychain backend. A file that is there and
+    /// does not parse is reported rather than ignored: something wrote it, and
+    /// moving on silently mints a key that cannot read what that one sealed.
+    fn file_key(dir: &Path) -> Option<[u8; KEY_LEN]> {
+        let path = dir.join(FALLBACK_KEY_FILE);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return None;
+        };
+
+        match parse_key(contents.trim()) {
+            Some(key) => Some(key),
+            None => {
+                tracing::warn!(
+                    "{} is not a 32-byte key; not moving it into the keychain",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
     /// The fallback file's copy, generating one when there is none.
     fn from_file(dir: &Path) -> Result<[u8; KEY_LEN], AppError> {
         let path = dir.join(FALLBACK_KEY_FILE);
 
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(key) = parse_key(contents.trim()) {
-                return Ok(key);
-            }
+        if let Some(key) = Self::file_key(dir) {
+            return Ok(key);
+        }
+        if path.exists() {
             return Err(AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
                 format!("{} is not a 32-byte key", path.display()),
@@ -718,6 +790,38 @@ mod tests {
             .mode();
 
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+    }
+
+    /// An install that ran without a keychain backend — Linux, before this build
+    /// — has its master key in a file, and every stored credential is sealed
+    /// under it. `file_key` is what finds it, so the same key can move into the
+    /// keychain rather than being replaced by a fresh one.
+    #[test]
+    fn a_master_key_left_in_a_file_is_read_back() {
+        let dir = scratch("file-key");
+        let key = random_bytes::<KEY_LEN>().expect("a key");
+        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), hex(&key)).expect("written");
+
+        assert_eq!(super::MasterKey::file_key(&dir), Some(key));
+    }
+
+    /// The ordinary case on every platform with a keychain: nothing was ever
+    /// written to the file, so there is nothing to move.
+    #[test]
+    fn a_first_run_has_no_file_key() {
+        let dir = scratch("no-file-key");
+
+        assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A file that is there but is not a key must not be read as one: a key made
+    /// of zeroes, or a truncated one, would silently orphan the whole store.
+    #[test]
+    fn a_file_that_is_not_a_key_is_absent_rather_than_a_short_key() {
+        let dir = scratch("bad-file-key");
+        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
+
+        assert_eq!(super::MasterKey::file_key(&dir), None);
     }
 
     #[test]

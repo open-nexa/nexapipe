@@ -310,6 +310,9 @@ jobs:
       # which cfg branch runs, so one amd64 runner per OS covers every cfg branch.
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
+        # libdbus-1-dev is what keyring's persistent Linux backend builds against
+        # (Secret Service). Without it the desktop crate does not compile here,
+        # and this is the only Linux job that type-checks it.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -319,7 +322,8 @@ jobs:
             libxdo-dev \
             libssl-dev \
             patchelf \
-            file
+            file \
+            libdbus-1-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03

@@ -55,6 +55,12 @@ not part of the tree). Not yet released, so no version numbers have moved.
   went back out with its full TTL again; and a zero TTL got a one-second floor
   instead of not being cached. Those tests are now executed in CI, which had only
   been compiling them.
+- The desktop app's claim that the OS keychain holds the credential store's
+  master key was not true on Linux: `keyring` had no Linux backend, so the key
+  was a `0600` file beside the encrypted credentials. Linux now uses the Secret
+  Service, and an install that already had a file key keeps it — the same key
+  moves into the keychain, because a fresh one would leave every credential in
+  the store undecryptable.
 
 ## [0.3.0] — 2026-09-29
 

@@ -373,6 +373,9 @@ jobs:
         # the image because tauri-plugin-opener enables the shell-open API, and it
         # hard-fails when /usr/bin/xdg-open does not exist ("xdg-open binary not
         # found"). The x64 runner image ships it, the arm64 image does not.
+        # libdbus-1-dev is what keyring's persistent Linux backend builds against
+        # (Secret Service); it is a build-time dependency only, the app links the
+        # library that any desktop session already has.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -384,7 +387,8 @@ jobs:
             patchelf \
             file \
             rpm \
-            xdg-utils
+            xdg-utils \
+            libdbus-1-dev
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
