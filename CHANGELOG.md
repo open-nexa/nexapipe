@@ -12,16 +12,26 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Nothing yet. The next minor release is v0.3.0; its scope is tracked in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+Nothing yet.
 
-## [0.2.0] — unreleased
+## [0.3.0] — 2026-09-29
 
-Version bumped in `43bb68c`; no `v0.2.0` tag exists yet, so this entry describes
-what is on `main` rather than what has shipped.
+0.2.0 was never tagged, so what was recorded against it ships here: one tag,
+everything since 0.1.1, with those entries merged into this one. A readable
+version of this release, with downloads, lives in
+[docs/releases/v0.3.0.html](docs/releases/v0.3.0.html).
 
 ### Added
 
+- `docs/iroh-boundaries.md` — what still depends on third-party infrastructure
+  whatever `relay_mode` says. Two README sections oversold what a mode buys:
+  `custom` constrains this endpoint only, and Endpoint ID discovery still
+  queries `dns.iroh.link` in every mode. Both READMEs now point here instead of
+  repeating the caveat. The same pass corrected the iroh version there, which
+  was wrong twice over: it is declared `^1.0.1`, not pinned, and `Cargo.lock`
+  resolves 1.2.0.
+- This CHANGELOG, starting with a retrospective 0.2.0 entry distilled from the
+  commits since 0.1.1.
 - Health checks are configurable. `[health_check] enabled = false` turns probing
   off, so a backend with no health endpoint is a supported deployment instead of
   a source of log noise (#47).
