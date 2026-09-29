@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-09-28 |
+| Last updated | 2026-09-29 (phases renumbered for v0.3.0; entries closed by it marked in §9) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -51,9 +51,9 @@ The gap is not architectural, it is maturity:
   rotating every device using that client.
 - Platform coverage has real holes: no IPv6 inside the TUN, no UDP on desktop
   TUN, a single Android ABI.
-- Release hygiene is missing: no CHANGELOG, no published container image (the
-  Dockerfiles build locally only), no package manager distribution, and no
-  documented way to run your own relay.
+- Release hygiene is thin: `CHANGELOG.md` arrived with v0.3.0, but there is
+  still no published container image (the Dockerfiles build locally only), no
+  package manager distribution, and no documented way to run your own relay.
 
 Until those are addressed, "you do not need to rent a server" is a claim that
 benefits a narrow audience, because the fallback path (relay) is undocumented
@@ -209,19 +209,19 @@ with TOTP as a human second factor rather than the device identity itself.
 
 ### 4.4 Operations and distribution (P1)
 
-- No runtime management surface: there is no admin API and no `route`/`client`
-  subcommand. Adding a client means editing `config.toml` by hand or generating
-  an invite from the CLI; there is no way to ask "which clients are connected" or
-  "which routes are live".
-- Hot reload rules exist but are scattered across the README (for example,
-  `[auth] enabled` can only be turned on, never off) and should be one table.
+- The management surface is read-only for now: `/v1/*` and `nexapipe status`
+  answer "which routes are live" and "who is connected", but nothing can change
+  them — adding or revoking a client still means editing `config.toml` by hand
+  or generating an invite from the CLI. Writes wait on R5's identity model.
+- Hot reload rules are one table in both READMEs as of v0.3.0, including what
+  needs a restart. What is still uneven is enforcement, not documentation.
 - Distribution is download-only: GitHub release archives, a signed APK and
   desktop bundles. No container image publication, no systemd unit in the docs,
   no Homebrew / winget / scoop packages, no documented self-hosted relay.
-- Engineering hygiene: no CHANGELOG; the test suite runs on Linux and macOS
-  runners, while Windows is `cargo check` only; the Android lint baseline still
-  pins 26 historical findings; no fuzzing, no benchmarks; the vendored smoltcp
-  patch needs long-term tracking.
+- Engineering hygiene: `CHANGELOG.md` exists as of v0.3.0; the test suite runs
+  on Linux and macOS runners, while Windows is `cargo check` only; the Android
+  lint baseline still pins 32 historical findings; no fuzzing, no benchmarks;
+  the vendored smoltcp patch needs long-term tracking.
 
 ### 4.5 Protocols and transport (P1/P2)
 
@@ -230,8 +230,11 @@ with TOTP as a human second factor rather than the device identity itself.
 - **No UDP in desktop TUN**; the local proxy speaks `CONNECT` only.
 - The iroh endpoint binds `0.0.0.0` unconditionally; there is no IPv6 knob.
   `proxy/mod.rs:220`
-- iroh dependency boundaries (discovery via `dns.iroh.link`, far-side n0 relays)
-  should have their own documentation instead of living in a README aside.
+
+The iroh dependency boundaries used to belong on this list — discovery via
+`dns.iroh.link`, far-side n0 relays. They are documented in
+`docs/iroh-boundaries.md` as of v0.3.0, so what remains is the exposure itself,
+not the absence of a description of it.
 
 ### 4.6 Client resilience (P1)
 
@@ -254,9 +257,9 @@ the work is: **the vault exists, the door does not.**
 
 | # | Gap | Where |
 |---|---|---|
-| C8 | **Desktop: encrypted at rest, ungated on read.** The TOTP secret, the enrollment token and the relay bearer already live in an AES-256-GCM file whose master key the OS keychain holds, so the original "secrets in a WebKit `localStorage` blob" exposure is closed. Two holes remain: the node ticket and the endpoint ID are still persisted in cleartext `localStorage`, and reading any of it back costs nothing — the store opens silently for whatever asks, and the renderer is handed plaintext on request with no prompt in front of it. | `ui-desktop/src-tauri/src/credentials.rs` (what exists); `ui-desktop/src/stores/config.ts` (ticket and endpoint ID, still cleartext) |
+| C8 | **Desktop: encrypted at rest, ungated on read.** The TOTP secret, the enrollment token and the relay bearer already live in an AES-256-GCM file whose master key the OS keychain holds, so the original "secrets in a WebKit `localStorage` blob" exposure is closed. Two holes remain: the node ticket and the endpoint ID are still persisted in cleartext `localStorage`, and reading any of it back costs nothing — the store opens silently for whatever asks, and the renderer is handed plaintext on request with no prompt in front of it. *This is the desktop half of R14, now carried by Phase 1.* | `ui-desktop/src-tauri/src/credentials.rs` (what exists); `ui-desktop/src/stores/config.ts` (ticket and endpoint ID, still cleartext) |
 | C9 | **The masking is cosmetic.** The dashboard and the config page return the value in full when it happens to be short, the sidebar tooltip carries the unmasked node ID, and the invite import dialog renders the parsed ticket and endpoint verbatim. | `ui-desktop/src/pages/DashboardPage.vue`, `ConfigPage.vue`, `app/shell/SideBarFooter.vue`, `components/InviteImportDialog.vue` |
-| C10 | **Android stores encrypted but never asks.** `SecretStore` already wraps values with Keystore AES-256-GCM, so at-rest storage is not the problem; the endpoint detail screen shows and edits the TOTP secret and can export it as an `otpauth` URI with no prompt at all. | `ui-android/.../SecretStore.kt`, `ui/EndpointDetailScreen.kt` |
+| C10 | **Android asks first, as of v0.3.0.** At-rest storage was never the problem — `SecretStore` already wrapped values with Keystore AES-256-GCM. What was missing was the prompt, and `auth/CredentialGate.kt` now supplies one in front of the TOTP secret, its `otpauth` export and any change to the relay configuration, refusing a device enrolled with neither a biometric nor a screen lock. **Not confirmed on a device**: CI could give compile, unit tests and lint, but nothing past `BiometricPrompt` itself has been seen running. | `ui-android/.../auth/CredentialGate.kt`, `ui/EndpointDetailScreen.kt`, `ui/VpnControlScreen.kt` |
 
 The direction is that **authentication is delegated to the operating system, and
 no secret reaches the UI that the OS has not authenticated**:
@@ -363,7 +366,7 @@ Defects are not sequenced here. A proxy that logs nothing, empties a backend poo
 on one failed probe, or drops connections because it shut down on a timer is not
 missing a feature — it is broken, and it gets fixed.
 
-### Phase 0 — v0.4, "operable"
+### Phase 0 — v0.3.0, "operable"
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -377,12 +380,25 @@ missing a feature — it is broken, and it gets fixed.
 R14 and R15 carry high IDs because they were added after R13 was written; each
 sits in the phase its notes put it in, not later.
 
+**Progress.** R8 has shipped whole, as `docs/iroh-boundaries.md`. R7 has shipped
+whole: `/metrics` and `/healthz` on the auxiliary listener. R4 has shipped as far
+as reading goes — the `/v1/*` endpoints and `nexapipe status`; the write half
+(`client add|revoke`) still waits on R5's identity model. R14 has shipped on
+Android only: `auth/CredentialGate.kt` puts the OS prompt in front of the TOTP
+secret, its `otpauth` export and any change to the relay configuration. Its
+desktop half — ticket and endpoint ID into the encrypted store, masks computed in
+Rust, and a native prompt on each of macOS, Windows and Linux — is the one item
+here that moved to Phase 1, because it is the one that needs a per-OS platform
+module and a native build dependency on Linux. See
+[4.7](#47-client-side-credential-protection-p0).
+
 **Done when:** revoke one of three devices and the other two keep working; a
 newcomer brings up a self-hosted relay from the docs without asking anyone; and
-no client renders a full secret without the operating system having
-authenticated the user first.
+no *Android* surface renders a full secret without the operating system having
+authenticated the user first. The desktop equivalent is carried by Phase 1
+below.
 
-### Phase 1 — v0.5, "wider"
+### Phase 1 — v0.4, "wider"
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -396,7 +412,9 @@ Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase.
 contributed iOS client would be accepted and clearly marked community-maintained.
 
 **Done when:** Android and desktop both complete HTTP, TLS passthrough and UDP
-round trips against one server, over both IPv4 and IPv6.
+round trips against one server, over both IPv4 and IPv6 — and no desktop surface
+renders a full credential without the operating system having authenticated the
+user first, which is the half of R14 that came here from Phase 0.
 
 ### Phase 2 — v1.0, "reachable without our client" (exploratory)
 
@@ -410,11 +428,14 @@ not to be the main reason people walk away, this stays shelved.
 ### Dependencies
 
 ```text
-R14 credential lock ───────────────────────────────────► v0.4
+R8 boundary docs ─────────────────────────────────────► shipped in v0.3.0
+R7 metrics ───────────────────────────────────────────► shipped in v0.3.0
+R14 credential lock ── Android ───────────────────────► shipped in v0.3.0
+                    └── desktop ──────────────────────► v0.4
 R4 management ── R5 per-device ──┬── R6 distribution ──► v0.4
-                                 └── R7 metrics ────────►
+        (read-only shipped in v0.3.0; the write half waits on R5)
                                               │
-      R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.5
+      R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.4
                                        └── R12 backends ──────────────────────►
                                               │
                               R13 edge (after validation) ──► v1.0
@@ -442,17 +463,19 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
 | Time to locate a failing backend | the access log covers every path, but there is nothing to aggregate | 5 minutes with metrics and structured logs |
 | Direct-connection rate | unmeasured | opt-in client telemetry: direct vs relayed, one-way latency — so "nothing to rent" becomes a number we can publish |
 | Platform coverage | Android (one ABI) + desktop | desktop TUN does UDP, TUN speaks IPv6, Android ships a second ABI |
-| Full secret rendered without authentication | the dashboard tooltip, the config page and the invite import dialog all show one | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
-| Release rhythm | no CHANGELOG | regular minor releases, each with a readable CHANGELOG |
+| Full secret rendered without authentication | Android asks first as of v0.3.0; on desktop the dashboard tooltip, the config page and the invite import dialog all still show one | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
+| Release rhythm | one `CHANGELOG.md` as of v0.3.0, and no released version carries an entry older than its own tag | regular minor releases, each with a readable CHANGELOG |
 
 ---
 
 ## 9. Evidence index
 
-Every gap still listed above was confirmed against the tree on 2026-09-28. The
-three fixed defects are recorded in [section 4](#4-self-review-what-is-missing)
-and in the commit history; they are kept here only so the audit that found them
-is reproducible.
+Every gap listed above was confirmed against the tree on 2026-09-28, and each
+entry here was re-checked on 2026-09-29 against what v0.3.0 actually shipped.
+Entries closed since the audit are marked in place rather than deleted: the
+audit that found them stays reproducible, and the before and after stay visible
+side by side. The three fixed defects are recorded in
+[section 4](#4-self-review-what-is-missing) and in the commit history.
 
 | Topic | Location |
 |---|---|
@@ -462,9 +485,9 @@ is reproducible.
 | No IPv6 in the TUN | `crates/nexapipe-client/src/tun_proxy.rs:1178-1180` |
 | Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
-| No metrics or admin surface | no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144` |
-| No CHANGELOG, no image publication | no `CHANGELOG*` at the repository root; `.github/workflows/release.yml` produces archives, desktop bundles and the APK only |
-| iroh version and boundary conditions | `Cargo.toml:34` pins `iroh 1.0.1`; the `[iroh]` section of the README describes discovery and far-side relays |
+| Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. |
+| CHANGELOG, image publication | *half closed in v0.3.0.* `CHANGELOG.md` exists at the repository root; image publication does not, and `.github/workflows/release.yml` still produces archives, desktop bundles and the APK only. |
+| iroh version and boundary conditions | `Cargo.toml:38` asks for `^1.0.1` and `Cargo.lock` resolves 1.2.0 — a caret range, not the pin an earlier note here claimed. The boundaries themselves are documented in `docs/iroh-boundaries.md`, linked from the `[iroh]` section of both READMEs. |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
 | Masking that is not masking | `ui-desktop/src/app/shell/SideBarFooter.vue:59` puts the full node ID in a tooltip while showing the short form; the dashboard and config pages return short values in full |
