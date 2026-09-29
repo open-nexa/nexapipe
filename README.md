@@ -392,7 +392,8 @@ unrecognised spelling — stops startup instead of quietly falling back. A
 
 **What no `relay_mode` changes:** Endpoint ID discovery still queries
 `dns.iroh.link`, and `custom` constrains this endpoint only — a peer advertising
-an N0 relay is still dialled through it. Neither has a switch in iroh 1.x.
+an N0 relay is still dialled through it. Discovery has no switch NexaPipe
+exposes, though iroh 1.2.0 itself has `clear_address_lookup()`.
 [What still depends on third-party infrastructure](docs/iroh-boundaries.md)
 states the boundary in full, including what `custom` does and does not buy.
 
