@@ -13,7 +13,7 @@ For what comes next, and for why some things are deliberately not planned, see
 ## [0.3.0] — 2026-09-29
 
 A readable version of this release, with downloads, is published at
-<https://open-nexa.github.io/nexapipe/releases/v0.3.0.html>. The page itself
+<https://open-nexa.github.io/nexapipe/v0.3.0.html>. The page itself
 lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Added
