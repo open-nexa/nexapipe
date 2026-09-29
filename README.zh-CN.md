@@ -33,7 +33,7 @@ NexaPipe 是一个 Rust workspace，由四部分组成：
 [安全边界](#安全边界) ·
 [客户端库](#使用客户端库) · [客户端应用](#客户端应用) ·
 [开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) ·
-[变更日志](CHANGELOG.md) · [v0.3.0 发布说明](https://yixinin.github.io/nexapipe/releases/v0.3.0.html)
+[变更日志](CHANGELOG.md) · [v0.3.0 发布说明](https://open-nexa.github.io/nexapipe/releases/v0.3.0.html)
 
 ---
 
