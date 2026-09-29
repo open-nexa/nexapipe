@@ -169,6 +169,48 @@ impl Metrics {
             + self.unknown.load(Ordering::Relaxed)
     }
 
+    /// Every counter as values, in the shape the management surface reads.
+    ///
+    /// Deliberately not a second rendering of [`Metrics::render`]: that one
+    /// produces Prometheus text for a scraper, while this one is read by
+    /// `nexapipe status` and printed as JSON. The numbers are the same and are
+    /// read from the same atomics, so the two cannot disagree; only the shape
+    /// differs, and parsing exposition text back into values to get at them
+    /// would be the wrong way round.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            connections_total: self.connections_total.load(Ordering::Relaxed),
+            connections_active: self.connections_active(),
+            connections_direct: self.direct.load(Ordering::Relaxed),
+            connections_relayed: self.relayed.load(Ordering::Relaxed),
+            connections_unknown: self.unknown.load(Ordering::Relaxed),
+            requests_by_class: CLASS_LABELS
+                .iter()
+                .enumerate()
+                .map(|(class, label)| {
+                    (
+                        (*label).to_string(),
+                        self.requests[class].load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+            request_duration_ms: self.request_duration_ms.load(Ordering::Relaxed),
+            l4_flows: L4_LABELS
+                .iter()
+                .enumerate()
+                .flat_map(|(proto, proto_label)| {
+                    CLASS_LABELS.iter().enumerate().map(move |(class, label)| {
+                        (
+                            (*proto_label).to_string(),
+                            (*label).to_string(),
+                            self.flows[proto][class].load(Ordering::Relaxed),
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+
     /// Renders every metric in the Prometheus text exposition format.
     ///
     /// `view` carries what is read from live state rather than counted —
@@ -310,6 +352,28 @@ impl Default for Metrics {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Every counter of one instance, as values rather than as exposition text.
+///
+/// Produced by [`Metrics::snapshot`] for `GET /v1/status`.
+pub struct Snapshot {
+    /// Connections accepted since startup, whatever happened to them.
+    pub connections_total: u64,
+    /// Connections open right now.
+    pub connections_active: u64,
+    /// Of those, the ones whose path is a direct UDP address.
+    pub connections_direct: u64,
+    /// Of those, the ones crossing a relay.
+    pub connections_relayed: u64,
+    /// Of those, the ones with no path selected yet.
+    pub connections_unknown: u64,
+    /// Requests answered, as `(status class, count)`.
+    pub requests_by_class: Vec<(String, u64)>,
+    /// Milliseconds spent answering them, summed.
+    pub request_duration_ms: u64,
+    /// L4 flows that ended, as `(protocol, status class, count)`.
+    pub l4_flows: Vec<(String, String, u64)>,
 }
 
 /// What is read from live state at exposition time rather than counted.

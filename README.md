@@ -496,16 +496,44 @@ enabled = true                   # serves /metrics on it; default: false
 A second listener that answers questions about **this instance** instead of
 forwarding traffic:
 
-| Path | Purpose |
-|---|---|
-| `GET /healthz` | `200 ok` for as long as the process is serving. No authentication. |
-| `GET /metrics` | Instance metrics in Prometheus text format, only while `[metrics] enabled` is true. |
+| Path | Auth | Purpose |
+|---|---|---|
+| `GET /healthz` | none | `200 ok` for as long as the process is serving. |
+| `GET /metrics` | none | Instance metrics in Prometheus text format, only while `[metrics] enabled` is true. |
+| `GET /v1/status` | token | Uptime, counters, backend health, what is enabled. |
+| `GET /v1/routes` | token | The live route table — what the last reload put in it. |
+| `GET /v1/clients` | token | Which clients exist. Never their secrets. |
+| `GET /v1/connections` | token | The peers connected right now. |
+| `GET /v1/health` | token | Backend pools, in and out of rotation. |
 
-`[metrics] enabled` is off by default because the listener it hangs off is
-unauthenticated: nothing is exposed until you ask for it *and* bind an address.
-Enabling it without an `[admin]` section logs a warning and serves nothing.
-With the listener up but metrics off, `/metrics` is **404, not empty** — a
-scraper pointed at a deployment that never enabled them has to be able to tell
+Read from the command line with **`nexapipe status`**, which needs no arguments
+beyond the config:
+
+```bash
+nexapipe status --config config.toml          # grouped, for a terminal
+nexapipe status --config config.toml --json   # one document, for anything that parses it
+```
+
+It asks the running process rather than reopening the config, so what it prints
+is what is loaded — including anything a reload changed since startup.
+
+**The token is generated, not configured.** On first start the server writes one
+to `<config>.admin-token`, readable only by the account running it, and logs
+where. There is deliberately no `token` key in the config: that would put a
+credential into the file you edit, copy and commit, and writing it back would
+trip the watcher that reloads on the config's mtime. `nexapipe status` reads the
+same file and never creates one — a token it minted itself would be one the
+server does not know about. Delete the file and restart to rotate it.
+
+`/v1/*` is read-only on purpose. `client add` and `client revoke` need the
+per-device identity model that is not here yet, and a surface that only answers
+questions cannot be talked into changing anything.
+
+`[metrics] enabled` is off by default because the unauthenticated half carries
+no credential check: nothing is exposed until you ask for it *and* bind an
+address. Enabling it without an `[admin]` section logs a warning and serves
+nothing. With the listener up but metrics off, `/metrics` is **404, not empty** —
+a scraper pointed at a deployment that never enabled them has to be able to tell
 "disabled" from "no traffic yet".
 
 **Loopback only, and there is no `expose`.** `[server] expose` exists because
@@ -593,6 +621,27 @@ no `=` (`?raw`) is a flag and is left alone; the path is not touched. Set
 
 Removed. Certificates belong to the backend now; the section is still parsed but
 ignored, and reported at startup. See [TLS](#tls).
+
+### What a reload applies
+
+The config file is watched, and a change is picked up without a restart — but
+not every key can be. Rather than spread that rule over the sections above, it
+is one table:
+
+| Key | On reload |
+|---|---|
+| `[[routes]]` | Applied. Backends are re-probed; connections already open keep the route they were authorized against. |
+| `[auth]` | Applied, including `enabled` — turning 2FA on gates connections opened after the reload. A file holding secrets has to be `0600` or the reload is refused. |
+| `[health_check]` | Applied. `enabled` pauses and resumes probing; the rest takes effect for routes added or changed by a reload. |
+| `[peers] allow` | Restart-only for now. |
+| `[iroh]` | Restart-only: the endpoint is bound once. |
+| `[server] listen_addr` | Restart-only — moving a listener is a restart. |
+| `[admin] listen_addr` | Restart-only, for the same reason. The rest of the surface is live: `/v1/*` reads the current routes, clients and pools on every request. |
+| `[metrics] enabled` | Restart-only, read once at startup. |
+| `[log]`, `[local_proxy]` | Restart-only. |
+
+A refused reload keeps serving the old config and says why in the log, so a
+typo cannot take a working instance down.
 
 ---
 

@@ -23,6 +23,30 @@ version of this release, with downloads, lives in
 
 ### Added
 
+- An auxiliary listener, bound only when `[admin] listen_addr` is set and only
+  ever on loopback: `GET /healthz` for liveness and, while `[metrics] enabled`
+  is true, `GET /metrics` in Prometheus text format (#52). A non-loopback bind
+  is refused at startup rather than warned about, and unlike `[server] expose`
+  there is no escape hatch: what it answers names your routes, clients and
+  backends.
+- Instance metrics on it: connections (total, active, and by whether the path is
+  direct or relayed — read from iroh rather than guessed at a socket address,
+  so "nothing to rent" is a number rather than a claim), requests by status
+  class and the milliseconds they took, L4 flows by protocol and status,
+  backends in and out of rotation, work still in flight, and uptime (#52). The
+  exposition is written by hand, so no `prometheus` crate was added and
+  `Cargo.lock` is untouched. `/metrics` with metrics off is `404` rather than an
+  empty body, so a scraper can tell "disabled" from "no traffic yet".
+- A read-only management surface behind a generated token: `GET /v1/status`,
+  `/v1/routes`, `/v1/clients`, `/v1/connections` and `/v1/health`, as JSON.
+  The token is written to `<config>.admin-token` on first start; there is
+  deliberately no key for it in the config, because a credential in the file an
+  operator edits, copies and commits is what this design avoids. No token means
+  `503`, not an open door.
+- `nexapipe status` — asks a running instance those five endpoints and prints
+  them grouped, or as one document with `--json`. It is a client of the same
+  endpoints rather than a second reader of the config, so the running instance
+  stays the one thing that decides what its state is.
 - `docs/iroh-boundaries.md` — what still depends on third-party infrastructure
   whatever `relay_mode` says. Two README sections oversold what a mode buys:
   `custom` constrains this endpoint only, and Endpoint ID discovery still
@@ -45,6 +69,8 @@ version of this release, with downloads, lives in
 
 ### Changed
 
+- Hot-reload rules, previously scattered across the configuration sections, are
+  one table in both READMEs: what a reload applies, and what needs a restart.
 - Shutdown drains instead of sleeping. It counts the connections both accept
   loops spawned and waits for them, with a bound so a stuck peer cannot hold the
   process open (#47).
