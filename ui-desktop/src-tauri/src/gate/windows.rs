@@ -20,10 +20,12 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
 };
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Security::Authentication::Identity::{
-    LogonUserW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+// Not `Win32::Security::Authentication::Identity`, where the logon helpers used
+// to sit before this version of the bindings moved them: `LogonUserW` is
+// directly under `Win32::Security`, and it writes the token through an out
+// parameter rather than returning it.
+use windows::Win32::Security::{LogonUserW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_future::{AsyncOperationCompletedHandler, IAsyncOperation};
 
@@ -104,20 +106,24 @@ impl Hello {
         let domain = HSTRING::from(domain);
         let password = HSTRING::from(password);
 
-        let token = unsafe {
+        // The handle is an out parameter: the call returns whether the logon
+        // succeeded, and the token it opened comes back through `token`.
+        let mut token = HANDLE::default();
+        let result = unsafe {
             LogonUserW(
                 PCWSTR(user.as_ptr()),
                 PCWSTR(domain.as_ptr()),
                 PCWSTR(password.as_ptr()),
                 LOGON32_LOGON_INTERACTIVE,
                 LOGON32_PROVIDER_DEFAULT,
+                &mut token,
             )
         };
 
-        match token {
+        match result {
             // An open handle to a token nobody asked for; it is closed at once
             // so a successful check leaves nothing behind.
-            Ok(token) => {
+            Ok(()) => {
                 let closed = unsafe { CloseHandle(token) };
                 if let Err(error) = closed {
                     tracing::debug!("the logon token could not be closed: {error}");
