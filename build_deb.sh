@@ -235,6 +235,12 @@ declare -A APT_FOR_MODULE=(
     [ayatana-appindicator3-0.1]="libayatana-appindicator3-dev"
     [librsvg-2.0]="librsvg2-dev"
     [openssl]="libssl-dev"
+    # What the desktop crate itself needs beyond Tauri: `dbus-1` for keyring's
+    # persistent Linux backend, `pam` for the credential door. Both are in the
+    # Linux steps of ci.yml and release.yml, and a preflight that does not know
+    # about them lets a local build start and fail where CI succeeds.
+    [dbus-1]="libdbus-1-dev"
+    [pam]="libpam0g-dev"
 )
 # libxdo-dev is deliberately not in APT_FOR_MODULE: Debian/Ubuntu ship no pkg-config file
 # for it (the file list on packages.ubuntu.com for noble/amd64 is exactly /usr/include/xdo.h,
