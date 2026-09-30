@@ -165,4 +165,15 @@ withDefaults(
     transform: rotate(360deg);
   }
 }
+
+/* The global reduced-motion rule in base.css stops every animation, but a
+   spinner is not decoration — it *is* the answer to "did the press land".
+   Scoped, so this selector outranks the universal one, and the !important is
+   what the blanket rule's own !important has to be answered with. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 640ms !important;
+    animation-iteration-count: infinite !important;
+  }
+}
 </style>

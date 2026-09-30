@@ -67,6 +67,11 @@ For what comes next, and for why some things are deliberately not planned, see
   asynchronous API and then a selection with the legacy command. A value that
   never arrived also stopped being reported as a clipboard failure, which sent
   the user looking at the wrong thing.
+- **The connecting spinner never moved on a Mac with Reduce Motion on.** The
+  accessibility rule that stills every animation flattened the loading spinner
+  and the connecting pulse with it, and a spinner that does not turn is a
+  button that looks dead. Those two are the state, not decoration, so they are
+  exempt from the stop now; everything ornamental still respects the setting.
 - **macOS ran the window with a title bar of its own on top of the app's.** The
   macOS build asked for native decorations without the title bar style that makes
   them transparent, so the system's bar sat above the one the app draws — two

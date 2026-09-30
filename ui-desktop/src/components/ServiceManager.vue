@@ -455,6 +455,15 @@ onBeforeUnmount(() => {
   }
 }
 
+/* A spinner reports an operation in flight, so the global reduced-motion stop
+   in base.css is answered here the same way as in AppButton.vue. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 1s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
 .service-hints {
   display: flex;
   flex-direction: column;
