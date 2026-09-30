@@ -33,7 +33,10 @@ lives in `docs/releases/`, and only that directory reaches the site.
   reopens its endpoints after a reboot with nobody at the keyboard, because
   the window is two minutes of memory that never leaves this process and is
   never handed to the service. This is the desktop half of the Android app's
-  credential lock, which shipped in 0.3.0; the two now behave the same way.
+  credential lock, which shipped in 0.3.0; both ask the operating system and
+  both stay open for two minutes, but not in front of the same surfaces — here
+  it is this endpoint's Node ID and a node's connection string, there the TOTP
+  secret, its `otpauth` export and the relay configuration.
 - `least_conn` as a third load-balancing strategy, alongside `round_robin` and
   `random`: pick the healthy backend with the fewest requests outstanding to it,
   under a lease released when the flow finishes. Ties rotate rather than taking
