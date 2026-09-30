@@ -60,8 +60,20 @@ async function submit(): Promise<void> {
   // system takes its time deciding.
   busy.value = true;
   failure.value = '';
-  const why = await verify(password);
-  busy.value = false;
+
+  // Reset whatever happens: `busy` is what disables the field, the Confirm
+  // button and `cancel()` alike, so a check that throws rather than answers
+  // would otherwise leave the dialog up with no way to close it — Escape goes
+  // through `cancel()` too. A throw is not an answer about the password, so it
+  // is reported as the one thing it does tell: nothing was confirmed.
+  let why: string | null;
+  try {
+    why = await verify(password);
+  } catch {
+    why = t('gate.notConfirmed');
+  } finally {
+    busy.value = false;
+  }
 
   if (why === null) {
     settle(password);

@@ -169,7 +169,13 @@ function clearRevealCaches(): void {
 }
 
 watch(unlocked, (isUnlocked) => {
-  if (!isUnlocked) clearRevealCaches();
+  if (isUnlocked) return;
+  clearRevealCaches();
+  // The invite dialog is mounted outside the `v-if` that hides the rest of the
+  // page, so a window that lapses — or the lock button — leaves it open on a
+  // page that is shut. Its import writes nodes and relay settings, which is
+  // what the door is for, so it goes with everything else.
+  showInviteDialog.value = false;
 });
 
 /** The secret field shows the mask; what the user types into it is what gets stored. */
@@ -224,6 +230,10 @@ function toggleTwoFactor(nodeId: string) {
 }
 
 async function importInvite(payload: { uri: string; applyRelay: boolean }) {
+  // Asked here as well as at the door of the page: the dialog outlives a window
+  // that closed while it was open, and an import is a write to the same
+  // configuration the page-level guard protects.
+  if (!(await ensureUnlocked(t("gate.reasonConfig")))) return;
   try {
     const outcome = await applyInvite(payload.uri, { applyRelay: payload.applyRelay });
     toast.success(t(outcome === "added" ? "invite.added" : "invite.merged"));

@@ -250,7 +250,7 @@ impl MasterKey {
         // the one time it is still found there it moves out — see
         // [`Self::migrate_keychain_key`].
         #[cfg(target_os = "macos")]
-        if let Some(key) = Self::migrate_keychain_key(dir) {
+        if let Some(key) = Self::migrate_keychain_key(dir)? {
             return Ok(Self {
                 key,
                 source: KeySource::File,
@@ -282,23 +282,62 @@ impl MasterKey {
     /// moved rather than replaced: minting a fresh one here would leave every
     /// stored node unreadable, which is indistinguishable from losing them.
     ///
-    /// `None` when there is nothing to move, which is every launch but the first
-    /// after this change — a file already holding the key, an install that never
-    /// used the keychain, a keychain that will not answer. Asking is the reason
-    /// this is guarded by the file's absence rather than done every time: it is
-    /// the one read that puts a sheet on the screen, and it is spent once.
+    /// `Ok(None)` when there is nothing to move, which is every launch but the
+    /// first after this change — a file already holding the key, an install that
+    /// never used the keychain. Asking is the reason this is guarded by the
+    /// file's absence rather than done every time: it is the one read that puts
+    /// a sheet on the screen, and it is spent once.
+    ///
+    /// A keychain that does not answer is not the same thing as one with no key
+    /// in it, and telling the two apart is what this function is for. A read
+    /// that failed because the keychain is locked, or because the sheet was
+    /// dismissed, is not proof that no key is there, so it fails the load
+    /// instead of falling through to [`Self::from_file`]: that would mint a
+    /// fresh key, write it to the file, and — because the file's mere existence
+    /// is what stops this from ever being tried again — leave the key that is
+    /// still in the keychain unreachable for good, with every credential sealed
+    /// under it unreadable. Failing costs a retry; minting costs the data.
     #[cfg(target_os = "macos")]
-    fn migrate_keychain_key(dir: &Path) -> Option<[u8; KEY_LEN]> {
+    fn migrate_keychain_key(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, AppError> {
         if dir.join(FALLBACK_KEY_FILE).exists() {
-            return None;
+            return Ok(None);
         }
 
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok()?;
-        let key = parse_key(&entry.get_password().ok()?)?;
+        let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) else {
+            // No keychain to ask at all, so nothing was declined either: the
+            // file is where this platform keeps its key regardless.
+            return Ok(None);
+        };
+
+        let stored = match entry.get_password() {
+            Ok(stored) => stored,
+            // The ordinary install that never used the keychain, and the only
+            // case in which a key may be minted: there is nothing there for it
+            // to overwrite.
+            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(error) => {
+                return Err(AppError::with_detail(
+                    codes::CREDENTIALS_STORE_FAILED,
+                    format!(
+                        "the keychain could not be read, so its master key was left alone: {error}"
+                    ),
+                ));
+            }
+        };
+
+        // Present but unreadable, which is no different from the read having
+        // failed: something wrote this, and a fresh key cannot read what it
+        // sealed.
+        let Some(key) = parse_key(&stored) else {
+            return Err(AppError::with_detail(
+                codes::CREDENTIALS_STORE_FAILED,
+                "the keychain master key is not 32 bytes; not replacing it",
+            ));
+        };
 
         // Written before the keychain copy is deleted, so there is no moment in
         // which neither of them holds it.
-        write_private(&dir.join(FALLBACK_KEY_FILE), &hex(&key)).ok()?;
+        write_private_atomic(&dir.join(FALLBACK_KEY_FILE), &hex(&key))?;
 
         // A copy left behind is a copy macOS still asks about. Deleted on a best
         // effort: a key now in two places is not a failure, but it is the thing
@@ -306,7 +345,7 @@ impl MasterKey {
         if let Err(e) = entry.delete_credential() {
             tracing::warn!("the master key moved out of the keychain, but the copy stayed: {e}");
         }
-        Some(key)
+        Ok(Some(key))
     }
 
     /// The keychain's copy, generating one when the keychain has none.
@@ -446,7 +485,7 @@ impl MasterKey {
         }
 
         let fresh = random_bytes::<KEY_LEN>()?;
-        write_private(&path, &hex(&fresh))?;
+        write_private_atomic(&path, &hex(&fresh))?;
         Ok(fresh)
     }
 }
@@ -687,6 +726,61 @@ fn store_dir() -> PathBuf {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(crate::log_dir)
+}
+
+/// Writes `contents` to `path` so that `path` is never seen half-written.
+///
+/// Two things read the master key file and neither recovers from a short one:
+/// [`MasterKey::file_key`] rejects a file that is not a 32-byte key, and
+/// [`MasterKey::migrate_keychain_key`] takes the file's mere existence as
+/// "already moved out". A write that dies halfway — a full disk, an I/O error
+/// after the file was truncated — therefore leaves an installation that can
+/// neither read its key nor read the keychain copy it still has. So the bytes
+/// go to a sibling temporary file, are flushed out of the page cache, and only
+/// then take the name they belong under: a rename is atomic to a reader, who
+/// sees the old file or the new one and never a mixture of the two.
+fn write_private_atomic(path: &Path, contents: &str) -> Result<(), AppError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            format!("{} has no file name to write beside", path.display()),
+        ));
+    };
+    // A sibling rather than a system temporary directory: a rename across
+    // filesystems is a copy, which is two writes with a gap between them.
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+
+    match write_private(&tmp, contents).and_then(|()| sync_file(&tmp)) {
+        Ok(()) => {}
+        Err(error) => {
+            // Nothing reads the temporary file, but it is a copy of the key
+            // with the wrong name, so it does not stay behind.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    }
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::cause(codes::CREDENTIALS_STORE_FAILED, e)
+    })
+}
+
+/// Pushes what was just written out of the page cache and onto the disk.
+///
+/// Dropping a [`std::fs::File`] does not do this: `write_all` can return `Ok`
+/// with every byte still in the cache, which a crash would take with it.
+#[cfg(unix)]
+fn sync_file(path: &Path) -> Result<(), AppError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))
+}
+
+/// `sync_all` has no equivalent on Windows' standard file handle.
+#[cfg(not(unix))]
+fn sync_file(_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], AppError> {
@@ -943,6 +1037,29 @@ mod tests {
         std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
 
         assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A minted key reaches the file whole, or the file is not written at all.
+    ///
+    /// `file_key` rejects a file that is not 32 bytes, and the macOS migration
+    /// takes the file's mere existence as "already moved out" — so a write that
+    /// died halfway would leave an installation that can neither read its key
+    /// nor read the keychain copy it still has. What is observable from outside
+    /// is that the file under its own name is a whole key, and that nothing was
+    /// left beside it under the name the bytes were written to first.
+    #[test]
+    fn a_minted_key_is_published_whole_and_leaves_no_temporary() {
+        let dir = scratch("minted-key");
+
+        let key = super::MasterKey::from_file(&dir).expect("a key is minted");
+
+        assert_eq!(super::MasterKey::file_key(&dir), Some(key));
+        let temporary = dir.join(format!("{}.tmp", super::FALLBACK_KEY_FILE));
+        assert!(
+            !temporary.exists(),
+            "{} was left beside the key",
+            temporary.display()
+        );
     }
 
     /// A mask is not a shortening: none of the original characters of a short
