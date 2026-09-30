@@ -49,8 +49,9 @@ The gap is not architectural, it is maturity:
 
 - Identity is one shared TOTP secret per client, so revoking one device means
   rotating every device using that client.
-- Platform coverage has real holes: no IPv6 inside the TUN, no UDP on desktop
-  TUN, a single Android ABI.
+- Platform coverage has real holes: no IPv6 inside the TUN, a single Android
+  ABI. (The desktop TUN does UDP; this list used to claim it did not. See
+  [4.5](#45-protocols-and-transport-p1p2).)
 - Release hygiene is thin: `CHANGELOG.md` arrived with v0.3.0, but there is
   still no published container image (the Dockerfiles build locally only), no
   package manager distribution, and no documented way to run your own relay.
@@ -113,7 +114,7 @@ Comparison against NexaPipe specifically:
 | Identity granularity | shared TOTP + host allowlist | bring your own | none | **SSO, OIDC, share links, audit** | Access (SSO) | IdP + ACLs | identity + private shares |
 | Observability | **access log only** | dashboard | none | dashboard + Traefik metrics | rich | rich | some |
 | Embeddable | **rlib / JNI / UniFFI** | no | no | no | no | tsnet (Go) | Go SDK |
-| UDP | yes (Android TUN; desktop TUN no) | yes | yes | yes | no | yes | yes |
+| UDP | yes (Android TUN and desktop TUN) | yes | yes | yes | no | yes | yes |
 | Transport | iroh / QUIC | TCP, KCP, QUIC | TCP + Noise | WireGuard | QUIC | WireGuard | OpenZiti |
 
 Read it this way: NexaPipe is the only entry that is green on "no TLS
@@ -227,7 +228,13 @@ with TOTP as a human second factor rather than the device identity itself.
 
 - **No IPv6 inside the TUN**: AAAA queries are answered empty (`ANCOUNT=0`).
   `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`
-- **No UDP in desktop TUN**; the local proxy speaks `CONNECT` only.
+- **The desktop TUN does UDP** — one `l4::open_udp` bi-stream per flow, through
+  the same smoltcp stack the Android client runs
+  (`ui-desktop/src-tauri/src/proxy/tun_proxy.rs`). This list used to claim
+  otherwise and was wrong. The local proxy, which is the `--local-proxy` mode
+  rather than the TUN, still speaks `CONNECT` only — a different path, and not
+  the same gap. What is actually missing here is IPv6, above, which makes R10
+  smaller than this section once made it look.
 - The iroh endpoint binds `0.0.0.0` unconditionally; there is no IPv6 knob.
   `proxy/mod.rs:220`
 
@@ -240,25 +247,35 @@ not the absence of a description of it.
 
 No background reconnect loop, no node health probing, and dead nodes are never
 removed from rotation (`endpoint_group.rs` keeps no health state). Multi-node
-failover is request-level only: drop the stale connection and retry three times.
-`local_proxy.rs:267`
+failover is request-level only: drop the stale connection and retry three times
+— `open_stream_with_retry` at `local_proxy.rs:473`, `OPEN_ATTEMPTS = 3` at
+`:119`, each attempt bounded by `[timeouts] connect_secs`. Health is consulted
+exactly once, before anything starts: `endpoint_group.rs:577-679`
+`preconnect_report` decides whether startup succeeded and is never asked again.
+
+*Not started as of v0.4.0* — R9, and the item this phase drops first. The
+structural cost is that `EndpointGroup` has no interior mutability
+(`endpoint_group.rs:106-109`), so nothing can add or remove a node while it is
+in use.
 
 ### 4.7 Client-side credential protection (P0)
 
 Both clients hold the material that authenticates a node — endpoint ID, ticket,
-TOTP secret, enrollment token, relay auth token — and neither one gates access
-to it. This is the only item here rated P0: the exposure is a credential
-disclosure, not a missing convenience.
+TOTP secret, enrollment token, relay auth token. This is the only item here
+rated P0: the exposure is a credential disclosure, not a missing convenience.
 
-Both clients already encrypt credentials at rest — the desktop with a
-keychain-held master key, Android with the Keystore — and neither asks anything
-before handing them back. Stating that precisely matters because it decides what
-the work is: **the vault exists, the door does not.**
+Both clients already encrypted credentials at rest — the desktop with a
+keychain-held master key, Android with the Keystore — and neither asked anything
+before handing them back. Stating that precisely mattered because it decided
+what the work was: **the vault existed, the door did not.** Android's door
+shipped in v0.3.0 and the desktop's in v0.4.0, so both halves of R14 are now
+built. What neither half has is a prompt that has been watched running on every
+platform it claims to support.
 
 | # | Gap | Where |
 |---|---|---|
-| C8 | **Desktop: encrypted at rest, ungated on read.** The TOTP secret, the enrollment token and the relay bearer already live in an AES-256-GCM file whose master key the OS keychain holds, so the original "secrets in a WebKit `localStorage` blob" exposure is closed. Two holes remain: the node ticket and the endpoint ID are still persisted in cleartext `localStorage`, and reading any of it back costs nothing — the store opens silently for whatever asks, and the renderer is handed plaintext on request with no prompt in front of it. *This is the desktop half of R14, now carried by Phase 1.* | `ui-desktop/src-tauri/src/credentials.rs` (what exists); `ui-desktop/src/stores/config.ts` (ticket and endpoint ID, still cleartext) |
-| C9 | **The masking is cosmetic.** The dashboard and the config page return the value in full when it happens to be short, the sidebar tooltip carries the unmasked node ID, and the invite import dialog renders the parsed ticket and endpoint verbatim. | `ui-desktop/src/pages/DashboardPage.vue`, `ConfigPage.vue`, `app/shell/SideBarFooter.vue`, `components/InviteImportDialog.vue` |
+| C8 | **Desktop: closed in v0.4.0.** The ticket and the endpoint ID join the TOTP secret, the enrollment token and the relay bearer in the encrypted store — a payload left over from an older build is migrated into it on the way in — and reading any of it back now costs an answer from the operating system: one trait, three platform modules, and a two-minute window in memory. A keychain item whose access control requires user presence on macOS, Windows Hello with a `LogonUserW` fallback on Windows, PAM with a password the UI collects on Linux. A machine with nothing to confirm anybody with is refused rather than downgraded. **Not confirmed on Windows or Linux**: the window is pinned by unit tests and the macOS prompt has been driven by hand, but neither of the other two has been watched running. | `ui-desktop/src-tauri/src/gate.rs` and `gate/{macos,windows,linux}.rs`; `credentials.rs` for the store |
+| C9 | **Closed with C8, in v0.4.0.** Masks come from `credentials::mask` in Rust, so a value is never in the renderer that is drawing it shortened; an invite is accepted by `accept_invite`, which files the credentials itself and answers with a receipt carrying none of them; and `reveal_credential` / `reveal_node_id` are the only two commands that answer with a whole value, which is what makes them the two the door stands in front of. | `ui-desktop/src-tauri/src/credentials.rs`, `src/lib.rs` |
 | C10 | **Android asks first, as of v0.3.0.** At-rest storage was never the problem — `SecretStore` already wrapped values with Keystore AES-256-GCM. What was missing was the prompt, and `auth/CredentialGate.kt` now supplies one in front of the TOTP secret, its `otpauth` export and any change to the relay configuration, refusing a device enrolled with neither a biometric nor a screen lock. **Not confirmed on a device**: CI could give compile, unit tests and lint, but nothing past `BiometricPrompt` itself has been seen running. | `ui-android/.../auth/CredentialGate.kt`, `ui/EndpointDetailScreen.kt`, `ui/VpnControlScreen.kt` |
 
 The direction is that **authentication is delegated to the operating system, and
@@ -301,17 +318,17 @@ anything, so it is refused rather than downgraded.
 
 The TUN answers DNS itself: a query that is not for one of its own virtual IPs is
 forwarded to the configured resolvers, and the answer is kept for as long as its
-own records say it is good. The cache is a first implementation whose semantics
-are incomplete, which makes this capability work rather than a defect: nothing
-crashes or loses data, but a name can resolve to an address that is no longer the
-right one, and only a cache that understands what it is holding can avoid it.
+own records say it is good. The cache was a first implementation whose semantics
+were incomplete — nothing crashed or lost data, but a name could resolve to an
+address that was no longer the right one. All four gaps below were closed in
+v0.4.0: the cache now answers only what it actually holds.
 
 | # | Gap | Where |
 |---|---|---|
-| C11 | **The cache key ignores QCLASS.** The question is parsed into a name and a QTYPE, and the class is neither checked nor part of the key, so a query in another class is answered from an entry cached for `IN`. | `crates/nexapipe-client/src/tun_proxy.rs:1269` (`parse_dns_query`); key at `:1551` |
-| C12 | **The cache is not scoped to the resolvers that answered.** The key is a name and a type with no notion of who answered, so changing the DNS servers in the configuration keeps serving what the previous ones said. | `crates/nexapipe-client/src/tun_proxy.rs:1551` |
-| C13 | **A cached answer is not aged.** A hit rewrites the transaction ID and nothing else, so a record fetched with a 300s TTL is handed back with the full 300s still on it even when it is 290s old: the entry expires on time, but the record it carries outlives itself. The remaining TTL belongs in each RR it writes out. | `crates/nexapipe-client/src/tun_proxy.rs:1571-1587` |
-| C14 | **A zero TTL is cached anyway.** TTLs are clamped into 1–300s, so a record the server said not to cache is kept for a second; by RFC 1035 a zero TTL means do not cache, and the clamp should not invent a floor. | `crates/nexapipe-client/src/tun_proxy.rs:1542-1543`, clamp at `:1664` |
+| C11 | **Closed in v0.4.0.** The cache key ignored QCLASS: the question is parsed into a name and a QTYPE, and the class was neither checked nor part of the key, so a query in another class was answered from an entry cached for `IN`. The class is part of the key now. | `crates/nexapipe-client/src/tun_proxy.rs` |
+| C12 | **Closed in v0.4.0.** The cache was not scoped to the resolvers that answered, so changing the DNS servers in the configuration kept serving what the previous ones said. It is scoped to them now. | `crates/nexapipe-client/src/tun_proxy.rs` |
+| C13 | **Closed in v0.4.0.** A cached answer was not aged: a hit rewrote the transaction ID and nothing else, so a record fetched with a 300s TTL was handed back with the full 300s still on it even when it was 290s old. A hit now rewrites each record's TTL to the part that is left. | `crates/nexapipe-client/src/tun_proxy.rs` |
+| C14 | **Closed in v0.4.0.** A zero TTL was cached anyway — TTLs were clamped into 1–300s, so a record the server said not to cache was kept for a second. A zero TTL is not cached now. | `crates/nexapipe-client/src/tun_proxy.rs` |
 
 What is already right, and should stay right: the TTL kept is the shortest among
 the answer's records rather than the first or the longest, an error or an empty
@@ -387,22 +404,23 @@ gated by config — `[admin] listen_addr` and `[metrics] enabled` — rather tha
 the cargo feature R7 asked for, which would have added a build and a test
 matrix to a choice nobody recompiles to make. R4 has shipped as far
 as reading goes — the `/v1/*` endpoints and `nexapipe status`; the write half
-(`client add|revoke`) still waits on R5's identity model. R14 has shipped on
-Android only: `auth/CredentialGate.kt` puts the OS prompt in front of the TOTP
-secret, its `otpauth` export and any change to the relay configuration. Its
-desktop half — ticket and endpoint ID into the encrypted store, masks computed in
-Rust, and a native prompt on each of macOS, Windows and Linux — is the one item
-here that moved to Phase 1, because it is the one that needs a per-OS platform
-module and a native build dependency on Linux. See
+(`client add|revoke`) still waits on R5's identity model. R14 has shipped on both
+clients now: Android in v0.3.0, where `auth/CredentialGate.kt` puts the OS prompt
+in front of the TOTP secret, its `otpauth` export and any change to the relay
+configuration; and the desktop half in v0.4.0, which was the one item here that
+moved to Phase 1 because it needs a per-OS platform module and a native build
+dependency on Linux — ticket and endpoint ID into the encrypted store, masks
+computed in Rust, and a native prompt on each of macOS, Windows and Linux. See
 [4.7](#47-client-side-credential-protection-p0).
 
-**Done when:** revoke one of three devices and the other two keep working; a
-newcomer brings up a self-hosted relay from the docs without asking anyone; and
-no *Android* surface renders a full secret without the operating system having
-authenticated the user first. The desktop equivalent is carried by Phase 1
-below.
+**Done when:** revoke one of three devices and the other two keep working —
+which is R5, **not yet started**, and the read-only half of R4 shipped without
+it; a newcomer brings up a self-hosted relay from the docs without asking
+anyone; and no *Android* surface renders a full secret without the operating
+system having authenticated the user first (shipped in v0.3.0). The desktop
+equivalent is carried by Phase 1 below, and shipped in v0.4.0.
 
-### Phase 1 — v0.4, "wider"
+### Phase 1 — v0.4.0, "wider"
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -415,10 +433,21 @@ below.
 Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
 
+**Progress.** Of the five, three shipped in v0.4.0: R12 (backend handling —
+`[timeouts]`, `least_conn`, and a refusal when every backend of a multi-backend
+route is down), R15 (the client DNS cache), and the desktop half of R14 that
+came here from Phase 0 (§4.7, C8 and C9). Three did not: **R9** client
+resilience, **R10** transport parity — whose UDP half turned out to be already
+done, leaving IPv6 in the TUN — and **R11** the second Android ABI. They stay
+in this phase rather than moving, because the phase is named for the release
+that began them and not for the one that will finish them; what is recorded here
+is that v0.4.0 shipped without them.
+
 **Done when:** Android and desktop both complete HTTP, TLS passthrough and UDP
-round trips against one server, over both IPv4 and IPv6 — and no desktop surface
-renders a full credential without the operating system having authenticated the
-user first, which is the half of R14 that came here from Phase 0.
+round trips against one server, over both IPv4 and IPv6 — the IPv6 half is R10
+and is **not yet started** — and no desktop surface renders a full credential
+without the operating system having authenticated the user first, which is the
+half of R14 that came here from Phase 0 and **shipped in v0.4.0**.
 
 ### Phase 2 — v1.0, "reachable without our client" (exploratory)
 
@@ -435,15 +464,18 @@ not to be the main reason people walk away, this stays shelved.
 R8 boundary docs ─────────────────────────────────────► shipped in v0.3.0
 R7 metrics ───────────────────────────────────────────► shipped in v0.3.0
 R14 credential lock ── Android ───────────────────────► shipped in v0.3.0
-                    └── desktop ──────────────────────► v0.4
-R4 management ── R5 per-device ──┬── R6 distribution ──► v0.4
+                    └── desktop ──────────────────────► shipped in v0.4.0
+R4 management ── R5 per-device ──┬── R6 distribution ──► v0.4.0
         (read-only shipped in v0.3.0; the write half waits on R5)
                                               │
-      R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.4
+      R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.4.0
                                        └── R12 backends ──────────────────────►
                                               │
                               R13 edge (after validation) ──► v1.0
 ```
+
+Of that last row, R15 and R12 shipped in v0.4.0; R9, R10 and R11 did not. See
+the progress note under Phase 1.
 
 ---
 
@@ -466,8 +498,8 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
 | First deploy to first successful request | requires reading the config reference, generating a secret, an invite and an import | under 10 minutes on one quickstart page |
 | Time to locate a failing backend | the access log covers every path, but there is nothing to aggregate | 5 minutes with metrics and structured logs |
 | Direct-connection rate | unmeasured | opt-in client telemetry: direct vs relayed, one-way latency — so "nothing to rent" becomes a number we can publish |
-| Platform coverage | Android (one ABI) + desktop | desktop TUN does UDP, TUN speaks IPv6, Android ships a second ABI |
-| Full secret rendered without authentication | Android asks first as of v0.3.0; on desktop the dashboard tooltip, the config page and the invite import dialog all still show one | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
+| Platform coverage | Android (one ABI) + desktop | TUN speaks IPv6, Android ships a second ABI (the desktop TUN already does UDP) |
+| Full secret rendered without authentication | both clients ask the operating system first — Android as of v0.3.0, desktop as of v0.4.0 — and neither has been watched running on every platform it supports | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
 | Release rhythm | one `CHANGELOG.md` as of v0.3.0, and no released version carries an entry older than its own tag | regular minor releases, each with a readable CHANGELOG |
 
 ---

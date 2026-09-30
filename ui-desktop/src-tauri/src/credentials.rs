@@ -808,8 +808,13 @@ mod tests {
             .expect("the entry is there")
             .clone();
         // Flip the last hex character: the ciphertext no longer matches its tag.
-        blob.pop();
-        blob.push(if blob.ends_with('a') { 'b' } else { 'a' });
+        // The character has to be read before it is replaced. Pushing back a
+        // fixed `a` or `b` sometimes restores the one that was just popped —
+        // whenever the last character was `a` and the one before it was not —
+        // and an untampered entry decrypts, failing this test about one run in
+        // four.
+        let last = blob.pop().expect("the blob is not empty");
+        blob.push(if last == 'a' { 'b' } else { 'a' });
 
         assert!(store.decrypt("totp:node-1", &blob).is_err());
     }

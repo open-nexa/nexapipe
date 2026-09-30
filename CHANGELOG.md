@@ -10,10 +10,11 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [0.4.0] — 2026-09-30
 
-M1 and M2 of the v0.4.0 plan (see `.workbuddy/plans/v0.4.0.md`, a working note,
-not part of the tree). Not yet released, so no version numbers have moved.
+A readable version of this release, with downloads, is published at
+<https://open-nexa.github.io/nexapipe/v0.4.0.html>. The page itself
+lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Added
 
@@ -31,7 +32,8 @@ not part of the tree). Not yet released, so no version numbers have moved.
   outcome this exists to prevent. The proxy is unaffected: it still starts and
   reopens its endpoints after a reboot with nobody at the keyboard, because
   the window is two minutes of memory that never leaves this process and is
-  never handed to the service.
+  never handed to the service. This is the desktop half of the Android app's
+  credential lock, which shipped in 0.3.0; the two now behave the same way.
 - `least_conn` as a third load-balancing strategy, alongside `round_robin` and
   `random`: pick the healthy backend with the fewest requests outstanding to it,
   under a lease released when the flow finishes. Ties rotate rather than taking
