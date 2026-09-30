@@ -1050,12 +1050,14 @@ workspace 构建覆盖不到的分目标检查：
 
 ```bash
 cargo ndk -t arm64-v8a check -p nexapipe-client --features jni,tun-proxy
+cargo ndk -t x86_64   check -p nexapipe-client --features jni,tun-proxy
 cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
 TUN 栈由 Android 与桌面端共用，只有它基于 fd 的入口是 `cfg(target_os = "android")`，
-所以那行 `cargo ndk` 仍是唯一会对 Android 那一半做类型检查的东西 —— 很容易忘。
+所以那两行 `cargo ndk` 仍是唯一会对 Android 那一半做类型检查的东西 —— 很容易忘。
+两个 ABI 各要一次：应用按 ABI 分别出包，CI 也两个都跑。
 `ui-desktop/src-tauri` 是一个独立的 cargo 项目，因此 workspace 的 lint 门禁也覆盖
 不到它。
 

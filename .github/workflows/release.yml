@@ -4,7 +4,8 @@ name: Release
 #   build          - the nexapipe server binary + client cdylib, 8-platform matrix
 #   build-desktop  - the Tauri desktop app, 6-platform matrix (nsis / dmg / deb /
 #                    rpm / appimage + the updater manifests merged into latest.json)
-#   build-apk      - the signed Android APK (cargo-ndk .so + gradle assembleRelease)
+#   build-apk      - the signed Android APKs, one per ABI (cargo-ndk .so per ABI +
+#                    gradle assembleRelease with ABI splits)
 #   release        - assembles every artifact into a single GitHub Release with one
 #                    SHA256SUMS.txt
 #
@@ -17,7 +18,7 @@ name: Release
 #   version   bare semver, no leading "v" (0.2.0, 0.2.0-rc.1)
 #   platform  the cargo target triple for the server (musl vs. glibc is part of it),
 #             "<os>-<cpu>" for the GUI: macos-aarch64, windows-x86_64, linux-x86_64,
-#             android-arm64
+#             android-arm64, android-x86_64
 #
 # Tauri's own bundle names break that rule (nexa_0.2.0_amd64.deb, nexa-0.2.0-1.x86_64.rpm,
 # an arch-less nexa.app.tar.gz), so ui-desktop/.github/scripts/stage-artifact.mjs renames
@@ -587,8 +588,10 @@ jobs:
     env:
       NDK_VERSION: 29.0.14206865
       MIN_SDK: 26
-      TARGET_ABI: arm64-v8a
-      TARGET_TRIPLE: aarch64-linux-android
+      # One APK per ABI (see the splits block in ui-android/app/build.gradle.kts).
+      # x86_64 is the emulator ABI; arm64-v8a is what phones run. Each needs its
+      # own .so built from the same crate, so both are listed as "abi:triple".
+      ANDROID_ABI_PAIRS: arm64-v8a:aarch64-linux-android x86_64:x86_64-linux-android
       # compileSdk 37 (Compose 1.12 requires it); note the platform package is
       # named android-37.0 — plain "android-37" no longer exists upstream.
       ANDROID_PLATFORM: '37.0'
@@ -637,7 +640,7 @@ jobs:
             echo ""
             echo "| Item | Value |"
             echo "| --- | --- |"
-            echo "| ABI | \`${TARGET_ABI}\` |"
+            echo "| ABIs | \`${ANDROID_ABI_PAIRS}\` |"
             echo "| Pre-release | \`${PRERELEASE}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -721,7 +724,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           toolchain: 1.98.1
-          targets: ${{ env.TARGET_TRIPLE }}
+          targets: aarch64-linux-android x86_64-linux-android
 
       - name: Install cargo-ndk
         if: steps.opts.outputs.skip_rust != 'true'
@@ -738,9 +741,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-${{ hashFiles('Cargo.lock') }}
+          # Both Android triples share one cache entry: each build below pulls
+          # the other's artifacts forward, and a per-triple key would compile
+          # the whole dependency tree twice.
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-
+            ${{ runner.os }}-cargo-android-
 
       # The .so is built straight from this repository's crates/nexapipe-client
       # and copied into the app's jniLibs (which app/.gitignore excludes).
@@ -749,53 +755,65 @@ jobs:
         run: |
           set -euo pipefail
           NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          LINKER="${NDK_BIN}/${TARGET_TRIPLE}${MIN_SDK}-clang"
-          if [ ! -x "$LINKER" ]; then
-            echo "::error::NDK linker not found: $LINKER"
-            ls -1 "$NDK_BIN" | grep -E 'clang$' || true
-            exit 1
-          fi
 
-          # The repo .cargo/config.toml hardcodes a Windows NDK linker path.
-          # Override it on the command line with --config (which takes
-          # precedence over both environment variables and the config file) so
-          # the Linux runner uses the right clang.
-          cargo ndk \
-            --target "${TARGET_ABI}" \
-            --platform "${MIN_SDK}" \
-            build --release \
-            -p nexapipe-client \
-            --features "jni local-proxy tun-proxy" \
-            --config "target.${TARGET_TRIPLE}.linker='${LINKER}'"
+          # One .so per shipped ABI, each from the same crate. The app packages
+          # one APK per ABI (build.gradle.kts splits), so a missing .so is not a
+          # build failure here — it is an APK that dies with UnsatisfiedLinkError
+          # on the device. Both are therefore built and both are checked below.
+          for PAIR in ${ANDROID_ABI_PAIRS}; do
+            ABI="${PAIR%%:*}"
+            TRIPLE="${PAIR##*:}"
+            LINKER="${NDK_BIN}/${TRIPLE}${MIN_SDK}-clang"
+            if [ ! -x "$LINKER" ]; then
+              echo "::error::NDK linker not found: $LINKER"
+              ls -1 "$NDK_BIN" | grep -E 'clang$' || true
+              exit 1
+            fi
 
-          mkdir -p "ui-android/app/src/main/jniLibs/${TARGET_ABI}"
-          cp "target/${TARGET_TRIPLE}/release/libnexapipe_client.so" \
-             "ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
-          ls -lh "ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
+            # The repo .cargo/config.toml hardcodes a Windows NDK linker path.
+            # Override it on the command line with --config (which takes
+            # precedence over both environment variables and the config file) so
+            # the Linux runner uses the right clang.
+            cargo ndk \
+              --target "${ABI}" \
+              --platform "${MIN_SDK}" \
+              build --release \
+              -p nexapipe-client \
+              --features "jni local-proxy tun-proxy" \
+              --config "target.${TRIPLE}.linker='${LINKER}'"
+
+            mkdir -p "ui-android/app/src/main/jniLibs/${ABI}"
+            cp "target/${TRIPLE}/release/libnexapipe_client.so" \
+               "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
+            ls -lh "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
+          done
 
       - name: Verify native library exports
         if: steps.opts.outputs.skip_rust != 'true'
         run: |
           set -euo pipefail
-          SO="ui-android/app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
-          test -f "$SO" || { echo "::error file=$SO::Native library not found"; exit 1; }
-
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          SYMS=$("$NM" -D --defined-only "$SO" \
-                 | grep -o 'Java_com_nexa_pipe_IrohProxy_[A-Za-z0-9_]*' | sort -u || true)
-          echo "$SYMS"
 
-          MISSING=0
-          for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
-                    nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
-                    nativeStopProxy nativeAddNode nativeStartTunProxy \
-                    nativeStopTunProxy nativeDestroy; do
-            if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
-              echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"
-              MISSING=1
-            fi
+          for PAIR in ${ANDROID_ABI_PAIRS}; do
+            ABI="${PAIR%%:*}"
+            SO="ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
+            test -f "$SO" || { echo "::error file=$SO::Native library not found"; exit 1; }
+            SYMS=$("$NM" -D --defined-only "$SO" \
+                   | grep -o 'Java_com_nexa_pipe_IrohProxy_[A-Za-z0-9_]*' | sort -u || true)
+            echo "$SYMS"
+
+            MISSING=0
+            for FN in nativeInit nativeSetDnsServers nativeSetDnsOverride nativeSetRelayConfig \
+                      nativeSetTwoFactor nativeStartIroh nativeStartProxy nativePreconnect \
+                      nativeStopProxy nativeAddNode nativeStartTunProxy \
+                      nativeStopTunProxy nativeDestroy; do
+              if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
+                echo "::error::${SO} is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"
+                MISSING=1
+              fi
+            done
+            [ "$MISSING" -eq 0 ] || exit 1
           done
-          [ "$MISSING" -eq 0 ] || exit 1
 
       # Restore RELEASE_KEYSTORE_BASE64 into a .jks file and surface every
       # problem (wrong secret content / wrong password / wrong alias) right
@@ -924,27 +942,43 @@ jobs:
         working-directory: ui-android
         run: |
           set -euo pipefail
-          APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort | head -n 1)
-          test -n "$APK" || { echo "::error::Release APK not found"; exit 1; }
-
           BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
-          "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
 
-          # <product>-<version>-<platform>, the same rule as the desktop bundles
-          # (productName "nexa" -> nexa-0.2.0-macos-aarch64.dmg). The GUI keeps its own
-          # product name; only the server archives are "nexapipe-" prefixed, so one
-          # Release never carries two names for one product.
-          OUT="nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk"
-          cp "$APK" "$OUT"
-          sha256sum "$OUT" > "${OUT}.sha256"
+          # One APK per ABI. The name the file already carries is the only
+          # reliable record of which one it is, so the staging step refuses
+          # anything it does not recognise rather than shipping it as "the" APK.
+          mapfile -t APKS < <(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort)
+          [ "${#APKS[@]}" -eq 2 ] || {
+            echo "::error::expected exactly 2 ABI APKs, found ${#APKS[@]}"
+            printf '%s\n' "${APKS[@]}"
+            exit 1
+          }
 
-          {
-            echo "### Artifacts"
-            echo '```'
-            "${BUILD_TOOLS_DIR}/aapt2" dump badging "$OUT" | head -n 4
-            cat "${OUT}.sha256"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          for APK in "${APKS[@]}"; do
+            "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
+
+            case "$APK" in
+              *arm64-v8a*) ABI_SUFFIX=arm64 ;;
+              *x86_64*)    ABI_SUFFIX=x86_64 ;;
+              *) echo "::error::unrecognised APK name: $APK"; exit 1 ;;
+            esac
+
+            # <product>-<version>-<platform>, the same rule as the desktop bundles
+            # (productName "nexa" -> nexa-0.2.0-macos-aarch64.dmg). The GUI keeps its own
+            # product name; only the server archives are "nexapipe-" prefixed, so one
+            # Release never carries two names for one product.
+            OUT="nexa-${{ steps.opts.outputs.version_name }}-android-${ABI_SUFFIX}.apk"
+            cp "$APK" "$OUT"
+            sha256sum "$OUT" > "${OUT}.sha256"
+
+            {
+              echo "### Artifacts"
+              echo '```'
+              "${BUILD_TOOLS_DIR}/aapt2" dump badging "$OUT" | head -n 4
+              cat "${OUT}.sha256"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Upload APK artifact
         if: steps.opts.outputs.skip_rust != 'true'
@@ -954,6 +988,8 @@ jobs:
           path: |
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk.sha256
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-x86_64.apk
+            ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-x86_64.apk.sha256
           if-no-files-found: error
           retention-days: 7
 

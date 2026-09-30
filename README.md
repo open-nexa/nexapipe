@@ -1175,13 +1175,15 @@ Per-target checks the workspace build cannot cover:
 
 ```bash
 cargo ndk -t arm64-v8a check -p nexapipe-client --features jni,tun-proxy
+cargo ndk -t x86_64   check -p nexapipe-client --features jni,tun-proxy
 cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
 The TUN stack is shared by Android and the desktop, and only its fd-based entry
-point is `cfg(target_os = "android")`, so that `cargo ndk` line is the only thing
-that type-checks the Android half — easy to forget. `ui-desktop/src-tauri` is a
+point is `cfg(target_os = "android")`, so those `cargo ndk` lines are the only
+things that type-check the Android half — easy to forget. Both shipped ABIs need
+one: the app builds an APK per ABI, and CI runs both. `ui-desktop/src-tauri` is a
 separate cargo project, so the workspace lint gate does not cover it either.
 
 Notes:
