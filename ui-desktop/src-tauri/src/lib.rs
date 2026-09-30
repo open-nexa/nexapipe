@@ -412,10 +412,11 @@ async fn get_node_id_display(use_service: Option<bool>) -> Result<String, AppErr
 /// This endpoint's Node ID in full.
 ///
 /// The one way a surface gets the whole of it, for the user to copy into a
-/// server's `[peers] allow` or into a message to whoever runs one. Once the lock
-/// is in, this is the command it sits in front of.
+/// server's `[peers] allow` or into a message to whoever runs one — which is
+/// why the door stands in front of it.
 #[tauri::command]
 async fn reveal_node_id(use_service: Option<bool>) -> Result<String, AppError> {
+    require_unlocked()?;
     node_id(use_service).await
 }
 
@@ -1041,17 +1042,30 @@ async fn credential_display(
 
 /// One credential in full, for the user to copy.
 ///
-/// The only path from the store to a surface, and the one the lock goes in front
-/// of: everything else the UI can ask for is either a mask or a shape. Until it
-/// does, this is no weaker than the copy button it replaces, which read the value
-/// straight out of the DOM.
+/// The only path from the store to a surface, and the one the door stands in
+/// front of: everything else the UI can ask for is either a mask or a shape.
 #[tauri::command]
 async fn reveal_credential(
     kind: String,
     node_id: Option<String>,
 ) -> Result<Option<String>, AppError> {
+    require_unlocked()?;
     let key = credential_kind(&kind, node_id)?;
     credentials::get(&key)
+}
+
+/// Refuses a reveal while the door is shut.
+///
+/// The check the rest of `gate` exists to make possible. It reads the window and
+/// nothing else: whether the machine can still ask is re-read when the UI asks
+/// for the status, which is what it does when the app comes back into view, and
+/// a window that is open is at most two minutes old.
+fn require_unlocked() -> Result<(), AppError> {
+    if gate::is_unlocked() {
+        Ok(())
+    } else {
+        Err(AppError::new(codes::CREDENTIALS_LOCKED))
+    }
 }
 
 /// The credential door, as a surface sees it: whether it is open, how long it

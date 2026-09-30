@@ -22,6 +22,7 @@ import { errorKey } from '../api/errors';
 import { confirm } from '../composables/useConfirm';
 import { useToast } from '../composables/useToast';
 import { useConfigStore } from '../stores/config';
+import { useCredentialGate } from '../stores/gate';
 import { useProxyStore } from '../stores/proxy';
 import type { LinkKind } from '../types';
 
@@ -45,6 +46,8 @@ const {
   revealNodeId,
   setUseTun,
 } = useProxyStore();
+
+const { ensureUnlocked } = useCredentialGate();
 
 const installing = ref(false);
 
@@ -151,6 +154,9 @@ async function installServiceForTun(): Promise<void> {
  */
 async function copyNodeId(): Promise<void> {
   if (!nodeId.value) return;
+  // The Node ID is the name this machine answers to on the network, so copying
+  // it is worth the same question as copying a credential.
+  if (!(await ensureUnlocked(t('gate.reasonNodeId')))) return;
   const full = await revealNodeId();
   if (!full) {
     toast.error(t('common.copyFailed'));

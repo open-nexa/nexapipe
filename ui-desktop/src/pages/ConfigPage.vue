@@ -8,9 +8,11 @@ import type {
   TwoFactorAlgorithm,
 } from "../types";
 import { useConfigStore } from "../stores/config";
+import { useCredentialGate } from "../stores/gate";
 import { useToast } from "../composables/useToast";
 import { errorDetail, errorKey } from "../api/errors";
 import { revealCredential } from "../api/credentials";
+import CredentialLock from "../components/CredentialLock.vue";
 import InviteImportDialog from "../components/InviteImportDialog.vue";
 
 const {
@@ -26,6 +28,8 @@ const {
   secretMask,
   resetConfig,
 } = useConfigStore();
+
+const { ensureUnlocked } = useCredentialGate();
 
 const { t } = useI18n();
 const toast = useToast();
@@ -87,6 +91,9 @@ async function toggleReveal(node: NodeConfig): Promise<void> {
     delete revealed.value[node.id];
     return;
   }
+  // Closing a reveal needs nothing, opening one needs the door: hiding what is
+  // already on the screen is not a disclosure.
+  if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
   const value = await revealCredential(connectionKind(node), node.id);
   if (value === null || value === "") return;
   revealed.value[node.id] = value;
@@ -95,6 +102,7 @@ async function toggleReveal(node: NodeConfig): Promise<void> {
 async function copyConnection(node: NodeConfig): Promise<void> {
   // Asked for here rather than read off the page: the copy button is a surface
   // too, and the value it puts on the clipboard comes from the store.
+  if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
   const value = revealed.value[node.id] ?? (await revealCredential(connectionKind(node), node.id));
   if (!value) return;
   try {
@@ -121,6 +129,7 @@ async function toggleSecret(node: NodeConfig): Promise<void> {
     delete revealedSecrets.value[node.id];
     return;
   }
+  if (!(await ensureUnlocked(t("gate.reasonSecret")))) return;
   const value = await revealCredential("totp", node.id);
   if (value === null || value === "") return;
   revealedSecrets.value[node.id] = value;
@@ -248,6 +257,9 @@ function clearConfig() {
     <div class="config-section">
       <div class="card-header">
         <h2>{{ t('config.nodeConfiguration') }}</h2>
+        <!-- The door sits with the values it guards, so its state is where the
+             reveal buttons are rather than in a settings page nobody opens. -->
+        <CredentialLock />
         <div class="card-header-decoration"></div>
         <button @click="openInviteDialog()" class="import-invite-btn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

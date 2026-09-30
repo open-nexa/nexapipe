@@ -23,6 +23,7 @@ import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
 import { initProxyState, onAppFocused } from './stores/proxy';
+import { initGate, refreshGate } from './stores/gate';
 import { initConfigStore } from './stores/config';
 
 import './styles/tokens.css';
@@ -49,12 +50,21 @@ async function bootstrap(): Promise<void> {
   app.use(router);
   app.mount('#app');
 
+  // The door is read before the first paint too, so a page cannot draw an open
+  // lock and then shut it.
+  void initGate();
+
   void initProxyState();
 
   // The status poll keeps running in the background, but a machine that was just asleep has been
   // showing the status it had before it slept — read immediately instead of waiting the interval.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') onAppFocused();
+    if (document.visibilityState !== 'visible') return;
+    onAppFocused();
+    // The one moment worth asking the machine again whether it can still confirm
+    // anybody: a password removed or a fingerprint deleted while the app was in
+    // the background must not leave a window open nobody can answer for.
+    void refreshGate();
   });
 }
 

@@ -14,6 +14,7 @@
  */
 import AppDialog from '../../components/base/AppDialog.vue';
 import ContextMenu from '../../components/base/ContextMenu.vue';
+import CredentialPasswordDialog from '../../components/CredentialPasswordDialog.vue';
 import ToastHost from '../../components/base/ToastHost.vue';
 import { useConfirmState } from '../../composables/useConfirm';
 
@@ -31,9 +32,13 @@ const { request, settle } = useConfirmState();
     :confirm-text="request?.confirmText"
     :cancel-text="request?.cancelText"
     :detail="request?.detail"
+    :hide-cancel="request?.hideCancel ?? false"
     @confirm="settle(true)"
     @cancel="settle(false)"
   />
+
+  <!-- Only ever opens on a platform with no prompt of its own to borrow. -->
+  <CredentialPasswordDialog />
 
   <ContextMenu />
 

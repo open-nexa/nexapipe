@@ -49,6 +49,10 @@ export const ERROR_CODES = [
   'service.dns_addr_outside_tun',
   // credential store
   'credentials.store_failed',
+  // credential door
+  'credentials.locked',
+  'credentials.gate_unavailable',
+  'credentials.gate_failed',
   // invite
   'invite.parse_failed',
   // logs

@@ -17,6 +17,21 @@ not part of the tree). Not yet released, so no version numbers have moved.
 
 ### Added
 
+- **A door in front of the credentials the desktop app holds.** Showing a TOTP
+  secret, a node's connection string or this endpoint's Node ID now asks the
+  operating system to confirm the user first — Touch ID or the account
+  password on macOS, Windows Hello or the account password on Windows, PAM on
+  Linux — and stays open for two minutes afterwards. Sealing the store at rest
+  and masking what crosses into the UI were answers to "is this value on the
+  screen"; this is the other half, and the one neither of them could answer:
+  *who* is asking. There is deliberately no app password, because a credential
+  of its own would be one more thing to forget, reset and attack — what gates
+  the surfaces is what gates the machine. A machine with nothing to confirm
+  anybody with refuses rather than handing the value over, which is the one
+  outcome this exists to prevent. The proxy is unaffected: it still starts and
+  reopens its endpoints after a reboot with nobody at the keyboard, because
+  the window is two minutes of memory that never leaves this process and is
+  never handed to the service.
 - `least_conn` as a third load-balancing strategy, alongside `round_robin` and
   `random`: pick the healthy backend with the fewest requests outstanding to it,
   under a lease released when the flow finishes. Ties rotate rather than taking

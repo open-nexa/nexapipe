@@ -193,6 +193,23 @@ export interface InviteAccepted {
 }
 
 /**
+ * The credential door, as a surface sees it. Mirrors `gate::Status` in `src-tauri/src/gate.rs`.
+ *
+ * `msRemaining` is what lets the UI run its own countdown: the window is a duration rather than a
+ * flag, so the page that drew it has to be the one that watches it run out.
+ */
+export interface GateStatus {
+  /** Whether credentials may be shown right now. */
+  unlocked: boolean;
+  /** Milliseconds left in the window; zero when it is shut. */
+  msRemaining: number;
+  /** Whether this machine can confirm the user at all. */
+  canAuthenticate: boolean;
+  /** Whether the UI has to collect a password before it can ask. */
+  needsPassword: boolean;
+}
+
+/**
  * A failure crossing the Rust/frontend boundary, as produced by `AppError` in
  * `src-tauri/src/error.rs`. `code` is stable and is looked up as `error.<code>` in the locale
  * files; `detail` is a raw English diagnostic meant for the log, never the headline message.
