@@ -21,7 +21,7 @@ The app is deliberately **not** a full-tunnel VPN:
       │  DNS query for a proxied domain
       ▼
  VpnService TUN            Builder: setMtu(1400), addRoute("10.0.1.0", 24),
-      │                    addDnsServer(<virtual DNS>)
+      │                    addRoute("fd00:10:0:1::", 64), addDnsServer(<virtual DNS>)
       ▼
  Rust: smoltcp userspace TCP/IP stack   (crates/nexapipe-client, feature tun-proxy)
       │  · DNS answers point the domain at the fake proxy IP

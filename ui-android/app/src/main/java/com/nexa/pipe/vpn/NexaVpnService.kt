@@ -84,6 +84,17 @@ class NexaVpnService : VpnService() {
     // tun_proxy.rs)
     private val virtualDNSIP = "10.0.1.2"
     private val tunInterfaceIP = "10.0.1.1"
+    // The IPv6 half of the same block: `::1` is the interface and the whole /64
+    // is routed into the TUN, so an AAAA answer inside it comes back to us the
+    // same way an A answer in 10.0.1.0/24 does. The pool Rust hands out of is
+    // ::16 … ::fffe (VIRTUAL_IPV6_FIRST/LAST in tun_proxy.rs).
+    //
+    // A ULA rather than a global address: fd00::/8 is never routed publicly, so
+    // an address that escapes the tunnel — a DNS answer, a log line — is a dead
+    // end. Only this /64 is claimed, so the device's IPv6 internet traffic keeps
+    // going to the physical network exactly as it does today.
+    private val tunInterfaceIPv6 = "fd00:10:0:1::1"
+    private val tunRouteIPv6 = "fd00:10:0:1::"
     // TUN interface MTU. Must match TUN_MTU in crates/nexapipe-client/src/tun_proxy.rs and
     // ui-desktop/src-tauri/src/proxy/tun_proxy.rs. 1400 keeps one inner IP packet inside a
     // single QUIC datagram (~1435 usable bytes after the short header + AEAD tag); at 1500
@@ -298,10 +309,18 @@ class NexaVpnService : VpnService() {
                 // Must match TUN_MTU in crates/nexapipe-client/src/tun_proxy.rs.
                 .setMtu(tunMtu)
                 .addAddress(tunInterfaceIP, 24)
-                // Route only the virtual IP range (10.0.1.0/24):
+                // The IPv6 half of the block. Without an address Android gives
+                // the TUN no IPv6 at all, and a route to a prefix the interface
+                // does not hold is refused, so both are needed for the AAAA
+                // answers Rust hands out to be reachable.
+                .addAddress(tunInterfaceIPv6, 64)
+                // Route only the virtual IP ranges:
                 // DNS queries (to 10.0.1.2:53) go through the TUN,
-                // TCP proxy traffic (to 10.0.1.3:80/443) goes through the TUN.
+                // TCP proxy traffic (to 10.0.1.3:80/443) goes through the TUN,
+                // and IPv6 traffic to fd00:10:0:1::/64 does too. Nothing else is
+                // claimed: the device's own IPv6 traffic is not our business.
                 .addRoute("10.0.1.0", 24)
+                .addRoute(tunRouteIPv6, 64)
                 .addDnsServer(virtualDNSIP)
                 // Exclude this app's own traffic so proxy connections use the
                 // physical network.
@@ -377,7 +396,11 @@ class NexaVpnService : VpnService() {
 
             tunProxyStarted = true
             isServiceActive = true
-            Log.d(TAG, "VPN + TUN proxy established successfully (routing 10.0.1.0/24)")
+            Log.d(
+                TAG,
+                "VPN + TUN proxy established successfully (routing 10.0.1.0/24 and " +
+                    "$tunRouteIPv6/64)"
+            )
             createNotificationChannel()
             startForeground(1, createNotification())
             true
