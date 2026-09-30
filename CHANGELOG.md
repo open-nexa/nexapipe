@@ -61,6 +61,16 @@ not part of the tree). Not yet released, so no version numbers have moved.
   Service, and an install that already had a file key keeps it — the same key
   moves into the keychain, because a fresh one would leave every credential in
   the store undecryptable.
+- The desktop app's `localStorage` payload no longer holds a node's connection
+  string. A ticket is a credential — it names an endpoint *and* carries how to
+  reach it — and it was written in the clear beside the rest of the config,
+  while the TOTP secret, the enrollment token and the relay bearer had already
+  moved into the encrypted store. Both spellings now live there too, a payload
+  left over from an older build is migrated into it on the way in, and a node
+  whose connection string is in neither is dropped — after the store has been
+  asked, which is the only moment that question has an answer. An older build
+  reading the new payload finds no connection string and drops the node, so
+  downgrading means re-importing the invite.
 
 ## [0.3.0] — 2026-09-29
 

@@ -1,11 +1,12 @@
 //! Encrypted at-rest storage for the credentials the UI used to keep in `localStorage`.
 //!
-//! A node's TOTP secret, its enrollment token and the relay bearer used to reach
-//! the server's relay are the most sensitive things this app holds, and they used
-//! to sit in a WebView `localStorage` blob: an unencrypted SQLite file inside the
-//! user's WebKit data directory, readable by anything the user runs and protected
-//! by nothing the OS knows about. The Android client keeps the same three values
-//! in the Keystore; this is the desktop equivalent.
+//! A node's TOTP secret, its enrollment token, the relay bearer used to reach
+//! the server's relay, and the connection string it reaches that server by are
+//! the most sensitive things this app holds, and they used to sit in a WebView
+//! `localStorage` blob: an unencrypted SQLite file inside the user's WebKit data
+//! directory, readable by anything the user runs and protected by nothing the OS
+//! knows about. The Android client keeps the same values in the Keystore; this is
+//! the desktop equivalent.
 //!
 //! # Shape
 //!
@@ -92,6 +93,14 @@ pub enum CredentialKind {
     EnrollmentToken,
     /// The bearer token a custom relay asks for. Not per-node: it is a global setting.
     RelayToken,
+    /// The ticket a node reaches its server by. An address-bearing invite string,
+    /// which is a credential and not configuration: it names an endpoint *and*
+    /// carries whatever the server put in it, so anyone holding it can connect.
+    Ticket,
+    /// The bare Node ID a node reaches its server by. Weaker than a ticket on its
+    /// own — it names a node without carrying a way to reach it — but it is still
+    /// what a node is, and it is what an invite of that kind hands out.
+    EndpointId,
 }
 
 impl CredentialKind {
@@ -100,6 +109,8 @@ impl CredentialKind {
             CredentialKind::TotpSecret => "totp",
             CredentialKind::EnrollmentToken => "enrollment",
             CredentialKind::RelayToken => "relay",
+            CredentialKind::Ticket => "ticket",
+            CredentialKind::EndpointId => "endpoint",
         }
     }
 }
@@ -822,6 +833,21 @@ mod tests {
         std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
 
         assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A connection string is a credential, so it is keyed per node like the
+    /// other two — a ticket written under one node's id and read under another's
+    /// is a ticket nobody can spend.
+    #[test]
+    fn a_connection_string_is_keyed_by_the_node_it_connects() {
+        assert_eq!(
+            super::secret_key(CredentialKind::Ticket, "node-1"),
+            "ticket:node-1"
+        );
+        assert_eq!(
+            super::secret_key(CredentialKind::EndpointId, "node-1"),
+            "endpoint:node-1"
+        );
     }
 
     #[test]

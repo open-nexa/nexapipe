@@ -828,6 +828,8 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
         "totp" => credentials::CredentialKind::TotpSecret,
         "enrollment" => credentials::CredentialKind::EnrollmentToken,
         "relay" => credentials::CredentialKind::RelayToken,
+        "ticket" => credentials::CredentialKind::Ticket,
+        "endpoint" => credentials::CredentialKind::EndpointId,
         other => {
             return Err(AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
