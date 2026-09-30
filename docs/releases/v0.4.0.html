@@ -181,6 +181,25 @@
   table.metrics td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
   table.metrics th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 
+  /* Downloads: one row per operating system, one column per architecture. */
+  .dl-wrap { overflow-x: auto; margin: 0 0 8px; }
+  table.dl { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 540px; }
+  table.dl th, table.dl td { text-align: left; padding: 10px 12px; border: 1px solid var(--border); vertical-align: top; }
+  table.dl thead th {
+    background: var(--panel); color: var(--muted);
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  table.dl tbody th { background: var(--panel); font-weight: 500; white-space: nowrap; }
+  table.dl a.pkg { display: block; color: var(--text); text-decoration: none; padding: 3px 0; }
+  table.dl a.pkg:hover .label { color: var(--accent); }
+  table.dl .label { font-weight: 500; }
+  table.dl .file {
+    display: block; font-family: var(--mono); font-size: 11.5px;
+    color: var(--muted); word-break: break-all;
+  }
+  table.dl td.hit { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--accent); }
+  table.dl td.hit .file { color: var(--text); }
+
   footer.site {
     margin-top: 56px;
     padding-top: 20px;
@@ -228,84 +247,122 @@
   <h2 id="downloads">Downloads</h2>
   <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
 
-  <h3 class="subhead">Desktop app &mdash; nexa</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-x86_64-setup.exe">
-      <span><span class="name">Windows installer</span><span class="file">nexa-0.4.0-windows-x86_64-setup.exe</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-aarch64-setup.exe">
-      <span><span class="name">Windows on ARM installer</span><span class="file">nexa-0.4.0-windows-aarch64-setup.exe</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-aarch64.dmg">
-      <span><span class="name">macOS &mdash; Apple silicon</span><span class="file">nexa-0.4.0-macos-aarch64.dmg</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-x86_64.dmg">
-      <span><span class="name">macOS &mdash; Intel</span><span class="file">nexa-0.4.0-macos-x86_64.dmg</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.deb">
-      <span><span class="name">Linux &mdash; Debian / Ubuntu (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.deb</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.deb">
-      <span><span class="name">Linux &mdash; Debian / Ubuntu (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.deb</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.rpm">
-      <span><span class="name">Linux &mdash; Fedora / RHEL (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.rpm</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.rpm">
-      <span><span class="name">Linux &mdash; Fedora / RHEL (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.rpm</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.AppImage">
-      <span><span class="name">Linux &mdash; AppImage (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.AppImage</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.AppImage">
-      <span><span class="name">Linux &mdash; AppImage (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.AppImage</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
-  <p class="note">Desktop bundles are signed with the Tauri updater key; the in-app updater reads
-    <code>latest.json</code> in the same release.</p>
-
-  <h3 class="subhead">Android &mdash; nexa</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-arm64.apk">
-      <span><span class="name">Android APK (arm64-v8a, signed)</span><span class="file">nexa-0.4.0-android-arm64.apk</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-x86_64.apk">
-      <span><span class="name">Android APK (x86_64, signed &mdash; emulators)</span><span class="file">nexa-0.4.0-android-x86_64.apk</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
+  <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-x86_64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.4.0-windows-x86_64-setup.exe</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-aarch64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.4.0-windows-aarch64-setup.exe</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-x86_64.dmg"><span class="label">Disk image &mdash; Intel</span><span class="file">nexa-0.4.0-macos-x86_64.dmg</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-aarch64.dmg"><span class="label">Disk image &mdash; Apple silicon</span><span class="file">nexa-0.4.0-macos-aarch64.dmg</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.4.0-linux-x86_64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.4.0-linux-x86_64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.4.0-linux-x86_64.AppImage</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.4.0-linux-aarch64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.4.0-linux-aarch64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.4.0-linux-aarch64.AppImage</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Android</th>
+          <td data-os="android" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-x86_64.apk"><span class="label">APK &mdash; emulators</span><span class="file">nexa-0.4.0-android-x86_64.apk</span></a>
+          </td>
+          <td data-os="android" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-arm64.apk"><span class="label">APK</span><span class="file">nexa-0.4.0-android-arm64.apk</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
   <p class="note">One APK per ABI: <code>arm64-v8a</code> for every phone, <code>x86_64</code> for the
-    emulator images a development machine can run. iOS is not a supported platform &mdash; see the
+    emulator images a development machine can run. Desktop bundles are signed with the Tauri updater
+    key; the in-app updater reads <code>latest.json</code> in the same release. iOS is not a supported
+    platform &mdash; see the
     <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">roadmap</a>.</p>
+  <p class="note">Checksums for every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
   <h3 class="subhead">Server &amp; client library &mdash; nexapipe</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz">
-      <span><span class="name">Linux x86_64 (glibc)</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz">
-      <span><span class="name">Linux arm64 (glibc)</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz">
-      <span><span class="name">Linux x86_64 (musl, static)</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz">
-      <span><span class="name">Linux arm64 (musl, static)</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-apple-darwin.tar.gz">
-      <span><span class="name">macOS &mdash; Apple silicon</span><span class="file">nexapipe-0.4.0-aarch64-apple-darwin.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-apple-darwin.tar.gz">
-      <span><span class="name">macOS &mdash; Intel</span><span class="file">nexapipe-0.4.0-x86_64-apple-darwin.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-pc-windows-msvc.zip">
-      <span><span class="name">Windows x86_64</span><span class="file">nexapipe-0.4.0-x86_64-pc-windows-msvc.zip</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-pc-windows-msvc.zip">
-      <span><span class="name">Windows ARM64</span><span class="file">nexapipe-0.4.0-aarch64-pc-windows-msvc.zip</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Linux (glibc)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux (musl, static)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Intel</span><span class="file">nexapipe-0.4.0-x86_64-apple-darwin.tar.gz</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Apple silicon</span><span class="file">nexapipe-0.4.0-aarch64-apple-darwin.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.4.0-x86_64-pc-windows-msvc.zip</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.4.0-aarch64-pc-windows-msvc.zip</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
   <p class="note">Each archive holds the <code>nexapipe</code> binary, the client <code>cdylib</code>
-    for embedding, <code>config.toml.2fa.example</code>, the README and the licence.</p>
+    for embedding, <code>config.toml.2fa.example</code>, the README and the licence. Checksums for
+    every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
   <h2>Install from a terminal</h2>
   <p class="hint">No package manager yet &mdash; these are the release assets, straight from the tag.</p>
@@ -576,11 +633,12 @@ response_secs = 30</pre>
       // so the primary button stays arm64 and the other APK is offered beside it.
       return {
         title: "Download for Android",
-        sub: "Signed APK, one per ABI.",
+        sub: "Signed APK, one per ABI. The one a phone wants is highlighted below.",
         links: [
           { href: BASE + "nexa-0.4.0-android-arm64.apk", label: "arm64-v8a (phones)" },
           { href: BASE + "nexa-0.4.0-android-x86_64.apk", label: "x86_64 (emulators)", secondary: true }
-        ]
+        ],
+        cells: [["android", "arm64"]]
       };
     }
     if (/iPhone|iPad|iPod/i.test(ua)) {
@@ -598,7 +656,8 @@ response_secs = 30</pre>
         links: [
           { href: BASE + (arm ? "nexa-0.4.0-windows-aarch64-setup.exe" : "nexa-0.4.0-windows-x86_64-setup.exe"), label: "Desktop app" },
           { href: BASE + (arm ? "nexapipe-0.4.0-aarch64-pc-windows-msvc.zip" : "nexapipe-0.4.0-x86_64-pc-windows-msvc.zip"), label: "Server archive", secondary: true }
-        ]
+        ],
+        cells: [["windows", arm ? "arm64" : "x86_64"]]
       };
     }
     if (/Macintosh|Mac OS X/i.test(ua)) {
@@ -612,7 +671,10 @@ response_secs = 30</pre>
         links: [
           { href: BASE + "nexa-0.4.0-macos-aarch64.dmg", label: "Apple silicon" },
           { href: BASE + "nexa-0.4.0-macos-x86_64.dmg", label: "Intel", secondary: true }
-        ]
+        ],
+        // Both chips are offered, so both columns light up: the browser will
+        // not say which one this Mac is.
+        cells: [["macos", "x86_64"], ["macos", "arm64"]]
       };
     }
     if (/Linux/i.test(ua)) {
@@ -625,7 +687,8 @@ response_secs = 30</pre>
         links: [
           { href: BASE + (arm ? "nexa-0.4.0-linux-aarch64.deb" : "nexa-0.4.0-linux-x86_64.deb"), label: "Desktop app" },
           { href: BASE + (arm ? "nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz" : "nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz"), label: "Server archive", secondary: true }
-        ]
+        ],
+        cells: [["linux", arm ? "arm64" : "x86_64"]]
       };
     }
     return {
@@ -652,6 +715,12 @@ response_secs = 30</pre>
     a.textContent = "See all downloads";
     buttons.appendChild(a);
   }
+
+  // Mark the cell the guess landed on, in the app table and in the server one.
+  (choice.cells || []).forEach(function (cell) {
+    var td = document.querySelector('table.dl td[data-os="' + cell[0] + '"][data-arch="' + cell[1] + '"]');
+    if (td) { td.classList.add("hit"); }
+  });
 
   document.querySelectorAll(".copy").forEach(function (button) {
     button.addEventListener("click", function () {
