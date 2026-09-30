@@ -13,10 +13,11 @@
 //! completion handler runs on the threadpool rather than on the thread that is
 //! waiting for it.
 
+use std::mem::MaybeUninit;
 use std::sync::mpsc;
 
 use windows::core::RuntimeType;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
 };
@@ -25,8 +26,12 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 // to sit before this version of the bindings moved them: `LogonUserW` is
 // directly under `Win32::Security`, and it writes the token through an out
 // parameter rather than returning it.
-use windows::Win32::Security::{LogonUserW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT};
+use windows::Win32::Security::{
+    GetTokenInformation, LookupAccountSidW, LogonUserW, TokenUser, LOGON32_LOGON_INTERACTIVE,
+    LOGON32_PROVIDER_DEFAULT, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_future::{AsyncOperationCompletedHandler, IAsyncOperation};
 
 use super::{Capability, OsGate, Outcome};
@@ -87,6 +92,10 @@ impl Hello {
 
     /// Checks the password the UI collected against the account it belongs to.
     ///
+    /// That account is the one this process is running as, read from its token
+    /// rather than from the environment — see [`current_account`]. Authenticating
+    /// some other account would open a door that was meant to open for one.
+    ///
     /// An interactive logon rather than a network one because that is the check
     /// the lock screen makes; no token is kept, so nothing is held open by it.
     fn password(password: Option<&str>) -> Outcome {
@@ -94,13 +103,10 @@ impl Hello {
             return Outcome::Failed("no password was supplied".to_string());
         };
 
-        let user = match std::env::var("USERNAME") {
-            Ok(user) if !user.is_empty() => user,
-            _ => return Outcome::Failed("the account to authenticate is unknown".to_string()),
+        let (user, domain) = match current_account() {
+            Some(account) => account,
+            None => return Outcome::Failed("the account to authenticate is unknown".to_string()),
         };
-        // A domain machine authenticates against the domain, a standalone one
-        // against itself; `.` is the local database when nothing else is known.
-        let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".to_string());
 
         let user = HSTRING::from(user);
         let domain = HSTRING::from(domain);
@@ -138,6 +144,123 @@ impl Hello {
             }
         }
     }
+}
+
+/// A token handle that closes itself.
+///
+/// The token is opened to read one answer out of it, and an early return is a
+/// normal outcome down here. A handle left open until the process exits is a
+/// handle held for nothing, which is why closing is tied to the scope rather
+/// than to the paths that happen to reach the end.
+struct TokenHandle(HANDLE);
+
+impl Drop for TokenHandle {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            tracing::debug!("a token handle could not be closed: {error}");
+        }
+    }
+}
+
+/// The account this process is running as, and the authority it belongs to.
+///
+/// Read out of the process token rather than from the environment. `USERNAME`
+/// and `USERDOMAIN` are whatever whoever started the app said they were, so a
+/// process launched with `USERNAME=somebody-else` asked Windows to authenticate
+/// an account it is not running as — and a password that was not the user's
+/// opened the door. The token is the process's own answer to who it is, and it
+/// cannot be handed in from outside, which is the same reason the Linux gate
+/// reads the effective uid.
+///
+/// `None` when any part of it cannot be read. The caller makes that a failure
+/// rather than something weaker.
+fn current_account() -> Option<(String, String)> {
+    // SAFETY: `GetCurrentProcess` hands back a pseudo-handle that is not to be
+    // closed, and the token opened from it is — which `TokenHandle` does.
+    // `TOKEN_USER` is fixed-size, so the buffer asked for is exactly its own.
+    unsafe {
+        let mut handle = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle).ok()?;
+        let token = TokenHandle(handle);
+
+        let mut user = MaybeUninit::<TOKEN_USER>::uninit();
+        let mut needed = 0u32;
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(user.as_mut_ptr().cast()),
+            std::mem::size_of::<TOKEN_USER>() as u32,
+            &mut needed,
+        )
+        .ok()?;
+        let sid = user.assume_init().User.Sid;
+
+        // Twice, because the first call reports how long the two names are:
+        // that is what the insufficient-buffer answer means here, not a failure
+        // to look the SID up.
+        let mut name_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut sid_use = SID_NAME_USE(0);
+        if LookupAccountSidW(
+            None,
+            sid,
+            None,
+            &mut name_len,
+            None,
+            &mut domain_len,
+            &mut sid_use,
+        )
+        .is_ok()
+        {
+            return None;
+        }
+        if name_len == 0 || domain_len == 0 {
+            return None;
+        }
+
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len as usize];
+        LookupAccountSidW(
+            None,
+            sid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut sid_use,
+        )
+        .ok()?;
+
+        let name = wide_to_string(&name);
+        if name.is_empty() {
+            return None;
+        }
+        // A standalone machine names itself as the authority, and `LogonUserW`
+        // accepts that; `.`, the guess made here before, is the local database
+        // and is the wrong one for a local account on a machine that knows its
+        // own name.
+        let domain = wide_to_string(&domain);
+        let domain = if domain.is_empty() {
+            ".".to_string()
+        } else {
+            domain
+        };
+
+        Some((name, domain))
+    }
+}
+
+/// Reads a NUL-terminated wide string out of a buffer Windows filled.
+///
+/// Cut at the terminator rather than at the reported length: the two disagree
+/// about whether the terminator is counted, and stopping at the first NUL is
+/// right either way.
+fn wide_to_string(buffer: &[u16]) -> String {
+    let end = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 impl OsGate for Hello {

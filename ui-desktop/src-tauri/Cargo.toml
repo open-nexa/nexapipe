@@ -100,6 +100,9 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Com",
+    # `OpenProcessToken` / `GetCurrentProcess`, which is how the account to
+    # authenticate is read off the process token instead of the environment.
+    "Win32_System_Threading",
 ] }
 # Hello is a WinRT API, so its answers arrive asynchronously; this is how one is
 # waited out. The version pair `windows` 0.62 generates its bindings against.
