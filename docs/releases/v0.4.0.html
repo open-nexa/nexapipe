@@ -181,6 +181,25 @@
   table.metrics td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
   table.metrics th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 
+  /* Downloads: one row per operating system, one column per architecture. */
+  .dl-wrap { overflow-x: auto; margin: 0 0 8px; }
+  table.dl { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 540px; }
+  table.dl th, table.dl td { text-align: left; padding: 10px 12px; border: 1px solid var(--border); vertical-align: top; }
+  table.dl thead th {
+    background: var(--panel); color: var(--muted);
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  table.dl tbody th { background: var(--panel); font-weight: 500; white-space: nowrap; }
+  table.dl a.pkg { display: block; color: var(--text); text-decoration: none; padding: 3px 0; }
+  table.dl a.pkg:hover .label { color: var(--accent); }
+  table.dl .label { font-weight: 500; }
+  table.dl .file {
+    display: block; font-family: var(--mono); font-size: 11.5px;
+    color: var(--muted); word-break: break-all;
+  }
+  table.dl td.hit { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--accent); }
+  table.dl td.hit .file { color: var(--text); }
+
   footer.site {
     margin-top: 56px;
     padding-top: 20px;
@@ -228,84 +247,122 @@
   <h2 id="downloads">Downloads</h2>
   <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
 
-  <h3 class="subhead">Desktop app &mdash; nexa</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-x86_64-setup.exe">
-      <span><span class="name">Windows installer</span><span class="file">nexa-0.4.0-windows-x86_64-setup.exe</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-aarch64-setup.exe">
-      <span><span class="name">Windows on ARM installer</span><span class="file">nexa-0.4.0-windows-aarch64-setup.exe</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-aarch64.dmg">
-      <span><span class="name">macOS &mdash; Apple silicon</span><span class="file">nexa-0.4.0-macos-aarch64.dmg</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-x86_64.dmg">
-      <span><span class="name">macOS &mdash; Intel</span><span class="file">nexa-0.4.0-macos-x86_64.dmg</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.deb">
-      <span><span class="name">Linux &mdash; Debian / Ubuntu (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.deb</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.deb">
-      <span><span class="name">Linux &mdash; Debian / Ubuntu (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.deb</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.rpm">
-      <span><span class="name">Linux &mdash; Fedora / RHEL (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.rpm</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.rpm">
-      <span><span class="name">Linux &mdash; Fedora / RHEL (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.rpm</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.AppImage">
-      <span><span class="name">Linux &mdash; AppImage (x86_64)</span><span class="file">nexa-0.4.0-linux-x86_64.AppImage</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.AppImage">
-      <span><span class="name">Linux &mdash; AppImage (arm64)</span><span class="file">nexa-0.4.0-linux-aarch64.AppImage</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
-  <p class="note">Desktop bundles are signed with the Tauri updater key; the in-app updater reads
-    <code>latest.json</code> in the same release.</p>
-
-  <h3 class="subhead">Android &mdash; nexa</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-arm64.apk">
-      <span><span class="name">Android APK (arm64-v8a, signed)</span><span class="file">nexa-0.4.0-android-arm64.apk</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-x86_64.apk">
-      <span><span class="name">Android APK (x86_64, signed &mdash; emulators)</span><span class="file">nexa-0.4.0-android-x86_64.apk</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
+  <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-x86_64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.4.0-windows-x86_64-setup.exe</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-windows-aarch64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.4.0-windows-aarch64-setup.exe</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-x86_64.dmg"><span class="label">Disk image &mdash; Intel</span><span class="file">nexa-0.4.0-macos-x86_64.dmg</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-macos-aarch64.dmg"><span class="label">Disk image &mdash; Apple silicon</span><span class="file">nexa-0.4.0-macos-aarch64.dmg</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.4.0-linux-x86_64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.4.0-linux-x86_64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-x86_64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.4.0-linux-x86_64.AppImage</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.4.0-linux-aarch64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.4.0-linux-aarch64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-linux-aarch64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.4.0-linux-aarch64.AppImage</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Android</th>
+          <td data-os="android" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-x86_64.apk"><span class="label">APK &mdash; emulators</span><span class="file">nexa-0.4.0-android-x86_64.apk</span></a>
+          </td>
+          <td data-os="android" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-arm64.apk"><span class="label">APK</span><span class="file">nexa-0.4.0-android-arm64.apk</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
   <p class="note">One APK per ABI: <code>arm64-v8a</code> for every phone, <code>x86_64</code> for the
-    emulator images a development machine can run. iOS is not a supported platform &mdash; see the
+    emulator images a development machine can run. Desktop bundles are signed with the Tauri updater
+    key; the in-app updater reads <code>latest.json</code> in the same release. iOS is not a supported
+    platform &mdash; see the
     <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">roadmap</a>.</p>
+  <p class="note">Checksums for every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
   <h3 class="subhead">Server &amp; client library &mdash; nexapipe</h3>
-  <ul class="rows">
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz">
-      <span><span class="name">Linux x86_64 (glibc)</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz">
-      <span><span class="name">Linux arm64 (glibc)</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz">
-      <span><span class="name">Linux x86_64 (musl, static)</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz">
-      <span><span class="name">Linux arm64 (musl, static)</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-apple-darwin.tar.gz">
-      <span><span class="name">macOS &mdash; Apple silicon</span><span class="file">nexapipe-0.4.0-aarch64-apple-darwin.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-apple-darwin.tar.gz">
-      <span><span class="name">macOS &mdash; Intel</span><span class="file">nexapipe-0.4.0-x86_64-apple-darwin.tar.gz</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-pc-windows-msvc.zip">
-      <span><span class="name">Windows x86_64</span><span class="file">nexapipe-0.4.0-x86_64-pc-windows-msvc.zip</span></span>
-      <span class="get">Download</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-pc-windows-msvc.zip">
-      <span><span class="name">Windows ARM64</span><span class="file">nexapipe-0.4.0-aarch64-pc-windows-msvc.zip</span></span>
-      <span class="get">Download</span></a></li>
-  </ul>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Linux (glibc)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux (musl, static)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Intel</span><span class="file">nexapipe-0.4.0-x86_64-apple-darwin.tar.gz</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Apple silicon</span><span class="file">nexapipe-0.4.0-aarch64-apple-darwin.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-x86_64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.4.0-x86_64-pc-windows-msvc.zip</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexapipe-0.4.0-aarch64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.4.0-aarch64-pc-windows-msvc.zip</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
   <p class="note">Each archive holds the <code>nexapipe</code> binary, the client <code>cdylib</code>
-    for embedding, <code>config.toml.2fa.example</code>, the README and the licence.</p>
+    for embedding, <code>config.toml.2fa.example</code>, the README and the licence. Checksums for
+    every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
   <h2>Install from a terminal</h2>
   <p class="hint">No package manager yet &mdash; these are the release assets, straight from the tag.</p>
@@ -411,6 +468,66 @@ response_secs = 30</pre>
       undecryptable.</li>
   </ul>
 
+  <h3 class="subhead">Android: it asks before taking another app's VPN</h3>
+  <ul class="changelog">
+    <li>Android allows one VPN slot per user, and <code>establish()</code> revokes whoever holds it
+      without asking anybody. Nexa used to look only at the <em>default</em> network, so a per-app or
+      split-tunnel VPN was invisible and was dropped silently.</li>
+    <li>Every VPN Android reports is now detected, and the first connection asks: take over, or
+      cancel. Cancel costs nothing &mdash; nothing has been started yet.</li>
+    <li>"Remember my choice" is optional and can be taken back from the settings, because a
+      remembered cancel must not become a setting you cannot find again.</li>
+    <li>An always-on VPN is refused outright, and says why: Android restores it immediately, and it
+      may be a work-profile VPN you are not allowed to break.</li>
+    <li>Taking the slot is never automatic: a rebuild after a network switch no longer revokes
+      another app's VPN by the way.</li>
+  </ul>
+
+  <h3 class="subhead">The tunnel carries IPv6</h3>
+  <ul class="changelog">
+    <li>A proxied domain answered an AAAA query with nothing, so every resolver that prefers IPv6
+      &mdash; which is most of them &mdash; had to fall back to A before it could reach anything.
+      Both families are answered now, each from a pool of its own.</li>
+    <li>The addresses come from a ULA block the VPN routes into the TUN for itself
+      (<code>fd00:10:0:1::/64</code> on Android, <code>fd00:198:18::/64</code> on the desktop), so
+      one that escapes the tunnel is a dead end rather than a real host. Only that /64 is claimed:
+      everything else the device sends over IPv6 still goes to the physical network.</li>
+    <li>On the desktop the address is configured per platform and may be refused &mdash; a service
+      account, an image with IPv6 turned off. When it is, AAAA is answered with the empty reply that
+      sends the resolver back to A, not with an address nothing routes, and the log says which
+      happened.</li>
+    <li>The server can listen on IPv6 too: <code>[iroh] bind_ipv6</code> adds
+      <code>[::]</code> on the configured <code>bind_port</code>. It adds a socket rather than
+      replacing one, so nothing that reaches the server over IPv4 loses its route.</li>
+  </ul>
+
+  <h3 class="subhead">Android: an APK for the emulator</h3>
+  <ul class="changelog">
+    <li>The APK was <code>arm64-v8a</code> only, which left an emulator &mdash; the x86_64 images
+      that run acceptably on a development machine &mdash; with nothing to install. There are now
+      two APKs, one per ABI.</li>
+    <li>One per ABI rather than one carrying both: a fat APK would make every phone download the
+      x86_64 library to get the arm64 one. Each carries its own version code, because two artifacts
+      of one version cannot both claim the same one.</li>
+  </ul>
+
+  <h3 class="subhead">The backends are asked whether they still answer</h3>
+  <ul class="changelog">
+    <li>Every 30 seconds each backend is probed in parallel and the result recorded, where before a
+      group dialled once at startup and never again &mdash; a backend that stopped answering was
+      discovered by the request that needed it, which on a phone is an app that has already timed
+      out.</li>
+    <li>The probe is also the reconnect: the pool drops a connection idle for a minute, so a round
+      keeps one warm to a backend nobody has talked to.</li>
+  </ul>
+  <div class="warn">
+    <strong>A dead backend is still handed out.</strong>
+    This release only notices them: the balancer picks by index into a list it cannot change, so
+    taking one out needs the group to become mutable &mdash; a change to every holder of it. That
+    half is left for the next release, and the one to watch for in the meantime is a request served
+    by a backend the log has already reported as silent.
+  </div>
+
   <h2>Changelog</h2>
 
   <h3 class="subhead">Added</h3>
@@ -421,6 +538,14 @@ response_secs = 30</pre>
       and <code>random</code>.</li>
     <li><code>[timeouts]</code>: <code>connect_secs</code> and <code>response_secs</code>, covering
       one step each of talking to a backend.</li>
+    <li>IPv6 inside the tunnel: AAAA is answered from a ULA block the VPN routes for itself, and a
+      packet is routed by the family it arrived on.</li>
+    <li>Server: <code>[iroh] bind_ipv6</code> binds <code>[::]</code> on the configured
+      <code>bind_port</code> as well as <code>0.0.0.0</code>.</li>
+    <li>Client: the backends are probed on a timer, and
+      <code>EndpointGroup::health_snapshot()</code> reports what each answered.</li>
+    <li>Android: a second ABI. One APK per ABI &mdash; <code>arm64-v8a</code> and
+      <code>x86_64</code> &mdash; each with its own version code.</li>
   </ul>
 
   <h3 class="subhead">Changed</h3>
@@ -446,6 +571,9 @@ response_secs = 30</pre>
     <li>Desktop: masks are computed in Rust rather than in the UI, so a full value no longer reaches
       the page that is drawing it shortened, and an invite's secret is filed by Rust instead of
       being handed to the frontend in full.</li>
+    <li>Android: another app's VPN is no longer disconnected without asking. The guard detects every
+      VPN Android reports rather than only the default network's, and the first connection asks
+      instead of refusing &mdash; or silently revoking.</li>
   </ul>
 
   <h2>Before upgrading</h2>
@@ -465,6 +593,19 @@ response_secs = 30</pre>
       there is no system prompt to borrow, the app asks for your login password itself.</li>
     <li>Desktop: bundles are signed, so an in-app update from 0.3.x verifies as usual through
       <code>latest.json</code>.</li>
+    <li>Android: the first connection asks if another app's VPN holds the slot. Cancel leaves that
+      VPN running and Nexa stopped; a remembered choice can be changed in the settings.</li>
+    <li>Traffic to a proxied domain now travels over IPv6 when the application resolves it to an
+      IPv6 address, which is what a resolver that prefers IPv6 will do. Nothing about the route
+      changes &mdash; the destination is still the name &mdash; but the packets crossing the TUN
+      are IPv6 ones, and a desktop TUN whose interface refused the IPv6 address stays on IPv4 and
+      says so in the log.</li>
+    <li>Server: <code>bind_ipv6</code> is off unless you set it, so an existing
+      <code>config.toml</code> binds exactly what it bound before.</li>
+    <li>Android: there are two APKs where there was one. Pick the one for the device &mdash;
+      <code>arm64-v8a</code> for a phone, <code>x86_64</code> for an emulator &mdash; and note
+      that the two carry different version codes, so a store that saw one does not treat the other
+      as the same build.</li>
   </ul>
 
   <footer class="site">
@@ -492,11 +633,12 @@ response_secs = 30</pre>
       // so the primary button stays arm64 and the other APK is offered beside it.
       return {
         title: "Download for Android",
-        sub: "Signed APK, one per ABI.",
+        sub: "Signed APK, one per ABI. The one a phone wants is highlighted below.",
         links: [
           { href: BASE + "nexa-0.4.0-android-arm64.apk", label: "arm64-v8a (phones)" },
           { href: BASE + "nexa-0.4.0-android-x86_64.apk", label: "x86_64 (emulators)", secondary: true }
-        ]
+        ],
+        cells: [["android", "arm64"]]
       };
     }
     if (/iPhone|iPad|iPod/i.test(ua)) {
@@ -514,7 +656,8 @@ response_secs = 30</pre>
         links: [
           { href: BASE + (arm ? "nexa-0.4.0-windows-aarch64-setup.exe" : "nexa-0.4.0-windows-x86_64-setup.exe"), label: "Desktop app" },
           { href: BASE + (arm ? "nexapipe-0.4.0-aarch64-pc-windows-msvc.zip" : "nexapipe-0.4.0-x86_64-pc-windows-msvc.zip"), label: "Server archive", secondary: true }
-        ]
+        ],
+        cells: [["windows", arm ? "arm64" : "x86_64"]]
       };
     }
     if (/Macintosh|Mac OS X/i.test(ua)) {
@@ -528,7 +671,10 @@ response_secs = 30</pre>
         links: [
           { href: BASE + "nexa-0.4.0-macos-aarch64.dmg", label: "Apple silicon" },
           { href: BASE + "nexa-0.4.0-macos-x86_64.dmg", label: "Intel", secondary: true }
-        ]
+        ],
+        // Both chips are offered, so both columns light up: the browser will
+        // not say which one this Mac is.
+        cells: [["macos", "x86_64"], ["macos", "arm64"]]
       };
     }
     if (/Linux/i.test(ua)) {
@@ -541,7 +687,8 @@ response_secs = 30</pre>
         links: [
           { href: BASE + (arm ? "nexa-0.4.0-linux-aarch64.deb" : "nexa-0.4.0-linux-x86_64.deb"), label: "Desktop app" },
           { href: BASE + (arm ? "nexapipe-0.4.0-aarch64-unknown-linux-musl.tar.gz" : "nexapipe-0.4.0-x86_64-unknown-linux-musl.tar.gz"), label: "Server archive", secondary: true }
-        ]
+        ],
+        cells: [["linux", arm ? "arm64" : "x86_64"]]
       };
     }
     return {
@@ -568,6 +715,12 @@ response_secs = 30</pre>
     a.textContent = "See all downloads";
     buttons.appendChild(a);
   }
+
+  // Mark the cell the guess landed on, in the app table and in the server one.
+  (choice.cells || []).forEach(function (cell) {
+    var td = document.querySelector('table.dl td[data-os="' + cell[0] + '"][data-arch="' + cell[1] + '"]');
+    if (td) { td.classList.add("hit"); }
+  });
 
   document.querySelectorAll(".copy").forEach(function (button) {
     button.addEventListener("click", function () {

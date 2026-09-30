@@ -425,7 +425,7 @@ equivalent is carried by Phase 1 below, and shipped in v0.4.0.
 | ID | Deliverable | Notes |
 |---|---|---|
 | R9 | **Client resilience** | Background reconnect, node health probing, automatic removal of dead nodes, and the results exposed through the R7 metrics |
-| R10 | **Transport parity** | IPv6 inside the TUN (virtual IPv6 addresses plus AAAA answers) and UDP in the desktop TUN |
+| R10 | **Transport parity** | IPv6 inside the TUN (virtual IPv6 addresses plus AAAA answers). The UDP half of this was already done — the old note claiming otherwise was wrong |
 | R11 | **Android ABI coverage** | Ship `x86_64` alongside `arm64-v8a`, or at least document why not |
 | R12 | **Backend handling** | Configurable connect/read/idle timeouts towards backends, `least_conn` for the pool, and an explicit failure when every backend is unhealthy instead of falling back to the first — see [4.1](#41-backend-handling-p2) |
 | R15 | **Client DNS cache semantics** | Make the cache answer only what it actually holds: key it on QCLASS as well as name and type, scope it to the resolvers that produced the answer, rewrite each record's TTL on every hit to the part that is left, and stop caching a zero TTL — see [4.8](#48-client-dns-resolution-p1) |
@@ -433,14 +433,23 @@ equivalent is carried by Phase 1 below, and shipped in v0.4.0.
 Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
 
-**Progress.** Two of the five shipped in v0.4.0: **R12** (backend handling —
-`[timeouts]`, `least_conn`, and a refusal when every backend of a multi-backend
-route is down) and **R15** (the client DNS cache). Three did not: **R9** client
-resilience, **R10** transport parity — whose UDP half turned out to be already
-done, leaving IPv6 in the TUN — and **R11** the second Android ABI. They stay
-in this phase rather than moving, because the phase is named for the release
-that began them and not for the one that will finish them; what is recorded here
-is that v0.4.0 shipped without them.
+**Progress.** Four of the five shipped in v0.4.0, one of them half:
+
+- **R12** backend handling — `[timeouts]`, `least_conn`, and a refusal when
+  every backend of a multi-backend route is down.
+- **R15** the client DNS cache.
+- **R10** transport parity: IPv6 inside the TUN, on Android and on the desktop,
+  plus `[iroh] bind_ipv6` on the server. The UDP half of this turned out to be
+  already done, so this was the IPv6 half alone.
+- **R11** the second Android ABI: one APK per ABI, `arm64-v8a` and `x86_64`.
+- **R9** client resilience, the first half: the backends are probed on a timer,
+  the probe doubles as the reconnect, and the results are exposed as
+  `EndpointGroup::health_snapshot()`. **A dead backend is still handed out** —
+  the balancer picks by index into a list it cannot change, so removing one
+  needs the group to become mutable, which is a change to every holder of it.
+  That is the half that did not ship, and the reason is structural rather than
+  a matter of time. The results are also **not** exposed through the R7 metrics:
+  those are the server's, and the client has no metrics module of its own.
 
 One more thing landed in v0.4.0 that is not one of the five: the desktop half of
 **R14**, which came here from Phase 0 (§4.7, C8 and C9). It is counted
@@ -449,9 +458,12 @@ separately because it is the one item this release finished from the phase
 
 **Done when:** Android and desktop both complete HTTP, TLS passthrough and UDP
 round trips against one server, over both IPv4 and IPv6 — the IPv6 half is R10
-and is **not yet started** — and no desktop surface renders a full credential
-without the operating system having authenticated the user first, which is the
-half of R14 that came here from Phase 0 and **shipped in v0.4.0**.
+and **shipped in v0.4.0**, though it has only been verified by unit tests and
+on macOS by hand, since CI has no routable IPv6 — and no desktop surface renders
+a full credential without the operating system having authenticated the user
+first, which is the half of R14 that came here from Phase 0 and **shipped in
+v0.4.0**. The one thing still open from this phase is the second half of R9
+above.
 
 ### Phase 2 — v1.0, "reachable without our client" (exploratory)
 
@@ -478,8 +490,9 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                               R13 edge (after validation) ──► v1.0
 ```
 
-Of that last row, R15 and R12 shipped in v0.4.0; R9, R10 and R11 did not. See
-the progress note under Phase 1.
+Of that row, R15, R12, R10 and R11 shipped in v0.4.0. R9 shipped its probing
+half; the half that removes a dead backend from rotation did not, and stays
+here for the next release. See the progress note under Phase 1.
 
 ---
 

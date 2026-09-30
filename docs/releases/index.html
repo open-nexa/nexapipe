@@ -78,6 +78,19 @@
   ul.rows .file { color: var(--muted); font-size: 13px; display: block; }
   ul.rows .get { color: var(--accent); font-size: 14px; font-weight: 600; white-space: nowrap; }
 
+  .tbl-wrap { overflow-x: auto; }
+  table.versions { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 520px; }
+  table.versions th, table.versions td {
+    text-align: left; padding: 10px 12px;
+    border: 1px solid var(--border); vertical-align: top;
+  }
+  table.versions thead th {
+    background: var(--panel); color: var(--muted);
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  table.versions tbody th { background: var(--panel); font-weight: 600; white-space: nowrap; }
+  table.versions td.date { color: var(--muted); white-space: nowrap; }
+
   footer.site {
     margin-top: 48px;
     padding-top: 20px;
@@ -115,17 +128,38 @@
   <h2>Versions</h2>
   <p class="hint">Newest first. 0.2.0 shipped on 28 September 2026 without a changelog, so its entry
     there is retrospective.</p>
-  <ul class="rows">
-    <li><a class="row" href="v0.4.0.html">
-      <span><span class="name">0.4.0</span><span class="file">30 September 2026 &middot; the desktop app asks the operating system before it shows a credential, and a route whose backends are all down refuses instead of dialling</span></span>
-      <span class="get">Release notes</span></a></li>
-    <li><a class="row" href="v0.3.0.html">
-      <span><span class="name">0.3.0</span><span class="file">29 September 2026 &middot; health, metrics and live instance state behind a loopback listener</span></span>
-      <span class="get">Release notes</span></a></li>
-    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/tag/v0.2.0">
-      <span><span class="name">0.2.0</span><span class="file">28 September 2026 &middot; hardening release; no page of its own, see the release on GitHub</span></span>
-      <span class="get">Release</span></a></li>
-  </ul>
+  <div class="tbl-wrap">
+    <table class="versions">
+      <thead>
+        <tr>
+          <th scope="col">Version</th>
+          <th scope="col">Released</th>
+          <th scope="col">What it was</th>
+          <th scope="col">Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">0.4.0</th>
+          <td class="date">30 September 2026</td>
+          <td>The desktop app asks the operating system before it shows a credential, and a route whose backends are all down refuses instead of dialling.</td>
+          <td><a href="v0.4.0.html">Release notes</a></td>
+        </tr>
+        <tr>
+          <th scope="row">0.3.0</th>
+          <td class="date">29 September 2026</td>
+          <td>Health, metrics and live instance state behind a loopback listener.</td>
+          <td><a href="v0.3.0.html">Release notes</a></td>
+        </tr>
+        <tr>
+          <th scope="row">0.2.0</th>
+          <td class="date">28 September 2026</td>
+          <td>Hardening release; no page of its own.</td>
+          <td><a href="https://github.com/open-nexa/nexapipe/releases/tag/v0.2.0">Release</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
 
   <footer class="site">
     NexaPipe is licensed under the terms in <code>LICENSE</code>. &middot;
