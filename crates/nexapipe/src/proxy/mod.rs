@@ -20,6 +20,7 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
+use iroh::endpoint::BindOpts;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use iroh_tickets::Ticket;
@@ -299,11 +300,36 @@ pub async fn run_proxy(
             }
         }
 
+        // IPv6 is opt-in because it is a second socket, not a change to the
+        // first: `bind_addr` adds one, so the IPv4 socket stays bound either way
+        // and a client with no IPv6 route keeps working. Without `bind_port`
+        // there is no port to keep the two families on, so the flag is ignored
+        // — and saying so beats letting an operator think IPv6 is on.
+        if iroh_cfg.bind_ipv6.unwrap_or(false) && iroh_cfg.bind_port.is_none() {
+            tracing::warn!(
+                "iroh.bind_ipv6 is set but iroh.bind_port is not: bind_ipv6 is ignored \
+                 without a fixed port; iroh keeps its default IPv4 and IPv6 bindings"
+            );
+        }
+
         if let Some(port) = iroh_cfg.bind_port {
             let addr = SocketAddr::from_str(&format!("0.0.0.0:{}", port))
                 .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;
             builder = builder.bind_addr(addr)?;
-            tracing::info!("Iroh bind port: {}", port);
+
+            if iroh_cfg.bind_ipv6.unwrap_or(false) {
+                // Not required: on a host with no IPv6 at all this bind fails,
+                // and a server that refuses to start because an optional socket
+                // was unavailable is worse than one that logs it. Everything
+                // dialling over IPv4 is unaffected.
+                let v6 = SocketAddr::from_str(&format!("[::]:{}", port))
+                    .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;
+                builder =
+                    builder.bind_addr_with_opts(v6, BindOpts::default().set_is_required(false))?;
+                tracing::info!("Iroh bind port: {} (IPv4 and IPv6)", port);
+            } else {
+                tracing::info!("Iroh bind port: {}", port);
+            }
         }
     }
 

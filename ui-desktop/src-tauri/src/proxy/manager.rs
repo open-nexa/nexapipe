@@ -437,6 +437,12 @@ impl ProxyManager {
         }
 
         let endpoint_group = Arc::new(endpoint_group);
+        // From here on the backends are asked whether they still answer, on a
+        // timer, instead of only when something tries to use them. Before this
+        // call the group is only dialled once (the gate below) and never again,
+        // so a backend that died after startup was discovered by the request
+        // that needed it.
+        endpoint_group.start_health_probe();
 
         tracing::info!("EndpointGroup initialized with {} nodes", nodes.len());
 

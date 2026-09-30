@@ -333,6 +333,7 @@ domains = ["app.example.com"]
 | --- | --- |
 | `secret_key` | 由 `--generate-secret` 生成的十六进制密钥；保持 Node ID 稳定。 |
 | `bind_port` | 固定 UDP 端口，而非临时端口。 |
+| `bind_ipv6` | 同时在该端口上绑定 `[::]`，使端点也能通过 IPv6 应答。IPv4 套接字保留 —— 这是**增加一个**，不是替换；且 IPv6 绑定允许失败，没有 IPv6 的主机仍能启动。未设置 `bind_port` 时此项无效。 |
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`。缺省即 `default`。 |
 | `relay_url` | `relay_mode = "custom"` 时使用的中继；只设置它而不设 `relay_mode` 等同于 `custom`。 |
 | `relay_auth_token` | 需要鉴权的 `custom` 中继所用的可选 bearer token。 |
@@ -746,7 +747,9 @@ L4 流是不透明的：访问日志记录的是字节数而不是请求行，�
 
 TUN 交给应用程序的是**每个域名一个虚拟地址**（Android 上从 `10.0.1.16+` 起，
 桌面端从 `10.0.0.2+` 起），所以目的地*就是*域名。全程不做任何嗅探，这正是 UDP 得以
-可行的原因。
+可行的原因。两个地址族都会应答（AAAA 取自 `fd00:10:0:1::16+`，一个 VPN 自己路由的
+ULA 段），因此通过 IPv6 解析出来的名字和通过 IPv4 解析的一样可路由 —— 唯一例外是
+桌面端 TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析器回落到 A。
 
 注意这隐含的路由模式：TUN 发往某个域名的流量以 L4 形式到达，所以该域名需要一条
 `tcp`（或 `udp`）路由 —— **即使是 80 端口上的明文 HTTP**，因为 TUN 交出的是 IP

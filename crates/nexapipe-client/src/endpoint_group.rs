@@ -6,6 +6,10 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(feature = "jni")]
 use crate::jni_log;
@@ -106,6 +110,101 @@ impl DomainPools {
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
     default_pools: Option<Arc<DomainPools>>,
+    /// What the background probe last found, per backend.
+    ///
+    /// Behind a lock of its own rather than inside the pools because it is not
+    /// connection state: a request that is handed a connection never reads it,
+    /// and the only writer is the probe task. `std::sync` and not `tokio`: the
+    /// critical section is a few map lookups, so there is nothing to yield on,
+    /// and `health_snapshot()` then works off a runtime as well as on one.
+    health: Mutex<HashMap<EndpointId, NodeHealth>>,
+    /// Set for good by [`Self::close_all`], and read by the probe before it
+    /// dials anything.
+    ///
+    /// Not a shutdown signal for the *task* — the task ends when the group is
+    /// dropped and its `Weak` stops upgrading — but for the work: `close_all()`
+    /// drops the connections while the group itself is still alive, and a probe
+    /// that then ran would dial them all again. That is the state a stopped
+    /// tunnel would be left in: idle, and quietly reconnecting.
+    probe_stopped: AtomicBool,
+}
+
+/// How often each backend is asked whether it still answers.
+///
+/// Under the pool's own idle timeout (60 s) on purpose. A pool that goes quiet
+/// has its connections dropped, so the probe is also what keeps one warm to a
+/// backend nobody has talked to for a minute; and it is what finds out a
+/// backend died half a minute after it happened instead of at the next request,
+/// which is the whole of what this buys.
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How far the first probe (and every following one) may be pushed back.
+///
+/// Every client of one server that started at the same moment would otherwise
+/// probe on the same second, which is a thundering herd for no reason — and
+/// without it the probe also runs in lockstep with the pool's 5 s cleanup.
+const PROBE_JITTER: Duration = Duration::from_secs(5);
+
+/// A persistently dead backend is reported once, then every this-many probes.
+///
+/// A backend that has been down for an hour has failed a hundred probes. Saying
+/// so a hundred times buries everything else in the log; saying it once hides
+/// the fact that it is still down.
+const PROBE_REMINDER_EVERY: u32 = 10;
+
+/// What the last probe of one backend found.
+#[derive(Debug, Clone)]
+pub struct NodeHealth {
+    /// The backend this describes.
+    pub node: EndpointId,
+    /// Whether it answered the last time it was asked.
+    pub reachable: bool,
+    /// How many probes in a row have failed. Zero since the last success.
+    pub consecutive_failures: u32,
+    /// When it last answered — `None` when it never has.
+    pub last_ok: Option<Instant>,
+    /// When it was last asked — `None` before the first probe.
+    pub last_probe: Option<Instant>,
+}
+
+impl NodeHealth {
+    /// How long ago it last answered, if it ever has.
+    ///
+    /// "It has been down for twenty minutes" is the question a UI actually asks;
+    /// a timestamp makes every caller do this subtraction and get the direction
+    /// wrong at least once.
+    pub fn down_for(&self) -> Option<Duration> {
+        self.last_ok.map(|ok| ok.elapsed())
+    }
+}
+
+/// Every backend's health at one moment, for a UI that polls.
+#[derive(Debug, Clone, Default)]
+pub struct HealthSnapshot {
+    pub nodes: Vec<NodeHealth>,
+}
+
+impl HealthSnapshot {
+    /// How many backends answered their last probe.
+    pub fn reachable(&self) -> usize {
+        self.nodes.iter().filter(|n| n.reachable).count()
+    }
+
+    /// Whether anything at all answered. False means the tunnel has nowhere to
+    /// send anything.
+    pub fn any_reachable(&self) -> bool {
+        self.reachable() > 0
+    }
+
+    /// The backends that did not answer, as a comma-separated list.
+    pub fn unreachable_ids(&self) -> String {
+        self.nodes
+            .iter()
+            .filter(|n| !n.reachable)
+            .map(|n| n.node.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Which configured backends answered a reachability probe.
@@ -250,6 +349,8 @@ impl EndpointGroup {
         Ok(Self {
             domains,
             default_pools,
+            health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         })
     }
 
@@ -356,6 +457,8 @@ impl EndpointGroup {
         Ok(Self {
             domains,
             default_pools,
+            health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         })
     }
 
@@ -367,6 +470,8 @@ impl EndpointGroup {
         Self {
             domains: HashMap::new(),
             default_pools,
+            health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         }
     }
 
@@ -678,6 +783,156 @@ impl EndpointGroup {
         report
     }
 
+    /// Starts the periodic health probe.
+    ///
+    /// One task per group, holding only a [`Weak`] reference, so it ends when
+    /// the group does — a stopped proxy is not kept alive by the thing that is
+    /// watching it. Nothing else stops it; a group that outlives the probe
+    /// simply stops being probed, which is the same state as before it started.
+    ///
+    /// Not started by the constructors: those return a bare `Self`, and the
+    /// probe needs the `Arc` the caller is about to wrap it in. Every long-lived
+    /// owner therefore has to call this once, right after building the group.
+    pub fn start_health_probe(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            // A full interval before the first round, not the jitter alone.
+            // Whoever starts the group probes it once at startup, and a round
+            // that landed 0–5 s in would dial the same backends while that one
+            // was still dialling them, so both would find the pool empty and
+            // each would open a connection the other did not know about.
+            let first = tokio::time::Instant::now()
+                + PROBE_INTERVAL
+                + Duration::from_millis(fastrand::u64(0..PROBE_JITTER.as_millis() as u64));
+            let mut interval = tokio::time::interval_at(first, PROBE_INTERVAL);
+            // A round that ran long (a backend timing out costs up to
+            // PRECONNECT_TIMEOUT) must not queue up a burst of make-up rounds.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                let Some(group) = weak.upgrade() else {
+                    break;
+                };
+                if group.probe_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                group.probe_round().await;
+                // Dropped here, at the end of the iteration: the strong
+                // reference must not survive into the sleep, or the group would
+                // never be dropped and this loop never ends.
+            }
+        });
+    }
+
+    /// Asks every backend once, in parallel, and records what each answered.
+    ///
+    /// In parallel because a dead backend costs the whole probe timeout, and
+    /// four of them would then take longer than the interval between rounds.
+    async fn probe_round(&self) {
+        if self.probe_stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut probing = tokio::task::JoinSet::new();
+        for (backend_id, pool) in self.unique_pools() {
+            probing.spawn(async move {
+                let answered =
+                    match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(_) => false,
+                    };
+                (backend_id, answered)
+            });
+        }
+        while let Some(result) = probing.join_next().await {
+            // Checked here as well as at the top: a round that is already
+            // dialling when the group closes has to stop dialling, and letting
+            // the set drop is what aborts the members still in flight.
+            if self.probe_stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok((backend_id, answered)) = result {
+                self.record_probe(backend_id, answered);
+            }
+        }
+    }
+
+    /// Folds one probe result into the group's health, logging the changes.
+    ///
+    /// The probe is the only writer, and it writes from one task, so the only
+    /// thing the lock protects is the snapshot a UI may be reading concurrently.
+    fn record_probe(&self, backend_id: EndpointId, answered: bool) {
+        let mut health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = health.entry(backend_id).or_insert(NodeHealth {
+            node: backend_id,
+            // Not "unknown": a backend that has not been probed has not
+            // answered, and the caller asking is about to be told so.
+            reachable: false,
+            consecutive_failures: 0,
+            last_ok: None,
+            last_probe: None,
+        });
+
+        let was_reachable = entry.reachable;
+        entry.last_probe = Some(Instant::now());
+
+        if answered {
+            entry.consecutive_failures = 0;
+            entry.last_ok = Some(Instant::now());
+            entry.reachable = true;
+            if !was_reachable {
+                jni_log!("[health] Node {} answers again", backend_id);
+                #[cfg(feature = "tracing")]
+                tracing::info!("backend {} answers again", backend_id);
+            }
+            return;
+        }
+
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.reachable = false;
+        // The first failure is news. So is every tenth one — a backend that has
+        // been down for an hour has failed a hundred probes, and a log line per
+        // probe would bury everything else.
+        if was_reachable || entry.consecutive_failures % PROBE_REMINDER_EVERY == 1 {
+            jni_log!(
+                "[health] Node {} did not answer ({} probes in a row)",
+                backend_id,
+                entry.consecutive_failures
+            );
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "backend {} did not answer ({} probes in a row)",
+                backend_id,
+                entry.consecutive_failures
+            );
+        }
+    }
+
+    /// Every backend's health as the last probe left it.
+    ///
+    /// Empty until the first probe has run, which is up to
+    /// [`PROBE_INTERVAL`] plus [`PROBE_JITTER`] after [`Self::start_health_probe`].
+    /// A caller that needs an answer before then wants
+    /// [`Self::preconnect_report`], which probes on the spot.
+    ///
+    /// Sorted by node ID so a UI polling it does not see the entries change
+    /// places between two polls.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let mut nodes: Vec<NodeHealth> = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        nodes.sort_by_key(|n| n.node.to_string());
+        HealthSnapshot { nodes }
+    }
+
     /// How traffic is currently reaching each backend: direct, or via a relay.
     ///
     /// One entry per *distinct backend*, because that is what a link describes — two domains
@@ -758,6 +1013,11 @@ impl EndpointGroup {
     }
 
     pub async fn close_all(&self) {
+        // Before the pools are cleared, not after: the probe reads this, and a
+        // round that started before this line must not go on to dial what is
+        // being closed underneath it.
+        self.probe_stopped.store(true, Ordering::SeqCst);
+
         for pools in self.domains.values() {
             for pool in &pools.pools {
                 pool.close_all().await;
@@ -1043,5 +1303,125 @@ mod tests {
         };
         assert!(!needs_2fa.any_reachable());
         assert!(needs_2fa.any_auth_required());
+    }
+
+    /// A group with two backends, bound to a local endpoint. Nothing is dialled
+    /// by building it, so the tests below decide what each "probe" found.
+    async fn group_with(backends: &[EndpointId]) -> EndpointGroup {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        EndpointGroup::new_with_nodes_and_endpoint(
+            backends
+                .iter()
+                .enumerate()
+                .map(|(i, id)| node(*id, &format!("backend{i}.example.com")))
+                .collect(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a bogus but well-formed node ID must still build a group")
+    }
+
+    /// The snapshot is empty — not "everything is up" — before the first probe:
+    /// a caller reading it must not conclude the tunnel is healthy because
+    /// nothing has been asked yet.
+    #[tokio::test]
+    async fn nothing_has_been_probed_yet_is_not_the_same_as_healthy() {
+        let backend = unused_backend_id();
+        let group = group_with(&[backend]).await;
+
+        let snapshot = group.health_snapshot();
+        assert!(snapshot.nodes.is_empty(), "{snapshot:?}");
+        assert!(!snapshot.any_reachable(), "{snapshot:?}");
+    }
+
+    #[tokio::test]
+    async fn one_down_backend_does_not_hide_the_one_that_answers() {
+        let up = unused_backend_id();
+        let down = unused_backend_id();
+        let group = group_with(&[up, down]).await;
+
+        group.record_probe(up, true);
+        group.record_probe(down, false);
+
+        let snapshot = group.health_snapshot();
+        assert_eq!(snapshot.nodes.len(), 2, "{snapshot:?}");
+        assert_eq!(snapshot.reachable(), 1, "{snapshot:?}");
+        assert!(snapshot.any_reachable(), "{snapshot:?}");
+        assert_eq!(snapshot.unreachable_ids(), down.to_string());
+
+        let up = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.reachable)
+            .expect("the answering backend");
+        assert_eq!(up.consecutive_failures, 0);
+        assert!(up.last_ok.is_some(), "it answered");
+        assert!(up.down_for().is_some());
+
+        let down = snapshot
+            .nodes
+            .iter()
+            .find(|n| !n.reachable)
+            .expect("the silent backend");
+        assert_eq!(down.consecutive_failures, 1);
+        assert!(down.last_ok.is_none(), "it never answered");
+        assert!(down.down_for().is_none());
+    }
+
+    /// What an operator is told: "down for twenty minutes", not "down".
+    #[tokio::test]
+    async fn a_backend_that_comes_back_resets_its_failure_count() {
+        let backend = unused_backend_id();
+        let group = group_with(&[backend]).await;
+
+        for _ in 0..3 {
+            group.record_probe(backend, false);
+        }
+        let snapshot = group.health_snapshot();
+        assert_eq!(snapshot.nodes[0].consecutive_failures, 3, "{snapshot:?}");
+        assert!(!snapshot.any_reachable());
+
+        group.record_probe(backend, true);
+
+        let snapshot = group.health_snapshot();
+        assert_eq!(snapshot.nodes[0].consecutive_failures, 0, "{snapshot:?}");
+        assert!(snapshot.nodes[0].reachable);
+        assert!(snapshot.nodes[0].down_for().is_some());
+        assert!(snapshot.any_reachable());
+    }
+
+    /// The snapshot is what a UI polls, and entries that change places between
+    /// two polls read as backends flapping.
+    #[tokio::test]
+    async fn the_snapshot_stays_in_one_order() {
+        let first = unused_backend_id();
+        let second = unused_backend_id();
+        let group = group_with(&[second, first]).await;
+        group.record_probe(first, true);
+        group.record_probe(second, false);
+
+        let ids: Vec<String> = group
+            .health_snapshot()
+            .nodes
+            .iter()
+            .map(|n| n.node.to_string())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "the entries are not in a stable order");
+        assert_eq!(
+            ids,
+            group
+                .health_snapshot()
+                .nodes
+                .iter()
+                .map(|n| n.node.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -370,6 +370,7 @@ startup — delete them and see [TLS](#tls).
 | --- | --- |
 | `secret_key` | Hex secret key from `--generate-secret`; keeps the Node ID stable. |
 | `bind_port` | Fixed UDP port instead of an ephemeral one. |
+| `bind_ipv6` | Also bind `[::]` on that port, so the endpoint answers over IPv6. The IPv4 socket stays — this adds one, it does not replace one — and the IPv6 bind is allowed to fail, so a host without IPv6 still starts. Ignored without `bind_port`. |
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`. Absent means `default`. |
 | `relay_url` | The relay to use with `relay_mode = "custom"`; setting it without a `relay_mode` means `custom`. |
 | `relay_auth_token` | Optional bearer token for a `custom` relay that requires one. |
@@ -821,7 +822,11 @@ once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under [QUIC tuning](#quic-tuning).
 
 The TUNs hand the application **one virtual address per domain** (`10.0.1.16+` on
 Android, `10.0.0.2+` on desktop), so the destination *is* the name. Nothing is
-sniffed, which is what makes UDP possible at all.
+sniffed, which is what makes UDP possible at all. Both families are answered
+(AAAA from `fd00:10:0:1::16+`, a ULA block the VPN routes for itself), so a name
+resolved over IPv6 is as routable as one resolved over IPv4 — except on a desktop
+TUN whose interface refused the IPv6 address, where AAAA is answered with nothing
+and the resolver falls back to A.
 
 Note the route mode this implies: traffic a TUN sends to a domain arrives as L4,
 so that domain needs a `tcp` (or `udp`) route — **even for plain HTTP on port

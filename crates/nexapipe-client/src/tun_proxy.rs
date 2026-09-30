@@ -94,6 +94,10 @@ use std::collections::HashMap;
 #[cfg(target_os = "android")]
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+// Only the Android half names an IPv6 literal: the constants it builds the TUN's
+// virtual block from are matched against the Kotlin side's.
+#[cfg(target_os = "android")]
+use std::net::Ipv6Addr;
 #[cfg(target_os = "android")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +122,29 @@ const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 /// The address every proxied domain used to resolve to. See the module docs.
 #[cfg(target_os = "android")]
 const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
+
+/// The virtual IPv6 block — must match the TUN config in the Kotlin-side
+/// NexaVpnService, which assigns `::1` to the interface and routes the whole
+/// /64 into the TUN.
+///
+/// A ULA (`fd00::/8`) rather than a global address: it is never routed on the
+/// public internet, so a leak of one of these addresses — a DNS answer that
+/// escapes the tunnel, a log line — is a dead end. `10.0.1.0/24` with a `fd00:`
+/// prefix in front of it, so the two families read as one block.
+#[cfg(target_os = "android")]
+const VIRTUAL_IPV6_NET: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0);
+/// First address handed out of [`VIRTUAL_IPV6_NET`]: `::10`, mirroring the
+/// IPv4 pool's `.16` — the sixteenth address, written in hexadecimal as IPv6
+/// notation has it.
+#[cfg(target_os = "android")]
+const VIRTUAL_IPV6_FIRST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0x10);
+/// Last address handed out: `::fffe`. The top of the /64 is left alone the same
+/// way `.255` is — the interface's own address is at the bottom, and a pool
+/// that could hand out the block's own solicited-node or anycast addresses is
+/// asking for confusion.
+#[cfg(target_os = "android")]
+const VIRTUAL_IPV6_LAST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0xfffe);
+
 /// The only port the DNS hijack answers on. A datagram to any other port is a flow.
 const DNS_PORT: u16 = 53;
 
@@ -387,6 +414,10 @@ impl TunProxy {
             fd_read,
             fd_write
         );
+        jni_log!(
+            "[tun-proxy] virtual blocks: 10.0.1.0/24 and {}/64",
+            VIRTUAL_IPV6_NET
+        );
 
         let stopped = Arc::new(AtomicBool::new(false));
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -399,7 +430,12 @@ impl TunProxy {
             TunStackConfig {
                 dns_ip: VIRTUAL_DNS_IP,
                 legacy_proxy_ip: Some(VIRTUAL_PROXY_IP),
-                ip_mapping: Arc::new(IpMapping::new()),
+                // IPv6 as well as IPv4: the Kotlin side routes
+                // `fd00:10:0:1::/64` into the TUN, so an AAAA answer inside it
+                // comes back to us the same way an A answer does.
+                ip_mapping: Arc::new(
+                    IpMapping::new().with_ipv6(VIRTUAL_IPV6_FIRST, VIRTUAL_IPV6_LAST),
+                ),
             },
             stopped.clone(),
             &mut tasks,
@@ -713,9 +749,21 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
             client_addr
         );
 
-        let IpAddr::V4(dest_ip) = dest_ip else {
-            jni_log!("[tun-proxy] TCP to {dest_ip} has no domain mapping, dropping");
-            continue;
+        // A per-domain address was handed out for A, for AAAA, or for both, and
+        // the packet says which one the application used. The legacy address
+        // and the mapping's IPv4 pool are the two things the v4 branch below
+        // still has to tell apart.
+        let dest_ip = match dest_ip {
+            IpAddr::V4(v4) => v4,
+            IpAddr::V6(v6) => {
+                let Some(domain) = ctx.ip_mapping.lookup_domain_v6(&v6) else {
+                    jni_log!("[tun-proxy] TCP to {v6}:{dest_port} has no domain mapping, dropping");
+                    continue;
+                };
+                let ctx = ctx.clone();
+                tokio::spawn(serve_tcp_flow(stream, ctx, domain, dest_port));
+                continue;
+            }
         };
 
         // Legacy address: applications that cached a DNS answer from before the
@@ -940,14 +988,12 @@ async fn run_udp_demux(
             continue;
         }
 
-        let IpAddr::V4(dst_ip) = dst_addr.ip() else {
-            jni_log!(
-                "[tun-proxy] UDP to {} has no domain mapping, dropping",
-                dst_addr
-            );
-            continue;
-        };
-        let Some(domain) = ctx.ip_mapping.lookup_domain(&dst_ip) else {
+        // Same split as the TCP acceptor: the destination's family says which
+        // pool to look the name up in.
+        let Some(domain) = (match dst_addr.ip() {
+            IpAddr::V4(dst_ip) => ctx.ip_mapping.lookup_domain(&dst_ip),
+            IpAddr::V6(dst_ip) => ctx.ip_mapping.lookup_domain_v6(&dst_ip),
+        }) else {
             jni_log!(
                 "[tun-proxy] UDP to {} has no domain mapping, dropping",
                 dst_addr
@@ -1240,23 +1286,43 @@ pub async fn handle_dns_query(
     let is_proxy = !is_iroh && should_proxy_domain(&domain, proxy_domains);
 
     if is_proxy {
-        // Only an A query **in the Internet class** gets an address. A rack of
-        // virtual IPv4 addresses cannot answer an AAAA query with the truth,
-        // and it cannot answer a question asked in another class either: what
-        // would be written back is an IN record, so handing one out for a CH or
-        // ANY question answers something that was not asked. Non-A and non-IN
-        // therefore both get an empty NOERROR and the application falls back to
-        // A — and, just as important, neither consumes an address for a name
+        // Only an A or an AAAA query **in the Internet class** gets an address,
+        // and each only from the pool of its own family: a rack of virtual IPv4
+        // addresses cannot answer an AAAA query with the truth, and it cannot
+        // answer a question asked in another class either — what would be
+        // written back is an IN record, so handing one out for a CH or ANY
+        // question answers something that was not asked. Anything else gets an
+        // empty NOERROR and the application falls back to the type it can use.
+        // Just as important, none of them consumes an address for a name
         // nothing may ever connect to.
-        if qtype != 1 || qclass != DNS_CLASS_IN {
+        if qclass != DNS_CLASS_IN || (qtype != DNS_TYPE_A && qtype != DNS_TYPE_AAAA) {
             return Some(build_empty_dns_response(query));
         }
-        let virtual_ip = ip_mapping.allocate(&domain);
+
+        let answer = match qtype {
+            DNS_TYPE_A => Some(IpAddr::V4(ip_mapping.allocate(&domain))),
+            DNS_TYPE_AAAA => {
+                // `None` when the TUN has no IPv6 block to route — the
+                // desktop's interface may have refused the address. An empty
+                // answer is then the honest one: the resolver falls back to A,
+                // whereas an address nothing routes is a connection that hangs.
+                let v6 = ip_mapping.allocate_v6(&domain);
+                if v6.is_none() {
+                    jni_log!("[tun-proxy] DNS: no IPv6 pool, answering AAAA with nothing");
+                }
+                v6.map(IpAddr::V6)
+            }
+            _ => None,
+        };
+        let Some(answer) = answer else {
+            return Some(build_empty_dns_response(query));
+        };
+
         // The name is deliberately left out: this runs for every name the
         // device resolves, so logging it turns logcat into a record of where
         // the user goes. What debugging needs is the decision, not the name.
-        jni_log!("[tun-proxy] DNS: proxying a query -> {}", virtual_ip);
-        Some(build_dns_response(query, virtual_ip, qtype))
+        jni_log!("[tun-proxy] DNS: proxying a query -> {}", answer);
+        Some(build_dns_response(query, answer, qtype))
     } else {
         // Forward to the real DNS.
         jni_log!("[tun-proxy] DNS: forwarding a query (qtype={})", qtype);
@@ -1268,9 +1334,13 @@ pub async fn handle_dns_query(
 /// declared unreadable. A real name needs one; more than that is a loop.
 const MAX_DNS_POINTER_JUMPS: usize = 4;
 
-/// The only QCLASS this proxy answers: everything it serves — a virtual IPv4
-/// address, or a record forwarded from a real resolver — belongs to it.
+/// The only QCLASS this proxy answers: everything it serves — a virtual address,
+/// or a record forwarded from a real resolver — belongs to it.
 const DNS_CLASS_IN: u16 = 1;
+
+/// The two QTYPEs this proxy answers itself: A and AAAA.
+const DNS_TYPE_A: u16 = 1;
+const DNS_TYPE_AAAA: u16 = 28;
 
 /// The `u16` at `pos`, or 0 when the packet is too short to hold one.
 fn read_u16(payload: &[u8], pos: usize) -> u16 {
@@ -1366,17 +1436,21 @@ fn parse_dns_query(payload: &[u8]) -> Option<(String, u16, u16)> {
     ))
 }
 
-/// Build a DNS response resolving the domain to the given IPv4 address.
+/// Build a DNS response resolving the queried name to `addr`.
 ///
-/// - qtype=1 (A): return an A record with 4 bytes of RDATA.
-/// - qtype=28 (AAAA) or other: return an empty answer (ANCOUNT=0) so the client falls back to an A query.
-fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
-    // Non-A query: return an empty answer (the virtual IP is IPv4, so it can't answer AAAA/MX, etc.).
-    if qtype != 1 {
-        return build_empty_dns_response(query);
-    }
+/// The record type follows the address: an IPv4 address answers an A query with
+/// 4 bytes of RDATA, an IPv6 address answers an AAAA query with 16. Anything
+/// else — an AAAA question answered from the IPv4 pool, an MX, a type this
+/// proxy has no address for — gets an empty answer (ANCOUNT=0) so the client
+/// falls back to a query it can use.
+fn build_dns_response(query: &[u8], addr: IpAddr, qtype: u16) -> Vec<u8> {
+    let (rtype, rdata): (u16, &[u8]) = match (addr, qtype) {
+        (IpAddr::V4(ip), DNS_TYPE_A) => (DNS_TYPE_A, &ip.octets()),
+        (IpAddr::V6(ip), DNS_TYPE_AAAA) => (DNS_TYPE_AAAA, &ip.octets()),
+        _ => return build_empty_dns_response(query),
+    };
 
-    let mut response = Vec::with_capacity(query.len() + 16);
+    let mut response = Vec::with_capacity(query.len() + rdata.len() + 16);
     response.extend_from_slice(query);
 
     // Set flags: QR=1, Opcode=0, AA=0, TC=0, RD=1(copied), RA=1
@@ -1390,9 +1464,8 @@ fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
     // Name: compression pointer 0xC00C → points to offset 12 (the Question section's domain name)
     response.push(0xC0);
     response.push(0x0C);
-    // TYPE: A = 1
-    response.push(0x00);
-    response.push(0x01);
+    // TYPE: A = 1, AAAA = 28
+    response.extend_from_slice(&rtype.to_be_bytes());
     // CLASS: IN = 1
     response.push(0x00);
     response.push(0x01);
@@ -1401,11 +1474,11 @@ fn build_dns_response(query: &[u8], ip: Ipv4Addr, qtype: u16) -> Vec<u8> {
     response.push(0x00);
     response.push(0x00);
     response.push(0x3C);
-    // RDLENGTH: 4 (IPv4)
-    response.push(0x00);
-    response.push(0x04);
-    // RDATA: the 4 bytes of the IP address.
-    response.extend_from_slice(&ip.octets());
+    // RDLENGTH: 4 for an A record, 16 for an AAAA one.
+    let rdlength = rdata.len() as u16;
+    response.extend_from_slice(&rdlength.to_be_bytes());
+    // RDATA: the address, in network order, which is what `octets()` already is.
+    response.extend_from_slice(rdata);
 
     response
 }
@@ -1804,9 +1877,10 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheKey, CachedAnswer, DNS_CLASS_IN, answer_matches_query, answer_ttl, answer_ttl_offsets,
-        cacheable_for, cached_answer, cached_answer_at, lock_cache, parse_dns_query, read_u32,
-        remember_answer, resolver_scope, set_answer_ttls,
+        CacheKey, CachedAnswer, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, IpMapping,
+        answer_matches_query, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
+        cached_answer_at, handle_dns_query, lock_cache, parse_dns_query, read_u32, remember_answer,
+        resolver_scope, set_answer_ttls,
     };
     use std::time::Duration;
 
@@ -2163,5 +2237,113 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7, 7]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // A / AAAA
+    // ------------------------------------------------------------------
+
+    /// The mapping the Android TUN runs with: an IPv4 pool and an IPv6 one.
+    fn dual_stack_mapping() -> IpMapping {
+        IpMapping::new().with_ipv6(
+            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x10),
+            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x20),
+        )
+    }
+
+    /// What `handle_dns_query` answered: the number of records and, for the one
+    /// it wrote, its type and its RDATA.
+    async fn answered(qtype: u16, mapping: &IpMapping) -> (u16, Option<(u16, Vec<u8>)>) {
+        let query = query(&wire_name(), qtype);
+        let response = handle_dns_query(
+            &query,
+            &["example.com".to_string()],
+            &[], // no upstream: a proxied name is never forwarded
+            mapping,
+        )
+        .await
+        .expect("a proxied query is answered");
+
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        if ancount == 0 {
+            return (0, None);
+        }
+        // Straight after the question: the name pointer, then TYPE, CLASS, TTL,
+        // RDLENGTH and the address itself.
+        let answer = query.len() + 2;
+        let rtype = u16::from_be_bytes([response[answer], response[answer + 1]]);
+        let rdlength = u16::from_be_bytes([response[answer + 8], response[answer + 9]]) as usize;
+        let rdata = response[answer + 10..answer + 10 + rdlength].to_vec();
+        (ancount, Some((rtype, rdata)))
+    }
+
+    #[tokio::test]
+    async fn an_a_query_is_answered_from_the_ipv4_pool() {
+        let mapping = dual_stack_mapping();
+        let (ancount, record) = answered(1, &mapping).await;
+        assert_eq!(ancount, 1);
+        let (rtype, rdata) = record.expect("one record");
+        assert_eq!(rtype, DNS_TYPE_A);
+        assert_eq!(rdata.len(), 4, "an A record carries four bytes");
+        assert_eq!(
+            mapping.lookup_domain(&std::net::Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3]
+            )),
+            Some("example.com".to_string()),
+            "the answer has to route: the stack looks the destination up here"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aaaa_query_is_answered_from_the_ipv6_pool() {
+        let mapping = dual_stack_mapping();
+        let (ancount, record) = answered(DNS_TYPE_AAAA, &mapping).await;
+        assert_eq!(ancount, 1);
+        let (rtype, rdata) = record.expect("one record");
+        assert_eq!(rtype, DNS_TYPE_AAAA);
+        assert_eq!(rdata.len(), 16, "an AAAA record carries sixteen bytes");
+
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&rdata);
+        let address = std::net::Ipv6Addr::from(octets);
+        assert_eq!(
+            mapping.lookup_domain_v6(&address),
+            Some("example.com".to_string()),
+            "the same reverse lookup the packet path uses"
+        );
+    }
+
+    /// The point of the empty answer: a resolver that is told "no address of
+    /// this type" falls back to A, while one that is handed an address nothing
+    /// routes hangs on a connection it cannot open.
+    #[tokio::test]
+    async fn an_aaaa_query_is_answered_with_nothing_without_an_ipv6_pool() {
+        // The desktop case: the interface refused the IPv6 address, so the TUN
+        // has no route for one.
+        let mapping = IpMapping::new();
+        assert_eq!(answered(DNS_TYPE_AAAA, &mapping).await, (0, None));
+    }
+
+    #[tokio::test]
+    async fn a_type_with_no_address_gets_the_same_empty_answer() {
+        let mapping = dual_stack_mapping();
+        // MX (15): the mapping has addresses, but none of that type.
+        assert_eq!(answered(15, &mapping).await, (0, None));
+    }
+
+    /// The two families answer independently: a name that resolved over IPv4
+    /// still gets its own IPv6 address, and neither allocation disturbs the
+    /// other's.
+    #[tokio::test]
+    async fn the_two_families_are_allocated_independently() {
+        let mapping = dual_stack_mapping();
+        let (_, a) = answered(1, &mapping).await;
+        let (_, aaaa) = answered(DNS_TYPE_AAAA, &mapping).await;
+        let (rtype_a, rdata_a) = a.expect("an A record");
+        let (rtype_aaaa, rdata_aaaa) = aaaa.expect("an AAAA record");
+        assert_eq!(rtype_a, DNS_TYPE_A);
+        assert_eq!(rtype_aaaa, DNS_TYPE_AAAA);
+        assert_ne!(rdata_a.len(), rdata_aaaa.len());
+        assert_eq!(mapping.len(), 2, "one mapping per family for one name");
     }
 }

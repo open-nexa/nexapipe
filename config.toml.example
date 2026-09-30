@@ -75,6 +75,12 @@ expose = false
 # Fixed UDP port; unset means an ephemeral one.
 bind_port = 0
 
+# Also bind [::] on that port, so the endpoint answers over IPv6 as well. The
+# IPv4 socket stays — this adds one, it does not replace one — and the bind is
+# allowed to fail, so a host with no IPv6 still starts (and logs it).
+# Ignored without bind_port: there would be no port to keep both families on.
+bind_ipv6 = false
+
 # Relay mode: pinned / default / disabled / custom. Unset means default.
 #   default  - every N0 relay, home relay chosen by latency; it can migrate
 #              between relays, which drops the connections routed through it
