@@ -61,6 +61,13 @@ For what comes next, and for why some things are deliberately not planned, see
   the asynchronous one is refused. A value that never arrived also stopped being
   reported as a clipboard failure, which sent the user looking at the wrong
   thing.
+- **macOS ran the window with a title bar of its own on top of the app's.** The
+  macOS build asked for native decorations without the title bar style that makes
+  them transparent, so the system's bar sat above the one the app draws — two
+  title bars, and two sets of close and minimize buttons, one at each end of the
+  window. The window now asks for the overlay style: the traffic lights stay
+  where macOS puts them, over the left of the app's own bar, and the app stops
+  drawing a second set.
 
 ## [0.4.0] — 2026-09-30
 

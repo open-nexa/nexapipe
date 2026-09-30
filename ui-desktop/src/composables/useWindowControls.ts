@@ -56,6 +56,17 @@ export function useWindowControls() {
    */
   const isFrameless = computed(() => !isLinux.value);
 
+  /**
+   * Whether the close / minimize / maximize buttons are ours to draw.
+   *
+   * Frameless, but not chrome-less: macOS runs with `decorations: true` and an
+   * `Overlay` title bar style, which leaves the native traffic lights floating
+   * over the left of our own bar. Drawing a second set of buttons on the right
+   * of it is what put two window controls — and, to the eye, two title bars —
+   * on the screen at once.
+   */
+  const needsWindowControls = computed(() => isFrameless.value && !isMacos.value);
+
   async function minimize(): Promise<void> {
     try {
       await currentWindow().minimize();
@@ -103,6 +114,7 @@ export function useWindowControls() {
     isWindows,
     isLinux,
     isFrameless,
+    needsWindowControls,
     minimize,
     toggleMaximize,
     close,
