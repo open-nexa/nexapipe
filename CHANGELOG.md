@@ -71,6 +71,17 @@ not part of the tree). Not yet released, so no version numbers have moved.
   asked, which is the only moment that question has an answer. An older build
   reading the new payload finds no connection string and drops the node, so
   downgrading means re-importing the invite.
+- The desktop app masked its credentials in the wrong place. The renderer
+  already held the value it was shortening, so a mask computed there was a mask
+  over a string sitting in that process's own memory — and an invite was worse:
+  its TOTP secret and its enrollment token were handed to the frontend in full,
+  so the page could work out which node the invite belonged to. Masks are now
+  computed in Rust (`credentials::mask`) and what crosses into the renderer is
+  the projection; an invite is accepted by `accept_invite`, which puts the
+  credentials in the store itself and answers with a receipt carrying none of
+  them. The Node ID is masked the same way, and `reveal_credential` and
+  `reveal_node_id` are now the only two commands that answer with a whole value
+  — which is what makes them the two the OS lock has to sit in front of.
 
 ## [0.3.0] — 2026-09-29
 

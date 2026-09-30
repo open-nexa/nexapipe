@@ -10,7 +10,7 @@
  * carries before the user accepts it.
  */
 import { invoke } from '@tauri-apps/api/core';
-import type { InvitePayload, IssuedCredential } from '../types';
+import type { InviteAccepted, InvitePayload, IssuedCredential } from '../types';
 
 /** Whether a pasted string looks like an invite rather than a bare ticket or Node ID. */
 export function isInviteLink(value: string): boolean {
@@ -25,6 +25,18 @@ export function isInviteLink(value: string): boolean {
  */
 export async function parseInvite(uri: string): Promise<InvitePayload> {
   return await invoke<InvitePayload>('parse_invite', { uri });
+}
+
+/**
+ * Files what an invite carries and says which node it belongs to.
+ *
+ * The credentials go straight from the code into the encrypted store: the renderer is not given
+ * a connection string or a secret to forward, because a preview does not need one and a surface
+ * that has one is a surface that can show it. What comes back is the node id and the rest of the
+ * code's contents, which is what the config store needs to build the node.
+ */
+export async function acceptInvite(uri: string): Promise<InviteAccepted> {
+  return await invoke<InviteAccepted>('accept_invite', { uri });
 }
 
 /**

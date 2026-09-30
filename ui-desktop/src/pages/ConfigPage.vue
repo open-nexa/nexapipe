@@ -3,13 +3,14 @@ import { ref, watch, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
   ConnectionType,
-  InvitePayload,
   LoadBalancingStrategy,
   NodeConfig,
   TwoFactorAlgorithm,
 } from "../types";
 import { useConfigStore } from "../stores/config";
 import { useToast } from "../composables/useToast";
+import { errorDetail, errorKey } from "../api/errors";
+import { revealCredential } from "../api/credentials";
 import InviteImportDialog from "../components/InviteImportDialog.vue";
 
 const {
@@ -21,6 +22,8 @@ const {
   setNodeTwoFactor,
   clearNodeTwoFactor,
   hasTwoFactor,
+  connectionMask,
+  secretMask,
   resetConfig,
 } = useConfigStore();
 
@@ -53,28 +56,46 @@ function openInviteDialog() {
 
 /**
  * Nodes arrive from invites and their target is not edited afterwards, so the connection string
- * is shown rather than input. Masked by default because a ticket is a credential: anyone looking
- * at the screen should not be able to read one off it.
+ * is shown rather than input — and shown as Rust masks it, never as the value.
+ *
+ * `revealed` holds the whole value for a node only while its reveal is open, and only after the
+ * reveal command returned it: the page never shortens a string it already has, which is what a
+ * mask computed in the renderer was. A short value used to be printed whole; it is not any more,
+ * because a 16-character TOTP secret shortened by four characters is still a working secret on
+ * screen.
  */
-const revealed = ref<Record<string, boolean>>({});
+const revealed = ref<Record<string, string>>({});
 
-function connectionValue(node: NodeConfig): string {
-  return node.connectionType === "ticket" ? node.ticket : node.endpointId;
-}
-
+/** What a node connects by, or the mask for it when its reveal is closed. */
 function connectionDisplay(node: NodeConfig): string {
-  const value = connectionValue(node);
-  if (!value) return "—";
-  if (revealed.value[node.id] || value.length <= 16) return value;
-  return `${value.slice(0, 8)}••••${value.slice(-4)}`;
+  const open = revealed.value[node.id];
+  if (open !== undefined) return open;
+  return connectionMask(node.id) || "—";
 }
 
-function toggleReveal(nodeId: string): void {
-  revealed.value[nodeId] = !revealed.value[nodeId];
+/** Which credential a node's connection string is filed under. */
+function connectionKind(node: NodeConfig): "ticket" | "endpoint" {
+  return node.connectionType === "ticket" ? "ticket" : "endpoint";
+}
+
+function isRevealed(nodeId: string): boolean {
+  return revealed.value[nodeId] !== undefined;
+}
+
+async function toggleReveal(node: NodeConfig): Promise<void> {
+  if (isRevealed(node.id)) {
+    delete revealed.value[node.id];
+    return;
+  }
+  const value = await revealCredential(connectionKind(node), node.id);
+  if (value === null || value === "") return;
+  revealed.value[node.id] = value;
 }
 
 async function copyConnection(node: NodeConfig): Promise<void> {
-  const value = connectionValue(node);
+  // Asked for here rather than read off the page: the copy button is a surface
+  // too, and the value it puts on the clipboard comes from the store.
+  const value = revealed.value[node.id] ?? (await revealCredential(connectionKind(node), node.id));
   if (!value) return;
   try {
     await navigator.clipboard.writeText(value);
@@ -82,6 +103,27 @@ async function copyConnection(node: NodeConfig): Promise<void> {
   } catch {
     toast.error(t("common.copyFailed"));
   }
+}
+
+const revealedSecrets = ref<Record<string, string>>({});
+
+/** The secret field shows the mask; what the user types into it is what gets stored. */
+function secretDisplay(node: NodeConfig): string {
+  return revealedSecrets.value[node.id] ?? secretMask(node.id);
+}
+
+function secretInputType(node: NodeConfig): "text" | "password" {
+  return revealedSecrets.value[node.id] === undefined ? "password" : "text";
+}
+
+async function toggleSecret(node: NodeConfig): Promise<void> {
+  if (revealedSecrets.value[node.id] !== undefined) {
+    delete revealedSecrets.value[node.id];
+    return;
+  }
+  const value = await revealCredential("totp", node.id);
+  if (value === null || value === "") return;
+  revealedSecrets.value[node.id] = value;
 }
 
 /**
@@ -98,9 +140,14 @@ function toggleTwoFactor(nodeId: string) {
   }
 }
 
-function importInvite(payload: { invite: InvitePayload; applyRelay: boolean }) {
-  const outcome = applyInvite(payload.invite, { applyRelay: payload.applyRelay });
-  toast.success(t(outcome === "added" ? "invite.added" : "invite.merged"));
+async function importInvite(payload: { uri: string; applyRelay: boolean }) {
+  try {
+    const outcome = await applyInvite(payload.uri, { applyRelay: payload.applyRelay });
+    toast.success(t(outcome === "added" ? "invite.added" : "invite.merged"));
+  } catch (error) {
+    toast.error(t(errorKey(error, "error.invite.parse_failed")));
+    console.error("[invite] import failed:", errorDetail(error));
+  }
 }
 
 function getNodeTypeLabel(type: ConnectionType): string {
@@ -264,10 +311,10 @@ function clearConfig() {
             <button
               type="button"
               class="connection-action"
-              :aria-label="revealed[node.id] ? t('node.hide') : t('node.reveal')"
-              @click="toggleReveal(node.id)"
+              :aria-label="isRevealed(node.id) ? t('node.hide') : t('node.reveal')"
+              @click="toggleReveal(node)"
             >
-              <svg v-if="revealed[node.id]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <svg v-if="isRevealed(node.id)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
                 <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
                 <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
@@ -340,13 +387,24 @@ function clearConfig() {
               </div>
               <div class="node-2fa-field">
                 <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
+                <!-- The mask, and never the secret: what is in the field is what Rust handed back
+                     for display, and typing into it is what replaces the stored one. -->
                 <input
-                  :value="node.twoFactor.secret"
+                  :value="secretDisplay(node)"
                   @change="setNodeTwoFactor(node.id, { secret: ($event.target as HTMLInputElement).value.trim() })"
-                  type="password"
+                  :type="secretInputType(node)"
                   placeholder="JBSWY3DPEHPK3PXP"
                   class="form-input"
                 />
+                <button
+                  v-if="secretMask(node.id)"
+                  type="button"
+                  class="node-2fa-reveal"
+                  :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
+                  @click="toggleSecret(node)"
+                >
+                  {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
+                </button>
               </div>
               <div class="node-2fa-field">
                 <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>

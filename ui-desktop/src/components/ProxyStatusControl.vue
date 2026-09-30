@@ -42,6 +42,7 @@ const {
   start,
   stop,
   refreshServiceRunning,
+  revealNodeId,
   setUseTun,
 } = useProxyStore();
 
@@ -143,10 +144,20 @@ async function installServiceForTun(): Promise<void> {
   }
 }
 
+/**
+ * Copies the Node ID, which means asking for it: `nodeId` is a mask, and what goes on the
+ * clipboard has to be the whole string. Copying is the act that makes the full value worth
+ * having, so it is also the act the OS lock will sit in front of.
+ */
 async function copyNodeId(): Promise<void> {
   if (!nodeId.value) return;
+  const full = await revealNodeId();
+  if (!full) {
+    toast.error(t('common.copyFailed'));
+    return;
+  }
   try {
-    await navigator.clipboard.writeText(nodeId.value);
+    await navigator.clipboard.writeText(full);
     toast.success(t('common.copied'));
   } catch {
     toast.error(t('common.copyFailed'));

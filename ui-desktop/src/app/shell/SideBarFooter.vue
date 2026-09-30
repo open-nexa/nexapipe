@@ -30,9 +30,12 @@ const modeLabel = computed(() =>
   status.value.running ? t(`mode.${status.value.mode}`) : '',
 );
 
-const shortNodeId = computed(() =>
-  nodeId.value ? `${nodeId.value.slice(0, 10)}…` : '',
-);
+/**
+ * The Node ID, already masked: `get_node_id_display` is what the store polls, and shortening a
+ * mask would only hide which node this is. There is no tooltip carrying the whole of it either —
+ * that used to be how the full ID reached the screen, one hover away from anyone watching.
+ */
+const shortNodeId = computed(() => nodeId.value);
 
 onMounted(async () => {
   try {
@@ -56,7 +59,7 @@ onMounted(async () => {
         <span class="side-bar-footer__value">{{ modeLabel }}</span>
       </div>
       <div v-if="shortNodeId" class="side-bar-footer__row">
-        <span class="side-bar-footer__value mono" :title="nodeId">{{ shortNodeId }}</span>
+        <span class="side-bar-footer__value mono">{{ shortNodeId }}</span>
       </div>
       <div v-if="version" class="side-bar-footer__row muted">
         {{ t('common.version') }} {{ version }}

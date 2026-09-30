@@ -25,15 +25,16 @@
 import { computed, reactive, watch } from 'vue';
 import {
   clearCredentials,
+  credentialDisplay,
   credentialStoreStatus,
   deleteCredential,
   getCredential,
   putCredential,
 } from '../api/credentials';
+import { acceptInvite } from '../api/invite';
 import type {
   ConnectionType,
   EnrollmentToken,
-  InvitePayload,
   IssuedCredential,
   LoadBalancingStrategy,
   NodeConfig,
@@ -486,6 +487,7 @@ export async function initConfigStore(): Promise<void> {
     // Now, and only now, that the store has answered: see
     // `dropNodesWithoutAConnectionString`.
     config.nodes = dropNodesWithoutAConnectionString(config.nodes);
+    await refreshConnectionMasks();
 
     // Only from here may a save touch the store. Nothing before this line has
     // read it, so nothing before this line may delete from it — a failure
@@ -520,6 +522,54 @@ const config = reactive<ProxyConfig>(loadConfig());
  * `null` until startup has asked. Read once there, because it cannot change while the app runs.
  */
 const credentialProtection = reactive<{ level: string | null }>({ level: null });
+
+/**
+ * What a surface may print for a node's connection string: the mask Rust produced, keyed by node.
+ *
+ * The value itself is here too — `start_proxy` takes it as an argument, so the renderer has not
+ * stopped holding it — but nothing renders it. Asking Rust for the mask rather than shortening
+ * what is already in memory is the difference: a mask the renderer computes is not one, because
+ * the thing it computed it from is one devtools panel away.
+ *
+ * Empty until the store has been asked, which is why a page falling back to it shows nothing
+ * rather than a value of its own.
+ */
+const connectionMasks = reactive<Record<string, string>>({});
+
+/** The same, for the TOTP secret a node authenticates with. */
+const secretMasks = reactive<Record<string, string>>({});
+
+async function refreshConnectionMasks(): Promise<void> {
+  const shown = await Promise.all(
+    config.nodes.map(async (node) => {
+      const connection = node.connectionType === 'ticket' ? 'ticket' : 'endpoint';
+      const [target, secret] = await Promise.all([
+        credentialDisplay(connection, node.id).catch((error: unknown) => {
+          console.error('[config] failed to read a connection string for display:', error);
+          return null;
+        }),
+        credentialDisplay('totp', node.id).catch((error: unknown) => {
+          console.error('[config] failed to read a secret for display:', error);
+          return null;
+        }),
+      ]);
+      return [node.id, target ?? '', secret ?? ''] as const;
+    }),
+  );
+
+  for (const [id, target, secret] of shown) {
+    connectionMasks[id] = target;
+    secretMasks[id] = secret;
+  }
+  // A node that is gone takes its masks: leaving them would keep a projection of
+  // credentials nothing is connecting to any more.
+  for (const id of Object.keys(connectionMasks)) {
+    if (!config.nodes.some((node) => node.id === id)) delete connectionMasks[id];
+  }
+  for (const id of Object.keys(secretMasks)) {
+    if (!config.nodes.some((node) => node.id === id)) delete secretMasks[id];
+  }
+}
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -570,32 +620,27 @@ export function useConfigStore() {
    *
    * Returns which of the two happened, so the caller can say so.
    */
-  function applyInvite(
-    invite: InvitePayload,
+  async function applyInvite(
+    uri: string,
     options: { applyRelay?: boolean } = {},
-  ): 'added' | 'merged' {
-    const connectionType: ConnectionType =
-      invite.kind === 'ticket' ? 'ticket' : 'endpoint_id';
-    const existing = config.nodes.find(
-      (node) =>
-        node.connectionType === connectionType &&
-        (connectionType === 'ticket' ? node.ticket : node.endpointId) === invite.target,
-    );
+  ): Promise<'added' | 'merged'> {
+    // The credentials go into the store before this returns, and the call answers which node they
+    // were filed under: a parsed invite no longer carries a connection string or a secret, so the
+    // comparison that decides "new node or an existing one" is made where the values are.
+    const accepted = await acceptInvite(uri);
 
-    const name = invite.name?.trim() || undefined;
+    const name = accepted.name?.trim() || undefined;
     let outcome: 'added' | 'merged';
-    let node: NodeConfig;
+    let node: NodeConfig | undefined = config.nodes.find((n) => n.id === accepted.nodeId);
 
-    if (existing) {
-      node = existing;
+    if (node) {
       outcome = 'merged';
       // A name already typed here wins: it is the label the user chose for this endpoint.
       if (name && !node.name) node.name = name;
     } else {
       node = createNode({
-        connectionType,
-        ticket: connectionType === 'ticket' ? invite.target : '',
-        endpointId: connectionType === 'endpoint_id' ? invite.target : '',
+        id: accepted.nodeId,
+        connectionType: accepted.connectionType,
         domains: [],
         ...(name ? { name } : {}),
       });
@@ -603,23 +648,25 @@ export function useConfigStore() {
     }
 
     const domains = [...node.domains];
-    for (const domain of invite.domains) {
+    for (const domain of accepted.domains) {
       if (!domains.includes(domain)) domains.push(domain);
     }
     node.domains = domains;
 
-    if (invite.relay && options.applyRelay) {
+    if (accepted.relay && options.applyRelay) {
       config.relayMode = 'custom';
-      config.relayUrl = invite.relay;
+      config.relayUrl = accepted.relay;
     }
 
     // The credentials belong to the server this invite came from, so they land on its node and
-    // nowhere else — a second server keeps whatever it was given before.
-    if (invite.totp) {
+    // nowhere else — a second server keeps whatever it was given before. What is set here is the
+    // *shape*: the secret and the token are already in the store, and keeping them out of this
+    // object is the whole point of `accept_invite`.
+    if (accepted.totp) {
       node.twoFactor = {
-        clientId: invite.totp.clientId,
-        secret: invite.totp.secret,
-        algorithm: invite.totp.algorithm,
+        clientId: accepted.totp.clientId,
+        secret: '',
+        algorithm: accepted.totp.algorithm,
       };
       delete node.enrollment;
     }
@@ -628,14 +675,22 @@ export function useConfigStore() {
     // answers with the secret this node is to keep. Stored on the node rather than applied to
     // `twoFactor` because a token is not a credential — writing it there would make the node
     // present the token as its TOTP secret and be refused.
-    if (invite.enrollment) {
-      node.enrollment = {
-        clientId: invite.enrollment.clientId,
-        token: invite.enrollment.token,
-      };
+    if (accepted.enrollment) {
+      node.enrollment = { clientId: accepted.enrollment.clientId, token: '' };
       delete node.twoFactor;
     }
 
+    // Read back the one credential the renderer still has to hold: `start_proxy` takes the
+    // connection string as an argument, and the mirror below has to agree with the store or the
+    // next save would delete what was just filed.
+    const [ticket, endpointId] = await Promise.all([
+      getCredential('ticket', node.id),
+      getCredential('endpoint', node.id),
+    ]);
+    node.ticket = ticket ?? '';
+    node.endpointId = endpointId ?? '';
+
+    await refreshConnectionMasks();
     return outcome;
   }
 
@@ -696,11 +751,18 @@ export function useConfigStore() {
 
     // A removed node takes its credentials with it. Done here rather than by sweeping the store
     // for orphans, because this is the only place a node stops existing.
+    // The connection string goes too, from this change on: it is a credential here, so a node
+    // that stops existing must not leave one behind under its id.
     void Promise.all([
       deleteCredential('totp', nodeId),
       deleteCredential('enrollment', nodeId),
+      deleteCredential('ticket', nodeId),
+      deleteCredential('endpoint', nodeId),
     ]).catch((error: unknown) => {
       console.error('[config] failed to delete the credentials of a removed node:', error);
+    });
+    void refreshConnectionMasks().catch((error: unknown) => {
+      console.error('[config] failed to refresh the connection masks:', error);
     });
   }
 
@@ -738,6 +800,10 @@ export function useConfigStore() {
   return {
     config,
     credentialProtection: computed(() => credentialProtection.level),
+    /** The mask to print for a node's connection string. Empty when the store has not answered. */
+    connectionMask: (nodeId: string): string => connectionMasks[nodeId] ?? '',
+    /** The mask to print for a node's TOTP secret, same terms. */
+    secretMask: (nodeId: string): string => secretMasks[nodeId] ?? '',
     updateConfig,
     removeNode,
     updateNode,

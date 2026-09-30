@@ -8,7 +8,7 @@ import { useProxyStore } from "../stores/proxy";
 import type { LinkKind, NodeConfig } from "../types";
 
 const { t } = useI18n();
-const { config } = useConfigStore();
+const { config, connectionMask } = useConfigStore();
 const { status, linkKindFor } = useProxyStore();
 
 /**
@@ -52,11 +52,16 @@ const linkSummary = computed(() =>
     .join(" · "),
 );
 
-/** The name the invite gave it, or a shortened connection string. */
+/**
+ * The name the invite gave it, or the masked connection string.
+ *
+ * Not a shortening of the value: a value long enough to print almost whole used to be printed
+ * almost whole (the old rule kept anything up to 24 characters), which is the leak, not the
+ * label. The mask comes from Rust, so this page never holds the string it prints.
+ */
 function endpointLabel(node: NodeConfig): string {
   if (node.name) return node.name;
-  const value = node.connectionType === "ticket" ? node.ticket : node.endpointId;
-  return value.length <= 24 ? value : `${value.slice(0, 14)}…${value.slice(-6)}`;
+  return connectionMask(node.id) || "—";
 }
 
 function kindIcon(kind: LinkKind): string {

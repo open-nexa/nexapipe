@@ -30,6 +30,34 @@ export async function getCredential(
   return await invoke<string | null>('get_credential', { kind, nodeId });
 }
 
+/**
+ * One credential as a surface may show it: masked in Rust, so the renderer is handed a projection
+ * and never the value.
+ *
+ * Every surface that prints a credential asks for this. `getCredential` is the plumbing that
+ * reads one back into the config — or hands a connection string to the proxy — and is never what
+ * a page renders.
+ */
+export async function credentialDisplay(
+  kind: CredentialKind,
+  nodeId?: string,
+): Promise<string | null> {
+  return await invoke<string | null>('credential_display', { kind, nodeId });
+}
+
+/**
+ * One credential in full, for the user to copy.
+ *
+ * The only path from the store to a surface, and the one the OS lock goes in front of: everything
+ * else the UI can ask for is a mask or a shape.
+ */
+export async function revealCredential(
+  kind: CredentialKind,
+  nodeId?: string,
+): Promise<string | null> {
+  return await invoke<string | null>('reveal_credential', { kind, nodeId });
+}
+
 /** Writes one credential, replacing whatever was there. */
 export async function putCredential(
   kind: CredentialKind,

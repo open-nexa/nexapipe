@@ -28,7 +28,9 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   (e: 'close'): void;
-  (e: 'import', payload: { invite: InvitePayload; applyRelay: boolean }): void;
+  // The link itself rather than the parsed invite: what the caller needs is the code, because
+  // accepting one is what files its credentials — and a parsed invite no longer carries them.
+  (e: 'import', payload: { uri: string; applyRelay: boolean }): void;
 }>();
 
 const { t } = useI18n();
@@ -171,8 +173,9 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function confirmImport(): void {
-  if (!invite.value) return;
-  emit('import', { invite: invite.value, applyRelay: applyRelay.value });
+  const trimmed = uri.value.trim();
+  if (!invite.value || !trimmed) return;
+  emit('import', { uri: trimmed, applyRelay: applyRelay.value });
   emit('close');
 }
 </script>
@@ -230,7 +233,7 @@ function confirmImport(): void {
               <dt>{{ t('invite.target') }}</dt>
               <dd>
                 <span class="badge">{{ invite.kind === 'ticket' ? t('invite.kindTicket') : t('invite.kindEndpoint') }}</span>
-                <span class="mono break">{{ invite.target }}</span>
+                <span class="mono break">{{ invite.targetMasked }}</span>
               </dd>
             </div>
             <div v-if="invite.name" class="row">

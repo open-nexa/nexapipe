@@ -115,6 +115,56 @@ impl CredentialKind {
     }
 }
 
+/// Characters of a masked value kept at the front, and at the back.
+///
+/// Enough to recognise a value the user has seen before — which node this is,
+/// which of two similar tickets it is not — and not enough to reconstruct it.
+/// The same eight and four the UI used to keep, minus the rule that a short
+/// value was shown whole.
+const MASK_HEAD: usize = 8;
+const MASK_TAIL: usize = 4;
+
+/// What stands in for the rest.
+const MASK_MIDDLE: &str = "••••";
+
+/// The longest value that keeps nothing at all.
+///
+/// A TOTP secret is 16 base32 characters, so 16 is not an arbitrary line: it is
+/// the length at which "just the first few characters" is most of the value.
+/// Everything at or below it is replaced whole rather than trimmed, because the
+/// mask is not there to make a secret harder to read over somebody's shoulder —
+/// it is there so a secret is never on the screen at all.
+const MASK_WHOLE: usize = 16;
+
+/// The projection of a credential that is safe to render: enough to recognise,
+/// not enough to use.
+///
+/// Computed here rather than in the renderer, because a mask the renderer
+/// computes is not one: to shorten a value it already holds, and what it holds
+/// is the whole thing, one devtools panel away from whoever is looking. A
+/// surface that needs the value itself asks for it through the reveal path
+/// instead, which is a deliberate act and, once the lock is in, an authenticated
+/// one.
+///
+/// Empty in, empty out: "no credential" and "a credential so short it is all
+/// bullets" must stay tellable apart, and that is the caller's call to make.
+pub fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+
+    if chars.len() <= MASK_WHOLE {
+        // Length is not the secret, so it is kept — up to a point, past which
+        // counting bullets stops being informative and starts being decoration.
+        return "•".repeat(chars.len().min(MASK_HEAD));
+    }
+
+    let head: String = chars.iter().take(MASK_HEAD).collect();
+    let tail: String = chars.iter().skip(chars.len() - MASK_TAIL).collect();
+    format!("{head}{MASK_MIDDLE}{tail}")
+}
+
 /// The key a credential is filed under.
 ///
 /// Built here and not by the caller so the two sides cannot disagree about the
@@ -833,6 +883,42 @@ mod tests {
         std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
 
         assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A mask is not a shortening: none of the original characters of a short
+    /// value may survive it, because a 16-character TOTP secret shortened by
+    /// four characters is still a working TOTP secret on screen.
+    #[test]
+    fn a_short_value_is_replaced_whole() {
+        let secret = "JBSWY3DPEHPK3PXP";
+
+        let masked = super::mask(secret);
+        assert!(!masked.is_empty(), "an empty mask reads as no credential");
+        for part in ["JBSW", "3DPE", "PXP"] {
+            assert!(!masked.contains(part), "{masked} still shows {part}");
+        }
+    }
+
+    /// A long value keeps its ends, because "which of my nodes is this" is the
+    /// question the mask exists to answer, and drops everything between them.
+    #[test]
+    fn a_long_value_keeps_its_ends_and_nothing_between() {
+        let ticket = "e4f1c9a0b2d3e5f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3";
+
+        let masked = super::mask(ticket);
+        assert!(masked.starts_with("e4f1c9a0"), "{masked} lost its head");
+        assert!(masked.ends_with("2d3"), "{masked} lost its tail");
+        assert!(
+            !masked.contains("b2d3e5f7a8b9c0d1"),
+            "{masked} kept the middle of the ticket"
+        );
+    }
+
+    /// Empty stays empty: "no credential" is a different thing from "a
+    /// credential I am not showing you", and the UI says so differently.
+    #[test]
+    fn nothing_to_mask_is_an_empty_mask() {
+        assert_eq!(super::mask(""), "");
     }
 
     /// A connection string is a credential, so it is keyed per node like the
