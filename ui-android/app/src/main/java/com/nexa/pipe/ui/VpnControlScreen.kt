@@ -138,6 +138,25 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     }
 
     /**
+     * True when every permission the connect path needs is already granted.
+     * Otherwise shows the permission guide and returns false.
+     *
+     * Only ever called once the slot is ours to take: the guide is the way into
+     * Android's preparation dialog, and that dialog is what displaces another
+     * VPN app.
+     */
+    fun permissionsReady(context: Context): Boolean {
+        val vpnGranted = viewModel.checkVpnPermission(context)
+        val notificationGranted = viewModel.checkNotificationPermission(context)
+
+        if (!vpnGranted || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationGranted)) {
+            showPermissionGuide = true
+            return false
+        }
+        return true
+    }
+
+    /**
      * Connects — asking first, when another VPN app owns the single slot
      * Android allows.
      *
@@ -145,24 +164,21 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      * establish() is itself what revokes the other app. So it is asked here,
      * before anything is started, which is also what makes Cancel free — there
      * is nothing to undo because nothing has happened yet.
+     *
+     * Permissions come second for the same reason: the permission guide leads
+     * to Android's own preparation dialog, and accepting that dialog is what
+     * grants Nexa the slot and displaces the other app. Reaching it before the
+     * question would leave Cancel unable to keep that app alive.
      */
     fun handleConnect(context: Context) {
-        viewModel.checkVpnPermission(context)
-        viewModel.checkNotificationPermission(context)
-
-        val vpnGranted = viewModel.vpnPermissionGranted.value
-        val notificationGranted = viewModel.notificationPermissionGranted.value
-
-        if (!vpnGranted || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationGranted)) {
-            showPermissionGuide = true
-            return
-        }
-
         screenScope.launch {
             when (viewModel.takeoverCheck(context)) {
                 // Nobody else wants the slot, or the user has already said to
                 // take it. The flag only matters while a foreign VPN is up.
-                is VpnTakeoverDecision.Proceed -> viewModel.connect(context, allowTakeover = true)
+                is VpnTakeoverDecision.Proceed ->
+                    if (permissionsReady(context)) {
+                        viewModel.connect(context, allowTakeover = true)
+                    }
                 // The one case that needs a UI: another VPN is running and the
                 // user has not yet said what to do about it.
                 is VpnTakeoverDecision.Ask -> {
@@ -902,7 +918,9 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     if (takeoverRememberChoice) {
                         viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.TakeOver)
                     }
-                    viewModel.connect(context, allowTakeover = true)
+                    if (permissionsReady(context)) {
+                        viewModel.connect(context, allowTakeover = true)
+                    }
                 },
                 onDismiss = {
                     showTakeoverDialog = false
