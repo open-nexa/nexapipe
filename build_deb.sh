@@ -236,19 +236,22 @@ declare -A APT_FOR_MODULE=(
     [librsvg-2.0]="librsvg2-dev"
     [openssl]="libssl-dev"
     # What the desktop crate itself needs beyond Tauri: `dbus-1` for keyring's
-    # persistent Linux backend, `pam` for the credential door. Both are in the
-    # Linux steps of ci.yml and release.yml, and a preflight that does not know
-    # about them lets a local build start and fail where CI succeeds.
+    # persistent Linux backend. It is in the Linux steps of ci.yml and
+    # release.yml, and a preflight that does not know about it lets a local
+    # build start and fail where CI succeeds.
     [dbus-1]="libdbus-1-dev"
-    [pam]="libpam0g-dev"
 )
-# libxdo-dev is deliberately not in APT_FOR_MODULE: Debian/Ubuntu ship no pkg-config file
-# for it (the file list on packages.ubuntu.com for noble/amd64 is exactly /usr/include/xdo.h,
-# libxdo.so and documentation), so `pkg-config --exists xdo` keeps failing on a machine where
-# the package is installed. Tauri asks for the package because it needs the header and the
-# -lxdo symlink at link time, which is what APT_FOR_HEADER probes instead.
+# Two packages are asked for by header rather than by pkg-config module, because
+# Debian/Ubuntu ship no .pc file for either: the file list on packages.ubuntu.com
+# is /usr/include/xdo.h, libxdo.so and documentation for libxdo-dev, and headers,
+# libraries, examples and man pages — no pam.pc — for libpam0g-dev. A probe that
+# asks pkg-config about them keeps failing on a machine where the package is
+# installed. Both are needed at build time anyway: Tauri wants the xdo header and
+# the -lxdo symlink, and pam-client wants security/pam_appl.h for the credential
+# door.
 declare -A APT_FOR_HEADER=(
     [xdo.h]="libxdo-dev"
+    [security/pam_appl.h]="libpam0g-dev"
 )
 declare -A APT_FOR_TOOL=(
     [patchelf]="patchelf"
