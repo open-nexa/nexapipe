@@ -13,7 +13,6 @@
 //! completion handler runs on the threadpool rather than on the thread that is
 //! waiting for it.
 
-use std::mem::MaybeUninit;
 use std::sync::mpsc;
 
 use windows::core::RuntimeType;
@@ -177,23 +176,35 @@ impl Drop for TokenHandle {
 fn current_account() -> Option<(String, String)> {
     // SAFETY: `GetCurrentProcess` hands back a pseudo-handle that is not to be
     // closed, and the token opened from it is — which `TokenHandle` does.
-    // `TOKEN_USER` is fixed-size, so the buffer asked for is exactly its own.
     unsafe {
         let mut handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle).ok()?;
         let token = TokenHandle(handle);
 
-        let mut user = MaybeUninit::<TOKEN_USER>::uninit();
+        // Twice, because `TokenUser` is not the fixed-size answer the struct
+        // suggests: Windows writes the variable-length SID *behind* the
+        // `TOKEN_USER` it hands back, and `User.Sid` points into that same
+        // buffer. One the size of the struct alone is therefore always too
+        // small, the call reports that rather than answering, and the SID is
+        // never reached. The first call is what says how much is needed.
         let mut needed = 0u32;
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            return None;
+        }
+        // `u64` storage, so the buffer is aligned the way `TOKEN_USER` has to
+        // be. It outlives the SID below: that pointer points into it, and is
+        // read only while it is still alive.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
         GetTokenInformation(
             token.0,
             TokenUser,
-            Some(user.as_mut_ptr().cast()),
-            std::mem::size_of::<TOKEN_USER>() as u32,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
             &mut needed,
         )
         .ok()?;
-        let sid = user.assume_init().User.Sid;
+        let sid = (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
 
         // Twice, because the first call reports how long the two names are:
         // that is what the insufficient-buffer answer means here, not a failure
@@ -202,7 +213,7 @@ fn current_account() -> Option<(String, String)> {
         let mut domain_len = 0u32;
         let mut sid_use = SID_NAME_USE(0);
         if LookupAccountSidW(
-            None,
+            PCWSTR::null(),
             sid,
             None,
             &mut name_len,
@@ -214,18 +225,26 @@ fn current_account() -> Option<(String, String)> {
         {
             return None;
         }
-        if name_len == 0 || domain_len == 0 {
+        // Only the name is demanded. A SID Windows reports no authority for is
+        // one `LogonUserW` is given `.` for below, and refusing it here would
+        // leave that fallback unreachable.
+        if name_len == 0 {
             return None;
         }
 
         let mut name = vec![0u16; name_len as usize];
         let mut domain = vec![0u16; domain_len as usize];
+        let domain_ptr = if domain.is_empty() {
+            None
+        } else {
+            Some(PWSTR(domain.as_mut_ptr()))
+        };
         LookupAccountSidW(
-            None,
+            PCWSTR::null(),
             sid,
             Some(PWSTR(name.as_mut_ptr())),
             &mut name_len,
-            Some(PWSTR(domain.as_mut_ptr())),
+            domain_ptr,
             &mut domain_len,
             &mut sid_use,
         )
