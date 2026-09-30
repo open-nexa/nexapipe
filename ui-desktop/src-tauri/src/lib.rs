@@ -33,6 +33,12 @@ lazy_static::lazy_static! {
 /// config store filling itself in before the app mounts, and refuses everything
 /// after that. A read that could be repeated at any time would be the ungated
 /// one this replaced, whatever it is called.
+///
+/// Debug builds are the exception, and only because a reload of the webview
+/// runs that start-up again without restarting this process. Re-arming it in a
+/// shipped build would not be a concession to that: a script in the renderer
+/// can reload the page whenever it likes, so anything that re-opens the read on
+/// a reload hands the script the answer this command exists to refuse.
 static RUNTIME_CREDENTIALS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// The nodes [`accept_invite`] filed credentials for in this process.
@@ -1105,7 +1111,10 @@ fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
 /// nothing away.
 #[tauri::command]
 async fn take_runtime_credentials(node_ids: Vec<String>) -> Result<RuntimeCredentials, AppError> {
-    if RUNTIME_CREDENTIALS_TAKEN.load(Ordering::SeqCst) {
+    // See `RUNTIME_CREDENTIALS_TAKEN`: a debug build answers again, because a
+    // reload of the webview is a new renderer in the same process and would
+    // otherwise be locked out of the store for the rest of the run.
+    if RUNTIME_CREDENTIALS_TAKEN.load(Ordering::SeqCst) && !cfg!(debug_assertions) {
         return Err(AppError::with_detail(
             codes::CREDENTIALS_STORE_FAILED,
             "the credentials were already read at start-up",
