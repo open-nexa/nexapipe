@@ -45,6 +45,45 @@ lives in `docs/releases/`, and only that directory reaches the site.
   load this strategy exists to spread. It counts requests, not sockets, because
   how many connections the pooled HTTP client is holding open is not something
   this process can see.
+- **IPv6 inside the tunnel.** A proxied domain answered an AAAA query with
+  nothing, which made every resolver that prefers IPv6 fall back to A to get
+  anywhere. Both families are now answered, each from a pool of its own: `A`
+  from `10.0.1.16+` as before, `AAAA` from `fd00:10:0:1::16+`, a ULA block the
+  VPN routes into the TUN for itself (Android; the desktop uses
+  `fd00:198:18::/64`), and the packet path looks a destination up in whichever
+  family it arrived on. A ULA rather than a global address so that an address
+  which escapes the tunnel is a dead end, and only that one /64 is claimed —
+  the device's own IPv6 traffic still goes to the physical network. On the
+  desktop the address is configured per platform and may be refused (a service
+  account, an image with IPv6 off); when it is, AAAA is answered with the empty
+  reply that sends the resolver back to A rather than with an address nothing
+  routes, and the log says which happened.
+- `[iroh] bind_ipv6`: bind `[::]` on the configured `bind_port` as well as
+  `0.0.0.0`. It adds a socket rather than replacing one, so no client loses the
+  route it has, and the IPv6 bind is not required — a host with no IPv6 starts
+  and logs it instead of refusing to. Ignored without `bind_port`, which is
+  also logged rather than left looking as though it worked.
+- **The backends are asked whether they still answer.** Every 30 seconds, with
+  up to 5 seconds of jitter, each backend is probed in parallel and the result
+  recorded — `EndpointGroup::health_snapshot()` is what a UI polls. Until now
+  a group dialled once, at startup, and never again, so a backend that stopped
+  answering was discovered by the request that needed it, which on a phone is
+  an app that has already timed out. The probe is also the reconnect: the pool
+  drops a connection idle for a minute, so a round keeps one warm to a backend
+  nobody has talked to. A failure is logged when it starts and then every
+  tenth probe, because a backend down for an hour has failed a hundred of
+  them. **A dead backend is still handed out**, which is the other half of this
+  and is not done: the balancer picks by index into a list it cannot change, so
+  removing one needs the group to become mutable — a change to every holder of
+  it, and the item this release leaves for the next one.
+- **A second Android ABI.** The APK was `arm64-v8a` only, which left an
+  emulator — the x86_64 images that run acceptably on a development machine —
+  with nothing to install. There are now two APKs, one per ABI, rather than one
+  carrying both: a fat APK would make every phone download the x86_64 library
+  to get the arm64 one. Each carries its own version code (the base with the
+  ABI as its low digit), because two artifacts of one version cannot both claim
+  the same one. `run_android.ps1 -Abi x86_64` builds and installs that one;
+  without it the local loop would face two APKs and no way to choose.
 - `[timeouts]`: `connect_secs` (default `10`) and `response_secs` (default `30`),
   each covering one step of talking to a backend and neither bounding the whole
   request — once a response head arrives, streaming its body can run as long as

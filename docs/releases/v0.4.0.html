@@ -411,6 +411,51 @@ response_secs = 30</pre>
       undecryptable.</li>
   </ul>
 
+  <h3 class="subhead">The tunnel carries IPv6</h3>
+  <ul class="changelog">
+    <li>A proxied domain answered an AAAA query with nothing, so every resolver that prefers IPv6
+      &mdash; which is most of them &mdash; had to fall back to A before it could reach anything.
+      Both families are answered now, each from a pool of its own.</li>
+    <li>The addresses come from a ULA block the VPN routes into the TUN for itself
+      (<code>fd00:10:0:1::/64</code> on Android, <code>fd00:198:18::/64</code> on the desktop), so
+      one that escapes the tunnel is a dead end rather than a real host. Only that /64 is claimed:
+      everything else the device sends over IPv6 still goes to the physical network.</li>
+    <li>On the desktop the address is configured per platform and may be refused &mdash; a service
+      account, an image with IPv6 turned off. When it is, AAAA is answered with the empty reply that
+      sends the resolver back to A, not with an address nothing routes, and the log says which
+      happened.</li>
+    <li>The server can listen on IPv6 too: <code>[iroh] bind_ipv6</code> adds
+      <code>[::]</code> on the configured <code>bind_port</code>. It adds a socket rather than
+      replacing one, so nothing that reaches the server over IPv4 loses its route.</li>
+  </ul>
+
+  <h3 class="subhead">Android: an APK for the emulator</h3>
+  <ul class="changelog">
+    <li>The APK was <code>arm64-v8a</code> only, which left an emulator &mdash; the x86_64 images
+      that run acceptably on a development machine &mdash; with nothing to install. There are now
+      two APKs, one per ABI.</li>
+    <li>One per ABI rather than one carrying both: a fat APK would make every phone download the
+      x86_64 library to get the arm64 one. Each carries its own version code, because two artifacts
+      of one version cannot both claim the same one.</li>
+  </ul>
+
+  <h3 class="subhead">The backends are asked whether they still answer</h3>
+  <ul class="changelog">
+    <li>Every 30 seconds each backend is probed in parallel and the result recorded, where before a
+      group dialled once at startup and never again &mdash; a backend that stopped answering was
+      discovered by the request that needed it, which on a phone is an app that has already timed
+      out.</li>
+    <li>The probe is also the reconnect: the pool drops a connection idle for a minute, so a round
+      keeps one warm to a backend nobody has talked to.</li>
+  </ul>
+  <div class="warn">
+    <strong>A dead backend is still handed out.</strong>
+    This release only notices them: the balancer picks by index into a list it cannot change, so
+    taking one out needs the group to become mutable &mdash; a change to every holder of it. That
+    half is left for the next release, and the one to watch for in the meantime is a request served
+    by a backend the log has already reported as silent.
+  </div>
+
   <h2>Changelog</h2>
 
   <h3 class="subhead">Added</h3>
@@ -421,6 +466,14 @@ response_secs = 30</pre>
       and <code>random</code>.</li>
     <li><code>[timeouts]</code>: <code>connect_secs</code> and <code>response_secs</code>, covering
       one step each of talking to a backend.</li>
+    <li>IPv6 inside the tunnel: AAAA is answered from a ULA block the VPN routes for itself, and a
+      packet is routed by the family it arrived on.</li>
+    <li>Server: <code>[iroh] bind_ipv6</code> binds <code>[::]</code> on the configured
+      <code>bind_port</code> as well as <code>0.0.0.0</code>.</li>
+    <li>Client: the backends are probed on a timer, and
+      <code>EndpointGroup::health_snapshot()</code> reports what each answered.</li>
+    <li>Android: a second ABI. One APK per ABI &mdash; <code>arm64-v8a</code> and
+      <code>x86_64</code> &mdash; each with its own version code.</li>
   </ul>
 
   <h3 class="subhead">Changed</h3>
@@ -465,6 +518,17 @@ response_secs = 30</pre>
       there is no system prompt to borrow, the app asks for your login password itself.</li>
     <li>Desktop: bundles are signed, so an in-app update from 0.3.x verifies as usual through
       <code>latest.json</code>.</li>
+    <li>Traffic to a proxied domain now travels over IPv6 when the application resolves it to an
+      IPv6 address, which is what a resolver that prefers IPv6 will do. Nothing about the route
+      changes &mdash; the destination is still the name &mdash; but the packets crossing the TUN
+      are IPv6 ones, and a desktop TUN whose interface refused the IPv6 address stays on IPv4 and
+      says so in the log.</li>
+    <li>Server: <code>bind_ipv6</code> is off unless you set it, so an existing
+      <code>config.toml</code> binds exactly what it bound before.</li>
+    <li>Android: there are two APKs where there was one. Pick the one for the device &mdash;
+      <code>arm64-v8a</code> for a phone, <code>x86_64</code> for an emulator &mdash; and note
+      that the two carry different version codes, so a store that saw one does not treat the other
+      as the same build.</li>
   </ul>
 
   <footer class="site">
