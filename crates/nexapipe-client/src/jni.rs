@@ -1357,6 +1357,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
 
             let endpoint_group_arc = Arc::new(endpoint_group);
 
+            // The backends are asked whether they still answer, on a timer, for
+            // as long as this group is up. A phone changes network far more
+            // often than a server does, and without this the group only ever
+            // dialled at startup: a backend that went away — or a tunnel that
+            // stopped working after a switch to cellular — was noticed by the
+            // request that needed it, which on Android is an app that has
+            // already timed out.
+            endpoint_group_arc.start_health_probe();
+
             // Deliberately no local TCP listener here. On Android the tunnel is
             // reached through the TUN fd (nativeStartTunProxy) alone; a
             // listener on 127.0.0.1 is reachable by every other app on the
