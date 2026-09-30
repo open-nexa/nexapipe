@@ -10,6 +10,33 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Changed
+
+- **The desktop credential door now stands in front of the whole Config page.**
+  Confirming who is at the keyboard — Touch ID or the account password on macOS,
+  Windows Hello or the account password on Windows, PAM on Linux — is what opens
+  the page, rather than something each reveal button asks for on its own. A shut
+  page renders none of it: no nodes, no connection strings, no two-factor
+  secrets, no relay, so there is nothing on the screen and nothing in the
+  document to read out of it. The window is still two minutes and still shuts
+  itself; the button at the top of the page opens it again, and shuts it early.
+- **The relay settings moved from Settings to Config.** Which relay this machine
+  dials is part of how it connects, not a preference about how the app looks, and
+  a custom relay's bearer token is a credential — so it now sits with the rest of
+  the connection configuration, behind the same door.
+
+### Fixed
+
+- **A password the operating system did not accept said nothing.** Asking and
+  being refused came back as "the door is shut", which the UI read as its own
+  instruction to stay quiet: a wrong password, a dismissed prompt or a failed
+  fingerprint left the page exactly as it had been, and the button that was
+  pressed answered for nothing. A press that does nothing now says why — the
+  locked page reports whether the password was not accepted or the device did
+  not confirm, and the password field carries that line when it opens again.
+
 ## [0.4.0] — 2026-09-30
 
 A readable version of this release, with downloads, is published at
