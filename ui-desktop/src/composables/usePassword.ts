@@ -20,6 +20,14 @@ export interface PasswordOptions {
   title: string;
   message: string;
   confirmText?: string;
+  /**
+   * Why the previous attempt was refused, already in the user's language.
+   *
+   * Shown inside the dialog the next time it opens, which is where a password
+   * that was not accepted belongs: the user is about to type another one, and
+   * "the last one was wrong" is the one thing worth knowing before they do.
+   */
+  error?: string;
 }
 
 export interface PasswordRequest extends Required<PasswordOptions> {}
@@ -40,6 +48,7 @@ export function askPassword(options: PasswordOptions): Promise<string | null> {
     title: options.title,
     message: options.message,
     confirmText: options.confirmText ?? translate('common.confirm'),
+    error: options.error ?? '',
   };
 
   return new Promise<string | null>((resolve) => {

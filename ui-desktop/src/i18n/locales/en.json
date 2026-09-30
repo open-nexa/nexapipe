@@ -263,7 +263,9 @@
     "passwordLabel": "Password",
     "reasonConnection": "Show a node's connection string",
     "reasonSecret": "Show a node's two-factor secret",
-    "reasonNodeId": "Copy this endpoint's Node ID"
+    "reasonNodeId": "Copy this endpoint's Node ID",
+    "wrongPassword": "That password was not accepted.",
+    "notConfirmed": "This device did not confirm it is you."
   },
   "error": {
     "unknown": "Something went wrong. Please try again.",

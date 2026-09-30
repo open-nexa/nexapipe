@@ -25,8 +25,9 @@ export async function gateStatus(): Promise<GateStatus> {
  * it on the system prompt at all. `password` is only wanted where
  * [`GateStatus.needsPassword`] said so: PAM has no dialog of its own.
  *
- * Rejects with `credentials.locked` when the user was asked and said no, which is an instruction
- * to the caller rather than a failure: stay shut, and say nothing.
+ * Rejects with `credentials.locked` when the user was asked and the answer was no — a password
+ * that was not accepted, or a prompt that was dismissed. Not a failure of the machine's, and not
+ * silence either: `ensureUnlocked` turns it into the one line the page behind it prints.
  */
 export async function unlockCredentials(reason: string, password?: string): Promise<GateStatus> {
   return await invoke<GateStatus>('unlock_credentials', {

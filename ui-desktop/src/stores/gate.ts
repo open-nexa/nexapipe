@@ -39,6 +39,20 @@ let ticker: ReturnType<typeof setInterval> | null = null;
 
 const toast = useToast();
 
+/**
+ * Why the last attempt to open the door did not open it, in the user's language.
+ *
+ * `null` is not "nobody has tried": it is "the last thing that happened was not
+ * a refusal". A refusal is worth keeping because the alternative is silence —
+ * the user pressed a button, the operating system said no, and a page that then
+ * looks exactly as it did before is a page that has swallowed the answer.
+ *
+ * Cleared when the next attempt starts, so it describes that attempt's
+ * predecessor and nothing older: a message from five minutes ago is not news
+ * about the button that was just pressed.
+ */
+const refusal = ref<string | null>(null);
+
 /** How much of the window is left. Zero the moment it lapses, shut or open. */
 const msRemaining = computed(() => (endsAt > now.value ? endsAt - now.value : 0));
 
@@ -137,6 +151,11 @@ async function sayUnavailable(): Promise<void> {
  * there was nothing to ask, and every caller treats false as "do not show it".
  */
 async function ensureUnlocked(reason: string): Promise<boolean> {
+  // What the previous attempt came back with, kept for one more attempt so the
+  // password dialog can open with it on the field the user is about to fill in.
+  const previous = refusal.value;
+  refusal.value = null;
+
   if (status.value === null) await refreshGate();
   if (unlocked.value) return true;
 
@@ -150,6 +169,7 @@ async function ensureUnlocked(reason: string): Promise<boolean> {
     const typed = await askPassword({
       title: translate('gate.passwordTitle'),
       message: reason,
+      error: previous ?? undefined,
     });
     // Dismissed, or left empty: the user did not ask for this after all.
     if (typed === null) return false;
@@ -164,10 +184,17 @@ async function ensureUnlocked(reason: string): Promise<boolean> {
       await sayUnavailable();
       return false;
     }
-    // Asked and refused: the user said no, and there is nothing to add to that.
-    // Anything else is the operating system failing, and its own words go in the
-    // details rather than in the headline.
-    if (key !== 'error.credentials.locked') {
+    if (key === 'error.credentials.locked') {
+      // The operating system was asked and the answer was no. Which no it was
+      // is something only this call knows: a password typed here and refused is
+      // a wrong password, while a system prompt that was dismissed is a user who
+      // changed their mind — and both leave the door shut with nothing said
+      // unless the page behind it is told why.
+      refusal.value =
+        password === undefined ? translate('gate.notConfirmed') : translate('gate.wrongPassword');
+    } else {
+      // Anything else is the operating system failing, and its own words go in
+      // the details rather than in the headline.
       toast.error(error, 'error.credentials.gate_failed');
     }
     console.error('[gate] the door did not open:', errorDetail(error));
@@ -177,12 +204,22 @@ async function ensureUnlocked(reason: string): Promise<boolean> {
   return unlocked.value;
 }
 
+/** Forgets what the last refusal said. A page that has been left and reopened has nothing to report. */
+export function clearRefusal(): void {
+  refusal.value = null;
+}
+
 export function useCredentialGate() {
   return {
     /** Whether a credential may be shown right now. */
     unlocked,
     /** Milliseconds left in the window; zero when it is shut. */
     msRemaining,
+    /**
+     * Why the last attempt to open the door did not open it, or `null` when the
+     * last attempt is not what the page is looking at.
+     */
+    refusal: computed(() => refusal.value),
     /** Whether the door has been read at all. Nothing is claimed before it has. */
     ready: computed(() => status.value !== null),
     /**

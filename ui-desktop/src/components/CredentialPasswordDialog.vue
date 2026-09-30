@@ -93,8 +93,21 @@ onBeforeUnmount(() => {
             type="password"
             autocomplete="current-password"
             class="password-input"
+            :class="{ 'password-input--rejected': request.error !== '' }"
+            :aria-invalid="request.error !== '' || undefined"
+            aria-describedby="credential-password-error"
             @keydown.enter.prevent="submit"
           />
+          <!-- What the last attempt came back with, when it came back with something. The field
+               is where the answer is typed, so it is where the answer is judged. -->
+          <p
+            v-if="request.error"
+            id="credential-password-error"
+            class="password-error"
+            role="alert"
+          >
+            {{ request.error }}
+          </p>
         </form>
 
         <footer class="password-actions">
@@ -190,6 +203,27 @@ onBeforeUnmount(() => {
 .password-input:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
+}
+
+.password-input--rejected {
+  border-color: var(--error);
+}
+
+.password-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-size-12);
+  color: var(--error-text);
+}
+
+.password-error::before {
+  content: '';
+  width: 4px;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--error);
+  flex-shrink: 0;
 }
 
 .password-actions {

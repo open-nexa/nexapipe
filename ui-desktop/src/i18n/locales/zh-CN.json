@@ -263,7 +263,9 @@
     "passwordLabel": "密码",
     "reasonConnection": "显示某个节点的连接串",
     "reasonSecret": "显示某个节点的两步验证密钥",
-    "reasonNodeId": "复制本端的节点 ID"
+    "reasonNodeId": "复制本端的节点 ID",
+    "wrongPassword": "密码不正确，请重试。",
+    "notConfirmed": "本设备未能确认是你本人。"
   },
   "error": {
     "unknown": "出错了，请重试。",
