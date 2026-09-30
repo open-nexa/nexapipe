@@ -68,6 +68,20 @@ class NexaVpnService : VpnService() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var underlyingNetwork: Network? = null
+    // The VPN networks Android created for our own TUN. Android does not label
+    // a VPN network with the app that owns it, so ours is identified by which
+    // network appeared when we called establish() — see trackOwnVpnNetwork.
+    // Replaced wholesale rather than mutated in place: establish runs on the IO
+    // dispatcher while stopVPN() and onRevoke() run on the main thread.
+    @Volatile private var ownVpnNetworks: Set<Network> = emptySet()
+    // Whether the last establish could not tell which VPN network was ours.
+    // Only then does vpnSlot() fall back to "a single unknown VPN while our own
+    // session is up is our own tunnel"; the rest of the time identity decides.
+    @Volatile private var ownVpnUnidentified = false
+    // Whether the user agreed, for this connect, that Nexa may take the slot
+    // from another VPN app. Never set on the rebuild path: a network switch
+    // must not revoke a VPN that took over while ours was being rebuilt.
+    @Volatile private var allowTakeover = false
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var isUserStarted = false
 
@@ -120,8 +134,9 @@ class NexaVpnService : VpnService() {
         serviceScope.cancel()
     }
 
-    fun startVPN(domains: Set<String>) {
+    fun startVPN(domains: Set<String>, allowTakeover: Boolean = false) {
         this.allowedDomains = domains.toMutableSet()
+        this.allowTakeover = allowTakeover
         isUserStarted = true
         // A new session begins: clear the stale "revoked" marker from a
         // previous session (consumed by VpnViewModel.syncVpnServiceState()).
@@ -166,7 +181,11 @@ class NexaVpnService : VpnService() {
             when (intent.action) {
                 ACTION_START -> {
                     val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
-                    startVPN(domains.toSet())
+                    // Whether the UI asked and was told to take the slot from
+                    // another VPN app. Absent means no: a start that carries no
+                    // such answer must not revoke anything.
+                    val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
+                    startVPN(domains.toSet(), takeover)
                 }
                 ACTION_STOP -> {
                     stopVPN()
@@ -196,6 +215,8 @@ class NexaVpnService : VpnService() {
         isRunning = false
         tunProxyStarted = false
         isServiceActive = false
+        ownVpnNetworks = emptySet()
+        ownVpnUnidentified = false
         wasRevoked = true
         reconnectJob?.cancel()
         reconnectJob = null
@@ -207,7 +228,7 @@ class NexaVpnService : VpnService() {
             // Notified before stopping: stopSelf() runs onDestroy(), which
             // cancels this scope, and the UI would otherwise wait for a signal
             // that the shutdown it triggered cut off.
-            notifyVpnRevoked()
+            notifyVpnRevoked(getString(R.string.error_vpn_taken_over))
             stopSelf()
         }
     }
@@ -217,6 +238,8 @@ class NexaVpnService : VpnService() {
         isUserStarted = false
         tunProxyStarted = false
         isServiceActive = false
+        ownVpnNetworks = emptySet()
+        ownVpnUnidentified = false
         // First, so an establish that is already running sees it however far
         // it gets.
         isStopping = true
@@ -252,7 +275,7 @@ class NexaVpnService : VpnService() {
         }
 
         serviceScope.launch {
-            if (!establishVpnInternal()) {
+            if (!establishVpnInternal(allowTakeover)) {
                 Log.d(TAG, "VPN establishment failed")
                 isRunning = false
                 // Nothing left to shut down when the service is already going
@@ -267,10 +290,15 @@ class NexaVpnService : VpnService() {
     /**
      * Establishes the VPN and the TUN proxy. Shared by the initial setup and
      * by the reconnect after a network switch.
+     *
+     * [allowTakeover] says the user has agreed to take the slot from another
+     * VPN app. It is the only way past the guard below, and the rebuild path
+     * never passes it.
+     *
      * @return true on success; false on failure (the caller then handles the
      *         isRunning state).
      */
-    private suspend fun establishVpnInternal(): Boolean {
+    private suspend fun establishVpnInternal(allowTakeover: Boolean): Boolean {
         // A teardown that landed while this was still queued: none of what
         // follows would outlive the service, so do not even ask Android for a
         // TUN slot.
@@ -282,15 +310,31 @@ class NexaVpnService : VpnService() {
         // Mutual-exclusion guard: Android allows only one active VpnService
         // TUN per user. If a foreign VPN app (e.g. Clash) currently owns the
         // slot, establish() would silently revoke it — refuse instead of
-        // stealing it back. This single choke point covers both the initial
-        // setup and the reconnect path (rebuildTunnel), including the race
-        // where the other VPN started while our session flags were still up.
-        if (isForeignVpnActive()) {
-            Log.e(TAG, "Another VPN app is active; refusing to establish our VPN (would revoke it)")
+        // stealing it, unless the user agreed to take it. This single choke
+        // point covers both the initial setup and the reconnect path
+        // (rebuildTunnel), including the race where the other VPN started
+        // while our session flags were still up.
+        val slot = vpnSlot()
+        val decision = VpnTakeoverPolicy.decide(
+            slot,
+            if (allowTakeover) VpnTakeoverChoice.TakeOver else VpnTakeoverChoice.Cancel
+        )
+        if (decision != VpnTakeoverDecision.Proceed) {
+            val reason = when (decision) {
+                is VpnTakeoverDecision.RefuseAlwaysOn ->
+                    getString(R.string.error_vpn_always_on, decision.packageName)
+                else -> getString(R.string.error_vpn_taken_over)
+            }
+            Log.e(TAG, "Another VPN owns the slot ($slot); refusing to establish")
             wasRevoked = true
-            notifyVpnRevoked()
+            notifyVpnRevoked(reason)
             return false
         }
+
+        val cm = connectivityManager
+        // Snapshot before establish(): the VPN network that appears on top of
+        // this is the one Android created for us.
+        val vpnNetworksBefore = cm?.let { UnderlyingNetworkSelector.vpnNetworks(it) }.orEmpty()
 
         return try {
             val builder = Builder()
@@ -324,6 +368,7 @@ class NexaVpnService : VpnService() {
                 Log.d(TAG, "Failed to establish VPN")
                 return false
             }
+            trackOwnVpnNetwork(vpnNetworksBefore)
 
             // Transfer TUN fd ownership to Rust (the PFD is no longer usable
             // after detachFd).
@@ -389,16 +434,75 @@ class NexaVpnService : VpnService() {
     }
 
     /**
-     * Whether a foreign VPN app (e.g. Clash) currently owns the platform VPN
-     * slot. Our own session is exempt via isServiceActive: during a reconnect
-     * the old TUN is torn down before the new one is established, and
-     * isServiceActive stays true throughout, so our own rebuilding session is
-     * never misdetected as a foreign VPN.
+     * Who owns the platform VPN slot right now.
+     *
+     * Our own tunnel is excluded by identity rather than by a flag: a flag
+     * cannot tell "our session is up" apart from "our session is up and another
+     * app has already taken the slot", which is exactly the rebuild race that
+     * used to revoke the other app.
      */
-    private fun isForeignVpnActive(): Boolean {
-        if (isServiceActive) return false
-        val cm = connectivityManager ?: return false
-        return UnderlyingNetworkSelector.hasActiveVpnNetwork(cm)
+    private fun vpnSlot(): VpnSlot {
+        val cm = connectivityManager ?: return VpnSlot.Free
+        val unknown = UnderlyingNetworkSelector.vpnNetworks(cm) - ownVpnNetworks
+        val foreign = when {
+            unknown.isEmpty() -> false
+            // Our own tunnel could not be told apart from a foreign one when it
+            // was established. Calling it foreign would tear the session down on
+            // the next network switch, which is worse than leaving the old
+            // exemption in place for a single network.
+            ownVpnUnidentified && isServiceActive -> unknown.size > 1
+            else -> true
+        }
+        if (!foreign) {
+            return if (isServiceActive) VpnSlot.OwnSession else VpnSlot.Free
+        }
+        // Which network belongs to which package is not something Android tells
+        // an app, so a configured always-on VPN is taken to be the VPN that is
+        // up. Refusing is the safe answer: Android would restore it anyway.
+        val alwaysOn = UnderlyingNetworkSelector.alwaysOnVpnPackage(this)
+            ?: return VpnSlot.ForeignVpn
+        return if (VpnTakeoverPolicy.isForeignAlwaysOn(alwaysOn, packageName)) {
+            VpnSlot.AlwaysOnVpn(alwaysOn)
+        } else {
+            VpnSlot.ForeignVpn
+        }
+    }
+
+    /**
+     * Records the VPN network Android created for the TUN just established.
+     *
+     * [before] is the set of VPN networks that existed when establish() was
+     * called; whatever appears on top of it is ours. Android registers that
+     * network asynchronously, hence the short wait: without a recorded network
+     * the next rebuild would see our own tunnel as a foreign VPN and refuse to
+     * re-establish, which would break network switching altogether.
+     */
+    private suspend fun trackOwnVpnNetwork(before: Set<Network>) {
+        val cm = connectivityManager ?: return
+        var created: Set<Network> = emptySet()
+        for (attempt in 0 until OWN_NETWORK_POLL_ATTEMPTS) {
+            val appeared = UnderlyingNetworkSelector.vpnNetworks(cm) - before
+            if (appeared.isNotEmpty()) {
+                created = appeared
+                break
+            }
+            if (attempt < OWN_NETWORK_POLL_ATTEMPTS - 1) delay(OWN_NETWORK_POLL_MS)
+        }
+        if (created.size != 1) {
+            // Nothing appeared, or a foreign VPN appeared in the same window and
+            // the two cannot be told apart. Guessing would let a rebuild revoke
+            // that foreign VPN, so nothing is recorded and vpnSlot() keeps its
+            // isServiceActive exemption for one network.
+            ownVpnUnidentified = true
+            Log.w(TAG, "Could not tell which VPN network is ours (${created.size} appeared)")
+            return
+        }
+        val current = UnderlyingNetworkSelector.vpnNetworks(cm)
+        // Drop the networks that are gone: the set would otherwise grow by one
+        // on every network switch, none of them ever matching again.
+        ownVpnNetworks = (ownVpnNetworks intersect current) + created
+        ownVpnUnidentified = false
+        Log.d(TAG, "Own VPN network: ${created.first()}")
     }
 
     /**
@@ -612,8 +716,11 @@ class NexaVpnService : VpnService() {
             .onFailure { Log.e(TAG, "Reconnect: nativeDropConnections failed: ${it.message}") }
 
         // 3. Re-establish the VPN (new TUN fd + new underlying network) and
-        //    start the TUN proxy.
-        if (!establishVpnInternal()) {
+        //    start the TUN proxy. Never with the user's takeover consent: a
+        //    network switch is not an answer to "may we disconnect the other
+        //    app", and a foreign VPN that arrived during the rebuild must not
+        //    be revoked by it.
+        if (!establishVpnInternal(allowTakeover = false)) {
             throw Exception("Reconnect: failed to re-establish VPN/TUN proxy")
         }
 
@@ -679,6 +786,17 @@ class NexaVpnService : VpnService() {
         const val ACTION_START = "com.nexa.pipe.vpn.ACTION_START"
         const val ACTION_STOP = "com.nexa.pipe.vpn.ACTION_STOP"
         const val EXTRA_DOMAINS = "com.nexa.pipe.vpn.EXTRA_DOMAINS"
+        // Whether the user agreed that Nexa may take the slot from another VPN
+        // app. Carried by ACTION_START; absent (or false) means the service
+        // refuses to establish rather than revoking the other app.
+        const val EXTRA_ALLOW_TAKEOVER = "com.nexa.pipe.vpn.EXTRA_ALLOW_TAKEOVER"
+
+        // How long to wait for Android to register the VPN network of the TUN
+        // we just established, and how often to look. Short on purpose: this
+        // runs inside establish(), between the TUN coming up and the proxy
+        // starting.
+        private const val OWN_NETWORK_POLL_ATTEMPTS = 5
+        private const val OWN_NETWORK_POLL_MS = 100L
 
         // Network-switch reconnect parameters
         private const val RECONNECT_DEBOUNCE_MS = 1_500L
@@ -717,17 +835,19 @@ class NexaVpnService : VpnService() {
 
         // Push channel for the "VPN slot lost" event so a foreground UI
         // updates immediately instead of waiting for the next resume-time
-        // syncVpnServiceState() call.
+        // syncVpnServiceState() call. The reason is the message to show: the
+        // slot can be lost to an ordinary VPN app or to the device's always-on
+        // one, and those need different words.
         @Volatile
         @JvmStatic
-        private var revokedListener: (() -> Unit)? = null
+        private var revokedListener: ((String) -> Unit)? = null
 
-        fun setRevokedListener(listener: (() -> Unit)?) {
+        fun setRevokedListener(listener: ((String) -> Unit)?) {
             revokedListener = listener
         }
 
-        private fun notifyVpnRevoked() {
-            revokedListener?.invoke()
+        private fun notifyVpnRevoked(reason: String) {
+            revokedListener?.invoke(reason)
         }
 
         /**

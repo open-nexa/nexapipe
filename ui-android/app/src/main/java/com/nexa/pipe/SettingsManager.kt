@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.core.content.edit
 import com.nexa.pipe.ui.NodeConfig
 import com.nexa.pipe.ui.NodeTwoFactor
+import com.nexa.pipe.vpn.VpnTakeoverChoice
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.decodeFromString
@@ -57,6 +58,11 @@ class SettingsManager(context: Context) {
         // Language tag of the app UI, e.g. "zh-CN". Empty means "follow the
         // system", which is the default.
         private const val KEY_LANGUAGE = "app_language"
+
+        // What the user chose the last time another VPN app owned the slot:
+        // "take_over" or "cancel". Absent means "ask every time", which is the
+        // default — a remembered choice is only written when one was made.
+        private const val KEY_VPN_TAKEOVER_CHOICE = "vpn_takeover_choice"
 
         /**
          * The saved language tag, or "" for "follow the system".
@@ -334,5 +340,28 @@ class SettingsManager(context: Context) {
     /** Loads the bearer token for the custom relay, if it needs one. */
     fun loadRelayAuthToken(): String {
         return secrets.unseal(secretPrefs.getString(KEY_RELAY_AUTH_TOKEN, ""))
+    }
+
+    /**
+     * Stores what the user wants done when another VPN app owns the slot.
+     *
+     * [VpnTakeoverChoice.Ask] removes the key rather than writing "ask": the
+     * default is a preference file that does not mention the choice at all, so
+     * an app that cannot read a value back is back to asking rather than to a
+     * remembered answer nobody remembers making.
+     */
+    fun saveVpnTakeoverChoice(choice: VpnTakeoverChoice) {
+        if (choice == VpnTakeoverChoice.Ask) {
+            prefs.edit { remove(KEY_VPN_TAKEOVER_CHOICE) }
+        } else {
+            prefs.edit { putString(KEY_VPN_TAKEOVER_CHOICE, choice.name) }
+        }
+    }
+
+    /** Loads the remembered takeover choice; [VpnTakeoverChoice.Ask] by default. */
+    fun loadVpnTakeoverChoice(): VpnTakeoverChoice {
+        val stored = prefs.getString(KEY_VPN_TAKEOVER_CHOICE, null) ?: return VpnTakeoverChoice.Ask
+        return runCatching { VpnTakeoverChoice.valueOf(stored) }
+            .getOrDefault(VpnTakeoverChoice.Ask)
     }
 }

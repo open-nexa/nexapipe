@@ -211,7 +211,18 @@
     <string name="notify_backend_unreachable">The network changed and no backend answered on the new one. Reconnect if the tunnel stays unusable.</string>
     <string name="notify_tunnel_rebuild_failed">The tunnel could not be rebuilt after the network changed. Please reconnect.</string>
 
+    <!-- Taking the single VPN slot from another VPN app -->
+    <string name="vpn_takeover_title">Another VPN is already active</string>
+    <string name="vpn_takeover_body">Android allows only one VPN at a time, so continuing will disconnect it.</string>
+    <string name="vpn_takeover_confirm">Take over</string>
+    <string name="vpn_takeover_remember">Remember my choice</string>
+    <string name="vpn_takeover_reset_title">Ask me again</string>
+    <string name="vpn_takeover_reset_subtitle">Remembered: %1$s when another VPN is active.</string>
+    <string name="vpn_takeover_choice_take_over">take over</string>
+    <string name="vpn_takeover_choice_cancel">never take over</string>
+
     <!-- Errors shown on the status card / as a toast -->
+    <string name="error_vpn_always_on">%1$s is the device\'s always-on VPN. Android restores it straight away, so Nexa cannot take its place — turn always-on VPN off there first.</string>
     <string name="error_vpn_taken_over">Another app (e.g. Clash) took over the tunnel. Android allows only one active tunnel at a time — disconnect the other app to use Nexa.</string>
     <string name="error_native_library">Native library not loaded. Please check if libnexapipe_client.so is properly included in the APK.</string>
     <string name="error_vpn_permission">Proxy permission not granted. Grant it from the permission guide first.</string>

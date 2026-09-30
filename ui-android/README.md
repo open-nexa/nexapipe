@@ -51,6 +51,11 @@ so the tunnel survives Wi-Fi ↔ cellular switches.
   Services, works offline), or export your own credentials as a QR code.
 - Pre-connect warm-up so the first request after the VPN comes up does not wait
   for the QUIC/relay handshake.
+- Asks before taking over another VPN app. Android allows one VPN at a time and
+  `VpnService.Builder.establish()` revokes the other app without asking anyone,
+  so every VPN Nexa can see (not just the default one) is checked before the
+  first connect and the user decides — once, or remembered. An always-on VPN is
+  refused outright: Android would restore it immediately.
 - Jetpack Compose UI (`VpnControlScreen`, `PermissionGuideScreen`), node list
   and settings persisted in `SharedPreferences`.
 
