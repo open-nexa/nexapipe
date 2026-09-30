@@ -12,10 +12,14 @@
 //!
 //! Two pieces, because only one of them belongs in the OS keychain:
 //!
-//! * A **master key** — 32 random bytes — held by the keychain (Keychain on
-//!   macOS, Credential Manager on Windows, the Secret Service on Linux). Only
-//!   *it* is worth putting there: it is one small entry, and losing it is a
-//!   single, comprehensible failure.
+//! * A **master key** — 32 random bytes — held by the keychain (Credential
+//!   Manager on Windows, the Secret Service on Linux). Only *it* is worth
+//!   putting there: it is one small entry, and losing it is a single,
+//!   comprehensible failure. macOS has a keychain too but keeps this key in the
+//!   same `0600` file as the fallback instead, because reading a keychain entry
+//!   is an *access* macOS asks about with a sheet of its own — at startup, and
+//!   again whenever the app's signature changes — and there is no way to read
+//!   one without being asked.
 //! * The **credentials themselves**, in an AES-256-GCM encrypted JSON file the
 //!   app owns. A file rather than one keychain entry per credential because the
 //!   elevated service has to be able to read them on two platforms — root and
@@ -25,8 +29,8 @@
 //! # Failure
 //!
 //! A keychain that cannot be reached (headless Linux with no Secret Service, a
-//! locked keychain) falls back to a `0600` file **and says so**, through
-//! [`status`]. It never falls back to plaintext: a credential store that quietly
+//! locked keychain) — or that this platform does not use — falls back to a
+//! `0600` file **and says so**, through [`status`]. It never falls back to plaintext: a credential store that quietly
 //! degrades is how a secret ends up in a file nobody thinks is sensitive, which
 //! is the bug this module exists to remove.
 
@@ -242,6 +246,18 @@ impl MasterKey {
 
     /// The uncached half of [`Self::load`]: where the key actually comes from.
     fn load_uncached(dir: &Path) -> Result<Self, AppError> {
+        // macOS used to keep the key in the keychain and does not any more, so
+        // the one time it is still found there it moves out — see
+        // [`Self::migrate_keychain_key`].
+        #[cfg(target_os = "macos")]
+        if let Some(key) = Self::migrate_keychain_key(dir) {
+            return Ok(Self {
+                key,
+                source: KeySource::File,
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
         if let Some(key) = Self::from_keychain(dir) {
             return Ok(Self {
                 key,
@@ -249,9 +265,10 @@ impl MasterKey {
             });
         }
 
-        // No keychain would take it — headless Linux without a Secret Service, a
-        // locked keychain, a build without the platform backend. The credentials
-        // are still encrypted; only the key is now a private file.
+        // No keychain holds it — headless Linux with no Secret Service, a locked
+        // keychain, a build without the platform backend, or macOS, which keeps
+        // the key in this file on purpose. The credentials are still encrypted;
+        // only the key is now a private file.
         let key = Self::from_file(dir)?;
         Ok(Self {
             key,
@@ -259,13 +276,50 @@ impl MasterKey {
         })
     }
 
+    /// Moves the master key out of the keychain and into the file, once.
+    ///
+    /// The key is what every credential in the store is sealed with, so it is
+    /// moved rather than replaced: minting a fresh one here would leave every
+    /// stored node unreadable, which is indistinguishable from losing them.
+    ///
+    /// `None` when there is nothing to move, which is every launch but the first
+    /// after this change — a file already holding the key, an install that never
+    /// used the keychain, a keychain that will not answer. Asking is the reason
+    /// this is guarded by the file's absence rather than done every time: it is
+    /// the one read that puts a sheet on the screen, and it is spent once.
+    #[cfg(target_os = "macos")]
+    fn migrate_keychain_key(dir: &Path) -> Option<[u8; KEY_LEN]> {
+        if dir.join(FALLBACK_KEY_FILE).exists() {
+            return None;
+        }
+
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok()?;
+        let key = parse_key(&entry.get_password().ok()?)?;
+
+        // Written before the keychain copy is deleted, so there is no moment in
+        // which neither of them holds it.
+        write_private(&dir.join(FALLBACK_KEY_FILE), &hex(&key)).ok()?;
+
+        // A copy left behind is a copy macOS still asks about. Deleted on a best
+        // effort: a key now in two places is not a failure, but it is the thing
+        // this change exists to stop.
+        if let Err(e) = entry.delete_credential() {
+            tracing::warn!("the master key moved out of the keychain, but the copy stayed: {e}");
+        }
+        Some(key)
+    }
+
     /// The keychain's copy, generating one when the keychain has none.
+    ///
+    /// macOS is deliberately not one of these platforms: see
+    /// [`Self::migrate_keychain_key`].
     ///
     /// `None` when there is no usable keychain at all — not when the entry is
     /// merely missing, which is the ordinary first run and creates one.
     ///
     /// `dir` is where a key that predates a working keychain would be: see
     /// [`Self::adopt_file_key`].
+    #[cfg(not(target_os = "macos"))]
     fn from_keychain(dir: &Path) -> Option<[u8; KEY_LEN]> {
         use keyring::Entry;
 
@@ -326,6 +380,7 @@ impl MasterKey {
     /// `None` when there is no file key to move, or when the keychain would not
     /// take it — either way the caller falls back to the file, which is exactly
     /// where the key already is.
+    #[cfg(not(target_os = "macos"))]
     fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Option<[u8; KEY_LEN]> {
         let key = Self::file_key(dir)?;
 
@@ -368,7 +423,7 @@ impl MasterKey {
             Some(key) => Some(key),
             None => {
                 tracing::warn!(
-                    "{} is not a 32-byte key; not moving it into the keychain",
+                    "{} is not a 32-byte key; not replacing it",
                     path.display()
                 );
                 None

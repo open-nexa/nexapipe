@@ -26,6 +26,15 @@ For what comes next, and for why some things are deliberately not planned, see
   dials is part of how it connects, not a preference about how the app looks, and
   a custom relay's bearer token is a credential — so it now sits with the rest of
   the connection configuration, behind the same door.
+- **macOS stopped using the keychain.** Reading a keychain entry is an access
+  macOS asks about with a sheet of its own — at startup, again whenever the app's
+  signature changes, and once more for every prompt — which is how one unlock
+  turned into two sheets, and how a locked page once came up with no way out.
+  The master key now lives in the same `0600` file the other platforms fall back
+  to, and is moved out of the keychain on the first launch rather than replaced,
+  so nothing already stored becomes unreadable. The door asks Authorization
+  Services instead — the framework a System Settings pane uses to put a lock on a
+  page, which brings its own sheet and asks nothing of the keychain.
 
 ### Fixed
 

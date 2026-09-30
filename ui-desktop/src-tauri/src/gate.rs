@@ -1,6 +1,6 @@
 //! The door in front of the credentials this app holds.
 //!
-//! `credentials` seals them at rest under a key the OS keychain holds, and
+//! `credentials` seals them at rest under a key the operating system holds, and
 //! `credentials::mask` keeps a whole value off the screen unless the user asks
 //! for it. Neither asks *who* is asking. The store is open for as long as the
 //! login session is, so anyone at the keyboard could read a TOTP secret; this
@@ -9,8 +9,9 @@
 //! Authentication is delegated to the operating system and to nothing else.
 //! There is deliberately no app password — a credential of its own would be one
 //! more thing to forget, reset and attack — so what gates the surfaces is the
-//! same thing that gates the device: Touch ID or the account password on macOS,
-//! Windows Hello or the account password on Windows, and PAM on Linux.
+//! same thing that gates the device: Authorization Services on macOS and Windows
+//! Hello on Windows, each of which brings its own prompt, and PAM on Linux,
+//! which has none and so is handed a password the UI collected.
 //!
 //! Two rules shape the rest of the code, both inherited from the Android app's
 //! `CredentialGate`, which is the same door on another platform:
@@ -98,8 +99,8 @@ pub trait OsGate {
 /// One function per platform rather than a type alias, because a type alias
 /// names a type and this has to hand back a value.
 #[cfg(target_os = "macos")]
-pub fn os() -> macos::Keychain {
-    macos::Keychain
+pub fn os() -> macos::Authorization {
+    macos::Authorization
 }
 
 /// The door this platform provides.

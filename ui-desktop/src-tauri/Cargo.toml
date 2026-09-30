@@ -76,12 +76,16 @@ nexapipe-client = { path = "../../crates/nexapipe-client", features = [
 # The credential door (src/gate.rs) asks the operating system who is at the
 # keyboard. Each of these is already built for its platform as part of something
 # else — `security-framework` by `keyring`'s macOS backend, `windows` (0.62) and
-# `windows-future` by iroh's `netwatch` — so naming them here adds an edge to
-# the graph and no code to the build. Only PAM is new, and only to Linux.
+# `windows-future` by iroh's `netwatch` — so naming them here adds an edge to the
+# graph and no code to the build. Only PAM is new, and only to Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
-# A keychain item whose access control requires user presence: reading it is
-# what puts the system's own prompt on the screen.
+# Authorization Services: asking the Security Server for a right is what puts
+# the system's own sheet on the screen, which is the prompt this platform
+# brings. The `-sys` crate is named alongside it because the safe wrapper does
+# not expose the status codes, and "the user dismissed the sheet" is worth
+# telling apart from "there was nowhere to put one".
 security-framework = "3"
+security-framework-sys = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux has no system prompt of its own to borrow, so the question goes to PAM.

@@ -182,7 +182,7 @@
     "credentialProtection": "Credential protection",
     "credentialProtectionHint": "Where the key that encrypts your stored credentials is kept",
     "credentialProtectionKeychain": "Encrypted, key held by the system keychain",
-    "credentialProtectionFile": "Encrypted, key kept in a private file — no keychain would take it",
+    "credentialProtectionFile": "Encrypted, key kept in a private file",
     "credentialProtectionUnknown": "Unknown",
     "tun": "TUN Settings",
     "tunDeviceName": "TUN Device Name",

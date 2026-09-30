@@ -1,7 +1,7 @@
 //! The Linux door: PAM, with a password the UI collects.
 //!
 //! Linux has no system prompt of its own to borrow — nothing that answers for
-//! the user the way macOS's keychain sheet or Windows Hello does — so the
+//! the user the way macOS's Authorization Services sheet or Windows Hello does — so the
 //! question goes to PAM, which is the one answer every distribution agrees on.
 //! What it does not come with is a dialog, so unlike the other two platforms
 //! this one asks the UI to collect the password and hands it over; see

@@ -1,8 +1,8 @@
 /**
  * Promise-based password prompt, for the one platform that needs one.
  *
- * macOS and Windows bring their own prompt — a keychain sheet, a Windows Hello dialog — so asking
- * is a single call that blocks on the system. Linux has nothing to borrow: PAM will ask for a
+ * macOS and Windows bring their own prompt — an Authorization Services sheet, a Windows Hello
+ * dialog — so asking is a single call that blocks on the system. Linux has nothing to borrow: PAM will ask for a
  * password and expects the application to have collected it, so this is the dialog that collects
  * it, in the shape `useConfirm` established (a module singleton and a promise, rather than a
  * `visible` prop somebody has to remember to set).
