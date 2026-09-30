@@ -22,7 +22,8 @@ import { useCredentialGate } from '../stores/gate';
 const props = defineProps<{ reason: string }>();
 
 const { t } = useI18n();
-const { unlocked, msRemaining, ready, canAuthenticate, lock, ensureUnlocked } = useCredentialGate();
+const { unlocked, msRemaining, ready, canAuthenticate, pending, lock, ensureUnlocked } =
+  useCredentialGate();
 
 /** mm:ss, which is all the precision a two-minute window needs. */
 const remaining = computed(() => {
@@ -71,14 +72,17 @@ async function toggle(): Promise<void> {
   <div class="credential-lock" :class="`credential-lock--${state}`">
     <AppIcon :name="state === 'unlocked' ? 'unlock' : 'lock'" :size="14" />
     <span class="credential-lock__text">{{ text }}</span>
-    <!-- Nothing to press where there is nothing to ask: the page says why instead. -->
+    <!-- Nothing to press where there is nothing to ask: the page says why instead.
+         While the machine is being asked, the button says so — a press that
+         looks unanswered is a press that looks broken. -->
     <button
       v-if="state !== 'unavailable'"
       type="button"
       class="credential-lock__action"
+      :disabled="pending"
       @click="toggle"
     >
-      {{ unlocked ? t('gate.lockNow') : t('gate.unlock') }}
+      {{ pending ? t('gate.confirming') : unlocked ? t('gate.lockNow') : t('gate.unlock') }}
     </button>
   </div>
 </template>
@@ -128,6 +132,12 @@ async function toggle(): Promise<void> {
 
 .credential-lock__action:hover {
   text-decoration: underline;
+}
+
+.credential-lock__action:disabled {
+  cursor: default;
+  text-decoration: none;
+  opacity: 0.6;
 }
 
 .credential-lock__action:focus-visible {

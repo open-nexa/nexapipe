@@ -257,6 +257,7 @@
     "unlockedFor": "Unlocked for {time}",
     "unlock": "Unlock",
     "lockNow": "Lock now",
+    "confirming": "Confirming…",
     "lockedTitle": "This page is locked",
     "lockedBody": "Confirm it is you to show and edit what this machine connects through — nodes, connection strings, two-factor secrets and the relay. The page shuts itself again after two minutes.",
     "unavailableShort": "This device cannot confirm it is you",

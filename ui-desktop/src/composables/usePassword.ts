@@ -28,9 +28,32 @@ export interface PasswordOptions {
    * "the last one was wrong" is the one thing worth knowing before they do.
    */
   error?: string;
+  /**
+   * Checks what was typed before the dialog is allowed to close.
+   *
+   * Resolves with `null` when it was accepted, and with why it was not, already
+   * in the user's language, otherwise — which the dialog shows where it was
+   * typed instead of closing. Waiting inside the dialog is the point: a password
+   * the operating system refuses costs seconds more than one it accepts, which
+   * it spends on purpose, and a dialog that closed before the answer came back
+   * leaves the user watching a button that looks like it did nothing.
+   *
+   * Left out, the dialog resolves as soon as something has been typed, which is
+   * what it always did.
+   */
+  verify?: VerifyPassword;
 }
 
-export interface PasswordRequest extends Required<PasswordOptions> {}
+/**
+ * What [`PasswordOptions.verify`] does: takes the password, comes back with the
+ * complaint or with nothing.
+ */
+export type VerifyPassword = (password: string) => Promise<string | null>;
+
+export interface PasswordRequest extends Required<Omit<PasswordOptions, 'verify'>> {
+  /** Null where the caller has nothing to check a password against. */
+  verify: VerifyPassword | null;
+}
 
 const request = ref<PasswordRequest | null>(null);
 let resolver: ((password: string | null) => void) | null = null;
@@ -49,6 +72,7 @@ export function askPassword(options: PasswordOptions): Promise<string | null> {
     message: options.message,
     confirmText: options.confirmText ?? translate('common.confirm'),
     error: options.error ?? '',
+    verify: options.verify ?? null,
   };
 
   return new Promise<string | null>((resolve) => {

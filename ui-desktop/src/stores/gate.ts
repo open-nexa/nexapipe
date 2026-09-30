@@ -53,6 +53,17 @@ const toast = useToast();
  */
 const refusal = ref<string | null>(null);
 
+/**
+ * Whether a confirmation is being waited on right now.
+ *
+ * The operating system takes as long as it takes, and on Linux a password it
+ * refuses costs seconds more than one it accepts — which it spends on purpose,
+ * to make guessing slow. A button that looks exactly as it did before the
+ * press reads as a button that did nothing, so the waiting is a state of its
+ * own: the press is answered at once even though the answer is not.
+ */
+const pending = ref(false);
+
 /** How much of the window is left. Zero the moment it lapses, shut or open. */
 const msRemaining = computed(() => (endsAt > now.value ? endsAt - now.value : 0));
 
@@ -144,6 +155,54 @@ async function sayUnavailable(): Promise<void> {
 }
 
 /**
+ * Asks the operating system to open the door, and reports what came back.
+ *
+ * Resolves with `null` when it opened, and with why it did not, in the user's
+ * language, otherwise. The reason is returned as well as kept in [`refusal`]
+ * because the caller is sometimes the password dialog, which has to say it
+ * where the password was typed rather than on the page behind.
+ *
+ * `pending` is true for as long as this takes, which is the whole point of it:
+ * the operating system answers in its own time, and on Linux a password it
+ * refuses costs seconds more than one it accepts.
+ */
+async function attempt(reason: string, password: string | undefined): Promise<string | null> {
+  pending.value = true;
+  try {
+    apply(await unlockCredentials(reason, password));
+    return null;
+  } catch (error) {
+    console.error('[gate] the door did not open:', errorDetail(error));
+
+    const key = errorKey(error, 'error.credentials.gate_failed');
+    if (key === 'error.credentials.gate_unavailable') {
+      // The machine has stopped having anything to ask with, which is worth
+      // explaining rather than flashing past — but it is still a no.
+      refusal.value = translate('gate.notConfirmed');
+      await sayUnavailable();
+      return refusal.value;
+    }
+    if (key === 'error.credentials.locked') {
+      // The operating system was asked and the answer was no. Which no it was
+      // is something only this call knows: a password typed here and refused is
+      // a wrong password, while a system prompt that was dismissed is a user who
+      // changed their mind — and both leave the door shut with nothing said
+      // unless the page behind it is told why.
+      refusal.value =
+        password === undefined ? translate('gate.notConfirmed') : translate('gate.wrongPassword');
+      return refusal.value;
+    }
+    // Anything else is the operating system failing, and its own words go in
+    // the details rather than in the headline.
+    toast.error(error, 'error.credentials.gate_failed');
+    refusal.value = translate('gate.notConfirmed');
+    return refusal.value;
+  } finally {
+    pending.value = false;
+  }
+}
+
+/**
  * Whether a credential may be shown, asking the operating system if it cannot.
  *
  * `reason` is what the prompt says it is for — which credential is about to be
@@ -164,44 +223,24 @@ async function ensureUnlocked(reason: string): Promise<boolean> {
     return false;
   }
 
-  let password: string | undefined;
   if (status.value?.needsPassword) {
-    const typed = await askPassword({
+    // Checked while the dialog is still open, so the wait and the answer both
+    // happen where the password was typed: see `PasswordOptions.verify`.
+    let opened = false;
+    await askPassword({
       title: translate('gate.passwordTitle'),
       message: reason,
       error: previous ?? undefined,
+      verify: async (password) => {
+        const why = await attempt(reason, password);
+        opened = why === null;
+        return why;
+      },
     });
-    // Dismissed, or left empty: the user did not ask for this after all.
-    if (typed === null) return false;
-    password = typed;
+    return opened;
   }
 
-  try {
-    apply(await unlockCredentials(reason, password));
-  } catch (error) {
-    const key = errorKey(error, 'error.credentials.gate_failed');
-    if (key === 'error.credentials.gate_unavailable') {
-      await sayUnavailable();
-      return false;
-    }
-    if (key === 'error.credentials.locked') {
-      // The operating system was asked and the answer was no. Which no it was
-      // is something only this call knows: a password typed here and refused is
-      // a wrong password, while a system prompt that was dismissed is a user who
-      // changed their mind — and both leave the door shut with nothing said
-      // unless the page behind it is told why.
-      refusal.value =
-        password === undefined ? translate('gate.notConfirmed') : translate('gate.wrongPassword');
-    } else {
-      // Anything else is the operating system failing, and its own words go in
-      // the details rather than in the headline.
-      toast.error(error, 'error.credentials.gate_failed');
-    }
-    console.error('[gate] the door did not open:', errorDetail(error));
-    return false;
-  }
-
-  return unlocked.value;
+  return (await attempt(reason, undefined)) === null;
 }
 
 /** Forgets what the last refusal said. A page that has been left and reopened has nothing to report. */
@@ -213,6 +252,12 @@ export function useCredentialGate() {
   return {
     /** Whether a credential may be shown right now. */
     unlocked,
+    /**
+     * Whether the operating system is being asked right now. True from the
+     * press until the answer — several seconds on a Linux password that is
+     * refused — so a surface can say it is waiting instead of looking idle.
+     */
+    pending: computed(() => pending.value),
     /** Milliseconds left in the window; zero when it is shut. */
     msRemaining,
     /**

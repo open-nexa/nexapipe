@@ -45,6 +45,14 @@ For what comes next, and for why some things are deliberately not planned, see
   pressed answered for nothing. A press that does nothing now says why — the
   locked page reports whether the password was not accepted or the device did
   not confirm, and the password field carries that line when it opens again.
+- **On Linux a password that was not accepted left the page looking unanswered
+  for as long as PAM took to refuse it.** The dialog closed the moment the
+  password was typed, which made it look as though the answer had already come
+  back, and the refusal then turned up seconds later on the page behind. The
+  password is now checked while the dialog is still open: the wait is said out
+  loud on the button, and the answer lands in the field it was typed in. PAM
+  still takes its time over a password it refuses — that delay is deliberate —
+  but nothing looks broken while it does.
 
 ## [0.4.0] — 2026-09-30
 

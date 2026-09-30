@@ -37,7 +37,8 @@ const {
  * locked page rather than swallowed: a button that was pressed and did nothing
  * is the one thing a locked page owes an explanation for.
  */
-const { ensureUnlocked, unlocked, refusal, canAuthenticate, refresh } = useCredentialGate();
+const { ensureUnlocked, unlocked, refusal, canAuthenticate, pending, refresh } =
+  useCredentialGate();
 
 const { t } = useI18n();
 const toast = useToast();
@@ -345,13 +346,14 @@ function clearConfig() {
         v-if="canAuthenticate"
         type="button"
         class="config-locked__action"
+        :disabled="pending"
         @click="unlockPage"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="3" y="11" width="18" height="11" rx="2"/>
           <path d="M7 11V7a4 4 0 0 1 7.5-2"/>
         </svg>
-        {{ t('gate.unlock') }}
+        {{ pending ? t('gate.confirming') : t('gate.unlock') }}
       </button>
     </div>
 
