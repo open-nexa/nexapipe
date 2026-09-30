@@ -10,10 +10,11 @@
 
       1. Preflight  - locate cargo-ndk, adb, the SDK and the NDK; verify a device
                       is usable. Fails here instead of three minutes into a build.
-      2. Rust build - cargo-ndk builds crates/nexapipe-client for aarch64-linux-android
-                      with the features the app needs, then the .so is copied to
-                      ui-android/app/src/main/jniLibs/arm64-v8a/. The file must stay
-                      named libnexapipe_client.so: that is what IrohProxy.kt loads.
+      2. Rust build - cargo-ndk builds crates/nexapipe-client for the triple behind -Abi
+                      (aarch64-linux-android by default) with the features the app needs,
+                      then the .so is copied to ui-android/app/src/main/jniLibs/<abi>/. The
+                      file must stay named libnexapipe_client.so: that is what
+                      IrohProxy.kt loads.
       3. Verify     - the copy is confirmed by size/mtime, and the fresh .so is scanned
                       for the JNI entry points the app calls. A .so built without the
                       tun-proxy feature has no nativeStartTunProxy and the VPN dies with
@@ -30,6 +31,10 @@
 
 .PARAMETER Serial
     adb device serial. Only needed when more than one device is attached.
+
+.PARAMETER Abi
+    Which of the two shipped ABIs to build and install: arm64-v8a (default, every
+    phone) or x86_64 (emulator images on a development machine).
 
 .PARAMETER Features
     cargo features for nexapipe-client. Default: jni,local-proxy,tun-proxy — the exact
@@ -74,6 +79,10 @@
     Cold start on a specific device, then stream the logs.
 
 .EXAMPLE
+    .\run_android.ps1 -Abi x86_64 -Serial emulator-5554
+    Same, on an emulator running an x86_64 image.
+
+.EXAMPLE
     .\run_android.ps1 -BuildOnly
     Just rebuild and verify the Android cdylib.
 
@@ -84,6 +93,11 @@
 [CmdletBinding()]
 param(
     [string]   $Serial,
+    # arm64-v8a for every phone; x86_64 for the emulator images that run on a
+    # development machine. The Rust target and the APK that gets installed are
+    # both derived from it.
+    [ValidateSet('arm64-v8a', 'x86_64')]
+    [string]   $Abi = 'arm64-v8a',
     [string[]] $Features = @('jni', 'local-proxy', 'tun-proxy'),
     [string]   $LogFile,
     [switch]   $SkipRust,
@@ -100,8 +114,14 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # Constants that must agree with the rest of the repo
 # ---------------------------------------------------------------------------
-$RustTarget = 'aarch64-linux-android'   # only ABI the app ships (build.gradle.kts abiFilters)
-$Abi        = 'arm64-v8a'               # jniLibs subdirectory for that triple
+# Both shipped ABIs, "Android ABI -> cargo triple". The app builds one APK per
+# ABI (the splits block in build.gradle.kts); this script builds and installs
+# the one named by -Abi, which is also the jniLibs subdirectory it lands in.
+$AbiToTriple = @{
+    'arm64-v8a' = 'aarch64-linux-android'
+    'x86_64'    = 'x86_64-linux-android'
+}
+$RustTarget = $AbiToTriple[$Abi]
 $SoFileName = 'libnexapipe_client.so'   # IrohProxy.kt: System.loadLibrary("nexapipe_client")
 # Same minSdk as ui-android's build.gradle.kts and release-apk.yml (MIN_SDK). cargo-ndk
 # needs it explicitly: its own default is 21, which would produce a .so built against an
@@ -349,7 +369,7 @@ function Select-Device {
     Stop-Script @"
 No usable adb device ($detail).
          - physical device: enable USB debugging, plug it in, accept the RSA prompt
-         - emulator: start an arm64 image first (the app is arm64-v8a only)
+         - emulator: start an image whose ABI you pass with -Abi (x86_64 or arm64-v8a)
          To only build the cdylib without a device, run: .\run_android.ps1 -BuildOnly
 "@
 }
@@ -540,7 +560,10 @@ if (-not $SkipInstall) {
     if (-not (Test-Path -LiteralPath $GradleWrapper)) {
         Stop-Script "gradlew.bat not found at $GradleWrapper (is ui-android checked out in this repository?)"
     }
-    Invoke-Native -Label 'gradlew installDebug' -Exe $GradleWrapper -Arguments @('-p', $AndroidDir, ':app:installDebug')
+    # -Pabi keeps the build to the one APK this device can run; without it
+    # assembleDebug produces one per ABI and installDebug has more than one
+    # candidate to put on it.
+    Invoke-Native -Label 'gradlew installDebug' -Exe $GradleWrapper -Arguments @('-p', $AndroidDir, ':app:installDebug', "-Pabi=$Abi")
     Write-Ok "installed $AppId on $device"
 } else {
     Write-Step "Skipping the APK install (-SkipInstall)"

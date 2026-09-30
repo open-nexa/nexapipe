@@ -1,3 +1,4 @@
+import com.android.build.api.variant.FilterConfiguration
 import java.security.KeyStore
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -74,8 +75,29 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        ndk {
-            abiFilters.add("arm64-v8a")
+        // No ndk.abiFilters here: AGP refuses to combine them with splits
+        // ("Conflicting configuration"), and the splits block below is what
+        // decides which ABIs ship.
+    }
+
+    // One APK per ABI rather than one carrying both .so files. x86_64 exists
+    // for emulators — a development convenience — and a fat APK would make
+    // every phone download it to get the arm64 one. There is deliberately no
+    // universal APK: it would be that fat APK under a third name.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            // -Pabi=<one> narrows the build to a single APK, which is what the
+            // local loop (run_android.ps1) passes so that installDebug has
+            // exactly one artifact to put on the device it is talking to.
+            val singleAbi = project.findProperty("abi") as String?
+            if (singleAbi != null) {
+                include(singleAbi)
+            } else {
+                include("arm64-v8a", "x86_64")
+            }
+            isUniversalApk = false
         }
     }
 
@@ -168,6 +190,25 @@ android {
                 "NewerVersionAvailable",
                 "AndroidGradlePluginVersion",
             )
+    }
+}
+
+// Two APKs of the same version need two version codes: a store will not accept
+// two artifacts that both claim one. The ABI is the low digit so the number
+// stays readable in `aapt2 dump badging`, and the run number stays the part
+// that grows, so ordering across releases is unaffected.
+private val abiVersionCodes = mapOf("arm64-v8a" to 1, "x86_64" to 2)
+
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            val abi =
+                output.filters
+                    .firstOrNull { it.filterType == FilterConfiguration.FilterType.ABI }
+                    ?.identifier
+            val base = android.defaultConfig.versionCode ?: 1
+            output.versionCode.set(base * 10 + (abiVersionCodes[abi] ?: 0))
+        }
     }
 }
 

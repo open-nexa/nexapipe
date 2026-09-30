@@ -269,8 +269,12 @@
     <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-arm64.apk">
       <span><span class="name">Android APK (arm64-v8a, signed)</span><span class="file">nexa-0.4.0-android-arm64.apk</span></span>
       <span class="get">Download</span></a></li>
+    <li><a class="row" href="https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/nexa-0.4.0-android-x86_64.apk">
+      <span><span class="name">Android APK (x86_64, signed &mdash; emulators)</span><span class="file">nexa-0.4.0-android-x86_64.apk</span></span>
+      <span class="get">Download</span></a></li>
   </ul>
-  <p class="note">Only <code>arm64-v8a</code> is shipped. iOS is not a supported platform &mdash; see the
+  <p class="note">One APK per ABI: <code>arm64-v8a</code> for every phone, <code>x86_64</code> for the
+    emulator images a development machine can run. iOS is not a supported platform &mdash; see the
     <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">roadmap</a>.</p>
 
   <h3 class="subhead">Server &amp; client library &mdash; nexapipe</h3>
@@ -483,10 +487,16 @@ response_secs = 30</pre>
 
   function pick() {
     if (/Android/i.test(ua)) {
+      // The emulator images a development machine runs are x86_64; everything a
+      // phone runs is arm64-v8a. The UA does not reliably say which one this is,
+      // so the primary button stays arm64 and the other APK is offered beside it.
       return {
         title: "Download for Android",
-        sub: "Signed APK, arm64-v8a.",
-        links: [{ href: BASE + "nexa-0.4.0-android-arm64.apk", label: "Download APK" }]
+        sub: "Signed APK, one per ABI.",
+        links: [
+          { href: BASE + "nexa-0.4.0-android-arm64.apk", label: "arm64-v8a (phones)" },
+          { href: BASE + "nexa-0.4.0-android-x86_64.apk", label: "x86_64 (emulators)", secondary: true }
+        ]
       };
     }
     if (/iPhone|iPad|iPod/i.test(ua)) {

@@ -69,9 +69,9 @@ so the tunnel survives Wi-Fi ↔ cellular switches.
 | JDK | 17 |
 | compileSdk / targetSdk | 36 |
 | minSdk | 26 (Android 8.0) |
-| ABI | `arm64-v8a` only |
+| ABI | `arm64-v8a` and `x86_64` — one APK each |
 | NDK | r26 or newer (CI pins `29.0.14206865`) |
-| Rust | stable + `cargo-ndk`, plus the `aarch64-linux-android` target |
+| Rust | stable + `cargo-ndk`, plus the `aarch64-linux-android` and `x86_64-linux-android` targets |
 
 ---
 
@@ -98,6 +98,12 @@ target/aarch64-linux-android/release/libnexapipe_client.so
 
 `tun-proxy` implies `local-proxy` and is what compiles `nativeStartTunProxy`.
 Build without it and the VPN dies with `UnsatisfiedLinkError` on device.
+
+`arm64-v8a` is what every phone runs. The app also ships `x86_64`, which is
+there for the emulator images a development machine can actually run — repeat
+the two commands above with `--target x86_64` and the `x86_64-linux-android`
+triple to build that half. `run_android.ps1 -Abi x86_64` does both and installs
+the matching APK; without `-Abi` it defaults to `arm64-v8a`.
 
 ### 2. One-shot debug loop (recommended)
 
@@ -215,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
 | Symptom | Cause |
 | --- | --- |
 | `UnsatisfiedLinkError: nativeStartTunProxy` | The `.so` was built without the `tun-proxy` feature. |
-| `UnsatisfiedLinkError` on `System.loadLibrary` | The `.so` is missing from `jniLibs/arm64-v8a/` or the ABI filter does not match the device. |
+| `UnsatisfiedLinkError` on `System.loadLibrary` | The `.so` is missing from `jniLibs/<abi>/` for the ABI the device runs, or the APK you installed was built for the other ABI. |
 | Tunnel connects then drops after a few seconds | Usually the smoltcp sequence-number underflow panic — make sure the workspace `[patch.crates-io]` for `third_party/smoltcp` is in effect. |
 | iroh never connects / `dns.iroh.link` timeouts | Set a relay override, or inject DNS servers (both are exposed in the UI). |
 | Poor throughput over long RTT links | Raise `NEXAPIPE_QUIC_STREAM_WINDOW` (see the root README). |

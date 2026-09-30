@@ -38,14 +38,16 @@ Checks that CI cannot cover, and that are easy to forget:
 
 ```bash
 cargo ndk -t arm64-v8a check -p nexapipe-client --features jni,tun-proxy
+cargo ndk -t x86_64   check -p nexapipe-client --features jni,tun-proxy
 cd ui-desktop/src-tauri && cargo check
 cd ui-android && ./gradlew.bat :app:compileDebugKotlin
 ```
 
 `crates/nexapipe-client/src/tun_proxy.rs` is `cfg(target_os = "android")`, so a
-host build never compiles it — that `cargo ndk` line is the only thing that
-type-checks it. `ui-desktop/src-tauri` is a separate cargo project, so the
-workspace lint gate does not cover it either.
+host build never compiles it — those `cargo ndk` lines are the only thing that
+type-checks it. Both shipped ABIs need one, because the app builds an APK per
+ABI. `ui-desktop/src-tauri` is a separate cargo project, so the workspace lint
+gate does not cover it either.
 
 ## Before you open a pull request
 
