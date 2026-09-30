@@ -213,7 +213,7 @@
     <string name="vpn_takeover_choice_cancel">不接管</string>
 
     <!-- 错误提示 -->
-    <string name="error_vpn_always_on">%1$s 是设备的始终开启 VPN。Android 会立即恢复它，Nexa 无法取而代之——请先在该应用中关闭始终开启 VPN。</string>
+    <string name="error_vpn_always_on">%1$s 是设备的始终开启 VPN。Android 会立即恢复它，Nexa 无法取而代之——请先在系统设置的 VPN 页面中关闭始终开启 VPN。</string>
     <string name="error_vpn_taken_over">另一个应用（如 Clash）占用了隧道。Android 同时只允许一个隧道处于活动状态——请先断开那个应用，再使用 Nexa。</string>
     <string name="error_native_library">原生库未加载。请检查 APK 中是否正确包含 libnexapipe_client.so。</string>
     <string name="error_vpn_permission">尚未授予代理权限，请先在权限引导中授予。</string>
