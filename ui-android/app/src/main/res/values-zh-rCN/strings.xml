@@ -202,7 +202,18 @@
     <string name="notify_backend_unreachable">网络已切换，而新网络下没有后端响应。若隧道持续不可用，请重新连接。</string>
     <string name="notify_tunnel_rebuild_failed">网络切换后无法重建隧道，请重新连接。</string>
 
+    <!-- 从另一个 VPN 应用接管唯一的 VPN 通道 -->
+    <string name="vpn_takeover_title">另一个 VPN 已在运行</string>
+    <string name="vpn_takeover_body">Android 同时只允许一个 VPN，继续操作会断开它。</string>
+    <string name="vpn_takeover_confirm">接管</string>
+    <string name="vpn_takeover_remember">记住我的选择</string>
+    <string name="vpn_takeover_reset_title">下次再问我</string>
+    <string name="vpn_takeover_reset_subtitle">已记住：另一个 VPN 运行时%1$s。</string>
+    <string name="vpn_takeover_choice_take_over">接管</string>
+    <string name="vpn_takeover_choice_cancel">不接管</string>
+
     <!-- 错误提示 -->
+    <string name="error_vpn_always_on">%1$s 是设备的始终开启 VPN。Android 会立即恢复它，Nexa 无法取而代之——请先在该应用中关闭始终开启 VPN。</string>
     <string name="error_vpn_taken_over">另一个应用（如 Clash）占用了隧道。Android 同时只允许一个隧道处于活动状态——请先断开那个应用，再使用 Nexa。</string>
     <string name="error_native_library">原生库未加载。请检查 APK 中是否正确包含 libnexapipe_client.so。</string>
     <string name="error_vpn_permission">尚未授予代理权限，请先在权限引导中授予。</string>

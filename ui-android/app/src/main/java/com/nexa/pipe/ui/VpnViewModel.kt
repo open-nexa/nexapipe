@@ -16,6 +16,10 @@ import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.locale.AppStrings
 import com.nexa.pipe.vpn.NexaVpnService
 import com.nexa.pipe.vpn.UnderlyingNetworkSelector
+import com.nexa.pipe.vpn.VpnSlot
+import com.nexa.pipe.vpn.VpnTakeoverChoice
+import com.nexa.pipe.vpn.VpnTakeoverDecision
+import com.nexa.pipe.vpn.VpnTakeoverPolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -26,6 +30,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.InetAddress
@@ -110,6 +115,17 @@ class VpnViewModel : ViewModel() {
         kotlinx.coroutines.flow.MutableStateFlow(SecretStore.Protection.Sealed)
 
     /**
+     * What to do when another VPN app owns the slot, as the user last decided.
+     *
+     * [VpnTakeoverChoice.Ask] until one is made, and resettable from the
+     * settings: a remembered Cancel is a decision to never use Nexa alongside
+     * another VPN, which is not something the user should have to uninstall the
+     * app to revisit.
+     */
+    val vpnTakeoverChoice =
+        kotlinx.coroutines.flow.MutableStateFlow(VpnTakeoverChoice.Ask)
+
+    /**
      * Runtime link type per backend (endpoint ID -> direct/relay), reported by iroh and
      * refreshed while the tunnel is up. Empty whenever nothing is connected, which is what
      * keeps the UI from drawing a stale icon after a disconnect.
@@ -134,12 +150,12 @@ class VpnViewModel : ViewModel() {
         // establishment was refused) because another VPN app (e.g. Clash)
         // took over the single VPN slot Android allows. Update the UI
         // immediately instead of waiting for the next syncVpnServiceState().
-        NexaVpnService.setRevokedListener {
+        NexaVpnService.setRevokedListener { reason ->
             viewModelScope.launch {
                 if (isVpnRunning.value) {
                     isVpnRunning.value = false
-                    errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
-                    addLog("Tunnel revoked: another app (e.g. Clash) took over the tunnel slot")
+                    errorMessage.value = reason
+                    addLog("Tunnel revoked: $reason")
                 }
             }
         }
@@ -291,6 +307,7 @@ class VpnViewModel : ViewModel() {
             relayMode.value = manager.loadRelayMode()
             relayUrl.value = manager.loadRelayUrl()
             relayAuthToken.value = manager.loadRelayAuthToken()
+            vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
             // Read after the load, because building a SettingsManager runs the
             // migration that re-seals whatever older versions left in plaintext —
             // on a device with a broken keystore that is the write that fails.
@@ -687,7 +704,75 @@ class VpnViewModel : ViewModel() {
         isVpnRunning.value = false
     }
 
-    fun connect(context: Context) {
+    /**
+     * Who owns the platform VPN slot, as seen from the UI.
+     *
+     * Runs off the main thread: both reads go through a binder. Our own session
+     * is [VpnSlot.OwnSession] — the set of VPN networks does not say which one
+     * is ours, and the service is the only side that can tell, so a connect
+     * that starts while our tunnel is up is never treated as a takeover.
+     */
+    private suspend fun vpnSlot(context: Context): VpnSlot = withContext(Dispatchers.IO) {
+        if (NexaVpnService.isServiceActive) return@withContext VpnSlot.OwnSession
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return@withContext VpnSlot.Free
+        if (UnderlyingNetworkSelector.vpnNetworks(cm).isEmpty()) {
+            return@withContext VpnSlot.Free
+        }
+        val alwaysOn = UnderlyingNetworkSelector.alwaysOnVpnPackage(context)
+            ?: return@withContext VpnSlot.ForeignVpn
+        if (VpnTakeoverPolicy.isForeignAlwaysOn(alwaysOn, context.packageName)) {
+            VpnSlot.AlwaysOnVpn(alwaysOn)
+        } else {
+            VpnSlot.ForeignVpn
+        }
+    }
+
+    /**
+     * What a connect may do about the VPN slot, before anything is started.
+     *
+     * The refusal cases are reported here as well as returned: the caller only
+     * needs to act on [VpnTakeoverDecision.Proceed] and
+     * [VpnTakeoverDecision.Ask], the latter being the one that needs a UI.
+     */
+    suspend fun takeoverCheck(context: Context): VpnTakeoverDecision {
+        val decision = VpnTakeoverPolicy.decide(vpnSlot(context), vpnTakeoverChoice.value)
+        when (decision) {
+            is VpnTakeoverDecision.RefuseAlwaysOn -> {
+                errorMessage.value = AppStrings.get(R.string.error_vpn_always_on, decision.packageName)
+                addLog("connect aborted: ${decision.packageName} is the always-on VPN")
+            }
+            is VpnTakeoverDecision.Refuse -> {
+                errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
+                addLog("connect aborted: another VPN app owns the slot")
+            }
+            is VpnTakeoverDecision.Ask, is VpnTakeoverDecision.Proceed -> Unit
+        }
+        return decision
+    }
+
+    /**
+     * Remembers what the user wants done when another VPN app owns the slot.
+     *
+     * [VpnTakeoverChoice.Ask] is how the setting is taken back: the UI offers
+     * it once a choice has been stored, so a remembered Cancel is not a dead
+     * end.
+     */
+    fun rememberVpnTakeoverChoice(choice: VpnTakeoverChoice) {
+        vpnTakeoverChoice.value = choice
+        settingsManager?.saveVpnTakeoverChoice(choice)
+        addLog("VPN takeover choice remembered: $choice")
+    }
+
+    /**
+     * Connects.
+     *
+     * [allowTakeover] carries the user's answer to "another VPN app owns the
+     * slot; may Nexa disconnect it?". Without it the connect is refused rather
+     * than revoking the other app — see [takeoverCheck], which is what puts the
+     * question to the user in the first place.
+     */
+    fun connect(context: Context, allowTakeover: Boolean = false) {
         if (isConnecting.value) return
         connectJob = viewModelScope.launch(Dispatchers.IO) {
             // Mutually exclusive with disconnect; abandon this connect if a
@@ -725,18 +810,24 @@ class VpnViewModel : ViewModel() {
                     throw Exception(AppStrings.get(R.string.error_vpn_permission))
                 }
 
-                // Mutual-exclusion guard: Android allows only one active
-                // VpnService TUN per user. If another VPN app (e.g. Clash)
-                // currently owns the slot, establishing ours would silently
-                // revoke it. Fail fast with a clear message instead of kicking
-                // the other VPN off. (Our own running session is exempt via
-                // isServiceActive — it was already handled above.)
-                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                if (!NexaVpnService.isServiceActive &&
-                    UnderlyingNetworkSelector.hasActiveVpnNetwork(cm)
-                ) {
-                    errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
-                    addLog("connect aborted: another proxy app is active")
+                // Mutual-exclusion guard, the last one before the service is
+                // told to establish: Android allows only one active VpnService
+                // TUN per user, and establish() revokes whatever app holds the
+                // slot without asking anybody. The UI asks first
+                // (takeoverCheck) and passes the answer down; a connect that
+                // arrives without one — a widget, a future entry point, a
+                // stale UI — refuses rather than kicking the other VPN off.
+                val decision = VpnTakeoverPolicy.decide(
+                    vpnSlot(context),
+                    if (allowTakeover) VpnTakeoverChoice.TakeOver else VpnTakeoverChoice.Cancel
+                )
+                if (decision != VpnTakeoverDecision.Proceed) {
+                    errorMessage.value = when (decision) {
+                        is VpnTakeoverDecision.RefuseAlwaysOn ->
+                            AppStrings.get(R.string.error_vpn_always_on, decision.packageName)
+                        else -> AppStrings.get(R.string.error_vpn_taken_over)
+                    }
+                    addLog("connect aborted: another VPN app owns the slot")
                     return@launch
                 }
 
@@ -849,6 +940,9 @@ class VpnViewModel : ViewModel() {
                         val intent = Intent(context, NexaVpnService::class.java).apply {
                             action = NexaVpnService.ACTION_START
                             putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(allDomains))
+                            // Carried through to the service: it is the only
+                            // thing that lets establish() past its own guard.
+                            putExtra(NexaVpnService.EXTRA_ALLOW_TAKEOVER, allowTakeover)
                         }
                         context.startForegroundService(intent)
                         isVpnRunning.value = true

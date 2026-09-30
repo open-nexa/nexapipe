@@ -50,6 +50,9 @@ import com.nexa.pipe.provisioning.EndpointInvite
 import com.nexa.pipe.provisioning.EndpointInviteCodec
 import com.nexa.pipe.provisioning.InviteParseResult
 import com.nexa.pipe.provisioning.InviteTarget
+import com.nexa.pipe.vpn.VpnTakeoverChoice
+import com.nexa.pipe.vpn.VpnTakeoverDecision
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -69,6 +72,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val relayUrl by viewModel.relayUrl.collectAsState()
     val relayAuthToken by viewModel.relayAuthToken.collectAsState()
     val credentialProtection by viewModel.credentialProtection.collectAsState()
+    val vpnTakeoverChoice by viewModel.vpnTakeoverChoice.collectAsState()
+    // For the VPN-slot question asked before a connect: the check reads the
+    // platform's VPN state off the main thread.
+    val screenScope = rememberCoroutineScope()
 
     // The endpoints traffic is actually going through right now, each with the kind of path it
     // is using. Empty until the native side reports a connection, which is also what hides the
@@ -98,6 +105,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // An endpoint invite rewrites shared settings, so it is confirmed when it
     // would overwrite something that already works.
     var pendingInviteImport by remember { mutableStateOf<EndpointInvite?>(null) }
+    // Another VPN app owns the single slot Android allows: whether to ask about
+    // it, and whether the answer should be remembered.
+    var showTakeoverDialog by remember { mutableStateOf(false) }
+    var takeoverRememberChoice by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(true) }
 
     // Sync the VPN service state whenever this composable becomes visible,
@@ -126,6 +137,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         errorMessage?.let { Toast.makeText(context, it, Toast.LENGTH_LONG).show() }
     }
 
+    /**
+     * Connects — asking first, when another VPN app owns the single slot
+     * Android allows.
+     *
+     * The question cannot be asked from the service: it has no UI, and calling
+     * establish() is itself what revokes the other app. So it is asked here,
+     * before anything is started, which is also what makes Cancel free — there
+     * is nothing to undo because nothing has happened yet.
+     */
     fun handleConnect(context: Context) {
         viewModel.checkVpnPermission(context)
         viewModel.checkNotificationPermission(context)
@@ -138,7 +158,22 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             return
         }
 
-        viewModel.connect(context)
+        screenScope.launch {
+            when (viewModel.takeoverCheck(context)) {
+                // Nobody else wants the slot, or the user has already said to
+                // take it. The flag only matters while a foreign VPN is up.
+                is VpnTakeoverDecision.Proceed -> viewModel.connect(context, allowTakeover = true)
+                // The one case that needs a UI: another VPN is running and the
+                // user has not yet said what to do about it.
+                is VpnTakeoverDecision.Ask -> {
+                    takeoverRememberChoice = false
+                    showTakeoverDialog = true
+                }
+                // Both refusals are reported by the ViewModel.
+                is VpnTakeoverDecision.Refuse,
+                is VpnTakeoverDecision.RefuseAlwaysOn -> Unit
+            }
+        }
     }
 
     /**
@@ -619,6 +654,19 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                             LanguageSection(
                                 onLanguagePicked = { language -> applyLanguage(language) }
                             )
+
+                            // Only once a choice exists: "ask every time" is the
+                            // default, and offering to take back a decision the
+                            // user never made is noise.
+                            if (vpnTakeoverChoice != VpnTakeoverChoice.Ask) {
+                                Spacer(modifier = Modifier.height(Dimens.Space3))
+                                VpnTakeoverSection(
+                                    choice = vpnTakeoverChoice,
+                                    onReset = {
+                                        viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.Ask)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -842,6 +890,28 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             InviteLinkDialog(
                 onDismiss = { showInviteLinkDialog = false },
                 onImport = { link -> handleInviteText(link) }
+            )
+        }
+
+        if (showTakeoverDialog) {
+            VpnTakeoverDialog(
+                rememberChoice = takeoverRememberChoice,
+                onRememberChoiceChanged = { takeoverRememberChoice = it },
+                onConfirm = {
+                    showTakeoverDialog = false
+                    if (takeoverRememberChoice) {
+                        viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.TakeOver)
+                    }
+                    viewModel.connect(context, allowTakeover = true)
+                },
+                onDismiss = {
+                    showTakeoverDialog = false
+                    // Cancel is a choice like any other when it is remembered:
+                    // it means "keep using the other VPN", not "ask again".
+                    if (takeoverRememberChoice) {
+                        viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.Cancel)
+                    }
+                }
             )
         }
 
@@ -1235,5 +1305,102 @@ private fun LanguageSection(
                 )
             }
         )
+    }
+}
+
+/**
+ * Asks before Nexa takes the VPN slot from another VPN app.
+ *
+ * Android allows one VpnService TUN per user and revokes the other app
+ * silently, so the question has to be asked before establish() — and the only
+ * place that can ask it is the UI.
+ */
+@Composable
+private fun VpnTakeoverDialog(
+    rememberChoice: Boolean,
+    onRememberChoiceChanged: (Boolean) -> Unit,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.vpn_takeover_title)) },
+        text = {
+            Column {
+                Text(
+                    text = stringResource(R.string.vpn_takeover_body),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(modifier = Modifier.height(Dimens.Space2))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onRememberChoiceChanged(!rememberChoice) }
+                ) {
+                    Checkbox(
+                        checked = rememberChoice,
+                        onCheckedChange = onRememberChoiceChanged
+                    )
+                    Spacer(modifier = Modifier.width(Dimens.Space2))
+                    Text(
+                        text = stringResource(R.string.vpn_takeover_remember),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        // Destructive weight on purpose: this is the button that disconnects
+        // the other app, and it must not look like the ordinary "continue".
+        confirmButton = {
+            NexaDangerButton(
+                text = stringResource(R.string.vpn_takeover_confirm),
+                onClick = onConfirm
+            )
+        },
+        dismissButton = {
+            NexaTextButton(
+                text = stringResource(R.string.action_cancel),
+                onClick = onDismiss
+            )
+        }
+    )
+}
+
+/**
+ * The way back from a remembered takeover choice.
+ *
+ * A stored Cancel means Nexa never connects while another VPN is up, which is
+ * not an answer the user should have to reinstall the app to change.
+ */
+@Composable
+private fun VpnTakeoverSection(
+    choice: VpnTakeoverChoice,
+    onReset: () -> Unit,
+) {
+    val remembered = when (choice) {
+        VpnTakeoverChoice.TakeOver -> stringResource(R.string.vpn_takeover_choice_take_over)
+        VpnTakeoverChoice.Cancel -> stringResource(R.string.vpn_takeover_choice_cancel)
+        // Nothing to take back: the section is not drawn in the first place.
+        VpnTakeoverChoice.Ask -> return
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onReset() },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(R.string.vpn_takeover_reset_title),
+                style = MaterialTheme.typography.titleSmall
+            )
+            Text(
+                text = stringResource(R.string.vpn_takeover_reset_subtitle, remembered),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
