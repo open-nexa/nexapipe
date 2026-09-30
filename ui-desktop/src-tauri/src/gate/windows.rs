@@ -147,11 +147,22 @@ impl OsGate for Hello {
         Capability::Available
     }
 
+    /// The branch follows what the caller collected, not a second look at
+    /// whether Hello is there.
+    ///
+    /// [`OsGate::needs_password`] already asked, and asking again can answer
+    /// differently: the check is a WinRT call, and a machine can lose Hello
+    /// between it and this. Taking the second answer at face value produced
+    /// `Failed("no password was supplied")` — a machine that does have a way to
+    /// confirm its user reported itself as broken, and the UI had no answer
+    /// because nothing had changed as far as it could tell. A password that
+    /// arrived means Hello was not there a moment ago, and it authenticates the
+    /// user either way; a machine that has grown a Hello since is not one this
+    /// password stopped working on.
     fn confirm(&self, reason: &str, password: Option<&str>) -> Outcome {
-        if Self::available() {
-            Self::hello(reason)
-        } else {
-            Self::password(password)
+        match password {
+            Some(_) => Self::password(password),
+            None => Self::hello(reason),
         }
     }
 

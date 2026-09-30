@@ -433,15 +433,19 @@ equivalent is carried by Phase 1 below, and shipped in v0.4.0.
 Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
 
-**Progress.** Of the five, three shipped in v0.4.0: R12 (backend handling —
+**Progress.** Two of the five shipped in v0.4.0: **R12** (backend handling —
 `[timeouts]`, `least_conn`, and a refusal when every backend of a multi-backend
-route is down), R15 (the client DNS cache), and the desktop half of R14 that
-came here from Phase 0 (§4.7, C8 and C9). Three did not: **R9** client
+route is down) and **R15** (the client DNS cache). Three did not: **R9** client
 resilience, **R10** transport parity — whose UDP half turned out to be already
 done, leaving IPv6 in the TUN — and **R11** the second Android ABI. They stay
 in this phase rather than moving, because the phase is named for the release
 that began them and not for the one that will finish them; what is recorded here
 is that v0.4.0 shipped without them.
+
+One more thing landed in v0.4.0 that is not one of the five: the desktop half of
+**R14**, which came here from Phase 0 (§4.7, C8 and C9). It is counted
+separately because it is the one item this release finished from the phase
+*before*, rather than one of the five this phase opened with.
 
 **Done when:** Android and desktop both complete HTTP, TLS passthrough and UDP
 round trips against one server, over both IPv4 and IPv6 — the IPv6 half is R10

@@ -311,7 +311,6 @@ function toPersisted(config: ProxyConfig): PersistedConfig {
 }
 
 /**
-/**
  * Whether `hydrateCredentials` has finished.
  *
  * Until it has, every secret in the config is empty — not because the user cleared it, but because
@@ -339,16 +338,24 @@ async function persistCredentials(config: ProxyConfig): Promise<void> {
   }
 
   for (const node of config.nodes) {
-    if (node.twoFactor?.secret.trim()) {
-      await putCredential('totp', node.twoFactor.secret, node.id);
-    } else {
+    // An object that is present with an empty value is not the same as one that
+    // is absent, and treating the two alike deletes a credential that is filed
+    // and deliberate. `applyInvite` is the case: it puts the secret in the store
+    // itself and builds the shape here with the value left out on purpose, so
+    // that the renderer never holds it. Reading that as "the user cleared it"
+    // removed what had just been filed, and the node started with no
+    // authentication. Clearing is `clearNodeTwoFactor`, which removes the
+    // object; an object with an empty value now leaves the store alone.
+    if (!node.twoFactor) {
       await deleteCredential('totp', node.id);
+    } else if (node.twoFactor.secret.trim()) {
+      await putCredential('totp', node.twoFactor.secret, node.id);
     }
 
-    if (node.enrollment?.token.trim()) {
-      await putCredential('enrollment', node.enrollment.token, node.id);
-    } else {
+    if (!node.enrollment) {
       await deleteCredential('enrollment', node.id);
+    } else if (node.enrollment.token.trim()) {
+      await putCredential('enrollment', node.enrollment.token, node.id);
     }
 
     // Both spellings are mirrored, not just the one `connectionType` names: the
@@ -370,10 +377,21 @@ async function persistCredentials(config: ProxyConfig): Promise<void> {
 }
 
 function persist(config: ProxyConfig): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersisted(config)));
-  } catch (error) {
-    console.error('[config] failed to save:', error);
+  // The redaction in `toPersisted` is only honest once the store has answered:
+  // it blanks the connection strings on the way out because they are supposed
+  // to have been filed in the encrypted store by then. When hydration failed
+  // they have not been, and `localStorage` may still be holding the only copy —
+  // a version-2 payload written before this migration. Writing over it there
+  // loses the node, and the mirror below is gated for the same reason, so
+  // nothing would have taken its place. Leave the stored payload alone until
+  // the store has been read; losing an edit is recoverable, losing a node is
+  // an invite the user has to go and find again.
+  if (credentialsHydrated) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersisted(config)));
+    } catch (error) {
+      console.error('[config] failed to save:', error);
+    }
   }
 
   // Not awaited: a save is a mirror, and the in-memory config is what the app runs on. A failure

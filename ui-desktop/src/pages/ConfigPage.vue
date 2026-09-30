@@ -29,7 +29,7 @@ const {
   resetConfig,
 } = useConfigStore();
 
-const { ensureUnlocked } = useCredentialGate();
+const { ensureUnlocked, unlocked } = useCredentialGate();
 
 const { t } = useI18n();
 const toast = useToast();
@@ -96,6 +96,10 @@ async function toggleReveal(node: NodeConfig): Promise<void> {
   if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
   const value = await revealCredential(connectionKind(node), node.id);
   if (value === null || value === "") return;
+  // The window can close while the command is in flight — two minutes is not
+  // long, and this is an `await`. Storing the answer afterwards would put a
+  // whole value on the page under a window that no longer exists.
+  if (!unlocked.value) return;
   revealed.value[node.id] = value;
 }
 
@@ -115,6 +119,24 @@ async function copyConnection(node: NodeConfig): Promise<void> {
 
 const revealedSecrets = ref<Record<string, string>>({});
 
+/**
+ * Both plaintext caches die with the window that opened them.
+ *
+ * A reveal is a value the page is holding for as long as somebody asked for it,
+ * and the window is how long that somebody is known to be at the keyboard. Once
+ * it closes — by the two minutes running out, or by the lock button — the value
+ * has to go with it, because a page still showing a secret it fetched under a
+ * window that has since shut is showing it to whoever replaced the user.
+ */
+function clearRevealCaches(): void {
+  revealed.value = {};
+  revealedSecrets.value = {};
+}
+
+watch(unlocked, (isUnlocked) => {
+  if (!isUnlocked) clearRevealCaches();
+});
+
 /** The secret field shows the mask; what the user types into it is what gets stored. */
 function secretDisplay(node: NodeConfig): string {
   return revealedSecrets.value[node.id] ?? secretMask(node.id);
@@ -122,6 +144,21 @@ function secretDisplay(node: NodeConfig): string {
 
 function secretInputType(node: NodeConfig): "text" | "password" {
   return revealedSecrets.value[node.id] === undefined ? "password" : "text";
+}
+
+/**
+ * Stores what the user typed, and refuses what the field was showing instead.
+ *
+ * A mask is a shape, not a secret. The field holds one until a reveal opens it,
+ * so a change that arrives while it does — one character typed, or the same
+ * string touched and blurred — carries bullets with it, and filing those as the
+ * TOTP secret would make every later handshake fail for a reason the UI cannot
+ * see. Anything still carrying the mask character was not typed by anybody.
+ */
+function onSecretChange(node: NodeConfig, event: Event): void {
+  const value = (event.target as HTMLInputElement).value.trim();
+  if (value.includes("•")) return;
+  setNodeTwoFactor(node.id, { secret: value });
 }
 
 async function toggleSecret(node: NodeConfig): Promise<void> {
@@ -132,6 +169,8 @@ async function toggleSecret(node: NodeConfig): Promise<void> {
   if (!(await ensureUnlocked(t("gate.reasonSecret")))) return;
   const value = await revealCredential("totp", node.id);
   if (value === null || value === "") return;
+  // As above: the window may have closed while the value was being fetched.
+  if (!unlocked.value) return;
   revealedSecrets.value[node.id] = value;
 }
 
@@ -399,13 +438,14 @@ function clearConfig() {
               </div>
               <div class="node-2fa-field">
                 <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
-                <!-- The mask, and never the secret: what is in the field is what Rust handed back
-                     for display, and typing into it is what replaces the stored one. -->
+                <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
+                     the value: a mask sitting in the field is a value, and a user who adds one
+                     character to it would store bullets as the TOTP secret. -->
                 <input
-                  :value="secretDisplay(node)"
-                  @change="setNodeTwoFactor(node.id, { secret: ($event.target as HTMLInputElement).value.trim() })"
+                  :value="revealedSecrets[node.id] ?? ''"
+                  @change="onSecretChange(node, $event)"
                   :type="secretInputType(node)"
-                  placeholder="JBSWY3DPEHPK3PXP"
+                  :placeholder="secretDisplay(node)"
                   class="form-input"
                 />
                 <button

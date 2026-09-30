@@ -97,11 +97,25 @@ impl OsGate for Pam {
 }
 
 /// Who the app is running as, which is who has to be authenticated.
+///
+/// Read from the process rather than from the environment. `USER` and `LOGNAME`
+/// are whatever whoever started the app said they were, so a process launched
+/// with `USER=somebody-else` would have this ask PAM to authenticate an account
+/// it is not running as — and a password that is not the user's would open the
+/// door. A uid cannot be handed in from outside.
 fn current_user() -> Option<String> {
-    ["USER", "LOGNAME"]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok())
-        .filter(|user| !user.is_empty())
+    // SAFETY: `geteuid` cannot fail, and `getpwuid` is given exactly what it
+    // returned. The struct it hands back belongs to libc and is not to be freed
+    // or kept, which is why the name is copied out of it before returning.
+    unsafe {
+        let entry = libc::getpwuid(libc::geteuid());
+        if entry.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*entry).pw_name);
+        let name = name.to_str().ok()?.to_string();
+        (!name.is_empty()).then_some(name)
+    }
 }
 
 /// Answers PAM's questions from what the UI collected.

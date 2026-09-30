@@ -320,7 +320,8 @@ cd nexapipe-0.4.0-aarch64-apple-darwin &amp;&amp; ./nexapipe --version</pre>
     <button class="copy" data-target="cmd-macos">Copy</button>
   </div>
   <div class="cmdblock">
-    <pre id="cmd-verify"><span class="c"># Verify a download against the release checksums</span>
+    <pre id="cmd-verify"><span class="c"># Verify before extracting: the check looks for the archive beside</span>
+<span class="c"># SHA256SUMS.txt, so it has to run before the cd into the directory</span>
 curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.4.0/SHA256SUMS.txt
 sha256sum -c --ignore-missing SHA256SUMS.txt</pre>
     <button class="copy" data-target="cmd-verify">Copy</button>

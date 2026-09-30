@@ -89,6 +89,9 @@ security-framework = "3"
 # desktop app. Builds against `libpam0g-dev` (see the Linux jobs in ci.yml and
 # release.yml).
 pam-client2 = { version = "0.5", default-features = false }
+# Only for `getpwuid(geteuid())`: the account to authenticate has to come from
+# the process, not from `USER`, which whoever launched the app decided.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Hello, with `LogonUserW` for the machines that have none.
