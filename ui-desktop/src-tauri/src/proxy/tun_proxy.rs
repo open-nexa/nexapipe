@@ -45,7 +45,7 @@ use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
 use nexapipe_client::tun_proxy::{TunProxy as StackProxy, TunStackConfig};
 use nexapipe_client::virtual_ip::IpMapping;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +96,42 @@ pub fn tun_ip() -> String {
 /// The block in use, in CIDR form.
 pub fn tun_network() -> String {
     format!("{}/24", tun_base())
+}
+
+/// The TUN's IPv6 block: `fd00:198:18::/64`.
+///
+/// One fixed block rather than a list of candidates, for the same reason the v4
+/// list exists in reverse: a ULA is not something a LAN or a router hands out,
+/// so there is nothing realistic to collide with. It mirrors the v4 convention
+/// (198.18 is the RFC 2544 fake-IP block) so the two read as one tunnel.
+pub const TUN_V6_BASE: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0198, 0x0018, 0, 0, 0, 0, 0);
+
+/// Prefix length of [`TUN_V6_BASE`]. 64 keeps the block one on-link prefix,
+/// which is what a ULA is meant to be and what the route below installs.
+pub const TUN_V6_PREFIX_LEN: u8 = 64;
+
+/// `TUN_V6_BASE` with the low 16 bits set to `host`.
+fn tun_v6_with(host: u16) -> Ipv6Addr {
+    let mut octets = TUN_V6_BASE.octets();
+    octets[14..16].copy_from_slice(&host.to_be_bytes());
+    Ipv6Addr::from(octets)
+}
+
+/// The TUN interface's own IPv6 address: `…::fe`, the same host part the v4 side
+/// gives the interface (`…254`).
+pub fn tun_v6_ip() -> Ipv6Addr {
+    tun_v6_with(0x00fe)
+}
+
+/// The block in CIDR form, for the route and the platform commands.
+pub fn tun_v6_network() -> String {
+    format!("{}/{}", TUN_V6_BASE, TUN_V6_PREFIX_LEN)
+}
+
+/// The per-domain IPv6 pool: `…::2` … `…::fd`, which is the v4 pool's `…2` …
+/// `…253` and leaves the interface's own host part alone.
+pub fn tun_v6_pool() -> (Ipv6Addr, Ipv6Addr) {
+    (tun_v6_with(0x0002), tun_v6_with(0x00fd))
 }
 
 /// Rewrites an address that still points into one of the *candidate* blocks (as it was
@@ -267,10 +303,38 @@ impl TunProxy {
         //    out an address the stack refuses to route. The pool leaves …254 (the
         //    interface/DNS address) to the interface, exactly like the old dns.rs pool.
         let base = tun_base();
-        let ip_mapping = Arc::new(IpMapping::with_range(
+
+        // IPv6 is best effort: the address has to be set per platform and any of
+        // them may refuse it (a service without the right to change the
+        // interface, an image with IPv6 disabled). When it does not take, the
+        // mapping gets no IPv6 pool and AAAA is answered with nothing, which the
+        // resolver reads as "use A" — rather than with an address no route leads
+        // to, which is a connection that hangs.
+        let has_ipv6 = routing::configure_ipv6(&interface);
+        let (v6_first, v6_last) = tun_v6_pool();
+        let mapping = IpMapping::with_range(
             Ipv4Addr::from(u32::from(base) | 0x02),
             Ipv4Addr::from(u32::from(base) | 0xFD),
-        ));
+        );
+        let ip_mapping = Arc::new(if has_ipv6 {
+            tracing::info!(
+                "TUN IPv6 ready: {} on {} ({}), pool {} … {}",
+                tun_v6_ip(),
+                interface,
+                tun_v6_network(),
+                v6_first,
+                v6_last
+            );
+            mapping.with_ipv6(v6_first, v6_last)
+        } else {
+            tracing::warn!(
+                "No IPv6 on the TUN ({} could not be configured on {}); AAAA queries for \
+                 proxied domains will be answered with nothing",
+                tun_v6_ip(),
+                interface
+            );
+            mapping
+        });
 
         // 3. Bind the local DNS server (DNS hijacking).
         //    The bind must succeed before system DNS is pointed at the TUN address, otherwise
@@ -422,6 +486,11 @@ impl TunProxy {
         }
         if let Err(e) = routing::remove_routes(&interface) {
             tracing::warn!("Failed to remove TUN routes: {}", e);
+        }
+        // Best effort and harmless when the address was never set: the v6 half
+        // of the teardown mirrors the v4 one.
+        if let Err(e) = routing::remove_ipv6(&interface) {
+            tracing::warn!("Failed to remove the TUN IPv6 address: {}", e);
         }
         if let Some(s) = stack.take() {
             s.shutdown_async().await;

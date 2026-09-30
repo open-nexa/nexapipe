@@ -55,6 +55,11 @@ debug = true
 # `--endpoint-id`, so set it before printing an invite (or pass --endpoint-id).
 # secret_key = "your-hex-encoded-secret-key"
 bind_port = 0
+# Also bind [::] on that port, so clients that reach this host over IPv6 are
+# answered there too. The IPv4 socket stays bound; this adds one. The IPv6 bind
+# is allowed to fail, so a host without IPv6 still starts. Ignored without
+# bind_port.
+bind_ipv6 = false
 # Which relay to use. One of: default (all N0 relays; the default when unset),
 # pinned (the single built-in relay this project pins), custom (relay_url below),
 # disabled (no relay transport at all — a peer's relay becomes unusable too).

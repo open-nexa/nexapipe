@@ -85,6 +85,20 @@ pub struct IrohConfig {
     /// client's relay map is the only place its token is read from.
     pub relay_auth_token: Option<String>,
     pub bind_port: Option<u16>,
+    /// Also bind the IPv6 wildcard (`[::]`) on the same port.
+    ///
+    /// Off unless asked for, so a config written before this existed keeps
+    /// binding exactly what it binds today.
+    ///
+    /// It is "also", not "instead": the IPv4 socket stays. An endpoint that
+    /// could only be reached over IPv6 would be a regression for every client
+    /// that has no IPv6 route, and the two sockets are independent here, so
+    /// there is nothing to trade off — turning this on adds a socket, it does
+    /// not move one.
+    ///
+    /// Only meaningful together with `bind_port`: without a fixed port there is
+    /// nothing to keep the two families on the same one.
+    pub bind_ipv6: Option<bool>,
     /// Secret key for stable endpoint identity.
     /// If provided, the endpoint will have the same Node ID across restarts.
     /// Can be generated using `nexapipe --generate-secret` command.
@@ -114,6 +128,7 @@ impl std::fmt::Debug for IrohConfig {
             .field("relay_mode", &self.relay_mode)
             .field("relay_auth_token", &redacted(&self.relay_auth_token))
             .field("bind_port", &self.bind_port)
+            .field("bind_ipv6", &self.bind_ipv6)
             .field("secret_key", &redacted(&self.secret_key))
             .finish()
     }
@@ -2557,6 +2572,7 @@ domains = ["fn.iroh.iakl.top"]
             relay_mode: Some("custom".to_string()),
             relay_auth_token: Some("bearer-secret".to_string()),
             bind_port: Some(1234),
+            bind_ipv6: Some(true),
             secret_key: Some("ed25519-private-key".to_string()),
         };
 

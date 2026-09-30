@@ -150,6 +150,283 @@ pub fn remove_routes(interface: &str) -> Result<()> {
     }
 }
 
+/// Assigns the TUN's IPv6 address and route (idempotent), returning whether the
+/// block is usable.
+///
+/// Unlike the IPv4 block this is optional, and failing is a supported outcome:
+/// a machine (or a service account) that will not let the interface take an
+/// address keeps working over IPv4, and the DNS hijack answers AAAA with
+/// nothing rather than with an address no route leads to. Callers must treat
+/// `false` as "stay on IPv4", not as an error.
+pub fn configure_ipv6(interface: &str) -> bool {
+    #[cfg(windows)]
+    return configure_ipv6_windows(interface);
+
+    #[cfg(target_os = "linux")]
+    return configure_ipv6_linux(interface);
+
+    #[cfg(target_os = "macos")]
+    return configure_ipv6_macos(interface);
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = interface;
+        false
+    }
+}
+
+/// Removes the TUN's IPv6 address and route (best effort).
+pub fn remove_ipv6(interface: &str) -> Result<()> {
+    #[cfg(windows)]
+    return remove_ipv6_windows(interface);
+
+    #[cfg(target_os = "linux")]
+    return remove_ipv6_linux(interface);
+
+    #[cfg(target_os = "macos")]
+    return remove_ipv6_macos(interface);
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = interface;
+        Ok(())
+    }
+}
+
+/// `ifconfig <if> inet6 <addr> prefixlen 64` plus the /64 route — an utun
+/// interface gets no connected route for an address it was only just given.
+#[cfg(target_os = "macos")]
+fn configure_ipv6_macos(interface: &str) -> bool {
+    use crate::proxy::tun_proxy::{TUN_V6_BASE, TUN_V6_PREFIX_LEN, tun_v6_ip};
+
+    let prefix = TUN_V6_PREFIX_LEN.to_string();
+    let out = Command::new("ifconfig")
+        .args([interface, "inet6", &tun_v6_ip().to_string(), "prefixlen", &prefix])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            tracing::warn!(
+                "ifconfig could not set {} on {}: {}",
+                tun_v6_ip(),
+                interface,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("could not run ifconfig for {}: {}", interface, e);
+            return false;
+        }
+    }
+
+    // "File exists" is the route already being there, which is what we asked
+    // for — every command here is meant to be idempotent.
+    let out = Command::new("route")
+        .args([
+            "-n",
+            "add",
+            "-inet6",
+            "-net",
+            &TUN_V6_BASE.to_string(),
+            "-prefixlen",
+            &prefix,
+            "-interface",
+            interface,
+        ])
+        .output();
+    match out {
+        Ok(out)
+            if out.status.success()
+                || String::from_utf8_lossy(&out.stderr).contains("File exists") =>
+        {
+            true
+        }
+        Ok(out) => {
+            tracing::warn!(
+                "route could not add {} via {}: {}",
+                TUN_V6_BASE,
+                interface,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("could not run route for {}: {}", interface, e);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_ipv6_macos(interface: &str) -> Result<()> {
+    use crate::proxy::tun_proxy::{TUN_V6_BASE, TUN_V6_PREFIX_LEN, tun_v6_ip};
+
+    let prefix = TUN_V6_PREFIX_LEN.to_string();
+    let _ = Command::new("route")
+        .args([
+            "-n",
+            "delete",
+            "-inet6",
+            "-net",
+            &TUN_V6_BASE.to_string(),
+            "-prefixlen",
+            &prefix,
+            "-interface",
+            interface,
+        ])
+        .output();
+    // `delete` (without `alias`) removes the address configured above; the
+    // interface and its IPv4 half are untouched.
+    let _ = Command::new("ifconfig")
+        .args([interface, "inet6", &tun_v6_ip().to_string(), "delete"])
+        .output();
+    Ok(())
+}
+
+/// `ip -6 addr replace` + `ip -6 route replace`; the kernel adds the connected
+/// route itself, and the explicit replace covers the cases where it does not.
+#[cfg(target_os = "linux")]
+fn configure_ipv6_linux(interface: &str) -> bool {
+    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip, tun_v6_network};
+
+    let addr = format!("{}/{}", tun_v6_ip(), TUN_V6_PREFIX_LEN);
+    let out = Command::new("ip")
+        .args(["-6", "addr", "replace", &addr, "dev", interface])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            tracing::warn!(
+                "ip could not set {} on {}: {}",
+                addr,
+                interface,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("could not run ip for {}: {}", interface, e);
+            return false;
+        }
+    }
+
+    let network = tun_v6_network();
+    let out = Command::new("ip")
+        .args(["-6", "route", "replace", &network, "dev", interface])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            tracing::warn!(
+                "ip could not route {} via {}: {}",
+                network,
+                interface,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("could not run ip route for {}: {}", interface, e);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_ipv6_linux(interface: &str) -> Result<()> {
+    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip};
+
+    let _ = Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "del",
+            &format!("{}/{}", tun_v6_ip(), TUN_V6_PREFIX_LEN),
+            "dev",
+            interface,
+        ])
+        .output();
+    Ok(())
+}
+
+/// `New-NetIPAddress` rather than the IP Helper API the IPv4 side uses: the
+/// failure this has to survive is the address already being there, which the
+/// cmdlet reports as an error we can simply look up, whereas the FFI path would
+/// need a second unsafe call to ask the same question.
+#[cfg(windows)]
+fn configure_ipv6_windows(interface: &str) -> bool {
+    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip};
+
+    let addr = tun_v6_ip().to_string();
+    // Already there is success — every command here is idempotent.
+    let present = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-NetIPAddress -InterfaceAlias '{interface}' -AddressFamily IPv6 \
+                 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{addr}' }} \
+                 | Measure-Object).Count -gt 0"
+            ),
+        ])
+        .output();
+    if let Ok(out) = &present {
+        if String::from_utf8_lossy(&out.stdout).trim() == "True" {
+            return true;
+        }
+    }
+
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "New-NetIPAddress -InterfaceAlias '{interface}' -IPAddress '{addr}' \
+                 -PrefixLength {TUN_V6_PREFIX_LEN} -ErrorAction Stop"
+            ),
+        ])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            tracing::warn!(
+                "New-NetIPAddress could not set {} on {}: {}",
+                addr,
+                interface,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("could not run powershell for {}: {}", interface, e);
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_ipv6_windows(interface: &str) -> Result<()> {
+    use crate::proxy::tun_proxy::tun_v6_ip;
+
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Get-NetIPAddress -InterfaceAlias '{interface}' -AddressFamily IPv6 \
+                 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{}' }} | \
+                 Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue",
+                tun_v6_ip()
+            ),
+        ])
+        .output();
+    Ok(())
+}
+
 #[cfg(windows)]
 fn configure_interface_windows(interface: &str) -> Result<()> {
     // Not one address but a list of candidate /24 blocks, tried in order.

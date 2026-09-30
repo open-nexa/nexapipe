@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::net::Ipv4Addr;
 
 // The per-domain virtual IP mapping is the same one the smoltcp stack routes by
 // (nexapipe-client's): an address this server hands out must be an address the
@@ -131,15 +130,28 @@ async fn handle_dns_query(
 
     // Check whether the domain is in the proxy list (suffix match on subdomains)
     if should_proxy_domain(&query.domain, proxy_domains) {
-        let virtual_ip = ip_mapping.allocate(&query.domain);
-        tracing::info!("DNS hijack: {} -> {}", query.domain, virtual_ip);
+        // A gets an address from the IPv4 pool, AAAA from the IPv6 one — and the
+        // IPv6 pool only exists when the TUN actually got an IPv6 address to
+        // route (see routing::configure_ipv6). Without it the honest answer is
+        // the empty NOERROR that sends the resolver back to A, not an address
+        // that leads nowhere.
+        let answer = match query.qtype {
+            1 => Some(std::net::IpAddr::V4(ip_mapping.allocate(&query.domain))),
+            28 => ip_mapping.allocate_v6(&query.domain).map(std::net::IpAddr::V6),
+            _ => None,
+        };
 
-        // A records return the virtual IP; every other type (AAAA, ...) gets an empty NOERROR
-        // reply so the query is not leaked upstream and browser resolution is not disturbed
-        let response = if query.qtype == 1 {
-            build_dns_response(data, &query, virtual_ip)
-        } else {
-            build_empty_dns_response(&query)
+        let response = match answer {
+            Some(address) => {
+                tracing::info!("DNS hijack: {} -> {}", query.domain, address);
+                build_dns_response(data, &query, address)
+            }
+            None => {
+                // Every other type (AAAA with no IPv6 pool, MX, ...) gets an empty NOERROR
+                // reply so the query is not leaked upstream and browser resolution is not
+                // disturbed.
+                build_empty_dns_response(&query)
+            }
         };
         socket.send_to(&response, client_addr).await?;
         return Ok(());
@@ -317,9 +329,15 @@ fn parse_dns_query(data: &[u8]) -> Result<DnsQuery> {
     })
 }
 
-/// Builds a DNS response containing an A record
-fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: Ipv4Addr) -> Vec<u8> {
-    let mut response = Vec::with_capacity(query.len() + 16);
+/// Builds a DNS response containing one address record: A for an IPv4 address,
+/// AAAA for an IPv6 one.
+fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: std::net::IpAddr) -> Vec<u8> {
+    let (rtype, rdata): (u16, &[u8]) = match ip {
+        std::net::IpAddr::V4(v4) => (1, &v4.octets()),
+        std::net::IpAddr::V6(v6) => (28, &v6.octets()),
+    };
+
+    let mut response = Vec::with_capacity(query.len() + rdata.len() + 16);
 
     // Header
     response.extend_from_slice(&dns_query.id.to_be_bytes()); // ID
@@ -340,16 +358,16 @@ fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: Ipv4Addr) -> Vec<u
     // Answer section
     // Name pointer (points at the domain name in the question section)
     response.extend_from_slice(&[0xC0, 0x0C]);
-    // TYPE=A
-    response.extend_from_slice(&1u16.to_be_bytes());
+    // TYPE=A (1) or AAAA (28)
+    response.extend_from_slice(&rtype.to_be_bytes());
     // CLASS=IN
     response.extend_from_slice(&1u16.to_be_bytes());
     // TTL=60
     response.extend_from_slice(&60u32.to_be_bytes());
-    // RDLENGTH=4
-    response.extend_from_slice(&4u16.to_be_bytes());
+    // RDLENGTH=4 for A, 16 for AAAA
+    response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     // RDATA=IP
-    response.extend_from_slice(&ip.octets());
+    response.extend_from_slice(rdata);
 
     response
 }
