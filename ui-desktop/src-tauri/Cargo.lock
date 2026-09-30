@@ -3414,7 +3414,9 @@ dependencies = [
  "lazy_static",
  "libc",
  "nexapipe-client",
+ "pam-client2",
  "parking_lot",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3429,6 +3431,8 @@ dependencies = [
  "tracing-subscriber",
  "tun",
  "url",
+ "windows 0.62.2",
+ "windows-future 0.3.2",
  "windows-service",
  "windows-sys 0.61.2",
  "zeroize",
@@ -3924,6 +3928,27 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pam-client2"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "407daa00f98b05147dbbaa6d2f6bce574e76794fa4952a5b38764681a23dde5f"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+ "pam-sys2",
+ "rustversion",
+]
+
+[[package]]
+name = "pam-sys2"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e07ea89c210813e1a48fc32cb358ba693aae8ca70163461e22d11f1884bf1d"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

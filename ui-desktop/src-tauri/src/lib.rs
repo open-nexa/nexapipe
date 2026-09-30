@@ -1,5 +1,6 @@
 ﻿pub mod credentials;
 pub mod error;
+pub mod gate;
 mod proxy;
 pub mod service;
 pub mod status;
@@ -1053,6 +1054,68 @@ async fn reveal_credential(
     credentials::get(&key)
 }
 
+/// The credential door, as a surface sees it: whether it is open, how long it
+/// has left, and whether this machine can be asked at all.
+#[tauri::command]
+async fn gate_status() -> Result<gate::Status, AppError> {
+    on_blocking_task(gate::status).await
+}
+
+/// Asks the operating system to confirm the user, and opens the door if it does.
+///
+/// `reason` is what the prompt says it is for, already in the user's language:
+/// the caller knows which credential is about to be shown and the door does not.
+/// `password` is what [`gate_status`] asked the UI to collect, and is `None` on
+/// the platforms that bring their own prompt.
+#[tauri::command]
+async fn unlock_credentials(
+    reason: String,
+    password: Option<String>,
+) -> Result<gate::Status, AppError> {
+    // Zeroed on drop, so the one platform that needs a password does not leave
+    // one behind in the heap of a task that has moved on.
+    let password = password.map(zeroize::Zeroizing::new);
+
+    let outcome =
+        on_blocking_task(move || gate::confirm(&reason, password.as_ref().map(|p| p.as_str())))
+            .await?;
+
+    match outcome {
+        gate::Outcome::Unlocked => on_blocking_task(gate::status).await,
+        // Asked, and the answer was no. Not worth telling the user twice: they
+        // just said it.
+        gate::Outcome::Refused => Err(AppError::new(codes::CREDENTIALS_LOCKED)),
+        gate::Outcome::Unavailable => Err(AppError::new(codes::CREDENTIALS_GATE_UNAVAILABLE)),
+        gate::Outcome::Failed(detail) => {
+            Err(AppError::with_detail(codes::CREDENTIALS_GATE_FAILED, detail))
+        }
+    }
+}
+
+/// Shuts the door again, without waiting for the window to lapse.
+#[tauri::command]
+async fn lock_credentials() -> Result<gate::Status, AppError> {
+    on_blocking_task(|| {
+        gate::lock();
+        gate::status()
+    })
+    .await
+}
+
+/// Runs one of the door's blocking calls off the async runtime.
+///
+/// Every platform prompt is a modal that lasts as long as the user takes to
+/// answer it, and even `capability` is a syscall or two; neither belongs on a
+/// worker that is also answering IPC for the proxy.
+async fn on_blocking_task<T>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, AppError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| AppError::with_detail(codes::CREDENTIALS_GATE_FAILED, error.to_string()))
+}
+
 /// Writes one credential.
 #[tauri::command]
 async fn put_credential(
@@ -1133,6 +1196,9 @@ pub fn run() {
             get_credential,
             credential_display,
             reveal_credential,
+            gate_status,
+            unlock_credentials,
+            lock_credentials,
             put_credential,
             delete_credential,
             clear_credentials,
