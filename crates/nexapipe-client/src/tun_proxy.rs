@@ -133,8 +133,9 @@ const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
 /// prefix in front of it, so the two families read as one block.
 #[cfg(target_os = "android")]
 const VIRTUAL_IPV6_NET: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0);
-/// First address handed out of [`VIRTUAL_IPV6_NET`]: `::16`, mirroring the
-/// IPv4 pool's `.16`.
+/// First address handed out of [`VIRTUAL_IPV6_NET`]: `::10`, mirroring the
+/// IPv4 pool's `.16` — the sixteenth address, written in hexadecimal as IPv6
+/// notation has it.
 #[cfg(target_os = "android")]
 const VIRTUAL_IPV6_FIRST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0x10);
 /// Last address handed out: `::fffe`. The top of the /64 is left alone the same
@@ -1876,10 +1877,10 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, CacheKey, CachedAnswer, IpMapping, answer_matches_query,
-        answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at,
-        handle_dns_query, lock_cache, parse_dns_query, read_u32, remember_answer, resolver_scope,
-        set_answer_ttls,
+        CacheKey, CachedAnswer, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, IpMapping,
+        answer_matches_query, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
+        cached_answer_at, handle_dns_query, lock_cache, parse_dns_query, read_u32, remember_answer,
+        resolver_scope, set_answer_ttls,
     };
     use std::time::Duration;
 

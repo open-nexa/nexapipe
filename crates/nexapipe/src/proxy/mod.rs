@@ -20,8 +20,8 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::client::legacy;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
-use iroh::endpoint::presets;
 use iroh::endpoint::BindOpts;
+use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
@@ -307,8 +307,8 @@ pub async fn run_proxy(
         // — and saying so beats letting an operator think IPv6 is on.
         if iroh_cfg.bind_ipv6.unwrap_or(false) && iroh_cfg.bind_port.is_none() {
             tracing::warn!(
-                "iroh.bind_ipv6 is set but iroh.bind_port is not: without a fixed port \
-                 there is no address to bind it on, so the endpoint stays IPv4"
+                "iroh.bind_ipv6 is set but iroh.bind_port is not: bind_ipv6 is ignored \
+                 without a fixed port; iroh keeps its default IPv4 and IPv6 bindings"
             );
         }
 
@@ -324,8 +324,8 @@ pub async fn run_proxy(
                 // dialling over IPv4 is unaffected.
                 let v6 = SocketAddr::from_str(&format!("[::]:{}", port))
                     .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;
-                builder = builder
-                    .bind_addr_with_opts(v6, BindOpts::default().set_is_required(false))?;
+                builder =
+                    builder.bind_addr_with_opts(v6, BindOpts::default().set_is_required(false))?;
                 tracing::info!("Iroh bind port: {} (IPv4 and IPv6)", port);
             } else {
                 tracing::info!("Iroh bind port: {}", port);

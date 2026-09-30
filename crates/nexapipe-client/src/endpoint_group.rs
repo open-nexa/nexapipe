@@ -7,6 +7,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -117,6 +118,15 @@ pub struct EndpointGroup {
     /// critical section is a few map lookups, so there is nothing to yield on,
     /// and `health_snapshot()` then works off a runtime as well as on one.
     health: Mutex<HashMap<EndpointId, NodeHealth>>,
+    /// Set for good by [`Self::close_all`], and read by the probe before it
+    /// dials anything.
+    ///
+    /// Not a shutdown signal for the *task* — the task ends when the group is
+    /// dropped and its `Weak` stops upgrading — but for the work: `close_all()`
+    /// drops the connections while the group itself is still alive, and a probe
+    /// that then ran would dial them all again. That is the state a stopped
+    /// tunnel would be left in: idle, and quietly reconnecting.
+    probe_stopped: AtomicBool,
 }
 
 /// How often each backend is asked whether it still answers.
@@ -340,6 +350,7 @@ impl EndpointGroup {
             domains,
             default_pools,
             health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         })
     }
 
@@ -447,6 +458,7 @@ impl EndpointGroup {
             domains,
             default_pools,
             health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         })
     }
 
@@ -459,6 +471,7 @@ impl EndpointGroup {
             domains: HashMap::new(),
             default_pools,
             health: Mutex::new(HashMap::new()),
+            probe_stopped: AtomicBool::new(false),
         }
     }
 
@@ -783,7 +796,13 @@ impl EndpointGroup {
     pub fn start_health_probe(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
+            // A full interval before the first round, not the jitter alone.
+            // Whoever starts the group probes it once at startup, and a round
+            // that landed 0–5 s in would dial the same backends while that one
+            // was still dialling them, so both would find the pool empty and
+            // each would open a connection the other did not know about.
             let first = tokio::time::Instant::now()
+                + PROBE_INTERVAL
                 + Duration::from_millis(fastrand::u64(0..PROBE_JITTER.as_millis() as u64));
             let mut interval = tokio::time::interval_at(first, PROBE_INTERVAL);
             // A round that ran long (a backend timing out costs up to
@@ -795,6 +814,9 @@ impl EndpointGroup {
                 let Some(group) = weak.upgrade() else {
                     break;
                 };
+                if group.probe_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
                 group.probe_round().await;
                 // Dropped here, at the end of the iteration: the strong
                 // reference must not survive into the sleep, or the group would
@@ -808,6 +830,9 @@ impl EndpointGroup {
     /// In parallel because a dead backend costs the whole probe timeout, and
     /// four of them would then take longer than the interval between rounds.
     async fn probe_round(&self) {
+        if self.probe_stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let mut probing = tokio::task::JoinSet::new();
         for (backend_id, pool) in self.unique_pools() {
             probing.spawn(async move {
@@ -821,6 +846,12 @@ impl EndpointGroup {
             });
         }
         while let Some(result) = probing.join_next().await {
+            // Checked here as well as at the top: a round that is already
+            // dialling when the group closes has to stop dialling, and letting
+            // the set drop is what aborts the members still in flight.
+            if self.probe_stopped.load(Ordering::SeqCst) {
+                break;
+            }
             if let Ok((backend_id, answered)) = result {
                 self.record_probe(backend_id, answered);
             }
@@ -982,6 +1013,11 @@ impl EndpointGroup {
     }
 
     pub async fn close_all(&self) {
+        // Before the pools are cleared, not after: the probe reads this, and a
+        // round that started before this line must not go on to dial what is
+        // being closed underneath it.
+        self.probe_stopped.store(true, Ordering::SeqCst);
+
         for pools in self.domains.values() {
             for pool in &pools.pools {
                 pool.close_all().await;
@@ -1378,6 +1414,14 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "the entries are not in a stable order");
-        assert_eq!(ids, group.health_snapshot().nodes.iter().map(|n| n.node.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            ids,
+            group
+                .health_snapshot()
+                .nodes
+                .iter()
+                .map(|n| n.node.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 }

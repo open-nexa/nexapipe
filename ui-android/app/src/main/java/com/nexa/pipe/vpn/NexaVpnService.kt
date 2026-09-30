@@ -87,7 +87,8 @@ class NexaVpnService : VpnService() {
     // The IPv6 half of the same block: `::1` is the interface and the whole /64
     // is routed into the TUN, so an AAAA answer inside it comes back to us the
     // same way an A answer in 10.0.1.0/24 does. The pool Rust hands out of is
-    // ::16 … ::fffe (VIRTUAL_IPV6_FIRST/LAST in tun_proxy.rs).
+    // ::10 … ::fffe (VIRTUAL_IPV6_FIRST/LAST in tun_proxy.rs) — ::10 is the
+    // sixteenth address, the same one the IPv4 pool starts at.
     //
     // A ULA rather than a global address: fd00::/8 is never routed publicly, so
     // an address that escapes the tunnel — a DNS answer, a log line — is a dead

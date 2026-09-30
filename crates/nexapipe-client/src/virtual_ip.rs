@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! dns.example.com   -> 10.0.1.16          (A)
-//! dns.example.com   -> fd00:10:0:1::16    (AAAA)
+//! dns.example.com   -> fd00:10:0:1::10    (AAAA)
 //! ```
 //!
 //! The address is inside the TUN route (`10.0.1.0/24`, `fd00:10:0:1::/64`), so
@@ -29,8 +29,10 @@
 //! the VPN: `.1` is the TUN interface, `.2` the DNS server the system resolver
 //! points at, `.3` the legacy virtual proxy address.
 //!
-//! IPv6: `::16` … `::fffe` in the block the TUN holds, with `::1` left to the
-//! interface for the same reason. Both ranges stay inside the routes the VPN
+//! IPv6: `::10` … `::fffe` in the block the TUN holds, with `::1` left to the
+//! interface for the same reason. `::10` is the sixteenth address, the same one
+//! the IPv4 pool starts at — IPv6 notation is hexadecimal, so it is written
+//! `10` and not `16`. Both ranges stay inside the routes the VPN
 //! installs, so nothing has to be renegotiated with the platform when a domain
 //! is resolved.
 //!
@@ -515,6 +517,9 @@ mod tests {
             mapping.lookup_domain_v6(&second).as_deref(),
             Some("second.test")
         );
-        assert_eq!(mapping.lookup_domain_v6(&third).as_deref(), Some("third.test"));
+        assert_eq!(
+            mapping.lookup_domain_v6(&third).as_deref(),
+            Some("third.test")
+        );
     }
 }
