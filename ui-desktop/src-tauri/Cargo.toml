@@ -22,6 +22,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
+# The clipboard has to be written natively: WKWebView exposes no async
+# clipboard on the `tauri://` scheme, and its `execCommand` fallback needs a
+# user gesture that the awaits between click and write (the gate's sheet, the
+# IPC that fetched the value) have already spent.
+tauri-plugin-clipboard-manager = "2"
 # Gives the UI the OS name (macOS drives traffic-light padding, Linux hides the custom window
 # buttons). The alternative would be sniffing the user agent, which is exactly what the refactor
 # plan rules out; this is the official, typed route and adds no command surface.

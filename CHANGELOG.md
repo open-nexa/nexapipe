@@ -62,10 +62,11 @@ For what comes next, and for why some things are deliberately not planned, see
   Those copies wrote straight to the asynchronous clipboard API, which WebKit
   refuses once the document is not focused — and confirming who is at the
   keyboard takes long enough to lose it. Every copy in the app now goes through
-  the same writer, which falls back to a selection and the legacy command when
-  the asynchronous one is refused. A value that never arrived also stopped being
-  reported as a clipboard failure, which sent the user looking at the wrong
-  thing.
+  the same writer, which writes natively through the operating system's own
+  clipboard — no focus, scheme or gesture required — and falls back to the
+  asynchronous API and then a selection with the legacy command. A value that
+  never arrived also stopped being reported as a clipboard failure, which sent
+  the user looking at the wrong thing.
 - **macOS ran the window with a title bar of its own on top of the app's.** The
   macOS build asked for native decorations without the title bar style that makes
   them transparent, so the system's bar sat above the one the app draws — two

@@ -1,17 +1,25 @@
 /**
  * Clipboard primitives for the application's own context menu (docs/ui-refactor-plan.md §5.11).
  *
- * Two APIs are in play, and the order matters:
+ * Three APIs are in play, and the order matters:
  *
- *   1. `navigator.clipboard` — asynchronous, promise-based, the only way to *read*. It needs a
- *      secure context, which the WebView gives us (`http://tauri.localhost` / `tauri://` are both
- *      treated as trustworthy), and it is already what the invite dialog and the log view use.
- *   2. `document.execCommand` — deprecated, synchronous, and the only way to *write* into a
- *      focused field while keeping its undo history. It is the fallback, never the first choice.
+ *   1. the Tauri clipboard plugin — native, and the only path with no opinion
+ *      about focus, schemes, or user gestures. It is tried first because the
+ *      two below are both refused in exactly the situation a copy button here
+ *      is used: several awaits (the gate's sheet, the IPC that fetched the
+ *      value) sit between the click and the write.
+ *   2. `navigator.clipboard` — asynchronous, promise-based, the only way to
+ *      *read*. It needs a secure context, which the `tauri://` custom scheme
+ *      is not, so on macOS it is simply absent.
+ *   3. `document.execCommand` — deprecated, synchronous, and the only way to
+ *      *write* into a focused field while keeping its undo history. WebKit
+ *      also wants a live user gesture for `copy`, which the awaits above have
+ *      spent. It stays as the last resort, never the first choice.
  *
  * Every function here reports success or failure instead of throwing: a clipboard call that
  * rejects mid-menu would otherwise leave the user with a menu that silently did nothing.
  */
+import { writeText as writeNative } from '@tauri-apps/plugin-clipboard-manager';
 
 /**
  * Writes through a throwaway textarea and the deprecated `execCommand` path.
@@ -58,18 +66,36 @@ function copyThroughSelection(text: string): boolean {
 export async function writeClipboardText(text: string): Promise<boolean> {
   if (!text) return false;
 
-  if (navigator.clipboard?.writeText) {
+  // Native first: the write survives a document that lost focus to the gate's
+  // sheet and needs no gesture. A failure here is reported and fallen through,
+  // because the WebView paths below are only ever worse, never impossible.
+  try {
+    await writeNative(text);
+    return true;
+  } catch (error) {
+    console.error('[clipboard] the native write failed:', error);
+  }
+
+  // Whether the async API is even there is most of the diagnosis, so it is
+  // reported: it needs a secure context, and Tauri serves macOS from
+  // `tauri://localhost`, a custom scheme WebKit does not treat as trustworthy.
+  const hasAsyncApi = Boolean(navigator.clipboard?.writeText);
+
+  if (hasAsyncApi) {
     try {
       await navigator.clipboard.writeText(text);
       return true;
-    } catch {
-      // Fall through: a WebView that refused the write, or one without the
-      // async API to refuse it with. `execCommand` needs a live selection, which
-      // `copyThroughSelection` brings of its own.
+    } catch (error) {
+      // Present and refused: a document that is not focused, or a user gesture
+      // the awaits in the caller spent before this ever ran.
+      console.error('[clipboard] the async API refused the write:', error);
     }
   }
 
-  return copyThroughSelection(text);
+  if (copyThroughSelection(text)) return true;
+
+  console.error(`[clipboard] no path took the write (async API present: ${hasAsyncApi})`);
+  return false;
 }
 
 /**
