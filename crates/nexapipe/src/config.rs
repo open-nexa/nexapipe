@@ -303,6 +303,87 @@ pub struct LogConfig {
     pub redact_query: Option<bool>,
 }
 
+/// The `[timeouts]` section: how long one round trip to a backend may take.
+///
+/// Deliberately not "how long a request may take". Every deadline here covers
+/// one step of talking to a backend — dialing it, or waiting for its answer —
+/// and none of them covers the request as a whole: once a response head
+/// arrives, streaming its body may run for as long as it needs to, on purpose,
+/// because "slow backend" is not the same failure as "silent backend". A
+/// timeout is here because its expiration is a diagnostic, not a quota.
+///
+/// Every key is optional, and every default is the constant the server used
+/// before this section existed, so writing `[timeouts]` and nothing under it
+/// changes nothing.
+///
+/// Read once at startup, not live: these are handed to the HTTP client builder
+/// and to the stream handlers when they start, so an edit takes a restart.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct TimeoutsConfig {
+    /// Seconds allowed for dialing a backend. Default: 10.
+    ///
+    /// One value because it is one thing: the HTTP path (including WebSocket
+    /// upgrades), TLS passthrough and the L4 tunnel all dial exactly one TCP
+    /// connection toward exactly one backend, and before this existed they each
+    /// carried their own copy of ten seconds.
+    ///
+    /// Dialing ends when the connection is up, so this has to cover the network
+    /// and nothing the backend says afterwards — raise it for a backend across
+    /// a slow or lossy link, where a too-short one turns every request into a
+    /// failure that looks like the backend being down.
+    pub connect_secs: Option<u64>,
+    /// Seconds a backend may take to answer with a status line. Default: 30.
+    ///
+    /// This is the wait for the response head, not for the response: the moment
+    /// the head arrives the deadline is over, and a one-hour stream can follow
+    /// it. It is the number to raise for an API that computes before it
+    /// answers, and what stops a backend that accepts the connection and then
+    /// says nothing from holding the request slot until the client gives up.
+    pub response_secs: Option<u64>,
+}
+
+/// The `[timeouts]` section with every default filled in.
+///
+/// The file answers "was this key written?"; this answers "how long do I wait?",
+/// which is the question the rest of the server actually asks. Reading either
+/// field of the config directly would put `.unwrap_or(TEN_SECONDS)` in every
+/// call site — three of them today — and one of them would eventually disagree
+/// with the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub connect: std::time::Duration,
+    pub response: std::time::Duration,
+}
+
+impl Timeouts {
+    /// The deadlines a server without a `[timeouts]` section runs with, i.e. the
+    /// constants this section replaced.
+    const DEFAULT_CONNECT: std::time::Duration = std::time::Duration::from_secs(10);
+    const DEFAULT_RESPONSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The longest wait either key accepts: an hour spent dialing, or waiting
+    /// for a status line, is not a slow backend but one that will never answer.
+    const MAX_SECS: u64 = 3600;
+
+    pub fn resolve(config: TimeoutsConfig) -> Self {
+        Timeouts {
+            connect: config
+                .connect_secs
+                .map_or(Self::DEFAULT_CONNECT, std::time::Duration::from_secs),
+            response: config
+                .response_secs
+                .map_or(Self::DEFAULT_RESPONSE, std::time::Duration::from_secs),
+        }
+    }
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self::resolve(TimeoutsConfig::default())
+    }
+}
+
 /// The `[health_check]` section: periodic `GET {path}` probing of `http` route
 /// backends.
 ///
@@ -372,6 +453,10 @@ pub struct ProxyConfig {
     /// Probing of `http` backends. Absent means the defaults, i.e. enabled.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// How long to wait on a backend. Absent means the deadlines this section
+    /// replaced, unchanged.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
     /// The auxiliary listener for `/healthz` and `/metrics`. Absent means it is
     /// not bound at all.
     pub admin: Option<AdminConfig>,
@@ -518,6 +603,46 @@ impl ProxyConfig {
         Ok(())
     }
 
+    /// Every `[timeouts]` value is a wait for one step of talking to a backend,
+    /// and neither end of the range is a number anyone would dial: zero is a
+    /// deadline that expires before the round trip it is meant to bound, so
+    /// every request to every backend fails; anything past the ceiling is not a
+    /// longer wait but a missing one, and the symptom is a request slot held
+    /// until the client gives up. Refused at load, where the operator is
+    /// looking, rather than discovered as "all requests fail 502".
+    fn validate_timeouts(&self) -> anyhow::Result<()> {
+        for (key, secs) in [
+            ("connect_secs", self.timeouts.connect_secs),
+            ("response_secs", self.timeouts.response_secs),
+        ] {
+            let Some(secs) = secs else {
+                continue;
+            };
+            if secs == 0 {
+                anyhow::bail!(
+                    "[timeouts] {key} is 0: no backend could answer that fast, so every request \
+                     would fail. It is a whole number of seconds, and the shortest wait anyone \
+                     asks for is 1"
+                );
+            }
+            if secs > Timeouts::MAX_SECS {
+                anyhow::bail!(
+                    "[timeouts] {key} is {secs}s, past the {max}s ceiling: a wait that long is a \
+                     request slot held until the client gives up, which is the failure a timeout \
+                     exists to prevent",
+                    max = Timeouts::MAX_SECS
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The `[timeouts]` deadlines this config resolves to.
+    pub fn timeouts(&self) -> Timeouts {
+        Timeouts::resolve(self.timeouts)
+    }
+
     pub fn holds_credentials(&self) -> bool {
         self.iroh
             .as_ref()
@@ -536,6 +661,7 @@ impl ProxyConfig {
         // health check is validated here rather than only at startup: an edit
         // that sets `interval = 0` is as wrong as one written by hand.
         self.validate_health_check()?;
+        self.validate_timeouts()?;
 
         // Refused rather than ignored: silently dropping the key would turn
         // every host it used to forward into a 404, which is a routing change
@@ -694,7 +820,21 @@ pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrate
         Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => {
             crate::lb::LoadBalancingStrategy::RoundRobin
         }
-        None | Some(_) => crate::lb::LoadBalancingStrategy::RoundRobin,
+        Some("least_conn") | Some("LeastConn") | Some("leastconn") => {
+            crate::lb::LoadBalancingStrategy::LeastConn
+        }
+        // Unrecognised values keep meaning round-robin rather than failing to
+        // load, and they say so: a mistyped strategy is otherwise invisible —
+        // traffic still flows, just not the way the config claims — and there
+        // is nowhere else this could be reported.
+        None => crate::lb::LoadBalancingStrategy::RoundRobin,
+        Some(other) => {
+            tracing::warn!(
+                "Unknown load balancing strategy {other:?}; falling back to round_robin \
+                 (accepted: \"round_robin\", \"random\", \"least_conn\")"
+            );
+            crate::lb::LoadBalancingStrategy::RoundRobin
+        }
     }
 }
 
@@ -1707,6 +1847,116 @@ backends = []
             error.contains("no backends"),
             "the message has to say what is missing, got: {error}"
         );
+    }
+
+    /// The point of the whole section: writing nothing under it has to mean "the
+    /// deadlines this server already had", not "wait forever" and not any other
+    /// number.
+    #[test]
+    fn no_timeouts_section_keeps_the_deadlines_it_replaced() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let timeouts = config.timeouts();
+        assert_eq!(timeouts.connect, std::time::Duration::from_secs(10));
+        assert_eq!(timeouts.response, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_partial_timeouts_section_leaves_the_rest_alone() {
+        let config = parse(
+            r#"
+[timeouts]
+response_secs = 120
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        config
+            .build_routes()
+            .expect("configuring one deadline is not an error");
+        let timeouts = config.timeouts();
+        assert_eq!(
+            timeouts.response,
+            std::time::Duration::from_secs(120),
+            "the one that was written"
+        );
+        assert_eq!(
+            timeouts.connect,
+            std::time::Duration::from_secs(10),
+            "the one that was not"
+        );
+    }
+
+    /// A zero timeout is not a stricter timeout: it is one no backend can meet,
+    /// so every request fails — and it fails looking like every backend is down.
+    #[test]
+    fn build_routes_rejects_a_zero_timeout() {
+        let config = parse(
+            r#"
+[timeouts]
+connect_secs = 0
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("connect_secs is 0"),
+            "the message has to name the key nobody can meet, got: {error}"
+        );
+    }
+
+    /// Past the ceiling a timeout stops describing a slow backend and starts
+    /// describing a request that never finishes, which is what it exists to
+    /// prevent.
+    #[test]
+    fn build_routes_rejects_a_timeout_that_never_expires() {
+        let config = parse(
+            r#"
+[timeouts]
+response_secs = 86400
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("86400s"),
+            "the message has to quote the number it refused, got: {error}"
+        );
+    }
+
+    #[test]
+    fn least_conn_is_a_strategy_a_config_can_ask_for() {
+        assert!(matches!(
+            get_strategy(&Some("least_conn".to_string())),
+            crate::lb::LoadBalancingStrategy::LeastConn
+        ));
+        assert!(matches!(
+            get_strategy(&Some("LeastConn".to_string())),
+            crate::lb::LoadBalancingStrategy::LeastConn
+        ));
+        // A typo is not one of them, and it must not silently become a strategy
+        // that ignores load either.
+        assert!(matches!(
+            get_strategy(&Some("least_conns".to_string())),
+            crate::lb::LoadBalancingStrategy::RoundRobin
+        ));
     }
 
     #[test]

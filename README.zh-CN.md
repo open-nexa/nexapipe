@@ -281,8 +281,8 @@ domains = ["app.example.com"]
 | `[iroh] relay_mode` | `default`：使用 N0 中继，按延迟挑选 home relay |
 | `mode` | `http` |
 | `path_pattern` | `/`，前缀匹配 |
-| `strategy` | `round_robin` |
-| `[health_check]` | 开启：每 10 秒 `GET {backend}/health`。后端没有这个端点时会被记为失败，但**流量照常转发** —— 没有任何健康后端时连接池会回退到第一个条目 —— 所以那只是日志噪音，不是故障。设 `enabled = false` 即可消停。 |
+| `strategy` | `round_robin`（或 `random`，或 `least_conn` —— 优先给当前在途请求最少的后端） |
+| `[health_check]` | 开启：每 10 秒 `GET {backend}/health`。后端没有这个端点时会被记为失败，但**只有一个后端的路由仍然照常转发** —— 那里没有第二个可挑的选项 —— 所以那只是日志噪音，不是故障；有多个后端且全部不健康时，直接回 503 且不再拨号。设 `enabled = false` 即可消停。 |
 | `[log]` | `./logs` 下的滚动日志 + 控制台输出，查询参数值会被脱敏 |
 | `[auth]`、`[peers]` | 不做任何认证 —— 启动时服务端会打印一条警告横幅。本机试用没问题；要拿去面对真正在意的服务时，至少加上 `[peers] allow`（或 2FA）。 |
 
@@ -365,7 +365,7 @@ domains = ["app.example.com"]
 host_pattern = "comfyui.example.com"
 path_pattern = "/"
 path_is_prefix = true
-strategy = "round_robin"          # 或 "random"
+strategy = "round_robin"          # 或 "random" / "least_conn"
 backends = ["http://192.0.2.20:18188"]
 mode = "http"                     # 默认
 # path_rewrite = "/api"
@@ -439,6 +439,31 @@ path = "/health"   # 追加到后端 URL 之后
 `interval`、`timeout`、`threshold` 都至少为 `1`：写 `0` 过去会被静默改成 `1`，而三者
 各自的含义都不是任何人想要的 —— 每秒一轮探测、永远无法完成的探测、或一次失败就摘空
 后端池。写 `0` 的配置在加载时会被拒绝。
+
+### `[timeouts]` —— 等待后端的时间
+
+```toml
+[timeouts]
+connect_secs = 10     # 默认：10 —— 拨号连接后端的上限秒数
+response_secs = 30    # 默认：30 —— 等待后端应答的上限秒数
+```
+
+两个键的单位都是秒、都可以不写，默认值就是服务端一直以来的行为，所以写上这一段但
+什么都不填，什么都不会改变。它们**都不限制一次请求能持续多久**：各自只覆盖「与后端
+打交道的某一步」，而一旦响应头到达，之后的响应体要传多久都不受它约束。
+
+| 键 | 约束的是什么 | 何时调大 |
+| --- | --- | --- |
+| `connect_secs` | 拨号。所有「朝一个后端开一条连接」的路径都用它：HTTP 请求（包括 WebSocket 升级）、TLS passthrough 与 `tcp` 隧道。 | 后端在慢链路或丢包严重的链路上 —— 太小会让每个请求都失败，而且表现得像后端挂了。 |
+| `response_secs` | 等待后端的应答：状态行；对 WebSocket 而言是升级响应。响应头一到就结束。 | 后端需要先把结果算出来才回答。它同时也是「后端接受连接后一句话不说」这种情况的上限。 |
+
+`0` 会在加载时被拒绝，超过 `3600` 同样如此：前者是任何后端都达不到的期限，后者描述的
+已经不是慢后端，而是一台根本不再应答的机器 —— 那时没人会替你拿着这个请求槽。
+
+等待**客户端**自己字节的超时刻意不在这里 —— L4 前导、TLS `ClientHello`、明文监听器
+的首字节。那些是协议机制，不是「我该容忍后端多久」。
+
+这两个键在启动时读取一次，改动需要重启。
 
 ### `[admin]` —— 辅助监听（默认关闭）
 
@@ -586,6 +611,7 @@ allow = [
 | `[[routes]]` | 生效。后端会被重新探测；已建立的连接保留其授权时所用的路由。 |
 | `[auth]` | 生效，含 `enabled` —— 打开 2FA 会开始对重载之后新建的连接生效。含密钥的文件必须是 `0600`，否则重载被拒。 |
 | `[health_check]` | 生效。`enabled` 暂停/恢复探测；其余键对重载新增或改动的路由生效。 |
+| `[timeouts]` | 需重启：启动时读取一次，与 `[server] listen_addr` 同理。 |
 | `[peers] allow` | 目前需重启。 |
 | `[iroh]` | 需重启：端点只绑定一次。 |
 | `[server] listen_addr` | 需重启 —— 迁移监听等同于重启。 |

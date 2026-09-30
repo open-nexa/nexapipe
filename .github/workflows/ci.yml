@@ -132,6 +132,12 @@ jobs:
           key: features-${{ matrix.features }}
       - name: cargo check
         run: cargo check -p nexapipe-client --all-targets --features "${{ matrix.features }}" --locked
+      # Compiling tests is not running them: the `tun-proxy` unit tests (DNS
+      # cache semantics, virtual-IP allocation) sat green in the repo for a
+      # release without ever executing on a runner, because the workspace test
+      # job runs default features and this job only used to `check`.
+      - name: cargo test
+        run: cargo test -p nexapipe-client --features "${{ matrix.features }}" --locked
 
   android-ndk:
     name: android ndk (tun-proxy / jni)

@@ -136,7 +136,7 @@ redact_query = true
 host_pattern = "app.example.com"
 path_pattern = "/"
 path_is_prefix = true
-strategy = "round_robin"          # or "random"
+strategy = "round_robin"          # or "random" or "least_conn"
 backends = ["http://127.0.0.1:18080", "http://127.0.0.2:18080"]
 mode = "http"                     # the default; may be omitted
 # path_rewrite = "/api"           # rewrite the path prefix before forwarding
@@ -200,6 +200,37 @@ interval = 10
 timeout = 5
 threshold = 3
 path = "/health"
+
+# ============================================================
+# [timeouts] - waiting on a backend
+# ============================================================
+# Both keys are seconds and both are optional; leaving the section out keeps the
+# deadlines this server has always used. Neither one bounds how long a request
+# may take - each covers one step of talking to a backend, and a response body
+# may then stream for as long as it needs:
+#
+#   connect_secs   dialing a backend: the HTTP request paths (including a
+#                  WebSocket upgrade), TLS passthrough and tcp tunnels all dial
+#                  exactly one connection, and all four wait this long for it.
+#                  Raise it for a backend across a slow or lossy link.
+#                  Default: 10
+#   response_secs  waiting for a backend's answer - its status line, or for a
+#                  WebSocket, its upgrade response. It ends as soon as the head
+#                  arrives. Raise it for an API that computes before it answers.
+#                  Default: 30
+#
+# `0` is refused at startup, and so is anything past 3600: the first is a
+# deadline no backend can meet, and the second is not a slow backend but one
+# that has stopped answering - and then nothing is holding the request slot.
+#
+# Waits on the *client's* bytes are deliberately not here - the L4 preface, the
+# TLS ClientHello, a first byte on the plaintext listener - because those are
+# protocol mechanics, not "how patient should I be with this backend".
+#
+# NOT hot-reloadable: read once at startup, so editing either takes a restart.
+# [timeouts]
+# connect_secs = 10
+# response_secs = 30
 
 # ============================================================
 # [admin] - the auxiliary listener (off by default)

@@ -13,7 +13,7 @@
 //! shows up as a backend that saw nothing.
 
 use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::presets};
-use nexapipe::config::RouteMode;
+use nexapipe::config::{RouteMode, Timeouts};
 use nexapipe::conn;
 use nexapipe::http;
 use nexapipe::l4::FlowLimiter;
@@ -215,7 +215,7 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
     let addr = dial_address(&ep);
 
     let config = Arc::new(RouteConfig::new(routes));
-    let client = Arc::new(http::create_http_client());
+    let client = Arc::new(http::create_http_client(Timeouts::default().connect));
     let limiter = Arc::new(FlowLimiter::new(64));
 
     tokio::spawn(async move {

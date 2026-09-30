@@ -286,7 +286,9 @@ mod tests {
     ) -> HealthChecker {
         HealthChecker::new(
             pool,
-            Arc::new(http::create_http_client()),
+            Arc::new(http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
             Duration::from_millis(10),
             Duration::from_millis(200),
             threshold,
@@ -444,7 +446,9 @@ mod tests {
         // for the rest of the run.
         let checker = HealthChecker::new(
             pool(),
-            Arc::new(http::create_http_client()),
+            Arc::new(http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
             Duration::from_millis(10),
             Duration::from_millis(200),
             1,

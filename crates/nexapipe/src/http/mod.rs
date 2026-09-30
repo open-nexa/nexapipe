@@ -1,4 +1,4 @@
-use crate::routes::{BackendInfo, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use ::http::{Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -19,21 +19,18 @@ pub type HttpClient = hyper_util::client::legacy::Client<
     Full<bytes::Bytes>,
 >;
 
-/// How long dialing a backend may take. Matches `l4` and `passthrough`.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long a backend may take to answer with a status line.
+/// Builds the client the proxy reaches backends through.
 ///
-/// This ends once the response head arrives: streaming the body can legitimately
-/// run far longer. A backend that accepts the connection and then never answers
-/// would otherwise hold the stream, and the request slot behind it, forever.
-const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-pub fn create_http_client() -> HttpClient {
+/// The connect deadline comes from `[timeouts] connect_secs` and lives inside the
+/// connector, so it applies to every dial this client makes — including the ones
+/// made after the response head arrives, for a pooled connection that was closed
+/// meanwhile. It is a builder setting, not something a caller passes per request,
+/// because that is the only place the transport enforces it.
+pub fn create_http_client(connect_timeout: std::time::Duration) -> HttpClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
-    http_connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http_connector.set_connect_timeout(Some(connect_timeout));
 
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .pool_max_idle_per_host(100)
@@ -126,15 +123,34 @@ pub async fn proxy_request(
     let method = req.method().clone();
 
     let backend_info: BackendInfo = match config.get_backend(host, path).await {
-        Some(info) => info,
-        None => {
-            // No route serves this host: saying 404 beats guessing at one.
+        BackendLookup::Found(info) => info,
+        // No route serves this host: saying 404 beats guessing at one.
+        BackendLookup::NoRoute => {
             return Ok(create_error_response(
                 hyper::StatusCode::NOT_FOUND,
                 &format!("No route for host {host}"),
             ));
         }
+        // The route is configured and every backend behind it is unhealthy. 503
+        // rather than 404, because the difference is which file the operator has
+        // to open: nothing here is misconfigured, something downstream is down.
+        BackendLookup::Unavailable => {
+            tracing::warn!("No healthy backend behind {host}{path}, answering 503");
+            return Ok(create_error_response(
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                &format!("No healthy backend for host {host}"),
+            ));
+        }
     };
+
+    // `backend_info` carries the lease (see `BackendInfo::_lease`), so the
+    // backend is counted as busy until this function returns — which is until
+    // the response head is in hand, and exactly what the deadline below bounds.
+    // A response whose body *then* streams is not counted for the whole stream,
+    // so `least_conn` sees a long-running transfer as finished; that skews a
+    // balance decision at worst, and it is the one path the lease cannot follow
+    // without owning the response body.
+    let response_deadline = config.timeouts().response;
 
     let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
         if backend_info.path_is_prefix && path.starts_with(&backend_info.path_pattern) {
@@ -190,14 +206,15 @@ pub async fn proxy_request(
         backend_port
     );
 
-    let response = match tokio::time::timeout(RESPONSE_TIMEOUT, client.request(proxied_req)).await {
+    let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
+    {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("backend request failed: {}", e))?,
         Err(_) => {
             return Err(anyhow::anyhow!(
                 "backend {}:{} did not respond within {:?}",
                 backend_host,
                 backend_port,
-                RESPONSE_TIMEOUT
+                response_deadline
             ));
         }
     };
@@ -432,8 +449,16 @@ impl ProxyFailure {
     }
 }
 
+// One more argument than clippy allows: the alternative is a struct bundling the
+// client with its deadlines, which every caller would have to build in order to
+// pass the same two things — see the note on `conn::handle_bidi_stream`.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_to_backend_streaming(
     client: &HttpClient,
+    // How long the backend may take to answer. Not read off the client, because
+    // it is not the client's: the client owns the deadline for every dial, this
+    // is the one for a single answer. See `crate::config::Timeouts`.
+    timeouts: crate::config::Timeouts,
     req: &Request<()>,
     backend_url: &str,
     body_data: Vec<u8>,
@@ -517,10 +542,12 @@ pub async fn proxy_to_backend_streaming(
         proxied_req.uri()
     );
 
-    // The same deadline `proxy_request` uses. Without it a backend that
-    // accepts the connection and then never sends a head keeps this task, and
-    // the stream slot it holds, alive forever.
-    let response = match tokio::time::timeout(RESPONSE_TIMEOUT, client.request(proxied_req)).await {
+    // The same deadline `proxy_request` uses — one number for one thing. Without
+    // it a backend that accepts the connection and then never sends a head keeps
+    // this task, and the stream slot it holds, alive forever.
+    let response_deadline = timeouts.response;
+    let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
+    {
         Ok(result) => result.map_err(|e| {
             tracing::error!("Failed to send request: {:?}", e);
             anyhow::anyhow!("failed to send request: {:?}", e)
@@ -528,7 +555,7 @@ pub async fn proxy_to_backend_streaming(
         Err(_) => {
             return Err(ProxyFailure::from(anyhow::anyhow!(
                 "backend did not respond within {:?}",
-                RESPONSE_TIMEOUT
+                response_deadline
             )));
         }
     };

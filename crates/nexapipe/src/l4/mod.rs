@@ -30,7 +30,7 @@
 
 use crate::auth::ClientAcl;
 use crate::metrics;
-use crate::routes::RouteConfig;
+use crate::routes::{BackendLookup, RouteConfig};
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
@@ -45,10 +45,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 /// How long a client may take to spell out a complete preface.
+///
+/// Not `[timeouts]`: this waits on the client's own bytes, and every other wait
+/// in that section is a wait on a backend.
 const PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a backend connection may take to establish.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a UDP flow may sit idle before it is torn down, unless the route sets
 /// `idle_timeout_secs`. Kept well above a typical DNS or database keep-alive interval.
@@ -217,24 +217,51 @@ where
     span.record("method", preface.proto.name());
     span.record("uri", target.as_str());
 
-    let Some(route) = config
+    let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)
-        .await
-    else {
-        let _ = write_status(&mut stream, Status::NoRoute).await;
+        .await;
+
+    let unhealthy = matches!(lookup, BackendLookup::Unavailable);
+    let Some(route) = lookup.backend() else {
+        // Both refusals end the flow, but with different statuses, because a
+        // client can act on the difference: no route is something the request
+        // named wrong, whereas a route whose every backend is down is an outage
+        // to retry later. Answering `NoRoute` for the second would tell every
+        // client its configuration is wrong at the moment it is correct.
+        let status = if unhealthy {
+            Status::BackendFailed
+        } else {
+            Status::NoRoute
+        };
+        // 404 and 503 are what the log and the metrics mean by those names; the
+        // wire carries its own vocabulary.
+        let logged_as = if unhealthy { 503 } else { 404 };
+        let _ = write_status(&mut stream, status).await;
         tracing::warn!(
-            "L4 {}: no `mode = {:?}` route for {}, closing",
+            "L4 {}: {} for {}, closing",
             preface.proto.name(),
-            mode,
+            if unhealthy {
+                "every backend behind the route is unhealthy"
+            } else {
+                "no route of this mode serves it"
+            },
             target
         );
         // A flow, not a request: this is a tunnel that stays open for as long
         // as the client wants, so it gets its own counter instead of being
         // counted alongside requests — a rate made of both would be a rate of
         // two different things.
-        metrics::METRICS.record_l4_flow(preface.proto.name(), 404);
-        span.record("status", 404u64);
-        crate::log::log_access(request_id, peer, preface.proto.name(), &target, 404, 0, 0);
+        metrics::METRICS.record_l4_flow(preface.proto.name(), logged_as);
+        span.record("status", logged_as as u64);
+        crate::log::log_access(
+            request_id,
+            peer,
+            preface.proto.name(),
+            &target,
+            logged_as,
+            0,
+            0,
+        );
         return Ok(());
     };
 
@@ -263,8 +290,9 @@ where
         peer
     );
 
+    let connect_timeout = config.timeouts().connect;
     let result = match preface.proto {
-        L4Proto::Tcp => serve_tcp(stream, &route.backend, leftover).await,
+        L4Proto::Tcp => serve_tcp(stream, &route.backend, leftover, connect_timeout).await,
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT);
             serve_udp(stream, &route.backend, leftover, idle).await
@@ -305,7 +333,12 @@ where
 }
 
 /// TCP: dial the backend, hand the client its status byte, then copy raw bytes.
-async fn serve_tcp<S>(mut stream: S, backend: &str, leftover: Vec<u8>) -> anyhow::Result<()>
+async fn serve_tcp<S>(
+    mut stream: S,
+    backend: &str,
+    leftover: Vec<u8>,
+    connect_timeout: Duration,
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -314,7 +347,7 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
-    let mut backend_stream = match connect(&host, port).await {
+    let mut backend_stream = match connect(&host, port, connect_timeout).await {
         Ok(s) => s,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
@@ -486,8 +519,13 @@ where
     Ok(())
 }
 
-async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+/// Dials a backend within `[timeouts] connect_secs`.
+///
+/// One deadline for every tunnel and every passthrough, because they are the
+/// same action: one TCP dial toward one backend. They used to carry three copies
+/// of ten seconds, kept in step by whoever happened to look.
+async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
         .await
         .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
         .map_err(|e| anyhow::anyhow!("failed to connect to backend {host}:{port}: {e}"))?;

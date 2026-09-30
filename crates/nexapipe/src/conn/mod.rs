@@ -1,12 +1,13 @@
 use crate::auth::{
     AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
 };
+use crate::config::Timeouts;
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::l4;
 use crate::metrics;
 use crate::passthrough;
-use crate::routes::{BackendInfo, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
@@ -272,48 +273,64 @@ pub async fn handle_bidi_stream(
     // No `Host` header — HTTP/1.0, or a malformed request — means no route can
     // be matched, because every route, including a `host_pattern = "*"`
     // catch-all, is selected by host. There is nothing to serve it with.
-    let backend_info: Option<BackendInfo> = match host {
+    // Answered, not raised: no `Host` means nothing to look up, and it is worth
+    // no less here than in `http::proxy_request`.
+    let lookup: BackendLookup<BackendInfo> = match host {
         Some(h) => config.get_backend_with_acl(h, path, acl.as_deref()).await,
-        None => None,
+        None => BackendLookup::NoRoute,
     };
 
-    let Some(backend_info) = backend_info else {
-        // Nothing serves this host and there is no default backend. A 404 the
-        // client can read beats closing the stream mid-request.
-        tracing::warn!("No route for host={:?}, answering 404", host);
+    // Which refusal it is decides the status, and nothing else — the writing
+    // and the logging below are the same either way. 404: nothing serves this
+    // name. 503: the route is there and every backend behind it is down, which
+    // is not something the client can fix by asking again for a different host.
+    let unavailable = matches!(lookup, BackendLookup::Unavailable);
+    let status = if unavailable { 503 } else { 404 };
+    let headline = if unavailable {
+        "HTTP/1.1 503 Service Unavailable"
+    } else {
+        "HTTP/1.1 404 Not Found"
+    };
+
+    let Some(backend_info) = lookup.backend() else {
+        tracing::warn!(
+            "Refusing host={:?}: {}, answering {}",
+            host,
+            if unavailable {
+                "no healthy backend behind a route that matches"
+            } else {
+                "no route matches"
+            },
+            status
+        );
         let mut send = send;
         let written = send
-            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .write_all(
+                format!("{headline}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+            )
             .await;
         let _ = send.finish();
         match written {
             Ok(()) => {
-                // Unroutable hosts are logged too: "which hosts are people
-                // asking for that I do not serve" is a routing question, and
-                // without the line the answer is invisible.
-                //
-                // Counted only when the answer reached the client, for the same
-                // reason it is only logged then: a 404 nobody received is not a
-                // request this instance served.
-                metrics::METRICS.record_request(404, 0);
+                // Counted and logged for either status, and only when the answer
+                // reached the client: a refusal nobody received is not a request
+                // this instance served.
+                metrics::METRICS.record_request(status, 0);
                 crate::log::log_access(
                     request_id,
                     peer,
                     request.method().as_str(),
                     request.uri().path(),
-                    404,
+                    status,
                     0,
                     0,
                 );
             }
             Err(e) => {
-                // Nothing reached the client, so there is no response to put in
-                // the access log — a 404 there would claim one was delivered.
-                // The host is still named above, which is what the log line
-                // exists for.
                 tracing::debug!(
-                    "No route for host={:?}, and the 404 could not be written: {}",
+                    "Refusal for host={:?} ({}) could not be written: {}",
                     host,
+                    status,
                     e
                 );
             }
@@ -346,13 +363,14 @@ pub async fn handle_bidi_stream(
     let outcome: Result<http::ProxySummary, http::ProxyFailure> =
         if http::is_websocket_request_static(&request) {
             tracing::debug!("WebSocket request detected");
-            handle_websocket_stream(send, recv, &request, &backend_info.url)
+            handle_websocket_stream(send, recv, &request, &backend_info.url, config.timeouts())
                 .await
                 .map_err(http::ProxyFailure::from)
         } else {
             let mut send = send;
             http::proxy_to_backend_streaming(
                 client,
+                config.timeouts(),
                 &request,
                 &backend_info.url,
                 body_data,
@@ -404,20 +422,12 @@ pub async fn handle_bidi_stream(
     }
 }
 
-/// How long dialing a backend for a WebSocket upgrade may take.
-///
-/// The HTTP path gets its connect timeout from the client builder and the TCP
-/// and TLS tunnels have their own; this was the one dial in the server with no
-/// deadline at all, so a backend that drops SYN kept the stream — and the
-/// request slot behind it — until the client gave up.
-const WS_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
-
-/// How long the backend may take to answer the upgrade.
-///
-/// Covers the handshake only: the session that follows is a pipe and has no
-/// duration to bound. A backend that accepts the connection and then never
-/// sends a byte would otherwise look exactly like one that is still thinking.
-const WS_HANDSHAKE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+// Both of these used to be constants, at exactly the values `[timeouts]`
+// defaults to. They are not the client's bytes or its own handshake, they are
+// the backend's: dialing it, and waiting for it to answer — which is what
+// `connect` and `response` already mean for a plain HTTP request. Leaving them
+// out would make the same two waits configurable for one kind of request and not
+// another, which nobody reading the config could guess.
 
 /// Returns the status the client was answered with: 101 once the tunnel is up,
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
@@ -428,6 +438,7 @@ async fn handle_websocket_stream(
     mut recv: iroh::endpoint::RecvStream,
     req: &Request<()>,
     backend_url: &str,
+    timeouts: Timeouts,
 ) -> anyhow::Result<http::ProxySummary> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
@@ -443,8 +454,10 @@ async fn handle_websocket_stream(
         .map(|h| h.to_string())
         .unwrap_or_else(|| host.to_string());
 
+    // Not the pooled HTTP client: a WebSocket holds one dedicated connection
+    // for the whole session, so this dial is its own, with the same deadline.
     let mut backend_stream = tokio::time::timeout(
-        WS_CONNECT_TIMEOUT,
+        timeouts.connect,
         tokio::net::TcpStream::connect((host, port)),
     )
     .await
@@ -520,14 +533,14 @@ async fn handle_websocket_stream(
         Ok(())
     };
 
-    tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, read_handshake)
+    tokio::time::timeout(timeouts.response, read_handshake)
         .await
         .map_err(|_| {
             anyhow::anyhow!(
                 "backend {}:{} did not answer the WebSocket handshake within {:?}",
                 host,
                 port,
-                WS_HANDSHAKE_TIMEOUT
+                timeouts.response
             )
         })??;
 
