@@ -317,16 +317,6 @@ async function copyNodeId(): Promise<void> {
   }
 }
 
-/* The pulse is how "starting" is said at all, so the global reduced-motion
-   stop in base.css must not flatten it into a static ring — see the matching
-   exemption on the button spinner in AppButton.vue. */
-@media (prefers-reduced-motion: reduce) {
-  .proxy-status__ring.starting .proxy-status__dot {
-    animation-duration: 1.5s !important;
-    animation-iteration-count: infinite !important;
-  }
-}
-
 .proxy-status__text {
   display: flex;
   flex-direction: column;
