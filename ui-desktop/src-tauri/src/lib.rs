@@ -16,7 +16,9 @@ use service::platform::ServiceState;
 use service::IpcClient;
 use status::{EndpointLink, ProxyStatus};
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::RwLock;
 
 lazy_static::lazy_static! {
@@ -24,6 +26,23 @@ lazy_static::lazy_static! {
     static ref STARTUP_ERROR: Arc<RwLock<Option<AppError>>> = Arc::new(RwLock::new(None));
     static ref LOG_CURSOR: Arc<RwLock<Option<LogCursor>>> = Arc::new(RwLock::new(None));
 }
+
+/// Whether [`take_runtime_credentials`] has answered already.
+///
+/// What makes it a start-up read rather than a general one: it is asked by the
+/// config store filling itself in before the app mounts, and refuses everything
+/// after that. A read that could be repeated at any time would be the ungated
+/// one this replaced, whatever it is called.
+static RUNTIME_CREDENTIALS_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The nodes [`accept_invite`] filed credentials for in this process.
+///
+/// What [`take_invited_node_credentials`] answers from. A node is here only
+/// because the user just imported an invite for it, and it leaves when those
+/// credentials are handed over — so the command cannot be pointed at a node
+/// whose credentials the renderer has no business holding.
+static INVITED_NODES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// How far the log page has read into the newest log file.
 ///
@@ -649,6 +668,14 @@ fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
         )?;
     }
 
+    // What `take_invited_node_credentials` answers from: the connection string
+    // this node is identified by was filed by an invite the user just imported,
+    // so the configuration is allowed to read it back — once.
+    INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(node_id.clone());
+
     Ok(InviteAccepted {
         node_id,
         connection_type: connection_type.to_string(),
@@ -1018,15 +1045,126 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
     Ok(credentials::secret_key(kind, &node_id))
 }
 
-/// One credential, decrypted. `None` when it was never stored.
+/// One node's credentials, in full.
 ///
-/// Not a display path: this is what the config store reads a credential back
-/// with, and what hands a connection string to the proxy. Every surface that
-/// shows one asks for [`credential_display`] instead.
+/// Not a display shape: this is what the config store fills itself in with at
+/// start-up, because `start_proxy` still takes a connection string and a TOTP
+/// secret as arguments. Nothing renders it — a surface asks
+/// [`credential_display`], or [`reveal_credential`] once the door is open.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeCredentials {
+    totp: Option<String>,
+    enrollment: Option<String>,
+    ticket: Option<String>,
+    endpoint: Option<String>,
+}
+
+/// Everything the app runs on: the relay bearer and one entry per node.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCredentials {
+    relay: Option<String>,
+    nodes: HashMap<String, NodeCredentials>,
+}
+
+/// Reads one node's credentials out of the store.
+fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
+    Ok(NodeCredentials {
+        totp: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::TotpSecret,
+            node_id,
+        ))?,
+        enrollment: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::EnrollmentToken,
+            node_id,
+        ))?,
+        ticket: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::Ticket,
+            node_id,
+        ))?,
+        endpoint: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::EndpointId,
+            node_id,
+        ))?,
+    })
+}
+
+/// Every credential the app runs on, read once at start-up.
+///
+/// The store used to be readable one value at a time, at any time, through
+/// `get_credential`. [`reveal_credential`] is gated, but a general read beside
+/// it is a gate with an open door next to it: anything that could reach this
+/// process could ask for a TOTP secret without the operating system ever being
+/// consulted. This is asked once, by the config store filling itself in before
+/// the app mounts, and refuses everything after that.
+///
+/// The node ids are an argument rather than something discovered here, so it
+/// answers for the configuration the caller already has and for nothing else.
+/// A read that failed is not spent: a store that handed nothing over has given
+/// nothing away.
 #[tauri::command]
-async fn get_credential(kind: String, node_id: Option<String>) -> Result<Option<String>, AppError> {
-    let key = credential_kind(&kind, node_id)?;
-    credentials::get(&key)
+async fn take_runtime_credentials(node_ids: Vec<String>) -> Result<RuntimeCredentials, AppError> {
+    if RUNTIME_CREDENTIALS_TAKEN.load(Ordering::SeqCst) {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            "the credentials were already read at start-up",
+        ));
+    }
+
+    let mut nodes = HashMap::with_capacity(node_ids.len());
+    for node_id in &node_ids {
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            continue;
+        }
+        nodes.insert(node_id.to_string(), node_credentials(node_id)?);
+    }
+
+    let bundle = RuntimeCredentials {
+        relay: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::RelayToken,
+            "",
+        ))?,
+        nodes,
+    };
+
+    RUNTIME_CREDENTIALS_TAKEN.store(true, Ordering::SeqCst);
+    Ok(bundle)
+}
+
+/// One node's credentials, for the node an invite has just filed them under.
+///
+/// `applyInvite` needs the connection string back after [`accept_invite`]
+/// filed it: the node in the configuration has to agree with the store, or the
+/// next save reads the empty string as a deletion and drops what was just
+/// imported. Narrower than a read by node id — it answers for the nodes this
+/// process imported an invite for, once each, and for no others.
+#[tauri::command]
+async fn take_invited_node_credentials(node_id: String) -> Result<NodeCredentials, AppError> {
+    let node_id = node_id.trim();
+
+    let accepted = INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(node_id);
+    if !accepted {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            "no invite was accepted for this node",
+        ));
+    }
+
+    let credentials = node_credentials(node_id)?;
+
+    // Taken off on the way out rather than on the way in: a read that failed
+    // has handed nothing over, so the caller may still ask again.
+    INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(node_id);
+
+    Ok(credentials)
 }
 
 /// One credential as a surface may show it: [`credentials::mask`] applied where
@@ -1207,7 +1345,8 @@ pub fn run() {
             get_startup_error,
             get_logs,
             clear_logs,
-            get_credential,
+            take_runtime_credentials,
+            take_invited_node_credentials,
             credential_display,
             reveal_credential,
             gate_status,

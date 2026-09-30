@@ -28,8 +28,9 @@ import {
   credentialDisplay,
   credentialStoreStatus,
   deleteCredential,
-  getCredential,
   putCredential,
+  takeInvitedNodeCredentials,
+  takeRuntimeCredentials,
 } from '../api/credentials';
 import { acceptInvite } from '../api/invite';
 import type {
@@ -426,10 +427,11 @@ function persist(config: ProxyConfig): void {
  * value is *written* to the store rather than merely trusted — so the migration happens once and
  * the cleartext copy is gone on the next save.
  *
- * Returns a copy rather than filling `config` in place: each lookup awaits, and the config watcher
- * is live while they run, so a node-by-node fill would expose a config whose first node has been
- * read and whose second has not — and a save started there deletes the second node's credentials
- * as if the user had cleared them.
+ * Returns a copy rather than filling `config` in place: the config watcher is live while this
+ * runs, so a node-by-node fill would expose a config whose first node has been read and whose
+ * second has not — and a save started there deletes the second node's credentials as if the user
+ * had cleared them. The read itself is one call rather than one per credential, which is what
+ * lets the backend answer it once and never again.
  */
 async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
   const hydrated: ProxyConfig = {
@@ -437,7 +439,9 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
     nodes: source.nodes.map((node) => ({ ...node })),
   };
 
-  const relay = await getCredential('relay');
+  const bundle = await takeRuntimeCredentials(hydrated.nodes.map((node) => node.id));
+
+  const relay = bundle.relay;
   if (relay) {
     hydrated.relayAuthToken = relay;
   } else if (hydrated.relayAuthToken.trim()) {
@@ -445,7 +449,9 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
   }
 
   for (const node of hydrated.nodes) {
-    const secret = await getCredential('totp', node.id);
+    const stored = bundle.nodes[node.id];
+
+    const secret = stored?.totp ?? null;
     if (secret) {
       node.twoFactor = {
         clientId: node.twoFactor?.clientId ?? '',
@@ -456,7 +462,7 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
       await putCredential('totp', node.twoFactor.secret, node.id);
     }
 
-    const token = await getCredential('enrollment', node.id);
+    const token = stored?.enrollment ?? null;
     if (token) {
       node.enrollment = { clientId: node.enrollment?.clientId ?? '', token };
     } else if (node.enrollment?.token.trim()) {
@@ -466,14 +472,14 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
     // The store wins, and a payload that still carries the connection string has it
     // written rather than merely trusted — that is the version 3 migration, and it
     // is the reason a node's connection string is empty in the payload from now on.
-    const ticket = await getCredential('ticket', node.id);
+    const ticket = stored?.ticket ?? null;
     if (ticket) {
       node.ticket = ticket;
     } else if (node.ticket.trim()) {
       await putCredential('ticket', node.ticket, node.id);
     }
 
-    const endpointId = await getCredential('endpoint', node.id);
+    const endpointId = stored?.endpoint ?? null;
     if (endpointId) {
       node.endpointId = endpointId;
     } else if (node.endpointId.trim()) {
@@ -730,13 +736,11 @@ export function useConfigStore() {
 
     // Read back the one credential the renderer still has to hold: `start_proxy` takes the
     // connection string as an argument, and the mirror below has to agree with the store or the
-    // next save would delete what was just filed.
-    const [ticket, endpointId] = await Promise.all([
-      getCredential('ticket', node.id),
-      getCredential('endpoint', node.id),
-    ]);
-    node.ticket = ticket ?? '';
-    node.endpointId = endpointId ?? '';
+    // next save would delete what was just filed. This answers only for the node the invite
+    // was accepted for, and only once, so it is not a way back into the store.
+    const stored = await takeInvitedNodeCredentials(node.id);
+    node.ticket = stored.ticket ?? '';
+    node.endpointId = stored.endpoint ?? '';
 
     await refreshConnectionMasks();
     return outcome;

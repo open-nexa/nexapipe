@@ -22,21 +22,57 @@ import { invoke } from '@tauri-apps/api/core';
  */
 export type CredentialKind = 'totp' | 'enrollment' | 'relay' | 'ticket' | 'endpoint';
 
-/** Reads one credential. `null` when it was never stored. */
-export async function getCredential(
-  kind: CredentialKind,
-  nodeId?: string,
-): Promise<string | null> {
-  return await invoke<string | null>('get_credential', { kind, nodeId });
+/**
+ * One node's credentials, in full.
+ *
+ * Not a display shape: this is what the config store fills itself in with at start-up, because
+ * `start_proxy` still takes a connection string and a TOTP secret as arguments. Nothing renders
+ * it — a page asks `credentialDisplay`, or `revealCredential` once the door is open.
+ */
+export interface NodeCredentials {
+  totp: string | null;
+  enrollment: string | null;
+  ticket: string | null;
+  endpoint: string | null;
+}
+
+/** Everything the app runs on: the relay bearer, and one entry per node id. */
+export interface RuntimeCredentials {
+  relay: string | null;
+  nodes: Record<string, NodeCredentials | undefined>;
+}
+
+/**
+ * Reads every credential the app runs on. Once.
+ *
+ * The door in front of `revealCredential` is worth nothing while a general read sits beside it:
+ * anything that can reach this process could ask for a TOTP secret and the operating system would
+ * never be consulted. So this is asked by the config store while it fills itself in, before the
+ * app mounts, and the backend refuses every ask after the first.
+ *
+ * Rejects with `credentials.store_failed` when it has already been read.
+ */
+export async function takeRuntimeCredentials(nodeIds: string[]): Promise<RuntimeCredentials> {
+  return await invoke<RuntimeCredentials>('take_runtime_credentials', { nodeIds });
+}
+
+/**
+ * One node's credentials, for a node an invite has just filed them under.
+ *
+ * The backend answers this only for nodes `accept_invite` imported in this run, and only once
+ * each, so it cannot be pointed at a node whose credentials the renderer has no business holding.
+ */
+export async function takeInvitedNodeCredentials(nodeId: string): Promise<NodeCredentials> {
+  return await invoke<NodeCredentials>('take_invited_node_credentials', { nodeId });
 }
 
 /**
  * One credential as a surface may show it: masked in Rust, so the renderer is handed a projection
  * and never the value.
  *
- * Every surface that prints a credential asks for this. `getCredential` is the plumbing that
- * reads one back into the config — or hands a connection string to the proxy — and is never what
- * a page renders.
+ * Every surface that prints a credential asks for this. `takeRuntimeCredentials` and
+ * `takeInvitedNodeCredentials` are the plumbing that reads one back into the config — which then
+ * hands a connection string to the proxy — and neither is what a page renders.
  */
 export async function credentialDisplay(
   kind: CredentialKind,
