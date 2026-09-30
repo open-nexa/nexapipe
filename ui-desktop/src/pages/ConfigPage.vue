@@ -12,6 +12,7 @@ import { useCredentialGate, clearRefusal } from "../stores/gate";
 import { useToast } from "../composables/useToast";
 import { errorDetail, errorKey } from "../api/errors";
 import { revealCredential } from "../api/credentials";
+import { writeClipboardText } from "../utils/clipboard";
 import CredentialLock from "../components/CredentialLock.vue";
 import InviteImportDialog from "../components/InviteImportDialog.vue";
 
@@ -141,10 +142,12 @@ async function copyConnection(node: NodeConfig): Promise<void> {
   if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
   const value = revealed.value[node.id] ?? (await revealCredential(connectionKind(node), node.id));
   if (!value) return;
-  try {
-    await navigator.clipboard.writeText(value);
+  // The same writer every copy in the app uses: the plain async clipboard call
+  // is refused by WebKit once the document is not focused, and the door that
+  // stands in front of this value takes long enough to lose it.
+  if (await writeClipboardText(value)) {
     toast.success(t("common.copied"));
-  } catch {
+  } else {
     toast.error(t("common.copyFailed"));
   }
 }
@@ -688,26 +691,21 @@ function clearConfig() {
         <div class="form-grid">
           <div class="form-group">
             <label for="relayMode" class="form-label">{{ t('config.relayMode') }}</label>
-            <div class="input-wrapper">
-              <div class="input-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <line x1="2" y1="12" x2="22" y2="12"/>
-                  <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-                </svg>
-              </div>
-              <select
-                id="relayMode"
-                v-model="config.relayMode"
-                class="form-select form-select--icon"
-                @change="updateConfig({ relayMode: config.relayMode })"
-              >
-                <option value="pinned">{{ t('config.relayPinned') }}</option>
-                <option value="default">{{ t('config.relayDefault') }}</option>
-                <option value="disabled">{{ t('config.relayDisabled') }}</option>
-                <option value="custom">{{ t('config.relayCustom') }}</option>
-              </select>
-            </div>
+            <!-- No leading icon, unlike the fields beside it. A native select
+                 paints its own control, so an icon laid over one sits on top of
+                 it — and takes the click that was meant to open it. The 2FA
+                 algorithm select further up is drawn the same way. -->
+            <select
+              id="relayMode"
+              v-model="config.relayMode"
+              class="form-select"
+              @change="updateConfig({ relayMode: config.relayMode })"
+            >
+              <option value="pinned">{{ t('config.relayPinned') }}</option>
+              <option value="default">{{ t('config.relayDefault') }}</option>
+              <option value="disabled">{{ t('config.relayDisabled') }}</option>
+              <option value="custom">{{ t('config.relayCustom') }}</option>
+            </select>
             <p class="hint">{{ t('config.relayModeHint') }}</p>
           </div>
 
@@ -1168,6 +1166,10 @@ function clearConfig() {
   height: 16px;
   color: var(--text-muted);
   z-index: 1;
+  /* Decoration only: it is laid over the field, so without this it takes the
+     click — on the leftmost sliver of an input, and on whatever a select would
+     have opened with it. */
+  pointer-events: none;
 }
 
 .input-icon svg {
@@ -1190,11 +1192,6 @@ function clearConfig() {
 }
 
 .form-input {
-  padding-left: 40px;
-}
-
-/* The relay mode keeps the leading icon the fields beside it have, so it needs the same inset. */
-.form-select--icon {
   padding-left: 40px;
 }
 

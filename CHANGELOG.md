@@ -53,6 +53,14 @@ For what comes next, and for why some things are deliberately not planned, see
   loud on the button, and the answer lands in the field it was typed in. PAM
   still takes its time over a password it refuses — that delay is deliberate —
   but nothing looks broken while it does.
+- **Copying a value the door had just opened came back as "could not copy".**
+  Those copies wrote straight to the asynchronous clipboard API, which WebKit
+  refuses once the document is not focused — and confirming who is at the
+  keyboard takes long enough to lose it. Every copy in the app now goes through
+  the same writer, which falls back to a selection and the legacy command when
+  the asynchronous one is refused. A value that never arrived also stopped being
+  reported as a clipboard failure, which sent the user looking at the wrong
+  thing.
 
 ## [0.4.0] — 2026-09-30
 

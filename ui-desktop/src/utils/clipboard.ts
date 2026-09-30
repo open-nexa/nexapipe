@@ -13,6 +13,47 @@
  * rejects mid-menu would otherwise leave the user with a menu that silently did nothing.
  */
 
+/**
+ * Writes through a throwaway textarea and the deprecated `execCommand` path.
+ *
+ * The async API is the right one to try first, and the only one that can *read*,
+ * but WebKit refuses it unless the document is focused — which it is not while a
+ * system sheet has just taken the window, and is not any more after the `await`
+ * that fetched the value being copied. `execCommand` asks neither of those
+ * things; what it wants is a selection, which is what the textarea is for.
+ */
+function copyThroughSelection(text: string): boolean {
+  const previous = document.activeElement as HTMLElement | null;
+  const selection = document.getSelection();
+  const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+  const field = document.createElement('textarea');
+  field.value = text;
+  // Moved out of sight rather than hidden: a `display: none` field has no
+  // selection, and no selection means nothing to copy.
+  field.setAttribute('readonly', '');
+  field.style.position = 'fixed';
+  field.style.top = '0';
+  field.style.left = '-9999px';
+  document.body.appendChild(field);
+
+  try {
+    field.select();
+    field.setSelectionRange(0, text.length);
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+    if (selection && previousRange) {
+      selection.removeAllRanges();
+      selection.addRange(previousRange);
+    }
+    // The caret goes back where it was: copying is not a reason to move it.
+    if (previous) previous.focus({ preventScroll: true });
+  }
+}
+
 /** Writes `text` to the system clipboard. Resolves false when neither path worked. */
 export async function writeClipboardText(text: string): Promise<boolean> {
   if (!text) return false;
@@ -22,17 +63,13 @@ export async function writeClipboardText(text: string): Promise<boolean> {
       await navigator.clipboard.writeText(text);
       return true;
     } catch {
-      // Fall through: a WebView without the async API, or one that refused the write (no
-      // transient activation). `execCommand` needs a live selection, which the menu deliberately
-      // preserves — see `ContextMenu.vue`.
+      // Fall through: a WebView that refused the write, or one without the
+      // async API to refuse it with. `execCommand` needs a live selection, which
+      // `copyThroughSelection` brings of its own.
     }
   }
 
-  try {
-    return document.execCommand('copy');
-  } catch {
-    return false;
-  }
+  return copyThroughSelection(text);
 }
 
 /**

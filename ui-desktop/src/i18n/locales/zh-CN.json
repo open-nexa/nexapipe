@@ -85,6 +85,7 @@
     "start": "启动代理",
     "stop": "停止代理",
     "nodeId": "节点 ID",
+    "nodeIdUnavailable": "无法读取节点 ID：代理未在运行",
     "connectedEndpoints": "已连接的节点",
     "directCount": "{count} 个直连",
     "relayCount": "{count} 个中继",

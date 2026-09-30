@@ -85,6 +85,7 @@
     "start": "Start proxy",
     "stop": "Stop proxy",
     "nodeId": "Node ID",
+    "nodeIdUnavailable": "The Node ID could not be read: the proxy is not up",
     "connectedEndpoints": "Connected endpoints",
     "directCount": "{count} direct",
     "relayCount": "{count} relay",
