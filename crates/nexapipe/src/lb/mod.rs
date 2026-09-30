@@ -138,6 +138,39 @@ impl BackendPool {
         }
     }
 
+    /// Which backend a `least_conn` pool hands out, from a snapshot of every
+    /// healthy backend's outstanding count.
+    ///
+    /// It takes a snapshot rather than the pool because the minimum and the tie
+    /// have to come from the same reading of the counters, and only one reading
+    /// can guarantee that — see the caller. Returns the chosen backend's index
+    /// and how many backends tied at the least, so the caller can advance its
+    /// cursor over the set it chose from.
+    ///
+    /// `counts` is never empty: a pool with no healthy backend either refuses
+    /// or hands out its single entry before reaching here, so the tie — which
+    /// always contains whoever holds the minimum, and the minimum comes from
+    /// this same slice — is never empty either.
+    fn least_conn_pick(counts: &[(usize, usize)], cursor: usize) -> (usize, usize) {
+        debug_assert!(
+            !counts.is_empty(),
+            "a pool with nothing healthy answers before it reaches the balancer"
+        );
+
+        let least = counts
+            .iter()
+            .map(|(_, outstanding)| *outstanding)
+            .min()
+            .unwrap_or(0);
+        let tied: Vec<usize> = counts
+            .iter()
+            .filter(|(_, outstanding)| *outstanding == least)
+            .map(|(index, _)| *index)
+            .collect();
+
+        (tied[cursor % tied.len()], tied.len())
+    }
+
     /// A backend to send this flow to, or `None` when the pool has nothing left
     /// to serve.
     ///
@@ -216,19 +249,21 @@ impl BackendPool {
                 // this strategy exists to spread. Rotating also means a lease
                 // released too early costs a little accuracy instead of all of
                 // it: worst case the balance degrades towards round-robin.
-                let least = healthy_backends
-                    .iter()
-                    .map(|i| self.backends[*i].in_flight.load(Ordering::Relaxed))
-                    .min()
-                    .unwrap_or(0);
-                let tied: Vec<usize> = healthy_backends
+                //
+                // The counts are read once, into one snapshot, and both the
+                // least and the tie come out of it. Reading them twice — once
+                // for the least, once for whoever is tied at it — lets a lease
+                // released in between empty the tie: the only backend at the
+                // least finishes, nothing is at the least any more, and a pool
+                // that does have backends divides by a tie of zero.
+                let counts: Vec<(usize, usize)> = healthy_backends
                     .into_iter()
-                    .filter(|i| self.backends[*i].in_flight.load(Ordering::Relaxed) == least)
+                    .map(|i| (i, self.backends[i].in_flight.load(Ordering::Relaxed)))
                     .collect();
 
                 let mut index = self.round_robin_index.write().await;
-                let idx = tied[*index % tied.len()];
-                *index = (*index + 1) % tied.len();
+                let (idx, tied) = Self::least_conn_pick(&counts, *index);
+                *index = (*index + 1) % tied;
                 idx
             }
         };
@@ -484,5 +519,81 @@ mod tests {
             vec![0, 0],
             "a dropped lease is finished work"
         );
+    }
+
+    #[test]
+    fn least_conn_pick_takes_the_backend_with_the_least_outstanding() {
+        assert_eq!(
+            BackendPool::least_conn_pick(&[(0, 3), (1, 1), (2, 7)], 0),
+            (1, 1),
+            "one backend carries a single flow against three and seven"
+        );
+    }
+
+    /// Ties rotate, and over the tied set rather than the whole pool: the caller
+    /// advances its cursor by the number the pick reports, so three idle
+    /// backends are walked in turn instead of the first one taking everything.
+    #[test]
+    fn least_conn_pick_rotates_through_every_backend_tied_at_the_least() {
+        let counts = vec![(0, 0), (1, 0), (2, 0)];
+
+        let picked: Vec<usize> = (0..4)
+            .map(|cursor| BackendPool::least_conn_pick(&counts, cursor).0)
+            .collect();
+        assert_eq!(
+            picked,
+            vec![0, 1, 2, 0],
+            "three idle backends, walked in turn"
+        );
+
+        // A unique minimum leaves nothing to rotate, however far the cursor has
+        // run — and it reports a tie of one, not of zero.
+        assert_eq!(
+            BackendPool::least_conn_pick(&[(0, 9), (1, 4), (2, 9)], 41),
+            (1, 1)
+        );
+    }
+
+    /// The pick reads the counters once, so the least and the tie come from the
+    /// same slice and whoever holds the least is always in the tie. Reading them
+    /// twice let a lease released in between empty it: the only backend at the
+    /// least finished, nothing was at the least any more, and a pool that did
+    /// have backends divided by zero.
+    #[test]
+    fn least_conn_pick_always_leaves_something_to_choose_from() {
+        let samples: Vec<Vec<(usize, usize)>> = vec![
+            vec![(0, 0)],
+            vec![(0, 5), (1, 5)],
+            vec![(0, 1), (1, 2), (2, 3)],
+            vec![(0, 3), (1, 2), (2, 1)],
+            vec![(0, 0), (1, 9), (2, 0)],
+            vec![(0, 7), (1, 7), (2, 7), (3, 6)],
+        ];
+
+        for counts in samples {
+            let least = counts
+                .iter()
+                .map(|(_, outstanding)| *outstanding)
+                .min()
+                .unwrap();
+            // `usize::MAX` included: the cursor is only ever taken modulo the
+            // tie, so it must not be able to overflow its way out of one.
+            for cursor in [0, 1, 2, 5, usize::MAX] {
+                let (index, tied) = BackendPool::least_conn_pick(&counts, cursor);
+
+                assert!(
+                    tied >= 1,
+                    "a tie of {tied} would divide by zero in the caller: {counts:?}"
+                );
+                let (_, outstanding) = counts
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .expect("the pick is one of the backends it was given");
+                assert_eq!(
+                    *outstanding, least,
+                    "a backend that is not at the least was chosen from {counts:?}"
+                );
+            }
+        }
     }
 }
