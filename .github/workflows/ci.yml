@@ -310,6 +310,11 @@ jobs:
       # which cfg branch runs, so one amd64 runner per OS covers every cfg branch.
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
+        # Two build-only dependencies of the desktop crate on Linux:
+        #   - libdbus-1-dev, what keyring's persistent backend builds against
+        #     (Secret Service); without it the crate does not compile.
+        #   - libpam0g-dev, what the credential door builds against: Linux has
+        #     no system prompt of its own to borrow, so it asks PAM.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -319,7 +324,9 @@ jobs:
             libxdo-dev \
             libssl-dev \
             patchelf \
-            file
+            file \
+            libdbus-1-dev \
+            libpam0g-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
@@ -351,6 +358,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The same two as the Linux half of desktop-check: this job runs clippy and
+      # the tests, which compile the whole crate and not just type-check it, so
+      # it needs every build-time dependency the desktop crate has on Linux.
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -361,7 +371,9 @@ jobs:
             libxdo-dev \
             libssl-dev \
             patchelf \
-            file
+            file \
+            libdbus-1-dev \
+            libpam0g-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03

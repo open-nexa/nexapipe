@@ -19,6 +19,14 @@ export interface ConfirmOptions {
   tone?: ConfirmTone;
   confirmText?: string;
   cancelText?: string;
+  /**
+   * Drops the cancel button, for a message that is told rather than asked.
+   *
+   * Used where the answer is not the user's to give — a device that cannot
+   * confirm anybody leaves one way out, and offering "cancel" beside it would
+   * only suggest there was a choice.
+   */
+  hideCancel?: boolean;
   /** Raw diagnostic for the optional "technical details" disclosure. */
   detail?: string;
 }
@@ -44,6 +52,7 @@ export function confirm(options: ConfirmOptions): Promise<boolean> {
     tone: options.tone ?? 'info',
     confirmText: options.confirmText ?? translate('common.confirm'),
     cancelText: options.cancelText ?? translate('common.cancel'),
+    hideCancel: options.hideCancel ?? false,
     detail: options.detail,
   };
 

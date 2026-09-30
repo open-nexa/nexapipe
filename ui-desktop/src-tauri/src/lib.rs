@@ -1,5 +1,6 @@
 ﻿pub mod credentials;
 pub mod error;
+pub mod gate;
 mod proxy;
 pub mod service;
 pub mod status;
@@ -15,7 +16,9 @@ use service::platform::ServiceState;
 use service::IpcClient;
 use status::{EndpointLink, ProxyStatus};
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::RwLock;
 
 lazy_static::lazy_static! {
@@ -23,6 +26,29 @@ lazy_static::lazy_static! {
     static ref STARTUP_ERROR: Arc<RwLock<Option<AppError>>> = Arc::new(RwLock::new(None));
     static ref LOG_CURSOR: Arc<RwLock<Option<LogCursor>>> = Arc::new(RwLock::new(None));
 }
+
+/// Whether [`take_runtime_credentials`] has answered already.
+///
+/// What makes it a start-up read rather than a general one: it is asked by the
+/// config store filling itself in before the app mounts, and refuses everything
+/// after that. A read that could be repeated at any time would be the ungated
+/// one this replaced, whatever it is called.
+///
+/// Debug builds are the exception, and only because a reload of the webview
+/// runs that start-up again without restarting this process. Re-arming it in a
+/// shipped build would not be a concession to that: a script in the renderer
+/// can reload the page whenever it likes, so anything that re-opens the read on
+/// a reload hands the script the answer this command exists to refuse.
+static RUNTIME_CREDENTIALS_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The nodes [`accept_invite`] filed credentials for in this process.
+///
+/// What [`take_invited_node_credentials`] answers from. A node is here only
+/// because the user just imported an invite for it, and it leaves when those
+/// credentials are handed over — so the command cannot be pointed at a node
+/// whose credentials the renderer has no business holding.
+static INVITED_NODES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// How far the log page has read into the newest log file.
 ///
@@ -397,8 +423,30 @@ async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyStatus, AppE
     })
 }
 
+/// This endpoint's Node ID, as [`credentials::mask`] renders it.
+///
+/// Masked for the same reason a stored credential is: this is the string the UI
+/// prints, and it is the name this machine answers to on the network. Nothing in
+/// the app needs the whole of it to work — [`reveal_node_id`] is how the user
+/// gets one to paste somewhere, which is a deliberate act rather than a glance.
 #[tauri::command]
-async fn get_node_id(use_service: Option<bool>) -> Result<String, AppError> {
+async fn get_node_id_display(use_service: Option<bool>) -> Result<String, AppError> {
+    Ok(credentials::mask(&node_id(use_service).await?))
+}
+
+/// This endpoint's Node ID in full.
+///
+/// The one way a surface gets the whole of it, for the user to copy into a
+/// server's `[peers] allow` or into a message to whoever runs one — which is
+/// why the door stands in front of it.
+#[tauri::command]
+async fn reveal_node_id(use_service: Option<bool>) -> Result<String, AppError> {
+    require_unlocked()?;
+    node_id(use_service).await
+}
+
+/// This endpoint's Node ID, from whichever process is running the proxy.
+async fn node_id(use_service: Option<bool>) -> Result<String, AppError> {
     let use_service = use_service.unwrap_or(false);
 
     if use_service {
@@ -450,13 +498,18 @@ async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLin
     })
 }
 
-/// A `nexapipe://` invitation read into the shape the UI needs to fill in a node.
+/// A `nexapipe://` invitation read into the shape the UI needs to *show* before the
+/// user commits.
 ///
 /// The grammar lives in `nexapipe-client` (module `provisioning`), the same parser the server that
 /// prints the code and the Android client that scans it both read; the desktop asks it instead of
-/// growing a third implementation that would drift. Only what the UI has to *show* before the
-/// user commits is carried across, and nothing is applied here: an invite is described, then the
-/// frontend decides.
+/// growing a third implementation that would drift.
+///
+/// Nothing here is applied, and — the difference from what this used to return —
+/// nothing secret crosses either: the connection string is masked by
+/// [`credentials::mask`], and a TOTP secret or enrollment token a code carries is
+/// not handed to the renderer at all. Showing an invite needs neither, and
+/// [`accept_invite`] is what files them once the user says yes.
 ///
 /// The fields cross into TypeScript, where `InvitePayload` in `src/types/index.ts` spells them
 /// camelCase. Nothing in Tauri rewrites the keys of a command result — every struct has to ask
@@ -468,8 +521,11 @@ async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLin
 pub struct InvitePayload {
     /// `endpoint` for a bare Node ID, `ticket` for an address-bearing ticket.
     pub kind: String,
-    /// The Node ID, or the ticket, verbatim.
-    pub target: String,
+    /// The Node ID, or the ticket, as [`credentials::mask`] renders it.
+    ///
+    /// Masked because the preview is a surface: this is the string the dialog
+    /// prints, and a ticket is the whole of what someone needs to connect.
+    pub target_masked: String,
     /// Cosmetic label from the invite. Nothing routes on it.
     pub name: Option<String>,
     pub domains: Vec<String>,
@@ -482,23 +538,50 @@ pub struct InvitePayload {
 }
 
 /// The enrollment half of an invite: a token to spend, not a secret to keep.
+///
+/// What crosses is *that* there is one and who it is for. The token itself is
+/// filed by [`accept_invite`] and never reaches the renderer.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteEnrollmentPayload {
     /// Which `[auth.clients]` entry the token is pending for.
     pub client_id: String,
-    pub token: String,
 }
 
 /// The 2FA half of an invite, in the form the config store keeps it.
+///
+/// The secret is not in here: an invite is shown to be recognised, not to be
+/// read, and the secret is the one part of a code that is still a credential
+/// after the connection it authorises is set up.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteTotpPayload {
     pub client_id: String,
-    pub secret: String,
     /// Lowercase algorithm name, which is what `twoFactorAlgorithm` holds.
     pub algorithm: String,
     pub issuer: String,
+}
+
+/// What [`accept_invite`] answers: which node an invite belongs to, and
+/// everything about it that is not a credential.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteAccepted {
+    /// The node the invite's credentials were filed under. An existing node's id
+    /// when one already held this connection string, so importing the same
+    /// invite twice tops a node up instead of adding a second one pointing at
+    /// the same backend.
+    pub node_id: String,
+    /// `ticket` or `endpoint_id`, which is what `connectionType` calls them.
+    pub connection_type: String,
+    /// Whether `node_id` named a node that was already here.
+    pub existing: bool,
+    /// Cosmetic label from the invite. Nothing routes on it.
+    pub name: Option<String>,
+    pub domains: Vec<String>,
+    pub relay: Option<String>,
+    pub totp: Option<InviteTotpPayload>,
+    pub enrollment: Option<InviteEnrollmentPayload>,
 }
 
 /// Reads a `nexapipe://` invite pasted into the UI.
@@ -522,13 +605,12 @@ fn parse_invite(uri: String) -> Result<InvitePayload, AppError> {
 
     Ok(InvitePayload {
         kind,
-        target,
+        target_masked: credentials::mask(&target),
         name: invite.name.clone(),
         domains: invite.domains.clone(),
         relay: invite.relay.clone(),
         totp: invite.totp.as_ref().map(|totp| InviteTotpPayload {
             client_id: totp.client_id.clone(),
-            secret: totp.secret.clone(),
             algorithm: totp.algorithm.name().to_string(),
             issuer: totp.issuer.clone(),
         }),
@@ -537,9 +619,128 @@ fn parse_invite(uri: String) -> Result<InvitePayload, AppError> {
             .as_ref()
             .map(|enrollment| InviteEnrollmentPayload {
                 client_id: enrollment.client_id.clone(),
-                token: enrollment.token.clone(),
             }),
     })
+}
+
+/// Files what an invite carries into the encrypted store and says which node it
+/// belongs to.
+///
+/// This exists because [`parse_invite`] stopped handing secrets to the renderer:
+/// something has to put the connection string, the TOTP secret and the enrollment
+/// token where they live, and the renderer is the one place they should not pass
+/// through on the way. The answer is everything else about the code — no
+/// credential in it, so the caller can build the node without ever holding one.
+///
+/// Which node it is gets decided here, by looking for one that already holds this
+/// connection string: the renderer cannot do that comparison any more, because it
+/// no longer has the string to compare with. Node ids are the keys the store
+/// files credentials under, so "which node" is a question about the store.
+#[tauri::command]
+fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
+    let invite = EndpointInvite::from_uri(&uri)
+        .map_err(|e| AppError::cause(codes::INVITE_PARSE_FAILED, e))?;
+
+    let (connection_type, target, kind) = match &invite.target {
+        EndpointTarget::NodeId(id) => (
+            "endpoint_id",
+            id.clone(),
+            credentials::CredentialKind::EndpointId,
+        ),
+        EndpointTarget::Ticket(ticket) => (
+            "ticket",
+            ticket.clone(),
+            credentials::CredentialKind::Ticket,
+        ),
+    };
+
+    let existing = node_holding(kind, &target)?;
+    let node_id = existing.clone().unwrap_or_else(new_node_id);
+
+    // The connection string first: everything below is filed under a node that
+    // is identified by having it, so a failure here must leave nothing behind.
+    credentials::put(&credentials::secret_key(kind, &node_id), &target)?;
+
+    if let Some(totp) = &invite.totp {
+        credentials::put(
+            &credentials::secret_key(credentials::CredentialKind::TotpSecret, &node_id),
+            &totp.secret,
+        )?;
+    }
+    if let Some(enrollment) = &invite.enrollment {
+        credentials::put(
+            &credentials::secret_key(credentials::CredentialKind::EnrollmentToken, &node_id),
+            &enrollment.token,
+        )?;
+    }
+
+    // What `take_invited_node_credentials` answers from: the connection string
+    // this node is identified by was filed by an invite the user just imported,
+    // so the configuration is allowed to read it back — once.
+    INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(node_id.clone());
+
+    Ok(InviteAccepted {
+        node_id,
+        connection_type: connection_type.to_string(),
+        existing: existing.is_some(),
+        name: invite.name.clone(),
+        domains: invite.domains.clone(),
+        relay: invite.relay.clone(),
+        totp: invite.totp.as_ref().map(|totp| InviteTotpPayload {
+            client_id: totp.client_id.clone(),
+            algorithm: totp.algorithm.name().to_string(),
+            issuer: totp.issuer.clone(),
+        }),
+        enrollment: invite
+            .enrollment
+            .as_ref()
+            .map(|enrollment| InviteEnrollmentPayload {
+                client_id: enrollment.client_id.clone(),
+            }),
+    })
+}
+
+/// The node whose stored connection string is `target`, if there is one.
+///
+/// A scan rather than an index because there is no index to keep: a node is
+/// identified by its connection string and there are a handful of them. Every
+/// entry is read here, and every read is a decrypt, which is the point — the
+/// comparison happens where the values are plaintext anyway.
+fn node_holding(
+    kind: credentials::CredentialKind,
+    target: &str,
+) -> Result<Option<String>, AppError> {
+    let prefix = format!("{}:", kind.as_str());
+
+    for key in credentials::keys()? {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        if credentials::get(&key)?.as_deref() == Some(target) {
+            return Ok(Some(key[prefix.len()..].to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// An id for a node no stored connection string belongs to yet.
+///
+/// Only has to be unique among the store's keys, and unguessable is not part of
+/// the job: it names a node in a file the user already owns.
+fn new_node_id() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Not a credential and not a nonce, so a coarse fallback is fine: the
+        // clock plus whatever the address happened to be still distinguishes
+        // two nodes created in the same session.
+        return format!("node-{:?}", std::time::SystemTime::now());
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("node-{hex}")
 }
 
 /// Hands back the credential a server issued for an enrollment token, and clears it.
@@ -828,6 +1029,8 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
         "totp" => credentials::CredentialKind::TotpSecret,
         "enrollment" => credentials::CredentialKind::EnrollmentToken,
         "relay" => credentials::CredentialKind::RelayToken,
+        "ticket" => credentials::CredentialKind::Ticket,
+        "endpoint" => credentials::CredentialKind::EndpointId,
         other => {
             return Err(AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
@@ -848,11 +1051,230 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
     Ok(credentials::secret_key(kind, &node_id))
 }
 
-/// One credential, decrypted. `None` when it was never stored.
+/// One node's credentials, in full.
+///
+/// Not a display shape: this is what the config store fills itself in with at
+/// start-up, because `start_proxy` still takes a connection string and a TOTP
+/// secret as arguments. Nothing renders it — a surface asks
+/// [`credential_display`], or [`reveal_credential`] once the door is open.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeCredentials {
+    totp: Option<String>,
+    enrollment: Option<String>,
+    ticket: Option<String>,
+    endpoint: Option<String>,
+}
+
+/// Everything the app runs on: the relay bearer and one entry per node.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCredentials {
+    relay: Option<String>,
+    nodes: HashMap<String, NodeCredentials>,
+}
+
+/// Reads one node's credentials out of the store.
+fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
+    Ok(NodeCredentials {
+        totp: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::TotpSecret,
+            node_id,
+        ))?,
+        enrollment: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::EnrollmentToken,
+            node_id,
+        ))?,
+        ticket: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::Ticket,
+            node_id,
+        ))?,
+        endpoint: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::EndpointId,
+            node_id,
+        ))?,
+    })
+}
+
+/// Every credential the app runs on, read once at start-up.
+///
+/// The store used to be readable one value at a time, at any time, through
+/// `get_credential`. [`reveal_credential`] is gated, but a general read beside
+/// it is a gate with an open door next to it: anything that could reach this
+/// process could ask for a TOTP secret without the operating system ever being
+/// consulted. This is asked once, by the config store filling itself in before
+/// the app mounts, and refuses everything after that.
+///
+/// The node ids are an argument rather than something discovered here, so it
+/// answers for the configuration the caller already has and for nothing else.
+/// A read that failed is not spent: a store that handed nothing over has given
+/// nothing away.
 #[tauri::command]
-async fn get_credential(kind: String, node_id: Option<String>) -> Result<Option<String>, AppError> {
+async fn take_runtime_credentials(node_ids: Vec<String>) -> Result<RuntimeCredentials, AppError> {
+    // See `RUNTIME_CREDENTIALS_TAKEN`: a debug build answers again, because a
+    // reload of the webview is a new renderer in the same process and would
+    // otherwise be locked out of the store for the rest of the run.
+    if RUNTIME_CREDENTIALS_TAKEN.load(Ordering::SeqCst) && !cfg!(debug_assertions) {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            "the credentials were already read at start-up",
+        ));
+    }
+
+    let mut nodes = HashMap::with_capacity(node_ids.len());
+    for node_id in &node_ids {
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            continue;
+        }
+        nodes.insert(node_id.to_string(), node_credentials(node_id)?);
+    }
+
+    let bundle = RuntimeCredentials {
+        relay: credentials::get(&credentials::secret_key(
+            credentials::CredentialKind::RelayToken,
+            "",
+        ))?,
+        nodes,
+    };
+
+    RUNTIME_CREDENTIALS_TAKEN.store(true, Ordering::SeqCst);
+    Ok(bundle)
+}
+
+/// One node's credentials, for the node an invite has just filed them under.
+///
+/// `applyInvite` needs the connection string back after [`accept_invite`]
+/// filed it: the node in the configuration has to agree with the store, or the
+/// next save reads the empty string as a deletion and drops what was just
+/// imported. Narrower than a read by node id — it answers for the nodes this
+/// process imported an invite for, once each, and for no others.
+#[tauri::command]
+async fn take_invited_node_credentials(node_id: String) -> Result<NodeCredentials, AppError> {
+    let node_id = node_id.trim();
+
+    let accepted = INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(node_id);
+    if !accepted {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            "no invite was accepted for this node",
+        ));
+    }
+
+    let credentials = node_credentials(node_id)?;
+
+    // Taken off on the way out rather than on the way in: a read that failed
+    // has handed nothing over, so the caller may still ask again.
+    INVITED_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(node_id);
+
+    Ok(credentials)
+}
+
+/// One credential as a surface may show it: [`credentials::mask`] applied where
+/// the value is, so the renderer is handed a projection and never the thing.
+#[tauri::command]
+async fn credential_display(
+    kind: String,
+    node_id: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let key = credential_kind(&kind, node_id)?;
+    Ok(credentials::get(&key)?.map(|value| credentials::mask(&value)))
+}
+
+/// One credential in full, for the user to copy.
+///
+/// The only path from the store to a surface, and the one the door stands in
+/// front of: everything else the UI can ask for is either a mask or a shape.
+#[tauri::command]
+async fn reveal_credential(
+    kind: String,
+    node_id: Option<String>,
+) -> Result<Option<String>, AppError> {
+    require_unlocked()?;
     let key = credential_kind(&kind, node_id)?;
     credentials::get(&key)
+}
+
+/// Refuses a reveal while the door is shut.
+///
+/// The check the rest of `gate` exists to make possible. It reads the window and
+/// nothing else: whether the machine can still ask is re-read when the UI asks
+/// for the status, which is what it does when the app comes back into view, and
+/// a window that is open is at most two minutes old.
+fn require_unlocked() -> Result<(), AppError> {
+    if gate::is_unlocked() {
+        Ok(())
+    } else {
+        Err(AppError::new(codes::CREDENTIALS_LOCKED))
+    }
+}
+
+/// The credential door, as a surface sees it: whether it is open, how long it
+/// has left, and whether this machine can be asked at all.
+#[tauri::command]
+async fn gate_status() -> Result<gate::Status, AppError> {
+    on_blocking_task(gate::status).await
+}
+
+/// Asks the operating system to confirm the user, and opens the door if it does.
+///
+/// `reason` is what the prompt says it is for, already in the user's language:
+/// the caller knows which credential is about to be shown and the door does not.
+/// `password` is what [`gate_status`] asked the UI to collect, and is `None` on
+/// the platforms that bring their own prompt.
+#[tauri::command]
+async fn unlock_credentials(
+    reason: String,
+    password: Option<String>,
+) -> Result<gate::Status, AppError> {
+    // Zeroed on drop, so the one platform that needs a password does not leave
+    // one behind in the heap of a task that has moved on.
+    let password = password.map(zeroize::Zeroizing::new);
+
+    let outcome =
+        on_blocking_task(move || gate::confirm(&reason, password.as_ref().map(|p| p.as_str())))
+            .await?;
+
+    match outcome {
+        gate::Outcome::Unlocked => on_blocking_task(gate::status).await,
+        // Asked, and the answer was no. Not worth telling the user twice: they
+        // just said it.
+        gate::Outcome::Refused => Err(AppError::new(codes::CREDENTIALS_LOCKED)),
+        gate::Outcome::Unavailable => Err(AppError::new(codes::CREDENTIALS_GATE_UNAVAILABLE)),
+        gate::Outcome::Failed(detail) => {
+            Err(AppError::with_detail(codes::CREDENTIALS_GATE_FAILED, detail))
+        }
+    }
+}
+
+/// Shuts the door again, without waiting for the window to lapse.
+#[tauri::command]
+async fn lock_credentials() -> Result<gate::Status, AppError> {
+    on_blocking_task(|| {
+        gate::lock();
+        gate::status()
+    })
+    .await
+}
+
+/// Runs one of the door's blocking calls off the async runtime.
+///
+/// Every platform prompt is a modal that lasts as long as the user takes to
+/// answer it, and even `capability` is a syscall or two; neither belongs on a
+/// worker that is also answering IPC for the proxy.
+async fn on_blocking_task<T>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, AppError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| AppError::with_detail(codes::CREDENTIALS_GATE_FAILED, error.to_string()))
 }
 
 /// Writes one credential.
@@ -917,9 +1339,11 @@ pub fn run() {
             start_proxy,
             stop_proxy,
             get_proxy_status,
-            get_node_id,
+            get_node_id_display,
+            reveal_node_id,
             get_endpoint_links,
             parse_invite,
+            accept_invite,
             take_issued_credential,
             install_service,
             uninstall_service,
@@ -930,7 +1354,13 @@ pub fn run() {
             get_startup_error,
             get_logs,
             clear_logs,
-            get_credential,
+            take_runtime_credentials,
+            take_invited_node_credentials,
+            credential_display,
+            reveal_credential,
+            gate_status,
+            unlock_credentials,
+            lock_credentials,
             put_credential,
             delete_credential,
             clear_credentials,
@@ -965,7 +1395,9 @@ mod tests {
         let payload = parse_invite(endpoint_invite().with_name("Home").to_uri()).unwrap();
 
         assert_eq!(payload.kind, "endpoint");
-        assert_eq!(payload.target, node_id());
+        // Recognisable, and not the thing: the preview is a surface.
+        assert_eq!(payload.target_masked, credentials::mask(&node_id()));
+        assert_ne!(payload.target_masked, node_id());
         assert_eq!(payload.name.as_deref(), Some("Home"));
         assert_eq!(payload.domains, vec!["a.example", "b.example"]);
         assert_eq!(payload.relay, None);
@@ -988,7 +1420,11 @@ mod tests {
 
         let payload = parse_invite(invite.to_uri()).unwrap();
         assert_eq!(payload.kind, "ticket");
-        assert_eq!(payload.target, target.to_string());
+        assert_eq!(payload.target_masked, credentials::mask(&target.to_string()));
+        assert!(
+            !payload.target_masked.contains(&target.to_string()[8..target.to_string().len() - 8]),
+            "the middle of the ticket must not reach the renderer"
+        );
         assert!(payload.domains.is_empty());
     }
 
@@ -999,10 +1435,18 @@ mod tests {
         ));
 
         let payload = parse_invite(invite.to_uri()).unwrap();
-        let totp = payload.totp.expect("the invite carries 2FA");
-        assert_eq!(totp.client_id, "client-001");
-        assert_eq!(totp.secret, "JBSWY3DPEHPK3PXP");
-        assert_eq!(totp.algorithm, "sha1");
+        assert!(payload.totp.is_some(), "the invite carries 2FA");
+
+        // What is *not* here is the point: a secret the renderer cannot show is
+        // one it cannot leak, and `accept_invite` files it without asking.
+        let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
+        let totp = json["totp"].as_object().expect("the 2FA block travels whole");
+        assert_eq!(totp["clientId"], "client-001");
+        assert_eq!(totp["algorithm"], "sha1");
+        assert!(
+            totp.get("secret").is_none(),
+            "a parsed invite must not carry its secret: {totp:?}"
+        );
     }
 
     /// The frontend reads `invite.totp.clientId`, and only the multi-word key was ever at risk:
@@ -1036,11 +1480,14 @@ mod tests {
             .clone()
             .expect("the invite carries a token");
         assert_eq!(enrollment.client_id, "client-001");
-        assert_eq!(enrollment.token, "tok");
         assert!(payload.totp.is_none(), "a code cannot carry both");
 
         let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["enrollment"]["clientId"], "client-001");
+        assert!(
+            json["enrollment"].get("token").is_none(),
+            "a parsed invite must not carry the token it is showing a summary of"
+        );
     }
 
     #[test]

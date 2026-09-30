@@ -21,12 +21,15 @@ const props = withDefaults(
     tone?: 'info' | 'warning' | 'danger';
     confirmText?: string;
     cancelText?: string;
+    /** Drops the cancel button, for a message that is told rather than asked. */
+    hideCancel?: boolean;
     detail?: string;
   }>(),
   {
     tone: 'info',
     confirmText: undefined,
     cancelText: undefined,
+    hideCancel: false,
     detail: undefined,
   },
 );
@@ -134,7 +137,9 @@ onBeforeUnmount(() => {
         </div>
 
         <footer class="dialog-actions">
-          <AppButton tone="ghost" @click="emit('cancel')">{{ cancelText || t('common.cancel') }}</AppButton>
+          <AppButton v-if="!hideCancel" tone="ghost" @click="emit('cancel')">
+            {{ cancelText || t('common.cancel') }}
+          </AppButton>
           <AppButton
             data-autofocus
             :tone="tone === 'danger' ? 'danger' : 'primary'"

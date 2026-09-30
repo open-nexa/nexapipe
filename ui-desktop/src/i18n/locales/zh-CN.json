@@ -253,6 +253,18 @@
     "twoFactorHint": "需与该服务端 [auth.clients] 中的条目一致；服务端未开启 2FA 时保持关闭即可。",
     "enrollmentPending": "等待以 {id} 完成注册：下次连接时服务端会下发该节点的凭证。"
   },
+  "gate": {
+    "unlockedFor": "已解锁，剩余 {time}",
+    "lockNow": "立即锁定",
+    "unavailableShort": "此设备无法确认是你本人",
+    "unavailableTitle": "此设备无法确认是你本人",
+    "unavailableBody": "在这里显示凭据前，需要本设备先确认使用者身份，但它没有任何可用的确认方式——没有密码、没有指纹，也没有任何可用于校验的设置。在这一切改变之前，凭据会保持隐藏。",
+    "passwordTitle": "确认是你本人",
+    "passwordLabel": "密码",
+    "reasonConnection": "显示某个节点的连接串",
+    "reasonSecret": "显示某个节点的两步验证密钥",
+    "reasonNodeId": "复制本端的节点 ID"
+  },
   "error": {
     "unknown": "出错了，请重试。",
     "proxy": {
@@ -292,7 +304,10 @@
       "dns_addr_outside_tun": "DNS 服务只能监听在 TUN 网段内。"
     },
     "credentials": {
-      "store_failed": "无法读取或写入已保存的凭据，请重新导入邀请以恢复。"
+      "store_failed": "无法读取或写入已保存的凭据，请重新导入邀请以恢复。",
+      "locked": "本设备未确认是你本人，因此未显示该凭据。",
+      "gate_unavailable": "本设备无法确认是你本人，因此凭据保持隐藏。",
+      "gate_failed": "本设备未能确认是你本人，详情请查看日志。"
     },
     "invite": {
       "parse_failed": "无法读取该邀请链接。"

@@ -6,30 +6,36 @@
  * configured and persists it; `proxy.ts` owns runtime status; `prefs.ts` owns UI preferences.
  *
  * Persistence is versioned (D11): `nexa-config` held a flat object with no version field, so
- * migrations could not be sequenced. The current shape is `{ version: 2, ...config }` under
+ * migrations could not be sequenced. The current shape is `{ version: 3, ...config }` under
  * `nexapipe.config`, and each future migration is a `from -> to` step in `migrate()`.
  *
  * # Credentials are not persisted here
  *
  * As of version 2 a TOTP secret, an enrollment token and the relay bearer are **not** written to
  * `localStorage`: they go to the encrypted store behind `api/credentials.ts`, whose master key
- * the OS keychain holds. What is persisted is the shape — that a node has 2FA, its client id and
- * its algorithm — and the values are read back into this config by [`initConfigStore`], which
- * the app awaits before it mounts. A payload written by version 1 does carry its secrets, and
- * the same call moves them into the store rather than leaving them in a file nothing protects.
+ * the OS keychain holds. As of version 3 the two connection strings are not either — a ticket
+ * names an endpoint *and* carries how to reach it, so it is a credential and not configuration.
+ *
+ * What is persisted is the shape — that a node has 2FA, its client id and its algorithm, and
+ * which of the two spellings of a connection string it uses — and the values are read back into
+ * this config by [`initConfigStore`], which the app awaits before it mounts. A payload written
+ * by an earlier version does carry them, and the same call moves them into the store rather
+ * than leaving them in a file nothing protects.
  */
 import { computed, reactive, watch } from 'vue';
 import {
   clearCredentials,
+  credentialDisplay,
   credentialStoreStatus,
   deleteCredential,
-  getCredential,
   putCredential,
+  takeInvitedNodeCredentials,
+  takeRuntimeCredentials,
 } from '../api/credentials';
+import { acceptInvite } from '../api/invite';
 import type {
   ConnectionType,
   EnrollmentToken,
-  InvitePayload,
   IssuedCredential,
   LoadBalancingStrategy,
   NodeConfig,
@@ -40,7 +46,7 @@ import type {
 
 const STORAGE_KEY = 'nexapipe.config';
 const LEGACY_STORAGE_KEY = 'nexa-config';
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 const SAVE_DEBOUNCE_MS = 300;
 
 /**
@@ -48,8 +54,11 @@ const SAVE_DEBOUNCE_MS = 300;
  *
  * Now `true`: every page and component reads this store, and the second loader that used to read
  * `nexa-config` (`composables/useConfigStore.ts`) is gone, so the legacy key has no readers left.
- * It is deleted in the same commit that removed that loader — the copy is written first either
- * way, so an older build downgraded onto this one still finds its configuration (§5.7, R3).
+ *
+ * `true` is *whether it may go*, not *when*: the copy is written first either way, so an older
+ * build downgraded onto this one still finds its configuration (§5.7, R3). The moment it goes is
+ * decided in `initConfigStore`, which is the first place that can prove a current-shaped payload
+ * exists.
  *
  * A function rather than a `const`, because a constant `false` makes the branch unreachable to
  * TypeScript and turns the constant itself into an unused-local error.
@@ -152,16 +161,12 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   const config: ProxyConfig = { ...defaultConfig };
 
   if (Array.isArray(raw.nodes)) {
-    config.nodes = raw.nodes
-      .map(normalizeNode)
-      .filter((node): node is NodeConfig => node !== null)
-      // A node with neither a ticket nor an endpoint ID routes nothing and is dropped by the
-      // backend at start-up, so it is dropped here too. They can only be left over from the
-      // "Add Node" button that created an empty row to be filled in by hand: nodes now come from
-      // invites, which always carry a connection string. Dropping them at load rather than
-      // hiding them in the UI keeps the stored config, the node count and what actually
-      // connects in agreement, and stops the placeholder being written back on every save.
-      .filter((node) => node.ticket.trim() !== '' || node.endpointId.trim() !== '');
+    config.nodes = raw.nodes.map(normalizeNode).filter((node): node is NodeConfig => node !== null);
+    // A node with neither a ticket nor an endpoint ID routes nothing, but it is *not* dropped
+    // here any more: from version 3 the connection string lives in the encrypted store, so a
+    // payload that has just been read has none of them until the store has answered, and
+    // dropping them at load time would delete every node on the second launch. See
+    // `dropNodesWithoutAConnectionString`, which runs once the store has had its say.
   } else if (raw.connectionType || raw.ticket || raw.endpointId) {
     // Pre-nodes payload: a single connection lived at the top level.
     const node = normalizeNode({
@@ -225,6 +230,11 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
  * the shape it migrates *from*:
  *
  *   if (version < 2) { current = withClusterSettings(current); }
+ *
+ * Version 3 is deliberately not here either: no key moved, was renamed or changed type. It
+ * stopped two *values* being written, and what happens to a payload that still carries them is
+ * decided in `hydrateCredentials`, which is the only place that can see both the payload and the
+ * store.
  */
 function migrate(config: ProxyConfig, _fromVersion: number): ProxyConfig {
   return config;
@@ -267,23 +277,37 @@ function loadConfig(): ProxyConfig {
 
   const legacy = readJson(LEGACY_STORAGE_KEY);
   if (legacy) {
-    const migrated = migrate(normalizeConfig(legacy), 0);
-    persist(migrated);
-    if (dropLegacyKey()) removeKey(LEGACY_STORAGE_KEY);
-    console.info('[config] migrated legacy nexa-config to version', CONFIG_VERSION);
-    return migrated;
+    // Neither written nor dropped here. This runs while the module is being
+    // imported, which is before `initConfigStore` has read the credential store,
+    // and a save made before that read is deliberately a no-op — see `persist`.
+    // Deleting the legacy key at this point would therefore remove the only
+    // durable copy the configuration has without ever writing its replacement.
+    // Both happen in `initConfigStore`, once hydration has succeeded.
+    legacyKeyDropPending = true;
+    return migrate(normalizeConfig(legacy), 0);
   }
 
   return { ...defaultConfig };
 }
 
 /**
+ * Whether a legacy payload was read and its key is still awaiting deletion.
+ *
+ * Set by `loadConfig`, which cannot delete it: see the comment there. It is cleared once
+ * `initConfigStore` has written a current-shaped payload and read it back, and it stays set if
+ * hydration failed, so the next launch reads the legacy payload again rather than finding
+ * neither copy.
+ */
+let legacyKeyDropPending = false;
+
+/**
  * The shape that goes into `localStorage`: everything except the credentials.
  *
- * A node keeps its credential *structure* — that it has 2FA, with which client id and algorithm —
- * because those are configuration, and a node with none is a node that performs no handshake.
- * The secret itself does not: it belongs to the encrypted store, and leaving it here would keep
- * the one copy this whole change is about removing.
+ * A node keeps its credential *structure* — that it has 2FA, with which client id and algorithm,
+ * and which spelling of connection string it uses — because those are configuration, and a node
+ * with none is a node that performs no handshake. The secret and the connection string
+ * themselves do not: they belong to the encrypted store, and leaving them here would keep the
+ * copies this whole change is about removing.
  */
 function toPersisted(config: ProxyConfig): PersistedConfig {
   return {
@@ -294,6 +318,8 @@ function toPersisted(config: ProxyConfig): PersistedConfig {
       const { twoFactor, enrollment, ...rest } = node;
       return {
         ...rest,
+        ticket: '',
+        endpointId: '',
         ...(twoFactor ? { twoFactor: { ...twoFactor, secret: '' } } : {}),
         ...(enrollment ? { enrollment: { ...enrollment, token: '' } } : {}),
       };
@@ -301,7 +327,6 @@ function toPersisted(config: ProxyConfig): PersistedConfig {
   };
 }
 
-/**
 /**
  * Whether `hydrateCredentials` has finished.
  *
@@ -330,25 +355,60 @@ async function persistCredentials(config: ProxyConfig): Promise<void> {
   }
 
   for (const node of config.nodes) {
-    if (node.twoFactor?.secret.trim()) {
-      await putCredential('totp', node.twoFactor.secret, node.id);
-    } else {
+    // An object that is present with an empty value is not the same as one that
+    // is absent, and treating the two alike deletes a credential that is filed
+    // and deliberate. `applyInvite` is the case: it puts the secret in the store
+    // itself and builds the shape here with the value left out on purpose, so
+    // that the renderer never holds it. Reading that as "the user cleared it"
+    // removed what had just been filed, and the node started with no
+    // authentication. Clearing is `clearNodeTwoFactor`, which removes the
+    // object; an object with an empty value now leaves the store alone.
+    if (!node.twoFactor) {
       await deleteCredential('totp', node.id);
+    } else if (node.twoFactor.secret.trim()) {
+      await putCredential('totp', node.twoFactor.secret, node.id);
     }
 
-    if (node.enrollment?.token.trim()) {
-      await putCredential('enrollment', node.enrollment.token, node.id);
-    } else {
+    if (!node.enrollment) {
       await deleteCredential('enrollment', node.id);
+    } else if (node.enrollment.token.trim()) {
+      await putCredential('enrollment', node.enrollment.token, node.id);
+    }
+
+    // Both spellings are mirrored, not just the one `connectionType` names: the
+    // other one is what a node that was re-imported the other way round would
+    // otherwise find still sitting in the store, and a stale connection string is
+    // worse than none because it looks like the one to use.
+    if (node.ticket.trim()) {
+      await putCredential('ticket', node.ticket, node.id);
+    } else {
+      await deleteCredential('ticket', node.id);
+    }
+
+    if (node.endpointId.trim()) {
+      await putCredential('endpoint', node.endpointId, node.id);
+    } else {
+      await deleteCredential('endpoint', node.id);
     }
   }
 }
 
 function persist(config: ProxyConfig): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersisted(config)));
-  } catch (error) {
-    console.error('[config] failed to save:', error);
+  // The redaction in `toPersisted` is only honest once the store has answered:
+  // it blanks the connection strings on the way out because they are supposed
+  // to have been filed in the encrypted store by then. When hydration failed
+  // they have not been, and `localStorage` may still be holding the only copy —
+  // a version-2 payload written before this migration. Writing over it there
+  // loses the node, and the mirror below is gated for the same reason, so
+  // nothing would have taken its place. Leave the stored payload alone until
+  // the store has been read; losing an edit is recoverable, losing a node is
+  // an invite the user has to go and find again.
+  if (credentialsHydrated) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersisted(config)));
+    } catch (error) {
+      console.error('[config] failed to save:', error);
+    }
   }
 
   // Not awaited: a save is a mirror, and the in-memory config is what the app runs on. A failure
@@ -367,10 +427,11 @@ function persist(config: ProxyConfig): void {
  * value is *written* to the store rather than merely trusted — so the migration happens once and
  * the cleartext copy is gone on the next save.
  *
- * Returns a copy rather than filling `config` in place: each lookup awaits, and the config watcher
- * is live while they run, so a node-by-node fill would expose a config whose first node has been
- * read and whose second has not — and a save started there deletes the second node's credentials
- * as if the user had cleared them.
+ * Returns a copy rather than filling `config` in place: the config watcher is live while this
+ * runs, so a node-by-node fill would expose a config whose first node has been read and whose
+ * second has not — and a save started there deletes the second node's credentials as if the user
+ * had cleared them. The read itself is one call rather than one per credential, which is what
+ * lets the backend answer it once and never again.
  */
 async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
   const hydrated: ProxyConfig = {
@@ -378,7 +439,9 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
     nodes: source.nodes.map((node) => ({ ...node })),
   };
 
-  const relay = await getCredential('relay');
+  const bundle = await takeRuntimeCredentials(hydrated.nodes.map((node) => node.id));
+
+  const relay = bundle.relay;
   if (relay) {
     hydrated.relayAuthToken = relay;
   } else if (hydrated.relayAuthToken.trim()) {
@@ -386,7 +449,9 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
   }
 
   for (const node of hydrated.nodes) {
-    const secret = await getCredential('totp', node.id);
+    const stored = bundle.nodes[node.id];
+
+    const secret = stored?.totp ?? null;
     if (secret) {
       node.twoFactor = {
         clientId: node.twoFactor?.clientId ?? '',
@@ -397,15 +462,52 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
       await putCredential('totp', node.twoFactor.secret, node.id);
     }
 
-    const token = await getCredential('enrollment', node.id);
+    const token = stored?.enrollment ?? null;
     if (token) {
       node.enrollment = { clientId: node.enrollment?.clientId ?? '', token };
     } else if (node.enrollment?.token.trim()) {
       await putCredential('enrollment', node.enrollment.token, node.id);
     }
+
+    // The store wins, and a payload that still carries the connection string has it
+    // written rather than merely trusted — that is the version 3 migration, and it
+    // is the reason a node's connection string is empty in the payload from now on.
+    const ticket = stored?.ticket ?? null;
+    if (ticket) {
+      node.ticket = ticket;
+    } else if (node.ticket.trim()) {
+      await putCredential('ticket', node.ticket, node.id);
+    }
+
+    const endpointId = stored?.endpoint ?? null;
+    if (endpointId) {
+      node.endpointId = endpointId;
+    } else if (node.endpointId.trim()) {
+      await putCredential('endpoint', node.endpointId, node.id);
+    }
   }
 
   return hydrated;
+}
+
+/**
+ * Drops nodes that have nothing to connect with, once the credential store has answered.
+ *
+ * This used to happen while the payload was being read, which cannot work from version 3: the
+ * connection string is in the store, so every node looks empty at that point and the second
+ * launch would delete all of them. It happens here instead — after `hydrateCredentials`, and
+ * only on the path where that succeeded, because a store that could not be read must not look
+ * like a user who deleted every node.
+ */
+function dropNodesWithoutAConnectionString(nodes: NodeConfig[]): NodeConfig[] {
+  return nodes.filter((node) => {
+    if (node.ticket.trim() !== '' || node.endpointId.trim() !== '') return true;
+    console.warn(
+      '[config] dropping a node with no connection string in the payload or the credential store:',
+      node.id,
+    );
+    return false;
+  });
 }
 
 /**
@@ -422,16 +524,35 @@ export async function initConfigStore(): Promise<void> {
     // `hydrateCredentials`.
     Object.assign(config, await hydrateCredentials(config));
 
+    // Now, and only now, that the store has answered: see
+    // `dropNodesWithoutAConnectionString`.
+    config.nodes = dropNodesWithoutAConnectionString(config.nodes);
+    await refreshConnectionMasks();
+
     // Only from here may a save touch the store. Nothing before this line has
     // read it, so nothing before this line may delete from it — a failure
     // above leaves the secrets in `config` empty, and an ungated mirror would
     // empty the store to match.
     credentialsHydrated = true;
+
+    // The legacy key goes now, and only because it can be proved redundant:
+    // `persist` swallows a write failure, so the payload is read back rather
+    // than trusted. A save that did not happen must not cost the user the copy
+    // it was meant to replace.
+    if (legacyKeyDropPending && dropLegacyKey()) {
+      persist(config);
+      if (readJson(STORAGE_KEY)) {
+        removeKey(LEGACY_STORAGE_KEY);
+        legacyKeyDropPending = false;
+        console.info('[config] migrated legacy nexa-config to version', CONFIG_VERSION);
+      }
+    }
   } catch (error) {
     // A store that cannot be read leaves the nodes without credentials: they will refuse to
     // handshake and the UI says so. Not fatal — the app has to stay usable enough to re-import
     // an invite. `credentialsHydrated` stays false, so the next save writes
-    // `localStorage` and leaves the store alone.
+    // `localStorage` and leaves the store alone — and `legacyKeyDropPending`
+    // stays true, so the legacy payload is still there to read next launch.
     console.error('[config] failed to load credentials:', error);
   }
 
@@ -455,6 +576,54 @@ const config = reactive<ProxyConfig>(loadConfig());
  * `null` until startup has asked. Read once there, because it cannot change while the app runs.
  */
 const credentialProtection = reactive<{ level: string | null }>({ level: null });
+
+/**
+ * What a surface may print for a node's connection string: the mask Rust produced, keyed by node.
+ *
+ * The value itself is here too — `start_proxy` takes it as an argument, so the renderer has not
+ * stopped holding it — but nothing renders it. Asking Rust for the mask rather than shortening
+ * what is already in memory is the difference: a mask the renderer computes is not one, because
+ * the thing it computed it from is one devtools panel away.
+ *
+ * Empty until the store has been asked, which is why a page falling back to it shows nothing
+ * rather than a value of its own.
+ */
+const connectionMasks = reactive<Record<string, string>>({});
+
+/** The same, for the TOTP secret a node authenticates with. */
+const secretMasks = reactive<Record<string, string>>({});
+
+async function refreshConnectionMasks(): Promise<void> {
+  const shown = await Promise.all(
+    config.nodes.map(async (node) => {
+      const connection = node.connectionType === 'ticket' ? 'ticket' : 'endpoint';
+      const [target, secret] = await Promise.all([
+        credentialDisplay(connection, node.id).catch((error: unknown) => {
+          console.error('[config] failed to read a connection string for display:', error);
+          return null;
+        }),
+        credentialDisplay('totp', node.id).catch((error: unknown) => {
+          console.error('[config] failed to read a secret for display:', error);
+          return null;
+        }),
+      ]);
+      return [node.id, target ?? '', secret ?? ''] as const;
+    }),
+  );
+
+  for (const [id, target, secret] of shown) {
+    connectionMasks[id] = target;
+    secretMasks[id] = secret;
+  }
+  // A node that is gone takes its masks: leaving them would keep a projection of
+  // credentials nothing is connecting to any more.
+  for (const id of Object.keys(connectionMasks)) {
+    if (!config.nodes.some((node) => node.id === id)) delete connectionMasks[id];
+  }
+  for (const id of Object.keys(secretMasks)) {
+    if (!config.nodes.some((node) => node.id === id)) delete secretMasks[id];
+  }
+}
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -505,32 +674,27 @@ export function useConfigStore() {
    *
    * Returns which of the two happened, so the caller can say so.
    */
-  function applyInvite(
-    invite: InvitePayload,
+  async function applyInvite(
+    uri: string,
     options: { applyRelay?: boolean } = {},
-  ): 'added' | 'merged' {
-    const connectionType: ConnectionType =
-      invite.kind === 'ticket' ? 'ticket' : 'endpoint_id';
-    const existing = config.nodes.find(
-      (node) =>
-        node.connectionType === connectionType &&
-        (connectionType === 'ticket' ? node.ticket : node.endpointId) === invite.target,
-    );
+  ): Promise<'added' | 'merged'> {
+    // The credentials go into the store before this returns, and the call answers which node they
+    // were filed under: a parsed invite no longer carries a connection string or a secret, so the
+    // comparison that decides "new node or an existing one" is made where the values are.
+    const accepted = await acceptInvite(uri);
 
-    const name = invite.name?.trim() || undefined;
+    const name = accepted.name?.trim() || undefined;
     let outcome: 'added' | 'merged';
-    let node: NodeConfig;
+    let node: NodeConfig | undefined = config.nodes.find((n) => n.id === accepted.nodeId);
 
-    if (existing) {
-      node = existing;
+    if (node) {
       outcome = 'merged';
       // A name already typed here wins: it is the label the user chose for this endpoint.
       if (name && !node.name) node.name = name;
     } else {
       node = createNode({
-        connectionType,
-        ticket: connectionType === 'ticket' ? invite.target : '',
-        endpointId: connectionType === 'endpoint_id' ? invite.target : '',
+        id: accepted.nodeId,
+        connectionType: accepted.connectionType,
         domains: [],
         ...(name ? { name } : {}),
       });
@@ -538,23 +702,25 @@ export function useConfigStore() {
     }
 
     const domains = [...node.domains];
-    for (const domain of invite.domains) {
+    for (const domain of accepted.domains) {
       if (!domains.includes(domain)) domains.push(domain);
     }
     node.domains = domains;
 
-    if (invite.relay && options.applyRelay) {
+    if (accepted.relay && options.applyRelay) {
       config.relayMode = 'custom';
-      config.relayUrl = invite.relay;
+      config.relayUrl = accepted.relay;
     }
 
     // The credentials belong to the server this invite came from, so they land on its node and
-    // nowhere else — a second server keeps whatever it was given before.
-    if (invite.totp) {
+    // nowhere else — a second server keeps whatever it was given before. What is set here is the
+    // *shape*: the secret and the token are already in the store, and keeping them out of this
+    // object is the whole point of `accept_invite`.
+    if (accepted.totp) {
       node.twoFactor = {
-        clientId: invite.totp.clientId,
-        secret: invite.totp.secret,
-        algorithm: invite.totp.algorithm,
+        clientId: accepted.totp.clientId,
+        secret: '',
+        algorithm: accepted.totp.algorithm,
       };
       delete node.enrollment;
     }
@@ -563,14 +729,20 @@ export function useConfigStore() {
     // answers with the secret this node is to keep. Stored on the node rather than applied to
     // `twoFactor` because a token is not a credential — writing it there would make the node
     // present the token as its TOTP secret and be refused.
-    if (invite.enrollment) {
-      node.enrollment = {
-        clientId: invite.enrollment.clientId,
-        token: invite.enrollment.token,
-      };
+    if (accepted.enrollment) {
+      node.enrollment = { clientId: accepted.enrollment.clientId, token: '' };
       delete node.twoFactor;
     }
 
+    // Read back the one credential the renderer still has to hold: `start_proxy` takes the
+    // connection string as an argument, and the mirror below has to agree with the store or the
+    // next save would delete what was just filed. This answers only for the node the invite
+    // was accepted for, and only once, so it is not a way back into the store.
+    const stored = await takeInvitedNodeCredentials(node.id);
+    node.ticket = stored.ticket ?? '';
+    node.endpointId = stored.endpoint ?? '';
+
+    await refreshConnectionMasks();
     return outcome;
   }
 
@@ -631,11 +803,18 @@ export function useConfigStore() {
 
     // A removed node takes its credentials with it. Done here rather than by sweeping the store
     // for orphans, because this is the only place a node stops existing.
+    // The connection string goes too, from this change on: it is a credential here, so a node
+    // that stops existing must not leave one behind under its id.
     void Promise.all([
       deleteCredential('totp', nodeId),
       deleteCredential('enrollment', nodeId),
+      deleteCredential('ticket', nodeId),
+      deleteCredential('endpoint', nodeId),
     ]).catch((error: unknown) => {
       console.error('[config] failed to delete the credentials of a removed node:', error);
+    });
+    void refreshConnectionMasks().catch((error: unknown) => {
+      console.error('[config] failed to refresh the connection masks:', error);
     });
   }
 
@@ -673,6 +852,10 @@ export function useConfigStore() {
   return {
     config,
     credentialProtection: computed(() => credentialProtection.level),
+    /** The mask to print for a node's connection string. Empty when the store has not answered. */
+    connectionMask: (nodeId: string): string => connectionMasks[nodeId] ?? '',
+    /** The mask to print for a node's TOTP secret, same terms. */
+    secretMask: (nodeId: string): string => secretMasks[nodeId] ?? '',
     updateConfig,
     removeNode,
     updateNode,

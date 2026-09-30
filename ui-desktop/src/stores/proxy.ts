@@ -51,6 +51,13 @@ const FAILURES_BEFORE_BACKOFF = 3;
 const SERVICE_POLL_MS = 10_000;
 
 const status = ref<ProxyStatus>({ running: false, mode: 'stopped' });
+/**
+ * The local Node ID, masked — `get_node_id_display` is what the poll reads.
+ *
+ * A mask is what every surface in the app needs: the string is printed, and it is the name this
+ * machine answers to on the network. The whole of it is only ever fetched on purpose, by
+ * `revealNodeId`, when the user asked to copy it somewhere.
+ */
 const nodeId = ref('');
 const busy = ref(false);
 const startupError = ref<AppError | null>(null);
@@ -137,13 +144,29 @@ function linkKindFor(node: NodeConfig): LinkKind | null {
 
 async function refreshNodeId(): Promise<void> {
   try {
-    nodeId.value = await invoke<string>('get_node_id', {
+    nodeId.value = await invoke<string>('get_node_id_display', {
       useService: config.useService,
     });
   } catch (error) {
     // Not running, or the node has not published an ID yet — both are normal, not reportable.
     nodeId.value = '';
     console.debug('[proxy] node id unavailable:', error);
+  }
+}
+
+/**
+ * The Node ID in full, for the user to copy into a server's `[peers] allow`.
+ *
+ * Deliberately not the value on screen: the poll reads a mask, and asking for the whole string is
+ * a request the backend can see and refuse. Callers get `null` rather than a rejection when the
+ * proxy is not up, so a copy button can stay quiet about it.
+ */
+async function revealNodeId(): Promise<string | null> {
+  try {
+    return await invoke<string>('reveal_node_id', { useService: config.useService });
+  } catch (error) {
+    console.error('[proxy] failed to reveal the node id:', error);
+    return null;
   }
 }
 
@@ -467,6 +490,7 @@ export function useProxyStore() {
     refresh,
     refreshNow,
     refreshNodeId,
+    revealNodeId,
     refreshServiceRunning,
     setUseTun,
     linkKindFor,

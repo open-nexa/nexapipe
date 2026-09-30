@@ -129,27 +129,38 @@ export interface EndpointLink {
 }
 
 /**
- * The 2FA credentials an invite can carry. Mirrors `InviteTotpPayload` in
- * `src-tauri/src/lib.rs`; `algorithm` is already lowercase, which is what a node's
- * `twoFactor.algorithm` holds.
+ * The 2FA half of an invite *as it is shown*. Mirrors `InviteTotpPayload` in
+ * `src-tauri/src/lib.rs`, which deliberately carries no secret: an invite is shown to be
+ * recognised, and the secret stays a credential after the connection it authorises is set up.
+ * `algorithm` is already lowercase, which is what a node's `twoFactor.algorithm` holds.
  */
 export interface InviteTotp {
   clientId: string;
-  secret: string;
   algorithm: TwoFactorAlgorithm;
   issuer: string;
+}
+
+/**
+ * The enrollment half of an invite *as it is shown*: which client the token is pending for, and
+ * nothing else. The token itself never reaches the renderer — `acceptInvite` files it.
+ */
+export interface InviteEnrollment {
+  clientId: string;
 }
 
 /**
  * A parsed `nexapipe://` invite. Mirrors `InvitePayload` in `src-tauri/src/lib.rs`, which gets it
  * from the one parser in `crates/nexapipe-client/src/provisioning.rs` — the UI never parses an
  * invite itself, so a code printed by the server reads the same here as it does on Android.
+ *
+ * Everything a surface could print, and nothing a surface should not: the connection string is
+ * the mask Rust produced, and neither a TOTP secret nor an enrollment token is in here at all.
  */
 export interface InvitePayload {
   /** `endpoint` for a bare Node ID, `ticket` for an address-bearing ticket. */
   kind: 'endpoint' | 'ticket';
-  /** The Node ID, or the ticket, verbatim. */
-  target: string;
+  /** The Node ID, or the ticket, as `credentials::mask` renders it. */
+  targetMasked: string;
   name?: string;
   domains: string[];
   relay?: string;
@@ -158,7 +169,44 @@ export interface InvitePayload {
    * A one-time enrollment token (`--registration` invites). Mutually exclusive with `totp`:
    * the parser refuses a code carrying both, so the UI never has to pick a winner.
    */
-  enrollment?: EnrollmentToken;
+  enrollment?: InviteEnrollment;
+}
+
+/**
+ * What `acceptInvite` answers: which node the invite belongs to, and everything about it that is
+ * not a credential. Mirrors `InviteAccepted` in `src-tauri/src/lib.rs`.
+ *
+ * `nodeId` is an existing node's when one already held this connection string, so importing the
+ * same invite twice tops a node up instead of adding a second one pointing at the same backend —
+ * a comparison the renderer cannot make any more, because it no longer holds the string.
+ */
+export interface InviteAccepted {
+  nodeId: string;
+  /** `ticket` or `endpoint_id`, which is what `connectionType` calls them. */
+  connectionType: ConnectionType;
+  existing: boolean;
+  name?: string;
+  domains: string[];
+  relay?: string;
+  totp?: InviteTotp;
+  enrollment?: InviteEnrollment;
+}
+
+/**
+ * The credential door, as a surface sees it. Mirrors `gate::Status` in `src-tauri/src/gate.rs`.
+ *
+ * `msRemaining` is what lets the UI run its own countdown: the window is a duration rather than a
+ * flag, so the page that drew it has to be the one that watches it run out.
+ */
+export interface GateStatus {
+  /** Whether credentials may be shown right now. */
+  unlocked: boolean;
+  /** Milliseconds left in the window; zero when it is shut. */
+  msRemaining: number;
+  /** Whether this machine can confirm the user at all. */
+  canAuthenticate: boolean;
+  /** Whether the UI has to collect a password before it can ask. */
+  needsPassword: boolean;
 }
 
 /**

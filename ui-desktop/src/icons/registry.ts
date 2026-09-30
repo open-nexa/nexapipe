@@ -126,6 +126,16 @@ const icons = {
     { t: 'path', d: 'M14.12 14.12a3 3 0 1 1-4.24-4.24' },
     { t: 'line', x1: 1, y1: 1, x2: 23, y2: 23 },
   ],
+  // The credential door: shut, and open. The shackle is what tells the two apart
+  // at a glance, which is the whole message the icon has to carry.
+  lock: [
+    { t: 'rect', x: 4, y: 11, width: 16, height: 10, rx: 2 },
+    { t: 'path', d: 'M8 11V7a4 4 0 0 1 8 0v4' },
+  ],
+  unlock: [
+    { t: 'rect', x: 4, y: 11, width: 16, height: 10, rx: 2 },
+    { t: 'path', d: 'M8 11V7a4 4 0 0 1 7.5-2' },
+  ],
   'chevron-down': [{ t: 'polyline', points: '6 9 12 15 18 9' }],
   'chevron-right': [{ t: 'polyline', points: '9 18 15 12 9 6' }],
   'chevron-left': [{ t: 'polyline', points: '15 18 9 12 15 6' }],

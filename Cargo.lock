@@ -2412,7 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base32",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-proto"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "nom"

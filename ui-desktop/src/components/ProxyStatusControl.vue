@@ -22,6 +22,7 @@ import { errorKey } from '../api/errors';
 import { confirm } from '../composables/useConfirm';
 import { useToast } from '../composables/useToast';
 import { useConfigStore } from '../stores/config';
+import { useCredentialGate } from '../stores/gate';
 import { useProxyStore } from '../stores/proxy';
 import type { LinkKind } from '../types';
 
@@ -42,8 +43,11 @@ const {
   start,
   stop,
   refreshServiceRunning,
+  revealNodeId,
   setUseTun,
 } = useProxyStore();
+
+const { ensureUnlocked } = useCredentialGate();
 
 const installing = ref(false);
 
@@ -143,10 +147,23 @@ async function installServiceForTun(): Promise<void> {
   }
 }
 
+/**
+ * Copies the Node ID, which means asking for it: `nodeId` is a mask, and what goes on the
+ * clipboard has to be the whole string. Copying is the act that makes the full value worth
+ * having, so it is also the act the OS lock will sit in front of.
+ */
 async function copyNodeId(): Promise<void> {
   if (!nodeId.value) return;
+  // The Node ID is the name this machine answers to on the network, so copying
+  // it is worth the same question as copying a credential.
+  if (!(await ensureUnlocked(t('gate.reasonNodeId')))) return;
+  const full = await revealNodeId();
+  if (!full) {
+    toast.error(t('common.copyFailed'));
+    return;
+  }
   try {
-    await navigator.clipboard.writeText(nodeId.value);
+    await navigator.clipboard.writeText(full);
     toast.success(t('common.copied'));
   } catch {
     toast.error(t('common.copyFailed'));

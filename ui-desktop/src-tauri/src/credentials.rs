@@ -1,11 +1,12 @@
 //! Encrypted at-rest storage for the credentials the UI used to keep in `localStorage`.
 //!
-//! A node's TOTP secret, its enrollment token and the relay bearer used to reach
-//! the server's relay are the most sensitive things this app holds, and they used
-//! to sit in a WebView `localStorage` blob: an unencrypted SQLite file inside the
-//! user's WebKit data directory, readable by anything the user runs and protected
-//! by nothing the OS knows about. The Android client keeps the same three values
-//! in the Keystore; this is the desktop equivalent.
+//! A node's TOTP secret, its enrollment token, the relay bearer used to reach
+//! the server's relay, and the connection string it reaches that server by are
+//! the most sensitive things this app holds, and they used to sit in a WebView
+//! `localStorage` blob: an unencrypted SQLite file inside the user's WebKit data
+//! directory, readable by anything the user runs and protected by nothing the OS
+//! knows about. The Android client keeps the same values in the Keystore; this is
+//! the desktop equivalent.
 //!
 //! # Shape
 //!
@@ -92,6 +93,14 @@ pub enum CredentialKind {
     EnrollmentToken,
     /// The bearer token a custom relay asks for. Not per-node: it is a global setting.
     RelayToken,
+    /// The ticket a node reaches its server by. An address-bearing invite string,
+    /// which is a credential and not configuration: it names an endpoint *and*
+    /// carries whatever the server put in it, so anyone holding it can connect.
+    Ticket,
+    /// The bare Node ID a node reaches its server by. Weaker than a ticket on its
+    /// own — it names a node without carrying a way to reach it — but it is still
+    /// what a node is, and it is what an invite of that kind hands out.
+    EndpointId,
 }
 
 impl CredentialKind {
@@ -100,8 +109,60 @@ impl CredentialKind {
             CredentialKind::TotpSecret => "totp",
             CredentialKind::EnrollmentToken => "enrollment",
             CredentialKind::RelayToken => "relay",
+            CredentialKind::Ticket => "ticket",
+            CredentialKind::EndpointId => "endpoint",
         }
     }
+}
+
+/// Characters of a masked value kept at the front, and at the back.
+///
+/// Enough to recognise a value the user has seen before — which node this is,
+/// which of two similar tickets it is not — and not enough to reconstruct it.
+/// The same eight and four the UI used to keep, minus the rule that a short
+/// value was shown whole.
+const MASK_HEAD: usize = 8;
+const MASK_TAIL: usize = 4;
+
+/// What stands in for the rest.
+const MASK_MIDDLE: &str = "••••";
+
+/// The longest value that keeps nothing at all.
+///
+/// A TOTP secret is 16 base32 characters, so 16 is not an arbitrary line: it is
+/// the length at which "just the first few characters" is most of the value.
+/// Everything at or below it is replaced whole rather than trimmed, because the
+/// mask is not there to make a secret harder to read over somebody's shoulder —
+/// it is there so a secret is never on the screen at all.
+const MASK_WHOLE: usize = 16;
+
+/// The projection of a credential that is safe to render: enough to recognise,
+/// not enough to use.
+///
+/// Computed here rather than in the renderer, because a mask the renderer
+/// computes is not one: to shorten a value it already holds, and what it holds
+/// is the whole thing, one devtools panel away from whoever is looking. A
+/// surface that needs the value itself asks for it through the reveal path
+/// instead, which is a deliberate act and, once the lock is in, an authenticated
+/// one.
+///
+/// Empty in, empty out: "no credential" and "a credential so short it is all
+/// bullets" must stay tellable apart, and that is the caller's call to make.
+pub fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+
+    if chars.len() <= MASK_WHOLE {
+        // Length is not the secret, so it is kept — up to a point, past which
+        // counting bullets stops being informative and starts being decoration.
+        return "•".repeat(chars.len().min(MASK_HEAD));
+    }
+
+    let head: String = chars.iter().take(MASK_HEAD).collect();
+    let tail: String = chars.iter().skip(chars.len() - MASK_TAIL).collect();
+    format!("{head}{MASK_MIDDLE}{tail}")
 }
 
 /// The key a credential is filed under.
@@ -181,7 +242,7 @@ impl MasterKey {
 
     /// The uncached half of [`Self::load`]: where the key actually comes from.
     fn load_uncached(dir: &Path) -> Result<Self, AppError> {
-        if let Some(key) = Self::from_keychain() {
+        if let Some(key) = Self::from_keychain(dir) {
             return Ok(Self {
                 key,
                 source: KeySource::Keychain,
@@ -202,7 +263,10 @@ impl MasterKey {
     ///
     /// `None` when there is no usable keychain at all — not when the entry is
     /// merely missing, which is the ordinary first run and creates one.
-    fn from_keychain() -> Option<[u8; KEY_LEN]> {
+    ///
+    /// `dir` is where a key that predates a working keychain would be: see
+    /// [`Self::adopt_file_key`].
+    fn from_keychain(dir: &Path) -> Option<[u8; KEY_LEN]> {
         use keyring::Entry;
 
         let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) else {
@@ -222,8 +286,14 @@ impl MasterKey {
                 return None;
             }
             // The ordinary first run, and the one case in which minting a key is
-            // right: there is nothing there for it to overwrite.
-            Err(keyring::Error::NoEntry) => {}
+            // right: there is nothing there for it to overwrite. A key left in
+            // the fallback file by a build with no keychain backend is not a
+            // first run, so it is moved across first.
+            Err(keyring::Error::NoEntry) => {
+                if let Some(key) = Self::adopt_file_key(&entry, dir) {
+                    return Some(key);
+                }
+            }
             // Anything else — a locked keychain, access denied, a backend that
             // would not start — is not proof that no key exists. Minting one
             // here would replace a key that credentials are encrypted under,
@@ -243,14 +313,77 @@ impl MasterKey {
         Some(fresh)
     }
 
+    /// Moves a master key out of the fallback file and into the keychain.
+    ///
+    /// This is the upgrade path for an installation that ran without a keychain
+    /// backend — Linux, before this build — and so kept its master key in
+    /// [`FALLBACK_KEY_FILE`]. Every credential in the store is encrypted under
+    /// that one key, so minting a fresh keychain key here would not improve
+    /// anything: it would replace the key the whole store is sealed with, and
+    /// every entry would come back undecryptable, which is indistinguishable
+    /// from losing them. The key moves as it is; only its holder changes.
+    ///
+    /// `None` when there is no file key to move, or when the keychain would not
+    /// take it — either way the caller falls back to the file, which is exactly
+    /// where the key already is.
+    fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Option<[u8; KEY_LEN]> {
+        let key = Self::file_key(dir)?;
+
+        if entry.set_password(&hex(&key)).is_err() {
+            tracing::warn!(
+                "the keychain would not take the existing master key; it stays in {}",
+                dir.join(FALLBACK_KEY_FILE).display()
+            );
+            return None;
+        }
+
+        // Removed only once the keychain holds it, so there is no moment in which
+        // neither does. A build that predates this one cannot read the keychain
+        // and would mint a key of its own on the way down, so re-importing a node
+        // is the price of the weaker file no longer being there — the settings
+        // page says which of the two the key is in.
+        let path = dir.join(FALLBACK_KEY_FILE);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                "the master key is in the keychain but {} could not be removed: {e}",
+                path.display()
+            );
+        }
+        Some(key)
+    }
+
+    /// The fallback file's key, when the file holds one.
+    ///
+    /// `None` on a first run, which is every platform but a Linux install
+    /// upgraded from a build with no keychain backend. A file that is there and
+    /// does not parse is reported rather than ignored: something wrote it, and
+    /// moving on silently mints a key that cannot read what that one sealed.
+    fn file_key(dir: &Path) -> Option<[u8; KEY_LEN]> {
+        let path = dir.join(FALLBACK_KEY_FILE);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return None;
+        };
+
+        match parse_key(contents.trim()) {
+            Some(key) => Some(key),
+            None => {
+                tracing::warn!(
+                    "{} is not a 32-byte key; not moving it into the keychain",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
     /// The fallback file's copy, generating one when there is none.
     fn from_file(dir: &Path) -> Result<[u8; KEY_LEN], AppError> {
         let path = dir.join(FALLBACK_KEY_FILE);
 
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(key) = parse_key(contents.trim()) {
-                return Ok(key);
-            }
+        if let Some(key) = Self::file_key(dir) {
+            return Ok(key);
+        }
+        if path.exists() {
             return Err(AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
                 format!("{} is not a 32-byte key", path.display()),
@@ -675,8 +808,13 @@ mod tests {
             .expect("the entry is there")
             .clone();
         // Flip the last hex character: the ciphertext no longer matches its tag.
-        blob.pop();
-        blob.push(if blob.ends_with('a') { 'b' } else { 'a' });
+        // The character has to be read before it is replaced. Pushing back a
+        // fixed `a` or `b` sometimes restores the one that was just popped —
+        // whenever the last character was `a` and the one before it was not —
+        // and an untampered entry decrypts, failing this test about one run in
+        // four.
+        let last = blob.pop().expect("the blob is not empty");
+        blob.push(if last == 'a' { 'b' } else { 'a' });
 
         assert!(store.decrypt("totp:node-1", &blob).is_err());
     }
@@ -718,6 +856,89 @@ mod tests {
             .mode();
 
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+    }
+
+    /// An install that ran without a keychain backend — Linux, before this build
+    /// — has its master key in a file, and every stored credential is sealed
+    /// under it. `file_key` is what finds it, so the same key can move into the
+    /// keychain rather than being replaced by a fresh one.
+    #[test]
+    fn a_master_key_left_in_a_file_is_read_back() {
+        let dir = scratch("file-key");
+        let key = random_bytes::<KEY_LEN>().expect("a key");
+        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), hex(&key)).expect("written");
+
+        assert_eq!(super::MasterKey::file_key(&dir), Some(key));
+    }
+
+    /// The ordinary case on every platform with a keychain: nothing was ever
+    /// written to the file, so there is nothing to move.
+    #[test]
+    fn a_first_run_has_no_file_key() {
+        let dir = scratch("no-file-key");
+
+        assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A file that is there but is not a key must not be read as one: a key made
+    /// of zeroes, or a truncated one, would silently orphan the whole store.
+    #[test]
+    fn a_file_that_is_not_a_key_is_absent_rather_than_a_short_key() {
+        let dir = scratch("bad-file-key");
+        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
+
+        assert_eq!(super::MasterKey::file_key(&dir), None);
+    }
+
+    /// A mask is not a shortening: none of the original characters of a short
+    /// value may survive it, because a 16-character TOTP secret shortened by
+    /// four characters is still a working TOTP secret on screen.
+    #[test]
+    fn a_short_value_is_replaced_whole() {
+        let secret = "JBSWY3DPEHPK3PXP";
+
+        let masked = super::mask(secret);
+        assert!(!masked.is_empty(), "an empty mask reads as no credential");
+        for part in ["JBSW", "3DPE", "PXP"] {
+            assert!(!masked.contains(part), "{masked} still shows {part}");
+        }
+    }
+
+    /// A long value keeps its ends, because "which of my nodes is this" is the
+    /// question the mask exists to answer, and drops everything between them.
+    #[test]
+    fn a_long_value_keeps_its_ends_and_nothing_between() {
+        let ticket = "e4f1c9a0b2d3e5f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3";
+
+        let masked = super::mask(ticket);
+        assert!(masked.starts_with("e4f1c9a0"), "{masked} lost its head");
+        assert!(masked.ends_with("2d3"), "{masked} lost its tail");
+        assert!(
+            !masked.contains("b2d3e5f7a8b9c0d1"),
+            "{masked} kept the middle of the ticket"
+        );
+    }
+
+    /// Empty stays empty: "no credential" is a different thing from "a
+    /// credential I am not showing you", and the UI says so differently.
+    #[test]
+    fn nothing_to_mask_is_an_empty_mask() {
+        assert_eq!(super::mask(""), "");
+    }
+
+    /// A connection string is a credential, so it is keyed per node like the
+    /// other two — a ticket written under one node's id and read under another's
+    /// is a ticket nobody can spend.
+    #[test]
+    fn a_connection_string_is_keyed_by_the_node_it_connects() {
+        assert_eq!(
+            super::secret_key(CredentialKind::Ticket, "node-1"),
+            "ticket:node-1"
+        );
+        assert_eq!(
+            super::secret_key(CredentialKind::EndpointId, "node-1"),
+            "endpoint:node-1"
+        );
     }
 
     #[test]

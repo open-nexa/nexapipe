@@ -3,13 +3,16 @@ import { ref, watch, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
   ConnectionType,
-  InvitePayload,
   LoadBalancingStrategy,
   NodeConfig,
   TwoFactorAlgorithm,
 } from "../types";
 import { useConfigStore } from "../stores/config";
+import { useCredentialGate } from "../stores/gate";
 import { useToast } from "../composables/useToast";
+import { errorDetail, errorKey } from "../api/errors";
+import { revealCredential } from "../api/credentials";
+import CredentialLock from "../components/CredentialLock.vue";
 import InviteImportDialog from "../components/InviteImportDialog.vue";
 
 const {
@@ -21,8 +24,12 @@ const {
   setNodeTwoFactor,
   clearNodeTwoFactor,
   hasTwoFactor,
+  connectionMask,
+  secretMask,
   resetConfig,
 } = useConfigStore();
+
+const { ensureUnlocked, unlocked } = useCredentialGate();
 
 const { t } = useI18n();
 const toast = useToast();
@@ -53,28 +60,54 @@ function openInviteDialog() {
 
 /**
  * Nodes arrive from invites and their target is not edited afterwards, so the connection string
- * is shown rather than input. Masked by default because a ticket is a credential: anyone looking
- * at the screen should not be able to read one off it.
+ * is shown rather than input — and shown as Rust masks it, never as the value.
+ *
+ * `revealed` holds the whole value for a node only while its reveal is open, and only after the
+ * reveal command returned it: the page never shortens a string it already has, which is what a
+ * mask computed in the renderer was. A short value used to be printed whole; it is not any more,
+ * because a 16-character TOTP secret shortened by four characters is still a working secret on
+ * screen.
  */
-const revealed = ref<Record<string, boolean>>({});
+const revealed = ref<Record<string, string>>({});
 
-function connectionValue(node: NodeConfig): string {
-  return node.connectionType === "ticket" ? node.ticket : node.endpointId;
-}
-
+/** What a node connects by, or the mask for it when its reveal is closed. */
 function connectionDisplay(node: NodeConfig): string {
-  const value = connectionValue(node);
-  if (!value) return "—";
-  if (revealed.value[node.id] || value.length <= 16) return value;
-  return `${value.slice(0, 8)}••••${value.slice(-4)}`;
+  const open = revealed.value[node.id];
+  if (open !== undefined) return open;
+  return connectionMask(node.id) || "—";
 }
 
-function toggleReveal(nodeId: string): void {
-  revealed.value[nodeId] = !revealed.value[nodeId];
+/** Which credential a node's connection string is filed under. */
+function connectionKind(node: NodeConfig): "ticket" | "endpoint" {
+  return node.connectionType === "ticket" ? "ticket" : "endpoint";
+}
+
+function isRevealed(nodeId: string): boolean {
+  return revealed.value[nodeId] !== undefined;
+}
+
+async function toggleReveal(node: NodeConfig): Promise<void> {
+  if (isRevealed(node.id)) {
+    delete revealed.value[node.id];
+    return;
+  }
+  // Closing a reveal needs nothing, opening one needs the door: hiding what is
+  // already on the screen is not a disclosure.
+  if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
+  const value = await revealCredential(connectionKind(node), node.id);
+  if (value === null || value === "") return;
+  // The window can close while the command is in flight — two minutes is not
+  // long, and this is an `await`. Storing the answer afterwards would put a
+  // whole value on the page under a window that no longer exists.
+  if (!unlocked.value) return;
+  revealed.value[node.id] = value;
 }
 
 async function copyConnection(node: NodeConfig): Promise<void> {
-  const value = connectionValue(node);
+  // Asked for here rather than read off the page: the copy button is a surface
+  // too, and the value it puts on the clipboard comes from the store.
+  if (!(await ensureUnlocked(t("gate.reasonConnection")))) return;
+  const value = revealed.value[node.id] ?? (await revealCredential(connectionKind(node), node.id));
   if (!value) return;
   try {
     await navigator.clipboard.writeText(value);
@@ -82,6 +115,63 @@ async function copyConnection(node: NodeConfig): Promise<void> {
   } catch {
     toast.error(t("common.copyFailed"));
   }
+}
+
+const revealedSecrets = ref<Record<string, string>>({});
+
+/**
+ * Both plaintext caches die with the window that opened them.
+ *
+ * A reveal is a value the page is holding for as long as somebody asked for it,
+ * and the window is how long that somebody is known to be at the keyboard. Once
+ * it closes — by the two minutes running out, or by the lock button — the value
+ * has to go with it, because a page still showing a secret it fetched under a
+ * window that has since shut is showing it to whoever replaced the user.
+ */
+function clearRevealCaches(): void {
+  revealed.value = {};
+  revealedSecrets.value = {};
+}
+
+watch(unlocked, (isUnlocked) => {
+  if (!isUnlocked) clearRevealCaches();
+});
+
+/** The secret field shows the mask; what the user types into it is what gets stored. */
+function secretDisplay(node: NodeConfig): string {
+  return revealedSecrets.value[node.id] ?? secretMask(node.id);
+}
+
+function secretInputType(node: NodeConfig): "text" | "password" {
+  return revealedSecrets.value[node.id] === undefined ? "password" : "text";
+}
+
+/**
+ * Stores what the user typed, and refuses what the field was showing instead.
+ *
+ * A mask is a shape, not a secret. The field holds one until a reveal opens it,
+ * so a change that arrives while it does — one character typed, or the same
+ * string touched and blurred — carries bullets with it, and filing those as the
+ * TOTP secret would make every later handshake fail for a reason the UI cannot
+ * see. Anything still carrying the mask character was not typed by anybody.
+ */
+function onSecretChange(node: NodeConfig, event: Event): void {
+  const value = (event.target as HTMLInputElement).value.trim();
+  if (value.includes("•")) return;
+  setNodeTwoFactor(node.id, { secret: value });
+}
+
+async function toggleSecret(node: NodeConfig): Promise<void> {
+  if (revealedSecrets.value[node.id] !== undefined) {
+    delete revealedSecrets.value[node.id];
+    return;
+  }
+  if (!(await ensureUnlocked(t("gate.reasonSecret")))) return;
+  const value = await revealCredential("totp", node.id);
+  if (value === null || value === "") return;
+  // As above: the window may have closed while the value was being fetched.
+  if (!unlocked.value) return;
+  revealedSecrets.value[node.id] = value;
 }
 
 /**
@@ -98,9 +188,14 @@ function toggleTwoFactor(nodeId: string) {
   }
 }
 
-function importInvite(payload: { invite: InvitePayload; applyRelay: boolean }) {
-  const outcome = applyInvite(payload.invite, { applyRelay: payload.applyRelay });
-  toast.success(t(outcome === "added" ? "invite.added" : "invite.merged"));
+async function importInvite(payload: { uri: string; applyRelay: boolean }) {
+  try {
+    const outcome = await applyInvite(payload.uri, { applyRelay: payload.applyRelay });
+    toast.success(t(outcome === "added" ? "invite.added" : "invite.merged"));
+  } catch (error) {
+    toast.error(t(errorKey(error, "error.invite.parse_failed")));
+    console.error("[invite] import failed:", errorDetail(error));
+  }
 }
 
 function getNodeTypeLabel(type: ConnectionType): string {
@@ -201,6 +296,9 @@ function clearConfig() {
     <div class="config-section">
       <div class="card-header">
         <h2>{{ t('config.nodeConfiguration') }}</h2>
+        <!-- The door sits with the values it guards, so its state is where the
+             reveal buttons are rather than in a settings page nobody opens. -->
+        <CredentialLock />
         <div class="card-header-decoration"></div>
         <button @click="openInviteDialog()" class="import-invite-btn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -264,10 +362,10 @@ function clearConfig() {
             <button
               type="button"
               class="connection-action"
-              :aria-label="revealed[node.id] ? t('node.hide') : t('node.reveal')"
-              @click="toggleReveal(node.id)"
+              :aria-label="isRevealed(node.id) ? t('node.hide') : t('node.reveal')"
+              @click="toggleReveal(node)"
             >
-              <svg v-if="revealed[node.id]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <svg v-if="isRevealed(node.id)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
                 <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
                 <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
@@ -340,13 +438,25 @@ function clearConfig() {
               </div>
               <div class="node-2fa-field">
                 <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
+                <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
+                     the value: a mask sitting in the field is a value, and a user who adds one
+                     character to it would store bullets as the TOTP secret. -->
                 <input
-                  :value="node.twoFactor.secret"
-                  @change="setNodeTwoFactor(node.id, { secret: ($event.target as HTMLInputElement).value.trim() })"
-                  type="password"
-                  placeholder="JBSWY3DPEHPK3PXP"
+                  :value="revealedSecrets[node.id] ?? ''"
+                  @change="onSecretChange(node, $event)"
+                  :type="secretInputType(node)"
+                  :placeholder="secretDisplay(node)"
                   class="form-input"
                 />
+                <button
+                  v-if="secretMask(node.id)"
+                  type="button"
+                  class="node-2fa-reveal"
+                  :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
+                  @click="toggleSecret(node)"
+                >
+                  {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
+                </button>
               </div>
               <div class="node-2fa-field">
                 <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>

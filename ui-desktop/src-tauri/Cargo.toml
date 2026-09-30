@@ -1,6 +1,6 @@
 [package]
 name = "nexa"
-version = "0.3.0"
+version = "0.4.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -52,7 +52,18 @@ sha2 = "0.11"
 # Credentials (TOTP secrets, enrollment tokens, relay bearers) are encrypted at
 # rest with AES-256-GCM under a master key the OS keychain holds.
 aes-gcm = "0.10"
-keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# Every platform gets a real backend, because without one keyring falls back to a
+# credential store that is only as private as the filesystem: `linux-native` on
+# its own is the kernel keyring, which does not survive a reboot, so Linux takes
+# the persistent Secret Service half as well. That half is the only reason the
+# Linux build needs `libdbus-1-dev` (see the desktop jobs in ci.yml and
+# release.yml); `sync` rather than `async` because nothing here is on an async
+# path and the async half would pull a runtime into the credential store.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native-sync-persistent",
+] }
 # The master key is wiped when it goes out of scope rather than left in freed memory.
 zeroize = "1"
 tun = { version = "0.8", features = ["async"] }
@@ -62,7 +73,41 @@ nexapipe-client = { path = "../../crates/nexapipe-client", features = [
     "tun-proxy",
 ] }
 
+# The credential door (src/gate.rs) asks the operating system who is at the
+# keyboard. Each of these is already built for its platform as part of something
+# else — `security-framework` by `keyring`'s macOS backend, `windows` (0.62) and
+# `windows-future` by iroh's `netwatch` — so naming them here adds an edge to
+# the graph and no code to the build. Only PAM is new, and only to Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+# A keychain item whose access control requires user presence: reading it is
+# what puts the system's own prompt on the screen.
+security-framework = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux has no system prompt of its own to borrow, so the question goes to PAM.
+# `cli` is off: it exists to read a password off a terminal, and this is a
+# desktop app. Builds against `libpam0g-dev` (see the Linux jobs in ci.yml and
+# release.yml).
+pam-client2 = { version = "0.5", default-features = false }
+# Only for `getpwuid(geteuid())`: the account to authenticate has to come from
+# the process, not from `USER`, which whoever launched the app decided.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
+# Windows Hello, with `LogonUserW` for the machines that have none.
+windows = { version = "0.62", features = [
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    # `OpenProcessToken` / `GetCurrentProcess`, which is how the account to
+    # authenticate is read off the process token instead of the environment.
+    "Win32_System_Threading",
+] }
+# Hello is a WinRT API, so its answers arrive asynchronously; this is how one is
+# waited out. The version pair `windows` 0.62 generates its bindings against.
+windows-future = "0.3"
+
 windows-service = "0.5"
 # Only for the TUN address: `netsh` silently does nothing when this runs as a service
 # (LocalSystem), which is the same class of failure as `net session` — see proxy/routing.rs.

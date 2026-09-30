@@ -10,13 +10,33 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [0.4.0] — 2026-09-30
 
-M1 and M2 of the v0.4.0 plan (see `.workbuddy/plans/v0.4.0.md`, a working note,
-not part of the tree). Not yet released, so no version numbers have moved.
+A readable version of this release, with downloads, is published at
+<https://open-nexa.github.io/nexapipe/v0.4.0.html>. The page itself
+lives in `docs/releases/`, and only that directory reaches the site.
 
 ### Added
 
+- **A door in front of the credentials the desktop app holds.** Showing a TOTP
+  secret, a node's connection string or this endpoint's Node ID now asks the
+  operating system to confirm the user first — Touch ID or the account
+  password on macOS, Windows Hello or the account password on Windows, PAM on
+  Linux — and stays open for two minutes afterwards. Sealing the store at rest
+  and masking what crosses into the UI were answers to "is this value on the
+  screen"; this is the other half, and the one neither of them could answer:
+  *who* is asking. There is deliberately no app password, because a credential
+  of its own would be one more thing to forget, reset and attack — what gates
+  the surfaces is what gates the machine. A machine with nothing to confirm
+  anybody with refuses rather than handing the value over, which is the one
+  outcome this exists to prevent. The proxy is unaffected: it still starts and
+  reopens its endpoints after a reboot with nobody at the keyboard, because
+  the window is two minutes of memory that never leaves this process and is
+  never handed to the service. This is the desktop half of the Android app's
+  credential lock, which shipped in 0.3.0; both ask the operating system and
+  both stay open for two minutes, but not in front of the same surfaces — here
+  it is this endpoint's Node ID and a node's connection string, there the TOTP
+  secret, its `otpauth` export and the relay configuration.
 - `least_conn` as a third load-balancing strategy, alongside `round_robin` and
   `random`: pick the healthy backend with the fewest requests outstanding to it,
   under a lease released when the flow finishes. Ties rotate rather than taking
@@ -55,6 +75,33 @@ not part of the tree). Not yet released, so no version numbers have moved.
   went back out with its full TTL again; and a zero TTL got a one-second floor
   instead of not being cached. Those tests are now executed in CI, which had only
   been compiling them.
+- The desktop app's claim that the OS keychain holds the credential store's
+  master key was not true on Linux: `keyring` had no Linux backend, so the key
+  was a `0600` file beside the encrypted credentials. Linux now uses the Secret
+  Service, and an install that already had a file key keeps it — the same key
+  moves into the keychain, because a fresh one would leave every credential in
+  the store undecryptable.
+- The desktop app's `localStorage` payload no longer holds a node's connection
+  string. A ticket is a credential — it names an endpoint *and* carries how to
+  reach it — and it was written in the clear beside the rest of the config,
+  while the TOTP secret, the enrollment token and the relay bearer had already
+  moved into the encrypted store. Both spellings now live there too, a payload
+  left over from an older build is migrated into it on the way in, and a node
+  whose connection string is in neither is dropped — after the store has been
+  asked, which is the only moment that question has an answer. An older build
+  reading the new payload finds no connection string and drops the node, so
+  downgrading means re-importing the invite.
+- The desktop app masked its credentials in the wrong place. The renderer
+  already held the value it was shortening, so a mask computed there was a mask
+  over a string sitting in that process's own memory — and an invite was worse:
+  its TOTP secret and its enrollment token were handed to the frontend in full,
+  so the page could work out which node the invite belonged to. Masks are now
+  computed in Rust (`credentials::mask`) and what crosses into the renderer is
+  the projection; an invite is accepted by `accept_invite`, which puts the
+  credentials in the store itself and answers with a receipt carrying none of
+  them. The Node ID is masked the same way, and `reveal_credential` and
+  `reveal_node_id` are now the only two commands that answer with a whole value
+  — which is what makes them the two the OS lock has to sit in front of.
 
 ## [0.3.0] — 2026-09-29
 

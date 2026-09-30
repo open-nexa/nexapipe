@@ -986,6 +986,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbus-secret-service"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "708b509edf7889e53d7efb0ffadd994cc6c2345ccb62f55cfd6b0682165e4fa6"
+dependencies = [
+ "dbus",
+ "zeroize",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2830,6 +2840,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
 dependencies = [
  "byteorder",
+ "dbus-secret-service",
+ "linux-keyutils",
  "log",
  "security-framework 2.11.1",
  "security-framework 3.7.0",
@@ -2908,6 +2920,16 @@ version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "linux-keyutils"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
+dependencies = [
+ "bitflags 2.13.2",
  "libc",
 ]
 
@@ -3377,7 +3399,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexa"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3392,7 +3414,9 @@ dependencies = [
  "lazy_static",
  "libc",
  "nexapipe-client",
+ "pam-client2",
  "parking_lot",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3407,6 +3431,8 @@ dependencies = [
  "tracing-subscriber",
  "tun",
  "url",
+ "windows 0.62.2",
+ "windows-future 0.3.2",
  "windows-service",
  "windows-sys 0.61.2",
  "zeroize",
@@ -3414,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base32",
@@ -3448,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-proto"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "nix"
@@ -3902,6 +3928,27 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pam-client2"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "407daa00f98b05147dbbaa6d2f6bce574e76794fa4952a5b38764681a23dde5f"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+ "pam-sys2",
+ "rustversion",
+]
+
+[[package]]
+name = "pam-sys2"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e07ea89c210813e1a48fc32cb358ba693aae8ca70163461e22d11f1884bf1d"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

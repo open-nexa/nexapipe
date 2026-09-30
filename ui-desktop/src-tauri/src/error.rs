@@ -117,6 +117,22 @@ pub mod codes {
     /// from the caller's point of view they are the same event: the credential is
     /// not available, and the fix is to supply it again rather than to retry.
     pub const CREDENTIALS_STORE_FAILED: &str = "credentials.store_failed";
+    /// The credential door is shut: the user has not confirmed, or the window
+    /// has lapsed.
+    ///
+    /// Not a failure to report so much as an instruction to the UI: ask, then
+    /// call again. The frontend turns it into a prompt rather than a red line.
+    pub const CREDENTIALS_LOCKED: &str = "credentials.locked";
+    /// The device has nothing to confirm the user with — no passcode, no
+    /// enrolled biometric, no PAM stack that can be opened.
+    ///
+    /// Refusing is the whole point, so this is the one the UI explains rather
+    /// than dismisses: the credential stays unreachable until the machine can
+    /// answer for whoever is using it.
+    pub const CREDENTIALS_GATE_UNAVAILABLE: &str = "credentials.gate_unavailable";
+    /// The operating system was asked and failed in a way that has a message,
+    /// which travels as `detail` and is shown in the OS's own words.
+    pub const CREDENTIALS_GATE_FAILED: &str = "credentials.gate_failed";
 
     // -- invite -----------------------------------------------------------------------------
     /// A `nexapipe://` invite could not be read.

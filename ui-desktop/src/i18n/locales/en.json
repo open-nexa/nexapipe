@@ -253,6 +253,18 @@
     "twoFactorHint": "Must match this server's [auth.clients] entry. Leave it off for a server that has no 2FA.",
     "enrollmentPending": "Waiting to enroll as {id}: the server issues this node's credentials on the next connect."
   },
+  "gate": {
+    "unlockedFor": "Unlocked for {time}",
+    "lockNow": "Lock now",
+    "unavailableShort": "This device cannot confirm it is you",
+    "unavailableTitle": "This device cannot confirm it is you",
+    "unavailableBody": "Showing a credential here asks this device to confirm who is using it first, and it has nothing to ask with — no password, no fingerprint, nothing set up to check against. Credentials stay hidden until that changes.",
+    "passwordTitle": "Confirm it is you",
+    "passwordLabel": "Password",
+    "reasonConnection": "Show a node's connection string",
+    "reasonSecret": "Show a node's two-factor secret",
+    "reasonNodeId": "Copy this endpoint's Node ID"
+  },
   "error": {
     "unknown": "Something went wrong. Please try again.",
     "proxy": {
@@ -292,7 +304,10 @@
       "dns_addr_outside_tun": "The DNS server can only listen inside the TUN network."
     },
     "credentials": {
-      "store_failed": "The saved credentials could not be read or written. Re-import the invite to restore them."
+      "store_failed": "The saved credentials could not be read or written. Re-import the invite to restore them.",
+      "locked": "This device did not confirm it is you, so the credential was not shown.",
+      "gate_unavailable": "This device cannot confirm it is you, so credentials stay hidden.",
+      "gate_failed": "This device could not confirm it is you. See the logs for details."
     },
     "invite": {
       "parse_failed": "This invite link could not be read."

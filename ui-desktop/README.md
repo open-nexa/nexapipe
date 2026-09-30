@@ -47,7 +47,7 @@ when it was imported from the former standalone repository.
                                      │  Tauri IPC
 ┌──────────────────────────── Rust backend (src-tauri) ─────────────────────────┐
 │  lib.rs — #[tauri::command]s: start_proxy, stop_proxy, get_proxy_status,       │
-│           get_node_id, install_service, uninstall_service,                     │
+│           get_node_id_display, reveal_node_id, install_service, …              │
 │           is_service_running, get_startup_error, get_logs                      │
 │  proxy/  — manager, local_proxy, tun_proxy (WinTun), dns, routing, packet      │
 │  service/— Windows service, elevation helper, IPC server + client              │
@@ -133,7 +133,9 @@ src-tauri/
 | `start_proxy` | Start forwarding. Takes nodes, domains, `local_addr`, `dns_addr`, `upstream_dns`, `load_balancing`, `tun_name`, `use_service`, `use_tun`, relay settings and 2FA settings. |
 | `stop_proxy` | Stop forwarding (service or in-process). |
 | `get_proxy_status` | `{ running, mode }` for the UI indicator. |
-| `get_node_id` | The local iroh Node ID. |
+| `get_node_id_display` | The local iroh Node ID, masked. What the UI prints. |
+| `reveal_node_id` | The same Node ID in full, for the user to copy. |
+| `credential_display` / `reveal_credential` | A stored credential masked, or in full — the same split as the Node ID. |
 | `install_service` / `uninstall_service` / `is_service_running` | Manage the elevated background service. |
 | `get_startup_error` | Failure captured during startup, if any. |
 | `get_logs` | Recent log lines for the Logs page. |
