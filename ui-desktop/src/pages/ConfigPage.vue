@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed } from "vue";
+import { ref, watch, computed, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
   ConnectionType,
@@ -8,7 +8,7 @@ import type {
   TwoFactorAlgorithm,
 } from "../types";
 import { useConfigStore } from "../stores/config";
-import { useCredentialGate } from "../stores/gate";
+import { useCredentialGate, clearRefusal } from "../stores/gate";
 import { useToast } from "../composables/useToast";
 import { errorDetail, errorKey } from "../api/errors";
 import { revealCredential } from "../api/credentials";
@@ -29,10 +29,41 @@ const {
   resetConfig,
 } = useConfigStore();
 
-const { ensureUnlocked, unlocked } = useCredentialGate();
+/**
+ * The whole page is behind the door, so the door is read from it.
+ *
+ * `refusal` is what the last attempt to open it came back with — a password that
+ * was not accepted, or a prompt that was dismissed — and it is printed on the
+ * locked page rather than swallowed: a button that was pressed and did nothing
+ * is the one thing a locked page owes an explanation for.
+ */
+const { ensureUnlocked, unlocked, refusal, canAuthenticate, refresh } = useCredentialGate();
 
 const { t } = useI18n();
 const toast = useToast();
+
+/**
+ * Re-read the door every time the page is opened.
+ *
+ * The window is two minutes of memory and nothing checks it while it runs, so a
+ * page that was unlocked and left must not still be open when it is come back
+ * to — and a machine that lost what it asks with while the app was in the
+ * background is found out here. What the last refusal said belongs to the visit
+ * that was refused, so it goes too.
+ */
+onMounted(() => {
+  clearRefusal();
+  void refresh();
+});
+
+/** Why the page is shut, which is also what opening it will cost. */
+const lockedBody = computed(() =>
+  canAuthenticate.value ? t("gate.lockedBody") : t("gate.unavailableBody"),
+);
+
+async function unlockPage(): Promise<void> {
+  await ensureUnlocked(t("gate.reasonConfig"));
+}
 
 const showInviteDialog = ref(false);
 /** A link pasted straight into a node field, handed to the dialog so it opens pre-filled. */
@@ -293,341 +324,373 @@ function clearConfig() {
 
 <template>
   <div class="config-page">
-    <div class="config-section">
-      <div class="card-header">
-        <h2>{{ t('config.nodeConfiguration') }}</h2>
-        <!-- The door sits with the values it guards, so its state is where the
-             reveal buttons are rather than in a settings page nobody opens. -->
-        <CredentialLock />
-        <div class="card-header-decoration"></div>
-        <button @click="openInviteDialog()" class="import-invite-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="8" y="3" width="8" height="4" rx="1"/>
-            <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
-          </svg>
-          {{ t('invite.import') }}
-        </button>
-      </div>
-      
-      <div class="nodes-container">
-        <div v-if="visibleNodes.length === 0" class="nodes-empty">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="8" y="3" width="8" height="4" rx="1"/>
-            <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
-          </svg>
-          <span class="nodes-empty-title">{{ t('config.noNodes') }}</span>
-          <span class="nodes-empty-hint">{{ t('config.noNodesHint') }}</span>
-        </div>
+    <!-- The door comes first, because it decides whether there is a page under it. -->
+    <div class="config-lockbar">
+      <CredentialLock :reason="t('gate.reasonConfig')" />
+    </div>
 
-        <div
-          v-for="(node, index) in visibleNodes"
-          :key="node.id"
-          class="node-card"
-        >
-          <div class="node-header">
-            <span class="node-label">{{ getNodeLabel(node, index) }}</span>
-            <span 
-              class="type-badge" 
-              :style="{ backgroundColor: getNodeTypeColor(node.connectionType) + '15', color: getNodeTypeColor(node.connectionType), borderColor: getNodeTypeColor(node.connectionType) + '30' }"
-            >
-              <svg v-if="node.connectionType === 'ticket'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                <path d="M7 16V3h7v13"/>
-                <path d="M17 16v-5a2 2 0 0 0-2-2H5"/>
-              </svg>
-              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
-              {{ getNodeTypeLabel(node.connectionType) }}
-            </span>
-            <button
-              v-if="visibleNodes.length > 1"
-              @click="removeNode(node.id)"
-              class="remove-node-btn"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
+    <div v-if="!unlocked" class="config-locked">
+      <span class="config-locked__icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </span>
+      <h2 class="config-locked__title">{{ t('gate.lockedTitle') }}</h2>
+      <p class="config-locked__body">{{ lockedBody }}</p>
+      <!-- What the last attempt came back with. Said here because the button that
+           was pressed is here: a press that does nothing has to answer for itself. -->
+      <p v-if="refusal" class="config-locked__error" role="alert">{{ refusal }}</p>
+      <button
+        v-if="canAuthenticate"
+        type="button"
+        class="config-locked__action"
+        @click="unlockPage"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a4 4 0 0 1 7.5-2"/>
+        </svg>
+        {{ t('gate.unlock') }}
+      </button>
+    </div>
+
+    <!-- Behind the door, so a locked page renders none of it: what is not on the
+         screen cannot be read out of it, which is the whole point. -->
+    <template v-if="unlocked">
+      <div class="config-section">
+        <div class="card-header">
+          <h2>{{ t('config.nodeConfiguration') }}</h2>
+          <div class="card-header-decoration"></div>
+          <button @click="openInviteDialog()" class="import-invite-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="8" y="3" width="8" height="4" rx="1"/>
+              <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
+            </svg>
+            {{ t('invite.import') }}
+          </button>
+        </div>
+      
+        <div class="nodes-container">
+          <div v-if="visibleNodes.length === 0" class="nodes-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="8" y="3" width="8" height="4" rx="1"/>
+              <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
+            </svg>
+            <span class="nodes-empty-title">{{ t('config.noNodes') }}</span>
+            <span class="nodes-empty-hint">{{ t('config.noNodesHint') }}</span>
           </div>
-          
-          <div class="connection-input-wrapper">
-            <div class="input-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M10 13a5 5 0 0 1 5-5m0 0a5 5 0 0 1 5 5m-5-5v10"/>
-              </svg>
+
+          <div
+            v-for="(node, index) in visibleNodes"
+            :key="node.id"
+            class="node-card"
+          >
+            <div class="node-header">
+              <span class="node-label">{{ getNodeLabel(node, index) }}</span>
+              <span 
+                class="type-badge" 
+                :style="{ backgroundColor: getNodeTypeColor(node.connectionType) + '15', color: getNodeTypeColor(node.connectionType), borderColor: getNodeTypeColor(node.connectionType) + '30' }"
+              >
+                <svg v-if="node.connectionType === 'ticket'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                  <path d="M7 16V3h7v13"/>
+                  <path d="M17 16v-5a2 2 0 0 0-2-2H5"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                </svg>
+                {{ getNodeTypeLabel(node.connectionType) }}
+              </span>
+              <button
+                v-if="visibleNodes.length > 1"
+                @click="removeNode(node.id)"
+                class="remove-node-btn"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"/>
+                  <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
             </div>
-            <code class="form-input connection-value">{{ connectionDisplay(node) }}</code>
-            <button
-              type="button"
-              class="connection-action"
-              :aria-label="isRevealed(node.id) ? t('node.hide') : t('node.reveal')"
-              @click="toggleReveal(node)"
-            >
-              <svg v-if="isRevealed(node.id)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
-                <line x1="1" y1="1" x2="23" y2="23"/>
-              </svg>
-              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/>
-                <circle cx="12" cy="12" r="3"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="connection-action"
-              :aria-label="t('common.copy')"
-              @click="copyConnection(node)"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-              </svg>
-            </button>
-          </div>
-          <p class="connection-hint">{{ t('node.connectionHint') }}</p>
           
-          <div class="node-domains-section">
-            <label class="form-label">
-              <span class="label-text">{{ t('config.proxiedDomains') }}</span>
-              <span class="domain-count">{{ t('config.domainsCount', { count: node.domains.length }) }}</span>
-            </label>
-            <div class="textarea-wrapper">
+            <div class="connection-input-wrapper">
               <div class="input-icon">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                  <line x1="16" y1="13" x2="8" y2="13"/>
-                  <line x1="16" y1="17" x2="8" y2="17"/>
+                  <path d="M10 13a5 5 0 0 1 5-5m0 0a5 5 0 0 1 5 5m-5-5v10"/>
                 </svg>
               </div>
-              <textarea
-                :value="getNodeDomainsText(node)"
-                @input="updateNodeDomainsText(node.id, ($event.target as HTMLTextAreaElement).value)"
-                rows="2"
-                :placeholder="t('config.domainsPlaceholder')"
-                class="form-textarea"
-              ></textarea>
+              <code class="form-input connection-value">{{ connectionDisplay(node) }}</code>
+              <button
+                type="button"
+                class="connection-action"
+                :aria-label="isRevealed(node.id) ? t('node.hide') : t('node.reveal')"
+                @click="toggleReveal(node)"
+              >
+                <svg v-if="isRevealed(node.id)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                  <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+                  <line x1="1" y1="1" x2="23" y2="23"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="connection-action"
+                :aria-label="t('common.copy')"
+                @click="copyConnection(node)"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+              </button>
             </div>
-          </div>
+            <p class="connection-hint">{{ t('node.connectionHint') }}</p>
+          
+            <div class="node-domains-section">
+              <label class="form-label">
+                <span class="label-text">{{ t('config.proxiedDomains') }}</span>
+                <span class="domain-count">{{ t('config.domainsCount', { count: node.domains.length }) }}</span>
+              </label>
+              <div class="textarea-wrapper">
+                <div class="input-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                  </svg>
+                </div>
+                <textarea
+                  :value="getNodeDomainsText(node)"
+                  @input="updateNodeDomainsText(node.id, ($event.target as HTMLTextAreaElement).value)"
+                  rows="2"
+                  :placeholder="t('config.domainsPlaceholder')"
+                  class="form-textarea"
+                ></textarea>
+              </div>
+            </div>
 
-          <div class="node-2fa-section">
-            <button type="button" class="node-2fa-toggle" @click="toggleTwoFactor(node.id)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="11" width="18" height="11" rx="2"/>
-                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-              </svg>
-              <span class="node-2fa-title">{{ t('node.twoFactor') }}</span>
-              <span class="node-2fa-state" :class="{ on: hasTwoFactor(node) }">
-                {{ hasTwoFactor(node) ? t('common.enabled') : t('common.disabled') }}
-              </span>
-            </button>
-            <div v-if="node.twoFactor" class="node-2fa-fields">
-              <div class="node-2fa-field">
-                <label class="form-label">{{ t('node.twoFactorClientId') }}</label>
-                <input
-                  :value="node.twoFactor.clientId"
-                  @change="setNodeTwoFactor(node.id, { clientId: ($event.target as HTMLInputElement).value.trim() })"
-                  type="text"
-                  placeholder="client-001"
-                  class="form-input"
-                />
+            <div class="node-2fa-section">
+              <button type="button" class="node-2fa-toggle" @click="toggleTwoFactor(node.id)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="11" width="18" height="11" rx="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+                <span class="node-2fa-title">{{ t('node.twoFactor') }}</span>
+                <span class="node-2fa-state" :class="{ on: hasTwoFactor(node) }">
+                  {{ hasTwoFactor(node) ? t('common.enabled') : t('common.disabled') }}
+                </span>
+              </button>
+              <div v-if="node.twoFactor" class="node-2fa-fields">
+                <div class="node-2fa-field">
+                  <label class="form-label">{{ t('node.twoFactorClientId') }}</label>
+                  <input
+                    :value="node.twoFactor.clientId"
+                    @change="setNodeTwoFactor(node.id, { clientId: ($event.target as HTMLInputElement).value.trim() })"
+                    type="text"
+                    placeholder="client-001"
+                    class="form-input"
+                  />
+                </div>
+                <div class="node-2fa-field">
+                  <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
+                  <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
+                       the value: a mask sitting in the field is a value, and a user who adds one
+                       character to it would store bullets as the TOTP secret. -->
+                  <input
+                    :value="revealedSecrets[node.id] ?? ''"
+                    @change="onSecretChange(node, $event)"
+                    :type="secretInputType(node)"
+                    :placeholder="secretDisplay(node)"
+                    class="form-input"
+                  />
+                  <button
+                    v-if="secretMask(node.id)"
+                    type="button"
+                    class="node-2fa-reveal"
+                    :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
+                    @click="toggleSecret(node)"
+                  >
+                    {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
+                  </button>
+                </div>
+                <div class="node-2fa-field">
+                  <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>
+                  <select
+                    :value="node.twoFactor.algorithm"
+                    @change="setNodeTwoFactor(node.id, { algorithm: ($event.target as HTMLSelectElement).value as TwoFactorAlgorithm })"
+                    class="form-select"
+                  >
+                    <option value="sha1">SHA1</option>
+                    <option value="sha256">SHA256</option>
+                    <option value="sha512">SHA512</option>
+                  </select>
+                </div>
+                <p class="node-2fa-hint">{{ t('node.twoFactorHint') }}</p>
               </div>
-              <div class="node-2fa-field">
-                <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
-                <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
-                     the value: a mask sitting in the field is a value, and a user who adds one
-                     character to it would store bullets as the TOTP secret. -->
-                <input
-                  :value="revealedSecrets[node.id] ?? ''"
-                  @change="onSecretChange(node, $event)"
-                  :type="secretInputType(node)"
-                  :placeholder="secretDisplay(node)"
-                  class="form-input"
-                />
-                <button
-                  v-if="secretMask(node.id)"
-                  type="button"
-                  class="node-2fa-reveal"
-                  :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
-                  @click="toggleSecret(node)"
-                >
-                  {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
-                </button>
-              </div>
-              <div class="node-2fa-field">
-                <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>
-                <select
-                  :value="node.twoFactor.algorithm"
-                  @change="setNodeTwoFactor(node.id, { algorithm: ($event.target as HTMLSelectElement).value as TwoFactorAlgorithm })"
-                  class="form-select"
-                >
-                  <option value="sha1">SHA1</option>
-                  <option value="sha256">SHA256</option>
-                  <option value="sha512">SHA512</option>
-                </select>
-              </div>
-              <p class="node-2fa-hint">{{ t('node.twoFactorHint') }}</p>
+              <!-- A token is not a credential yet, so there is nothing to edit here: it is spent
+                   on the next connect, which writes the real secret into this node. -->
+              <p v-else-if="node.enrollment" class="node-2fa-hint">
+                {{ t('node.enrollmentPending', { id: node.enrollment.clientId }) }}
+              </p>
             </div>
-            <!-- A token is not a credential yet, so there is nothing to edit here: it is spent
-                 on the next connect, which writes the real secret into this node. -->
-            <p v-else-if="node.enrollment" class="node-2fa-hint">
-              {{ t('node.enrollmentPending', { id: node.enrollment.clientId }) }}
-            </p>
           </div>
         </div>
+        <p v-if="visibleNodes.length > 1" class="hint">{{ t('config.multipleNodesHint') }}</p>
       </div>
-      <p v-if="visibleNodes.length > 1" class="hint">{{ t('config.multipleNodesHint') }}</p>
-    </div>
 
-    <div class="config-section">
-      <div class="card-header">
-        <h2>{{ t('config.domainOverview') }}</h2>
-        <div class="card-header-decoration"></div>
-      </div>
+      <div class="config-section">
+        <div class="card-header">
+          <h2>{{ t('config.domainOverview') }}</h2>
+          <div class="card-header-decoration"></div>
+        </div>
       
-      <div class="domain-overview">
-        <div v-if="allDomains.length === 0" class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-            <path d="M3 3v5h5"/>
-            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-            <path d="M16 21h5v-5"/>
-            <path d="M12 3v5"/>
-            <path d="M12 16v5"/>
-            <path d="M3 12h5"/>
-            <path d="M16 12h5"/>
-          </svg>
-          <span>{{ t('config.noDomains') }}</span>
+        <div class="domain-overview">
+          <div v-if="allDomains.length === 0" class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+              <path d="M16 21h5v-5"/>
+              <path d="M12 3v5"/>
+              <path d="M12 16v5"/>
+              <path d="M3 12h5"/>
+              <path d="M16 12h5"/>
+            </svg>
+            <span>{{ t('config.noDomains') }}</span>
+          </div>
+          <div v-else class="domain-tags">
+            <span 
+              v-for="domain in allDomains" 
+              :key="domain" 
+              class="domain-tag"
+            >
+              {{ domain }}
+            </span>
+          </div>
         </div>
-        <div v-else class="domain-tags">
-          <span 
-            v-for="domain in allDomains" 
-            :key="domain" 
-            class="domain-tag"
+        <p class="hint">{{ t('config.overviewHint', { count: allDomains.length }) }}</p>
+      </div>
+
+      <div class="config-section">
+        <div class="card-header">
+          <h2>{{ t('config.network') }}</h2>
+          <div class="card-header-decoration"></div>
+        </div>
+      
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="localAddr" class="form-label">{{ t('config.localAddr') }}</label>
+            <div class="input-wrapper">
+              <div class="input-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2a10 10 0 0 0-10 10c0 4.42 2.87 8.17 6.84 9.49"/>
+                  <path d="M12 2a10 10 0 0 1 10 10c0 4.42-2.87 8.17-6.84 9.49"/>
+                  <path d="M12 12l4 4"/>
+                  <path d="M12 12l-4 4"/>
+                  <path d="M12 12l4-4"/>
+                  <path d="M12 12l-4-4"/>
+                </svg>
+              </div>
+              <input
+                id="localAddr"
+                v-model="localAddr"
+                type="text"
+                placeholder="127.0.0.1:8080"
+                class="form-input"
+              />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="dnsAddr" class="form-label">{{ t('config.dnsAddr') }}</label>
+            <div class="input-wrapper">
+              <div class="input-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <polyline points="12 6 12 12 16 14"/>
+                </svg>
+              </div>
+              <input
+                id="dnsAddr"
+                v-model="dnsAddr"
+                type="text"
+                placeholder="198.18.0.254:53"
+                class="form-input"
+              />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="upstreamDns" class="form-label">{{ t('config.upstreamDns') }}</label>
+            <div class="input-wrapper">
+              <div class="input-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                </svg>
+              </div>
+              <input
+                id="upstreamDns"
+                v-model="upstreamDns"
+                type="text"
+                placeholder="223.5.5.5:53"
+                class="form-input"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="card-header">
+          <h2>{{ t('config.loadBalancing') }}</h2>
+          <div class="card-header-decoration"></div>
+        </div>
+      
+        <div class="load-balancing-options">
+          <label 
+            v-for="option in loadBalancingOptions" 
+            :key="option.value"
+            class="strategy-option"
+            :class="{ active: loadBalancing === option.value }"
           >
-            {{ domain }}
-          </span>
-        </div>
-      </div>
-      <p class="hint">{{ t('config.overviewHint', { count: allDomains.length }) }}</p>
-    </div>
-
-    <div class="config-section">
-      <div class="card-header">
-        <h2>{{ t('config.network') }}</h2>
-        <div class="card-header-decoration"></div>
-      </div>
-      
-      <div class="form-grid">
-        <div class="form-group">
-          <label for="localAddr" class="form-label">{{ t('config.localAddr') }}</label>
-          <div class="input-wrapper">
-            <div class="input-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 2a10 10 0 0 0-10 10c0 4.42 2.87 8.17 6.84 9.49"/>
-                <path d="M12 2a10 10 0 0 1 10 10c0 4.42-2.87 8.17-6.84 9.49"/>
-                <path d="M12 12l4 4"/>
-                <path d="M12 12l-4 4"/>
-                <path d="M12 12l4-4"/>
-                <path d="M12 12l-4-4"/>
-              </svg>
-            </div>
             <input
-              id="localAddr"
-              v-model="localAddr"
-              type="text"
-              placeholder="127.0.0.1:8080"
-              class="form-input"
+              v-model="loadBalancing"
+              :value="option.value"
+              type="radio"
+              class="strategy-radio"
             />
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label for="dnsAddr" class="form-label">{{ t('config.dnsAddr') }}</label>
-          <div class="input-wrapper">
-            <div class="input-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"/>
-                <polyline points="12 6 12 12 16 14"/>
-              </svg>
+            <div class="strategy-content">
+              <span class="strategy-label">{{ t(option.label) }}</span>
+              <span class="strategy-desc">{{ t(option.desc) }}</span>
             </div>
-            <input
-              id="dnsAddr"
-              v-model="dnsAddr"
-              type="text"
-              placeholder="198.18.0.254:53"
-              class="form-input"
-            />
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label for="upstreamDns" class="form-label">{{ t('config.upstreamDns') }}</label>
-          <div class="input-wrapper">
-            <div class="input-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-              </svg>
-            </div>
-            <input
-              id="upstreamDns"
-              v-model="upstreamDns"
-              type="text"
-              placeholder="223.5.5.5:53"
-              class="form-input"
-            />
-          </div>
+          </label>
         </div>
       </div>
-    </div>
 
-    <div class="config-section">
-      <div class="card-header">
-        <h2>{{ t('config.loadBalancing') }}</h2>
-        <div class="card-header-decoration"></div>
+      <div class="config-actions">
+        <button class="btn btn-secondary" @click="loadExampleConfig">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          {{ t('config.loadExample') }}
+        </button>
+        <button class="btn btn-outline" @click="clearConfig">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+          {{ t('config.clearConfig') }}
+        </button>
       </div>
-      
-      <div class="load-balancing-options">
-        <label 
-          v-for="option in loadBalancingOptions" 
-          :key="option.value"
-          class="strategy-option"
-          :class="{ active: loadBalancing === option.value }"
-        >
-          <input
-            v-model="loadBalancing"
-            :value="option.value"
-            type="radio"
-            class="strategy-radio"
-          />
-          <div class="strategy-content">
-            <span class="strategy-label">{{ t(option.label) }}</span>
-            <span class="strategy-desc">{{ t(option.desc) }}</span>
-          </div>
-        </label>
-      </div>
-    </div>
-
-    <div class="config-actions">
-      <button class="btn btn-secondary" @click="loadExampleConfig">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-        </svg>
-        {{ t('config.loadExample') }}
-      </button>
-      <button class="btn btn-outline" @click="clearConfig">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-        {{ t('config.clearConfig') }}
-      </button>
-    </div>
+    </template>
 
     <InviteImportDialog
       :open="showInviteDialog"
@@ -659,6 +722,93 @@ function clearConfig() {
 .config-page::-webkit-scrollbar-thumb {
   background: var(--border-color);
   border-radius: 2px;
+}
+
+/* The door, as the page's first row: right-aligned, because it is a state and an action rather
+   than a section of its own. */
+.config-lockbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* What a shut page is. The sections are not rendered at all while it shows, so there is nothing
+   to scroll past and nothing in the document to read out of it. */
+.config-locked {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 48px 24px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  text-align: center;
+}
+
+.config-locked__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.config-locked__icon svg {
+  width: 26px;
+  height: 26px;
+}
+
+.config-locked__title {
+  margin: 4px 0 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.config-locked__body {
+  margin: 0;
+  max-width: 420px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.config-locked__error {
+  margin: 0;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--error-50);
+  color: var(--error-600);
+  font-size: 12px;
+}
+
+.config-locked__action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 10px 18px;
+  border: 1px solid var(--primary-400);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--primary-600);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-normal);
+}
+
+.config-locked__action:hover {
+  background: var(--primary-50);
+}
+
+.config-locked__action svg {
+  width: 16px;
+  height: 16px;
 }
 
 .config-section {
@@ -959,6 +1109,7 @@ function clearConfig() {
 .form-input {
   padding-left: 40px;
 }
+
 
 .form-input:focus,
 .form-textarea:focus,
