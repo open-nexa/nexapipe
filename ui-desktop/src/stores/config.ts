@@ -53,8 +53,11 @@ const SAVE_DEBOUNCE_MS = 300;
  *
  * Now `true`: every page and component reads this store, and the second loader that used to read
  * `nexa-config` (`composables/useConfigStore.ts`) is gone, so the legacy key has no readers left.
- * It is deleted in the same commit that removed that loader — the copy is written first either
- * way, so an older build downgraded onto this one still finds its configuration (§5.7, R3).
+ *
+ * `true` is *whether it may go*, not *when*: the copy is written first either way, so an older
+ * build downgraded onto this one still finds its configuration (§5.7, R3). The moment it goes is
+ * decided in `initConfigStore`, which is the first place that can prove a current-shaped payload
+ * exists.
  *
  * A function rather than a `const`, because a constant `false` makes the branch unreachable to
  * TypeScript and turns the constant itself into an unused-local error.
@@ -273,15 +276,28 @@ function loadConfig(): ProxyConfig {
 
   const legacy = readJson(LEGACY_STORAGE_KEY);
   if (legacy) {
-    const migrated = migrate(normalizeConfig(legacy), 0);
-    persist(migrated);
-    if (dropLegacyKey()) removeKey(LEGACY_STORAGE_KEY);
-    console.info('[config] migrated legacy nexa-config to version', CONFIG_VERSION);
-    return migrated;
+    // Neither written nor dropped here. This runs while the module is being
+    // imported, which is before `initConfigStore` has read the credential store,
+    // and a save made before that read is deliberately a no-op — see `persist`.
+    // Deleting the legacy key at this point would therefore remove the only
+    // durable copy the configuration has without ever writing its replacement.
+    // Both happen in `initConfigStore`, once hydration has succeeded.
+    legacyKeyDropPending = true;
+    return migrate(normalizeConfig(legacy), 0);
   }
 
   return { ...defaultConfig };
 }
+
+/**
+ * Whether a legacy payload was read and its key is still awaiting deletion.
+ *
+ * Set by `loadConfig`, which cannot delete it: see the comment there. It is cleared once
+ * `initConfigStore` has written a current-shaped payload and read it back, and it stays set if
+ * hydration failed, so the next launch reads the legacy payload again rather than finding
+ * neither copy.
+ */
+let legacyKeyDropPending = false;
 
 /**
  * The shape that goes into `localStorage`: everything except the credentials.
@@ -512,11 +528,25 @@ export async function initConfigStore(): Promise<void> {
     // above leaves the secrets in `config` empty, and an ungated mirror would
     // empty the store to match.
     credentialsHydrated = true;
+
+    // The legacy key goes now, and only because it can be proved redundant:
+    // `persist` swallows a write failure, so the payload is read back rather
+    // than trusted. A save that did not happen must not cost the user the copy
+    // it was meant to replace.
+    if (legacyKeyDropPending && dropLegacyKey()) {
+      persist(config);
+      if (readJson(STORAGE_KEY)) {
+        removeKey(LEGACY_STORAGE_KEY);
+        legacyKeyDropPending = false;
+        console.info('[config] migrated legacy nexa-config to version', CONFIG_VERSION);
+      }
+    }
   } catch (error) {
     // A store that cannot be read leaves the nodes without credentials: they will refuse to
     // handshake and the UI says so. Not fatal — the app has to stay usable enough to re-import
     // an invite. `credentialsHydrated` stays false, so the next save writes
-    // `localStorage` and leaves the store alone.
+    // `localStorage` and leaves the store alone — and `legacyKeyDropPending`
+    // stays true, so the legacy payload is still there to read next launch.
     console.error('[config] failed to load credentials:', error);
   }
 
