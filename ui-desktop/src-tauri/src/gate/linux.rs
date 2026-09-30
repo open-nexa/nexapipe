@@ -15,6 +15,7 @@
 
 use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
 use std::ffi::{CStr, CString};
+use std::mem::MaybeUninit;
 use zeroize::Zeroizing;
 
 use super::{Capability, OsGate, Outcome};
@@ -104,17 +105,46 @@ impl OsGate for Pam {
 /// it is not running as — and a password that is not the user's would open the
 /// door. A uid cannot be handed in from outside.
 fn current_user() -> Option<String> {
-    // SAFETY: `geteuid` cannot fail, and `getpwuid` is given exactly what it
-    // returned. The struct it hands back belongs to libc and is not to be freed
-    // or kept, which is why the name is copied out of it before returning.
+    // SAFETY: `geteuid` cannot fail, and `getpwuid_r` is given exactly what it
+    // returned. The reentrant form rather than `getpwuid` because that one
+    // answers out of storage libc owns and reuses: `confirm` runs on a blocking
+    // task and nothing serialises two of them, so two readers could be handed
+    // the same struct. Everything here is owned by this call — the entry, and
+    // the buffer its strings point into.
     unsafe {
-        let entry = libc::getpwuid(libc::geteuid());
-        if entry.is_null() {
-            return None;
+        let mut buffer_len = 1024_usize;
+        loop {
+            let mut buffer = vec![0_u8; buffer_len];
+            let mut entry = MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+
+            // Unlike `getpwuid`, this returns the error number rather than
+            // setting `errno`, and it reports a uid with no entry as `0` with a
+            // null result — which is "no such user", not "out of memory".
+            let error = libc::getpwuid_r(
+                libc::geteuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            );
+
+            if error == libc::ERANGE {
+                buffer_len = buffer_len.checked_mul(2)?;
+                continue;
+            }
+            if error != 0 || result.is_null() {
+                return None;
+            }
+
+            let entry = entry.assume_init();
+            if entry.pw_name.is_null() {
+                return None;
+            }
+            let name = CStr::from_ptr(entry.pw_name);
+            let name = name.to_str().ok()?.to_string();
+            return (!name.is_empty()).then_some(name);
         }
-        let name = std::ffi::CStr::from_ptr((*entry).pw_name);
-        let name = name.to_str().ok()?.to_string();
-        (!name.is_empty()).then_some(name)
     }
 }
 
