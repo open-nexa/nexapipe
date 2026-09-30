@@ -19,8 +19,14 @@
 ; The two directions differ on purpose. Upgrading must not cost the user the service they had
 ; installed, so the installer only *stops* it and leaves the SCM entry alone (there is nothing on
 ; disk that needs it deleted - the binary itself is what the installer replaces), then restores
-; and restarts it once the new binary is in place. Only uninstalling, which really does remove
-; everything, drops the entry.
+; and restarts it once the new binary is in place.
+;
+; Uninstalling really does drop the entry, and that path is not always taken deliberately: the
+; stock maintenance page of an NSIS installer offers "Uninstall before installing" as the
+; pre-selected option when it finds an older version, and the uninstaller it then runs comes
+; through these very same hooks. `sc delete` takes the answer to "was a service registered here?"
+; with it, so the uninstaller writes that down first (NEXAPIPE_REMEMBER_SERVICE) and the install
+; that follows reads it back (NEXAPIPE_RECALL_SERVICE) instead of asking the SCM.
 
 ; LogicLib is pulled in explicitly: the generated installer may or may not already include it.
 !include LogicLib.nsh
@@ -35,6 +41,13 @@
 !define NEXAPIPE_STOP_SCRIPT "$TEMP\nexapipe-stop-service.cmd"
 !define NEXAPIPE_RESTORE_SCRIPT "$TEMP\nexapipe-restore-service.cmd"
 !define NEXAPIPE_RESTORE_LOG "$TEMP\nexapipe-restore-service.log"
+
+; Where the uninstaller leaves its note about the service it is about to drop, for the install
+; that follows to pick up. The two product names are spelled out rather than read from
+; MANUFACTURER / PRODUCTNAME, which installer.nsi defines below this include. Nothing in either
+; the uninstaller or the installer removes this key, and because it keeps that manufacturer key
+; non-empty not even the "delete app data" checkbox's DeleteRegKey /ifempty touches it.
+!define NEXAPIPE_SERVICE_STATE_KEY "Software\nexa\nexa-service-state"
 
 ; What the pre-install hook has to give back afterwards, recorded before it stops anything:
 ; whether the SCM entry existed at all, and whether its own process was what held the binary open.
@@ -56,6 +69,47 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
     Sleep 1000
     IntOp $0 $0 + 1
   ${LoopUntil} $0 >= 15
+  Pop $0
+!macroend
+
+; Called by the uninstaller before it drops the entry. Tells the two ways an uninstall happens
+; apart without any string work: an uninstaller launched normally copies itself into the temp
+; directory and runs from there, while NSIS's own `_?=` switch, which is exactly what installer.nsi
+; appends when its maintenance page runs the uninstaller, keeps it in place - so the two paths are
+; told apart by whether this executable is the one sitting in the installation directory.
+;
+;   * installer-driven - an upgrade is happening, and the install that follows has to be able to
+;     get the service back, so what is registered here gets written down.
+;   * genuine uninstall - someone is removing nexa from Apps & features, and it has to leave
+;     nothing behind: a note would make a later reinstall resurrect a service the user removed on
+;     purpose, so any stale note is cleared instead. That is also why this is called even when
+;     nothing is registered; clearing the note a declined UAC prompt left behind matters just as
+;     much as writing a fresh one.
+!macro NEXAPIPE_REMEMBER_SERVICE
+  ${If} $EXEDIR == $INSTDIR
+    ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
+      DetailPrint "Noting that the ${NEXAPIPE_SERVICE_NAME} was registered here..."
+      WriteRegStr SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasInstalled" "1"
+      WriteRegStr SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasRunning" "$NEXAPIPE_SERVICE_WAS_RUNNING"
+    ${EndIf}
+  ${Else}
+    DeleteRegKey SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}"
+  ${EndIf}
+!macroend
+
+; Reads that note back, for the installer only, when the SCM itself has nothing to say. Neither
+; global is ever lowered here: the entry may already have been found still registered, and a
+; service that was running when it was dropped still has to be started again afterwards. The note
+; itself is only cleared by NEXAPIPE_RESTORE_SERVICE, once the entry is really back.
+!macro NEXAPIPE_RECALL_SERVICE
+  Push $0
+  ReadRegStr $0 SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasInstalled"
+  ${If} $0 == "1"
+    StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 1
+    ReadRegStr $0 SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasRunning"
+    ${IfThen} $0 == "1" ${|} StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1 ${|}
+    DetailPrint "${NEXAPIPE_SERVICE_NAME} was registered here before; putting it back."
+  ${EndIf}
   Pop $0
 !macroend
 
@@ -104,6 +158,10 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${NEXAPIPE_SERVICE_NAME}" "ImagePath"
   ${If} $0 != ""
     StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 1
+  ${Else}
+    ; Nothing registered right now, but an install-driven uninstall may have run moments ago and
+    ; left a note about what it dropped. See NEXAPIPE_REMEMBER_SERVICE for why it keeps one.
+    !insertmacro NEXAPIPE_RECALL_SERVICE
   ${EndIf}
 
   ; Then ask the file itself: if it can be removed, nothing holds it and there is nothing to stop,
@@ -186,6 +244,13 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
       FileClose $0
       Delete "${NEXAPIPE_RESTORE_LOG}"
     ${EndIf}
+
+    ; Forget the note only once the entry is really back. A declined UAC prompt keeps it for the
+    ; next attempt instead of costing the user their service.
+    ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${NEXAPIPE_SERVICE_NAME}" "ImagePath"
+    ${If} $0 != ""
+      DeleteRegKey SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}"
+    ${EndIf}
   ${EndIf}
 
   Pop $1
@@ -198,13 +263,13 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   Push $0
   Push $1
 
-  ; $0 = "something has to be dropped".
-  StrCpy $0 0
+  StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 0
+  StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 0
 
   ; The service key is readable without elevation, so this alone never triggers a UAC prompt.
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\${NEXAPIPE_SERVICE_NAME}" "ImagePath"
   ${If} $1 != ""
-    StrCpy $0 1
+    StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 1
   ${EndIf}
 
   ; Then ask the file itself: if it can be removed, nothing holds it, and extracting it again
@@ -212,16 +277,26 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   ClearErrors
   Delete "$INSTDIR\${NEXAPIPE_SERVICE_EXE}"
   ${If} ${Errors}
-    StrCpy $0 1
+    StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1
   ${EndIf}
 
-  ${If} $0 = 1
+  ; Note what is registered here before it goes - or make sure nothing is left behind. The macro
+  ; itself tells an installer-driven uninstall, which has to be followed by getting the service
+  ; back, from a genuine one, which must not leave anything that could resurrect it later.
+  !insertmacro NEXAPIPE_REMEMBER_SERVICE
+
+  ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
+  ${OrIf} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
     DetailPrint "Stopping ${NEXAPIPE_SERVICE_NAME} so it can be unregistered..."
 
     FileOpen $0 "${NEXAPIPE_STOP_SCRIPT}" w
     FileWrite $0 "@echo off$\r$\n"
-    !insertmacro NEXAPIPE_WRITE_STOP_WAIT
-    FileWrite $0 "sc delete ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
+    ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
+      !insertmacro NEXAPIPE_WRITE_STOP_WAIT
+    ${EndIf}
+    ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
+      FileWrite $0 "sc delete ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
+    ${EndIf}
     FileClose $0
 
     !insertmacro NEXAPIPE_RUN_ELEVATED "${NEXAPIPE_STOP_SCRIPT}"
