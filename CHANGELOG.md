@@ -34,7 +34,12 @@ For what comes next, and for why some things are deliberately not planned, see
   to, and is moved out of the keychain on the first launch rather than replaced,
   so nothing already stored becomes unreadable. The door asks Authorization
   Services instead — the framework a System Settings pane uses to put a lock on a
-  page, which brings its own sheet and asks nothing of the keychain.
+  page, which brings its own sheet and asks nothing of the keychain. The right
+  it asks for is `system.privilege.admin`, because the policy database defines
+  it `shared = false`: a shared right (`system.preferences` is the trap) keeps
+  its credential in the session for its timeout, and any authentication that
+  landed there — an unlock of System Settings counts — would let the page open
+  with no sheet at all.
 
 ### Fixed
 

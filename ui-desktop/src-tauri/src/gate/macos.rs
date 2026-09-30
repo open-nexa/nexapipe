@@ -18,6 +18,15 @@
 //! the user. Nothing is executed and nothing is granted: the answer is taken as
 //! a yes or a no, and the right is dropped on the way out.
 //!
+//! Why this right and not another authenticate-user one: the policy database
+//! defines it with `shared = false`, so a credential is never reused across
+//! authorization references — and `confirm` builds a fresh reference every
+//! time, which is what brings the sheet back on every call. A shared right
+//! such as `system.preferences` is the trap: its credential lives in the
+//! session for its timeout (five minutes), and any authentication that landed
+//! there — an unlock of System Settings counts — lets a later request through
+//! without a sheet at all.
+//!
 //! Two consequences worth writing down:
 //!
 //! - The right is revoked as soon as it has been granted, so the sheet comes
