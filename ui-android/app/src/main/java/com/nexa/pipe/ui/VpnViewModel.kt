@@ -9,8 +9,10 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.nexa.pipe.IrohProxy
+import com.nexa.pipe.NodeTraffic
 import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.R
+import com.nexa.pipe.parseNodeTraffic
 import com.nexa.pipe.SecretStore
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.locale.AppStrings
@@ -132,6 +134,17 @@ class VpnViewModel : ViewModel() {
      */
     val linkKinds = kotlinx.coroutines.flow.MutableStateFlow<Map<String, LinkKind>>(emptyMap())
 
+    /**
+     * What each backend has carried, keyed by endpoint ID: cumulative bytes since the proxy
+     * was started, plus the flows open to it right now. Refreshed alongside [linkKinds], and
+     * empty whenever nothing is connected, for the same reason.
+     *
+     * A node that is absent has carried nothing — the native side leaves those out instead of
+     * reporting zeroes — so a caller showing per-node figures has to say "nothing yet" rather
+     * than leave the gap looking like a backend that is down.
+     */
+    val traffic = kotlinx.coroutines.flow.MutableStateFlow<Map<String, NodeTraffic>>(emptyMap())
+
     // 2FA lives on the endpoint now (`NodeConfig.twoFactor`): one server, one
     // pair of credentials. There is no app-wide setting left to publish here.
 
@@ -237,6 +250,28 @@ class VpnViewModel : ViewModel() {
         linkKinds.value = parseLinkKinds(raw)
     }
 
+    /**
+     * Reads what each backend has carried from the native side.
+     *
+     * Best-effort, as [refreshLinkKinds] is: a failed read leaves the last known values in
+     * place rather than zeroing every row. A null answer means nothing has been started — or
+     * the endpoint group is gone — and clears the map, so no total survives the session it
+     * was counted in.
+     */
+    fun refreshTraffic() {
+        if (!IrohProxy.isNativeLoaded()) {
+            if (traffic.value.isNotEmpty()) traffic.value = emptyMap()
+            return
+        }
+        val raw = try {
+            IrohProxy.nativeTraffic()
+        } catch (e: Exception) {
+            addLog("Could not read traffic counters: ${e.message}")
+            return
+        }
+        traffic.value = if (raw == null) emptyMap() else parseNodeTraffic(raw)
+    }
+
     /** Decodes `id=direct;id2=relay` — the format the native side writes. */
     private fun parseLinkKinds(raw: String): Map<String, LinkKind> {
         val parsed = linkedMapOf<String, LinkKind>()
@@ -253,7 +288,8 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * Starts re-reading the link types; no-op when a poll is already running.
+     * Starts re-reading what the tunnel reports per backend — the link type and what each one
+     * has carried; no-op when a poll is already running.
      *
      * Public because `connect()` is not the only way a session comes to exist: the service
      * outlives a UI that was recreated in the background, and the ViewModel that wakes up with
@@ -264,6 +300,7 @@ class VpnViewModel : ViewModel() {
         linkPollJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
                 refreshLinkKinds()
+                refreshTraffic()
                 delay(LINK_POLL_INTERVAL_MS)
             }
         }
@@ -273,6 +310,7 @@ class VpnViewModel : ViewModel() {
         linkPollJob?.cancel()
         linkPollJob = null
         linkKinds.value = emptyMap()
+        traffic.value = emptyMap()
     }
 
     companion object {

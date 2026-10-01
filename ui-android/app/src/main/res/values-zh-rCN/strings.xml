@@ -15,6 +15,11 @@
     <string name="action_connect">连接</string>
     <string name="action_disconnect">断开</string>
     <string name="connected_endpoints_title">已连接的端点</string>
+    <string name="node_traffic_line">↑ 发送 %1$s · ↓ 接收 %2$s · %3$s</string>
+    <plurals name="node_traffic_flows">
+        <item quantity="other">%1$d 条连接</item>
+    </plurals>
+    <string name="node_traffic_none">暂无流量</string>
 
     <!-- 日志 -->
     <string name="logs_title">日志</string>
@@ -199,6 +204,7 @@
     <string name="notification_channel_description">Nexa 服务</string>
     <string name="notification_title">Nexa</string>
     <string name="notification_text">已连接</string>
+    <string name="notification_text_rate">已连接 · ↑ %1$s · ↓ %2$s</string>
     <string name="notify_backend_unreachable">网络已切换，而新网络下没有后端响应。若隧道持续不可用，请重新连接。</string>
     <string name="notify_tunnel_rebuild_failed">网络切换后无法重建隧道，请重新连接。</string>
 
