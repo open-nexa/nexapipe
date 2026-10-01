@@ -6,7 +6,7 @@ use crate::error::{codes, AppError};
 use crate::service::ipc::{
     IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
 };
-use crate::status::{EndpointLink, ProxyStatus};
+use crate::status::{EndpointLink, NodeHealthStatus, ProxyStatus};
 
 pub struct IpcClient;
 
@@ -236,6 +236,18 @@ impl IpcClient {
     pub async fn get_endpoint_links() -> Result<Vec<EndpointLink>, AppError> {
         match Self::send_message(IpcMessage::GetEndpointLinks).await? {
             IpcResponse::EndpointLinks(links) => Ok(links),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Whether each configured node answered its last probe.
+    ///
+    /// Empty when the service has no manager, which is the same shape the process-mode answer
+    /// takes — the UI matches a reading to a node by `connection` and simply finds none.
+    pub async fn get_node_health() -> Result<Vec<NodeHealthStatus>, AppError> {
+        match Self::send_message(IpcMessage::GetNodeHealth).await? {
+            IpcResponse::NodeHealth(health) => Ok(health),
             IpcResponse::Error(e) => Err(e),
             other => Err(unexpected(&other)),
         }

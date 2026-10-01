@@ -5,11 +5,11 @@ import ProxyStatusControl from "../components/ProxyStatusControl.vue";
 import AppIcon from "../components/base/AppIcon.vue";
 import { useConfigStore } from "../stores/config";
 import { useProxyStore } from "../stores/proxy";
-import type { LinkKind, NodeConfig } from "../types";
+import type { LinkKind, NodeConfig, NodeHealth } from "../types";
 
 const { t } = useI18n();
 const { config, connectionMask } = useConfigStore();
-const { status, linkKindFor } = useProxyStore();
+const { status, linkKindFor, healthFor } = useProxyStore();
 
 /**
  * The endpoints traffic is actually going through right now, each with the kind of path it is
@@ -31,8 +31,11 @@ const nodes = computed(() =>
 
 const connected = computed(() =>
   nodes.value
-    .map((node) => ({ node, kind: linkKindFor(node) }))
-    .filter((entry): entry is { node: NodeConfig; kind: LinkKind } => entry.kind !== null),
+    .map((node) => ({ node, kind: linkKindFor(node), health: healthFor(node) }))
+    .filter(
+      (entry): entry is { node: NodeConfig; kind: LinkKind; health: NodeHealth | null } =>
+        entry.kind !== null,
+    ),
 );
 
 const directCount = computed(
@@ -74,6 +77,31 @@ function kindLabel(kind: LinkKind): string {
     : kind === "relay"
       ? t("link.relay")
       : t("link.connecting");
+}
+
+/**
+ * How long a node has been down, at the coarsest unit that still reads as a duration.
+ *
+ * The backend sends whole seconds: a probe answers every half minute, so "down 47s" and
+ * "down 47.3s" say the same thing, and a badge has no room for the finer one anyway.
+ */
+function downDuration(seconds: number): string {
+  if (seconds < 60) return t("health.seconds", { count: seconds });
+  if (seconds < 3600) return t("health.minutes", { count: Math.floor(seconds / 60) });
+  if (seconds < 86400) return t("health.hours", { count: Math.floor(seconds / 3600) });
+  return t("health.days", { count: Math.floor(seconds / 86400) });
+}
+
+/**
+ * What the probe last found: that it answered, or how long it has been missing.
+ *
+ * A node the probe has not reached yet has no duration to show — it has never answered, so
+ * "down for" would be a guess dressed up as a measurement.
+ */
+function healthLabel(health: NodeHealth): string {
+  if (health.reachable) return t("health.up");
+  if (health.downForSecs === null) return t("health.down");
+  return t("health.downFor", { duration: downDuration(health.downForSecs) });
 }
 
 const connectionLabel = computed(() => {
@@ -122,6 +150,13 @@ const uniqueDomains = computed(() => {
           <span class="link-badge" :class="entry.kind">
             <AppIcon :name="kindIcon(entry.kind)" :size="12" />
             <span>{{ kindLabel(entry.kind) }}</span>
+          </span>
+          <span
+            v-if="entry.health"
+            class="health-badge"
+            :class="entry.health.reachable ? 'up' : 'down'"
+          >
+            {{ healthLabel(entry.health) }}
           </span>
         </li>
       </ul>
@@ -512,6 +547,28 @@ const uniqueDomains = computed(() => {
 .link-badge.unknown {
   background: var(--surface-3);
   color: var(--text-muted);
+}
+
+/* Answered is the good colour; no answer is an error, because nothing is being forwarded. */
+.health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.health-badge.up {
+  background: var(--success-subtle);
+  color: var(--success-text);
+}
+
+.health-badge.down {
+  background: var(--error-subtle);
+  color: var(--error-text);
 }
 
 .node-value {
