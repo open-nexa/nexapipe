@@ -1,5 +1,10 @@
 services:
   nexapipe:
+    # Named so that a published image and a local build are the same thing to
+    # `docker compose`: `up` uses the image when it is already here and builds
+    # when it is not, and `--build` always builds and tags the result with this
+    # name. Without it there was no image to pull — only ever a build to run.
+    image: ghcr.io/open-nexa/nexapipe:latest
     build: .
     container_name: nexapipe
     restart: unless-stopped
