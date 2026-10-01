@@ -130,6 +130,33 @@ pub struct NodeHealthStatus {
     pub since_last_probe_secs: Option<u64>,
 }
 
+/// What one configured node has carried, and how many flows it carries right now.
+///
+/// One entry per node, keyed by `connection` exactly as [`EndpointLink`] and
+/// [`NodeHealthStatus`] key themselves, so a link, a health reading and a volume for one node can
+/// be paired.
+///
+/// Every byte figure is cumulative since the counters started — since the proxy was started, in
+/// practice — and no rate crosses: a rate is two readings and a division, and the only caller
+/// already polls, so it does the subtraction on its own side.
+///
+/// A node the counters have nothing for is *absent* rather than zero: "has carried nothing" and
+/// "is carrying nothing right now" are different facts, and only the caller can say which one it
+/// is looking at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTrafficStatus {
+    /// The ticket or endpoint ID exactly as the node was configured — see
+    /// [`EndpointLink::connection`].
+    pub connection: String,
+    /// Bytes this machine has put into the tunnel towards this node, cumulative.
+    pub sent: u64,
+    /// Bytes that have come back from it, cumulative.
+    pub received: u64,
+    /// Flows open through it right now. The only figure here that ever goes down.
+    pub active: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +215,22 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&health).unwrap(),
             r#"{"connection":"node1ticket","reachable":false,"consecutiveFailures":3,"downForSecs":90,"sinceLastProbeSecs":null}"#
+        );
+    }
+
+    /// The frontend pairs a volume with a link and a health reading by `connection`, and reads
+    /// all three figures as plain numbers — so the camelCase spelling has to hold.
+    #[test]
+    fn serializes_node_traffic() {
+        let traffic = NodeTrafficStatus {
+            connection: "node1ticket".to_string(),
+            sent: 1_048_576,
+            received: 512,
+            active: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&traffic).unwrap(),
+            r#"{"connection":"node1ticket","sent":1048576,"received":512,"active":3}"#
         );
     }
 }

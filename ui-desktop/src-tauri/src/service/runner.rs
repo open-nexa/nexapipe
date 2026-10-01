@@ -291,6 +291,7 @@ impl ServiceRunner {
                     Self::handle_get_endpoint_links(&proxy_manager).await
                 }
                 IpcMessage::GetNodeHealth => Self::handle_get_node_health(&proxy_manager).await,
+                IpcMessage::GetNodeTraffic => Self::handle_get_node_traffic(&proxy_manager).await,
                 IpcMessage::GetIssuedCredential => {
                     Self::handle_get_issued_credential(&proxy_manager).await
                 }
@@ -617,6 +618,22 @@ impl ServiceRunner {
             None => Vec::new(),
         };
         IpcResponse::NodeHealth(health)
+    }
+
+    /// What each configured node has carried, and how many flows are open to it.
+    ///
+    /// An absent manager answers with an empty list rather than an error, as the links and the
+    /// health do: this is polled while the proxy is up, and "nothing is running" is a state the
+    /// caller draws as no figure at all, not as a failure.
+    async fn handle_get_node_traffic(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
+        let pm = proxy_manager.read().await;
+        let traffic = match pm.as_ref() {
+            Some(manager) => manager.node_traffic().await,
+            None => Vec::new(),
+        };
+        IpcResponse::NodeTraffic(traffic)
     }
 }
 

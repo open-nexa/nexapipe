@@ -2,8 +2,9 @@
 /**
  * Sidebar footer: what the app is doing, without being a dashboard.
  *
- * Status dot, mode, truncated node ID, version — the honest minimum. No bandwidth readout: no
- * backend command exposes byte counters, so a traffic widget would be decoration (§1).
+ * Status dot, mode, truncated node ID, version — the honest minimum. The backend does expose per
+ * node byte counters (`get_node_traffic`) and the Dashboard shows them; there is still no readout
+ * here, because a footer is the wrong place for a number that changes every poll (§1).
  */
 import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
