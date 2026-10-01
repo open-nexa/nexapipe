@@ -116,7 +116,19 @@ async fn open(
         // `send` stays untouched: the caller writes the payload once the server has
         // accepted the flow, so nothing is pipelined behind the preface.
         let (pooled, send, mut recv) =
-            open_stream_with_retry(endpoint_group, host, Some(&preface)).await?;
+            match open_stream_with_retry(endpoint_group, host, Some(&preface)).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    // The helper has already said what it knows about the
+                    // attempts it spent. This reports the earlier ones recorded
+                    // above, which would otherwise leave no trace: `tried` is
+                    // dropped the moment this function returns, and a backend
+                    // that never answered the preface has every later request
+                    // dialling it again first.
+                    endpoint_group.record_request_failures(&tried);
+                    return Err(e);
+                }
+            };
 
         match read_status(&mut recv, proto, host, port).await {
             Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
