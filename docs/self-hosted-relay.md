@@ -255,15 +255,21 @@ For whether traffic is actually arriving, watch the relay's own metrics listener
 
 A relay carries traffic between two endpoints, and **each endpoint uses the
 relay configuration it was given** — so setting `custom` on the server alone
-does not move client traffic off the N0 relays. Both clients resolve the same
-three names through the same `RelayModeSpec`, and both default to `pinned` when
-nothing is configured:
+does not move client traffic off the N0 relays. Every endpoint here resolves the
+same three names through the same `RelayModeSpec`, and that is where the
+symmetry ends: **with nothing configured, the clients default to `pinned` and
+the server to `default`.** `RelayModeSpec::parse` answers "not configured" with
+`None` and leaves the caller to decide, and the callers do not decide alike.
 
-| Client | Where the same three keys live |
-|---|---|
-| Server (`nexapipe`) | `[iroh] relay_mode` / `relay_url` / `relay_auth_token`. Restart-only. |
-| Desktop (`ui-desktop`) | The Config page's relay section — a mode select and a URL field behind the same credential door that protects the rest of the connection settings. |
-| Android (`ui-android`) | The stored `relay_mode` / `relay_url` / `relay_auth_token` preferences, which reach the library through `nativeSetRelayConfig` before the endpoint is started. |
+This one is worth getting right rather than approximately right, because both
+directions fail quietly. A client that somehow came up on `default` keeps using
+the N0 relays you set out to leave, and there is nothing in the logs to say so.
+
+| Endpoint | Where the same three keys live | With nothing configured |
+|---|---|---|
+| Server (`nexapipe`) | `[iroh] relay_mode` / `relay_url` / `relay_auth_token`. Restart-only. | `default` — every N0 relay, iroh's own choice at runtime |
+| Desktop (`ui-desktop`) | The Config page's relay section — a mode select and a URL field behind the same credential door that protects the rest of the connection settings. | `pinned` |
+| Android (`ui-android`) | The stored `relay_mode` / `relay_url` / `relay_auth_token` preferences, which reach the library through `nativeSetRelayConfig` before the endpoint is started. | `pinned` |
 
 One route in particular does not survive this section: **an invite cannot carry
 a relay token.** `--generate-invite` puts `relay=` in the link from the server's
