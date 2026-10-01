@@ -91,6 +91,18 @@ pub async fn run_local_proxy(
         EndpointGroup::new_with_single_pool(conn_pool).await
     };
 
+    let endpoint_group = Arc::new(endpoint_group);
+
+    // Keeps health current, which here means "capable of being restored".
+    // Nothing records a backend *answering* except the background probe, so a
+    // group without this task marks backends down and then leaves them there: a
+    // domain with several of them stops forwarding, and only a restart clears
+    // it. Every other long-lived owner of a group already starts this.
+    //
+    // Not instead of the report below — that one is the startup gate, and it
+    // decides whether this process runs at all.
+    endpoint_group.start_health_probe();
+
     // 2FA: if `[local_proxy.two_factor]` is configured and enabled, every new connection
     // performs an authentication handshake first.
     if let Some(tf) = two_factor_config
@@ -149,8 +161,7 @@ pub async fn run_local_proxy(
     }
     tracing::info!("{} backend(s) reachable", report.reachable.len());
 
-    let local_proxy =
-        Arc::new(LocalProxy::new(&listen_addr, proxy_domains, Arc::new(endpoint_group)).await?);
+    let local_proxy = Arc::new(LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await?);
 
     // Waits for the notice instead of polling for it, and is aborted once
     // `run()` is over: the watcher used to keep running — waking ten times a
