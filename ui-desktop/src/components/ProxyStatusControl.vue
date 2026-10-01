@@ -21,6 +21,7 @@ import AppToggle from './base/AppToggle.vue';
 import { errorKey } from '../api/errors';
 import { confirm } from '../composables/useConfirm';
 import { useToast } from '../composables/useToast';
+import { writeClipboardText } from '../utils/clipboard';
 import { useConfigStore } from '../stores/config';
 import { useCredentialGate } from '../stores/gate';
 import { useProxyStore } from '../stores/proxy';
@@ -159,13 +160,15 @@ async function copyNodeId(): Promise<void> {
   if (!(await ensureUnlocked(t('gate.reasonNodeId')))) return;
   const full = await revealNodeId();
   if (!full) {
-    toast.error(t('common.copyFailed'));
+    // Nothing was fetched, so nothing was copied. A clipboard failure this is
+    // not, and saying "could not copy" sends the user looking at the wrong
+    // thing: the value never arrived.
+    toast.error(t('connect.nodeIdUnavailable'));
     return;
   }
-  try {
-    await navigator.clipboard.writeText(full);
+  if (await writeClipboardText(full)) {
     toast.success(t('common.copied'));
-  } catch {
+  } else {
     toast.error(t('common.copyFailed'));
   }
 }

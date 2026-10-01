@@ -96,12 +96,21 @@ async function refresh(): Promise<boolean> {
     const result = await invoke<ProxyStatus>('get_proxy_status', {
       useService: config.useService,
     });
-    status.value = result;
+    // Assigned only when it has moved. `waitForStart` reads this several times a
+    // second, and every result is a fresh object, so writing it unconditionally
+    // re-rendered the whole page four times a second for an answer that had not
+    // changed — which is what left the main thread too busy to keep a spinner
+    // turning. `running` and `mode` are the whole of `ProxyStatus`.
+    if (result.running !== status.value.running || result.mode !== status.value.mode) {
+      status.value = result;
+    }
     if (result.running) {
       await refreshNodeId();
     } else {
+      // Cleared only when there is something to clear: a fresh `[]` is a new
+      // array, and every one of them invalidated the link badges.
       nodeId.value = '';
-      endpointLinks.value = [];
+      if (endpointLinks.value.length > 0) endpointLinks.value = [];
     }
     return true;
   } catch (error) {

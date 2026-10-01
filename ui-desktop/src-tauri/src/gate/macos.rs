@@ -1,97 +1,144 @@
-//! The macOS door: a keychain item only the user can read.
+//! The macOS door: Authorization Services, and the sheet it brings with it.
 //!
-//! Rather than a second, parallel notion of "who is at the keyboard", the gate
-//! is a keychain item whose access control requires user presence. Asking is
-//! reading: `SecItemCopyMatching` against an item protected that way makes the
-//! system put up its own prompt — Touch ID where there is a sensor, the account
-//! password otherwise — and fails when the user does not answer it. The prompt,
-//! its wording, its lockout behaviour and its language are the system's, which
-//! is the whole point of asking the system.
+//! The keychain is the wrong instrument for this. An item there is *data*, and
+//! reading one is a question macOS answers with a sheet of its own about that
+//! item — at startup, again whenever the app's signature changes, and once more
+//! for every prompt — which is how one unlock turned into two. What opens this
+//! door is Authorization Services instead: the framework a System Settings pane
+//! uses to put a lock on a page. It asks the Security Server for a right, and
+//! the Security Server is what puts the familiar sheet on the screen.
 //!
-//! The one thing that is not the system's is *what* is being unlocked: the
-//! `reason` the caller passes cannot be put on a keychain prompt, so the item
-//! carries a fixed label and the UI says what is about to be shown before it
-//! asks.
+//! That leaves macOS like Windows and unlike Linux: the operating system brings
+//! the dialog, so no password crosses the renderer and
+//! [`OsGate::needs_password`] stays false. What is asked for is a *right*
+//! rather than a credential, and the right is `system.privilege.admin` —
+//! `kAuthorizationRightExecute`, the one `AuthorizationExecuteWithPrivileges`
+//! asks for — because it is the right every macOS install defines with
+//! `authenticate-user` turned on, so asking for it is what makes the system ask
+//! the user. Nothing is executed and nothing is granted: the answer is taken as
+//! a yes or a no, and the right is dropped on the way out.
+//!
+//! Why this right and not another authenticate-user one: the policy database
+//! defines it with `shared = false`, so a credential is never reused across
+//! authorization references — and `confirm` builds a fresh reference every
+//! time, which is what brings the sheet back on every call. A shared right
+//! such as `system.preferences` is the trap: its credential lives in the
+//! session for its timeout (five minutes), and any authentication that landed
+//! there — an unlock of System Settings counts — lets a later request through
+//! without a sheet at all.
+//!
+//! Two consequences worth writing down:
+//!
+//! - The right is revoked as soon as it has been granted, so the sheet comes
+//!   back every time. A right left standing stays valid for its timeout —
+//!   minutes — and a granted admin right is a thing another process could ask
+//!   to share.
+//! - `system.privilege.admin` is defined for the `admin` group, so an account
+//!   that is not an administrator is refused. A right of our own would have to
+//!   be written into the policy database, which only root may do; a Mac whose
+//!   user is not an administrator is not one this app got installed on by
+//!   accident.
 
-use security_framework::access_control::SecAccessControl;
-use security_framework::passwords;
-use security_framework::passwords_options::{AccessControlOptions, PasswordOptions};
+use security_framework::authorization::{
+    Authorization as OsAuthorization, AuthorizationItemSetBuilder, Flags,
+};
+use security_framework::base::Error;
+// The status codes are not part of the safe wrapper, only of the bindings under
+// it, and "the user dismissed the sheet" is worth telling apart from "the
+// machine has nothing to ask with". Renamed on the way in, because they arrive
+// with the framework's own spelling of a constant.
+use security_framework_sys::authorization::{
+    errAuthorizationCanceled as CANCELED, errAuthorizationDenied as DENIED,
+    errAuthorizationInteractionNotAllowed as INTERACTION_NOT_ALLOWED,
+};
 
 use super::{Capability, OsGate, Outcome};
 
-/// Where the sentinel is filed.
-///
-/// Not the credential store: this item is not a secret, and keeping it apart
-/// means a reset of one does not affect the other.
-const SERVICE: &str = "nexa";
-const ACCOUNT: &str = "credential-gate";
+/// The right asked for, which is only a way of being asked: see the module docs.
+const RIGHT: &str = "system.privilege.admin";
 
-/// What is stored. Nothing reads it — the value that matters is whether the
-/// read was allowed at all.
-const SENTINEL: &[u8] = b"present";
+/// The environment item that puts the caller's own words in the sheet, so it
+/// says which credential is about to be shown rather than "wants to make
+/// changes".
+const PROMPT: &str = "prompt";
 
-/// `errSecDuplicateItem`: already filed, which is the outcome wanted.
-const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
-/// `errSecUserCanceled`: the prompt was dismissed.
-const ERR_SEC_USER_CANCELED: i32 = -128;
-/// `errSecAuthFailed`: what was presented was not accepted.
-const ERR_SEC_AUTH_FAILED: i32 = -25293;
-/// `errSecInteractionNotAllowed`: there is no session to put a prompt in — a
-/// headless login, or a lockout still running.
-const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+pub struct Authorization;
 
-pub struct Keychain;
-
-impl Keychain {
-    /// Files the sentinel, unless it is already there.
-    ///
-    /// Adding an item whose access control requires user presence does not
-    /// itself ask anything, so this is how "can this Mac confirm its user" is
-    /// answered without putting a prompt on the screen: a machine with no
-    /// passcode and no biometrics cannot hold the item at all.
-    fn file() -> Result<(), security_framework::base::Error> {
-        let mut options = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
-        options.set_label("Nexa credentials");
-        options.set_access_control(SecAccessControl::create_with_flags(
-            AccessControlOptions::USER_PRESENCE.bits(),
-        )?);
-        passwords::set_generic_password_options(SENTINEL, options)
-    }
-}
-
-impl OsGate for Keychain {
+impl OsGate for Authorization {
     fn capability(&self) -> Capability {
-        match Self::file() {
-            Ok(()) => Capability::Available,
-            // Filed on an earlier launch; asking is still possible.
-            Err(error) if error.code() == ERR_SEC_DUPLICATE_ITEM => Capability::Available,
+        // Whether the right is defined at all — a question about the machine,
+        // not to the user: reading the policy database puts nothing on the
+        // screen, so this can be asked at startup without being a prompt.
+        match OsAuthorization::right_exists(RIGHT) {
+            Ok(true) => Capability::Available,
+            Ok(false) => {
+                tracing::warn!("Authorization Services does not define the {RIGHT} right");
+                Capability::Unavailable
+            }
             Err(error) => {
-                tracing::warn!(
-                    "macOS cannot hold a keychain item that requires the user: {}",
-                    error
-                );
+                tracing::warn!("the {RIGHT} right could not be read: {error}");
                 Capability::Unavailable
             }
         }
     }
 
-    fn confirm(&self, _reason: &str, _password: Option<&str>) -> Outcome {
-        // Blocks for as long as the prompt is up, which is why the caller runs
-        // this on a blocking task rather than on the async runtime.
-        match passwords::get_generic_password(SERVICE, ACCOUNT) {
-            Ok(_) => Outcome::Unlocked,
-            Err(error) => match error.code() {
-                // Dismissed, or not recognised. Neither is worth a message: the
-                // user was asked and the answer was no.
-                ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => Outcome::Refused,
-                // Nothing on screen to ask on, so nothing can be shown.
-                ERR_SEC_INTERACTION_NOT_ALLOWED => Outcome::Unavailable,
-                _ => Outcome::Failed(
-                    error
-                        .message()
-                        .unwrap_or_else(|| format!("keychain error {}", error.code())),
-                ),
-            },
+    fn confirm(&self, reason: &str, _password: Option<&str>) -> Outcome {
+        let rights = match AuthorizationItemSetBuilder::new().add_right(RIGHT) {
+            Ok(rights) => rights.build(),
+            Err(error) => return failed(error),
+        };
+        let environment = match AuthorizationItemSetBuilder::new().add_string(PROMPT, reason) {
+            Ok(environment) => environment.build(),
+            Err(error) => return failed(error),
+        };
+
+        // Interaction is what puts the sheet on the screen, and extending is
+        // what makes the Security Server try to grant the right rather than only
+        // describe what granting it would take. Destroying is deliberately not
+        // among them: as a creation flag it has no meaning to
+        // `AuthorizationCreate`, and the wrapper would not carry it over if it
+        // did — it is `destroy_rights` below that sets it.
+        let flags = Flags::INTERACTION_ALLOWED | Flags::EXTEND_RIGHTS;
+
+        match OsAuthorization::new(Some(rights), Some(environment), flags) {
+            // Asked, and the Security Server granted it. `destroy_rights` is
+            // what tears the granted right down with the reference: dropped
+            // without it, Security Server keeps the right for its timeout —
+            // minutes in which another process can ask for it and, if the right
+            // is a shared one, be given it without a sheet. The window this
+            // door means to open is [`super::UNLOCK_WINDOW`] of memory, not the
+            // five minutes of a live admin credential.
+            Ok(authorization) => {
+                authorization.destroy_rights();
+                Outcome::Unlocked
+            }
+            Err(error) => outcome_for(error),
         }
+    }
+}
+
+/// What a no from the Security Server means, in the door's own words.
+///
+/// The message is the framework's, taken from `SecCopyErrorMessageString` when
+/// it has one and from its `Display` when it does not: what went wrong is
+/// Security Server's to say, not this module's to guess at.
+fn failed(error: Error) -> Outcome {
+    Outcome::Failed(error.message().unwrap_or_else(|| error.to_string()))
+}
+
+fn outcome_for(error: Error) -> Outcome {
+    match error.code() {
+        // The sheet was put up and dismissed. Asked, and the answer was no.
+        CANCELED => Outcome::Refused,
+        // Asked and not granted. Wrong passwords are the sheet's own business —
+        // it shakes and asks again, and does not come back here — so what is
+        // left is an account the right is not defined for.
+        DENIED => Outcome::Refused,
+        // There is nowhere to put a sheet: no GUI session to put one in, which
+        // is what an app started over ssh or before login has.
+        INTERACTION_NOT_ALLOWED => Outcome::Unavailable,
+        // Anything else is the Security Server failing, and its own words are
+        // worth more than anything this module would say.
+        _ => failed(error),
     }
 }

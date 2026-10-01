@@ -71,6 +71,13 @@ withDefaults(
   opacity: 0.55;
 }
 
+/* A busy button is not dimmed. The dim is a transparency layer wrapped around
+   everything inside it, and re-rasterising that layer on every frame is exactly
+   the main-thread work the spinner below is trying to stay off of. */
+.app-button.loading:disabled {
+  opacity: 1;
+}
+
 .app-button:not(:disabled):focus-visible {
   box-shadow: var(--focus-ring);
 }
@@ -146,12 +153,27 @@ withDefaults(
   border: 2px solid currentColor;
   border-right-color: transparent;
   border-radius: var(--radius-full);
+  /* Promoted to its own layer. A rotating rounded box with a transparent side
+     is otherwise repainted by the main thread, which is what turns a wait that
+     also re-renders the page into a spinner that stopped. */
+  will-change: transform;
   animation: spin 640ms linear infinite;
 }
 
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* The global reduced-motion rule in base.css stops every animation, but a
+   spinner is not decoration — it *is* the answer to "did the press land".
+   Scoped, so this selector outranks the universal one, and the !important is
+   what the blanket rule's own !important has to be answered with. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 640ms !important;
+    animation-iteration-count: infinite !important;
   }
 }
 </style>

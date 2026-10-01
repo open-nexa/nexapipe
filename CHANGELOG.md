@@ -10,6 +10,78 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Changed
+
+- **The desktop credential door now stands in front of the whole Config page.**
+  Confirming who is at the keyboard — Touch ID or the account password on macOS,
+  Windows Hello or the account password on Windows, PAM on Linux — is what opens
+  the page, rather than something each reveal button asks for on its own. A shut
+  page renders none of it: no nodes, no connection strings, no two-factor
+  secrets, no relay, so there is nothing on the screen and nothing in the
+  document to read out of it. The window is still two minutes and still shuts
+  itself; the button at the top of the page opens it again, and shuts it early.
+- **The relay settings moved from Settings to Config.** Which relay this machine
+  dials is part of how it connects, not a preference about how the app looks, and
+  a custom relay's bearer token is a credential — so it now sits with the rest of
+  the connection configuration, behind the same door.
+- **macOS stopped using the keychain.** Reading a keychain entry is an access
+  macOS asks about with a sheet of its own — at startup, again whenever the app's
+  signature changes, and once more for every prompt — which is how one unlock
+  turned into two sheets, and how a locked page once came up with no way out.
+  The master key now lives in the same `0600` file the other platforms fall back
+  to, and is moved out of the keychain on the first launch rather than replaced,
+  so nothing already stored becomes unreadable. The door asks Authorization
+  Services instead — the framework a System Settings pane uses to put a lock on a
+  page, which brings its own sheet and asks nothing of the keychain. The right
+  it asks for is `system.privilege.admin`, because the policy database defines
+  it `shared = false`: a shared right (`system.preferences` is the trap) keeps
+  its credential in the session for its timeout, and any authentication that
+  landed there — an unlock of System Settings counts — would let the page open
+  with no sheet at all.
+
+### Fixed
+
+- **A password the operating system did not accept said nothing.** Asking and
+  being refused came back as "the door is shut", which the UI read as its own
+  instruction to stay quiet: a wrong password, a dismissed prompt or a failed
+  fingerprint left the page exactly as it had been, and the button that was
+  pressed answered for nothing. A press that does nothing now says why — the
+  locked page reports whether the password was not accepted or the device did
+  not confirm, and the password field carries that line when it opens again.
+- **On Linux a password that was not accepted left the page looking unanswered
+  for as long as PAM took to refuse it.** The dialog closed the moment the
+  password was typed, which made it look as though the answer had already come
+  back, and the refusal then turned up seconds later on the page behind. The
+  password is now checked while the dialog is still open: the wait is said out
+  loud on the button, and the answer lands in the field it was typed in. PAM
+  still takes its time over a password it refuses — that delay is deliberate —
+  but nothing looks broken while it does.
+- **Copying a value the door had just opened came back as "could not copy".**
+  Those copies wrote straight to the asynchronous clipboard API, which WebKit
+  refuses once the document is not focused — and confirming who is at the
+  keyboard takes long enough to lose it. Every copy in the app now goes through
+  the same writer, which writes natively through the operating system's own
+  clipboard — no focus, scheme or gesture required — and falls back to the
+  asynchronous API and then a selection with the legacy command. A value that
+  never arrived also stopped being reported as a clipboard failure, which sent
+  the user looking at the wrong thing.
+- **The loading spinner never turned on a Mac with Reduce Motion on.** The
+  accessibility rule that stills every animation flattened it along with
+  everything ornamental, and a spinner that does not turn is a button that
+  looks dead. A spinner is the state rather than decoration — there is no other
+  way to say "working" — so it is exempt from the stop now. The pulse next to
+  the proxy's status is not: the status text already says "Starting", so that
+  one is decoration and still respects the setting.
+- **macOS ran the window with a title bar of its own on top of the app's.** The
+  macOS build asked for native decorations without the title bar style that makes
+  them transparent, so the system's bar sat above the one the app draws — two
+  title bars, and two sets of close and minimize buttons, one at each end of the
+  window. The window now asks for the overlay style: the traffic lights stay
+  where macOS puts them, over the left of the app's own bar, and the app stops
+  drawing a second set.
+
 ## [0.4.0] — 2026-09-30
 
 A readable version of this release, with downloads, is published at

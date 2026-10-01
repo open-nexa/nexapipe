@@ -16,7 +16,7 @@ import AppIcon from '../../components/base/AppIcon.vue';
 import { useWindowControls } from '../../composables/useWindowControls';
 
 const { t } = useI18n();
-const { isMacos, isFrameless, handleDragDoubleClick } = useWindowControls();
+const { isMacos, needsWindowControls, handleDragDoubleClick } = useWindowControls();
 </script>
 
 <template>
@@ -38,7 +38,9 @@ const { isMacos, isFrameless, handleDragDoubleClick } = useWindowControls();
          attribute on the exact target element (§5.2). -->
     <div class="title-bar__spacer" data-tauri-drag-region="true" />
 
-    <WindowControls v-if="isFrameless" />
+    <!-- macOS brings its own, over the leading side reserved above. Drawing them
+         too is what put two sets of window controls on the screen at once. -->
+    <WindowControls v-if="needsWindowControls" />
   </header>
 </template>
 
