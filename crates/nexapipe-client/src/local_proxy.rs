@@ -724,6 +724,13 @@ where
                 }
             };
 
+        // One tunnel is one flow for as long as this handler lives, however it
+        // ends: EOF, either direction failing, or this task being cancelled
+        // because the proxy stopped.
+        let _flow = pooled_conn.enter_flow();
+        let count_to_backend = pooled_conn.clone();
+        let count_from_backend = pooled_conn.clone();
+
         let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -738,6 +745,7 @@ where
                 match client_read.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        count_to_backend.record_sent(n as u64);
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             #[cfg(feature = "tracing")]
                             tracing::debug!("Tunnel client_to_iroh write error: {}", e);
@@ -759,6 +767,7 @@ where
                 match recv.read(&mut buf).await {
                     Ok(None) => break,
                     Ok(Some(n)) => {
+                        count_from_backend.record_received(n as u64);
                         if let Err(e) = client_write.write_all(&buf[..n]).await {
                             #[cfg(feature = "tracing")]
                             tracing::debug!("Tunnel iroh_to_client write error: {}", e);
@@ -878,6 +887,13 @@ where
                 let (pooled_conn, mut send, mut recv) =
                     open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
 
+                // One tunnel is one flow, and it stays counted until the
+                // handler this sits in returns — see the CONNECT branch.
+                let _flow = pooled_conn.enter_flow();
+                pooled_conn.record_sent(request_to_send.len() as u64);
+                let count_to_backend = pooled_conn.clone();
+                let count_from_backend = pooled_conn.clone();
+
                 let (mut client_read, mut client_write) = tokio::io::split(stream);
                 jni_log!(
                     "[DEBUG:local-proxy] WebSocket request sent to iroh: {} bytes",
@@ -895,6 +911,7 @@ where
                                 return "client_eof";
                             }
                             Ok(n) => {
+                                count_to_backend.record_sent(n as u64);
                                 // Payload, not metadata: it costs a preview to
                                 // build and it is the user's traffic, so it is
                                 // only worth it while debugging.
@@ -947,6 +964,7 @@ where
                                 return "iroh_eof";
                             }
                             Ok(Some(n)) => {
+                                count_from_backend.record_received(n as u64);
                                 if first {
                                     first = false;
                                     let p = &buf[..std::cmp::min(n, 200)];
@@ -1034,6 +1052,15 @@ where
     let (pooled_conn, mut send, mut recv) =
         open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
 
+    // The helper wrote the request — headers and whatever body had already
+    // arrived — before this line was reached. Counting the copy loop alone
+    // would therefore be counting everything except a large upload, which for
+    // a POST is most of it.
+    let _flow = pooled_conn.enter_flow();
+    pooled_conn.record_sent(request_to_send.len() as u64);
+    let count_to_backend = pooled_conn.clone();
+    let count_from_backend = pooled_conn.clone();
+
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     let client_to_backend = async move {
@@ -1042,6 +1069,7 @@ where
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    count_to_backend.record_sent(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("Client to backend write error: {}", e);
@@ -1067,6 +1095,7 @@ where
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
+                    count_from_backend.record_received(n as u64);
                     total_bytes += n;
                     if !response_sent && debug_preview.len() < 1500 {
                         debug_preview.extend_from_slice(
@@ -1220,6 +1249,13 @@ where
     let (pooled_conn, mut send, mut recv) =
         open_stream_with_retry(&endpoint_group, &sni, Some(&data)).await?;
 
+    // Same accounting as the HTTP path: the helper already wrote the
+    // ClientHello it was handed.
+    let _flow = pooled_conn.enter_flow();
+    pooled_conn.record_sent(data.len() as u64);
+    let count_to_backend = pooled_conn.clone();
+    let count_from_backend = pooled_conn.clone();
+
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     // Bidirectional raw data forwarding (TCP tunnel)
@@ -1229,6 +1265,7 @@ where
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    count_to_backend.record_sent(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         jni_log!(
                             "[DEBUG:local-proxy] TLS tunnel client->iroh write error: {}",
@@ -1251,6 +1288,7 @@ where
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
+                    count_from_backend.record_received(n as u64);
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         jni_log!(
                             "[DEBUG:local-proxy] TLS tunnel iroh->client write error: {}",
