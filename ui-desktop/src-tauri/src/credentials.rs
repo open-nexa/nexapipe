@@ -763,13 +763,28 @@ fn write_private_atomic(path: &Path, contents: &str) -> Result<(), AppError> {
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         AppError::cause(codes::CREDENTIALS_STORE_FAILED, e)
-    })
+    })?;
+
+    // A rename is atomic to a reader, not durable to a crash: the directory
+    // entry it creates lives in the page cache until the directory itself is
+    // flushed too. `migrate_keychain_key` deletes the keychain copy as soon as
+    // this returns, so losing that entry costs the key rather than one write —
+    // nothing holds it any more, and the next launch mints a fresh one that
+    // cannot open what the lost one sealed.
+    if let Some(parent) = path.parent() {
+        sync_file(parent)?;
+    }
+
+    Ok(())
 }
 
 /// Pushes what was just written out of the page cache and onto the disk.
 ///
 /// Dropping a [`std::fs::File`] does not do this: `write_all` can return `Ok`
 /// with every byte still in the cache, which a crash would take with it.
+///
+/// `path` is a file or a directory — opening one and flushing it is how the
+/// renaming done above is made to survive the same crash.
 #[cfg(unix)]
 fn sync_file(path: &Path) -> Result<(), AppError> {
     std::fs::File::open(path)
