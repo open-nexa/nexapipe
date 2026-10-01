@@ -27,6 +27,7 @@
 use crate::ClientError;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::local_proxy::open_stream_with_retry;
+use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +103,11 @@ async fn open(
     })?;
 
     let mut last_err: Option<ClientError> = None;
+    // Whose health each attempt is spent on: see `open_stream_with_retry`, which
+    // keeps the same list for the failures it discards on its own. Both lists
+    // are writable only once every attempt has failed, so neither can condemn a
+    // backend for having been idle.
+    let mut tried: Vec<EndpointId> = Vec::new();
 
     // The retry exists for the same reason it does on the HTTP path: a pooled connection
     // may have been closed by the peer without anything noticing, and the failure only
@@ -130,11 +136,14 @@ async fn open(
                 // Closed, not dropped: a watcher task holds another handle to
                 // it, so dropping this one would leave the connection open
                 // until that task noticed — holding a slot in the meantime.
+                tried.extend(pooled.node());
                 pooled.discard(b"the server never answered the preface");
                 last_err = Some(e);
             }
         }
     }
+
+    endpoint_group.record_request_failures(&tried);
 
     Err(last_err.unwrap_or(ClientError::TimeoutError))
 }

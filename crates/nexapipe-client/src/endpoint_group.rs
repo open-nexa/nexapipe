@@ -32,23 +32,18 @@ macro_rules! jni_log {
 pub struct PooledConnection {
     conn: Connection,
     pool_index: usize,
-    /// Where to record that this connection turned out to be unusable.
+    /// The backend this connection reaches, when somebody is keeping health for
+    /// it.
     ///
     /// `None` for a connection nobody is keeping health for, which is a pool
     /// standing on its own rather than one inside an [`EndpointGroup`].
-    failure_sink: Option<FailureSink>,
-}
-
-/// The health table a connection belongs to, and which entry in it.
-///
-/// Carried by the connection so that the caller who discovers it is dead —
-/// which is whoever could not open a stream on it — is also the caller who says
-/// so. Passing the information back up by hand would mean every failure path
-/// in the proxy knowing how to name the backend it just used.
-#[derive(Debug, Clone)]
-struct FailureSink {
-    health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
-    node: EndpointId,
+    ///
+    /// Carried by the connection so that the caller which spent its attempts on
+    /// it can name whose health those attempts were about. Asking the group
+    /// afterwards would be asking again, and by then it may have handed somebody
+    /// else out; naming the backend at every failure path instead would mean
+    /// every one of them knowing how health is recorded.
+    node: Option<EndpointId>,
 }
 
 impl PooledConnection {
@@ -56,21 +51,16 @@ impl PooledConnection {
         Self {
             conn,
             pool_index,
-            failure_sink: None,
+            node: None,
         }
     }
 
-    /// A connection whose failure the group wants to hear about.
-    pub(crate) fn tracked(
-        conn: Connection,
-        pool_index: usize,
-        health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
-        node: EndpointId,
-    ) -> Self {
+    /// A connection whose backend the group keeps health for.
+    pub(crate) fn tracked(conn: Connection, pool_index: usize, node: EndpointId) -> Self {
         Self {
             conn,
             pool_index,
-            failure_sink: Some(FailureSink { health, node }),
+            node: Some(node),
         }
     }
 
@@ -82,6 +72,12 @@ impl PooledConnection {
         &self.conn
     }
 
+    /// The backend this connection reaches, when somebody is keeping health for
+    /// it.
+    pub fn node(&self) -> Option<EndpointId> {
+        self.node
+    }
+
     /// Closes the connection instead of just letting go of it.
     ///
     /// Dropping one handle does not close a connection: it closes when the
@@ -89,17 +85,17 @@ impl PooledConnection {
     /// a caller that has decided the connection is dead has to say so or it
     /// stays open — still in the pool's address space, still counted, and
     /// still handed to whatever asks next.
+    ///
+    /// Says nothing about the backend's health, and that is the point. Most of
+    /// what reaches here is a connection the peer closed while nothing was
+    /// using it — the ordinary case these retry loops exist for, and one that
+    /// says nothing about whether the backend itself answers. Condemning it
+    /// here would take a healthy backend out of rotation for as long as the
+    /// next probe is away, and on the paths with no probe at all, permanently.
+    /// The failure worth recording is the one no attempt outlived: see
+    /// [`EndpointGroup::record_request_failure`].
     pub fn discard(self, reason: &'static [u8]) {
         self.conn.close(0u32.into(), reason);
-        // A connection that had to be closed is a backend that did not serve
-        // this request, which is stronger evidence than a probe that got no
-        // answer — this is the thing the user was waiting for. Saying so here
-        // is what makes the retry land somewhere else instead of drawing the
-        // same dead connection again; the next probe puts the backend back when
-        // it answers.
-        if let Some(sink) = &self.failure_sink {
-            sink.record_failure();
-        }
     }
 
     pub fn pool_index(&self) -> usize {
@@ -107,22 +103,16 @@ impl PooledConnection {
     }
 }
 
-impl FailureSink {
-    /// Says that a request this connection was carrying did not get served.
-    fn record_failure(&self) {
-        record_outcome(&self.health, self.node, false);
-    }
-}
-
 /// Folds one answer, or one failure, into the health table, logging the changes.
 ///
 /// Two callers, one fact: the background probe asks every backend whether it
-/// still answers, and a request that found out one does not says the same thing
+/// still answers, and a request that could not be served after spending every
+/// attempt it had says the same thing
 /// about the same backend. Keeping them in one place is what stops
 /// `health_snapshot()` from having two meanings of "down".
 ///
-/// A free function because the connection that discovers a failure holds the
-/// table itself and has no group to call back into.
+/// Not reachable from a connection: the two callers are the probe task and the
+/// retry loop that ran out of attempts, and both already hold the group.
 fn record_outcome(
     health: &Mutex<HashMap<EndpointId, NodeHealth>>,
     backend_id: EndpointId,
@@ -159,17 +149,20 @@ fn record_outcome(
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     entry.reachable = false;
     // The first failure is news. So is every tenth one — a backend that has
-    // been down for an hour has failed a hundred probes, and a log line per
-    // probe would bury everything else.
+    // been down for an hour has failed a hundred times, and a log line per
+    // failure would bury everything else.
     if was_reachable || entry.consecutive_failures % PROBE_REMINDER_EVERY == 1 {
         jni_log!(
-            "[health] Node {} did not answer ({} probes in a row)",
+            // Not "probes in a row": this counter also counts requests that got
+            // nowhere, and calling those probes would make an operator looking
+            // into one failed request go and read the probe instead.
+            "[health] Node {} did not answer ({} failures in a row)",
             backend_id,
             entry.consecutive_failures
         );
         #[cfg(feature = "tracing")]
         tracing::warn!(
-            "backend {} did not answer ({} probes in a row)",
+            "backend {} did not answer ({} failures in a row)",
             backend_id,
             entry.consecutive_failures
         );
@@ -264,12 +257,7 @@ impl DomainPools {
         let index = self.choose()?;
         let pool = &self.pools[index];
         let conn = pool.get_connection().await?;
-        Ok(PooledConnection::tracked(
-            conn,
-            index,
-            self.health.clone(),
-            pool.backend_id(),
-        ))
+        Ok(PooledConnection::tracked(conn, index, pool.backend_id()))
     }
 
     pub async fn return_connection(&self, pooled_conn: PooledConnection) {
@@ -347,7 +335,10 @@ pub struct NodeHealth {
     pub node: EndpointId,
     /// Whether it answered the last time it was asked.
     pub reachable: bool,
-    /// How many probes in a row have failed. Zero since the last success.
+    /// How many failures in a row it has had. Zero since the last success.
+    ///
+    /// Not only probes: a request that spent every attempt it had without being
+    /// served counts too, and reaches this counter from the same place.
     pub consecutive_failures: u32,
     /// When it last answered — `None` when it never has.
     pub last_ok: Option<Instant>,
@@ -1082,6 +1073,33 @@ impl EndpointGroup {
         record_outcome(&self.health, backend_id, answered);
     }
 
+    /// Says that a request spent every attempt it had on `backends` without
+    /// being served by any of them.
+    ///
+    /// The counterpart to a probe: same table, same one meaning of "down", but
+    /// the evidence is stronger, because somebody asked for real and waited.
+    ///
+    /// Takes the list rather than one backend so that a backend is counted once
+    /// however many attempts landed on it: one request that failed is one
+    /// failure, not three, and a counter someone reads has to mean one thing.
+    ///
+    /// Callers reach this through [`PooledConnection::node`] only once every
+    /// attempt has failed — never per attempt. That boundary is what keeps an
+    /// ordinary stale connection from taking its backend out of rotation: the
+    /// retry loops exist precisely because the first attempt often draws a
+    /// connection the peer closed while nothing was using it, and the second
+    /// one usually succeeds.
+    pub fn record_request_failures(&self, backends: &[EndpointId]) {
+        let mut counted: Vec<EndpointId> = Vec::with_capacity(backends.len());
+        for backend in backends.iter().copied() {
+            if counted.contains(&backend) {
+                continue;
+            }
+            record_outcome(&self.health, backend, false);
+            counted.push(backend);
+        }
+    }
+
     /// Every backend's health as the last probe left it.
     ///
     /// Empty until the first probe has run, which is up to
@@ -1692,22 +1710,19 @@ mod tests {
         );
     }
 
-    /// The other half of the same change: a request that found a backend dead
-    /// says so, so a retry lands on a backend that answers rather than drawing
-    /// the same dead connection again.
+    /// The other half of the same change: a backend a request could not be
+    /// served by — after every attempt was spent, not on the first connection
+    /// that turned out stale — stops being handed out, while the one nothing
+    /// happened to keeps answering.
     #[tokio::test]
-    async fn a_connection_that_had_to_be_closed_marks_its_backend_down() {
+    async fn a_request_that_spent_every_attempt_marks_its_backend_down() {
         let up = unused_backend_id();
         let down = unused_backend_id();
         let group = group_with(&[up, down]).await;
         group.record_probe(up, true);
         group.record_probe(down, true);
 
-        FailureSink {
-            health: group.health.clone(),
-            node: down,
-        }
-        .record_failure();
+        group.record_request_failures(&[down]);
 
         let snapshot = group.health_snapshot();
         let down = snapshot
@@ -1724,5 +1739,49 @@ mod tests {
             snapshot.any_reachable(),
             "the backend that was left alone still answers"
         );
+    }
+
+    /// The corollary, and the reason the recording moved out of
+    /// [`PooledConnection::discard`]: nothing else got named, so nothing else
+    /// changed. A group whose other backend was left alone keeps serving.
+    #[tokio::test]
+    async fn a_request_failure_leaves_the_other_backend_alone() {
+        let up = unused_backend_id();
+        let down = unused_backend_id();
+        let group = group_with(&[up, down]).await;
+        group.record_probe(up, true);
+        group.record_probe(down, true);
+
+        group.record_request_failures(&[down]);
+
+        let snapshot = group.health_snapshot();
+        let up = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node == up)
+            .expect("it was probed");
+        assert!(up.reachable, "only the backend that failed is recorded");
+        assert_eq!(up.consecutive_failures, 0);
+    }
+
+    /// One request is one failure. An attempt that landed on the same backend
+    /// three times must not grow a counter someone reads as "three things went
+    /// wrong", or a number that looked stable would start moving with how the
+    /// balancer happened to rotate.
+    #[tokio::test]
+    async fn repeating_a_backend_in_the_list_counts_it_once() {
+        let only = unused_backend_id();
+        let group = group_with(&[only]).await;
+        group.record_probe(only, true);
+
+        group.record_request_failures(&[only, only, only]);
+
+        let snapshot = group.health_snapshot();
+        let only = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node == only)
+            .expect("it was probed");
+        assert_eq!(only.consecutive_failures, 1);
     }
 }

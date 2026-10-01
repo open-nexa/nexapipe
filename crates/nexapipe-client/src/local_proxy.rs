@@ -2,6 +2,7 @@ use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
+use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -476,9 +477,15 @@ pub(crate) async fn open_stream_with_retry(
     initial_data: Option<&[u8]>,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     let mut last_err: Option<ClientError> = None;
+    // Whose health each attempt is spent on, kept so that running out of
+    // attempts can name the backend that ran out. Recording the failure as it
+    // happens would condemn a backend for having been idle: see
+    // [`PooledConnection::discard`].
+    let mut tried: Vec<EndpointId> = Vec::new();
 
     for _attempt in 1..=OPEN_ATTEMPTS {
         let pooled_conn = endpoint_group.get_connection(host).await?;
+        let tried_node = pooled_conn.node();
         let conn = pooled_conn.conn().clone();
 
         let (mut send, recv) = match tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
@@ -493,6 +500,7 @@ pub(crate) async fn open_stream_with_retry(
                     e
                 );
                 last_err = Some(anyhow::anyhow!(e).into());
+                tried.extend(tried_node);
                 // Closed rather than dropped: another handle is held by the
                 // path watcher, so dropping this one would leave the
                 // connection open until that task got around to it.
@@ -511,6 +519,7 @@ pub(crate) async fn open_stream_with_retry(
                 // same treatment rather than ending the loop on the first
                 // attempt.
                 last_err = Some(ClientError::TimeoutError);
+                tried.extend(tried_node);
                 pooled_conn.discard(b"the connection never opened a stream");
                 continue;
             }
@@ -526,6 +535,7 @@ pub(crate) async fn open_stream_with_retry(
                 e
             );
             last_err = Some(e.into());
+            tried.extend(tried_node);
             // Same reasoning as the `open_bi` failures: a connection that
             // could not take the first bytes is not one to hand back.
             pooled_conn.discard(b"the connection would not take the first bytes");
@@ -534,6 +544,16 @@ pub(crate) async fn open_stream_with_retry(
 
         return Ok((pooled_conn, send, recv));
     }
+
+    // Every attempt spent and not one served. "Down" is now the most generous
+    // reading left, and it is the reading the next request needs: continuing to
+    // hand out these backends would spend another three attempts each on
+    // connections nobody asked for. The next successful probe clears it.
+    // Every attempt spent and not one served. "Down" is now the most generous
+    // reading left, and it is the reading the next request needs: continuing to
+    // hand out these backends would spend another three attempts each on
+    // connections nobody asked for. The next successful probe clears it.
+    endpoint_group.record_request_failures(&tried);
 
     Err(last_err.unwrap_or_else(|| {
         ClientError::ConnectionError(format!(
