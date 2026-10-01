@@ -94,17 +94,24 @@ impl OsGate for Authorization {
 
         // Interaction is what puts the sheet on the screen, and extending is
         // what makes the Security Server try to grant the right rather than only
-        // describe what granting it would take. Destroying it is the flag that
-        // matters here: a granted right outlives this call by minutes otherwise,
-        // and the answer was the point, not the right.
-        let flags = Flags::INTERACTION_ALLOWED | Flags::EXTEND_RIGHTS | Flags::DESTROY_RIGHTS;
+        // describe what granting it would take. Destroying is deliberately not
+        // among them: as a creation flag it has no meaning to
+        // `AuthorizationCreate`, and the wrapper would not carry it over if it
+        // did — it is `destroy_rights` below that sets it.
+        let flags = Flags::INTERACTION_ALLOWED | Flags::EXTEND_RIGHTS;
 
         match OsAuthorization::new(Some(rights), Some(environment), flags) {
-            // Asked, and the Security Server granted it. The right is dropped
-            // with the reference rather than held: the window this opens is
-            // [`super::UNLOCK_WINDOW`] of memory, not five minutes of a granted
-            // admin right.
-            Ok(_) => Outcome::Unlocked,
+            // Asked, and the Security Server granted it. `destroy_rights` is
+            // what tears the granted right down with the reference: dropped
+            // without it, Security Server keeps the right for its timeout —
+            // minutes in which another process can ask for it and, if the right
+            // is a shared one, be given it without a sheet. The window this
+            // door means to open is [`super::UNLOCK_WINDOW`] of memory, not the
+            // five minutes of a live admin credential.
+            Ok(authorization) => {
+                authorization.destroy_rights();
+                Outcome::Unlocked
+            }
             Err(error) => outcome_for(error),
         }
     }
