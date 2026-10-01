@@ -484,7 +484,19 @@ pub(crate) async fn open_stream_with_retry(
     let mut tried: Vec<EndpointId> = Vec::new();
 
     for _attempt in 1..=OPEN_ATTEMPTS {
-        let pooled_conn = endpoint_group.get_connection(host).await?;
+        let pooled_conn = match endpoint_group.get_connection(host).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Leaving the loop before every attempt is spent must not lose
+                // what those attempts found out. The group that could not offer
+                // another connection has itself recorded what it learned about
+                // the backend it was reaching for; without this the backends
+                // named in `tried` keep every later request dialling them for
+                // another full round of attempts first.
+                endpoint_group.record_request_failures(&tried);
+                return Err(e);
+            }
+        };
         let tried_node = pooled_conn.node();
         let conn = pooled_conn.conn().clone();
 
