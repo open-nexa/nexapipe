@@ -874,6 +874,13 @@ async fn proxy_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
+    // The same figure `log_access` prints below, and it arrives here rather
+    // than being counted off the wire because this listener has no stream of
+    // its own to instrument — `content-length` is the only size it ever knew.
+    // Anything chunked therefore reads as zero, which the access log has always
+    // reported the same way.
+    crate::metrics::METRICS.record_bytes_sent(content_length as u64);
+
     log::log_access(
         &request_id,
         &remote_addr,

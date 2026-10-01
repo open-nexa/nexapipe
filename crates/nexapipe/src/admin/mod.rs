@@ -288,6 +288,10 @@ async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
         },
         "requests": requests,
         "request_duration_ms": counters.request_duration_ms,
+        "traffic": {
+            "sent_bytes": counters.bytes_sent,
+            "received_bytes": counters.bytes_received,
+        },
         "l4_flows": flows,
         "backends": { "up": view.backends_up, "down": view.backends_down },
         "in_flight": view.in_flight,

@@ -63,6 +63,11 @@ pub async fn handle_iroh_stream(
 
     let mut backend = connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
+    // Read off the client before the copy below ever saw the stream, so no
+    // funnel is going to do it: without this line the ClientHello — the only
+    // bytes some connections ever send before being refused SNI-first — never
+    // appears in the totals.
+    crate::metrics::METRICS.record_bytes_received(handshake.len() as u64);
 
     let client = DuplexIroh::new(send, recv);
     copy_both_ways(client, backend, "TLS passthrough").await?;
