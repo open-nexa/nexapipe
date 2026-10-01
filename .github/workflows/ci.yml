@@ -5,10 +5,13 @@ name: CI
 # jobs that used to live in the open-nexa/nexa-desktop / nexa-android repos.
 # Multi-platform builds are verified by release.yml when a tag is pushed.
 #
-# The `test` job runs on Linux and macOS. Windows is compile-checked only: the
-# integration tests spawn the built binary, and the cfg(unix) parts of the
-# config and shutdown tests do not exist there, so a red Windows test job would
-# report a platform nobody has committed to supporting.
+# The `test` job runs on Linux and macOS. Windows gets `windows-check`, a
+# `cargo check` of the root workspace: the integration tests spawn the built
+# binary, and the cfg(unix) halves of the config watcher and of shutdown have no
+# Windows counterpart to run them against, so a Windows *test* job would report
+# a platform nobody has committed to supporting. Checking is the part that pays:
+# without this job the root workspace was not compiled on Windows at all, and a
+# platform-specific break in it surfaced only when release.yml built a tag.
 #
 # Jobs that exist purely because the default feature set cannot see the code they cover:
 #   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
@@ -108,6 +111,29 @@ jobs:
           key: test-${{ matrix.os }}
       - name: cargo test
         run: cargo test --workspace --locked
+
+  # The root workspace's only Windows coverage. release.yml does build Windows
+  # binaries, but only from a tag, so this is what tells a PR that the crates
+  # still compile there.
+  windows-check:
+    name: cargo check (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+      # --all-targets so the integration tests are compiled as well: they are
+      # where the crates' public surface is used the way a caller uses it, and
+      # a change that broke them would otherwise wait for a tag to be noticed.
+      # They are not run here — see the note at the top of this file.
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
 
   features:
     name: client features (${{ matrix.features }})
