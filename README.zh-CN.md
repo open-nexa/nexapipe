@@ -348,7 +348,8 @@ domains = ["app.example.com"]
   拨号。
 - **`custom`** —— 一个你自己运行的中继，且**只用它**：既不作为归属中继，也不作为
   探测目标。把它指向 `*.relay.n0.iroh.link` 形式的 URL 会被拒绝；那类地址请用
-  `pinned` 或 `default`。
+  `pinned` 或 `default`。这个模式的另一半 —— 先把那台中继跑起来 —— 写在
+  [自建中继](docs/self-hosted-relay.md)。
 
 写了 `relay_mode` 但不可用 —— 例如 `custom` 却没有 URL，或拼写无法识别 —— 会直接
 阻止启动，而不是悄悄回落。在不接受 `relay_url` 的模式旁写了 `relay_url` 会被忽略
