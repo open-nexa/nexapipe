@@ -163,6 +163,9 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
+镜像也已发布到 GHCR（`linux/amd64` 与 `linux/arm64`），不必自己构建：
+`docker pull ghcr.io/open-nexa/nexapipe:latest`。
+
 #### 修改配置文件
 
 配置文件每 5 秒重新读取一次，改动无需重启 —— 但**凡是会写入这个文件的操作，

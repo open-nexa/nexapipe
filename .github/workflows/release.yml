@@ -6,6 +6,10 @@ name: Release
 #                    rpm / appimage + the updater manifests merged into latest.json)
 #   build-apk      - the signed Android APKs, one per ABI (cargo-ndk .so per ABI +
 #                    gradle assembleRelease with ABI splits)
+#   build-image    - the container image, one leg per architecture, pushed by
+#                    digest to ghcr.io/open-nexa/nexapipe
+#   publish-image  - merges those per-arch images into one manifest list and
+#                    tags it: the version, plus "latest" for a stable tag
 #   release        - assembles every artifact into a single GitHub Release with one
 #                    SHA256SUMS.txt
 #
@@ -992,6 +996,169 @@ jobs:
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-x86_64.apk.sha256
           if-no-files-found: error
           retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # Container image: ghcr.io/open-nexa/nexapipe.
+  #
+  # One leg per architecture, each on a runner whose CPU is the platform it
+  # builds, so neither leg needs QEMU: Dockerfile compiles for the machine it
+  # runs on, and emulating a full cargo build (iroh is a large dependency tree)
+  # costs more wall clock than the arm64 runner it would save.
+  #
+  # Dockerfile-aarch64 is deliberately unused. Its builder stage has no
+  # `FROM --platform=$BUILDPLATFORM` pin, so buildx resolves it to arm64 and
+  # runs the aarch64 cross-compilation under emulation anyway — the opposite of
+  # what a cross-compiling Dockerfile is for — and its runtime stage pulls
+  # alpine from a self-hosted mirror (registry.it.iakl.top) that a hosted
+  # runner has no route to.
+  #
+  # A single buildx build cannot span two runners, so each leg pushes only its
+  # own digest and publish-image merges them into one manifest list afterwards.
+  # ----------------------------------------------------------------------
+  build-image:
+    name: image ${{ matrix.arch }}
+    if: ${{ inputs.signing_only != true }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    # The GHCR push. Elevated here and not in the workflow-level block, which
+    # stays read-only for the whole build stage.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # One architecture failing should not hide the other's failure
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            # Native arm64 runner, as the arm64 desktop bundle uses: Dockerfile
+            # builds for the host triple, so an arm64 image needs an arm64 CPU.
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          # GITHUB_TOKEN can push to the repository's own package, so publishing
+          # needs no secret of its own.
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          # Untagged on purpose: the tags are decided once in publish-image,
+          # when both architectures are known to have built. A release whose
+          # arm64 leg failed must not leave an amd64-only image under the
+          # version tag.
+          outputs: type=image,name=ghcr.io/open-nexa/nexapipe,push-by-digest=true,push=true
+
+      # The digest is the only handle this leg's image has. It goes through an
+      # artifact because a matrix job's outputs would only survive for one of
+      # the two legs.
+      - name: Export digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # The tag that turns the two digests into one multi-arch image. "latest" is
+  # applied with the same pre-release rule as the GitHub release and the APK:
+  # a version carrying a hyphen (v0.5.0-rc.1) gets the version tag and nothing
+  # else, so a release candidate cannot take "latest" away from a stable one.
+  # ----------------------------------------------------------------------
+  publish-image:
+    name: publish image
+    needs: [build-image]
+    if: ${{ inputs.signing_only != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Same elevation as build-image: imagetools writes the manifest list to GHCR
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Create manifest list
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags=("ghcr.io/open-nexa/nexapipe:${VERSION}")
+          case "$VERSION" in
+            *-*) ;;
+            *)   tags+=("ghcr.io/open-nexa/nexapipe:latest") ;;
+          esac
+
+          sources=()
+          for f in /tmp/digests/*; do
+            sources+=("ghcr.io/open-nexa/nexapipe@sha256:$(basename "$f")")
+          done
+          # Two legs in, two digests out: a manifest list built from one of them
+          # is a single-arch image wearing a multi-arch name.
+          [ "${#sources[@]}" -eq 2 ] || {
+            echo "::error::expected 2 platform digests, got ${#sources[@]}"
+            ls -l /tmp/digests
+            exit 1
+          }
+
+          tag_args=()
+          for t in "${tags[@]}"; do
+            tag_args+=(--tag "$t")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "ghcr.io/open-nexa/nexapipe:${VERSION}"
 
   release:
     name: publish release
