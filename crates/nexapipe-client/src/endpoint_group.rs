@@ -307,14 +307,42 @@ impl DomainPools {
     pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
         let index = self.choose()?;
         let pool = &self.pools[index];
-        let conn = pool.get_connection().await?;
-        let node = pool.backend_id();
-        Ok(PooledConnection::tracked(
-            conn,
-            index,
-            node,
-            self.traffic.clone(),
-        ))
+        let backend_id = pool.backend_id();
+
+        // Said here rather than left to the caller, because this is the only
+        // place that knows which backend refused — the caller gets an error
+        // without a name in it — and because nobody else says it: the retry
+        // loops above only ever observe connections that were handed to them.
+        //
+        // A backend that cannot be dialled leaves no connection to discover
+        // later, so without this line failure to reach one would never reach
+        // the health table at all: another request would come along and spend a
+        // full connect timeout on the same backend before trying a different
+        // one, which is exactly the cost health-aware routing exists to avoid.
+        //
+        // Counting failure to connect, or to authenticate, as "down" reads as
+        // harsh, and it is the same verdict the probe reaches: `preconnect`
+        // connects and authenticates too, from the same pool, so nothing here
+        // can mark a backend down that the next probe then marks back up.
+        //
+        // Not `InvalidConfig`, which is the only way this pool reports the
+        // endpoint being gone: that is this process having let go of its own
+        // side, which every pool says at once on shutdown and which is news
+        // about nobody's backend. Calling it "down" would paint the whole node
+        // list unreachable each time a tunnel stops.
+        match pool.get_connection().await {
+            Ok(conn) => Ok(PooledConnection::tracked(
+                conn,
+                index,
+                backend_id,
+                self.traffic.clone(),
+            )),
+            Err(e @ ClientError::InvalidConfig(_)) => Err(e),
+            Err(e) => {
+                record_outcome(&self.health, backend_id, false);
+                Err(e)
+            }
+        }
     }
 
     pub async fn return_connection(&self, pooled_conn: PooledConnection) {
@@ -1857,6 +1885,43 @@ mod tests {
             .expect("it was probed");
         assert!(up.reachable, "only the backend that failed is recorded");
         assert_eq!(up.consecutive_failures, 0);
+    }
+
+    /// The one failure `get_connection` can report that is not the backend's.
+    ///
+    /// Every other failure here means a backend was asked and did not answer,
+    /// and so belongs in the health table. This one means there was nothing to
+    /// ask with: our own endpoint is gone, which is what shutting a tunnel down
+    /// does, and every pool says it at the same moment. Reading it as "the
+    /// backend is down" would turn stopping a proxy into a node list where
+    /// nothing answers — and restarting would inherit that list.
+    #[tokio::test]
+    async fn letting_go_of_our_own_endpoint_is_news_about_us() {
+        let backend = unused_backend_id();
+        // A pool that owns its endpoint, unlike every pool `group_with` builds:
+        // ownership is what decides whether `close_all` takes it away. Nothing
+        // is ever dialled — the endpoint is gone before anything could try.
+        let pool =
+            crate::connection_pool::IrohConnectionPool::new(iroh::EndpointAddr::new(backend))
+                .await
+                .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_single_pool(pool).await;
+        group.record_probe(backend, true);
+
+        group.close_all().await;
+        let outcome = group.get_connection("whatever.example").await;
+
+        assert!(
+            outcome.is_err(),
+            "there is no endpoint left to dial out from"
+        );
+        let snapshot = group.health_snapshot();
+        let backend = snapshot.nodes.first().expect("it was probed");
+        assert!(
+            backend.reachable,
+            "nothing said the backend stopped answering"
+        );
+        assert_eq!(backend.consecutive_failures, 0);
     }
 
     /// One request is one failure. An attempt that landed on the same backend
