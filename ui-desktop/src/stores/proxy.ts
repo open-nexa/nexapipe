@@ -129,6 +129,9 @@ async function refresh(): Promise<boolean> {
     // changed — which is what left the main thread too busy to keep a spinner
     // turning. `running` and `mode` are the whole of `ProxyStatus`.
     if (result.running !== status.value.running || result.mode !== status.value.mode) {
+      // Bumped on the transition, not on every answer: starting and stopping are the moments a
+      // reply about the previous run can still be on its way. See `session`.
+      if (result.running !== status.value.running) session += 1;
       status.value = result;
     }
     if (result.running) {
@@ -174,12 +177,16 @@ async function refreshEndpointLinks(): Promise<void> {
  * and a failure here must never become an error over an otherwise healthy proxy.
  */
 async function refreshNodeHealth(): Promise<void> {
+  const asked = session;
   try {
-    nodeHealth.value = await invoke<NodeHealth[]>('get_node_health', {
+    const health = await invoke<NodeHealth[]>('get_node_health', {
       useService: config.useService,
     });
+    if (asked !== session) return;
+    nodeHealth.value = health;
   } catch (error) {
     console.debug('[proxy] node health unavailable:', error);
+    if (asked !== session) return;
     nodeHealth.value = [];
   }
 }
@@ -191,12 +198,16 @@ async function refreshNodeHealth(): Promise<void> {
  * and a failure here must never become an error over an otherwise healthy proxy.
  */
 async function refreshNodeTraffic(): Promise<void> {
+  const asked = session;
   try {
-    nodeTraffic.value = await invoke<NodeTraffic[]>('get_node_traffic', {
+    const traffic = await invoke<NodeTraffic[]>('get_node_traffic', {
       useService: config.useService,
     });
+    if (asked !== session) return;
+    nodeTraffic.value = traffic;
   } catch (error) {
     console.debug('[proxy] node traffic unavailable:', error);
+    if (asked !== session) return;
     nodeTraffic.value = [];
   }
 }
@@ -501,6 +512,21 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let servicePollTimer: ReturnType<typeof setTimeout> | null = null;
 let inFlight = false;
 let consecutiveFailures = 0;
+/**
+ * Which run of the proxy the numbers below describe.
+ *
+ * Bumped whenever the proxy starts or stops. Every read takes the value it had when it asked and
+ * drops the answer if it has moved since, because a request that was already in flight when `stop()`
+ * ran comes back with the totals from before it — and writing those back was how a stopped session
+ * kept reporting traffic: `stopped` clears the counters, the reply lands a moment later and
+ * refills them, and the dashboard shows bytes moving across a tunnel that is down until some later
+ * poll happens to clear them again. Starting is the same argument in the other direction: whatever
+ * a previous session was carrying is not this session's history.
+ *
+ * Not a lock and not an abort: the request still completes, because cancelling an `invoke` is not
+ * something this layer can do. What is refused is writing its answer.
+ */
+let session = 0;
 
 function nextInterval(): number {
   if (consecutiveFailures >= FAILURES_BEFORE_BACKOFF) return POLL_BACKOFF_MS;
