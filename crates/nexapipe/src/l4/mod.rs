@@ -362,6 +362,9 @@ where
     // silently truncate the first request of every client that does this.
     if !leftover.is_empty() {
         backend_stream.write_all(&leftover).await?;
+        // Same bytes the same comment above is about, and for the same reason
+        // the funnel cannot count them: they were read before it existed.
+        crate::metrics::METRICS.record_bytes_received(leftover.len() as u64);
     }
 
     copy_both_ways(stream, backend_stream, "L4 TCP").await?;
@@ -444,6 +447,10 @@ where
                             tracing::debug!("L4 UDP: backend send failed: {}", e);
                             return;
                         }
+                        // The payload, not the frame around it: the 2-byte
+                        // length is this tunnel's own framing, and every other
+                        // number here counts bytes an application recognises.
+                        crate::metrics::METRICS.record_bytes_received(payload.len() as u64);
                         offset += consumed;
                     }
                 }
@@ -504,6 +511,10 @@ where
                 tracing::debug!("L4 UDP: client flush failed: {}", e);
                 return;
             }
+            // After the flush, like the stream copy does, and counted as the
+            // payload rather than the frame: a datagram that never left is not
+            // bytes served, and its length prefix is not either.
+            crate::metrics::METRICS.record_bytes_sent(n as u64);
         }
     };
 

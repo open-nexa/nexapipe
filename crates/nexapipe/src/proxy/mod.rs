@@ -8,9 +8,8 @@ use crate::config::{
 };
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
-use crate::health::{HealthChecker, HealthProbes};
+use crate::health::{HealthChecker, HealthProbes, ProbeKind, ProbeTarget};
 use crate::http;
-use crate::lb::BackendPool;
 use crate::log;
 use crate::passthrough;
 use crate::routes::RouteConfig;
@@ -55,29 +54,48 @@ pub async fn sync_health_checks(
 ) {
     // Which routes want a probe right now, and on which pool. Taken before the
     // lock on the probes, because none of it depends on them.
-    let mut wanted: std::collections::HashMap<String, Arc<BackendPool>> =
+    let mut wanted: std::collections::HashMap<String, ProbeTarget> =
         std::collections::HashMap::new();
 
     for route in config.routes().await {
-        // Only an http:// backend answers `GET /health`. A passthrough backend is
-        // a TLS listener and an L4 backend is whatever the route points at — a
-        // database, a TURN server, an SSH daemon. Probing either would fail, mark
-        // the backend down, and the pool would then quietly fall back to its first
-        // entry. There is nothing to probe without speaking the protocol, so the
-        // pool is left alone; a dead backend shows up as a connect error when a
-        // flow arrives.
-        // A route serving `http` *and* something else is still probed: the pool
-        // is shared, so its health is what the other modes dial into as well.
-        if !route.serves(RouteMode::Http) {
+        // How a backend is asked depends on what it can answer. An http backend
+        // answers `GET {health_path}`. A passthrough or L4 backend — a TLS
+        // listener, a database, a TURN server, an SSH daemon — answers nothing
+        // without being spoken to in the protocol it serves, so it gets a TCP
+        // connect instead, which is the smallest question anybody can answer:
+        // it says a port is listening, and not that what is behind it works.
+        //
+        // A route serving `http` *and* another mode is asked the HTTP question:
+        // the pool is shared, and an answer the backend gave is worth more than
+        // a connection anything would accept.
+        //
+        // A `udp`-only route gets no probe at all. UDP answers nothing without
+        // a datagram in the protocol it serves, so the only probe available
+        // would be one every backend fails — and a pool emptied by a probe that
+        // could never have succeeded is worse than none.
+        let kind = if route.serves(RouteMode::Http) {
+            ProbeKind::Http {
+                path: health.path.clone(),
+            }
+        } else if route.serves(RouteMode::Passthrough) || route.serves(RouteMode::Tcp) {
+            ProbeKind::Tcp
+        } else {
             tracing::info!(
-                "Route {}: modes={:?}, skipping the HTTP health check",
+                "Route {}: modes={:?}, no probe speaks these, so a dead backend shows up \
+                 when a flow arrives",
                 route.host_pattern(),
                 route.modes()
             );
             continue;
-        }
+        };
 
-        wanted.insert(route.pool_key().await, route.backend_pool().clone());
+        wanted.insert(
+            route.pool_key().await,
+            ProbeTarget {
+                pool: route.backend_pool().clone(),
+                kind,
+            },
+        );
     }
 
     let mut probes = probes.lock().await;
@@ -93,21 +111,21 @@ pub async fn sync_health_checks(
         return;
     }
 
-    for (key, backend_pool) in wanted {
+    for (key, target) in wanted {
         if probes.contains(&key) {
             continue;
         }
 
         let health_checker = HealthChecker::new(
-            backend_pool.clone(),
+            target.pool.clone(),
             http_client.clone(),
             std::time::Duration::from_secs(health.interval.max(1)),
             std::time::Duration::from_secs(health.timeout.max(1)),
             health.threshold,
-            &health.path,
+            target.kind,
             enabled.clone(),
         );
-        probes.spawn(key, backend_pool, health_checker);
+        probes.spawn(key, target.pool, health_checker);
     }
 }
 
@@ -874,6 +892,23 @@ async fn proxy_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
+    // Two different claims below, and deliberately so.
+    //
+    // `log_access` prints what the header says, because that is what it has
+    // always printed and people parse that field. The metric counts what this
+    // listener actually put on the wire. For most responses those are the same
+    // number — which is why taking both from here was worth doing — but a HEAD,
+    // a 1xx, a 204 and a 304 describe a representation without sending one, and
+    // every one of them keeps `Content-Length` while doing it (RFC 9110 s6.4.1,
+    // s8.3). Counting those bytes would say NexaPipe served something it never
+    // wrote, which is worse than the two disagreeing.
+    let delivered = if response_has_body(&method, status) {
+        content_length
+    } else {
+        0
+    };
+    crate::metrics::METRICS.record_bytes_sent(delivered as u64);
+
     log::log_access(
         &request_id,
         &remote_addr,
@@ -887,6 +922,19 @@ async fn proxy_handler(
     Ok(with_request_id(response, &request_id))
 }
 
+/// Whether a response to this request puts a body on the wire.
+///
+/// RFC 9110 s6.4.1 and s8.3: a HEAD response, a 1xx, a 204 and a 304 answer
+/// without a body, and each of them may still carry `Content-Length` saying how
+/// long that absent body would have been. Anything counting bytes as traffic has
+/// to ask this before reading the header.
+fn response_has_body(method: &str, status: u16) -> bool {
+    if method == "HEAD" {
+        return false;
+    }
+    !matches!(status, 204 | 304) && !(100..200).contains(&status)
+}
+
 pub async fn run_local_proxy(
     local_proxy_config: LocalProxyConfig,
     shutdown_signal: Arc<ShutdownSignal>,
@@ -898,7 +946,7 @@ const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
-    use super::{may_bind_plaintext, plaintext_auth_conflict};
+    use super::{may_bind_plaintext, plaintext_auth_conflict, response_has_body};
     use std::net::SocketAddr;
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
@@ -949,5 +997,38 @@ mod tests {
             plaintext_auth_conflict(addr("127.0.0.1", 8080), false, true),
             None
         );
+    }
+
+    /// The case where the metric must not follow the log line. A `HEAD` says how
+    /// long the `GET` answer would have been and then sends none of it, so
+    /// counting the header would report a download that never happened — and a
+    /// monitoring client scraping this would bill someone for it.
+    #[test]
+    fn head_has_no_body_whatever_content_length_says() {
+        assert!(!response_has_body("HEAD", 200));
+        assert!(!response_has_body("HEAD", 404));
+        // Its content-length describes the GET, which nobody asked for.
+        assert!(!response_has_body("HEAD", 204));
+    }
+
+    /// The statuses that answer without a payload, and keep `Content-Length`
+    /// from the representation they stand in for.
+    #[test]
+    fn no_content_and_not_modified_are_answered_without_a_body() {
+        assert!(!response_has_body("GET", 204));
+        assert!(!response_has_body("GET", 304));
+        // Informational: there is nothing else these could be carrying yet.
+        assert!(!response_has_body("GET", 100));
+        assert!(!response_has_body("GET", 103));
+    }
+
+    /// The ordinary case, which is everything else on every other method.
+    #[test]
+    fn everything_else_delivers_what_content_length_says() {
+        assert!(response_has_body("GET", 200));
+        assert!(response_has_body("GET", 404));
+        assert!(response_has_body("POST", 201));
+        // Not HEAD, and not one of the bodyless statuses.
+        assert!(response_has_body("OPTIONS", 200));
     }
 }

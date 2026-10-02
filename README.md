@@ -401,6 +401,8 @@ Relay modes:
 - **`custom`** — one relay you run, and only that one: no N0 relay is used,
   neither as a home relay nor as a probe target. Pointing it at an
   `*.relay.n0.iroh.link` URL is rejected; use `pinned` or `default` for those.
+  [Running your own relay](docs/self-hosted-relay.md) covers the other half of
+  this mode — getting that server up in the first place.
 
 A `relay_mode` that is present but unusable — `custom` with no URL, an
 unrecognised spelling — stops startup instead of quietly falling back. A

@@ -258,6 +258,13 @@ pub async fn handle_bidi_stream(
 
     let request = http::parse_http_request_legacy(&buf)?;
 
+    // Everything before the blank line is bytes the client sent, and it is the
+    // only place the request head exists as bytes: from here on it is a parsed
+    // request, and nobody downstream can say how large it was on the wire.
+    // Counted before any routing, so a request whose body never arrives still
+    // reports what did — the same trade the access log makes.
+    metrics::METRICS.record_bytes_received(buf.len() as u64);
+
     let host = request
         .headers()
         .get("host")
@@ -385,6 +392,12 @@ pub async fn handle_bidi_stream(
     match outcome {
         Ok(summary) => {
             metrics::METRICS.record_request(summary.status, elapsed_ms);
+            // The same number the log line below prints, taken from the same
+            // place, rather than counted again off the wire. `crate::http`
+            // knows how much of a response reached the client — it has to, the
+            // access log says so — and it counts only what landed, including
+            // the partial answer when a stream died mid-body.
+            metrics::METRICS.record_bytes_sent(summary.bytes_sent as u64);
             span.record("status", summary.status as u64);
             crate::log::log_access(
                 request_id,
@@ -407,6 +420,9 @@ pub async fn handle_bidi_stream(
                 None => (502, 0),
             };
             metrics::METRICS.record_request(status, elapsed_ms);
+            // Same source, same reason, including that there may have been no
+            // partial answer at all: nothing was served, so nothing is counted.
+            metrics::METRICS.record_bytes_sent(bytes_sent as u64);
             span.record("status", status as u64);
             crate::log::log_access(
                 request_id,
@@ -569,6 +585,7 @@ async fn handle_websocket_stream(
                             tracing::debug!("WebSocket backend write failed: {}", e);
                             return "backend_write_error";
                         }
+                        crate::metrics::METRICS.record_bytes_received(n as u64);
                     }
                     Err(_) => return "iroh_read_error",
                 }
@@ -586,6 +603,7 @@ async fn handle_websocket_stream(
                             tracing::debug!("WebSocket iroh write failed: {}", e);
                             return "iroh_write_error";
                         }
+                        crate::metrics::METRICS.record_bytes_sent(n as u64);
                     }
                     Err(_) => return "backend_read_error",
                 }
