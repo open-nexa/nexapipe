@@ -101,6 +101,13 @@ class NexaVpnService : VpnService() {
     private var lastTrafficSample: TrafficSample? = null
     // The last text handed to NotificationManager. Android throttles rapid updates, so a
     // tick that worked out the same text posts nothing rather than queueing behind one.
+    //
+    // Written from two threads and from two different ideas of what the notification is
+    // showing: the poller sets it to whatever it just posted, and anything that re-posts
+    // the plain notification — `startForeground` on a rebuild — has to clear it, because
+    // the content on screen no longer matches what it remembers. Both happen under this
+    // lock together with the post itself.
+    private val notificationLock = Any()
     @Volatile private var lastNotificationText: String? = null
     /** One read of the cumulative counters, with the moment it was taken. */
     private data class TrafficSample(val sent: Long, val received: Long, val atMs: Long)
@@ -467,7 +474,16 @@ class NexaVpnService : VpnService() {
                     "$tunRouteIPv6/64)"
             )
             createNotificationChannel()
-            startForeground(NOTIFICATION_ID, createNotification())
+            // Posted with the cache together, and not in two steps: this replaces whatever
+            // the poller last showed, so the cache has to hear about it in the same breath.
+            // Cleared separately it would still hold the old rate text, and a tick whose new
+            // text happened to equal that one would be skipped as "already showing" while
+            // the banner sat there saying only "Connected" — which is what a network switch
+            // looked like when the rates were quietly zero.
+            synchronized(notificationLock) {
+                startForeground(NOTIFICATION_ID, createNotification())
+                lastNotificationText = null
+            }
             // The tunnel is up, so the counters mean something: start showing them.
             startTrafficPolling()
             true
@@ -855,7 +871,7 @@ class NexaVpnService : VpnService() {
         trafficJob?.cancel()
         trafficJob = null
         lastTrafficSample = null
-        lastNotificationText = null
+        synchronized(notificationLock) { lastNotificationText = null }
     }
 
     /**
@@ -916,12 +932,21 @@ class NexaVpnService : VpnService() {
      * Same id as the one `startForeground` used, so this updates that notification instead of
      * adding a second one. Android throttles posts that come faster than it can render, and a
      * rate that has not changed is not worth spending one on.
+     *
+     * The two checks are what make it safe to call from anywhere: cancelling the poller does
+     * not wait for the tick already running, and that tick reaches this line after the tunnel
+     * is down and its notification has been taken away. Posting then would put a rate back on
+     * screen for a service the user has stopped, which is why the teardown marker is read —
+     * and written — inside the same lock the post itself takes.
      */
     private fun publishNotificationText(text: String) {
-        if (text == lastNotificationText) return
-        lastNotificationText = text
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, createNotification(text))
+        synchronized(notificationLock) {
+            if (isStopping) return
+            if (text == lastNotificationText) return
+            lastNotificationText = text
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(NOTIFICATION_ID, createNotification(text))
+        }
     }
 
     companion object {
