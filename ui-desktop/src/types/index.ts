@@ -128,6 +128,52 @@ export interface EndpointLink {
   link: LinkKind;
 }
 
+/** How one configured node answered its last probe. Mirrors `NodeHealthStatus` in `src-tauri/src/status.rs`. */
+export interface NodeHealth {
+  /**
+   * The ticket or endpoint ID exactly as the node was configured — the same key `EndpointLink`
+   * carries, so a link and a health reading for one node can be paired.
+   */
+  connection: string;
+  /** Whether it answered. False before the first probe has run: unasked means unanswered. */
+  reachable: boolean;
+  /** Probes in a row that have failed. Zero while it answers. */
+  consecutiveFailures: number;
+  /**
+   * How long it has been down, in seconds. `null` while it answers, and `null` when it has
+   * never answered — which is not "down for no time at all".
+   */
+  downForSecs: number | null;
+  /** How long ago it was last probed, in seconds. `null` before the first probe. */
+  sinceLastProbeSecs: number | null;
+}
+
+/**
+ * What one node has carried, as a pair of cumulative byte counters and a flow count. Mirrors
+ * `NodeTrafficStatus` in `src-tauri/src/status.rs`.
+ *
+ * Every byte figure is cumulative since the counters started, which in practice means since the
+ * proxy did: nothing crossing here divides by anything, because a rate is two readings and a
+ * division and this is polled.
+ *
+ * A node the backend has nothing to say about has *no entry at all* rather than one full of
+ * zeroes — see `NodeTrafficStatus`, and `trafficFor` in the proxy store, which answers `null` for
+ * it.
+ */
+export interface NodeTraffic {
+  /**
+   * The ticket or endpoint ID exactly as the node was configured — the same key `EndpointLink`
+   * and `NodeHealth` carry, so a volume, a link and a health reading for one node can be paired.
+   */
+  connection: string;
+  /** Bytes this machine has put into the tunnel towards this node. Cumulative. */
+  sent: number;
+  /** Bytes that have come back from it. Cumulative. */
+  received: number;
+  /** Flows open through it right now. The only figure here that goes down. */
+  active: number;
+}
+
 /**
  * The 2FA half of an invite *as it is shown*. Mirrors `InviteTotpPayload` in
  * `src-tauri/src/lib.rs`, which deliberately carries no secret: an invite is shown to be

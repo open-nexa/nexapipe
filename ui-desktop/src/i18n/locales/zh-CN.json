@@ -78,6 +78,20 @@
     "relay": "中继",
     "connecting": "连接中"
   },
+  "health": {
+    "up": "有响应",
+    "down": "无响应",
+    "downFor": "已中断 {duration}",
+    "seconds": "{count} 秒",
+    "minutes": "{count} 分钟",
+    "hours": "{count} 小时",
+    "days": "{count} 天"
+  },
+  "traffic": {
+    "sent": "已发送",
+    "received": "已接收",
+    "flows": "{count} 条连接"
+  },
   "connect": {
     "title": "连接",
     "started": "代理已启动",

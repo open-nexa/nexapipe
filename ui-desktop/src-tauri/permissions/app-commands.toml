@@ -1,0 +1,167 @@
+# Permissions for the commands this application registers itself.
+#
+# Tauri only checks its access-control list against an application's own
+# commands once the application has a manifest of its own; without this file
+# every command above is reachable from the webview whether or not a capability
+# grants it. Adding the manifest is what turns the check on, which is why every
+# command is listed: once it is on, a command that is not granted is refused.
+#
+# One permission per command, named the way Tauri names them — `allow-` followed
+# by the command with its underscores as hyphens. `deny-` variants exist for
+# more than this application needs, so they are left out until something wants
+# one: a command that is not granted is already refused.
+
+[[permission]]
+identifier = "allow-accept-invite"
+description = "Enables the accept_invite command without any pre-configured scope."
+commands.allow = ["accept_invite"]
+
+[[permission]]
+identifier = "allow-clear-credentials"
+description = "Enables the clear_credentials command without any pre-configured scope."
+commands.allow = ["clear_credentials"]
+
+[[permission]]
+identifier = "allow-clear-logs"
+description = "Enables the clear_logs command without any pre-configured scope."
+commands.allow = ["clear_logs"]
+
+[[permission]]
+identifier = "allow-credential-display"
+description = "Enables the credential_display command without any pre-configured scope."
+commands.allow = ["credential_display"]
+
+[[permission]]
+identifier = "allow-credential-store-status"
+description = "Enables the credential_store_status command without any pre-configured scope."
+commands.allow = ["credential_store_status"]
+
+[[permission]]
+identifier = "allow-delete-credential"
+description = "Enables the delete_credential command without any pre-configured scope."
+commands.allow = ["delete_credential"]
+
+[[permission]]
+identifier = "allow-gate-status"
+description = "Enables the gate_status command without any pre-configured scope."
+commands.allow = ["gate_status"]
+
+[[permission]]
+identifier = "allow-get-endpoint-links"
+description = "Enables the get_endpoint_links command without any pre-configured scope."
+commands.allow = ["get_endpoint_links"]
+
+[[permission]]
+identifier = "allow-get-logs"
+description = "Enables the get_logs command without any pre-configured scope."
+commands.allow = ["get_logs"]
+
+[[permission]]
+identifier = "allow-get-node-health"
+description = "Enables the get_node_health command without any pre-configured scope."
+commands.allow = ["get_node_health"]
+
+[[permission]]
+identifier = "allow-get-node-id-display"
+description = "Enables the get_node_id_display command without any pre-configured scope."
+commands.allow = ["get_node_id_display"]
+
+[[permission]]
+identifier = "allow-get-node-traffic"
+description = "Enables the get_node_traffic command without any pre-configured scope."
+commands.allow = ["get_node_traffic"]
+
+[[permission]]
+identifier = "allow-get-proxy-status"
+description = "Enables the get_proxy_status command without any pre-configured scope."
+commands.allow = ["get_proxy_status"]
+
+[[permission]]
+identifier = "allow-get-service-status"
+description = "Enables the get_service_status command without any pre-configured scope."
+commands.allow = ["get_service_status"]
+
+[[permission]]
+identifier = "allow-get-startup-error"
+description = "Enables the get_startup_error command without any pre-configured scope."
+commands.allow = ["get_startup_error"]
+
+[[permission]]
+identifier = "allow-install-service"
+description = "Enables the install_service command without any pre-configured scope."
+commands.allow = ["install_service"]
+
+[[permission]]
+identifier = "allow-is-service-running"
+description = "Enables the is_service_running command without any pre-configured scope."
+commands.allow = ["is_service_running"]
+
+[[permission]]
+identifier = "allow-lock-credentials"
+description = "Enables the lock_credentials command without any pre-configured scope."
+commands.allow = ["lock_credentials"]
+
+[[permission]]
+identifier = "allow-parse-invite"
+description = "Enables the parse_invite command without any pre-configured scope."
+commands.allow = ["parse_invite"]
+
+[[permission]]
+identifier = "allow-put-credential"
+description = "Enables the put_credential command without any pre-configured scope."
+commands.allow = ["put_credential"]
+
+[[permission]]
+identifier = "allow-reveal-credential"
+description = "Enables the reveal_credential command without any pre-configured scope."
+commands.allow = ["reveal_credential"]
+
+[[permission]]
+identifier = "allow-reveal-node-id"
+description = "Enables the reveal_node_id command without any pre-configured scope."
+commands.allow = ["reveal_node_id"]
+
+[[permission]]
+identifier = "allow-start-proxy"
+description = "Enables the start_proxy command without any pre-configured scope."
+commands.allow = ["start_proxy"]
+
+[[permission]]
+identifier = "allow-start-service"
+description = "Enables the start_service command without any pre-configured scope."
+commands.allow = ["start_service"]
+
+[[permission]]
+identifier = "allow-stop-proxy"
+description = "Enables the stop_proxy command without any pre-configured scope."
+commands.allow = ["stop_proxy"]
+
+[[permission]]
+identifier = "allow-stop-service"
+description = "Enables the stop_service command without any pre-configured scope."
+commands.allow = ["stop_service"]
+
+[[permission]]
+identifier = "allow-take-invited-node-credentials"
+description = "Enables the take_invited_node_credentials command without any pre-configured scope."
+commands.allow = ["take_invited_node_credentials"]
+
+[[permission]]
+identifier = "allow-take-issued-credential"
+description = "Enables the take_issued_credential command without any pre-configured scope."
+commands.allow = ["take_issued_credential"]
+
+[[permission]]
+identifier = "allow-take-runtime-credentials"
+description = "Enables the take_runtime_credentials command without any pre-configured scope."
+commands.allow = ["take_runtime_credentials"]
+
+[[permission]]
+identifier = "allow-uninstall-service"
+description = "Enables the uninstall_service command without any pre-configured scope."
+commands.allow = ["uninstall_service"]
+
+[[permission]]
+identifier = "allow-unlock-credentials"
+description = "Enables the unlock_credentials command without any pre-configured scope."
+commands.allow = ["unlock_credentials"]

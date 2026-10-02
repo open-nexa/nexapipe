@@ -23,6 +23,15 @@
     <string name="action_connect">Connect</string>
     <string name="action_disconnect">Disconnect</string>
     <string name="connected_endpoints_title">Connected endpoints</string>
+    <!-- What one backend has carried, shown under its row in the list above. The flows part
+         is a plural so the count reads right in languages that pluralise it. -->
+    <string name="node_traffic_line">↑ %1$s sent · ↓ %2$s received · %3$s</string>
+    <plurals name="node_traffic_flows">
+        <item quantity="one">%1$d flow open</item>
+        <item quantity="other">%1$d flows open</item>
+    </plurals>
+    <!-- Shown instead when the backend has carried nothing: absent from the answer, not zero. -->
+    <string name="node_traffic_none">No traffic yet</string>
 
     <!-- Logs -->
     <string name="logs_title">Logs</string>
@@ -208,6 +217,8 @@
     <string name="notification_channel_description">Nexa Service</string>
     <string name="notification_title">Nexa</string>
     <string name="notification_text">Connected</string>
+    <!-- The same line once throughput is known: up and down rates in KiB/s or MiB/s. -->
+    <string name="notification_text_rate">Connected · ↑ %1$s · ↓ %2$s</string>
     <string name="notify_backend_unreachable">The network changed and no backend answered on the new one. Reconnect if the tunnel stays unusable.</string>
     <string name="notify_tunnel_rebuild_failed">The tunnel could not be rebuilt after the network changed. Please reconnect.</string>
 

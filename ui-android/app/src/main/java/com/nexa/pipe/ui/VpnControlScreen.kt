@@ -36,6 +36,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.R
+import com.nexa.pipe.formatByteCount
+import com.nexa.pipe.nodeTrafficOf
 import com.nexa.pipe.SecretStore
 import com.nexa.pipe.locale.AppLanguage
 import com.nexa.pipe.locale.AppLocale
@@ -65,6 +67,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val isConnecting by viewModel.isConnecting.collectAsState()
     val nodes by viewModel.nodes.collectAsState()
     val linkKinds by viewModel.linkKinds.collectAsState()
+    val traffic by viewModel.traffic.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
@@ -535,13 +538,42 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                             .clickable { selectedNodeId = node.nodeId },
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text(
-                                            text = shortenNodeId(node.nodeId),
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f)
-                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = shortenNodeId(node.nodeId),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            // What this backend has carried, in the muted
+                                            // style the card uses for everything that
+                                            // supports the headline. A backend the native
+                                            // side says nothing about has carried nothing —
+                                            // it is absent, not zero — so that is said
+                                            // instead of leaving a gap next to a badge that
+                                            // still reads "connected".
+                                            val volume = nodeTrafficOf(traffic, node.nodeId)
+                                            Text(
+                                                text = if (volume != null) {
+                                                    stringResource(
+                                                        R.string.node_traffic_line,
+                                                        formatByteCount(volume.sent),
+                                                        formatByteCount(volume.received),
+                                                        pluralStringResource(
+                                                            R.plurals.node_traffic_flows,
+                                                            volume.active.toInt(),
+                                                            volume.active.toInt()
+                                                        )
+                                                    )
+                                                } else {
+                                                    stringResource(R.string.node_traffic_none)
+                                                },
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
                                         Spacer(modifier = Modifier.width(8.dp))
                                         LinkKindBadge(kind)
                                     }

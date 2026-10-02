@@ -822,6 +822,12 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
         port
     );
 
+    // One TCP flow is what an application would call a connection, so it is
+    // what the counters call one: open until this task ends, whatever ends it.
+    let _flow = pooled.enter_flow();
+    let count_to_tunnel = pooled.clone();
+    let count_from_tunnel = pooled.clone();
+
     let (mut app_read, mut app_write) = tokio::io::split(stream);
 
     let app_to_tunnel = async {
@@ -833,6 +839,7 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
                     if tunnel_send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
+                    count_to_tunnel.record_sent(n as u64);
                 }
                 Err(e) => {
                     jni_log!("[tun-proxy] TCP {}:{} app read error: {}", domain, port, e);
@@ -854,6 +861,7 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
                     if app_write.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
+                    count_from_tunnel.record_received(n as u64);
                 }
                 Err(e) => {
                     jni_log!(
@@ -1102,6 +1110,13 @@ async fn run_udp_flow(
         port
     );
 
+    // A UDP "flow" is one socket's traffic to one host: it lasts until either
+    // side goes quiet, so for accounting it is one open flow for all that time
+    // rather than one per datagram. That is deliberately not the same unit as
+    // the TCP one, and it is the honest one — an application holding a QUIC
+    // socket open has one thing in flight, not thousands.
+    let _flow = pooled.enter_flow();
+
     let mut read_buf = vec![0u8; MAX_UDP_PAYLOAD + FRAME_HEADER_LEN];
     // A bi-stream has no message boundaries, so a datagram can start in one read
     // and finish in the next. `partial` holds the bytes of the frames that have
@@ -1142,10 +1157,16 @@ async fn run_udp_flow(
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
+                        // The datagram, not the frame: the two bytes that carry
+                        // its length are the tunnel's own, and an application
+                        // that sent `datagram.len()` bytes sent exactly those.
+                        // Counted behind the write, like every other path here:
+                        // a datagram the tunnel refused never left the device.
                         if tunnel_send.write_all(&encoded).await.is_err() {
                             jni_log!("[tun-proxy] UDP flow to {}:{} is gone", domain, port);
                             break;
                         }
+                        pooled.record_sent(datagram.len() as u64);
                     }
                     Err(e) => {
                         jni_log!(
@@ -1175,6 +1196,10 @@ async fn run_udp_flow(
                     // The reply comes *from* the address the application sent to,
                     // because the application's socket is often connected and a
                     // datagram from any other source is discarded.
+                    // The payload, not the frame: the two bytes that carried
+                    // its length are the tunnel's own. Counted once the TUN
+                    // writer has taken it, which is the moment it becomes the
+                    // application's bytes rather than the frame's.
                     if ctx
                         .tun_out
                         .send((payload.to_vec(), virtual_dst, client_addr))
@@ -1184,6 +1209,7 @@ async fn run_udp_flow(
                         tun_gone = true;
                         break;
                     }
+                    pooled.record_received(payload.len() as u64);
                     consumed += frame_len;
                 }
                 partial.drain(..consumed);

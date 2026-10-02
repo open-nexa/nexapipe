@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::AppError,
     proxy::{NodeEnrollment, NodeTwoFactor},
-    status::{EndpointLink, ProxyStatus},
+    status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus},
 };
 
 pub const IPC_SOCKET_PATH: &str = "127.0.0.1:12345";
@@ -198,6 +198,10 @@ pub enum IpcMessage {
     GetNodeId,
     /// How each configured node currently reaches its backend (direct / relay).
     GetEndpointLinks,
+    /// Whether each configured node answered its last probe, and for how long it has been down.
+    GetNodeHealth,
+    /// What each configured node has carried, and how many flows are open to it.
+    GetNodeTraffic,
     /// The credential the server issued for an enrollment token, if one was spent.
     ///
     /// Read once and gone: a token can only be spent once, so this is the service's only
@@ -245,6 +249,8 @@ pub enum IpcResponse {
     Status(ProxyStatus),
     NodeId(String),
     EndpointLinks(Vec<EndpointLink>),
+    NodeHealth(Vec<NodeHealthStatus>),
+    NodeTraffic(Vec<NodeTrafficStatus>),
     /// `None` means the last start settled without a failure.
     StartupError(Option<AppError>),
     /// `None` means nothing has enrolled, or the credential was already taken.

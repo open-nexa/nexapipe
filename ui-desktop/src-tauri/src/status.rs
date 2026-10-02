@@ -101,6 +101,62 @@ pub struct EndpointLink {
     pub link: LinkKind,
 }
 
+/// What the last probe of one configured node found.
+///
+/// One entry per configured node, keyed by `connection` exactly as [`EndpointLink`] keys
+/// itself, so the UI can pair a reading with the node it came from.
+///
+/// Sent in this shape and not as `nexapipe_client::endpoint_group::NodeHealth`, which carries
+/// `std::time::Instant`s: an `Instant` is a reading of *this* process's monotonic clock, so a
+/// timestamp off it says nothing in another process — and the service, which is the other end
+/// of IPC, is another process. Every timestamp is therefore flattened here into the elapsed
+/// duration the UI actually prints: whole seconds, or `None` for "never".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHealthStatus {
+    /// The ticket or endpoint ID exactly as the node was configured — see
+    /// [`EndpointLink::connection`].
+    pub connection: String,
+    /// Whether it answered its last probe. `false` before the first probe has run: a backend
+    /// that has not been asked has not answered.
+    pub reachable: bool,
+    /// How many probes in a row have failed. Zero while the node answers.
+    pub consecutive_failures: u32,
+    /// How long it has been since it last answered — `None` while it is up, and `None` when it
+    /// has never answered, which is not the same as "down for no time at all".
+    pub down_for_secs: Option<u64>,
+    /// How long ago it was last asked — `None` before the first probe, which is up to the
+    /// probe interval plus its jitter after a start.
+    pub since_last_probe_secs: Option<u64>,
+}
+
+/// What one configured node has carried, and how many flows it carries right now.
+///
+/// One entry per node, keyed by `connection` exactly as [`EndpointLink`] and
+/// [`NodeHealthStatus`] key themselves, so a link, a health reading and a volume for one node can
+/// be paired.
+///
+/// Every byte figure is cumulative since the counters started — since the proxy was started, in
+/// practice — and no rate crosses: a rate is two readings and a division, and the only caller
+/// already polls, so it does the subtraction on its own side.
+///
+/// A node the counters have nothing for is *absent* rather than zero: "has carried nothing" and
+/// "is carrying nothing right now" are different facts, and only the caller can say which one it
+/// is looking at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTrafficStatus {
+    /// The ticket or endpoint ID exactly as the node was configured — see
+    /// [`EndpointLink::connection`].
+    pub connection: String,
+    /// Bytes this machine has put into the tunnel towards this node, cumulative.
+    pub sent: u64,
+    /// Bytes that have come back from it, cumulative.
+    pub received: u64,
+    /// Flows open through it right now. The only figure here that ever goes down.
+    pub active: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +197,40 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&link).unwrap(),
             r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay"}"#
+        );
+    }
+
+    /// The frontend keys health off `connection`, the same string a link carries, and reads the
+    /// two durations as optional seconds — so both the key spelling and the `null`s have to
+    /// hold.
+    #[test]
+    fn serializes_node_health() {
+        let health = NodeHealthStatus {
+            connection: "node1ticket".to_string(),
+            reachable: false,
+            consecutive_failures: 3,
+            down_for_secs: Some(90),
+            since_last_probe_secs: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&health).unwrap(),
+            r#"{"connection":"node1ticket","reachable":false,"consecutiveFailures":3,"downForSecs":90,"sinceLastProbeSecs":null}"#
+        );
+    }
+
+    /// The frontend pairs a volume with a link and a health reading by `connection`, and reads
+    /// all three figures as plain numbers — so the camelCase spelling has to hold.
+    #[test]
+    fn serializes_node_traffic() {
+        let traffic = NodeTrafficStatus {
+            connection: "node1ticket".to_string(),
+            sent: 1_048_576,
+            received: 512,
+            active: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&traffic).unwrap(),
+            r#"{"connection":"node1ticket","sent":1048576,"received":512,"active":3}"#
         );
     }
 }

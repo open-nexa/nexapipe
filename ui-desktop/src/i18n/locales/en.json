@@ -78,6 +78,20 @@
     "relay": "Relay",
     "connecting": "Connecting"
   },
+  "health": {
+    "up": "Answers",
+    "down": "No answer",
+    "downFor": "down {duration}",
+    "seconds": "{count}s",
+    "minutes": "{count}m",
+    "hours": "{count}h",
+    "days": "{count}d"
+  },
+  "traffic": {
+    "sent": "Sent",
+    "received": "Received",
+    "flows": "{count} flows"
+  },
   "connect": {
     "title": "Connect",
     "started": "Proxy started",
