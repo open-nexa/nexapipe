@@ -257,10 +257,16 @@ class VpnViewModel : ViewModel() {
      * place rather than zeroing every row. A null answer means nothing has been started — or
      * the endpoint group is gone — and clears the map, so no total survives the session it
      * was counted in.
+     *
+     * The read and the decoding stay on whichever dispatcher the caller was on — the polling
+     * loop runs on [Dispatchers.IO], and a JNI call has no business on the main thread — but
+     * the map itself is UI state, so it is published on [Dispatchers.Main]. Writing it from
+     * the polling thread would work, because `MutableStateFlow.value` is thread-safe, and
+     * would still be the wrong place to write it from.
      */
-    fun refreshTraffic() {
+    suspend fun refreshTraffic() {
         if (!IrohProxy.isNativeLoaded()) {
-            if (traffic.value.isNotEmpty()) traffic.value = emptyMap()
+            withContext(Dispatchers.Main) { traffic.value = emptyMap() }
             return
         }
         val raw = try {
@@ -269,7 +275,8 @@ class VpnViewModel : ViewModel() {
             addLog("Could not read traffic counters: ${e.message}")
             return
         }
-        traffic.value = if (raw == null) emptyMap() else parseNodeTraffic(raw)
+        val totals = if (raw == null) emptyMap() else parseNodeTraffic(raw)
+        withContext(Dispatchers.Main) { traffic.value = totals }
     }
 
     /** Decodes `id=direct;id2=relay` — the format the native side writes. */
