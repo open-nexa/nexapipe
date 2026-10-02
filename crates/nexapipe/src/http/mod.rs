@@ -534,6 +534,11 @@ pub async fn proxy_to_backend_streaming(
         builder = builder.header("content-length", full_body.len());
     }
 
+    // The body is complete at this point in every branch above, and this is the
+    // only place it is whole: what goes out is a reconstructed request with its
+    // own framing, so its size on the way out is not what arrived.
+    crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
+
     let proxied_req = builder.body(Full::new(full_body.into()))?;
 
     tracing::debug!(

@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::metrics::CopyLeg;
+
 /// Read size for the copy loops. Large enough that a 1400-byte inner segment never
 /// needs two syscalls, small enough to stay off the allocator's slow path.
 pub const COPY_BUF_SIZE: usize = 16 * 1024;
@@ -84,8 +86,8 @@ where
     // is dropped mid-flight and a shutdown written inside it would never run. Shutting
     // both write halves down out here is what makes the half-close reach both peers.
     let finished = tokio::select! {
-        result = copy_one_way(&mut client_read, &mut backend_write, label, "client->backend") => result,
-        result = copy_one_way(&mut backend_read, &mut client_write, label, "backend->client") => result,
+        result = copy_one_way(&mut client_read, &mut backend_write, label, CopyLeg::Client) => result,
+        result = copy_one_way(&mut backend_read, &mut client_write, label, CopyLeg::Backend) => result,
     };
 
     let _ = backend_write.shutdown().await;
@@ -95,16 +97,22 @@ where
 }
 
 /// Copies until `reader` ends. Returns `Ok` on a clean EOF, and the error otherwise.
+///
+/// `leg` says which way these bytes are going, and therefore which counter they
+/// belong in. It replaces the direction string this used to take: the label in
+/// the debug lines below and the answer "was this accepted or served" are one
+/// fact, and two parameters carrying it could disagree.
 async fn copy_one_way<R, W>(
     reader: &mut R,
     writer: &mut W,
     label: &str,
-    direction: &str,
+    leg: CopyLeg,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let direction = leg.label();
     let mut buf = vec![0u8; COPY_BUF_SIZE];
     loop {
         let n = match reader.read(&mut buf).await {
@@ -126,6 +134,10 @@ where
             tracing::debug!("{}: {} flush failed: {}", label, direction, e);
             e
         })?;
+        // Counted last, after both have succeeded: a chunk that never left this
+        // process was not served to anybody, and reporting it would put bytes
+        // in the total that no client ever received.
+        crate::metrics::METRICS.record_tunnel_bytes(leg, n as u64);
     }
 }
 
@@ -314,6 +326,44 @@ mod tests {
 
         let mut rest = Vec::new();
         let _ = client_end.read_to_end(&mut rest).await;
+    }
+
+    /// Which counter each direction lands in.
+    ///
+    /// Asserted as "at least", not "exactly": these are the process-wide
+    /// counters, another test in this binary — an L4 tunnel, say — can be
+    /// moving them at the same time. Both legs have to have moved by what this
+    /// transfer put through them, and neither may move into the other's
+    /// direction, which is the part worth locking down.
+    #[tokio::test]
+    async fn each_direction_is_counted_on_the_leg_it_crossed() {
+        use crate::metrics::METRICS;
+
+        let before = METRICS.snapshot();
+        let (mut client_end, mut backend_end, client_side, backend_side) = pair();
+        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+
+        client_end.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        backend_end.read_exact(&mut buf).await.unwrap();
+
+        backend_end.write_all(b"pong ").await.unwrap();
+        let mut buf = [0u8; 5];
+        client_end.read_exact(&mut buf).await.unwrap();
+
+        drop(client_end);
+        drop(backend_end);
+        copy.await.unwrap().unwrap();
+
+        let after = METRICS.snapshot();
+        assert!(
+            after.bytes_received - before.bytes_received >= 4,
+            "bytes from the client belong in received"
+        );
+        assert!(
+            after.bytes_sent - before.bytes_sent >= 5,
+            "bytes from the backend belong in sent"
+        );
     }
 
     #[tokio::test]

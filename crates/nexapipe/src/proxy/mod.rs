@@ -892,6 +892,23 @@ async fn proxy_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
+    // Two different claims below, and deliberately so.
+    //
+    // `log_access` prints what the header says, because that is what it has
+    // always printed and people parse that field. The metric counts what this
+    // listener actually put on the wire. For most responses those are the same
+    // number — which is why taking both from here was worth doing — but a HEAD,
+    // a 1xx, a 204 and a 304 describe a representation without sending one, and
+    // every one of them keeps `Content-Length` while doing it (RFC 9110 s6.4.1,
+    // s8.3). Counting those bytes would say NexaPipe served something it never
+    // wrote, which is worse than the two disagreeing.
+    let delivered = if response_has_body(&method, status) {
+        content_length
+    } else {
+        0
+    };
+    crate::metrics::METRICS.record_bytes_sent(delivered as u64);
+
     log::log_access(
         &request_id,
         &remote_addr,
@@ -905,6 +922,19 @@ async fn proxy_handler(
     Ok(with_request_id(response, &request_id))
 }
 
+/// Whether a response to this request puts a body on the wire.
+///
+/// RFC 9110 s6.4.1 and s8.3: a HEAD response, a 1xx, a 204 and a 304 answer
+/// without a body, and each of them may still carry `Content-Length` saying how
+/// long that absent body would have been. Anything counting bytes as traffic has
+/// to ask this before reading the header.
+fn response_has_body(method: &str, status: u16) -> bool {
+    if method == "HEAD" {
+        return false;
+    }
+    !matches!(status, 204 | 304) && !(100..200).contains(&status)
+}
+
 pub async fn run_local_proxy(
     local_proxy_config: LocalProxyConfig,
     shutdown_signal: Arc<ShutdownSignal>,
@@ -916,7 +946,7 @@ const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
-    use super::{may_bind_plaintext, plaintext_auth_conflict};
+    use super::{may_bind_plaintext, plaintext_auth_conflict, response_has_body};
     use std::net::SocketAddr;
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
@@ -967,5 +997,38 @@ mod tests {
             plaintext_auth_conflict(addr("127.0.0.1", 8080), false, true),
             None
         );
+    }
+
+    /// The case where the metric must not follow the log line. A `HEAD` says how
+    /// long the `GET` answer would have been and then sends none of it, so
+    /// counting the header would report a download that never happened — and a
+    /// monitoring client scraping this would bill someone for it.
+    #[test]
+    fn head_has_no_body_whatever_content_length_says() {
+        assert!(!response_has_body("HEAD", 200));
+        assert!(!response_has_body("HEAD", 404));
+        // Its content-length describes the GET, which nobody asked for.
+        assert!(!response_has_body("HEAD", 204));
+    }
+
+    /// The statuses that answer without a payload, and keep `Content-Length`
+    /// from the representation they stand in for.
+    #[test]
+    fn no_content_and_not_modified_are_answered_without_a_body() {
+        assert!(!response_has_body("GET", 204));
+        assert!(!response_has_body("GET", 304));
+        // Informational: there is nothing else these could be carrying yet.
+        assert!(!response_has_body("GET", 100));
+        assert!(!response_has_body("GET", 103));
+    }
+
+    /// The ordinary case, which is everything else on every other method.
+    #[test]
+    fn everything_else_delivers_what_content_length_says() {
+        assert!(response_has_body("GET", 200));
+        assert!(response_has_body("GET", 404));
+        assert!(response_has_body("POST", 201));
+        // Not HEAD, and not one of the bodyless statuses.
+        assert!(response_has_body("OPTIONS", 200));
     }
 }

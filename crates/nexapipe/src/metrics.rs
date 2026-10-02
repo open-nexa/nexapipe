@@ -22,6 +22,32 @@
 //! answer, so it is read at exposition time from the live routing table; a
 //! counter maintained by the probes could only drift from it.
 //!
+//! # Where bytes come from
+//!
+//! Bytes are counted on the **client leg** of every conversation and nowhere
+//! else, which is the only place one number can mean one thing across paths
+//! this different. `sent` is what reached a client, `received` is what a client
+//! handed us.
+//!
+//! - **An HTTP response is not counted twice.** [`crate::http`] already counts
+//!   what it delivered, because the access log prints it, and this module reads
+//!   that number off the summary rather than looking at the wire again — two
+//!   counts of one transfer are one count waiting to disagree with the other.
+//!   What the summary carries includes the response head and any chunk framing,
+//!   because that is what the client actually received.
+//! - **A request is counted where it is assembled**: the head where it is
+//!   parsed, the body once it has been read whole. One refused before its head
+//!   finished is not counted, which is also what its access log line reports.
+//! - **Tunnels** — TLS passthrough, L4 TCP, WebSocket after the handshake — are
+//!   counted in [`crate::stream_util`], and a chunk is recorded only once it has
+//!   left this process, so a write that failed reports nothing.
+//! - **L4 UDP** keeps its own pair of loops and is counted there. Its framing is
+//!   not: a datagram counts as its payload, the way every number here counts
+//!   bytes an application would recognise.
+//! - **The plaintext listener** records what it served and nothing else. It is a
+//!   second entry point of a different shape, and `content-length` was always
+//!   all it had.
+//!
 //! # One process, one set of counters
 //!
 //! These are process-wide by nature — there is one instance behind one set of
@@ -68,6 +94,10 @@ pub struct Metrics {
     requests: [AtomicU64; STATUS_CLASSES],
     /// Milliseconds spent answering them, summed.
     request_duration_ms: AtomicU64,
+    /// Bytes served to clients. See the module docs for where these come from.
+    bytes_sent: AtomicU64,
+    /// Bytes accepted from clients.
+    bytes_received: AtomicU64,
     /// L4 flows by protocol and status class: `[tcp, udp][class]`.
     flows: [[AtomicU64; STATUS_CLASSES]; L4_PROTOS],
 }
@@ -108,6 +138,8 @@ impl Metrics {
                 AtomicU64::new(0),
             ],
             request_duration_ms: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
             flows: [
                 [
                     AtomicU64::new(0),
@@ -159,6 +191,24 @@ impl Metrics {
         self.flows[proto][status_class(status)].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records bytes served to a client.
+    pub fn record_bytes_sent(&self, n: u64) {
+        self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records bytes accepted from a client.
+    pub fn record_bytes_received(&self, n: u64) {
+        self.bytes_received.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` bytes that crossed one leg of a tunnel.
+    pub fn record_tunnel_bytes(&self, leg: CopyLeg, n: u64) {
+        match leg {
+            CopyLeg::Client => self.record_bytes_received(n),
+            CopyLeg::Backend => self.record_bytes_sent(n),
+        }
+    }
+
     /// Connections open right now.
     ///
     /// Derived from the path buckets rather than kept separately: two counts of
@@ -195,6 +245,8 @@ impl Metrics {
                 })
                 .collect(),
             request_duration_ms: self.request_duration_ms.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
             l4_flows: L4_LABELS
                 .iter()
                 .enumerate()
@@ -291,6 +343,25 @@ impl Metrics {
             self.request_duration_ms.load(Ordering::Relaxed),
         );
 
+        // One metric with a label rather than two counters: they are the same
+        // number seen from either side, and a dashboard should be able to ask
+        // for both without being told there are two.
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_traffic_bytes_total Bytes that crossed the client leg of a \
+             connection. Sent reached the client; received came from it."
+        );
+        let _ = writeln!(out, "# TYPE nexapipe_traffic_bytes_total counter");
+        for (label, value) in [
+            ("sent", self.bytes_sent.load(Ordering::Relaxed)),
+            ("received", self.bytes_received.load(Ordering::Relaxed)),
+        ] {
+            let _ = writeln!(
+                out,
+                "nexapipe_traffic_bytes_total{{direction=\"{label}\"}} {value}"
+            );
+        }
+
         let _ = writeln!(
             out,
             "# HELP nexapipe_l4_flows_total L4 flows that ended, by protocol and status."
@@ -372,6 +443,10 @@ pub struct Snapshot {
     pub requests_by_class: Vec<(String, u64)>,
     /// Milliseconds spent answering them, summed.
     pub request_duration_ms: u64,
+    /// Bytes served to clients, counted on the client leg. See the module docs.
+    pub bytes_sent: u64,
+    /// Bytes accepted from clients, counted the same way.
+    pub bytes_received: u64,
     /// L4 flows that ended, as `(protocol, status class, count)`.
     pub l4_flows: Vec<(String, String, u64)>,
 }
@@ -439,6 +514,31 @@ impl Drop for PathTicket {
         self.metrics
             .bucket(self.kind)
             .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Which leg of a tunnel a copied chunk came from.
+///
+/// A copy loop knows which way it is pumping but not what that means to anyone
+/// counting, so it hands the leg back instead of deciding. `stream_util` is
+/// generic over two *streams* and deliberately not over what they are: passing
+/// this is how the answer stays "bytes from a client" rather than "bytes from
+/// whichever argument came first".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CopyLeg {
+    /// Read off the client: bytes this process accepted.
+    Client,
+    /// Read off the backend: bytes this process serves to the client.
+    Backend,
+}
+
+impl CopyLeg {
+    /// How this leg names itself in a debug log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Client => "client->backend",
+            Self::Backend => "backend->client",
+        }
     }
 }
 
@@ -514,6 +614,7 @@ mod tests {
             "nexapipe_connections_by_path",
             "nexapipe_requests_total",
             "nexapipe_request_duration_ms_total",
+            "nexapipe_traffic_bytes_total",
             "nexapipe_l4_flows_total",
             "nexapipe_backends_up",
             "nexapipe_backends_down",
@@ -529,7 +630,41 @@ mod tests {
         assert!(body.contains("nexapipe_connections_by_path{kind=\"direct\"} 0"));
         assert!(body.contains("nexapipe_connections_by_path{kind=\"relayed\"} 0"));
         assert!(body.contains("nexapipe_requests_total{status_class=\"2xx\"} 0"));
+        assert!(body.contains("nexapipe_traffic_bytes_total{direction=\"sent\"} 0"));
+        assert!(body.contains("nexapipe_traffic_bytes_total{direction=\"received\"} 0"));
         assert!(body.contains("nexapipe_l4_flows_total{proto=\"udp\",status_class=\"4xx\"} 0"));
+    }
+
+    /// The two directions are separate numbers about the same transfer, so each
+    /// has to accumulate without touching the other — otherwise "how much did
+    /// we serve" and "how much did we take" would be answers to one question.
+    #[test]
+    fn the_two_directions_count_independently_and_cumulatively() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.bytes_sent.load(Ordering::Relaxed), 0);
+
+        metrics.record_bytes_sent(1200);
+        metrics.record_bytes_sent(300);
+        metrics.record_bytes_received(64);
+
+        assert_eq!(metrics.bytes_sent.load(Ordering::Relaxed), 1500);
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 64);
+    }
+
+    /// A tunnel reports its two legs as the two directions, which is the whole
+    /// reason [`CopyLeg`] exists: the loop that knows the direction is not the
+    /// place that knows what it means.
+    #[test]
+    fn a_tunnels_two_legs_land_in_the_two_directions() {
+        let metrics = Metrics::new();
+        metrics.record_tunnel_bytes(CopyLeg::Client, 40);
+        metrics.record_tunnel_bytes(CopyLeg::Backend, 9000);
+
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 40);
+        assert_eq!(metrics.bytes_sent.load(Ordering::Relaxed), 9000);
+
+        assert_eq!(CopyLeg::Client.label(), "client->backend");
+        assert_eq!(CopyLeg::Backend.label(), "backend->client");
     }
 
     /// A request is counted in its own class and nowhere else, which is the only
