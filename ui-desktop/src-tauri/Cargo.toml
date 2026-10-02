@@ -56,7 +56,7 @@ hmac = "0.13"
 sha2 = "0.11"
 # Credentials (TOTP secrets, enrollment tokens, relay bearers) are encrypted at
 # rest with AES-256-GCM under a master key the OS keychain holds.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # Every platform gets a real backend, because without one keyring falls back to a
 # credential store that is only as private as the filesystem: `linux-native` on
 # its own is the kernel keyring, which does not survive a reboot, so Linux takes
