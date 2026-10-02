@@ -32,11 +32,36 @@ macro_rules! jni_log {
 pub struct PooledConnection {
     conn: Connection,
     pool_index: usize,
+    /// The backend this connection reaches, when somebody is keeping health for
+    /// it.
+    ///
+    /// `None` for a connection nobody is keeping health for, which is a pool
+    /// standing on its own rather than one inside an [`EndpointGroup`].
+    ///
+    /// Carried by the connection so that the caller which spent its attempts on
+    /// it can name whose health those attempts were about. Asking the group
+    /// afterwards would be asking again, and by then it may have handed somebody
+    /// else out; naming the backend at every failure path instead would mean
+    /// every one of them knowing how health is recorded.
+    node: Option<EndpointId>,
 }
 
 impl PooledConnection {
     pub fn new(conn: Connection, pool_index: usize) -> Self {
-        Self { conn, pool_index }
+        Self {
+            conn,
+            pool_index,
+            node: None,
+        }
+    }
+
+    /// A connection whose backend the group keeps health for.
+    pub(crate) fn tracked(conn: Connection, pool_index: usize, node: EndpointId) -> Self {
+        Self {
+            conn,
+            pool_index,
+            node: Some(node),
+        }
     }
 
     pub fn into_inner(self) -> Connection {
@@ -47,6 +72,12 @@ impl PooledConnection {
         &self.conn
     }
 
+    /// The backend this connection reaches, when somebody is keeping health for
+    /// it.
+    pub fn node(&self) -> Option<EndpointId> {
+        self.node
+    }
+
     /// Closes the connection instead of just letting go of it.
     ///
     /// Dropping one handle does not close a connection: it closes when the
@@ -54,6 +85,15 @@ impl PooledConnection {
     /// a caller that has decided the connection is dead has to say so or it
     /// stays open — still in the pool's address space, still counted, and
     /// still handed to whatever asks next.
+    ///
+    /// Says nothing about the backend's health, and that is the point. Most of
+    /// what reaches here is a connection the peer closed while nothing was
+    /// using it — the ordinary case these retry loops exist for, and one that
+    /// says nothing about whether the backend itself answers. Condemning it
+    /// here would take a healthy backend out of rotation for as long as the
+    /// next probe is away, and on the paths with no probe at all, permanently.
+    /// The failure worth recording is the one no attempt outlived: see
+    /// [`EndpointGroup::record_request_failure`].
     pub fn discard(self, reason: &'static [u8]) {
         self.conn.close(0u32.into(), reason);
     }
@@ -63,29 +103,190 @@ impl PooledConnection {
     }
 }
 
+/// Folds one answer, or one failure, into the health table, logging the changes.
+///
+/// Two callers, one fact: the background probe asks every backend whether it
+/// still answers, and a request that could not be served after spending every
+/// attempt it had says the same thing
+/// about the same backend. Keeping them in one place is what stops
+/// `health_snapshot()` from having two meanings of "down".
+///
+/// Not reachable from a connection: the two callers are the probe task and the
+/// retry loop that ran out of attempts, and both already hold the group.
+fn record_outcome(
+    health: &Mutex<HashMap<EndpointId, NodeHealth>>,
+    backend_id: EndpointId,
+    answered: bool,
+) {
+    let mut health = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = health.entry(backend_id).or_insert(NodeHealth {
+        node: backend_id,
+        // Not "unknown": a backend that has not been probed has not answered,
+        // and the caller asking is about to be told so.
+        reachable: false,
+        consecutive_failures: 0,
+        last_ok: None,
+        last_probe: None,
+    });
+
+    let was_reachable = entry.reachable;
+    entry.last_probe = Some(Instant::now());
+
+    if answered {
+        entry.consecutive_failures = 0;
+        entry.last_ok = Some(Instant::now());
+        entry.reachable = true;
+        if !was_reachable {
+            jni_log!("[health] Node {} answers again", backend_id);
+            #[cfg(feature = "tracing")]
+            tracing::info!("backend {} answers again", backend_id);
+        }
+        return;
+    }
+
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    entry.reachable = false;
+    // The first failure is news. So is every tenth one — a backend that has
+    // been down for an hour has failed a hundred times, and a log line per
+    // failure would bury everything else.
+    if was_reachable || entry.consecutive_failures % PROBE_REMINDER_EVERY == 1 {
+        jni_log!(
+            // Not "probes in a row": this counter also counts requests that got
+            // nowhere, and calling those probes would make an operator looking
+            // into one failed request go and read the probe instead.
+            "[health] Node {} did not answer ({} failures in a row)",
+            backend_id,
+            entry.consecutive_failures
+        );
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            "backend {} did not answer ({} failures in a row)",
+            backend_id,
+            entry.consecutive_failures
+        );
+    }
+}
+
 pub struct DomainPools {
     pools: Vec<Arc<IrohConnectionPool>>,
     balancer: Box<dyn LoadBalancer + Sync + Send>,
+    /// What the probe last found, shared with the group rather than copied.
+    ///
+    /// One domain's pools are a subset of the group's backends, and the probe
+    /// asks each backend once whoever serves it, so there is one table and
+    /// every domain reads it.
+    health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
 }
 
 impl DomainPools {
-    pub fn new(pools: Vec<Arc<IrohConnectionPool>>, strategy: LoadBalancingStrategy) -> Self {
+    pub fn new(
+        pools: Vec<Arc<IrohConnectionPool>>,
+        strategy: LoadBalancingStrategy,
+        health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
+    ) -> Self {
         let balancer: Box<dyn LoadBalancer + Sync + Send> = match strategy {
             LoadBalancingStrategy::RoundRobin => Box::new(RoundRobinBalancer::new()),
             LoadBalancingStrategy::Random => Box::new(RandomBalancer::new()),
         };
-        Self { pools, balancer }
+        Self {
+            pools,
+            balancer,
+            health,
+        }
     }
 
-    pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
+    /// Which backends may be handed out: every one the health table does not
+    /// say is down.
+    ///
+    /// A backend that has never been asked is included — "not asked" is not
+    /// "not answering", and refusing on it would leave the group unusable for
+    /// the interval before the first probe round and after every restart.
+    fn candidates(&self) -> Vec<bool> {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.pools
+            .iter()
+            .map(|pool| {
+                health
+                    .get(&pool.backend_id())
+                    .is_none_or(|node| node.reachable)
+            })
+            .collect()
+    }
+
+    /// Which pool serves the next request. Decided here, and only here, because
+    /// every caller reaches a backend through this one method.
+    ///
+    /// A domain with several backends and nothing answering refuses without
+    /// dialling: the answer is already known, and a connect timeout would only
+    /// deliver this refusal late. A domain with one is handed out anyway —
+    /// refusing the only backend there is buys nothing and turns every request
+    /// into a failure, which is the rule the server already follows for the
+    /// same case.
+    fn choose(&self) -> Result<usize, ClientError> {
         if self.pools.is_empty() {
             return Err(ClientError::InvalidConfig(
                 "No endpoint pools configured".to_string(),
             ));
         }
-        let index = self.balancer.select(self.pools.len());
-        let conn = self.pools[index].get_connection().await?;
-        Ok(PooledConnection::new(conn, index))
+
+        let candidates = self.candidates();
+        if let Some(index) = self.balancer.select(&candidates) {
+            return Ok(index);
+        }
+
+        if self.pools.len() == 1 {
+            return Ok(0);
+        }
+
+        Err(ClientError::ConnectionFailed(format!(
+            "no backend is answering: {}",
+            self.node_ids()
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
+    pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
+        let index = self.choose()?;
+        let pool = &self.pools[index];
+        let backend_id = pool.backend_id();
+
+        // Said here rather than left to the caller, because this is the only
+        // place that knows which backend refused — the caller gets an error
+        // without a name in it — and because nobody else says it: the retry
+        // loops above only ever observe connections that were handed to them.
+        //
+        // A backend that cannot be dialled leaves no connection to discover
+        // later, so without this line failure to reach one would never reach
+        // the health table at all: another request would come along and spend a
+        // full connect timeout on the same backend before trying a different
+        // one, which is exactly the cost health-aware routing exists to avoid.
+        //
+        // Counting failure to connect, or to authenticate, as "down" reads as
+        // harsh, and it is the same verdict the probe reaches: `preconnect`
+        // connects and authenticates too, from the same pool, so nothing here
+        // can mark a backend down that the next probe then marks back up.
+        //
+        // Not `InvalidConfig`, which is the only way this pool reports the
+        // endpoint being gone: that is this process having let go of its own
+        // side, which every pool says at once on shutdown and which is news
+        // about nobody's backend. Calling it "down" would paint the whole node
+        // list unreachable each time a tunnel stops.
+        match pool.get_connection().await {
+            Ok(conn) => Ok(PooledConnection::tracked(conn, index, backend_id)),
+            Err(e @ ClientError::InvalidConfig(_)) => Err(e),
+            Err(e) => {
+                record_outcome(&self.health, backend_id, false);
+                Err(e)
+            }
+        }
     }
 
     pub async fn return_connection(&self, pooled_conn: PooledConnection) {
@@ -117,7 +318,11 @@ pub struct EndpointGroup {
     /// and the only writer is the probe task. `std::sync` and not `tokio`: the
     /// critical section is a few map lookups, so there is nothing to yield on,
     /// and `health_snapshot()` then works off a runtime as well as on one.
-    health: Mutex<HashMap<EndpointId, NodeHealth>>,
+    ///
+    /// Shared rather than owned because the pools read it: which backend serves
+    /// a request is decided per domain, and the domain's pools need the answer
+    /// the probe wrote for that backend.
+    health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
     /// Set for good by [`Self::close_all`], and read by the probe before it
     /// dials anything.
     ///
@@ -159,7 +364,10 @@ pub struct NodeHealth {
     pub node: EndpointId,
     /// Whether it answered the last time it was asked.
     pub reachable: bool,
-    /// How many probes in a row have failed. Zero since the last success.
+    /// How many failures in a row it has had. Zero since the last success.
+    ///
+    /// Not only probes: a request that spent every attempt it had without being
+    /// served counts too, and reaches this counter from the same place.
     pub consecutive_failures: u32,
     /// When it last answered — `None` when it never has.
     pub last_ok: Option<Instant>,
@@ -310,6 +518,10 @@ impl EndpointGroup {
             );
         }
 
+        // Built here and shared with every pool: the health table is one fact
+        // per backend, not one per domain, so it cannot live inside a pool.
+        let health = Arc::new(Mutex::new(HashMap::new()));
+
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
             jni_log!(
@@ -322,7 +534,8 @@ impl EndpointGroup {
                 .filter_map(|k| pool_by_key.get(&k).cloned())
                 .collect();
             if !pools.is_empty() {
-                let domain_pools = Arc::new(DomainPools::new(pools, default_strategy));
+                let domain_pools =
+                    Arc::new(DomainPools::new(pools, default_strategy, health.clone()));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
                     "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
@@ -341,6 +554,7 @@ impl EndpointGroup {
             Some(Arc::new(DomainPools::new(
                 vec![Arc::new(pool)],
                 default_strategy,
+                health.clone(),
             )))
         } else {
             None
@@ -349,7 +563,7 @@ impl EndpointGroup {
         Ok(Self {
             domains,
             default_pools,
-            health: Mutex::new(HashMap::new()),
+            health,
             probe_stopped: AtomicBool::new(false),
         })
     }
@@ -418,6 +632,10 @@ impl EndpointGroup {
             );
         }
 
+        // Built here and shared with every pool: the health table is one fact
+        // per backend, not one per domain, so it cannot live inside a pool.
+        let health = Arc::new(Mutex::new(HashMap::new()));
+
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
             jni_log!(
@@ -430,7 +648,8 @@ impl EndpointGroup {
                 .filter_map(|k| pool_by_key.get(&k).cloned())
                 .collect();
             if !pools.is_empty() {
-                let domain_pools = Arc::new(DomainPools::new(pools, default_strategy));
+                let domain_pools =
+                    Arc::new(DomainPools::new(pools, default_strategy, health.clone()));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
                     "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
@@ -449,6 +668,7 @@ impl EndpointGroup {
             Some(Arc::new(DomainPools::new(
                 vec![Arc::new(pool)],
                 default_strategy,
+                health.clone(),
             )))
         } else {
             None
@@ -457,20 +677,22 @@ impl EndpointGroup {
         Ok(Self {
             domains,
             default_pools,
-            health: Mutex::new(HashMap::new()),
+            health,
             probe_stopped: AtomicBool::new(false),
         })
     }
 
     pub async fn new_with_single_pool(conn_pool: IrohConnectionPool) -> Self {
+        let health = Arc::new(Mutex::new(HashMap::new()));
         let default_pools = Some(Arc::new(DomainPools::new(
             vec![Arc::new(conn_pool)],
             LoadBalancingStrategy::RoundRobin,
+            health.clone(),
         )));
         Self {
             domains: HashMap::new(),
             default_pools,
-            health: Mutex::new(HashMap::new()),
+            health,
             probe_stopped: AtomicBool::new(false),
         }
     }
@@ -775,6 +997,23 @@ impl EndpointGroup {
             }
         }
 
+        // What the probe would have recorded, written now: startup has just
+        // dialled every backend, so the group knows which of them answer from
+        // the first request instead of from the first probe round, which is up
+        // to a whole interval later. A backend that answered the handshake and
+        // then asked for 2FA counts as answering — it is reachable, and what it
+        // wants is a credential, which is a different thing to go and fix.
+        for backend_id in report.reachable.iter().chain(report.auth_required.iter()) {
+            self.record_probe(*backend_id, true);
+        }
+        for backend_id in report
+            .unreachable
+            .iter()
+            .filter(|id| !report.auth_required.contains(id))
+        {
+            self.record_probe(*backend_id, false);
+        }
+
         jni_log!(
             "[preconnect] Connectivity test done: {}/{} node(s) reachable",
             report.reachable.len(),
@@ -858,57 +1097,35 @@ impl EndpointGroup {
         }
     }
 
-    /// Folds one probe result into the group's health, logging the changes.
-    ///
-    /// The probe is the only writer, and it writes from one task, so the only
-    /// thing the lock protects is the snapshot a UI may be reading concurrently.
+    /// Folds one probe result into the group's health.
     fn record_probe(&self, backend_id: EndpointId, answered: bool) {
-        let mut health = self
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = health.entry(backend_id).or_insert(NodeHealth {
-            node: backend_id,
-            // Not "unknown": a backend that has not been probed has not
-            // answered, and the caller asking is about to be told so.
-            reachable: false,
-            consecutive_failures: 0,
-            last_ok: None,
-            last_probe: None,
-        });
+        record_outcome(&self.health, backend_id, answered);
+    }
 
-        let was_reachable = entry.reachable;
-        entry.last_probe = Some(Instant::now());
-
-        if answered {
-            entry.consecutive_failures = 0;
-            entry.last_ok = Some(Instant::now());
-            entry.reachable = true;
-            if !was_reachable {
-                jni_log!("[health] Node {} answers again", backend_id);
-                #[cfg(feature = "tracing")]
-                tracing::info!("backend {} answers again", backend_id);
+    /// Says that a request spent every attempt it had on `backends` without
+    /// being served by any of them.
+    ///
+    /// The counterpart to a probe: same table, same one meaning of "down", but
+    /// the evidence is stronger, because somebody asked for real and waited.
+    ///
+    /// Takes the list rather than one backend so that a backend is counted once
+    /// however many attempts landed on it: one request that failed is one
+    /// failure, not three, and a counter someone reads has to mean one thing.
+    ///
+    /// Callers reach this through [`PooledConnection::node`] only once every
+    /// attempt has failed — never per attempt. That boundary is what keeps an
+    /// ordinary stale connection from taking its backend out of rotation: the
+    /// retry loops exist precisely because the first attempt often draws a
+    /// connection the peer closed while nothing was using it, and the second
+    /// one usually succeeds.
+    pub fn record_request_failures(&self, backends: &[EndpointId]) {
+        let mut counted: Vec<EndpointId> = Vec::with_capacity(backends.len());
+        for backend in backends.iter().copied() {
+            if counted.contains(&backend) {
+                continue;
             }
-            return;
-        }
-
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.reachable = false;
-        // The first failure is news. So is every tenth one — a backend that has
-        // been down for an hour has failed a hundred probes, and a log line per
-        // probe would bury everything else.
-        if was_reachable || entry.consecutive_failures % PROBE_REMINDER_EVERY == 1 {
-            jni_log!(
-                "[health] Node {} did not answer ({} probes in a row)",
-                backend_id,
-                entry.consecutive_failures
-            );
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                "backend {} did not answer ({} probes in a row)",
-                backend_id,
-                entry.consecutive_failures
-            );
+            record_outcome(&self.health, backend, false);
+            counted.push(backend);
         }
     }
 
@@ -1423,5 +1640,214 @@ mod tests {
                 .map(|n| n.node.to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Two backends behind one domain, which is the only shape in which there
+    /// is anything to choose between.
+    async fn shared_domain_group(backends: &[EndpointId]) -> EndpointGroup {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        EndpointGroup::new_with_nodes_and_endpoint(
+            backends
+                .iter()
+                .map(|backend| node(*backend, "shared.example.com"))
+                .collect(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a bogus but well-formed node ID must still build a group")
+    }
+
+    /// The point of probing: a backend that stopped answering stops being
+    /// handed out, instead of being found dead by the request that needed it.
+    #[tokio::test]
+    async fn a_backend_the_probe_found_dead_stops_being_handed_out() {
+        let up = unused_backend_id();
+        let down = unused_backend_id();
+        let group = shared_domain_group(&[up, down]).await;
+        group.record_probe(up, true);
+        group.record_probe(down, false);
+
+        let pools = group
+            .domains
+            .get("shared.example.com")
+            .expect("both backends serve it");
+        assert_eq!(pools.pools.len(), 2, "the domain must see both backends");
+
+        for _ in 0..4 {
+            let index = pools.choose().expect("one backend answers");
+            assert_eq!(
+                pools.pools[index].backend_id(),
+                up,
+                "the backend that is down was handed out"
+            );
+        }
+    }
+
+    /// "Not asked" is not "not answering": a group that has not probed yet has
+    /// to keep serving, or the tunnel would be dead for its first interval.
+    #[tokio::test]
+    async fn a_backend_that_has_never_been_probed_is_still_handed_out() {
+        let group = shared_domain_group(&[unused_backend_id(), unused_backend_id()]).await;
+
+        let pools = group
+            .domains
+            .get("shared.example.com")
+            .expect("the domain must have pools");
+        assert!(pools.choose().is_ok(), "nothing has said it is down yet");
+    }
+
+    /// The rule the server already follows: with several backends and none of
+    /// them answering, refuse at once instead of spending a connect timeout on
+    /// delivering the refusal late.
+    #[tokio::test]
+    async fn a_domain_with_nothing_answering_refuses_before_dialling() {
+        let first = unused_backend_id();
+        let second = unused_backend_id();
+        let group = shared_domain_group(&[first, second]).await;
+        group.record_probe(first, false);
+        group.record_probe(second, false);
+
+        let pools = group
+            .domains
+            .get("shared.example.com")
+            .expect("the domain must have pools");
+        let err = pools.choose().expect_err("nothing answers");
+        assert!(err.to_string().contains("no backend is answering"), "{err}");
+    }
+
+    /// ...and the exception to it. With one backend there is nothing to choose
+    /// between, so refusing would turn every request into a failure and buy
+    /// nothing: hand it out and let the request fail loudly.
+    #[tokio::test]
+    async fn the_only_backend_is_handed_out_even_when_it_is_down() {
+        let only = unused_backend_id();
+        let group = shared_domain_group(&[only]).await;
+        group.record_probe(only, false);
+
+        let pools = group
+            .domains
+            .get("shared.example.com")
+            .expect("the domain must have pools");
+        assert_eq!(
+            pools.choose().expect("there is nothing to choose between"),
+            0
+        );
+    }
+
+    /// The other half of the same change: a backend a request could not be
+    /// served by — after every attempt was spent, not on the first connection
+    /// that turned out stale — stops being handed out, while the one nothing
+    /// happened to keeps answering.
+    #[tokio::test]
+    async fn a_request_that_spent_every_attempt_marks_its_backend_down() {
+        let up = unused_backend_id();
+        let down = unused_backend_id();
+        let group = group_with(&[up, down]).await;
+        group.record_probe(up, true);
+        group.record_probe(down, true);
+
+        group.record_request_failures(&[down]);
+
+        let snapshot = group.health_snapshot();
+        let down = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node == down)
+            .expect("it was probed");
+        assert!(
+            !down.reachable,
+            "a request that failed is a backend that is down"
+        );
+        assert_eq!(down.consecutive_failures, 1);
+        assert!(
+            snapshot.any_reachable(),
+            "the backend that was left alone still answers"
+        );
+    }
+
+    /// The corollary, and the reason the recording moved out of
+    /// [`PooledConnection::discard`]: nothing else got named, so nothing else
+    /// changed. A group whose other backend was left alone keeps serving.
+    #[tokio::test]
+    async fn a_request_failure_leaves_the_other_backend_alone() {
+        let up = unused_backend_id();
+        let down = unused_backend_id();
+        let group = group_with(&[up, down]).await;
+        group.record_probe(up, true);
+        group.record_probe(down, true);
+
+        group.record_request_failures(&[down]);
+
+        let snapshot = group.health_snapshot();
+        let up = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node == up)
+            .expect("it was probed");
+        assert!(up.reachable, "only the backend that failed is recorded");
+        assert_eq!(up.consecutive_failures, 0);
+    }
+
+    /// The one failure `get_connection` can report that is not the backend's.
+    ///
+    /// Every other failure here means a backend was asked and did not answer,
+    /// and so belongs in the health table. This one means there was nothing to
+    /// ask with: our own endpoint is gone, which is what shutting a tunnel down
+    /// does, and every pool says it at the same moment. Reading it as "the
+    /// backend is down" would turn stopping a proxy into a node list where
+    /// nothing answers — and restarting would inherit that list.
+    #[tokio::test]
+    async fn letting_go_of_our_own_endpoint_is_news_about_us() {
+        let backend = unused_backend_id();
+        // A pool that owns its endpoint, unlike every pool `group_with` builds:
+        // ownership is what decides whether `close_all` takes it away. Nothing
+        // is ever dialled — the endpoint is gone before anything could try.
+        let pool =
+            crate::connection_pool::IrohConnectionPool::new(iroh::EndpointAddr::new(backend))
+                .await
+                .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_single_pool(pool).await;
+        group.record_probe(backend, true);
+
+        group.close_all().await;
+        let outcome = group.get_connection("whatever.example").await;
+
+        assert!(
+            outcome.is_err(),
+            "there is no endpoint left to dial out from"
+        );
+        let snapshot = group.health_snapshot();
+        let backend = snapshot.nodes.first().expect("it was probed");
+        assert!(
+            backend.reachable,
+            "nothing said the backend stopped answering"
+        );
+        assert_eq!(backend.consecutive_failures, 0);
+    }
+
+    /// One request is one failure. An attempt that landed on the same backend
+    /// three times must not grow a counter someone reads as "three things went
+    /// wrong", or a number that looked stable would start moving with how the
+    /// balancer happened to rotate.
+    #[tokio::test]
+    async fn repeating_a_backend_in_the_list_counts_it_once() {
+        let only = unused_backend_id();
+        let group = group_with(&[only]).await;
+        group.record_probe(only, true);
+
+        group.record_request_failures(&[only, only, only]);
+
+        let snapshot = group.health_snapshot();
+        let only = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node == only)
+            .expect("it was probed");
+        assert_eq!(only.consecutive_failures, 1);
     }
 }
