@@ -15,7 +15,15 @@
  */
 import { computed, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import type { AppError, EndpointLink, LinkKind, NodeConfig, ProxyMode, ProxyStatus } from '../types';
+import type {
+  AppError,
+  EndpointLink,
+  LinkKind,
+  NodeConfig,
+  NodeHealth,
+  ProxyMode,
+  ProxyStatus,
+} from '../types';
 import { useConfigStore } from './config';
 import { takeIssuedCredential } from '../api/invite';
 import { translate } from '../i18n';
@@ -71,6 +79,13 @@ const serviceInstalled = ref(false);
 const endpointLinks = ref<EndpointLink[]>([]);
 
 /**
+ * Whether each configured node answered its last probe, filled in from the Rust side while the
+ * proxy is up. Empty whenever nothing is running, so a stopped proxy shows no health at all
+ * rather than the reading it had when it stopped.
+ */
+const nodeHealth = ref<NodeHealth[]>([]);
+
+/**
  * Set when the last few status reads failed, so the UI can admit the numbers on screen may be
  * out of date rather than presenting them with the same confidence as a live reading.
  */
@@ -111,6 +126,7 @@ async function refresh(): Promise<boolean> {
       // array, and every one of them invalidated the link badges.
       nodeId.value = '';
       if (endpointLinks.value.length > 0) endpointLinks.value = [];
+      if (nodeHealth.value.length > 0) nodeHealth.value = [];
     }
     return true;
   } catch (error) {
@@ -139,6 +155,23 @@ async function refreshEndpointLinks(): Promise<void> {
 }
 
 /**
+ * Reads whether every node answered its last probe.
+ *
+ * Infallible for the same reason the links are: an empty answer means "nothing has been probed",
+ * and a failure here must never become an error over an otherwise healthy proxy.
+ */
+async function refreshNodeHealth(): Promise<void> {
+  try {
+    nodeHealth.value = await invoke<NodeHealth[]>('get_node_health', {
+      useService: config.useService,
+    });
+  } catch (error) {
+    console.debug('[proxy] node health unavailable:', error);
+    nodeHealth.value = [];
+  }
+}
+
+/**
  * The runtime link kind of a node, or null when nothing is connected to it — the normal answer
  * before the proxy is started.
  *
@@ -149,6 +182,18 @@ function linkKindFor(node: NodeConfig): LinkKind | null {
   const connection = node.connectionType === 'ticket' ? node.ticket : node.endpointId;
   if (!connection) return null;
   return endpointLinks.value.find((link) => link.connection === connection)?.link ?? null;
+}
+
+/**
+ * What the last probe of a node found, or null when nothing has probed it — the normal answer
+ * before the proxy is started, and for the first probe interval after it is.
+ *
+ * Keyed on the connection string, the same key `linkKindFor` looks its own answer up by.
+ */
+function healthFor(node: NodeConfig): NodeHealth | null {
+  const connection = node.connectionType === 'ticket' ? node.ticket : node.endpointId;
+  if (!connection) return null;
+  return nodeHealth.value.find((health) => health.connection === connection) ?? null;
 }
 
 async function refreshNodeId(): Promise<void> {
@@ -259,7 +304,10 @@ async function start(): Promise<void> {
     await waitForStart();
     // A fresh session means fresh paths: read them now instead of waiting out the poll, which
     // otherwise leaves the link badges empty for the first few seconds after every start.
-    if (status.value.running) await refreshEndpointLinks();
+    if (status.value.running) {
+      await refreshEndpointLinks();
+      await refreshNodeHealth();
+    }
 
     if (!status.value.running) {
       // Only read the recorded failure when the start did not succeed: it is never cleared, so a
@@ -415,7 +463,10 @@ async function pollOnce(): Promise<void> {
     const ok = await refresh();
     consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
     stale.value = !ok && consecutiveFailures >= FAILURES_BEFORE_BACKOFF;
-    if (status.value.running) await refreshEndpointLinks();
+    if (status.value.running) {
+      await refreshEndpointLinks();
+      await refreshNodeHealth();
+    }
   } finally {
     inFlight = false;
   }
@@ -488,6 +539,8 @@ export function useProxyStore() {
     serviceInstalled,
     /** What each node's traffic is actually doing right now. */
     endpointLinks,
+    /** Whether each node answered its last probe. */
+    nodeHealth,
     /** The mode the last start asked for; compared against what actually runs. */
     requestedMode,
     /** True when the status could not be read for a while; the panel says so out loud. */
@@ -503,6 +556,7 @@ export function useProxyStore() {
     refreshServiceRunning,
     setUseTun,
     linkKindFor,
+    healthFor,
     startPolling,
     stopPolling,
   };

@@ -128,6 +128,26 @@ export interface EndpointLink {
   link: LinkKind;
 }
 
+/** How one configured node answered its last probe. Mirrors `NodeHealthStatus` in `src-tauri/src/status.rs`. */
+export interface NodeHealth {
+  /**
+   * The ticket or endpoint ID exactly as the node was configured — the same key `EndpointLink`
+   * carries, so a link and a health reading for one node can be paired.
+   */
+  connection: string;
+  /** Whether it answered. False before the first probe has run: unasked means unanswered. */
+  reachable: boolean;
+  /** Probes in a row that have failed. Zero while it answers. */
+  consecutiveFailures: number;
+  /**
+   * How long it has been down, in seconds. `null` while it answers, and `null` when it has
+   * never answered — which is not "down for no time at all".
+   */
+  downForSecs: number | null;
+  /** How long ago it was last probed, in seconds. `null` before the first probe. */
+  sinceLastProbeSecs: number | null;
+}
+
 /**
  * The 2FA half of an invite *as it is shown*. Mirrors `InviteTotpPayload` in
  * `src-tauri/src/lib.rs`, which deliberately carries no secret: an invite is shown to be

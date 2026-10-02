@@ -101,6 +101,35 @@ pub struct EndpointLink {
     pub link: LinkKind,
 }
 
+/// What the last probe of one configured node found.
+///
+/// One entry per configured node, keyed by `connection` exactly as [`EndpointLink`] keys
+/// itself, so the UI can pair a reading with the node it came from.
+///
+/// Sent in this shape and not as `nexapipe_client::endpoint_group::NodeHealth`, which carries
+/// `std::time::Instant`s: an `Instant` is a reading of *this* process's monotonic clock, so a
+/// timestamp off it says nothing in another process — and the service, which is the other end
+/// of IPC, is another process. Every timestamp is therefore flattened here into the elapsed
+/// duration the UI actually prints: whole seconds, or `None` for "never".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHealthStatus {
+    /// The ticket or endpoint ID exactly as the node was configured — see
+    /// [`EndpointLink::connection`].
+    pub connection: String,
+    /// Whether it answered its last probe. `false` before the first probe has run: a backend
+    /// that has not been asked has not answered.
+    pub reachable: bool,
+    /// How many probes in a row have failed. Zero while the node answers.
+    pub consecutive_failures: u32,
+    /// How long it has been since it last answered — `None` while it is up, and `None` when it
+    /// has never answered, which is not the same as "down for no time at all".
+    pub down_for_secs: Option<u64>,
+    /// How long ago it was last asked — `None` before the first probe, which is up to the
+    /// probe interval plus its jitter after a start.
+    pub since_last_probe_secs: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +170,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&link).unwrap(),
             r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay"}"#
+        );
+    }
+
+    /// The frontend keys health off `connection`, the same string a link carries, and reads the
+    /// two durations as optional seconds — so both the key spelling and the `null`s have to
+    /// hold.
+    #[test]
+    fn serializes_node_health() {
+        let health = NodeHealthStatus {
+            connection: "node1ticket".to_string(),
+            reachable: false,
+            consecutive_failures: 3,
+            down_for_secs: Some(90),
+            since_last_probe_secs: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&health).unwrap(),
+            r#"{"connection":"node1ticket","reachable":false,"consecutiveFailures":3,"downForSecs":90,"sinceLastProbeSecs":null}"#
         );
     }
 }

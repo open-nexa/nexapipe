@@ -6,7 +6,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use nexapipe_client::auth::{Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth};
 use nexapipe_client::connection_pool::parse_endpoint_addr;
-use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig};
+use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::status::EndpointLink;
+use crate::status::{EndpointLink, NodeHealthStatus};
 
 /// Why a start attempt failed.
 ///
@@ -665,6 +665,69 @@ impl ProxyManager {
                     connection,
                     endpoint_id: addr.id.to_string(),
                     link: kinds.get(&addr.id).copied().unwrap_or(LinkKind::Unknown),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether each configured node answered its last probe, and for how long it has been
+    /// missing.
+    ///
+    /// One entry per configured node, in configuration order and keyed by the same `connection`
+    /// string as [`Self::endpoint_links`], so the UI can pair the two readings for one node.
+    /// Empty when nothing is running, exactly as the links are: there is nothing probing.
+    ///
+    /// A node the probe has not reached yet reads as unreachable with no `down_for_secs` — it has
+    /// not answered, and it has also never answered, so there is no "down since" to report.
+    pub async fn node_health(&self) -> Vec<NodeHealthStatus> {
+        // Cloned out of the lock and dropped before the first await: a parking_lot guard must
+        // not be held across a suspension point.
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+
+        let Some(group) = group else {
+            return Vec::new();
+        };
+
+        let health: HashMap<EndpointId, NodeHealth> = group
+            .health_snapshot()
+            .nodes
+            .into_iter()
+            .map(|node| (node.node, node))
+            .collect();
+
+        self.config
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let connection = match &node.connection {
+                    ConnectionConfig::Ticket(ticket) => ticket.clone(),
+                    ConnectionConfig::EndpointId(id) => id.clone(),
+                };
+                // Same filter as the links: a node the group could not parse has no pool, so
+                // nothing probes it and there is no health to report.
+                let addr = backend_addr(&node.connection)?;
+                // `None` until the first probe has run, which is up to the probe interval plus
+                // its jitter after a start.
+                let probed = health.get(&addr.id);
+                Some(NodeHealthStatus {
+                    connection,
+                    reachable: probed.is_some_and(|node| node.reachable),
+                    consecutive_failures: probed
+                        .map(|node| node.consecutive_failures)
+                        .unwrap_or_default(),
+                    // Asked only for a node that is actually down: while it answers there is no
+                    // outage to time, and `Some(0)` would read as "down for no time at all".
+                    down_for_secs: probed
+                        .filter(|node| !node.reachable)
+                        .and_then(|node| node.down_for())
+                        .map(|down| down.as_secs()),
+                    since_last_probe_secs: probed
+                        .and_then(|node| node.last_probe)
+                        .map(|last| last.elapsed().as_secs()),
                 })
             })
             .collect()

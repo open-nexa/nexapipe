@@ -14,7 +14,7 @@ use proxy::{
 use service::ipc::{IssuedCredentialPayload, NodeInput, StartProxyRequest};
 use service::platform::ServiceState;
 use service::IpcClient;
-use status::{EndpointLink, ProxyStatus};
+use status::{EndpointLink, NodeHealthStatus, ProxyStatus};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,6 +494,33 @@ async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLin
     let proxy_manager = PROXY_MANAGER.read().await;
     Ok(match proxy_manager.as_ref() {
         Some(manager) => manager.endpoint_links().await,
+        None => Vec::new(),
+    })
+}
+
+/// Whether each configured node answered its last probe, and how long it has been down.
+///
+/// Empty when the proxy is not running — there is nothing probing. Like the links, this is a
+/// poll with no error for "not running": the UI draws no badge when it gets nothing back.
+#[tauri::command]
+async fn get_node_health(use_service: Option<bool>) -> Result<Vec<NodeHealthStatus>, AppError> {
+    let use_service = use_service.unwrap_or(false);
+
+    if use_service {
+        match IpcClient::get_node_health().await {
+            Ok(health) => return Ok(health),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to get node health via service, falling back to process mode: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let proxy_manager = PROXY_MANAGER.read().await;
+    Ok(match proxy_manager.as_ref() {
+        Some(manager) => manager.node_health().await,
         None => Vec::new(),
     })
 }
@@ -1343,6 +1370,7 @@ pub fn run() {
             get_node_id_display,
             reveal_node_id,
             get_endpoint_links,
+            get_node_health,
             parse_invite,
             accept_invite,
             take_issued_credential,
