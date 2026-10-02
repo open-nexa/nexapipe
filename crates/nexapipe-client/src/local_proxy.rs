@@ -773,12 +773,12 @@ where
                 match client_read.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        count_to_backend.record_sent(n as u64);
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             #[cfg(feature = "tracing")]
                             tracing::debug!("Tunnel client_to_iroh write error: {}", e);
                             break;
                         }
+                        count_to_backend.record_sent(n as u64);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing")]
@@ -795,7 +795,6 @@ where
                 match recv.read(&mut buf).await {
                     Ok(None) => break,
                     Ok(Some(n)) => {
-                        count_from_backend.record_received(n as u64);
                         if let Err(e) = client_write.write_all(&buf[..n]).await {
                             #[cfg(feature = "tracing")]
                             tracing::debug!("Tunnel iroh_to_client write error: {}", e);
@@ -806,6 +805,7 @@ where
                             tracing::debug!("Tunnel iroh_to_client flush error: {}", e);
                             break;
                         }
+                        count_from_backend.record_received(n as u64);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing")]
@@ -939,7 +939,6 @@ where
                                 return "client_eof";
                             }
                             Ok(n) => {
-                                count_to_backend.record_sent(n as u64);
                                 // Payload, not metadata: it costs a preview to
                                 // build and it is the user's traffic, so it is
                                 // only worth it while debugging.
@@ -973,6 +972,7 @@ where
                                     jni_log!("[DEBUG:local-proxy] WS client->backend err: {}", e);
                                     return "client_write_error";
                                 }
+                                count_to_backend.record_sent(n as u64);
                             }
                             Err(e) => {
                                 jni_log!("[DEBUG:local-proxy] WS client read error: {}", e);
@@ -992,7 +992,6 @@ where
                                 return "iroh_eof";
                             }
                             Ok(Some(n)) => {
-                                count_from_backend.record_received(n as u64);
                                 if first {
                                     first = false;
                                     let p = &buf[..std::cmp::min(n, 200)];
@@ -1018,6 +1017,7 @@ where
                                 if client_write.write_all(&buf[..n]).await.is_err() {
                                     return "client_write_error";
                                 }
+                                count_from_backend.record_received(n as u64);
                                 let _ = client_write.flush().await;
                             }
                             Err(e) => {
@@ -1097,12 +1097,12 @@ where
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    count_to_backend.record_sent(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("Client to backend write error: {}", e);
                         break;
                     }
+                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     #[cfg(feature = "tracing")]
@@ -1123,7 +1123,6 @@ where
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
-                    count_from_backend.record_received(n as u64);
                     total_bytes += n;
                     if !response_sent && debug_preview.len() < 1500 {
                         debug_preview.extend_from_slice(
@@ -1140,6 +1139,7 @@ where
                         tracing::debug!("Backend to client flush error: {}", e);
                         break;
                     }
+                    count_from_backend.record_received(n as u64);
                     if !response_sent {
                         response_sent = true;
                         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
@@ -1293,7 +1293,6 @@ where
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    count_to_backend.record_sent(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         jni_log!(
                             "[DEBUG:local-proxy] TLS tunnel client->iroh write error: {}",
@@ -1301,6 +1300,7 @@ where
                         );
                         break;
                     }
+                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     jni_log!("[DEBUG:local-proxy] TLS tunnel client read error: {}", e);
@@ -1316,7 +1316,6 @@ where
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
-                    count_from_backend.record_received(n as u64);
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         jni_log!(
                             "[DEBUG:local-proxy] TLS tunnel iroh->client write error: {}",
@@ -1328,6 +1327,7 @@ where
                         jni_log!("[DEBUG:local-proxy] TLS tunnel flush error: {}", e);
                         break;
                     }
+                    count_from_backend.record_received(n as u64);
                 }
                 Err(e) => {
                     jni_log!("[DEBUG:local-proxy] TLS tunnel backend read error: {}", e);
