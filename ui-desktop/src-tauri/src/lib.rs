@@ -21,7 +21,8 @@ use status::{
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use tauri::Manager;
 use tokio::sync::RwLock;
 
 lazy_static::lazy_static! {
@@ -187,6 +188,16 @@ async fn start_proxy(
 ) -> Result<(), AppError> {
     let use_service = use_service.unwrap_or(false);
     let use_tun = use_tun.unwrap_or(false);
+
+    // Before anything is probed or spawned, and only when a tunnel is actually being asked for.
+    // The stale-hijack cleanup resets every adapter still pointing at a TUN address, and on
+    // Windows there is no "is that tunnel still alive" guard (`address_is_held` is macOS and
+    // Linux only) — so a cleanup still running would reset the DNS of the tunnel this start is
+    // in the middle of bringing up. Service mode is exempt for the same reason it is exempt
+    // below: that tunnel belongs to the other process, which runs its own cleanup.
+    if use_tun && !use_service {
+        wait_for_stale_hijack_cleanup().await;
+    }
 
     // Checked here, before anything is spawned, so the caller gets the precise code instead of a
     // generic async start failure: a manager that cannot obtain privileges must not be created
@@ -1467,6 +1478,63 @@ async fn credential_store_status() -> Result<String, AppError> {
     Ok(credentials::status()?.as_str().to_string())
 }
 
+/// How long the window stays hidden waiting for the frontend to paint, before it is shown
+/// anyway.
+///
+/// The frontend normally shows the window itself one frame after it mounts, which is the
+/// right moment: the first paint is on screen and nothing empty was ever displayed. This is
+/// the deadline for the case where that never happens — a bundle that failed to load, a
+/// renderer that threw before mount — because a window that never appears is
+/// indistinguishable from an application that did not start.
+///
+/// Generous on purpose. A cold WebView2 on a slow machine, or a first run that also has to
+/// unpack and JIT the bundle, can take a while, and showing a window with nothing in it is a
+/// lesser failure than never showing one. Nothing waits on this: it runs alongside the
+/// frontend's own `show()` and whichever arrives first wins, the second being a no-op.
+const FIRST_PAINT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The running [`cleanup_stale_hijack`], so a start can wait for it.
+///
+/// Spawned rather than run inline because on Windows it costs 1.4-1.7 seconds: it shells out
+/// to PowerShell, and `Get-NetUDPEndpoint` / `Get-DnsClientServerAddress` each load the
+/// `NetTCPIP` module first. Run from `setup()` that is time the window sits there empty — the
+/// window is created *before* the setup closure runs, so the user stares at a blank frame for
+/// the whole of it.
+///
+/// Waiting for it in [`start_proxy`] is not optional. The Windows cleanup resets every adapter
+/// whose DNS still points at a TUN address, and the guard that spares a live tunnel
+/// (`address_is_held`) is only compiled on macOS and Linux — so a cleanup still running when a
+/// start begins would reset the DNS of the tunnel that start is bringing up.
+///
+/// `OnceLock`, not a `LazyLock`: the wait is [`OnceLock::get_or_init`] on a second cell, and a
+/// thread that has not been spawned yet must block rather than run the cleanup a second time.
+static CLEANUP_JOIN: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+
+/// Whether [`cleanup_stale_hijack`] has finished. Separate from [`CLEANUP_JOIN`] because a
+/// waiter that arrives first has to be able to start it itself.
+static CLEANUP_DONE: OnceLock<()> = OnceLock::new();
+
+/// Starts the stale-DNS cleanup on a background thread, once per process.
+///
+/// Idempotent, and safe to call from both the setup hook and a start: whichever caller gets
+/// there first spawns the thread, the other finds it already running.
+fn spawn_stale_hijack_cleanup() {
+    let _ = CLEANUP_JOIN.set(std::thread::spawn(|| {
+        crate::proxy::dns_config::cleanup_stale_hijack();
+        let _ = CLEANUP_DONE.set(());
+    }));
+}
+
+/// Waits for [`spawn_stale_hijack_cleanup`] to finish, starting it first if it has not begun.
+///
+/// Called before a tunnel is brought up, so the cleanup cannot reset the DNS that tunnel is
+/// about to claim. Never called on the way to the first paint — that is the whole point of
+/// moving the work off the main thread.
+async fn wait_for_stale_hijack_cleanup() {
+    spawn_stale_hijack_cleanup();
+    let _ = CLEANUP_DONE.get_or_init(|| ());
+}
+
 /// Stops a tunnel this process is still running, so that quitting the app hands the
 /// machine's DNS back.
 ///
@@ -1512,7 +1580,7 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .setup(|_app| {
+        .setup(|app| {
             // Same reason the service runner does it: a hijack whose process died
             // before its teardown left the machine's DNS pointing at a TUN address
             // that no longer exists, and nothing else will ever undo that. Doing it
@@ -1521,7 +1589,33 @@ pub fn run() {
             // LaunchDaemon is not what that process becomes. Best effort: an
             // unprivileged desktop cannot change system DNS and the service, which
             // runs as root, cleans up on its own start.
-            crate::proxy::dns_config::cleanup_stale_hijack();
+            //
+            // On a thread, because this is not something the first paint should wait
+            // for: the window already exists by the time this closure runs, and on
+            // Windows the PowerShell it shells out to costs over a second. A start
+            // waits for it explicitly — see `wait_for_stale_hijack_cleanup`.
+            spawn_stale_hijack_cleanup();
+
+            // The window is created hidden (`visible: false`) and shown by the frontend
+            // once it has something to paint, so a slow start shows no window rather
+            // than an empty one. This is the backstop for the case where the frontend
+            // never gets there — a bundle that failed to load, a renderer that threw
+            // before mount: a window that never appears is indistinguishable from an app
+            // that did not start, so it is shown anyway once the wait has clearly run
+            // long enough to be a failure rather than a slow machine.
+            //
+            // Best effort on every platform, and deliberately not fatal: a build with no
+            // window to show must still start.
+            if let Some(window) = app.get_webview_window("main") {
+                let handle = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(FIRST_PAINT_FALLBACK).await;
+                    if let Err(e) = handle.show() {
+                        tracing::warn!("the fallback could not show the window: {e}");
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

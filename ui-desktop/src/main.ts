@@ -11,11 +11,13 @@
  *      then disappear
  *   4. `<html lang>` and the document title from the resolved locale (D14)
  *   5. mount
+ *   6. show the window, which the backend created hidden
  *
  * Runtime proxy state is deliberately last and not awaited: it needs the backend, and the shell
  * renders `stopped` until the first status arrives.
  */
 import { createApp } from 'vue';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import App from './App.vue';
 import router from './router';
 import i18n, { resolveLocale, setI18nLocale } from './i18n';
@@ -24,7 +26,7 @@ import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
 import { initProxyState, onAppFocused } from './stores/proxy';
 import { initGate, refreshGate } from './stores/gate';
-import { initConfigStore } from './stores/config';
+import { initConfigStore, initConfigStoreDeferred } from './stores/config';
 
 import './styles/tokens.css';
 import './styles/themes.css';
@@ -33,6 +35,30 @@ import './styles/base.css';
 import './styles/legacy.css';
 
 applyStoredTheme();
+
+/**
+ * Shows the window the backend created hidden.
+ *
+ * Everything above this line runs before anything is on screen, so a slow start — a cold
+ * WebView2, an awaited credential read — used to leave the user looking at an empty frame with
+ * the app's own background filling it. Waiting until the app has mounted and painted means the
+ * window appears already drawn instead.
+ *
+ * A frame is asked for first so the paint being *finished* is what the user sees, not merely
+ * scheduled: showing on the same tick as `mount()` would put a window up that still has nothing
+ * in it, which is the thing this is here to avoid.
+ *
+ * Failure is not fatal and neither is a plain browser: `vite dev` has no Tauri window and the
+ * call rejects, which is expected and says nothing about the app.
+ */
+async function showWindow(): Promise<void> {
+  try {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await getCurrentWindow().show();
+  } catch (error) {
+    console.warn('[window] could not show the window:', error);
+  }
+}
 
 async function bootstrap(): Promise<void> {
   await initPlatform();
@@ -49,6 +75,13 @@ async function bootstrap(): Promise<void> {
   app.use(i18n);
   app.use(router);
   app.mount('#app');
+
+  // The window exists from the start but is not shown until there is something in it.
+  void showWindow();
+
+  // Everything from here on is a projection no first screen renders, so it must not sit between
+  // the mount and the paint: the display masks cost two IPC round-trips per configured node.
+  void initConfigStoreDeferred();
 
   // The door is read before the first paint too, so a page cannot draw an open
   // lock and then shut it.
