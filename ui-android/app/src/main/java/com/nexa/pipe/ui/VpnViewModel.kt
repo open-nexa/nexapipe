@@ -197,6 +197,11 @@ class VpnViewModel : ViewModel() {
         NexaVpnService.setRevokedListener { reason ->
             viewModelScope.launch {
                 if (isVpnRunning.value) {
+                    // The counters belong to the session that just ended, and the poll that
+                    // reads them belongs to it too: leaving either running would keep a total
+                    // on screen under "Disconnected", which reads as a tunnel that is up and
+                    // carrying bytes. See `refreshTraffic` — no total outlives its session.
+                    stopLinkPolling()
                     isVpnRunning.value = false
                     errorMessage.value = reason
                     addLog("Tunnel revoked: $reason")
@@ -1246,6 +1251,9 @@ class VpnViewModel : ViewModel() {
         // was recreated): align the UI now instead of showing a stale
         // "Connected".
         if (isVpnRunning.value && !isConnecting.value && NexaVpnService.wasRevoked) {
+            // Same reason as the revoked listener above: the session is over, so its counters
+            // and the poll behind them go with it.
+            stopLinkPolling()
             isVpnRunning.value = false
             errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
             addLog("Synced UI state: tunnel was revoked by another app")
