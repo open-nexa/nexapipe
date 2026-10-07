@@ -219,18 +219,52 @@ mod windows_impl {
             return Ok(());
         }
 
+        // Stopped, and confirmed stopped, before it is deleted. `sc delete` would stop
+        // the service too, but `sc stop` reports success the moment the control manager
+        // accepts the request — which says nothing about whether the teardown that
+        // restores the system DNS has finished — and a delete issued on top of a stop
+        // that is still running races it.
         run(
             |_| {
                 vec![
                     format!("sc.exe stop {SERVICE_NAME}"),
-                    format!("sc.exe delete {SERVICE_NAME}"),
+                    tolerate(NOT_STARTED),
+                    tolerate(NOT_INSTALLED),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
-            "service uninstall",
+            "service uninstall (stop)",
             Escalation::OnAccessDenied,
             codes::SERVICE_UNINSTALL_FAILED,
         )
+        .and_then(|()| {
+            // The stop may have taken the service off the register entirely — the
+            // code above already tolerates 1060 from `sc stop`. Absent is the state
+            // an uninstall is trying to reach, so there is nothing to wait for and
+            // nothing left to delete: `settle` would wait out the timeout for a
+            // state a service that is not registered can never reach, and
+            // `sc delete` on it fails with 1060.
+            if !service_exists() {
+                return Ok(());
+            }
+            settle(ServiceState::Stopped, codes::SERVICE_UNINSTALL_FAILED)
+        })
+        .and_then(|()| {
+            if !service_exists() {
+                return Ok(());
+            }
+            run(
+                |_| {
+                    vec![
+                        format!("sc.exe delete {SERVICE_NAME}"),
+                        "exit /b %errorlevel%".to_string(),
+                    ]
+                },
+                "service uninstall (delete)",
+                Escalation::OnAccessDenied,
+                codes::SERVICE_UNINSTALL_FAILED,
+            )
+        })
         .and_then(|()| verify_absent())
     }
 
@@ -680,6 +714,36 @@ fn stop_elevated() -> Result<(), AppError> {
     elevate::run_self_elevated(&["--stop"])
 }
 
+/// Waits for the service process to go away, so that uninstalling it cannot report
+/// success while the machine's DNS still points at the TUN.
+///
+/// The process is the only thing that can restore the system DNS, and both service
+/// managers ask it to stop by signal — so deleting the definition while the teardown
+/// is still running deletes the only record of a hijack that is still up. Bounded
+/// rather than fatal: a definition left on disk is a service that is still installed,
+/// so the delete goes ahead either way and a timeout is only logged.
+#[cfg(not(windows))]
+fn wait_for_service_exit(is_gone: impl Fn() -> bool) {
+    use std::time::{Duration, Instant};
+
+    // Comfortably past `TunProxy::stop_and_wait`'s twenty seconds: that is the work
+    // being waited on, and a longer wait here buys nothing the teardown would finish.
+    const TIMEOUT: Duration = Duration::from_secs(45);
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !is_gone() {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "the service process is still up {}s after it was asked to stop; \
+                 the system DNS restore may not have run",
+                TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Absolute path of the running executable, which is what the service manager is pointed at.
 #[cfg(not(windows))]
 fn current_exe_string() -> Result<String, AppError> {
@@ -851,6 +915,11 @@ fn uninstall_service_linux() -> Result<(), AppError> {
         .args(["stop", SERVICE_NAME])
         .output();
 
+    // `systemctl stop` sends SIGTERM; the teardown that restores the system DNS is
+    // what answers it. Wait for the process to be gone before the unit file — the
+    // only thing that says the service was ever installed — is deleted.
+    wait_for_service_exit(|| !is_service_running_linux());
+
     let _ = Command::new("systemctl")
         .args(["disable", SERVICE_NAME])
         .output();
@@ -965,14 +1034,22 @@ fn wait_for_service_state_linux(expected: ServiceState, failure: &str) -> Result
     }
 }
 
-#[cfg(target_os = "macos")]
-fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::path::Path;
-    use std::process::Command;
-
-    let plist_content = format!(
+/// The launchd job definition.
+///
+/// `ExitTimeOut` is how long launchd lets a job spend on SIGTERM before it sends SIGKILL.
+/// The default is 20s and the teardown is bounded by the same 20s
+/// (`TunProxy::stop_and_wait`), so a slow stop used to be killed right at the edge of
+/// finishing — taking the system-DNS restore with it. 30s leaves room.
+///
+/// A plist already on disk keeps whatever it was installed with, so this only takes
+/// effect from the next install onwards.
+///
+/// Kept out of the installer and compiled under `test` on every platform because that
+/// key is both easy to lose and invisible when lost: nothing fails, and a slow stop
+/// simply stops restoring the machine's DNS.
+#[cfg(any(target_os = "macos", test))]
+fn macos_plist_content(exe_path: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -988,6 +1065,8 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>/var/log/nexa-service.log</string>
     <key>StandardErrorPath</key>
@@ -996,7 +1075,17 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
 </plist>
 "#,
         SERVICE_NAME, exe_path
-    );
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::Command;
+
+    let plist_content = macos_plist_content(exe_path);
 
     let plist_path =
         Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
@@ -1037,6 +1126,14 @@ fn uninstall_service_macos() -> Result<(), AppError> {
     let _ = Command::new("launchctl")
         .args(["unload", plist_path.to_str().unwrap()])
         .output();
+
+    // `unload` stops the job with SIGTERM, and the teardown that restores the system
+    // DNS is what answers it: on macOS that setting lives in the system configuration
+    // and survives the reboot, so deleting the plist while the job is still coming
+    // down leaves the machine resolving against a TUN address with nothing left to
+    // put it back.
+    wait_for_service_exit(|| !is_service_running_macos());
+
     let _ = fs::remove_file(&plist_path);
 
     Ok(())
@@ -1117,5 +1214,43 @@ fn stop_service_macos() -> Result<(), AppError> {
             codes::SERVICE_STOP_FAILED,
             String::from_utf8_lossy(&output.stderr),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{macos_plist_content, SERVICE_NAME};
+
+    /// launchd's own default for `ExitTimeOut` is 20s, which is also what the teardown
+    /// allows itself — so a job without an explicit, longer one gets SIGKILLed right
+    /// around the moment the system-DNS restore is finishing.
+    #[test]
+    fn the_job_is_allowed_longer_than_the_teardown_takes() {
+        let plist = macos_plist_content("/Applications/Nexa.app/Contents/MacOS/nexa");
+
+        let seconds = plist
+            .split("<key>ExitTimeOut</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("<integer>").nth(1))
+            .and_then(|rest| rest.split("</integer>").next())
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .expect("the job carries an ExitTimeOut");
+
+        // `TunProxy::stop_and_wait` gives the teardown twenty seconds.
+        assert!(
+            seconds > 20,
+            "an ExitTimeOut of {seconds}s leaves the teardown no room to restore the system DNS"
+        );
+    }
+
+    /// The executable path is the only part of the job that is interpolated into XML
+    /// rather than fixed, so it is the only part that can break it.
+    #[test]
+    fn the_executable_path_reaches_the_job_intact() {
+        let path = "/Applications/Nexa.app/Contents/MacOS/nexa";
+        let plist = macos_plist_content(path);
+
+        assert!(plist.contains(&format!("<string>{path}</string>")));
+        assert!(plist.contains(&format!("com.nexa.{SERVICE_NAME}")));
     }
 }

@@ -74,13 +74,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let runner = ServiceRunner::new();
+
+    // Unix: a service manager stops a job with SIGTERM, and handling it is what lets the
+    // teardown — the system-DNS restore — run at all. Windows has no equivalent on this
+    // path: `--foreground` there is a manual run, and a real stop arrives through the
+    // control manager instead (see `start_windows_service`).
+    #[cfg(unix)]
+    runner.run_until_signalled().await?;
+    #[cfg(not(unix))]
     runner.run().await?;
+
     Ok(())
 }
 
 #[cfg(windows)]
 fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
-    use std::future::pending;
     use std::time::Duration;
 
     use tokio::sync::watch;
@@ -139,22 +147,6 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
         })
     }
 
-    /// Resolves once a stop has been requested.
-    ///
-    /// Never resolves early: the sender belongs to the control handler, which lives as long as
-    /// this process, so a closed channel means nobody can ask any more — not that anyone did.
-    async fn await_stop(mut stop: watch::Receiver<bool>) {
-        loop {
-            if *stop.borrow_and_update() {
-                return;
-            }
-            match stop.changed().await {
-                Ok(()) => continue,
-                Err(_) => pending::<()>().await,
-            }
-        }
-    }
-
     fn run_windows_service(_args: Vec<std::ffi::OsString>) -> windows_service::Result<()> {
         // A stop reaches a Windows service through the control handler, which runs on a thread of
         // its own and must therefore only *flag* it: the async loop owns the tunnel and decides
@@ -196,7 +188,7 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::error!("Service runner error: {}", e);
                         }
                     }
-                    () = await_stop(stop_rx) => {
+                    () = nexa_lib::service::runner::await_stop(stop_rx) => {
                         // Announced before the teardown starts, so a slow tunnel shutdown reads as
                         // "stopping" to the SCM instead of as a service that stopped answering.
                         if let Err(e) = set_status(&status_handle, ServiceState::StopPending) {

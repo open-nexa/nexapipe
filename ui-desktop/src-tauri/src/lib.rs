@@ -1369,6 +1369,25 @@ async fn credential_store_status() -> Result<String, AppError> {
     Ok(credentials::status()?.as_str().to_string())
 }
 
+/// Stops a tunnel this process is still running, so that quitting the app hands the
+/// machine's DNS back.
+///
+/// Quitting reaches neither [`stop_proxy`] nor the teardown inside `TunProxy::run`,
+/// so a hijack that was up when the window closed stayed up — and stayed pointing
+/// the machine at a TUN address that was about to stop existing. Only the in-process
+/// tunnel is stopped: one the launchd/systemd service owns belongs to that daemon,
+/// which outlives the window on purpose.
+async fn stop_tunnel_on_exit() {
+    // Taken rather than borrowed, so a second pass — `ExitRequested` is followed by
+    // `Exit` — finds nothing and does not run the teardown twice.
+    let manager = PROXY_MANAGER.write().await.take();
+    let Some(manager) = manager else {
+        return;
+    };
+    tracing::info!("stopping the tunnel on exit so the system DNS is restored");
+    manager.stop().await;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _guard = init_tracing("nexa.log");
@@ -1385,13 +1404,28 @@ pub fn run() {
     // Prevent the runtime from being dropped — it must live as long as the
     // process. Tauri holds the Handle and uses it for all async commands.
     std::mem::forget(runtime);
+    // Kept: the exit hook below has to run the teardown on this very runtime, and
+    // the one Tauri is handed is a clone of it.
+    let shutdown = handle.clone();
     tauri::async_runtime::set(handle);
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|_app| {
+            // Same reason the service runner does it: a hijack whose process died
+            // before its teardown left the machine's DNS pointing at a TUN address
+            // that no longer exists, and nothing else will ever undo that. Doing it
+            // here as well matters because the tunnel is not always the service's —
+            // the desktop can run one itself when it was launched elevated — and a
+            // LaunchDaemon is not what that process becomes. Best effort: an
+            // unprivileged desktop cannot change system DNS and the service, which
+            // runs as root, cleans up on its own start.
+            crate::proxy::dns_config::cleanup_stale_hijack();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_proxy,
             stop_proxy,
@@ -1425,8 +1459,29 @@ pub fn run() {
             clear_credentials,
             credential_store_status
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // Closing the window, Cmd+Q, or an `app.exit()` all end the process without
+    // going anywhere near the proxy's teardown, which is what put the system DNS
+    // back — so the machine kept the address the hijack gave it until the next
+    // start cleaned up after it. Both events are handled because which of them a
+    // platform emits last is not this code's to choose: one is the last window's
+    // destruction, the other the event loop being torn down, and a quit reaches
+    // either one or both depending on how it was asked for.
+    //
+    // Blocking here is what makes it work — the restore runs on the runtime these
+    // commands use — and it is bounded: `stop_and_wait` gives the teardown twenty
+    // seconds. Stale-hijack cleanup at start-up is still the backstop, because
+    // nothing reaches either event when the process is killed or the power goes.
+    app.run(move |_app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            shutdown.block_on(stop_tunnel_on_exit());
+        }
+    });
 }
 
 #[cfg(test)]
