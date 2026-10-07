@@ -177,6 +177,10 @@ mod windows_impl {
     pub fn install() -> Result<(), AppError> {
         let bin_path = bin_path_value(&service_binary()?);
 
+        // Whatever is already running has to go first — see [`stop_if_running`]. Done before
+        // the binary is re-pointed, because the process is what keeps the old build alive.
+        stop_if_running()?;
+
         // `create` fails with 1073 when an older installation is already registered, so an
         // existing service is re-pointed at the current binary instead of being rejected. Both
         // branches carry their own redirection: the elevated run cannot hand stdout back, so a
@@ -194,10 +198,9 @@ mod windows_impl {
                     format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
                     "if errorlevel 1 exit /b %errorlevel%".to_string(),
                     format!("sc.exe start {SERVICE_NAME}"),
-                    // Already running is the state the install asked for. Note that the service
-                    // keeps running the binary it was launched from: a re-pointed `binPath`
-                    // only takes effect on the next start, which an uninstall/start or a reboot
-                    // provides.
+                    // Nothing should be up at this point — [`stop_if_running`] brought the old
+                    // process down first — so 1056 means the service was started again by
+                    // something else, which is still the state the install asked for.
                     tolerate(ALREADY_RUNNING),
                     "exit /b %errorlevel%".to_string(),
                 ]
@@ -212,6 +215,28 @@ mod windows_impl {
         // successful start. Waiting for the state to become RUNNING is what turns "installed but
         // not running" into a reported failure instead of a mystery.
         .and_then(|()| settle(ServiceState::Running, codes::SERVICE_START_FAILED))
+    }
+
+    /// Brings a running service down, so that [`install`] can start it from the binary it has
+    /// just been pointed at.
+    ///
+    /// A service keeps running what it was launched from: re-pointing `binPath` only takes
+    /// effect the next time the control manager starts it, so an install over a running service
+    /// — which is what an upgrade looks like — used to leave the previous build up and the app
+    /// talking to it. Stopping first is the only ordering that works, and it has to be waited
+    /// for: `sc stop` only *asks*, answering while the service is still `STOP_PENDING`, and a
+    /// start issued behind it is refused.
+    ///
+    /// Skipped when nothing is running, which is the ordinary first install: this is the one
+    /// step that can cost a second elevation prompt, and a service that is not up has no build
+    /// to retire. Waited out by [`stop`], which reports a failure rather than letting the
+    /// install race a teardown that has not finished.
+    fn stop_if_running() -> Result<(), AppError> {
+        if state() != ServiceState::Running {
+            return Ok(());
+        }
+
+        stop()
     }
 
     pub fn uninstall() -> Result<(), AppError> {
@@ -855,9 +880,24 @@ fn install_service_linux(exe_path: &str) -> Result<(), AppError> {
     }
 
     // Registration is not startup: a unit that is only enabled stays stopped until the next
-    // boot, while the UI promises install and start as one action.
-    start_service_linux()?;
+    // boot, while the UI promises install and start as one action. A restart rather than a
+    // start — see [`linux_activation_args`].
+    restart_service_linux()?;
     wait_for_service_state_linux(ServiceState::Running, codes::SERVICE_START_FAILED)
+}
+
+/// The `systemctl` verb an install uses to bring the unit up, with the unit's name.
+///
+/// `restart`, not `start`: a unit that is already running keeps the process it was launched
+/// from, so an install that only started it — which is every upgrade — re-reads the unit file
+/// and leaves the previous build running. systemd's `restart` also starts a unit that is not
+/// running, so this covers a first install as well.
+///
+/// Split out of [`restart_service_linux`] because the choice is the whole fix and is otherwise
+/// invisible: nothing fails when it is wrong, the service simply keeps its old build.
+#[cfg(any(target_os = "linux", test))]
+fn linux_activation_args() -> [&'static str; 2] {
+    ["restart", SERVICE_NAME]
 }
 
 /// The command systemd should run in the foreground.
@@ -966,6 +1006,27 @@ fn start_service_linux() -> Result<(), AppError> {
 
     let output = Command::new("systemctl")
         .args(["start", SERVICE_NAME])
+        .output()
+        .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::with_detail(
+            codes::SERVICE_START_FAILED,
+            String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+}
+
+/// Brings the unit up, or back up — see [`linux_activation_args`] for why this is a restart
+/// rather than a start.
+#[cfg(target_os = "linux")]
+fn restart_service_linux() -> Result<(), AppError> {
+    use std::process::Command;
+
+    let output = Command::new("systemctl")
+        .args(linux_activation_args())
         .output()
         .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
 
@@ -1274,7 +1335,10 @@ fn stop_service_macos() -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_install_commands, macos_job_target, macos_plist_content, SERVICE_NAME};
+    use super::{
+        linux_activation_args, macos_install_commands, macos_job_target, macos_plist_content,
+        SERVICE_NAME,
+    };
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
     /// "system-defined" and is shorter than the teardown allows itself — 5s on this
@@ -1352,6 +1416,18 @@ mod tests {
             successful_exit,
             "a clean exit is what a stop produces, so it must be the one that is not restarted"
         );
+    }
+
+    /// An install that only *started* the unit installed nothing on a machine that already had
+    /// one running: the process keeps the build it was launched from, so an upgrade stayed on
+    /// its first-ever binary while the unit file on disk named the new one. `restart` replaces
+    /// the process, and starts a unit that is not up yet.
+    #[test]
+    fn an_install_replaces_a_running_unit_rather_than_starting_it() {
+        let [verb, unit] = linux_activation_args();
+
+        assert_eq!(verb, "restart", "a start leaves the old build running");
+        assert_eq!(unit, SERVICE_NAME);
     }
 
     /// The executable path is the only part of the job that is interpolated into XML
