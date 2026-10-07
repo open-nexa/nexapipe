@@ -655,9 +655,12 @@ fn cleanup_stale_hijack_windows() {
 #[cfg(target_os = "linux")]
 const RESOLV_CONF_BACKUP: &str = "/etc/resolv.conf.nexapipe.bak";
 
-/// The routing domain that claims every name for a link: `~.`.
-#[cfg(target_os = "linux")]
-const DEFAULT_ROUTE_DOMAIN: &str = "~.";
+/// The routing domain that claims every name on a link, and the two shapes it
+/// has: `~.` is what `resolvectl` is given — routing-only, so no search list
+/// gains a root entry — and `.` is what [`parse_resolvectl_domains`] hands
+/// back once the marker is off, which is the shape a read-back compares in.
+#[cfg(any(target_os = "linux", test))]
+const DEFAULT_ROUTE_DOMAIN: &str = ".";
 
 /// Points the configured domains at the TUN resolver through systemd-resolved's
 /// per-link routing domains, and leaves every other name to whoever was already
@@ -850,12 +853,24 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
                             );
                             return Ok(());
                         }
-                        Err(e) => tracing::warn!(
-                            "resolvectl could not route every query to {}: {}; \
-                             falling back to writing /etc/resolv.conf",
-                            interface,
-                            e
-                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "resolvectl could not route every query to {}: {}; \
+                                 falling back to writing /etc/resolv.conf",
+                                interface,
+                                e
+                            );
+                            // The `dns` step did land, and a resolver left on the
+                            // link is a second owner of the names the file below
+                            // is about to claim: resolved fans a query out to
+                            // every link that is a DNS route and keeps the first
+                            // answer, so the TUN would win some names and not
+                            // others with nobody to say which. Hand the link
+                            // back, so the file is the only hijack in place —
+                            // and so the fallback starts from the machine's own
+                            // resolver rather than from half of ours.
+                            revert_resolvectl(interface);
+                        }
                     }
                 }
                 Some(servers) => tracing::warn!(
@@ -1160,17 +1175,18 @@ fn parse_resolvectl_dns(output: &str) -> Vec<String> {
 /// does with a file.
 #[cfg(target_os = "linux")]
 fn set_resolvectl_default_route_domain(link: &str) -> Result<()> {
+    // The marker is part of the token: resolved reads `~.` as "route the root
+    // domain here" and a bare `.` as an ordinary search domain.
+    let domain = format!("~{DEFAULT_ROUTE_DOMAIN}");
     let output = Command::new("resolvectl")
-        .args(["domain", link, DEFAULT_ROUTE_DOMAIN])
+        .args(["domain", link, &domain])
         .output()
-        .map_err(|e| {
-            anyhow::anyhow!("resolvectl domain {} {}: {}", link, DEFAULT_ROUTE_DOMAIN, e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("resolvectl domain {} {}: {}", link, domain, e))?;
     if !output.status.success() {
         anyhow::bail!(
             "resolvectl domain {} {}: {}",
             link,
-            DEFAULT_ROUTE_DOMAIN,
+            domain,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -1179,7 +1195,7 @@ fn set_resolvectl_default_route_domain(link: &str) -> Result<()> {
         Some(domains) => anyhow::bail!(
             "resolvectl domain {} {} exited 0 but the link has {:?}",
             link,
-            DEFAULT_ROUTE_DOMAIN,
+            domain,
             domains
         ),
         None => anyhow::bail!("could not read back the routing domain set on {}", link),
@@ -1865,8 +1881,9 @@ mod tests {
     // parser for a file this code rewrites is not something to ship unexercised.
     #[cfg(any(target_os = "linux", test))]
     use super::{
-        parse_resolvectl_dns, parse_resolvectl_domains, resolv_conf_names_a_tun_address,
-        resolv_conf_nameservers, resolv_conf_without_nameservers, routes_every_domain,
+        DEFAULT_ROUTE_DOMAIN, parse_resolvectl_dns, parse_resolvectl_domains,
+        resolv_conf_names_a_tun_address, resolv_conf_nameservers, resolv_conf_without_nameservers,
+        routes_every_domain,
     };
 
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -2106,6 +2123,23 @@ mod tests {
             parse_resolvectl_domains("Link 5 (nexa0):\n"),
             Vec::<String>::new()
         );
+    }
+
+    /// The exclusive-route read-back compares what `resolvectl domain` printed
+    /// against [`DEFAULT_ROUTE_DOMAIN`], so the two have to agree on the shape:
+    /// the `~` that makes it routing-only is not part of what the parser keeps.
+    /// A parser that starts keeping it would turn a working hijack into one that
+    /// silently falls back to rewriting /etc/resolv.conf.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn the_default_route_domain_reads_back_as_the_root() {
+        assert_eq!(
+            parse_resolvectl_domains("Link 5 (nexa-tun): ~.\n"),
+            vec![DEFAULT_ROUTE_DOMAIN.to_string()]
+        );
+        // The token it is written as, and the one it is read back as.
+        assert_eq!(DEFAULT_ROUTE_DOMAIN, ".");
+        assert_eq!(format!("~{DEFAULT_ROUTE_DOMAIN}"), "~.");
     }
 
     /// What the scoped hijack writes has to be what its restore reads: a file
