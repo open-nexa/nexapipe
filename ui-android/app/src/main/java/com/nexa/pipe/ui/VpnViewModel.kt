@@ -28,6 +28,10 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -144,6 +148,33 @@ class VpnViewModel : ViewModel() {
      * than leave the gap looking like a backend that is down.
      */
     val traffic = kotlinx.coroutines.flow.MutableStateFlow<Map<String, NodeTraffic>>(emptyMap())
+
+    /**
+     * What every backend has carried together: [traffic] summed across the map.
+     *
+     * Derived, not read a second time — the native side is not asked for anything it does not
+     * already report, and there is no way for the row on screen to disagree with the per-node
+     * figures beside it.
+     *
+     * `null` while the map is empty, which is the same distinction [traffic] makes per node:
+     * nothing has been counted yet, which is not the same as a total that happens to be zero.
+     * A screen that drew `0 B` before the first byte would look like a tunnel that works and
+     * carries nothing.
+     */
+    val totalTraffic: StateFlow<NodeTraffic?> =
+        traffic
+            .map { totals ->
+                if (totals.isEmpty()) {
+                    null
+                } else {
+                    NodeTraffic(
+                        sent = totals.values.sumOf { it.sent },
+                        received = totals.values.sumOf { it.received },
+                        active = totals.values.sumOf { it.active },
+                    )
+                }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     // 2FA lives on the endpoint now (`NodeConfig.twoFactor`): one server, one
     // pair of credentials. There is no app-wide setting left to publish here.
