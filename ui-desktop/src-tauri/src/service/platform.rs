@@ -108,6 +108,58 @@ pub fn is_service_running() -> bool {
 // Windows: sc.exe, elevated through UAC when the unprivileged call is refused
 // ==========================================================================
 
+/// What `sc query` says the service is doing, with the states [`ServiceState`] flattens kept
+/// apart.
+///
+/// The panel draws three states, so [`ServiceState`] calls everything that is not running
+/// "stopped" — including `STOP_PENDING`, which is not stopped but on its way there. Replacing a
+/// running service has to tell those apart: the teardown that restores the system DNS runs in
+/// that window, and starting the new build behind a teardown that has not finished is what the
+/// wait exists to prevent.
+///
+/// Kept outside the Windows-only module, and compiled under `test` too, so the reading of an
+/// `sc.exe` answer is testable on a machine that has no `sc.exe`.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScState {
+    /// `RUNNING` — up, and accepting what the control manager asks of it.
+    Running,
+    /// `STOPPED` — finished coming down, nothing left executing.
+    Stopped,
+    /// Any `*PENDING` — on its way from one to the other, and currently neither.
+    Pending,
+    /// Not registered, so there is no state to be in.
+    Absent,
+    /// `sc.exe` could not be asked, or answered without a state line.
+    Unknown,
+}
+
+/// Reads that answer out of what `sc.exe query` prints.
+///
+/// `1060` only counts when `sc.exe` reported it as a failure: the same four digits appear in the
+/// `PID` line of a perfectly healthy service, and reading that as "absent" would let an install
+/// replace a service that is still up.
+#[cfg(any(windows, test))]
+fn sc_state(query_output: &str) -> ScState {
+    if query_output
+        .lines()
+        .any(|line| line.contains("FAILED") && line.contains("1060"))
+    {
+        return ScState::Absent;
+    }
+
+    match query_output
+        .lines()
+        .find(|line| line.trim_start().starts_with("STATE"))
+    {
+        // Pending is checked first, because `STOP_PENDING` is neither stopped nor running.
+        Some(line) if line.contains("PENDING") => ScState::Pending,
+        Some(line) if line.contains("RUNNING") => ScState::Running,
+        Some(line) if line.contains("STOPPED") => ScState::Stopped,
+        _ => ScState::Unknown,
+    }
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use std::io::Write;
@@ -117,7 +169,9 @@ mod windows_impl {
     use std::time::{Duration, Instant};
 
     use crate::error::{codes, AppError};
-    use crate::service::platform::{SERVICE_DISPLAY_NAME, SERVICE_NAME, ServiceState};
+    use crate::service::platform::{
+        SERVICE_DISPLAY_NAME, SERVICE_NAME, ScState, ServiceState, sc_state,
+    };
 
     /// Text `services.msc` shows for the entry.
     const SERVICE_DESCRIPTION: &str =
@@ -263,16 +317,13 @@ mod windows_impl {
             codes::SERVICE_UNINSTALL_FAILED,
         )
         .and_then(|()| {
-            // The stop may have taken the service off the register entirely — the
-            // code above already tolerates 1060 from `sc stop`. Absent is the state
-            // an uninstall is trying to reach, so there is nothing to wait for and
-            // nothing left to delete: `settle` would wait out the timeout for a
-            // state a service that is not registered can never reach, and
-            // `sc delete` on it fails with 1060.
-            if !service_exists() {
-                return Ok(());
-            }
-            settle(ServiceState::Stopped, codes::SERVICE_UNINSTALL_FAILED)
+            // The stop may have taken the service off the register entirely — the code above
+            // already tolerates 1060 from `sc stop` — and absent is the state an uninstall is
+            // heading towards, so [`settle_down`] counts it as down instead of waiting out the
+            // timeout for it. What it does wait for is the real thing: [`settle`] with
+            // [`ServiceState::Stopped`] returned while the service was still STOP_PENDING, and a
+            // delete issued on top of a teardown that has not finished races it.
+            settle_down(codes::SERVICE_UNINSTALL_FAILED)
         })
         .and_then(|()| {
             if !service_exists() {
@@ -323,17 +374,56 @@ mod windows_impl {
             Escalation::OnAccessDenied,
             codes::SERVICE_STOP_FAILED,
         )
-        .and_then(|()| settle(ServiceState::Stopped, codes::SERVICE_STOP_FAILED))
+        // Waited out with the real state rather than [`settle`]: an install replaces the binary
+        // as soon as this returns, which is only safe once nothing is running.
+        .and_then(|()| settle_down(codes::SERVICE_STOP_FAILED))
     }
 
     /// What the service manager says right now.
     pub fn state() -> ServiceState {
-        match sc_query() {
-            Some(text) if text.contains("1060") => ServiceState::NotInstalled,
-            Some(text) if text.contains("RUNNING") => ServiceState::Running,
-            Some(_) => ServiceState::Stopped,
+        match sc_query().map(|text| sc_state(&text)) {
+            Some(ScState::Running) => ServiceState::Running,
             // `sc.exe` itself could not be run, so there is nothing to report as installed.
-            None => ServiceState::NotInstalled,
+            Some(ScState::Absent) | None => ServiceState::NotInstalled,
+            // Pending included: a service coming up is not answering yet, and one going down has
+            // already stopped answering — both are "not running" to every control keyed off this.
+            _ => ServiceState::Stopped,
+        }
+    }
+
+    /// Waits until the service is down — "not running any more", rather than "reported stopped".
+    ///
+    /// Waiting through [`settle`] with [`ServiceState::Stopped`] does not wait at all: [`state`]
+    /// answers Stopped for `STOP_PENDING` too, so it returned while the service was still coming
+    /// down. Replacing the binary has to wait for the real thing, because the last thing the
+    /// teardown does is restore the system DNS, and starting the new build races that cleanup.
+    ///
+    /// A service that disappeared counts as down — nothing is running, which is what is being
+    /// waited for, and it is the state an uninstall is heading towards anyway.
+    fn settle_down(failure: &str) -> Result<(), AppError> {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            match sc_query().map(|text| sc_state(&text)) {
+                Some(ScState::Stopped | ScState::Absent) => return Ok(()),
+                // `sc.exe` could not be run at all, so there is nothing to wait out.
+                Some(ScState::Unknown) | None => {
+                    return Err(AppError::with_detail(failure, "sc.exe reported no state"))
+                }
+                Some(ScState::Running | ScState::Pending) => {}
+            }
+
+            if Instant::now() >= deadline {
+                return Err(AppError::with_detail(
+                    failure,
+                    format!(
+                        "the service was still up after {}s\n{}",
+                        SETTLE_TIMEOUT.as_secs(),
+                        sc_query().unwrap_or_default()
+                    ),
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -1337,7 +1427,7 @@ fn stop_service_macos() -> Result<(), AppError> {
 mod tests {
     use super::{
         linux_activation_args, macos_install_commands, macos_job_target, macos_plist_content,
-        SERVICE_NAME,
+        sc_state, ScState, SERVICE_NAME,
     };
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
@@ -1428,6 +1518,90 @@ mod tests {
 
         assert_eq!(verb, "restart", "a start leaves the old build running");
         assert_eq!(unit, SERVICE_NAME);
+    }
+
+    /// `sc query` for a service that is running. The PID is 1060 on purpose — see below.
+    fn query_running() -> &'static str {
+        "\
+SERVICE_NAME: nexa-service
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+        PID                : 1060
+"
+    }
+
+    /// `sc query` for a service that accepted a stop and is still running its teardown, which
+    /// ends with restoring the system DNS.
+    fn query_stop_pending() -> &'static str {
+        "\
+SERVICE_NAME: nexa-service
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 3  STOP_PENDING
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x1
+        WAIT_HINT          : 0x4e20
+"
+    }
+
+    /// A service that has not finished coming down is not a stopped one.
+    ///
+    /// Reading `STOP_PENDING` as stopped is what made waiting for a stop return immediately, so
+    /// an install went on re-pointing the binary and starting it while the previous build was
+    /// still tearing down. Restoring the system DNS is the last thing that teardown does, which
+    /// makes it the one that races whatever the new build does at startup.
+    #[test]
+    fn a_pending_stop_is_not_a_finished_one() {
+        assert_eq!(sc_state(query_stop_pending()), ScState::Pending);
+
+        assert_ne!(
+            sc_state(query_stop_pending()),
+            ScState::Stopped,
+            "a stop that is still in progress must not read as one that finished"
+        );
+    }
+
+    /// The same digits that mean "not installed" also appear where they mean nothing.
+    ///
+    /// A missing service is reported as `FAILED 1060` and has no `PID` line at all, while
+    /// `PID : 1060` is a process id. Matching the number anywhere would make a running service
+    /// read as absent, and an install that believes the service is gone does not stop it first.
+    #[test]
+    fn a_process_id_is_not_a_missing_service() {
+        assert_eq!(sc_state(query_running()), ScState::Running);
+
+        assert_eq!(
+            sc_state("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"),
+            ScState::Absent
+        );
+    }
+
+    /// The four answers a wait keys off: coming down, up, gone, and "no answer".
+    #[test]
+    fn every_state_the_control_manager_reports_is_read() {
+        assert_eq!(
+            sc_state(
+                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 0  (0x0)\n"
+            ),
+            ScState::Stopped
+        );
+        assert_eq!(
+            sc_state(
+                "SERVICE_NAME: nexa-service\n        STATE              : 2  START_PENDING\n                                (NOT_STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\n"
+            ),
+            ScState::Pending
+        );
+        assert_eq!(
+            sc_state("[SC] OpenSCManager FAILED 5:\n\nAccess is denied.\n"),
+            ScState::Unknown,
+            "a query that never reached a service answers no state, which is not 'stopped'"
+        );
     }
 
     /// The executable path is the only part of the job that is interpolated into XML
