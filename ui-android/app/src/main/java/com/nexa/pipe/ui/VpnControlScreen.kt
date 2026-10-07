@@ -522,7 +522,11 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                     ),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
+                                    // Two, not one: on a narrow screen the two byte counts can
+                                    // fill the first line by themselves, and a single line ends
+                                    // by trading the flow count — the figure that says whether
+                                    // the tunnel is carrying anything at all — for an ellipsis.
+                                    maxLines = 2,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
