@@ -17,12 +17,19 @@ use std::process::Command;
 // one, are shared by the platforms that write a DNS setting somewhere outside this
 // process: macOS into the system configuration, Linux into a file. Both of them
 // keep it across a reboot, which is what makes a missed restore permanent.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// One platform wider than the platform code: `is_tun_dns_address` is compiled
+// under `test` everywhere, and this is what it compares against.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, UdpSocket};
+// `IpAddr` is imported one platform wider: the file's parsers are compiled under
+// `test` everywhere so they can be exercised on any host, and this is the type they
+// parse into. The two above are needed only by the platform code itself.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::net::IpAddr;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 
@@ -307,6 +314,7 @@ fn cleanup_stale_hijack_macos() {
 
     let recorded = read_dns_backup();
     let mut reset = Vec::new();
+    let mut failed = Vec::new();
 
     for service in &services {
         let Some(servers) = dns_servers_for(service) else {
@@ -345,8 +353,12 @@ fn cleanup_stale_hijack_macos() {
             }
             // Expected when this process is not elevated: the desktop cannot change
             // system DNS by itself, and the service runs as root and will clean up on
-            // its own start.
-            Err(e) => tracing::warn!("could not reset the stale DNS of {}: {}", service, e),
+            // its own start. Recorded all the same, because this service still needs
+            // its original servers and the backup is the only record of them.
+            Err(e) => {
+                tracing::warn!("could not reset the stale DNS of {}: {}", service, e);
+                failed.push(service.clone());
+            }
         }
     }
 
@@ -360,8 +372,28 @@ fn cleanup_stale_hijack_macos() {
         reset.len(),
         reset.join(", ")
     );
-    // Spent: a later hijack has to record its own starting point.
-    let _ = std::fs::remove_file(DNS_BACKUP_PATH);
+
+    if backup_is_spent(&reset, &failed) {
+        // A later hijack has to record its own starting point.
+        let _ = std::fs::remove_file(DNS_BACKUP_PATH);
+    } else {
+        tracing::warn!(
+            "kept {}: {} could not be reset, and its original DNS is recorded nowhere else",
+            DNS_BACKUP_PATH,
+            failed.join(", ")
+        );
+    }
+}
+
+/// Whether the recorded DNS can be retired after a cleanup pass.
+///
+/// Only when something was actually reset *and* nothing failed. A service that
+/// could not be reset still carries the hijack address, so it will be attempted
+/// again — and its original servers are in no other place. Clearing the file
+/// here would leave the next pass able only to hand it to DHCP.
+#[cfg(target_os = "macos")]
+fn backup_is_spent(reset: &[String], failed: &[String]) -> bool {
+    !reset.is_empty() && failed.is_empty()
 }
 
 #[cfg(windows)]
@@ -461,7 +493,18 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
     // Fallback: back up and overwrite /etc/resolv.conf. The copy is the only record
     // of what the machine used before — a hand-written resolver is not something
     // NetworkManager hands out again on the next connection.
-    if let Err(e) = std::fs::copy("/etc/resolv.conf", RESOLV_CONF_BACKUP) {
+    //
+    // So it must not be taken from a file this code already wrote: a restore that
+    // failed to put the original back leaves the hijack in place, and copying that
+    // over the backup destroys the only copy of the machine's own resolver — the
+    // next restore would then put the hijack back and call it a recovery.
+    let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    if resolv_conf_names_a_tun_address(&current) {
+        tracing::warn!(
+            "/etc/resolv.conf already names a TUN address; keeping the existing {}",
+            RESOLV_CONF_BACKUP
+        );
+    } else if let Err(e) = std::fs::copy("/etc/resolv.conf", RESOLV_CONF_BACKUP) {
         tracing::warn!(
             "could not back up /etc/resolv.conf to {}: {}",
             RESOLV_CONF_BACKUP,
@@ -696,6 +739,17 @@ fn resolv_conf_nameservers(contents: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `contents` already names one of the hijack's own addresses.
+///
+/// Guards the backup: a resolv.conf in this state is one this code wrote and
+/// failed to put back, not the machine's own configuration.
+#[cfg(any(target_os = "linux", test))]
+fn resolv_conf_names_a_tun_address(contents: &str) -> bool {
+    resolv_conf_nameservers(contents)
+        .iter()
+        .any(|server| is_tun_dns_address(server))
+}
+
 /// `contents` with the `nameserver` lines naming one of `addresses` removed, and
 /// every other line kept exactly as it was.
 #[cfg(any(target_os = "linux", test))]
@@ -919,9 +973,11 @@ fn set_dns_servers(service: &str, servers: &[String]) -> Result<()> {
 /// never the whole /24 around it: `10.0.0.0/24` is both a candidate block and the
 /// subnet a great many home LANs sit in, so treating every address in it as ours
 /// would wipe the DNS of anyone whose router hands out 10.0.0.1.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn is_tun_dns_address(address: &str) -> bool {
-    let Ok(ip) = address.parse::<Ipv4Addr>() else {
+    // Spelled out because this is compiled one platform wider than the `Ipv4Addr`
+    // import: under `test` it also builds where that import does not apply.
+    let Ok(ip) = address.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
     TUN_BASE_CANDIDATES
@@ -1031,13 +1087,19 @@ fn parse_network_services(output: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
-    use super::{is_tun_dns_address, parse_getdnsservers, parse_network_services, NO_DNS_SERVERS};
+    use super::{
+        backup_is_spent, is_tun_dns_address, parse_getdnsservers, parse_network_services,
+        NO_DNS_SERVERS,
+    };
 
     // The resolv.conf and resolvectl readers are pure, so they are compiled under
     // `test` on every platform: the Linux code cannot be built or run here, and a
     // parser for a file this code rewrites is not something to ship unexercised.
     #[cfg(any(target_os = "linux", test))]
-    use super::{parse_resolvectl_dns, resolv_conf_nameservers, resolv_conf_without_nameservers};
+    use super::{
+        parse_resolvectl_dns, resolv_conf_names_a_tun_address, resolv_conf_nameservers,
+        resolv_conf_without_nameservers,
+    };
 
     /// The legend `-listallnetworkservices` prints ahead of its list is not a service.
     /// Handing it to `-setdnsservers` anyway is where every startup's worth of
@@ -1145,6 +1207,56 @@ mod tests {
         assert_eq!(
             resolv_conf_without_nameservers(contents, &["198.18.0.254".to_string()]),
             "# written by hand\nsearch example.internal\nnameserver 8.8.8.8\noptions edns0\n"
+        );
+    }
+
+    /// The backup is only ever taken from a resolv.conf the machine still owns. A
+    /// file that already names one of the hijack's addresses is one this code wrote
+    /// and failed to put back: copying it over the backup would destroy the only
+    /// record of the machine's own resolver, and the next restore would then put the
+    /// hijack back and call it a recovery.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn a_hijacked_resolv_conf_is_not_a_backup_source() {
+        assert!(resolv_conf_names_a_tun_address(
+            "search example.internal\nnameserver 198.18.0.254\n"
+        ));
+        assert!(resolv_conf_names_a_tun_address(
+            "nameserver 8.8.8.8\nnameserver 198.18.0.254\n"
+        ));
+
+        assert!(
+            !resolv_conf_names_a_tun_address("nameserver 8.8.8.8\noptions edns0\n"),
+            "the machine's own resolver is exactly what the backup exists to keep"
+        );
+        assert!(!resolv_conf_names_a_tun_address("# no nameserver at all\n"));
+        assert!(
+            !resolv_conf_names_a_tun_address("nameserver 10.0.0.1\n"),
+            "a LAN router's DNS is not a hijack"
+        );
+    }
+
+    /// The recorded DNS is spent only when a cleanup pass reset something *and* left
+    /// nothing behind. A service whose reset failed still carries the hijack address
+    /// and will be attempted again, and its original servers are written nowhere else
+    /// — deleting the file would leave the next pass able only to hand it to DHCP.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_backup_outlives_a_partial_cleanup() {
+        let reset = ["Wi-Fi".to_string()];
+        let failed = ["Thunderbolt Bridge".to_string()];
+
+        assert!(
+            backup_is_spent(&reset, &[]),
+            "every service that was attempted came back"
+        );
+        assert!(
+            !backup_is_spent(&reset, &failed),
+            "a service that could not be reset still needs its recorded DNS"
+        );
+        assert!(
+            !backup_is_spent(&[], &[]),
+            "nothing was reset, so nothing was spent"
         );
     }
 
