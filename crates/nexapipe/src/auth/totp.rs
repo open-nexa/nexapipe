@@ -3,7 +3,7 @@
 use super::config::{AuthConfig, TotpAlgorithm};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use totp_rs::{Algorithm, TOTP};
+use totp_rs::{Algorithm, Builder, Secret};
 
 /// HMAC-SHA256 keyed by the client's TOTP secret.
 type HmacSha256 = Hmac<Sha256>;
@@ -89,21 +89,33 @@ impl<'a> TotpValidator<'a> {
             return Err(AuthError::ChallengeMismatch);
         }
 
-        let totp = TOTP::new(
-            self.get_algorithm(),
-            self.config.digits as usize,
-            self.config.window as u8,
-            self.config.time_step as u64,
-            secret,
-        )
-        .map_err(|_| AuthError::TotpCreationFailed)?;
+        // `Builder` narrows two of these: 5.x took `digits` as a `usize` and
+        // `skew` as a `u8`, 6.0 takes a `u8` and a `u16`. Converting rather
+        // than casting keeps a config that does not fit from being truncated
+        // into a plausible one — a `digits` of 262 would otherwise read as 6
+        // and issue codes nobody asked for.
+        let digits = u8::try_from(self.config.digits).map_err(|_| AuthError::TotpCreationFailed)?;
+        let skew = u16::try_from(self.config.window).map_err(|_| AuthError::TotpCreationFailed)?;
 
-        Ok(totp.check_current(code).unwrap_or(false))
+        let totp = Builder::new()
+            .with_algorithm(self.get_algorithm())
+            .with_digits(digits)
+            .with_skew(skew)
+            .with_step_duration(self.config.time_step as u64)
+            .with_secret(secret)
+            .build()
+            .map_err(|_| AuthError::TotpCreationFailed)?;
+
+        // `check_current` answers with the step it matched on — `Some` is the
+        // "yes" this used to get as a `bool`, and the step itself is nothing
+        // an AUTH_RESPONSE is asking about.
+        Ok(totp.check_current(code).is_some())
     }
 
     /// Generate a new TOTP secret for a client (for setup)
     pub fn generate_secret() -> String {
-        totp_rs::Secret::generate_secret().to_encoded().to_string()
+        // Unpadded base32, the same spelling `decode_secret` reads back.
+        Secret::generate().to_base32()
     }
 }
 

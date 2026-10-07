@@ -7,7 +7,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
 use sha2::Sha256;
 use std::fmt;
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Algorithm, Builder, Secret};
 
 /// Application error codes the server closes a connection with during the 2FA
 /// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`
@@ -164,17 +164,28 @@ impl TwoFactorAuth {
 
     /// Generate current TOTP code
     pub fn generate_code(&self) -> Result<String, ClientError> {
-        let totp = TOTP::new(
-            self.algorithm.to_totp_rs(),
-            self.digits as usize,
-            0,
-            self.time_step as u64,
-            self.secret.clone(),
-        )
-        .map_err(|e| ClientError::Other(format!("Failed to create TOTP: {}", e)))?;
+        // Same narrowing as the server's validator: `digits` is a `u8` here
+        // where 5.x gave it a `usize`, so an out-of-range config is refused
+        // rather than truncated into a digit count nobody asked for.
+        let digits = u8::try_from(self.digits).map_err(|_| {
+            ClientError::InvalidConfig(format!("{} is not a TOTP digit count", self.digits))
+        })?;
 
-        totp.generate_current()
-            .map_err(|e| ClientError::Other(format!("Failed to generate TOTP code: {}", e)))
+        let totp = Builder::new()
+            .with_algorithm(self.algorithm.to_totp_rs())
+            .with_digits(digits)
+            // No skew: this side only ever generates, and a code is either the
+            // current one or not. The server's window is what grants tolerance.
+            .with_skew(0)
+            .with_step_duration(self.time_step as u64)
+            .with_secret(self.secret.clone())
+            .build()
+            .map_err(|e| ClientError::Other(format!("Failed to create TOTP: {e}")))?;
+
+        // `generate_current` no longer returns a `Result`: the only thing it
+        // could have failed on was a clock set before the Unix epoch, which is
+        // not a condition a handshake can recover from.
+        Ok(totp.generate_current().to_string())
     }
 
     /// Get client ID
@@ -579,7 +590,7 @@ const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Generate a new secret for client setup
 pub fn generate_secret() -> String {
-    Secret::generate_secret().to_encoded().to_string()
+    Secret::generate().to_base32()
 }
 
 /// Protocol messages for authentication handshake
