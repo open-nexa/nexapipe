@@ -103,6 +103,7 @@
     "alreadyGone": "该连接已经结束了。",
     "noneOpen": "该节点当前没有打开的连接。",
     "nodeUnknown": "没有配置的节点与之对应。",
+    "unnamedNode": "配置中未包含",
     "unknownTarget": "未指明目标",
     "unknownSource": "来源未知",
     "openSeconds": "{count} 秒",

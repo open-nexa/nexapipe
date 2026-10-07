@@ -103,6 +103,7 @@
     "alreadyGone": "That connection had already ended.",
     "noneOpen": "That node had no open connections.",
     "nodeUnknown": "No configured node matches that connection.",
+    "unnamedNode": "Not in this configuration",
     "unknownTarget": "destination not named",
     "unknownSource": "origin unknown",
     "openSeconds": "{count}s",

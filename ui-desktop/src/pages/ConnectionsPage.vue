@@ -15,12 +15,14 @@ import { useI18n } from 'vue-i18n';
 import AppButton from '../components/base/AppButton.vue';
 import AppIcon from '../components/base/AppIcon.vue';
 import { useConnectionsStore } from '../stores/connections';
+import { useConfigStore } from '../stores/config';
 import { useProxyStore } from '../stores/proxy';
 import { formatBytes } from '../utils/format';
 import type { ActiveFlow } from '../types';
 
 const { t } = useI18n();
 const { status } = useProxyStore();
+const { config, connectionMask } = useConfigStore();
 const {
   flows,
   total,
@@ -52,6 +54,28 @@ const rows = computed(() => flows.value);
  * backend, this configuration just does not name it, and dropping it would be hiding a
  * connection that is open.
  */
+/**
+ * What may be printed for the node a group of flows reaches.
+ *
+ * Deliberately not `flow.connection` and not `flow.endpointId`: when the node was configured with
+ * a ticket that string *is* the ticket, and a ticket is a credential. The rule the rest of the
+ * shell keeps (see `stores/config.ts`) is that a connection string is only ever shown as the mask
+ * Rust produced for it, because a mask the renderer computes from the real value is not one — so
+ * the group's key is resolved back to a configured node and the mask is asked for by node id. A
+ * name the invite gave the node wins, the same way it does on the other pages.
+ *
+ * Falls back to a placeholder for a flow reaching a backend this configuration does not name: it
+ * has a backend, there is simply no configured node to ask for a mask.
+ */
+function labelFor(key: string): string {
+  const node = config.nodes.find(
+    (candidate) =>
+      (candidate.connectionType === 'ticket' ? candidate.ticket : candidate.endpointId) === key,
+  );
+  if (!node) return t('connections.unnamedNode');
+  return node.name || connectionMask(node.id) || t('connections.unnamedNode');
+}
+
 const groups = computed(() => {
   const byKey = new Map<string, { key: string; label: string; flows: ActiveFlow[] }>();
   for (const flow of rows.value) {
@@ -60,7 +84,7 @@ const groups = computed(() => {
     if (entry) {
       entry.flows.push(flow);
     } else {
-      byKey.set(key, { key, label: flow.connection ?? flow.endpointId, flows: [flow] });
+      byKey.set(key, { key, label: labelFor(key), flows: [flow] });
     }
   }
   return [...byKey.values()];
@@ -160,7 +184,6 @@ function sourceOf(flow: ActiveFlow): string {
             </div>
 
             <div class="flow-row__meta">
-              <span>{{ flow.endpointId }}</span>
               <span class="flow-row__from">{{ sourceOf(flow) }}</span>
             </div>
           </li>
