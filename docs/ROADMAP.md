@@ -233,17 +233,27 @@ with TOTP as a human second factor rather than the device identity itself.
 
 ### 4.5 Protocols and transport (P1/P2)
 
-- **No IPv6 inside the TUN**: AAAA queries are answered empty (`ANCOUNT=0`).
-  `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`
+- **IPv6 inside the TUN shipped in v0.4.0** — R10, on both clients. An AAAA
+  query in the Internet class now gets a real answer, 16 bytes of RDATA out of
+  a virtual pool (`crates/nexapipe-client/src/tun_proxy.rs:1324-1340`,
+  `:1472-1475`). Android routes `fd00:10:0:1::/64` into the TUN and always has
+  a pool (`:135-146`, `:430-438`). The desktop is best effort: `configure_ipv6`
+  has to set the address per platform and may be refused, and when it is, AAAA
+  is answered with nothing — which a resolver reads as "use A", not as an
+  address no route leads to
+  (`ui-desktop/src-tauri/src/proxy/tun_proxy.rs:307-337`).
 - **The desktop TUN does UDP** — one `l4::open_udp` bi-stream per flow, through
   the same smoltcp stack the Android client runs
   (`ui-desktop/src-tauri/src/proxy/tun_proxy.rs`). This list used to claim
   otherwise and was wrong. The local proxy, which is the `--local-proxy` mode
   rather than the TUN, still speaks `CONNECT` only — a different path, and not
-  the same gap. What is actually missing here is IPv6, above, which makes R10
-  smaller than this section once made it look.
-- The iroh endpoint binds `0.0.0.0` unconditionally; there is no IPv6 knob.
-  `proxy/mod.rs:220`
+  the same gap.
+- The iroh endpoint binds `0.0.0.0` on the configured port, and `[::]` beside
+  it when `[iroh] bind_ipv6` is set — a second socket rather than a
+  replacement, and one that is allowed to fail so a host without IPv6 still
+  starts. Both need `bind_port`: without a fixed port there is nothing to keep
+  the two families on, and the flag is ignored
+  (`crates/nexapipe/src/config.rs:101`, `proxy/mod.rs:326-345`).
 
 The iroh dependency boundaries used to belong on this list — discovery via
 `dns.iroh.link`, far-side n0 relays. They are documented in
@@ -595,12 +605,12 @@ side by side. The three fixed defects are recorded in
 |---|---|
 | HTTP/1.1-only backend client | `crates/nexapipe/src/http/mod.rs:13-32` |
 | Load balancing strategies and fallback | `crates/nexapipe/src/lb/mod.rs:6-9,83-90` |
-| Health checks skipped for three route modes | `crates/nexapipe/src/proxy/mod.rs:58-65` |
-| No IPv6 in the TUN | `crates/nexapipe-client/src/tun_proxy.rs:1178-1180` |
+| Health checks skipped for three route modes | *closed in v0.5.0, apart from the one mode that cannot be.* Was "`passthrough`, `tcp` and `udp` routes are never probed" at `crates/nexapipe/src/proxy/mod.rs:58-65`. Now `passthrough` and `tcp` routes get a TCP connect probe — liveness rather than health, and a TLS listener is hung up on mid-handshake — while a `udp`-only route is deliberately left unprobed, because inventing a datagram would report an answer no backend gave (`crates/nexapipe/src/health/mod.rs:30-47`, `:193-197`). |
+| No IPv6 in the TUN | *closed in v0.4.0.* Was "AAAA queries are answered empty (`ANCOUNT=0`)" at `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`. Now an AAAA query in the Internet class gets a 16-byte answer out of a virtual pool (`:1324-1340`, `:1472-1475`), on both clients; the desktop's pool is best effort, since `configure_ipv6` may be refused per platform. |
 | Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
 | Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. The same release added what R7 asked for beside the gauges: a request ID per request (`log::next_request_id`, on the access line and as `x-request-id`) and a span around each one. |
-| CHANGELOG, image publication | *half closed in v0.3.0.* `CHANGELOG.md` exists at the repository root; image publication does not, and `.github/workflows/release.yml` still produces archives, desktop bundles and the APK only. |
+| CHANGELOG, image publication | *closed in v0.5.0.* `CHANGELOG.md` has been at the repository root since v0.3.0; the image half lands with this release, where `build-image` pushes one leg per architecture by digest and `publish-image` merges them into a single multi-arch manifest under `ghcr.io/open-nexa/nexapipe` — `:latest` only for a tag with no prerelease suffix (`.github/workflows/release.yml:1018`, `:1097`). |
 | iroh version and boundary conditions | `Cargo.toml:38` asks for `^1.0.1` and `Cargo.lock` resolves 1.2.0 — a caret range, not the pin an earlier note here claimed. The boundaries themselves are documented in `docs/iroh-boundaries.md`, linked from the `[iroh]` section of both READMEs. |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
