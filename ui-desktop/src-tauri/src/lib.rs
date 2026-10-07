@@ -21,7 +21,7 @@ use status::{
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -193,10 +193,15 @@ async fn start_proxy(
     // The stale-hijack cleanup resets every adapter still pointing at a TUN address, and on
     // Windows there is no "is that tunnel still alive" guard (`address_is_held` is macOS and
     // Linux only) — so a cleanup still running would reset the DNS of the tunnel this start is
-    // in the middle of bringing up. Service mode is exempt for the same reason it is exempt
-    // below: that tunnel belongs to the other process, which runs its own cleanup.
-    if use_tun && !use_service {
-        wait_for_stale_hijack_cleanup().await;
+    // in the middle of bringing up.
+    //
+    // Service mode is not exempt. The cleanup this process started is *this* process's, not the
+    // service's: the service runs one of its own when it boots (`ServiceRunner::run`), which is
+    // no help here, because a long-lived service does not boot again between two starts and has
+    // no reason to re-clean before the second one. The tunnel whose DNS is at stake belongs to
+    // the service, and this process's cleanup is perfectly capable of resetting it.
+    if use_tun {
+        stale_hijack_cleanup().await;
     }
 
     // Checked here, before anything is spawned, so the caller gets the precise code instead of a
@@ -1493,7 +1498,8 @@ async fn credential_store_status() -> Result<String, AppError> {
 /// frontend's own `show()` and whichever arrives first wins, the second being a no-op.
 const FIRST_PAINT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The running [`cleanup_stale_hijack`], so a start can wait for it.
+/// The stale-hijack cleanup, once per process: whoever needs it first runs it, everyone else
+/// waits for that run.
 ///
 /// Spawned rather than run inline because on Windows it costs 1.4-1.7 seconds: it shells out
 /// to PowerShell, and `Get-NetUDPEndpoint` / `Get-DnsClientServerAddress` each load the
@@ -1506,33 +1512,30 @@ const FIRST_PAINT_FALLBACK: std::time::Duration = std::time::Duration::from_secs
 /// (`address_is_held`) is only compiled on macOS and Linux — so a cleanup still running when a
 /// start begins would reset the DNS of the tunnel that start is bringing up.
 ///
-/// `OnceLock`, not a `LazyLock`: the wait is [`OnceLock::get_or_init`] on a second cell, and a
-/// thread that has not been spawned yet must block rather than run the cleanup a second time.
-static CLEANUP_JOIN: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
+/// A [`tokio::sync::OnceCell`], not a `OnceLock` plus a second cell standing in for "finished".
+/// `OnceLock::get_or_init` is the wrong shape for this: the closure runs in whichever caller
+/// finds the cell empty, so a caller arriving while the cleanup is mid-flight would initialise
+/// the cell itself and return at once — the wait would be a no-op in exactly the case it
+/// exists for. This cell's `get_or_init` instead hands the work to the one caller that wins the
+/// permit and parks the others until it is done, and the cleanup goes to a blocking thread
+/// because it is 1.4 seconds of synchronous process output that must not sit on a runtime
+/// worker.
+static STALE_HIJACK_CLEANUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-/// Whether [`cleanup_stale_hijack`] has finished. Separate from [`CLEANUP_JOIN`] because a
-/// waiter that arrives first has to be able to start it itself.
-static CLEANUP_DONE: OnceLock<()> = OnceLock::new();
-
-/// Starts the stale-DNS cleanup on a background thread, once per process.
+/// Runs [`cleanup_stale_hijack`] once per process, off the async runtime, and resolves when it
+/// has finished.
 ///
-/// Idempotent, and safe to call from both the setup hook and a start: whichever caller gets
-/// there first spawns the thread, the other finds it already running.
-fn spawn_stale_hijack_cleanup() {
-    let _ = CLEANUP_JOIN.set(std::thread::spawn(|| {
-        crate::proxy::dns_config::cleanup_stale_hijack();
-        let _ = CLEANUP_DONE.set(());
-    }));
-}
-
-/// Waits for [`spawn_stale_hijack_cleanup`] to finish, starting it first if it has not begun.
-///
-/// Called before a tunnel is brought up, so the cleanup cannot reset the DNS that tunnel is
-/// about to claim. Never called on the way to the first paint — that is the whole point of
-/// moving the work off the main thread.
-async fn wait_for_stale_hijack_cleanup() {
-    spawn_stale_hijack_cleanup();
-    let _ = CLEANUP_DONE.get_or_init(|| ());
+/// Two callers, opposite needs: [`setup`] starts it and walks away so the first paint is not
+/// held up, and [`start_proxy`] waits for it so a tunnel cannot come up underneath it. Both
+/// reach the same cleanup through [`STALE_HIJACK_CLEANUP`], so whichever gets there first does
+/// the work and the other one waits for the result rather than starting a second run.
+async fn stale_hijack_cleanup() {
+    let _ = STALE_HIJACK_CLEANUP
+        .get_or_init(|| async {
+            let _ =
+                tokio::task::spawn_blocking(crate::proxy::dns_config::cleanup_stale_hijack).await;
+        })
+        .await;
 }
 
 /// Stops a tunnel this process is still running, so that quitting the app hands the
@@ -1590,11 +1593,11 @@ pub fn run() {
             // unprivileged desktop cannot change system DNS and the service, which
             // runs as root, cleans up on its own start.
             //
-            // On a thread, because this is not something the first paint should wait
+            // On a task, because this is not something the first paint should wait
             // for: the window already exists by the time this closure runs, and on
             // Windows the PowerShell it shells out to costs over a second. A start
-            // waits for it explicitly — see `wait_for_stale_hijack_cleanup`.
-            spawn_stale_hijack_cleanup();
+            // waits for it explicitly — see `stale_hijack_cleanup`.
+            tauri::async_runtime::spawn(stale_hijack_cleanup());
 
             // The window is created hidden (`visible: false`) and shown by the frontend
             // once it has something to paint, so a slow start shows no window rather
