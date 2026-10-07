@@ -4,11 +4,11 @@ use crate::relay::RelayModeSpec;
 use crate::tun_proxy::TunProxy;
 use crate::{DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, NodeConfig};
 use iroh::Endpoint;
-use iroh::dns::{DnsError, DnsProtocol, DnsResolver, Resolver, TxtRecordData};
+use iroh::dns::{DnsError, DnsResolver, NameserverConfig, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
-use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
+use jni::{Env, EnvUnowned, Outcome};
 use ndk_context;
 use once_cell::sync::{Lazy, OnceCell};
 use std::collections::HashMap;
@@ -279,6 +279,37 @@ macro_rules! jni_log {
     };
 }
 
+/// Runs `body` with a temporary `Env`, answering `failure` when it failed or
+/// panicked.
+///
+/// jni 0.22 hands the environment to a closure rather than handing it over, and
+/// the `ErrorPolicy`s it ships with answer `Default` when that closure fails.
+/// For a `jint` that is `0` — the value every entry point here returns for
+/// success — so a panic would reach Kotlin as "started fine", which is worse
+/// than the native crash it replaces. Failure is worth saying out loud, so the
+/// value to answer with is passed in: -1, or a null string.
+fn with_env_or<T, F>(unowned_env: &mut EnvUnowned<'_>, failure: T, body: F) -> T
+where
+    F: FnOnce(&mut Env<'_>) -> T,
+{
+    let outcome = unowned_env.with_env(|env| -> jni::errors::Result<T> { Ok(body(env)) });
+    match outcome.into_outcome() {
+        Outcome::Ok(value) => value,
+        Outcome::Err(e) => {
+            jni_log!("[WARN:jni] a JNI call failed: {e}");
+            failure
+        }
+        Outcome::Panic(_) => {
+            // The hook `nativeInit` installs has already logged the message and
+            // the location. All this has to do is stop the unwind from leaving
+            // the frame, which on Android is a native crash rather than
+            // something the JVM can report.
+            jni_log!("[WARN:jni] a native method panicked");
+            failure
+        }
+    }
+}
+
 /// Custom DNS Resolver that wraps the hickory resolver and returns pre-resolved IPs for specific domains.
 ///
 /// The GFW drops UDP DNS responses for `iroh.link` domains, causing hickory resolution to time out.
@@ -296,8 +327,14 @@ impl OverrideResolver {
         let inner = if nameservers.is_empty() {
             DnsResolver::new()
         } else {
+            // `NameserverConfig` keeps its fields private, so the port has to
+            // be re-applied after the protocol constructor defaults it to 53.
             DnsResolver::builder()
-                .with_nameservers(nameservers.iter().map(|a| (*a, DnsProtocol::Udp)))
+                .add_nameserver_configs(
+                    nameservers
+                        .iter()
+                        .map(|a| NameserverConfig::udp(a.ip()).with_port(a.port())),
+                )
                 .build()
         };
         Self {
@@ -410,22 +447,40 @@ impl Resolver for OverrideResolver {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| native_init(env))
+}
+
+fn native_init(env: &mut Env<'_>) -> jint {
+    // Only the Android half needs the environment; elsewhere the parameter is
+    // accepted so the entry point can be written once.
+    #[cfg(not(target_os = "android"))]
+    let _ = env;
+
     #[cfg(target_os = "android")]
     {
-        unsafe {
-            let raw_env = env.get_raw();
-            let mut raw_vm = std::ptr::null_mut();
-            // The result is checked rather than unwrapped: a null VM handed to
-            // the context is a crash the first time anything logs, and this
-            // runs before there is a logger to say so.
-            if let Some(get_java_vm) = (**raw_env).GetJavaVM
-                && get_java_vm(raw_env, &mut raw_vm) == jni::sys::JNI_OK
-                && !raw_vm.is_null()
-            {
-                ndk_context::initialize_android_context(raw_vm as *mut _, std::ptr::null_mut());
+        // The VM this thread is attached to, asked for through `Env` rather
+        // than read out of the JNI function table by hand: 0.22's `sys`
+        // bindings group those slots by the JNI version they arrived in, so
+        // there is no flat `GetJavaVM` field to call any more.
+        //
+        // `JavaVM::singleton()` would read tidier but it is still empty at this
+        // point — jni records the VM the first time it hands out an `Env`, and
+        // this runs before anything has. Going through `Env` is what fills it.
+        //
+        // Still checked rather than unwrapped: a null VM handed to the context
+        // is a crash the first time anything logs, and this runs before there
+        // is a logger to say so.
+        if let Ok(vm) = env.get_java_vm() {
+            let raw_vm = vm.get_raw();
+            if !raw_vm.is_null() {
+                // SAFETY: `raw_vm` is the VM this thread is attached to, which
+                // is what ndk_context wants; it outlives the process.
+                unsafe {
+                    ndk_context::initialize_android_context(raw_vm as *mut _, std::ptr::null_mut());
+                }
             }
         }
         // `Info` by default, not `Debug`: the debug logs along the data path
@@ -497,24 +552,24 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
 /// reads it before bind. Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     dns_servers: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        set_dns_servers(env, dns_servers)
+    })
+}
+
+fn set_dns_servers(env: &mut Env<'_>, dns_servers: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetDnsServers");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let dns_str = match env.get_string(&dns_servers) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                jni_log!("Failed to convert DNS servers string to UTF-8");
-                return -1;
-            }
-        },
+    let dns_str = match dns_servers.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => {
             jni_log!("Failed to get DNS servers string from JNI");
             return -1;
@@ -557,24 +612,22 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsServers(
 /// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     overrides: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| set_dns_override(env, overrides))
+}
+
+fn set_dns_override(env: &mut Env<'_>, overrides: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetDnsOverride");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let overrides_str = match env.get_string(&overrides) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                jni_log!("Failed to convert DNS overrides string to UTF-8");
-                return -1;
-            }
-        },
+    let overrides_str = match overrides.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => {
             jni_log!("Failed to get DNS overrides string from JNI");
             return -1;
@@ -646,47 +699,40 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDnsOverride(
 /// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     relay_mode: JString,
     relay_url: JString,
     relay_auth_token: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        set_relay_config(env, relay_mode, relay_url, relay_auth_token)
+    })
+}
+
+fn set_relay_config(
+    env: &mut Env<'_>,
+    relay_mode: JString,
+    relay_url: JString,
+    relay_auth_token: JString,
+) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetRelayConfig");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let mode_str = match env.get_string(&relay_mode) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                jni_log!("Failed to convert relay_mode string to UTF-8");
-                return -1;
-            }
-        },
+    let mode_str = match relay_mode.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => {
             jni_log!("Failed to get relay_mode string from JNI");
             return -1;
         }
     };
 
-    let url_str = match env.get_string(&relay_url) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => String::new(),
-        },
-        Err(_) => String::new(),
-    };
+    let url_str = relay_url.try_to_string(env).unwrap_or_default();
 
-    let token_str = match env.get_string(&relay_auth_token) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => String::new(),
-        },
-        Err(_) => String::new(),
-    };
+    let token_str = relay_auth_token.try_to_string(env).unwrap_or_default();
 
     jni_log!(
         "[DEBUG:jni] nativeSetRelayConfig: mode='{}', url='{}', auth_token={}",
@@ -708,11 +754,8 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
 }
 
 /// Reads a Java string argument; None when it is null or not valid UTF-8.
-fn read_jstring(env: &mut JNIEnv, s: &JString) -> Option<String> {
-    env.get_string(s).ok().and_then(|j| match j.to_str() {
-        Ok(s) => Some(s.to_string()),
-        Err(_) => None,
-    })
+fn read_jstring(env: &Env<'_>, s: &JString<'_>) -> Option<String> {
+    s.try_to_string(env).ok()
 }
 
 /// Builds a [`TwoFactorAuth`] from a stored (client id, secret, algorithm) triple.
@@ -787,27 +830,38 @@ fn node_enrollment_snapshot() -> Vec<(String, (String, String))> {
 /// algorithm: "sha1" / "sha256" / "sha512".
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     client_id: JString,
     secret: JString,
     algorithm: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        set_two_factor(env, client_id, secret, algorithm)
+    })
+}
+
+fn set_two_factor(
+    env: &mut Env<'_>,
+    client_id: JString,
+    secret: JString,
+    algorithm: JString,
+) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetTwoFactor");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let client_id = match read_jstring(&mut env, &client_id) {
+    let client_id = match read_jstring(env, &client_id) {
         Some(v) => v,
         None => {
             jni_log!("Failed to read client_id in nativeSetTwoFactor");
             return -1;
         }
     };
-    let secret = read_jstring(&mut env, &secret).unwrap_or_default();
-    let algorithm = read_jstring(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+    let secret = read_jstring(env, &secret).unwrap_or_default();
+    let algorithm = read_jstring(env, &algorithm).unwrap_or_else(|| "sha1".to_string());
 
     jni_log!(
         "[DEBUG:jni] nativeSetTwoFactor: client_id='{}', algorithm='{}', secret={} chars",
@@ -838,35 +892,47 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactor(
 /// Must be called before nativeStartProxy.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     node_id: JString,
     client_id: JString,
     secret: JString,
     algorithm: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        set_two_factor_for_node(env, node_id, client_id, secret, algorithm)
+    })
+}
+
+fn set_two_factor_for_node(
+    env: &mut Env<'_>,
+    node_id: JString,
+    client_id: JString,
+    secret: JString,
+    algorithm: JString,
+) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetTwoFactorForNode");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let node_id = match read_jstring(&mut env, &node_id) {
+    let node_id = match read_jstring(env, &node_id) {
         Some(v) => v.trim().to_string(),
         None => {
             jni_log!("Failed to read node_id in nativeSetTwoFactorForNode");
             return -1;
         }
     };
-    let client_id = match read_jstring(&mut env, &client_id) {
+    let client_id = match read_jstring(env, &client_id) {
         Some(v) => v,
         None => {
             jni_log!("Failed to read client_id in nativeSetTwoFactorForNode");
             return -1;
         }
     };
-    let secret = read_jstring(&mut env, &secret).unwrap_or_default();
-    let algorithm = read_jstring(&mut env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+    let secret = read_jstring(env, &secret).unwrap_or_default();
+    let algorithm = read_jstring(env, &algorithm).unwrap_or_else(|| "sha1".to_string());
 
     if node_id.is_empty() {
         jni_log!("nativeSetTwoFactorForNode: empty node_id");
@@ -907,33 +973,44 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
 /// Must be called before nativeStartProxy.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetEnrollmentForNode(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     node_id: JString,
     client_id: JString,
     token: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        set_enrollment_for_node(env, node_id, client_id, token)
+    })
+}
+
+fn set_enrollment_for_node(
+    env: &mut Env<'_>,
+    node_id: JString,
+    client_id: JString,
+    token: JString,
+) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetEnrollmentForNode");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let node_id = match read_jstring(&mut env, &node_id) {
+    let node_id = match read_jstring(env, &node_id) {
         Some(v) => v.trim().to_string(),
         None => {
             jni_log!("Failed to read node_id in nativeSetEnrollmentForNode");
             return -1;
         }
     };
-    let client_id = match read_jstring(&mut env, &client_id) {
+    let client_id = match read_jstring(env, &client_id) {
         Some(v) => v,
         None => {
             jni_log!("Failed to read client_id in nativeSetEnrollmentForNode");
             return -1;
         }
     };
-    let token = read_jstring(&mut env, &token).unwrap_or_default();
+    let token = read_jstring(env, &token).unwrap_or_default();
 
     if node_id.is_empty() {
         jni_log!("nativeSetEnrollmentForNode: empty node_id");
@@ -960,7 +1037,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetEnrollmentForNode(
 /// keeps a stale entry from applying to a node that no longer has one.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
@@ -980,9 +1057,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
 /// already forgotten and cannot enroll again.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeIssuedCredential(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        take_issued_credential(env)
+    })
+}
+
+fn take_issued_credential(env: &mut Env<'_>) -> jstring {
     let runtime = match get_runtime() {
         Some(r) => r,
         None => return std::ptr::null_mut(),
@@ -1041,12 +1124,18 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeIssuedCredential(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        start_iroh(env)
+    })
+}
+
+fn start_iroh(env: &mut Env<'_>) -> jstring {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeStartIroh");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return std::ptr::null_mut();
     }
 
@@ -1187,12 +1276,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartIroh(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| start_proxy(env))
+}
+
+fn start_proxy(env: &mut Env<'_>) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeStartProxy");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
@@ -1425,9 +1518,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
 /// report.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeLastError(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        read_last_error(env)
+    })
+}
+
+fn read_last_error(env: &mut Env<'_>) -> jstring {
     let message = match take_last_error() {
         Some(message) => message,
         None => return std::ptr::null_mut(),
@@ -1444,21 +1543,24 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeLastError(
 /// checks and to give immediate feedback while the user edits a node.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeValidateNodeId(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     node_id: JString,
 ) -> jstring {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        validate_node_id(env, node_id)
+    })
+}
+
+fn validate_node_id(env: &mut Env<'_>, node_id: JString) -> jstring {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeValidateNodeId");
-        env.exception_clear().ok();
+        env.exception_clear();
         return std::ptr::null_mut();
     }
 
-    let node_id = match env.get_string(&node_id) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return std::ptr::null_mut(),
-        },
+    let node_id = match node_id.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
 
@@ -1480,7 +1582,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeValidateNodeId(
 /// or -1 on error.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     jni_log!("[DEBUG:jni] nativePreconnect called");
@@ -1569,9 +1671,15 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
 /// "nothing to report" from "asked and answered".
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeLinkKinds(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        link_kinds(env)
+    })
+}
+
+fn link_kinds(env: &mut Env<'_>) -> jstring {
     let runtime = match get_runtime() {
         Some(r) => r,
         None => return std::ptr::null_mut(),
@@ -1636,9 +1744,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeLinkKinds(
 /// "nothing to report" from "asked and answered".
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTraffic(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| traffic(env))
+}
+
+fn traffic(env: &mut Env<'_>) -> jstring {
     let runtime = match get_runtime() {
         Some(r) => r,
         None => return std::ptr::null_mut(),
@@ -1712,7 +1824,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTraffic(
 /// Returns 0 when the connections were dropped, -1 when nothing has been started yet.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     let runtime = match get_runtime() {
@@ -1765,7 +1877,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopProxy(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     // The body drives the runtime through three `block_on`s. Unwinding out of
@@ -1880,30 +1992,28 @@ fn stop_proxy() -> jint {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     node_id: JString,
     domains: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| add_node(env, node_id, domains))
+}
+
+fn add_node(env: &mut Env<'_>, node_id: JString, domains: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeAddNode");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let node_id_str = match env.get_string(&node_id) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let node_id_str = match node_id.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
-    let domains_str = match env.get_string(&domains) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let domains_str = match domains.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
@@ -1954,30 +2064,30 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     domain: JString,
     node_id: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| {
+        add_domain_mapping(env, domain, node_id)
+    })
+}
+
+fn add_domain_mapping(env: &mut Env<'_>, domain: JString, node_id: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeAddDomainMapping");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let domain_str = match env.get_string(&domain) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let domain_str = match domain.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
-    let node_id_str = match env.get_string(&node_id) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let node_id_str = match node_id.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
@@ -2014,21 +2124,22 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveNode(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     node_id: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| remove_node(env, node_id))
+}
+
+fn remove_node(env: &mut Env<'_>, node_id: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeRemoveNode");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let node_id_str = match env.get_string(&node_id) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let node_id_str = match node_id.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
@@ -2050,7 +2161,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveNode(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodes(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     let state = match get_state() {
@@ -2070,21 +2181,22 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodes(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomain(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     domain: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| add_domain(env, domain))
+}
+
+fn add_domain(env: &mut Env<'_>, domain: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeAddDomain");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let domain_str = match env.get_string(&domain) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let domain_str = match domain.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
@@ -2106,21 +2218,22 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomain(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveDomain(
-    mut env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     domain: JString,
 ) -> jint {
-    if env.exception_check().unwrap_or(false) {
+    with_env_or(&mut unowned_env, -1, |env| remove_domain(env, domain))
+}
+
+fn remove_domain(env: &mut Env<'_>, domain: JString) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeRemoveDomain");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
-    let domain_str = match env.get_string(&domain) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return -1,
-        },
+    let domain_str = match domain.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => return -1,
     };
 
@@ -2140,7 +2253,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveDomain(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
     jni_log!("[DEBUG:jni] nativeDestroy called (full teardown: endpoint + proxy)");
@@ -2198,45 +2311,34 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartTunProxy(
-    env: JNIEnv,
+    mut unowned_env: EnvUnowned,
     _class: JClass,
     tun_fd: jint,
     proxy_domains: JString,
 ) -> jint {
-    // Unwinding out of an extern "system" frame is a native crash on Android,
-    // not a Java exception, and the body below builds a smoltcp stack and
-    // spawns its pumps — a long chain with plenty that can panic. Every other
-    // entry point here already catches one.
-    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+    with_env_or(&mut unowned_env, -1, |env| {
         start_tun_proxy(env, _class, tun_fd, proxy_domains)
-    })) {
-        Ok(code) => code,
-        Err(_) => {
-            jni_log!("[DEBUG:jni] Panic occurred during nativeStartTunProxy");
-            -1
-        }
-    }
+    })
 }
 
 /// The body of `nativeStartTunProxy`, split out so the catch has something to
 /// wrap and nothing else inside it has to care.
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
-fn start_tun_proxy(mut env: JNIEnv, _class: JClass, tun_fd: jint, proxy_domains: JString) -> jint {
-    if env.exception_check().unwrap_or(false) {
+fn start_tun_proxy(
+    env: &mut Env<'_>,
+    _class: JClass,
+    tun_fd: jint,
+    proxy_domains: JString,
+) -> jint {
+    if env.exception_check() {
         jni_log!("JNI exception pending before nativeStartTunProxy");
-        let _ = env.exception_clear();
+        env.exception_clear();
         return -1;
     }
 
     // Parse the proxied domains (comma-separated).
-    let proxy_domains_str = match env.get_string(&proxy_domains) {
-        Ok(s) => match s.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                jni_log!("Failed to convert proxy_domains to UTF-8");
-                return -1;
-            }
-        },
+    let proxy_domains_str = match proxy_domains.try_to_string(env) {
+        Ok(s) => s,
         Err(_) => {
             jni_log!("Failed to get proxy_domains string from JNI");
             return -1;
@@ -2309,7 +2411,7 @@ fn start_tun_proxy(mut env: JNIEnv, _class: JClass, tun_fd: jint, proxy_domains:
         if guard.tun_proxy.is_some() {
             jni_log!("[DEBUG:jni] TUN proxy already running, stopping old one first");
             drop(guard);
-            let _ = Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(env, _class);
+            let _ = stop_tun_proxy();
         }
     }
 
@@ -2353,9 +2455,13 @@ fn start_tun_proxy(mut env: JNIEnv, _class: JClass, tun_fd: jint, proxy_domains:
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    stop_tun_proxy()
+}
+
+fn stop_tun_proxy() -> jint {
     jni_log!("[DEBUG:jni] nativeStopTunProxy called");
 
     let state = match get_state() {
