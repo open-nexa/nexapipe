@@ -27,6 +27,7 @@ const { collapsed, autoCollapsed, toggle } = useSidebar();
 /** Order here is the visual order and the tab order — they are not allowed to differ. */
 const NAV_ITEMS = [
   { path: '/', icon: 'wifi', labelKey: 'nav.connect' },
+  { path: '/connections', icon: 'activity', labelKey: 'nav.connections' },
   { path: '/config', icon: 'sliders', labelKey: 'nav.config' },
   { path: '/settings', icon: 'settings', labelKey: 'nav.settings' },
   { path: '/logs', icon: 'file-text', labelKey: 'nav.logs' },

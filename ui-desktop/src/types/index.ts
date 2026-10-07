@@ -175,6 +175,80 @@ export interface NodeTraffic {
 }
 
 /**
+ * Every node's counters added together.
+ *
+ * Nothing on the backend reports this — it is the sum of what `NodeTraffic` already carries, so
+ * the total on screen cannot disagree with the per-node figures beside it.
+ *
+ * `null` while there is nothing to add up, which is not the same as a total of zero: no counters
+ * have been read yet, and printing `0 B` would read as a tunnel that connects and moves nothing.
+ */
+export interface TrafficTotals {
+  sent: number;
+  received: number;
+  active: number;
+}
+
+/**
+ * Bytes per second in each direction, as two totals and a division.
+ *
+ * Deliberately computed here and not on the backend: the counters there are cumulative and
+ * deliberately hold no rate (see `crates/nexapipe-client/src/traffic.rs`), and every consumer
+ * already polls, so a second clock in Rust would have nothing to say that two samples do not.
+ *
+ * `up` is towards the backends, `down` is what comes back — the same direction [`NodeTraffic`]
+ * counts them in, so a total and a rate can be read side by side.
+ */
+export interface TrafficRate {
+  up: number;
+  down: number;
+}
+
+/**
+ * One connection the proxy has open right now. Mirrors `ActiveFlow` in `src-tauri/src/status.rs`.
+ *
+ * `kind` arrives as a string rather than a union because the list of doors a connection can come
+ * in by belongs to the client library, and a second vocabulary for it in the shell would be a
+ * second place to change when one is added. The names are the same ones `flow::FlowKind` prints.
+ *
+ * `connection` is `null` when a flow reaches a backend this configuration does not name, which
+ * is not the same as a flow with no node: it has one, this app just does not configure it.
+ */
+export interface ActiveFlow {
+  /** Stable while the flow is open, and never reused after it ends. */
+  id: number;
+  /** The ticket or endpoint ID exactly as the node was configured. */
+  connection: string | null;
+  /** The backend's endpoint ID. */
+  endpointId: string;
+  /** `http` | `connect` | `websocket` | `tls` | `tun_tcp` | `tun_udp`. */
+  kind: string;
+  /** Where the bytes are going, as the client named it. `null` when it never said. */
+  target: string | null;
+  /** Where they came from. `null` when the socket did not say. */
+  source: string | null;
+  /** Whole seconds since the flow opened. */
+  openForSecs: number;
+  /** Bytes this machine has put into the tunnel through this flow. Cumulative. */
+  sent: number;
+  /** Bytes that have come back through it. Cumulative. */
+  received: number;
+}
+
+/**
+ * One page of open connections. Mirrors `ActiveFlowPage` in `src-tauri/src/status.rs`.
+ *
+ * `total` is how many are open and `flows` is how many of them are here: the backend caps the
+ * list, and a page that printed `flows.length` as the number of connections would be quietly
+ * under-reporting a busy tunnel.
+ */
+export interface ActiveFlowPage {
+  flows: ActiveFlow[];
+  total: number;
+  limit: number;
+}
+
+/**
  * The 2FA half of an invite *as it is shown*. Mirrors `InviteTotpPayload` in
  * `src-tauri/src/lib.rs`, which deliberately carries no secret: an invite is shown to be
  * recognised, and the secret stays a credential after the connection it authorises is set up.

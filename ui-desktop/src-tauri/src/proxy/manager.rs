@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus};
+use crate::status::{
+    ActiveFlow, ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus,
+};
 
 /// Why a start attempt failed.
 ///
@@ -784,5 +786,130 @@ impl ProxyManager {
                 })
             })
             .collect()
+    }
+
+    /// The connections this proxy has open right now, one row each.
+    ///
+    /// The other half of [`Self::node_traffic`], which hands the same bytes back added up per
+    /// node: this names each connection, which door it came in by, where it says it is going,
+    /// and how long it has been open. A node carrying 40 MiB across 12 flows says nothing about
+    /// whether one of those has been stuck for an hour, and "how much" cannot become "stop that
+    /// one" without this.
+    ///
+    /// Empty when nothing is running, like every other reading here: no tunnel, no flows.
+    pub async fn active_flows(&self, limit: usize) -> ActiveFlowPage {
+        // Cloned out of the lock and dropped before the first await: a parking_lot guard must
+        // not be held across a suspension point.
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+
+        let Some(group) = group else {
+            return ActiveFlowPage::empty();
+        };
+
+        let (total, views) = group.flow_snapshot(limit);
+
+        // Backend -> the connection string the UI configures it by, which is the same key a
+        // link, a health reading and a volume carry. Built once for the whole page rather than
+        // looked up per flow, and omitted when a flow reaches a backend this configuration does
+        // not name.
+        let connections: HashMap<EndpointId, String> = self
+            .config
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let connection = match &node.connection {
+                    ConnectionConfig::Ticket(ticket) => ticket.clone(),
+                    ConnectionConfig::EndpointId(id) => id.clone(),
+                };
+                let addr = backend_addr(&node.connection)?;
+                Some((addr.id, connection))
+            })
+            .collect();
+
+        let flows = views
+            .into_iter()
+            .map(|view| ActiveFlow {
+                id: view.id,
+                connection: connections.get(&view.node).cloned(),
+                endpoint_id: view.node.to_string(),
+                kind: view.kind.as_str().to_string(),
+                target: view.target,
+                source: view.source,
+                open_for_secs: view.open_for_secs,
+                sent: view.sent,
+                received: view.received,
+            })
+            .collect();
+
+        ActiveFlowPage {
+            flows,
+            total,
+            limit,
+        }
+    }
+
+    /// Asks one open flow to end.
+    ///
+    /// `false` when there is no flow open with that id, which covers both "there never was one"
+    /// and "it ended between the list being drawn and the click landing" — a UI polling every
+    /// few seconds will sometimes be clicked on a row that has already gone, and the honest
+    /// answer is that nothing was asked rather than an error.
+    ///
+    /// Nothing is *removed* here: the flow wakes the copy loop holding its sockets, and that
+    /// loop is what lets go of them and deregisters. A list read immediately afterwards may
+    /// therefore still show the flow for a moment, and that is the truth rather than a delay.
+    pub fn close_flow(&self, id: u64) -> bool {
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+
+        match group {
+            Some(group) => group.close_flow(id),
+            None => false,
+        }
+    }
+
+    /// Asks every flow reaching one configured node to end, and drops the connections the pool
+    /// was keeping for it.
+    ///
+    /// The flows *and* the idle connections, because they are not the same thing: a pool holds
+    /// connections no flow is using, and ending the flows while leaving those behind is how a
+    /// backend that has gone bad keeps being handed out.
+    ///
+    /// Returns how many flows were asked, which is what a UI can show. `None` when `connection`
+    /// names a node this configuration cannot resolve to, because that is a different answer
+    /// from "resolved, and had nothing open" — one is a bad request, the other is an idle
+    /// backend.
+    pub async fn close_node_flows(&self, connection: &str) -> Option<usize> {
+        // Cloned out of the lock and dropped before the first await: a parking_lot guard must
+        // not be held across a suspension point.
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+
+        // No manager: nothing is running, so there is no flow to ask about and no node to
+        // resolve — which is the same `None` an unresolvable connection gets, because from the
+        // caller's side both mean "nothing was closed and here is why not".
+        let group = group?;
+
+        let node = self
+            .config
+            .nodes
+            .iter()
+            .find(|node| match &node.connection {
+                ConnectionConfig::Ticket(ticket) => ticket == connection,
+                ConnectionConfig::EndpointId(id) => id == connection,
+            })
+            .and_then(|node| backend_addr(&node.connection))?;
+
+        Some(group.close_node_flows(&node.id).await)
     }
 }

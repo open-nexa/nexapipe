@@ -68,6 +68,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val nodes by viewModel.nodes.collectAsState()
     val linkKinds by viewModel.linkKinds.collectAsState()
     val traffic by viewModel.traffic.collectAsState()
+    val totalTraffic by viewModel.totalTraffic.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
@@ -493,6 +494,44 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    // What every backend has carried together, not one backend's share: the
+                    // card answers "is it working", and the next question is always "how much".
+                    //
+                    // Hidden until the counters have anything to say. "Nothing counted yet" is
+                    // not the same as "counted, and the answer is zero" — see `totalTraffic` —
+                    // and drawing a row of zeroes before the first byte moves would read as a
+                    // tunnel that connects and carries nothing.
+                    AnimatedVisibility(visible = totalTraffic != null) {
+                        val total = totalTraffic
+                        if (total != null) {
+                            Row(
+                                modifier = Modifier.padding(top = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = stringResource(
+                                        R.string.total_traffic_line,
+                                        formatByteCount(total.sent),
+                                        formatByteCount(total.received),
+                                        pluralStringResource(
+                                            R.plurals.node_traffic_flows,
+                                            total.active.toInt(),
+                                            total.active.toInt()
+                                        )
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    // Two, not one: on a narrow screen the two byte counts can
+                                    // fill the first line by themselves, and a single line ends
+                                    // by trading the flow count — the figure that says whether
+                                    // the tunnel is carrying anything at all — for an ellipsis.
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
 
                     // The one action this screen is for, as a labelled button in the card.
                     // It used to live only on the FAB, where a colour and an icon had to stand

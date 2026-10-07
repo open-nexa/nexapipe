@@ -6,6 +6,7 @@
   "nav": {
     "primaryNavigation": "Primary navigation",
     "connect": "Connect",
+    "connections": "Connections",
     "config": "Config",
     "settings": "Settings",
     "logs": "Logs",
@@ -96,10 +97,42 @@
     "hours": "{count}h",
     "days": "{count}d"
   },
+  "connections": {
+    "count": "{count} open",
+    "cropped": "showing {shown} of {total}",
+    "hint": "Each row is one connection the proxy is carrying right now.",
+    "notRunning": "Start the proxy to see its connections.",
+    "none": "Nothing is open right now.",
+    "unavailable": "The connection list could not be read.",
+    "reading": "Reading…",
+    "close": "Close",
+    "closeNode": "Close all",
+    "closedOne": "That connection is being closed.",
+    "closedMany": "{count} connections are being closed.",
+    "alreadyGone": "That connection had already ended.",
+    "noneOpen": "That node had no open connections.",
+    "nodeUnknown": "No configured node matches that connection.",
+    "unnamedNode": "Not in this configuration",
+    "unknownTarget": "destination not named",
+    "unknownSource": "origin unknown",
+    "openSeconds": "{count}s",
+    "openMinutes": "{count}m",
+    "openHours": "{count}h",
+    "kind": {
+      "http": "HTTP",
+      "connect": "CONNECT",
+      "websocket": "WebSocket",
+      "tls": "TLS",
+      "tun_tcp": "TCP",
+      "tun_udp": "UDP"
+    }
+  },
   "traffic": {
     "sent": "Sent",
     "received": "Received",
-    "flows": "{count} flows"
+    "flows": "{count} flows",
+    "totalSent": "Total sent",
+    "totalReceived": "Total received"
   },
   "connect": {
     "title": "Connect",
@@ -307,7 +340,8 @@
       "stop_failed": "The proxy failed to stop. See the logs for details.",
       "not_running": "The proxy is not running.",
       "node_id_unavailable": "The node ID is not available yet.",
-      "tun_unavailable": "TUN mode needs the system service. Install it first, then enable TUN."
+      "tun_unavailable": "TUN mode needs the system service. Install it first, then enable TUN.",
+      "close_failed": "The connection could not be closed. See the logs for details."
     },
     "service": {
       "unavailable": "The system service is not responding. It may not be installed.",

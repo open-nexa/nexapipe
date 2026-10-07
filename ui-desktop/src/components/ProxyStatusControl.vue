@@ -22,6 +22,7 @@ import { errorKey } from '../api/errors';
 import { confirm } from '../composables/useConfirm';
 import { useToast } from '../composables/useToast';
 import { writeClipboardText } from '../utils/clipboard';
+import { formatBytes, formatRate } from '../utils/format';
 import { useConfigStore } from '../stores/config';
 import { useCredentialGate } from '../stores/gate';
 import { useProxyStore } from '../stores/proxy';
@@ -41,6 +42,8 @@ const {
   endpointLinks,
   stale,
   canStart,
+  totals,
+  rate,
   start,
   stop,
   refreshServiceRunning,
@@ -213,6 +216,35 @@ async function copyNodeId(): Promise<void> {
         <AppIcon :name="linkInfo.icon" :size="14" />
         {{ linkInfo.label }}
       </span>
+    </div>
+
+    <!--
+      What the tunnel has carried in total, and how fast it is carrying it right now.
+
+      Only while there is something to add up: `totals` is null until the counters have been read,
+      and "not read yet" is not the same as "read, and the answer is zero" — a row of zeroes drawn
+      before the first byte moved reads as a tunnel that connects and forwards nothing.
+
+      The rate is its own condition because it needs two readings, not one: the first poll of a
+      run has nothing to divide against, and saying `0 B/s` then is the same lie in the other
+      direction.
+    -->
+    <div v-if="totals" class="proxy-status__traffic">
+      <span class="traffic-figure traffic-figure--sent">
+        <AppIcon name="arrow-up" :size="13" />
+        <span class="traffic-figure__label">{{ t('traffic.totalSent') }}</span>
+        <span class="traffic-figure__value">{{ formatBytes(totals.sent) }}</span>
+        <span v-if="rate" class="traffic-figure__rate">{{ formatRate(rate.up) }}</span>
+      </span>
+
+      <span class="traffic-figure traffic-figure--received">
+        <AppIcon name="arrow-down" :size="13" />
+        <span class="traffic-figure__label">{{ t('traffic.totalReceived') }}</span>
+        <span class="traffic-figure__value">{{ formatBytes(totals.received) }}</span>
+        <span v-if="rate" class="traffic-figure__rate">{{ formatRate(rate.down) }}</span>
+      </span>
+
+      <span class="pill pill--flows">{{ t('traffic.flows', { count: totals.active }) }}</span>
     </div>
 
     <div v-if="nodeId" class="proxy-status__node">
@@ -412,6 +444,54 @@ async function copyNodeId(): Promise<void> {
 .pill--mixed {
   background: var(--bg-inset);
   color: var(--text-secondary);
+}
+
+/* Pushed to the trailing edge of the traffic row: it is the only figure there that is a count,
+   and it reads as a summary of the two beside it rather than as a third of the same kind. */
+.pill--flows {
+  margin-left: auto;
+}
+
+.proxy-status__traffic {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+/* The same two colours the node list on the Connect page uses for the same two directions, so
+   "sent" is the same colour everywhere it appears. */
+.traffic-figure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--font-size-12);
+}
+
+.traffic-figure--sent {
+  color: var(--warning-text);
+}
+
+.traffic-figure--received {
+  color: var(--accent-text);
+}
+
+/* Monospace and tabular so successive polls do not shift the row as digits change width. */
+.traffic-figure__value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-13);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.traffic-figure__rate {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
 }
 
 .proxy-status__node {

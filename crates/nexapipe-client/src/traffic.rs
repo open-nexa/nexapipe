@@ -34,6 +34,13 @@
 //! as it already carries the health table it belongs to, and a copy loop that
 //! is handed one can say how much it moved without knowing whose it is.
 //!
+//! A [`Flow`] is that, plus who: the same guard that counts a node's open flows
+//! is the only thing every path through the tunnel has in common, so it is also
+//! where a flow gets listed for a reader that wants to see the connections
+//! themselves. See [`crate::flow`] — the per-flow counters here are that
+//! module's, and the identity is worth having only because the guard already
+//! spans every way a flow can end.
+//!
 //! Accumulators are cumulative and never reset while the [`EndpointGroup`] that
 //! owns them lives. That is a deliberate omission of convenience: a rate is two
 //! readings and a division, and every consumer here already polls — the desktop
@@ -48,6 +55,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
+
+use crate::flow::{self, FlowEntry, FlowId, FlowMeta, FlowRegistry};
 
 /// The accumulators of one node.
 ///
@@ -136,20 +145,152 @@ pub struct NodeVolume {
 ///
 /// A flow is counted by its lifetime and not by two calls somewhere in a copy
 /// loop, because the ways outnumber the ways in: a copy loop returns on EOF,
-/// on a read error, on a write error, on a flush error, and on being cancelled
-/// when the proxy stops. Every one of those would have to remember to count
-/// itself out, and one that forgot would leave a node looking busy forever.
-/// `Drop` cannot forget.
+/// on a read error, on a write error, on a flush error, on being cancelled
+/// when the proxy stops, and now on being asked to end. Every one of those
+/// would have to remember to count itself out, and one that forgot would leave
+/// a node looking busy forever. `Drop` cannot forget.
+///
+/// Deliberately **not** `Clone`.
+///
+/// This value is the flow's lifetime, and there is exactly one of it: `Drop` is
+/// what counts the flow out of its node and out of the registry, and a second
+/// copy would run that a second time — a copy loop's two halves would each
+/// deregister the flow when *they* finished, which is a connection that is still
+/// open but no longer listed, and a node that looks idle while it is carrying
+/// bytes. What a copy loop half wants is [`Self::counter`], which can be cloned
+/// because it ends nothing.
 #[derive(Debug)]
 pub struct Flow {
     traffic: Arc<NodeTraffic>,
+    /// Where this flow is listed, when the group counting it keeps a list.
+    ///
+    /// `None` for a group nobody is tracking, which is also the only case where
+    /// a flow has no id: nothing can ask after it, so nothing is listed.
+    listed: Option<ListedFlow>,
+}
+
+/// The registry entry this flow holds open, and the registry it belongs to.
+///
+/// Both, because deregistering is the one thing a `Drop` has to do and a
+/// registry cannot be reached from its own entry without a cycle.
+#[derive(Debug)]
+struct ListedFlow {
+    registry: Arc<FlowRegistry>,
+    entry: Arc<FlowEntry>,
+}
+
+impl Drop for ListedFlow {
+    fn drop(&mut self) {
+        self.registry.remove(self.entry.id());
+    }
+}
+
+/// Where one half of a copy loop records what it moved.
+///
+/// Cloneable, and the reason [`Flow`] does not have to be: recording is
+/// something several tasks do at once, ending is something exactly one of them
+/// does, and mixing the two is how a counter becomes a lifetime.
+#[derive(Debug, Clone)]
+pub struct FlowCounter {
+    traffic: Arc<NodeTraffic>,
+    entry: Option<Arc<FlowEntry>>,
+}
+
+impl FlowCounter {
+    /// Counts `bytes` leaving this machine through this flow.
+    pub fn record_sent(&self, bytes: u64) {
+        self.traffic.record_sent(bytes);
+        if let Some(entry) = &self.entry {
+            entry.record_sent(bytes);
+        }
+    }
+
+    /// Counts `bytes` arriving through this flow.
+    pub fn record_received(&self, bytes: u64) {
+        self.traffic.record_received(bytes);
+        if let Some(entry) = &self.entry {
+            entry.record_received(bytes);
+        }
+    }
 }
 
 impl Flow {
     /// Counts one flow as open on `traffic`, until this value is dropped.
     pub fn open(traffic: Arc<NodeTraffic>) -> Self {
         traffic.enter();
-        Self { traffic }
+        Self {
+            traffic,
+            listed: None,
+        }
+    }
+
+    /// `open`, and listed in `registry` as one flow of `node` until this value
+    /// is dropped.
+    ///
+    /// Taking the registry as well as the counters is what keeps the two from
+    /// disagreeing: a flow listed somewhere other than where it is counted would
+    /// be a list whose numbers add up to something else.
+    pub fn listed(
+        traffic: Arc<NodeTraffic>,
+        registry: &Arc<FlowRegistry>,
+        node: EndpointId,
+        meta: FlowMeta,
+    ) -> Self {
+        let entry = registry.open(node, meta);
+        traffic.enter();
+        Self {
+            traffic,
+            listed: Some(ListedFlow {
+                registry: registry.clone(),
+                entry,
+            }),
+        }
+    }
+
+    /// The id this flow is listed under, or `None` for a flow nothing tracks.
+    pub fn id(&self) -> Option<FlowId> {
+        self.listed.as_ref().map(|listed| listed.entry.id())
+    }
+
+    /// A handle one half of a copy loop records its bytes through.
+    ///
+    /// Two of these are what a bidirectional tunnel wants, and neither of them
+    /// ends the flow — only this [`Flow`] dropping does that.
+    pub fn counter(&self) -> FlowCounter {
+        FlowCounter {
+            traffic: self.traffic.clone(),
+            entry: self.listed.as_ref().map(|listed| listed.entry.clone()),
+        }
+    }
+
+    /// Counts `bytes` leaving this machine through this flow.
+    ///
+    /// Charged to the node and to the flow, which are not two counts of the same
+    /// thing so much as one count read at two depths — and the flow's copy is
+    /// the only one that can tell a reader which connection moved them.
+    pub fn record_sent(&self, bytes: u64) {
+        self.counter().record_sent(bytes);
+    }
+
+    /// Counts `bytes` arriving through this flow.
+    pub fn record_received(&self, bytes: u64) {
+        self.counter().record_received(bytes);
+    }
+
+    /// Resolves when somebody has asked for this flow to end.
+    ///
+    /// Never resolves for a flow nobody is tracking, which is the correct answer
+    /// rather than a missing one: an untracked flow has no reader that could ask,
+    /// and a future that returned immediately would end every connection the
+    /// moment it opened.
+    pub async fn cancelled(&self) {
+        match &self.listed {
+            Some(listed) => listed.entry.cancelled().await,
+            // Not "already cancelled": there is nothing here that *can* be
+            // cancelled, and a copy loop must not gain an exit it cannot be
+            // woken from.
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -157,6 +298,11 @@ impl Drop for Flow {
     fn drop(&mut self) {
         self.traffic.leave();
     }
+}
+
+/// An empty flow table, for a group that has nothing to list into.
+pub fn flow_registry() -> Arc<FlowRegistry> {
+    Arc::new(flow::FlowRegistry::new())
 }
 
 /// The traffic of every node one [`EndpointGroup`] knows about.

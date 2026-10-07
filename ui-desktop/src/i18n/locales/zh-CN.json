@@ -6,6 +6,7 @@
   "nav": {
     "primaryNavigation": "主导航",
     "connect": "连接",
+    "connections": "活跃连接",
     "config": "配置",
     "settings": "设置",
     "logs": "日志",
@@ -96,10 +97,42 @@
     "hours": "{count} 小时",
     "days": "{count} 天"
   },
+  "connections": {
+    "count": "{count} 条连接",
+    "cropped": "显示 {shown} 条，共 {total} 条",
+    "hint": "每一行是当前正在转发的一条连接。",
+    "notRunning": "启动代理后即可查看连接。",
+    "none": "当前没有打开的连接。",
+    "unavailable": "无法读取连接列表。",
+    "reading": "读取中…",
+    "close": "断开",
+    "closeNode": "全部断开",
+    "closedOne": "该连接正在关闭。",
+    "closedMany": "正在关闭 {count} 条连接。",
+    "alreadyGone": "该连接已经结束了。",
+    "noneOpen": "该节点当前没有打开的连接。",
+    "nodeUnknown": "没有配置的节点与之对应。",
+    "unnamedNode": "配置中未包含",
+    "unknownTarget": "未指明目标",
+    "unknownSource": "来源未知",
+    "openSeconds": "{count} 秒",
+    "openMinutes": "{count} 分钟",
+    "openHours": "{count} 小时",
+    "kind": {
+      "http": "HTTP",
+      "connect": "CONNECT",
+      "websocket": "WebSocket",
+      "tls": "TLS",
+      "tun_tcp": "TCP",
+      "tun_udp": "UDP"
+    }
+  },
   "traffic": {
     "sent": "已发送",
     "received": "已接收",
-    "flows": "{count} 条连接"
+    "flows": "{count} 条连接",
+    "totalSent": "总发送",
+    "totalReceived": "总接收"
   },
   "connect": {
     "title": "连接",
@@ -307,7 +340,8 @@
       "stop_failed": "代理停止失败，详情请查看日志。",
       "not_running": "代理当前未运行。",
       "node_id_unavailable": "节点 ID 暂不可用。",
-      "tun_unavailable": "TUN 模式需要系统服务，请先安装服务再开启 TUN。"
+      "tun_unavailable": "TUN 模式需要系统服务，请先安装服务再开启 TUN。",
+      "close_failed": "无法关闭该连接，详情请查看日志。"
     },
     "service": {
       "unavailable": "系统服务无响应，可能尚未安装。",

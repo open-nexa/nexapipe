@@ -20,6 +20,7 @@
         <item quantity="other">%1$d 条连接</item>
     </plurals>
     <string name="node_traffic_none">暂无流量</string>
+    <string name="total_traffic_line">总计 ↑ %1$s · ↓ %2$s · %3$s</string>
 
     <!-- 日志 -->
     <string name="logs_title">日志</string>
