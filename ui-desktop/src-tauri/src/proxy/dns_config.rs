@@ -125,6 +125,27 @@ pub fn set_system_dns(
     }
 }
 
+/// Whether anything still resolves against the address this run hijacked.
+///
+/// Read back before undoing a global hijack. The attempt behind that undo can
+/// have failed before it reached the machine — and undoing is not a no-op:
+/// writing every service back from a backup an earlier run left behind, or
+/// reverting a link's own DNS along with ours, changes settings this run never
+/// touched. So the question is not "did the hijack succeed" but "is it there",
+/// which is also what covers a hijack that partly landed before it failed.
+///
+/// `dns_ip` is matched exactly and not widened to the candidate blocks: one of
+/// those is a router's own address, and counting a machine that was given it by
+/// hand as hijacked would rewrite a setting nobody asked about. What an earlier
+/// run left behind at another block is the startup cleanup's business, see
+/// `cleanup_stale_hijack`.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn hijack_is_in_effect(observed: &[Vec<String>], dns_ip: &str) -> bool {
+    observed
+        .iter()
+        .any(|servers| servers.iter().any(|server| server == dns_ip))
+}
+
 /// Restores the system DNS configuration (best effort), undoing the kind of
 /// hijack [`set_system_dns`] reported it had installed.
 pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> Result<()> {
@@ -142,7 +163,24 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     {
         match hijack {
             DnsHijack::Scoped => restore_scoped_dns_linux(interface),
-            DnsHijack::Global => restore_system_dns_linux(interface, dns_ip),
+            DnsHijack::Global => {
+                let observed = [
+                    resolvectl_dns_for(interface).unwrap_or_default(),
+                    resolv_conf_nameservers(
+                        &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
+                    ),
+                ];
+                if hijack_is_in_effect(&observed, dns_ip) {
+                    restore_system_dns_linux(interface, dns_ip)
+                } else {
+                    tracing::info!(
+                        "nothing resolves against {} — this run installed no hijack to undo, \
+                         and restoring is not a no-op here: it reverts the link's own DNS too",
+                        dns_ip
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -150,7 +188,24 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     {
         match hijack {
             DnsHijack::Scoped => restore_scoped_dns_macos(),
-            DnsHijack::Global => restore_system_dns_macos(dns_ip),
+            DnsHijack::Global => {
+                let observed: Vec<Vec<String>> = network_services()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|service| dns_servers_for(service))
+                    .collect();
+                if hijack_is_in_effect(&observed, dns_ip) {
+                    restore_system_dns_macos(dns_ip)
+                } else {
+                    tracing::info!(
+                        "no network service points at {} — this run installed no hijack to undo, \
+                         and restoring would write every service from a backup an earlier run \
+                         may have left behind",
+                        dns_ip
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -1188,13 +1243,9 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
         return Ok(false);
     }
 
-    let (written, someone_elses) = write_resolver_files(Path::new(RESOLVER_DIR), dns_ip, &domains);
-
-    // Read back rather than trusting the writes: a hijack that silently did not
-    // happen looks exactly like a proxy that resolves nothing.
-    let in_effect = count_resolvers_in_effect(&written, dns_ip);
-    if !scoped_install_is_complete(in_effect, written.len()) {
-        for path in &written {
+    let install = scoped_install_tally(Path::new(RESOLVER_DIR), dns_ip, &domains);
+    if !scoped_install_is_complete(install.in_effect, install.meant_to_write) {
+        for path in &install.written {
             if count_resolvers_in_effect(std::slice::from_ref(path), dns_ip) == 0 {
                 tracing::warn!(
                     "{} does not name {} after the write",
@@ -1203,13 +1254,13 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
                 );
             }
         }
-        for path in &written {
+        for path in &install.written {
             let _ = std::fs::remove_file(path);
         }
         tracing::warn!(
             "{} of {} resolver(s) under {} took effect — every query goes to the TUN instead",
-            in_effect,
-            written.len(),
+            install.in_effect,
+            install.meant_to_write,
             RESOLVER_DIR
         );
         return Ok(false);
@@ -1217,18 +1268,50 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
 
     tracing::info!(
         "{} of {} configured domain(s) resolve through {} via {}",
-        in_effect,
+        install.in_effect,
         domains.len(),
         dns_ip,
         RESOLVER_DIR
     );
-    if !someone_elses.is_empty() {
+    if !install.owned_by_someone_else.is_empty() {
         tracing::warn!(
             "left resolving where they were, because another resolver already owns them: {}",
-            someone_elses.join(", ")
+            install.owned_by_someone_else.join(", ")
         );
     }
     Ok(true)
+}
+
+/// What a scoped install has to be judged on.
+///
+/// Read back rather than trusted from the writes: a hijack that silently did not
+/// happen looks exactly like a proxy that resolves nothing.
+///
+/// `meant_to_write` is deliberately not `written.len()`. A write that failed
+/// leaves no file behind, so asking "did every file I wrote take" answers yes
+/// when every single write failed — and reports a scoped hijack that is not
+/// there. A domain whose resolver somebody else already owns is subtracted: that
+/// file is left alone by choice, and failing the install over it would only send
+/// the machine to the global hijack, which does not win the domain back.
+#[cfg(any(target_os = "macos", test))]
+struct ScopedInstall {
+    written: Vec<PathBuf>,
+    owned_by_someone_else: Vec<String>,
+    in_effect: usize,
+    meant_to_write: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn scoped_install_tally(dir: &Path, dns_ip: &str, domains: &[String]) -> ScopedInstall {
+    let (written, owned_by_someone_else) = write_resolver_files(dir, dns_ip, domains);
+    let in_effect = count_resolvers_in_effect(&written, dns_ip);
+    let meant_to_write = domains.len() - owned_by_someone_else.len();
+    ScopedInstall {
+        written,
+        owned_by_someone_else,
+        in_effect,
+        meant_to_write,
+    }
 }
 
 /// Writes one resolver file per domain under `dir`, and returns the paths
@@ -1285,9 +1368,12 @@ fn count_resolvers_in_effect(written: &[PathBuf], dns_ip: &str) -> usize {
 /// All of them or none of them: a domain whose file did not take would go on
 /// resolving outside the proxy while the caller is told the hijack is scoped,
 /// which is the one thing falling back to the global hijack is for.
+///
+/// `meant` is what the install set out to write, so a write that never landed
+/// counts against it instead of quietly shrinking the target to what survived.
 #[cfg(any(target_os = "macos", test))]
-fn scoped_install_is_complete(in_effect: usize, written: usize) -> bool {
-    in_effect == written
+fn scoped_install_is_complete(in_effect: usize, meant: usize) -> bool {
+    in_effect == meant
 }
 
 /// Takes back the per-domain resolvers a scoped hijack installed.
@@ -1717,13 +1803,15 @@ mod tests {
         resolv_conf_nameservers, resolv_conf_without_nameservers, routes_every_domain,
     };
 
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    use super::hijack_is_in_effect;
     // Same for the per-domain resolver file: what this code writes has to be
     // what it reads back, or a restore would leave its own files behind.
     #[cfg(any(target_os = "macos", test))]
     use super::{
         RESOLVER_MARKER, count_resolvers_in_effect, is_our_resolver_file, is_tun_dns_address,
         remove_resolver_files, resolver_file_contents, resolver_nameserver,
-        scoped_install_is_complete, write_resolver_files,
+        scoped_install_is_complete, scoped_install_tally, write_resolver_files,
     };
     #[cfg(any(target_os = "macos", test))]
     use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
@@ -2042,7 +2130,80 @@ mod tests {
         // Nothing asked for, nothing missing.
         assert!(scoped_install_is_complete(0, 0));
         assert!(!scoped_install_is_complete(2, 3));
-        assert!(!scoped_install_is_complete(0, 3));
+        // Two domains asked for and no file written — every write failed. Nothing
+        // to score against is not the same as everything having taken effect.
+        assert!(!scoped_install_is_complete(0, 2));
+    }
+
+    /// Scored against what the install set out to write, so a write that failed
+    /// counts as a domain that did not take rather than disappearing from the
+    /// score. Too long to be a filename is how a write fails here.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn an_install_is_scored_against_the_domains_it_meant_to_write() {
+        let dir = scratch_dir("resolver-tally");
+        let too_long = format!("{}.com", "a".repeat(300));
+
+        let install = scoped_install_tally(&dir, "198.18.0.254", &[too_long]);
+        assert!(install.written.is_empty());
+        assert_eq!(install.in_effect, 0);
+        assert_eq!(install.meant_to_write, 1);
+        assert!(!scoped_install_is_complete(
+            install.in_effect,
+            install.meant_to_write
+        ));
+
+        let ok = scoped_install_tally(
+            &dir,
+            "198.18.0.254",
+            &["example.com".to_string(), "foo.io".to_string()],
+        );
+        assert_eq!(ok.meant_to_write, 2);
+        assert_eq!(ok.in_effect, 2);
+        assert!(scoped_install_is_complete(ok.in_effect, ok.meant_to_write));
+
+        // A domain another resolver owns is subtracted rather than counted as a
+        // refusal: reaching for the global hijack would not win that domain back
+        // — the file outranks it — and would take the rest of the machine's DNS
+        // with it.
+        std::fs::write(dir.join("corp.example"), "nameserver 172.17.0.1\n").unwrap();
+        let mixed = scoped_install_tally(
+            &dir,
+            "198.18.0.254",
+            &["example.com".to_string(), "corp.example".to_string()],
+        );
+        assert_eq!(mixed.owned_by_someone_else.len(), 1);
+        assert_eq!(mixed.meant_to_write, 1);
+        assert_eq!(mixed.in_effect, 1);
+        assert!(scoped_install_is_complete(
+            mixed.in_effect,
+            mixed.meant_to_write
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Why the global restore asks before it writes. An attempt that never
+    /// reached the machine has nothing to undo, and undoing is not free: every
+    /// service gets written, from a backup an earlier run may have left behind.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[test]
+    fn undoing_a_hijack_depends_on_what_is_in_effect() {
+        let none: [Vec<String>; 0] = [];
+        assert!(!hijack_is_in_effect(&none, "198.18.0.254"));
+
+        let some = [
+            vec!["192.168.1.1".to_string()],
+            vec!["198.18.0.254".to_string()],
+        ];
+        assert!(hijack_is_in_effect(&some, "198.18.0.254"));
+
+        // `10.0.0.254` is one of the candidate blocks and a router address. It is
+        // not this run's hijack, and treating it as one is what the restore would
+        // have to rewrite — see the startup cleanup for the other blocks.
+        assert!(!hijack_is_in_effect(
+            &[vec!["10.0.0.254".to_string()]],
+            "198.18.0.254"
+        ));
     }
 
     /// Why ownership cannot be read off the address: `10.0.0.254` is the last of
