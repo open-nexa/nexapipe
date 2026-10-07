@@ -396,11 +396,20 @@ cd nexapipe-0.5.0-aarch64-apple-darwin &amp;&amp; ./nexapipe --version</pre>
     <button class="copy" data-target="cmd-macos">Copy</button>
   </div>
   <div class="cmdblock">
-    <pre id="cmd-verify"><span class="c"># Verify before extracting: the check looks for the archive beside</span>
+    <pre id="cmd-verify"><span class="c"># Linux — verify before extracting: the check looks for the archive beside</span>
 <span class="c"># SHA256SUMS.txt, so it has to run before the cd into the directory</span>
 curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt
 sha256sum -c --ignore-missing SHA256SUMS.txt</pre>
     <button class="copy" data-target="cmd-verify">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-verify-macos"><span class="c"># macOS — the same check with shasum, which is what ships there. macOS 26</span>
+<span class="c"># added sha256sum, but every release older than that has only shasum, and not</span>
+<span class="c"># every version of it understands --ignore-missing, so grep narrows the list</span>
+<span class="c"># to the one archive you actually downloaded. Still before the cd.</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt
+grep nexapipe-0.5.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -c -</pre>
+    <button class="copy" data-target="cmd-verify-macos">Copy</button>
   </div>
   <p class="note">All assets: <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
