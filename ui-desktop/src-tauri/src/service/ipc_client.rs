@@ -6,7 +6,9 @@ use crate::error::{codes, AppError};
 use crate::service::ipc::{
     IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
 };
-use crate::status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus};
+use crate::status::{
+    ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus,
+};
 
 pub struct IpcClient;
 
@@ -261,6 +263,43 @@ impl IpcClient {
     pub async fn get_node_traffic() -> Result<Vec<NodeTrafficStatus>, AppError> {
         match Self::send_message(IpcMessage::GetNodeTraffic).await? {
             IpcResponse::NodeTraffic(traffic) => Ok(traffic),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The connections the proxy has open right now.
+    ///
+    /// An empty page when the service has no manager, which is the same shape the process-mode
+    /// answer takes — the UI draws an empty list and does not treat it as a failure.
+    pub async fn get_active_flows() -> Result<ActiveFlowPage, AppError> {
+        match Self::send_message(IpcMessage::GetActiveFlows).await? {
+            IpcResponse::ActiveFlows(page) => Ok(page),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Asks one open flow to end. `false` when the service has no such flow.
+    pub async fn close_flow(id: u64) -> Result<bool, AppError> {
+        match Self::send_message(IpcMessage::CloseFlow { id }).await? {
+            IpcResponse::FlowClosed(closed) => Ok(closed),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Asks every flow reaching one configured node to end.
+    ///
+    /// `None` when `connection` names a node this configuration cannot resolve to, which is a
+    /// different answer from "resolved, and had nothing open".
+    pub async fn close_node_flows(connection: &str) -> Result<Option<usize>, AppError> {
+        match Self::send_message(IpcMessage::CloseNodeFlows {
+            connection: connection.to_string(),
+        })
+        .await?
+        {
+            IpcResponse::NodeFlowsClosed(closed) => Ok(closed),
             IpcResponse::Error(e) => Err(e),
             other => Err(unexpected(&other)),
         }

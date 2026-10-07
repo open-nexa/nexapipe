@@ -20,6 +20,15 @@ const router = createRouter({
       meta: { titleKey: 'nav.connect' },
     },
     {
+      // Between Connect and Config: it is the page you go to from the status line on Connect
+      // ("how much has gone through" -> "what, exactly"), and it is about the running proxy
+      // rather than about how the proxy is configured.
+      path: '/connections',
+      name: 'connections',
+      component: () => import('../pages/ConnectionsPage.vue'),
+      meta: { titleKey: 'nav.connections' },
+    },
+    {
       path: '/config',
       name: 'config',
       component: () => import('../pages/ConfigPage.vue'),
