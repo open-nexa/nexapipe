@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexaPipe 0.5.0 — release notes and downloads</title>
+<meta name="description" content="NexaPipe 0.5.0: health decides which node the next request goes to, the backends that cannot answer GET /health are probed anyway, and every part counts the bytes it carries. Downloads for Linux, macOS, Windows and Android.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f7f8fa;
+    --panel-hover: #f0f2f5;
+    --border: #e4e7ec;
+    --text: #16181d;
+    --muted: #6b7280;
+    --accent: #1668dc;
+    --accent-text: #ffffff;
+    --accent-soft: #e8f1fd;
+    --warn-bg: #fff6e6;
+    --warn-border: #f0d28a;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-hover: #1e222b;
+      --border: #282d36;
+      --text: #e6e8eb;
+      --muted: #98a1ad;
+      --accent: #4d9dff;
+      --accent-text: #0b1017;
+      --accent-soft: #16243a;
+      --warn-bg: #2a2213;
+      --warn-border: #5d4a22;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 0 20px 72px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.site {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 0;
+    margin-bottom: 40px;
+  }
+  header.site .wrap {
+    padding-bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand { font-weight: 700; font-size: 17px; letter-spacing: -0.2px; }
+  .brand span { color: var(--muted); font-weight: 500; }
+  header.site nav { display: flex; gap: 18px; font-size: 14px; }
+  header.site nav a { color: var(--muted); }
+  header.site nav a:hover { color: var(--accent); }
+
+  .chip {
+    display: inline-block;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-weight: 600;
+  }
+  h1 { font-size: 40px; line-height: 1.15; margin: 16px 0 8px; letter-spacing: -0.8px; }
+  .lede { font-size: 18px; color: var(--muted); margin: 0 0 10px; max-width: 60ch; }
+  .meta { font-size: 14px; color: var(--muted); margin: 0; }
+
+  .detect {
+    margin: 28px 0 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    background: var(--panel);
+  }
+  .detect h3 { margin: 0 0 2px; font-size: 15px; }
+  .detect .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .btnrow { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    background: var(--accent);
+    color: var(--accent-text);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 15px;
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .btn:hover { text-decoration: none; filter: brightness(1.08); }
+  .btn.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { background: var(--panel-hover); }
+
+  h2 { font-size: 22px; margin: 48px 0 4px; letter-spacing: -0.3px; }
+  h2 + .hint { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  h3.subhead { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 28px 0 10px; }
+
+  ul.rows { list-style: none; margin: 0 0 8px; padding: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  ul.rows li { border-bottom: 1px solid var(--border); }
+  ul.rows li:last-child { border-bottom: 0; }
+  ul.rows a.row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 12px 16px; color: var(--text); text-decoration: none;
+  }
+  ul.rows a.row:hover { background: var(--panel-hover); text-decoration: none; }
+  ul.rows .name { font-size: 15px; font-weight: 500; }
+  ul.rows .file { display: block; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  ul.rows .get { font-size: 13px; color: var(--accent); white-space: nowrap; }
+
+  .note {
+    font-size: 14px;
+    color: var(--muted);
+    border-left: 3px solid var(--border);
+    padding: 2px 0 2px 12px;
+    margin: 16px 0 0;
+  }
+  .warn {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 14px;
+    margin: 18px 0 0;
+  }
+  .warn strong { display: block; margin-bottom: 2px; }
+
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 0 0 10px;
+  }
+  pre .c { color: var(--muted); }
+  .cmdblock { position: relative; }
+  .copy {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--bg); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-size: 12px; padding: 3px 9px; cursor: pointer;
+  }
+  .copy:hover { color: var(--accent); border-color: var(--accent); }
+
+  ul.changelog { margin: 0 0 22px; padding-left: 22px; }
+  ul.changelog li { margin-bottom: 7px; }
+  .tagline { font-size: 15px; color: var(--muted); margin: 0 0 14px; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 14px; margin: 0 0 10px; }
+  table.metrics th, table.metrics td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.metrics td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  table.metrics th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Downloads: one row per operating system, one column per architecture. */
+  .dl-wrap { overflow-x: auto; margin: 0 0 8px; }
+  table.dl { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 540px; }
+  table.dl th, table.dl td { text-align: left; padding: 10px 12px; border: 1px solid var(--border); vertical-align: top; }
+  table.dl thead th {
+    background: var(--panel); color: var(--muted);
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  table.dl tbody th { background: var(--panel); font-weight: 500; white-space: nowrap; }
+  table.dl a.pkg { display: block; color: var(--text); text-decoration: none; padding: 3px 0; }
+  table.dl a.pkg:hover .label { color: var(--accent); }
+  table.dl .label { font-weight: 500; }
+  table.dl .file {
+    display: block; font-family: var(--mono); font-size: 11.5px;
+    color: var(--muted); word-break: break-all;
+  }
+  table.dl td.hit { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--accent); }
+  table.dl td.hit .file { color: var(--text); }
+
+  footer.site {
+    margin-top: 56px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 14px;
+  }
+  @media (max-width: 560px) {
+    h1 { font-size: 32px; }
+    ul.rows a.row { flex-direction: column; align-items: flex-start; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <div class="brand">NexaPipe <span>0.5.0</span></div>
+    <nav>
+      <a href="https://github.com/open-nexa/nexapipe">GitHub</a>
+      <a href="https://github.com/open-nexa/nexapipe/releases/latest">All releases</a>
+      <a href="https://github.com/open-nexa/nexapipe/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section class="hero">
+    <span class="chip">Release</span>
+    <h1>NexaPipe 0.5.0</h1>
+    <p class="lede">Nothing here opens a new front. Health finally decides which node the next
+      request goes to, the backends that cannot answer <code>GET /health</code> are asked anyway, and
+      the server and both clients count the bytes they carry. Alongside it: an image in the release,
+      your own relay documented, and a desktop whose DNS no longer outlives the tunnel.</p>
+    <p class="meta">7 October 2026 &middot; one tag ships the server archives, the desktop bundles, the Android APK and the container image.</p>
+
+    <div class="detect" id="detect">
+      <h3 id="detect-title">Download for your platform</h3>
+      <p class="sub" id="detect-sub">Pick a build below if the guess is wrong.</p>
+      <div class="btnrow" id="detect-buttons"></div>
+    </div>
+  </section>
+
+  <h2 id="downloads">Downloads</h2>
+  <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
+
+  <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-windows-x86_64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.5.0-windows-x86_64-setup.exe</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-windows-aarch64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.5.0-windows-aarch64-setup.exe</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-macos-x86_64.dmg"><span class="label">Disk image &mdash; Intel</span><span class="file">nexa-0.5.0-macos-x86_64.dmg</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-macos-aarch64.dmg"><span class="label">Disk image &mdash; Apple silicon</span><span class="file">nexa-0.5.0-macos-aarch64.dmg</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-x86_64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.5.0-linux-x86_64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-x86_64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.5.0-linux-x86_64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-x86_64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.5.0-linux-x86_64.AppImage</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-aarch64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.5.0-linux-aarch64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-aarch64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.5.0-linux-aarch64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-linux-aarch64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.5.0-linux-aarch64.AppImage</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Android</th>
+          <td data-os="android" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-android-x86_64.apk"><span class="label">APK &mdash; emulators</span><span class="file">nexa-0.5.0-android-x86_64.apk</span></a>
+          </td>
+          <td data-os="android" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexa-0.5.0-android-arm64.apk"><span class="label">APK</span><span class="file">nexa-0.5.0-android-arm64.apk</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">One APK per ABI: <code>arm64-v8a</code> for every phone, <code>x86_64</code> for the
+    emulator images a development machine can run. Desktop bundles are signed with the Tauri updater
+    key; the in-app updater reads <code>latest.json</code> in the same release. iOS is not a supported
+    platform &mdash; see the
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">roadmap</a>.</p>
+  <p class="note">Checksums for every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h3 class="subhead">Server &amp; client library &mdash; nexapipe</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Linux (glibc)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-x86_64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.5.0-x86_64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-aarch64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.5.0-aarch64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux (musl, static)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-x86_64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.5.0-x86_64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-aarch64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.5.0-aarch64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-x86_64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Intel</span><span class="file">nexapipe-0.5.0-x86_64-apple-darwin.tar.gz</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-aarch64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Apple silicon</span><span class="file">nexapipe-0.5.0-aarch64-apple-darwin.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-x86_64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.5.0-x86_64-pc-windows-msvc.zip</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-aarch64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.5.0-aarch64-pc-windows-msvc.zip</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Each archive holds the <code>nexapipe</code> binary, the client <code>cdylib</code>
+    for embedding, <code>config.toml.2fa.example</code>, the README and the licence. Checksums for
+    every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h2>Container image</h2>
+  <p class="hint">New in this release: the image is published with everything else, as one multi-arch
+    manifest for <code>linux/amd64</code> and <code>linux/arm64</code>.</p>
+  <div class="cmdblock">
+    <pre id="cmd-image"><span class="c"># This release exactly</span>
+docker pull ghcr.io/open-nexa/nexapipe:0.5.0
+
+<span class="c"># The newest stable release (:latest never points at a pre-release)</span>
+docker pull ghcr.io/open-nexa/nexapipe:latest</pre>
+    <button class="copy" data-target="cmd-image">Copy</button>
+  </div>
+  <p class="note"><code>docker-compose.yaml</code> names the published image, so <code>docker compose up</code>
+    pulls it rather than building &mdash; <code>--build</code> still builds locally under the same name.</p>
+
+  <h2>Install from a terminal</h2>
+  <p class="hint">No package manager yet &mdash; these are the release assets, straight from the tag.</p>
+  <div class="cmdblock">
+    <pre id="cmd-linux"><span class="c"># Linux x86_64, static binary</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf nexapipe-0.5.0-x86_64-unknown-linux-musl.tar.gz
+cd nexapipe-0.5.0-x86_64-unknown-linux-musl &amp;&amp; ./nexapipe --version</pre>
+    <button class="copy" data-target="cmd-linux">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-macos"><span class="c"># macOS, Apple silicon</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/nexapipe-0.5.0-aarch64-apple-darwin.tar.gz
+tar -xzf nexapipe-0.5.0-aarch64-apple-darwin.tar.gz
+cd nexapipe-0.5.0-aarch64-apple-darwin &amp;&amp; ./nexapipe --version</pre>
+    <button class="copy" data-target="cmd-macos">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-verify"><span class="c"># Linux — verify before extracting: the check looks for the archive beside</span>
+<span class="c"># SHA256SUMS.txt, so it has to run before the cd into the directory</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt</pre>
+    <button class="copy" data-target="cmd-verify">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-verify-macos"><span class="c"># macOS — the same check with shasum, which is what ships there. macOS 26</span>
+<span class="c"># added sha256sum, but every release older than that has only shasum, and not</span>
+<span class="c"># every version of it understands --ignore-missing, so grep narrows the list</span>
+<span class="c"># to the one archive you actually downloaded. Still before the cd.</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt
+grep nexapipe-0.5.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -c -</pre>
+    <button class="copy" data-target="cmd-verify-macos">Copy</button>
+  </div>
+  <p class="note">All assets: <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h2>What's new</h2>
+  <p class="tagline">0.5.0 follows 0.4.0, released 30 September 2026. No configuration key changes,
+    and nothing stopped working that used to &mdash; but a <code>passthrough</code> or <code>tcp</code>
+    route whose backend refuses connections is now <em>reported</em> unhealthy where it previously
+    looked fine.</p>
+
+  <h3 class="subhead">Health decides which node gets the next request</h3>
+  <ul class="changelog">
+    <li>0.4.0 started probing the nodes and writing down what came back; nothing read those records.
+      The balancer still picked by index into a list nothing could change, so a node dead for an hour
+      kept receiving its share of the traffic.</li>
+    <li>Selection takes one flag per candidate now and answers <code>Option&lt;usize&gt;</code>, so
+      "none of them" is a sayable answer &mdash; index <code>0</code> was always a valid reply to
+      "which node", which is why the old code could never say no.</li>
+    <li>A request that fails to dial marks the node down where it noticed, rather than waiting up to
+      thirty seconds for the probe to find out.</li>
+    <li>A single node that is down is still dialled, because refusing to dial the only node turns
+      "down" into "no service at all" for a deployment with nothing to fail over to.</li>
+  </ul>
+
+  <h3 class="subhead">The backends that cannot answer <code>GET /health</code></h3>
+  <ul class="changelog">
+    <li>Only routes serving <code>http</code> were probed. A TLS listener behind a
+      <code>passthrough</code> route had no health at all: it surfaced as a connect error on whichever
+      flow happened to try it first.</li>
+    <li><code>passthrough</code> and <code>tcp</code> routes are probed by connecting to them &mdash;
+      a TLS backend by completing its handshake. That is deliberately the smaller claim: something is
+      listening, not that it works.</li>
+    <li>A <code>udp</code>-only route is still not probed, now for a stated reason: every probe
+      available is one every backend would fail, and a pool emptied by a check that could never have
+      succeeded is worse than an unchecked one.</li>
+  </ul>
+
+  <h3 class="subhead">What each node carried, and whether it answered</h3>
+  <ul class="changelog">
+    <li>The server exposes <code>nexapipe_traffic_bytes_total{direction="sent"|"received"}</code>, and
+      <code>/v1/status</code> carries the same two numbers. They are counted on the <em>client leg</em>
+      and nowhere else &mdash; the one place where one number means one thing across paths this
+      different. An HTTP response takes its count from what the access log already printed, so the log
+      line and the Prometheus number cannot disagree.</li>
+    <li>The desktop lists each node's health beside its traffic: whether it answered the last probe,
+      how long it has been unreachable, and how much it has carried. The Android notification shows
+      live up and down rates.</li>
+    <li>What is counted is tunnel payload: no protocol headers, nothing discarded, and nothing counted
+      twice &mdash; the TUN interface pump is deliberately not instrumented.</li>
+  </ul>
+
+  <h3 class="subhead">Desktop: the whole Config page stands behind the door</h3>
+  <ul class="changelog">
+    <li>In 0.4.0 the operating system was asked before one credential was revealed. Now it is asked
+      before the page renders at all: no node list, no connection strings, no two-factor secrets, no
+      relay. A shut page puts none of it in the document.</li>
+    <li>A press that does nothing says why. Being refused used to come back as "the door is shut",
+      which the UI read as its own instruction to stay quiet &mdash; so a wrong password, a dismissed
+      prompt or a failed fingerprint left the page exactly as it had been.</li>
+    <li>The relay settings moved from Settings to Config, behind the same door: which relay this
+      machine dials is part of how it connects, and a custom relay's bearer token is a credential.</li>
+    <li>macOS stopped using the keychain. Its access prompt is what turned one unlock into two sheets,
+      and what once left a locked page with no way out; the master key now lives in the same
+      <code>0600</code> file the other platforms fall back to, and is <em>moved</em> rather than
+      replaced, so nothing already stored becomes unreadable.</li>
+    <li>Five smaller fixes came with it: a failed PAM check says so in the dialog instead of arriving
+      seconds later; copies go through the operating system's clipboard rather than the asynchronous
+      API WebKit refuses without focus; the spinner survives Reduce Motion; macOS stopped drawing a
+      second title bar above the app's own.</li>
+  </ul>
+
+  <h3 class="subhead">Desktop: the machine's DNS no longer outlives the tunnel</h3>
+  <ul class="changelog">
+    <li>Three separate gaps each leaked on their own. A run that died before its teardown left the
+      system DNS pointed at the TUN with nothing to undo it at the next start &mdash; on macOS and
+      Linux there was no self-heal at all.</li>
+    <li>Quitting skipped the restore entirely: nothing handled the exit events, so Cmd+Q left the
+      machine pointed at a tunnel that no longer existed.</li>
+    <li>The Unix service process had no signal handling whatsoever, so <code>launchctl unload</code>,
+      <code>systemctl stop</code> and the shutdown broadcast all just killed it. Windows was the only
+      platform doing this correctly; it now has graceful shutdown, an explicit launchd
+      <code>ExitTimeOut</code>, and a Windows service entry point that matches what the
+      <code>nexa-service</code> binary already did.</li>
+    <li>Only the <code>&hellip;254</code> host address of a candidate block counts as ours, never the
+      <code>/24</code> around it: <code>10.0.0.0/24</code> is both a candidate block and the subnet a
+      great many home LANs use.</li>
+  </ul>
+
+  <h3 class="subhead">Distribution: an image, and your own relay</h3>
+  <ul class="changelog">
+    <li>The release publishes <code>ghcr.io/open-nexa/nexapipe</code> &mdash; one multi-arch manifest,
+      <code>linux/amd64</code> and <code>linux/arm64</code> &mdash; under the same tag that already
+      drives the archives, the bundles and the APK.</li>
+    <li><code>docs/self-hosted-relay.md</code> takes a relay from nothing to running, and how to point
+      NexaPipe at it. It does not remove the third-party dependency &mdash; only changes whom you
+      depend on.</li>
+  </ul>
+  <div class="warn">
+    <strong>Two things in this release have not been watched running.</strong>
+    The relay guide has been written from this tree and from upstream's <code>iroh-relay</code>, but
+    not followed end to end on a machine that had nothing on it. The Android notification's rates are
+    verified by unit tests and by compilation only. Everything else here has been compiled, tested and
+    driven by hand on the platform it touches.
+  </div>
+
+  <h3 class="subhead">Also in this release</h3>
+  <ul class="changelog">
+    <li>The root workspace is compiled on Windows in CI, which it never was &mdash; only the desktop
+      crate had a Windows job. Check only, no tests: the integration tests spawn the binary and reach
+      for <code>cfg(unix)</code> fixtures.</li>
+    <li>The credential gates have both been driven by hand on macOS, Windows and Linux, and past
+      <code>BiometricPrompt</code> on a real Android device. Nothing about the designs changed; what
+      changed is that 0.4.0's note no longer has to say it might not work.</li>
+  </ul>
+
+  <h2>Changelog</h2>
+
+  <h3 class="subhead">Added</h3>
+  <ul class="changelog">
+    <li>Client: the health map decides which node the next request goes to, and a failed dial writes
+      to it where the failure was noticed.</li>
+    <li>Server: <code>passthrough</code> and <code>tcp</code> routes get a TCP connect probe, a TLS
+      backend one that completes its handshake.</li>
+    <li>Server: <code>nexapipe_traffic_bytes_total</code> and a <code>traffic</code> object on
+      <code>/v1/status</code>.</li>
+    <li>Client, desktop and Android: per-node byte counters, a desktop node-health view, and live
+      transfer rates in the Android notification.</li>
+    <li>Release: a container image published to GHCR alongside the archives.</li>
+    <li><code>docs/self-hosted-relay.md</code>.</li>
+  </ul>
+
+  <h3 class="subhead">Changed</h3>
+  <ul class="changelog">
+    <li>Desktop: the whole Config page renders only while the operating system has confirmed the
+      user, and the relay settings moved into it from Settings.</li>
+    <li>macOS: the credential store's master key lives in a <code>0600</code> file rather than the
+      keychain, and is migrated out of it on first launch.</li>
+    <li>Service shutdown is graceful on every platform rather than one: UNIX signals are handled
+      instead of killing the process, and DNS restore, self-heal and exit hooks exist on all three
+      rather than on Windows alone.</li>
+    <li>CI: the root workspace is compiled on Windows.</li>
+  </ul>
+
+  <h3 class="subhead">Fixed</h3>
+  <ul class="changelog">
+    <li>Desktop: disconnecting, quitting or uninstalling no longer leaves the machine's DNS pointed
+      at a tunnel that is gone &mdash; across every exit path, on every platform.</li>
+    <li>Desktop: a password the operating system did not accept said nothing; it now says whether the
+      password was wrong or the device did not confirm.</li>
+    <li>Desktop: a copy made just after the OS prompt came back as "could not copy", because the
+      clipboard API refuses a document that lost focus while the prompt was up.</li>
+    <li>Desktop: the loading spinner never turned with Reduce Motion on, and macOS ran a system title
+      bar above the app's own.</li>
+    <li>Server: an invalid health-check path panicked instead of failing the probe.</li>
+  </ul>
+
+  <h2>Before upgrading</h2>
+  <ul class="changelog">
+    <li>No configuration key changed and no default moved. A <code>config.toml</code> that works on
+      0.4.0 loads unchanged on 0.5.0.</li>
+    <li><code>passthrough</code> and <code>tcp</code> routes are probed now. A backend that refuses
+      TCP connections will be reported unhealthy and, in a multi-backend route, skipped &mdash; where
+      it previously looked healthy and failed on the request.</li>
+    <li><code>/metrics</code> gains a counter and loses nothing; <code>/v1/status</code> gains a
+      <code>traffic</code> object.</li>
+    <li>Desktop (macOS): the master key moves out of the keychain on first launch. It is moved rather
+      than replaced, so every credential already in the store stays readable &mdash; and macOS stops
+      asking whether the app may read the keychain.</li>
+    <li>Desktop: opening Config asks the machine to confirm you before it shows anything. Two minutes
+      still covers everything after it.</li>
+    <li>Docker: <code>docker-compose.yaml</code> names the published image, so <code>docker compose up</code>
+      pulls instead of building. Pin <code>:0.5.0</code> rather than <code>:latest</code> if you want
+      the version to stay put.</li>
+    <li>Downgrading the desktop app still means re-importing the invite, as it did in 0.4.0: a node's
+      connection string moved into the encrypted store, and an older build finds nothing and drops the
+      node.</li>
+  </ul>
+
+  <footer class="site">
+    NexaPipe is licensed under the terms in <code>LICENSE</code>. &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/CHANGELOG.md">Changelog</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/iroh-boundaries.md">iroh boundaries</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/self-hosted-relay.md">Your own relay</a> &middot;
+    <a href="index.html">All versions</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe">Repository</a>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var BASE = "https://github.com/open-nexa/nexapipe/releases/download/v0.5.0/";
+  var ua = navigator.userAgent || "";
+  var title = document.getElementById("detect-title");
+  var sub = document.getElementById("detect-sub");
+  var buttons = document.getElementById("detect-buttons");
+
+  function pick() {
+    if (/Android/i.test(ua)) {
+      // The emulator images a development machine runs are x86_64; everything a
+      // phone runs is arm64-v8a. The UA does not reliably say which one this is,
+      // so the primary button stays arm64 and the other APK is offered beside it.
+      return {
+        title: "Download for Android",
+        sub: "Signed APK, one per ABI. The one a phone wants is highlighted below.",
+        links: [
+          { href: BASE + "nexa-0.5.0-android-arm64.apk", label: "arm64-v8a (phones)" },
+          { href: BASE + "nexa-0.5.0-android-x86_64.apk", label: "x86_64 (emulators)", secondary: true }
+        ],
+        cells: [["android", "arm64"]]
+      };
+    }
+    if (/iPhone|iPad|iPod/i.test(ua)) {
+      return {
+        title: "No iOS build",
+        sub: "iOS is not a supported platform and none is planned. See the roadmap.",
+        links: [{ href: "https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md", label: "Why", secondary: true }]
+      };
+    }
+    if (/Windows/i.test(ua)) {
+      var arm = /ARM|aarch64/i.test(ua);
+      return {
+        title: "Download for Windows",
+        sub: arm ? "Windows on ARM detected." : "Windows installer, signed for the updater.",
+        links: [
+          { href: BASE + (arm ? "nexa-0.5.0-windows-aarch64-setup.exe" : "nexa-0.5.0-windows-x86_64-setup.exe"), label: "Desktop app" },
+          { href: BASE + (arm ? "nexapipe-0.5.0-aarch64-pc-windows-msvc.zip" : "nexapipe-0.5.0-x86_64-pc-windows-msvc.zip"), label: "Server archive", secondary: true }
+        ],
+        cells: [["windows", arm ? "arm64" : "x86_64"]]
+      };
+    }
+    if (/Macintosh|Mac OS X/i.test(ua)) {
+      // A Mac's user agent says "Macintosh" on both chips, so which one is
+      // wanted cannot be read off it. Offer both rather than guessing: a
+      // guessed architecture is a download that installs and then refuses to
+      // run.
+      return {
+        title: "Download for macOS",
+        sub: "Whether this Mac is Apple silicon or Intel decides which one, and the browser does not say. Both are here; the server archives are in the list below.",
+        links: [
+          { href: BASE + "nexa-0.5.0-macos-aarch64.dmg", label: "Apple silicon" },
+          { href: BASE + "nexa-0.5.0-macos-x86_64.dmg", label: "Intel", secondary: true }
+        ],
+        // Both chips are offered, so both columns light up: the browser will
+        // not say which one this Mac is.
+        cells: [["macos", "x86_64"], ["macos", "arm64"]]
+      };
+    }
+    if (/Linux/i.test(ua)) {
+      // Unlike a Mac, a Linux browser usually does put the architecture in the
+      // user agent, so the same guess is worth making here that Windows gets.
+      var arm = /ARM|aarch64|armv/i.test(ua);
+      return {
+        title: "Download for Linux",
+        sub: arm ? "Linux on arm64 detected." : "Debian package and a static server binary. rpm, AppImage and the arm64 builds are below.",
+        links: [
+          { href: BASE + (arm ? "nexa-0.5.0-linux-aarch64.deb" : "nexa-0.5.0-linux-x86_64.deb"), label: "Desktop app" },
+          { href: BASE + (arm ? "nexapipe-0.5.0-aarch64-unknown-linux-musl.tar.gz" : "nexapipe-0.5.0-x86_64-unknown-linux-musl.tar.gz"), label: "Server archive", secondary: true }
+        ],
+        cells: [["linux", arm ? "arm64" : "x86_64"]]
+      };
+    }
+    return {
+      title: "Pick your platform",
+      sub: "Everything this release ships is listed below.",
+      links: []
+    };
+  }
+
+  var choice = pick();
+  title.textContent = choice.title;
+  sub.textContent = choice.sub;
+  choice.links.forEach(function (link) {
+    var a = document.createElement("a");
+    a.href = link.href;
+    a.className = link.secondary ? "btn secondary" : "btn";
+    a.textContent = link.label;
+    buttons.appendChild(a);
+  });
+  if (choice.links.length === 0) {
+    var a = document.createElement("a");
+    a.href = "#downloads";
+    a.className = "btn";
+    a.textContent = "See all downloads";
+    buttons.appendChild(a);
+  }
+
+  // Mark the cell the guess landed on, in the app table and in the server one.
+  (choice.cells || []).forEach(function (cell) {
+    var td = document.querySelector('table.dl td[data-os="' + cell[0] + '"][data-arch="' + cell[1] + '"]');
+    if (td) { td.classList.add("hit"); }
+  });
+
+  document.querySelectorAll(".copy").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var node = document.getElementById(button.getAttribute("data-target"));
+      var text = node.innerText;
+      var done = function () {
+        var old = button.textContent;
+        button.textContent = "Copied";
+        setTimeout(function () { button.textContent = old; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done);
+      } else {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
