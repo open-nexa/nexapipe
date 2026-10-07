@@ -219,18 +219,38 @@ mod windows_impl {
             return Ok(());
         }
 
+        // Stopped, and confirmed stopped, before it is deleted. `sc delete` would stop
+        // the service too, but `sc stop` reports success the moment the control manager
+        // accepts the request — which says nothing about whether the teardown that
+        // restores the system DNS has finished — and a delete issued on top of a stop
+        // that is still running races it.
         run(
             |_| {
                 vec![
                     format!("sc.exe stop {SERVICE_NAME}"),
-                    format!("sc.exe delete {SERVICE_NAME}"),
+                    tolerate(NOT_STARTED),
+                    tolerate(NOT_INSTALLED),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
-            "service uninstall",
+            "service uninstall (stop)",
             Escalation::OnAccessDenied,
             codes::SERVICE_UNINSTALL_FAILED,
         )
+        .and_then(|()| settle(ServiceState::Stopped, codes::SERVICE_UNINSTALL_FAILED))
+        .and_then(|()| {
+            run(
+                |_| {
+                    vec![
+                        format!("sc.exe delete {SERVICE_NAME}"),
+                        "exit /b %errorlevel%".to_string(),
+                    ]
+                },
+                "service uninstall (delete)",
+                Escalation::OnAccessDenied,
+                codes::SERVICE_UNINSTALL_FAILED,
+            )
+        })
         .and_then(|()| verify_absent())
     }
 

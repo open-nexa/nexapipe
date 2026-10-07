@@ -42,6 +42,25 @@ fn startup_error_slot() -> &'static Arc<tokio::sync::RwLock<Option<AppError>>> {
     SLOT.get_or_init(|| Arc::new(tokio::sync::RwLock::new(None)))
 }
 
+/// Resolves once a stop has been requested.
+///
+/// Never resolves early: the sender belongs to the control handler, which lives as long as
+/// this process, so a closed channel means nobody can ask any more — not that anyone did.
+#[cfg(windows)]
+pub async fn await_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
+    use std::future::pending;
+
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        match stop.changed().await {
+            Ok(()) => continue,
+            Err(_) => pending::<()>().await,
+        }
+    }
+}
+
 pub struct ServiceRunner {
     proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
 }
@@ -132,6 +151,25 @@ impl ServiceRunner {
             }
             _ = interrupt.recv() => {
                 tracing::info!("SIGINT received; stopping the proxy so the system DNS is restored");
+                self.shutdown().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs the IPC server until `stop` is raised, then winds the proxy down.
+    ///
+    /// The Windows counterpart of [`Self::run_until_signalled`]: the control manager
+    /// delivers a stop to the handler the service registered, not as a signal, so the
+    /// caller owns that half and hands the receiving end in here.
+    #[cfg(windows)]
+    pub async fn run_until_stop_flag(
+        &self,
+        stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        tokio::select! {
+            result = self.run() => result,
+            () = await_stop(stop) => {
                 self.shutdown().await;
                 Ok(())
             }
