@@ -39,13 +39,13 @@
 //! - Linux:   the tun crate creates a /dev/net/tun device; any name works (≤15 chars)
 //! - macOS:   the name must be utunN; if omitted the system assigns one automatically
 
-use crate::proxy::dns::{DnsServer, DnsServerConfig};
+use crate::proxy::dns::{self, DnsServer, DnsServerConfig};
 use crate::proxy::{dns_config, routing};
 use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
 use nexapipe_client::tun_proxy::{TunProxy as StackProxy, TunStackConfig};
 use nexapipe_client::virtual_ip::IpMapping;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,6 +168,23 @@ pub fn retarget(addr: &str) -> String {
         Some(port) => format!("{retargeted}:{port}"),
         None => retargeted.to_string(),
     }
+}
+
+/// The addresses this process answers DNS on itself: the address the local
+/// server listens on, and the IPv6 loopback it also binds (see `run`, where a
+/// Windows hijack points every adapter's IPv6 DNS at `::1`).
+///
+/// Forwarding a query to either is a loop, not a lookup, so neither may end up
+/// in the chain of resolvers the local server forwards to.
+fn own_dns_addresses(listen_addr: &str) -> Vec<IpAddr> {
+    let mut ours = vec![IpAddr::V6(Ipv6Addr::LOCALHOST)];
+    let host = listen_addr
+        .rsplit_once(':')
+        .map_or(listen_addr, |(host, _port)| host);
+    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse() {
+        ours.push(ip);
+    }
+    ours
 }
 
 /// Must match `TUN_MTU` in `crates/nexapipe-client/src/tun_proxy.rs` (the smoltcp stack is
@@ -348,6 +365,28 @@ impl TunProxy {
         //    the interface actually got is only known now — see [`retarget`].
         let dns_listen = retarget(&self.config.dns.listen_addr);
         let dns_ip = retarget(&self.config.dns_ip);
+
+        // Read before step 4 replaces it: from then on, a domain this proxy does
+        // not handle is answered by the resolver the machine was already using,
+        // which is the only one that knows its internal and split-horizon names
+        // — and on a host that runs another tunnel, that tunnel's resolver.
+        let previous_resolvers = dns::forwardable_resolvers(
+            &dns_config::current_dns_servers(),
+            &own_dns_addresses(&dns_listen),
+            dns::MAX_PREVIOUS_RESOLVERS,
+        );
+        if previous_resolvers.is_empty() {
+            tracing::info!(
+                "No pre-existing DNS server to keep in the chain; non-proxied domains go to {}",
+                self.config.dns.upstream_dns
+            );
+        } else {
+            tracing::info!(
+                "Non-proxied domains go to the machine's own resolvers first: {}",
+                previous_resolvers.join(", ")
+            );
+        }
+
         let dns_server = DnsServer::new(
             DnsServerConfig {
                 listen_addr: dns_listen.clone(),
@@ -355,7 +394,8 @@ impl TunProxy {
                 proxy_domains: self.config.dns.proxy_domains.clone(),
             },
             ip_mapping.clone(),
-        );
+        )
+        .with_previous_resolvers(previous_resolvers);
         let dns_socket = dns_server.bind().await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to bind DNS server on {}: {}. Ensure the TUN interface {} is configured with {} and port 53 is free.",

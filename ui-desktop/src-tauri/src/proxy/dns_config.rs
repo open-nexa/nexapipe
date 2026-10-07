@@ -19,7 +19,9 @@ use std::process::Command;
 // keep it across a reboot, which is what makes a missed restore permanent.
 // One platform wider than the platform code: `is_tun_dns_address` is compiled
 // under `test` everywhere, and this is what it compares against.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+// Imported one platform wider than the platform code that used to be its only
+// reader: `is_tun_dns_address` is now a plain predicate the DNS server asks on
+// every platform, and this is what it compares against.
 use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
@@ -84,6 +86,42 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str) -> Result<()> {
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         Ok(())
+    }
+}
+
+/// The DNS servers the machine is resolving against right now — the ones the
+/// hijack is about to displace.
+///
+/// Asked before [`set_system_dns`] replaces them, so the local resolver can keep
+/// asking whoever was authoritative instead of skipping to a public one: a
+/// machine's own resolvers are the only ones that answer its internal and
+/// split-horizon names, and on a host that already runs another tunnel they are
+/// that tunnel's resolver. Routing around them is what makes a second tunnel
+/// look like "the internet broke" rather than "the other app stopped working".
+///
+/// Unfiltered: dropping the addresses that would send a query back to us is the
+/// caller's job, see `dns::forwardable_resolvers`. An empty answer is a fine one
+/// — "the machine has no static DNS" just leaves the chain to the configured
+/// upstream and the fallbacks.
+pub fn current_dns_servers() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        current_dns_servers_macos()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        current_dns_servers_linux()
+    }
+
+    #[cfg(windows)]
+    {
+        current_dns_servers_windows()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        Vec::new()
     }
 }
 
@@ -207,6 +245,34 @@ fn windows_dns_points_at(dns_ip: &str) -> bool {
     match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains(dns_ip),
         Err(_) => false,
+    }
+}
+
+/// The DNS servers every adapter is configured with, per `Get-DnsClientServerAddress`.
+///
+/// IPv4 only. The IPv6 lists are what the hijack overwrites with `::1` — router-
+/// learned `fe80::…` addresses that name a link as well as a host, and that this
+/// process cannot dial without a scope id it does not have.
+#[cfg(windows)]
+fn current_dns_servers_windows() -> Vec<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | ForEach-Object { $_.ServerAddresses -join ',' }",
+        ])
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            tracing::debug!("Could not read the current DNS servers: {}", e);
+            Vec::new()
+        }
     }
 }
 
@@ -714,6 +780,36 @@ fn resolvectl_dns_for(link: &str) -> Option<Vec<String>> {
     )))
 }
 
+/// The resolvers the machine is using: what `resolvectl` reports for every link,
+/// or the `nameserver` lines of resolv.conf when there is no resolved to ask.
+///
+/// resolv.conf is the fallback rather than the other way round because on a
+/// resolved machine it is the stub (`127.0.0.53`), which forwards to the same
+/// per-link settings anyway — so it only adds a hop, while on a machine without
+/// resolved it is the only answer there is.
+#[cfg(target_os = "linux")]
+fn current_dns_servers_linux() -> Vec<String> {
+    let mut servers: Vec<String> = Vec::new();
+    if let Ok(output) = Command::new("resolvectl").arg("dns").output() {
+        if output.status.success() {
+            for server in parse_resolvectl_dns(&String::from_utf8_lossy(&output.stdout)) {
+                if !servers.contains(&server) {
+                    servers.push(server);
+                }
+            }
+        }
+    }
+    if servers.is_empty() {
+        let contents = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        for server in resolv_conf_nameservers(&contents) {
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    }
+    servers
+}
+
 /// The addresses in `resolvectl dns` output: `Link 2 (eth0): 198.18.0.254` or a bare
 /// list, depending on whether the command was given a link. Taking every token that
 /// reads as an address covers both without depending on how the line is punctuated,
@@ -945,6 +1041,24 @@ fn parse_getdnsservers(output: &str) -> Option<Vec<String>> {
     Some(servers)
 }
 
+/// The DNS servers every network service is using, deduplicated in the order
+/// the services are listed.
+///
+/// A service with no static DNS contributes nothing: it takes whatever DHCP
+/// hands out, which is not an address this process can be told to ask.
+#[cfg(target_os = "macos")]
+fn current_dns_servers_macos() -> Vec<String> {
+    let mut servers: Vec<String> = Vec::new();
+    for service in network_services().unwrap_or_default() {
+        for server in dns_servers_for(&service).unwrap_or_default() {
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    }
+    servers
+}
+
 /// Sets the DNS servers of one network service; `["empty"]` clears them, which
 /// is how a service is handed back to DHCP.
 #[cfg(target_os = "macos")]
@@ -973,8 +1087,7 @@ fn set_dns_servers(service: &str, servers: &[String]) -> Result<()> {
 /// never the whole /24 around it: `10.0.0.0/24` is both a candidate block and the
 /// subnet a great many home LANs sit in, so treating every address in it as ours
 /// would wipe the DNS of anyone whose router hands out 10.0.0.1.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn is_tun_dns_address(address: &str) -> bool {
+pub(crate) fn is_tun_dns_address(address: &str) -> bool {
     // Spelled out because this is compiled one platform wider than the `Ipv4Addr`
     // import: under `test` it also builds where that import does not apply.
     let Ok(ip) = address.parse::<std::net::Ipv4Addr>() else {

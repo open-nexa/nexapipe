@@ -5,9 +5,17 @@ use anyhow::Result;
 // stack can reverse-lookup, so both share one instance and one pool.
 pub use nexapipe_client::virtual_ip::IpMapping;
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+
+/// How many of the machine's own resolvers the upstream chain may carry.
+///
+/// Every one of them that does not answer costs a 1.5s window before the next is
+/// tried, so an unbounded list of them would turn "the resolver is slow" into
+/// "the query never finishes". Two is what a machine normally has.
+pub(crate) const MAX_PREVIOUS_RESOLVERS: usize = 2;
 
 /// DNS server configuration
 #[derive(Debug, Clone)]
@@ -20,6 +28,11 @@ pub struct DnsServerConfig {
 /// DNS server — implements DNS hijacking
 pub struct DnsServer {
     config: DnsServerConfig,
+    /// The resolvers the machine was using before the hijack displaced them, in
+    /// the order they are tried. Kept out of [`DnsServerConfig`] because it is
+    /// not configuration: it is read off the host at the moment the tunnel comes
+    /// up, and a caller that builds a config before then has none to give.
+    previous_resolvers: Vec<String>,
     ip_mapping: Arc<IpMapping>,
     stopped: Arc<AtomicBool>,
 }
@@ -28,9 +41,18 @@ impl DnsServer {
     pub fn new(config: DnsServerConfig, ip_mapping: Arc<IpMapping>) -> Self {
         Self {
             config,
+            previous_resolvers: Vec::new(),
             ip_mapping,
             stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Records the resolvers the machine was using before the hijack, so that
+    /// domains this proxy does not handle are still answered by whoever was
+    /// authoritative for them — see [`forwardable_resolvers`].
+    pub fn with_previous_resolvers(mut self, resolvers: Vec<String>) -> Self {
+        self.previous_resolvers = resolvers;
+        self
     }
 
     pub fn stopped_flag(&self) -> Arc<AtomicBool> {
@@ -54,6 +76,7 @@ impl DnsServer {
     pub async fn run_with_socket(&self, socket: Arc<UdpSocket>) -> Result<()> {
         let upstream = self.config.upstream_dns.clone();
         let proxy_domains = Arc::new(self.config.proxy_domains.clone());
+        let previous = Arc::new(self.previous_resolvers.clone());
         let ip_mapping = self.ip_mapping.clone();
         let stopped = self.stopped.clone();
 
@@ -75,6 +98,7 @@ impl DnsServer {
                     let socket = socket.clone();
                     let upstream = upstream.clone();
                     let proxy_domains = proxy_domains.clone();
+                    let previous = previous.clone();
                     let ip_mapping = ip_mapping.clone();
 
                     tokio::spawn(async move {
@@ -83,6 +107,7 @@ impl DnsServer {
                             &data,
                             addr,
                             &upstream,
+                            &previous,
                             &proxy_domains,
                             &ip_mapping,
                         )
@@ -110,6 +135,7 @@ async fn handle_dns_query(
     data: &[u8],
     client_addr: std::net::SocketAddr,
     upstream: &str,
+    previous: &[String],
     proxy_domains: &[String],
     ip_mapping: &IpMapping,
 ) -> Result<()> {
@@ -157,9 +183,97 @@ async fn handle_dns_query(
         return Ok(());
     }
 
-    // Non-proxied domains: forward upstream (falls back to other public resolvers when the
-    // configured one is unreachable)
-    forward_to_upstream(socket, data, client_addr, upstream).await
+    // Non-proxied domains: forward upstream. The machine's own resolvers come
+    // first — see [`resolver_chain`] for why — and the public fallbacks close the
+    // chain for when none of them answers.
+    forward_to_upstream(socket, data, client_addr, upstream, previous).await
+}
+
+/// Of the resolvers a host reports, the ones worth forwarding a query to.
+///
+/// A machine's own resolvers are the only ones that can answer its
+/// split-horizon and internal names, and on a host that already runs another
+/// tunnel they are that tunnel's resolver — asking a public one instead routes
+/// around both. What makes one *not* worth asking:
+///
+/// - it is an address this hijack answers on itself (`ours`), which is a loop
+///   and not a lookup;
+/// - it is one of the TUN addresses the hijack points system DNS at, which is
+///   the same loop left over from a run that never restored;
+/// - it is unspecified, or link-local (a `fe80::` address cannot be dialled
+///   without the scope id this process does not know).
+///
+/// Deduplicated and capped at `limit`, both because a repeated or unreachable
+/// address costs a 1.5s window each time it is tried.
+pub(crate) fn forwardable_resolvers(
+    candidates: &[String],
+    ours: &[IpAddr],
+    limit: usize,
+) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let Ok(ip) = candidate.parse::<IpAddr>() else {
+            continue;
+        };
+        if ours.contains(&ip) || ip.is_unspecified() || is_link_local(&ip) {
+            continue;
+        }
+        if crate::proxy::dns_config::is_tun_dns_address(candidate) {
+            continue;
+        }
+        if kept.contains(candidate) {
+            continue;
+        }
+        kept.push(candidate.clone());
+        if kept.len() >= limit {
+            break;
+        }
+    }
+    kept
+}
+
+/// Whether `ip` is a link-local address: one that names a link as well as a
+/// host, so dialling it needs a scope id this process does not have.
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.octets()[..2] == [169, 254],
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
+/// `address` with a port, so a bare address a platform reported can be compared
+/// with — and stand next to — the configured `host:port`.
+fn with_default_port(address: &str) -> String {
+    match address.parse::<std::net::SocketAddr>() {
+        Ok(_) => address.to_string(),
+        // Either a bare IPv4 address, or a bare IPv6 one that needs brackets.
+        Err(_) if address.contains(':') => format!("[{address}]:53"),
+        Err(_) => format!("{address}:53"),
+    }
+}
+
+/// The upstreams to try, in order: the machine's own resolvers first, then the
+/// configured one, then the public fallbacks.
+///
+/// The order is the point. A resolver this machine was already using is the one
+/// whose answers are right for it — an internal zone, a split-horizon name, or
+/// the fake-IP answers another tunnel hands out — and a public resolver asked
+/// the same question answers NXDOMAIN for all of them. The configured upstream
+/// and the fallbacks stay behind them so the chain still ends somewhere when the
+/// machine's own resolvers are unreachable.
+fn resolver_chain(previous: &[String], configured: &str) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let candidates = previous
+        .iter()
+        .map(|server| with_default_port(server))
+        .chain(std::iter::once(configured.to_string()))
+        .chain(FALLBACK_UPSTREAMS.iter().map(|server| server.to_string()));
+    for candidate in candidates {
+        if !chain.contains(&candidate) {
+            chain.push(candidate);
+        }
+    }
+    chain
 }
 
 /// Fallback upstream resolvers, tried in order when the configured upstream times out or is
@@ -173,27 +287,19 @@ pub(crate) const FALLBACK_UPSTREAMS: &[&str] = &[
     "1.1.1.1:53",         // Cloudflare
 ];
 
-/// Forwards the query to the configured upstream and then to each fallback, returning the
-/// first successful reply. Each upstream gets a 1.5s window and only a response coming from
-/// the upstream we queried is accepted (spoofing protection).
+/// Forwards the query along [`resolver_chain`], returning the first successful
+/// reply. Each upstream gets a 1.5s window and only a response coming from the
+/// upstream we queried is accepted (spoofing protection).
 async fn forward_to_upstream(
     socket: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: std::net::SocketAddr,
     configured_upstream: &str,
+    previous: &[String],
 ) -> Result<()> {
-    // Build a de-duplicated upstream list: user configuration first, fallbacks afterwards
-    let mut upstreams: Vec<String> = Vec::new();
-    if !upstreams.iter().any(|u| u == configured_upstream) {
-        upstreams.push(configured_upstream.to_string());
-    }
-    for fb in FALLBACK_UPSTREAMS {
-        if !upstreams.iter().any(|u| u == fb) {
-            upstreams.push(fb.to_string());
-        }
-    }
+    let upstreams = resolver_chain(previous, configured_upstream);
 
-    for upstream in upstreams {
+    for upstream in &upstreams {
         let upstream_addr: std::net::SocketAddr = match upstream.parse() {
             Ok(a) => a,
             Err(_) => continue,
@@ -402,4 +508,143 @@ fn build_empty_dns_response(dns_query: &DnsQuery) -> Vec<u8> {
     // Question section (copied verbatim)
     response.extend_from_slice(&dns_query.question_section);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// The address every hijack points system DNS at: `…254` of the block in use.
+    fn a_tun_dns_address() -> String {
+        Ipv4Addr::from(u32::from(TUN_BASE_CANDIDATES[0]) | 0x0000_00FE).to_string()
+    }
+
+    /// The whole point of the chain: the resolver the machine was already using
+    /// is asked before the configured one and before any public fallback, because
+    /// it is the only one that can answer that machine's own names.
+    #[test]
+    fn the_machines_own_resolvers_come_first() {
+        let chain = resolver_chain(&["192.168.1.1".to_string()], "8.8.8.8:53");
+        assert_eq!(chain[0], "192.168.1.1:53");
+        assert_eq!(chain[1], "8.8.8.8:53");
+        // The public fallbacks still close the chain: a machine whose own
+        // resolvers are unreachable must not be left without an answer.
+        assert_eq!(chain.len(), 1 + 1 + FALLBACK_UPSTREAMS.len());
+    }
+
+    /// Two machines' resolvers, then the configured one, then the fallbacks.
+    #[test]
+    fn every_resolver_in_the_chain_appears_once() {
+        let chain = resolver_chain(
+            &["192.168.1.1".to_string(), "10.0.0.1".to_string()],
+            "8.8.8.8:53",
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "192.168.1.1:53",
+                "10.0.0.1:53",
+                "8.8.8.8:53",
+                "223.5.5.5:53",
+                "114.114.114.114:53",
+                "1.1.1.1:53",
+            ]
+        );
+    }
+
+    /// A machine whose resolver is also the configured upstream — or one of the
+    /// public fallbacks — does not get asked twice, and keeps its place at the
+    /// front rather than being pushed behind the fallbacks.
+    #[test]
+    fn a_resolver_repeated_later_in_the_chain_is_asked_once() {
+        let chain = resolver_chain(&["223.5.5.5".to_string()], "223.5.5.5:53");
+        assert_eq!(
+            chain,
+            vec!["223.5.5.5:53", "114.114.114.114:53", "1.1.1.1:53"]
+        );
+    }
+
+    /// A bare address a platform reported has to come out comparable with the
+    /// configured `host:port`, or the de-duplication above never matches it.
+    #[test]
+    fn a_bare_address_gets_a_port_and_a_bare_ipv6_one_gets_brackets() {
+        assert_eq!(with_default_port("192.168.1.1"), "192.168.1.1:53");
+        assert_eq!(with_default_port("fd00::1"), "[fd00::1]:53");
+        assert_eq!(with_default_port("8.8.8.8:53"), "8.8.8.8:53");
+    }
+
+    /// Asking an address this process answers on itself is a loop, not a lookup:
+    /// the query would come straight back and be forwarded again.
+    #[test]
+    fn our_own_addresses_are_not_forwarding_targets() {
+        let ours = vec![
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 254)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let kept = forwardable_resolvers(
+            &[
+                "198.18.0.254".to_string(),
+                "::1".to_string(),
+                "192.168.1.1".to_string(),
+            ],
+            &ours,
+            MAX_PREVIOUS_RESOLVERS,
+        );
+        assert_eq!(kept, vec!["192.168.1.1".to_string()]);
+    }
+
+    /// The same loop left behind by a run that never restored: system DNS still
+    /// pointing at a TUN address, read back as "what this machine uses".
+    #[test]
+    fn a_tun_address_left_in_the_system_dns_is_not_a_forwarding_target() {
+        let kept = forwardable_resolvers(&[a_tun_dns_address()], &[], MAX_PREVIOUS_RESOLVERS);
+        assert!(
+            kept.is_empty(),
+            "{} should not be forwarded to: it is ours",
+            a_tun_dns_address()
+        );
+    }
+
+    /// A link-local address names a link as well as a host; without the scope id
+    /// this process does not have, it cannot be dialled. Neither can 0.0.0.0.
+    #[test]
+    fn addresses_we_cannot_dial_are_not_forwarding_targets() {
+        let kept = forwardable_resolvers(
+            &[
+                "fe80::1".to_string(),
+                "169.254.1.1".to_string(),
+                "0.0.0.0".to_string(),
+                "::".to_string(),
+                "192.168.1.1".to_string(),
+            ],
+            &[],
+            MAX_PREVIOUS_RESOLVERS,
+        );
+        assert_eq!(kept, vec!["192.168.1.1".to_string()]);
+    }
+
+    /// Cap and de-duplication: every address kept is tried for 1.5s, so a long
+    /// list of them would turn a slow resolver into a stalled query.
+    #[test]
+    fn at_most_a_handful_of_resolvers_survive_and_none_twice() {
+        let candidates: Vec<String> = (0..8).map(|i| format!("10.0.0.{i}")).collect();
+        let kept = forwardable_resolvers(&candidates, &[], MAX_PREVIOUS_RESOLVERS);
+        assert_eq!(kept.len(), MAX_PREVIOUS_RESOLVERS);
+
+        let repeated = vec!["10.0.0.1".to_string(), "10.0.0.1".to_string()];
+        assert_eq!(
+            forwardable_resolvers(&repeated, &[], MAX_PREVIOUS_RESOLVERS),
+            vec!["10.0.0.1".to_string()]
+        );
+    }
+
+    /// An answer this code cannot read — `networksetup` naming a service, or a
+    /// platform reporting something that is not an address — is skipped rather
+    /// than dialled.
+    #[test]
+    fn something_that_is_not_an_address_is_not_a_forwarding_target() {
+        assert!(forwardable_resolvers(&["There aren't any".to_string()], &[], 2).is_empty());
+    }
 }
