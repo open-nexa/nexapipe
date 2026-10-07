@@ -376,11 +376,7 @@ impl ProxyManager {
             // A node holding a secret authenticates with it and never enrolls: enrolling
             // rotates the server-side secret, so doing it on every start would invalidate
             // every other device that already scanned the same invite.
-            if let Some(enrollment) = node
-                .enrollment
-                .as_ref()
-                .filter(|_| !has_secret)
-            {
+            if let Some(enrollment) = node.enrollment.as_ref().filter(|_| !has_secret) {
                 // The server looks an enrollment up by client_id too, so a token with no
                 // id can never match any pending entry there.
                 if enrollment.client_id.trim().is_empty() {

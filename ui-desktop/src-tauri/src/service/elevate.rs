@@ -386,7 +386,7 @@ fn spawn_elevated(exe: &Path, args: &[String]) -> Result<ElevatedSpawn, AppError
                     failure: None,
                     denied,
                     hint: format_output(&output),
-                })
+                });
             }
             Err(e) => last_error = format!("Failed to start {}: {}", shell, e),
         }

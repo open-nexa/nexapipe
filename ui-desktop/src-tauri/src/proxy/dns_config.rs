@@ -1,4 +1,4 @@
-﻿//! System DNS configuration — points system DNS at the TUN virtual IP so that queries reach
+//! System DNS configuration — points system DNS at the TUN virtual IP so that queries reach
 //! the local DNS server.
 //!
 //! - Windows: PowerShell Set-DnsClientServerAddress (netsh fallback), verified afterwards
@@ -138,7 +138,13 @@ fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()> {
     // effect) — so verify the result instead of trusting the exit code.
     let _ = Command::new("netsh")
         .args([
-            "interface", "ip", "set", "dnsservers", "all", dns_ip, "primary",
+            "interface",
+            "ip",
+            "set",
+            "dnsservers",
+            "all",
+            dns_ip,
+            "primary",
         ])
         .output();
     let _ = Command::new("netsh")
@@ -435,7 +441,9 @@ fn cleanup_stale_hijack_windows() {
             }
             tracing::info!(
                 "stale DNS hijack cleanup: {}",
-                String::from_utf8_lossy(&o.stdout).trim().replace('\n', "; ")
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .replace('\n', "; ")
             );
         }
         Err(e) => tracing::warn!("stale DNS hijack cleanup could not run: {}", e),
@@ -449,10 +457,16 @@ fn cleanup_stale_hijack_windows() {
 #[cfg(target_os = "linux")]
 const RESOLV_CONF_BACKUP: &str = "/etc/resolv.conf.nexapipe.bak";
 
+/// The routing domain that claims every name for a link: `~.`.
+#[cfg(target_os = "linux")]
+const DEFAULT_ROUTE_DOMAIN: &str = "~.";
+
 #[cfg(target_os = "linux")]
 fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
-    // Prefer resolvectl (systemd-resolved): it leaves the machine's own resolver in
-    // the loop, so only the proxied domains go through the TUN.
+    // Prefer resolvectl (systemd-resolved) to rewriting /etc/resolv.conf: the link
+    // keeps the machine's own resolver configuration for the restore to hand back.
+    // The TUN resolver answers the proxied domains itself and forwards the rest
+    // upstream, so it can own every query while the tunnel is up.
     match Command::new("resolvectl")
         .args(["dns", interface, dns_ip])
         .output()
@@ -464,8 +478,22 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
             // resolver may not even be reading.
             match resolvectl_dns_for(interface) {
                 Some(servers) if servers.iter().any(|server| server == dns_ip) => {
-                    tracing::info!("resolvectl set DNS for {}: {}", interface, dns_ip);
-                    return Ok(());
+                    match set_resolvectl_default_route_domain(interface) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "resolvectl set DNS for {} to {} and routed every query to it",
+                                interface,
+                                dns_ip
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => tracing::warn!(
+                            "resolvectl could not route every query to {}: {}; \
+                             falling back to writing /etc/resolv.conf",
+                            interface,
+                            e
+                        ),
+                    }
                 }
                 Some(servers) => tracing::warn!(
                     "resolvectl dns {} {} exited 0 but the link has {:?}",
@@ -530,7 +558,8 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn restore_system_dns_linux(interface: &str, _dns_ip: &str) -> Result<()> {
-    // Prefer reverting via resolvectl
+    // Prefer reverting via resolvectl: one `revert` drops the DNS server and the
+    // `~.` route that made it the only one.
     match Command::new("resolvectl")
         .args(["revert", interface])
         .output()
@@ -723,6 +752,77 @@ fn parse_resolvectl_dns(output: &str) -> Vec<String> {
     output
         .split_whitespace()
         .filter(|token| token.parse::<IpAddr>().is_ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Makes `link` the DNS route for every name, not merely one more upstream.
+///
+/// `resolvectl dns` alone leaves the TUN resolver competing with whatever the
+/// other links carry: systemd-resolved fans a query out to every link that is a
+/// DNS route and keeps the first answer, so on a machine with more than one uplink
+/// a proxied domain resolves to its real address as often as to the virtual one —
+/// and the real address is exactly the one the tunnel exists to replace. `~.`
+/// routes every query here instead, which is what the /etc/resolv.conf fallback
+/// does with a file.
+#[cfg(target_os = "linux")]
+fn set_resolvectl_default_route_domain(link: &str) -> Result<()> {
+    let output = Command::new("resolvectl")
+        .args(["domain", link, DEFAULT_ROUTE_DOMAIN])
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!("resolvectl domain {} {}: {}", link, DEFAULT_ROUTE_DOMAIN, e)
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "resolvectl domain {} {}: {}",
+            link,
+            DEFAULT_ROUTE_DOMAIN,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    match resolvectl_domains_for(link) {
+        Some(domains) if domains.iter().any(|d| d == DEFAULT_ROUTE_DOMAIN) => Ok(()),
+        Some(domains) => anyhow::bail!(
+            "resolvectl domain {} {} exited 0 but the link has {:?}",
+            link,
+            DEFAULT_ROUTE_DOMAIN,
+            domains
+        ),
+        None => anyhow::bail!("could not read back the routing domain set on {}", link),
+    }
+}
+
+/// The routing domains `resolvectl domain <link>` reports for a link.
+///
+/// `None` when the answer is not one this code understands — no resolved on this
+/// machine, a command that was refused, or output in a shape it has never seen.
+#[cfg(target_os = "linux")]
+fn resolvectl_domains_for(link: &str) -> Option<Vec<String>> {
+    let output = Command::new("resolvectl")
+        .args(["domain", link])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_resolvectl_domains(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The routing domains in `resolvectl domain` output: `Link 2 (eth0): ~.` or a
+/// bare list. A domain never contains a colon, so the last one on the line is the
+/// end of the `Link …` prefix — and a link name containing one is not mistaken
+/// for part of the list either.
+#[cfg(any(target_os = "linux", test))]
+fn parse_resolvectl_domains(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .flat_map(|line| {
+            let domains = line.rsplit_once(':').map_or(line, |(_, domains)| domains);
+            domains.split_whitespace()
+        })
         .map(str::to_string)
         .collect()
 }
@@ -1097,8 +1197,8 @@ mod tests {
     // parser for a file this code rewrites is not something to ship unexercised.
     #[cfg(any(target_os = "linux", test))]
     use super::{
-        parse_resolvectl_dns, resolv_conf_names_a_tun_address, resolv_conf_nameservers,
-        resolv_conf_without_nameservers,
+        parse_resolvectl_dns, parse_resolvectl_domains, resolv_conf_names_a_tun_address,
+        resolv_conf_nameservers, resolv_conf_without_nameservers,
     };
 
     /// The legend `-listallnetworkservices` prints ahead of its list is not a service.
@@ -1280,6 +1380,28 @@ mod tests {
         );
         assert_eq!(
             parse_resolvectl_dns("Link 2 (eth0):\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// `resolvectl domain` answers with a `Link …:` prefix when asked about one
+    /// link and with a bare list when asked about all of them. Everything after
+    /// the first colon is a domain — `~.` included, since it is a routing domain
+    /// like any other and the read-back above looks for exactly that token.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn resolvectl_domains_read_in_either_shape() {
+        assert_eq!(
+            parse_resolvectl_domains("Link 5 (nexa-tun): ~.\n"),
+            vec!["~.".to_string()]
+        );
+        assert_eq!(
+            parse_resolvectl_domains("Link 3 (wlan0): ~. example.com\n"),
+            vec!["~.".to_string(), "example.com".to_string()]
+        );
+        assert_eq!(parse_resolvectl_domains("~.\n"), vec!["~.".to_string()]);
+        assert_eq!(
+            parse_resolvectl_domains("Link 2 (eth0):\n"),
             Vec::<String>::new()
         );
     }

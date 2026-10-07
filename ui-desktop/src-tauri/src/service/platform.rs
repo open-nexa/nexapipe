@@ -117,7 +117,7 @@ mod windows_impl {
     use std::time::{Duration, Instant};
 
     use crate::error::{codes, AppError};
-    use crate::service::platform::{SERVICE_DISPLAY_NAME, SERVICE_NAME, ServiceState};
+    use crate::service::platform::{ServiceState, SERVICE_DISPLAY_NAME, SERVICE_NAME};
 
     /// Text `services.msc` shows for the entry.
     const SERVICE_DESCRIPTION: &str =
@@ -148,7 +148,7 @@ mod windows_impl {
     ///
     /// Not a failure: running is the state the command asked for. Reported as it is, the exit
     /// code turns a successful install into `service.install_failed` carrying
-        /// "StartService failed 1056" — an install that worked, described as one that did not.
+    /// "StartService failed 1056" — an install that worked, described as one that did not.
     const ALREADY_RUNNING: &str = "1056";
 
     /// `sc stop` on a service that is not started (or not installed).
@@ -569,7 +569,9 @@ mod windows_impl {
     }
 
     fn service_exists() -> bool {
-        sc_query().map(|output| !output.contains("1060")).unwrap_or(true)
+        sc_query()
+            .map(|output| !output.contains("1060"))
+            .unwrap_or(true)
     }
 
     /// An install that reported success still has to leave a service behind.
@@ -578,10 +580,7 @@ mod windows_impl {
 
         match sc_query() {
             Some(output) if !output.contains("1060") => Ok(()),
-            Some(output) => Err(AppError::with_detail(
-                codes::SERVICE_INSTALL_FAILED,
-                output,
-            )),
+            Some(output) => Err(AppError::with_detail(codes::SERVICE_INSTALL_FAILED, output)),
             None => Err(AppError::new(codes::SERVICE_INSTALL_FAILED)),
         }
     }
@@ -1142,8 +1141,8 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     fs::create_dir_all("/Library/LaunchDaemons")
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
 
-    let mut file =
-        File::create(&plist_path).map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
+    let mut file = File::create(&plist_path)
+        .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
 
     file.write_all(plist_content.as_bytes())
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
@@ -1213,7 +1212,8 @@ fn is_service_running_macos() -> bool {
 fn state_macos() -> ServiceState {
     use std::path::Path;
 
-    let plist = Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
+    let plist =
+        Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
     if !plist.exists() {
         return ServiceState::NotInstalled;
     }

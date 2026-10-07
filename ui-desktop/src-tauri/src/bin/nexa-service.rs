@@ -132,9 +132,11 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
             // kills the process at machine shutdown without any control event, the teardown
             // never runs, and the static DNS entries it left behind (they survive a reboot)
             // break name resolution for the whole machine on the next boot.
-            _ => ServiceControlAccept::STOP
-                | ServiceControlAccept::SHUTDOWN
-                | ServiceControlAccept::PRESHUTDOWN,
+            _ => {
+                ServiceControlAccept::STOP
+                    | ServiceControlAccept::SHUTDOWN
+                    | ServiceControlAccept::PRESHUTDOWN
+            }
         };
         handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,

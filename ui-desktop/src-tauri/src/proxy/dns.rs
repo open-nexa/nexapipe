@@ -137,7 +137,9 @@ async fn handle_dns_query(
         // that leads nowhere.
         let answer = match query.qtype {
             1 => Some(std::net::IpAddr::V4(ip_mapping.allocate(&query.domain))),
-            28 => ip_mapping.allocate_v6(&query.domain).map(std::net::IpAddr::V6),
+            28 => ip_mapping
+                .allocate_v6(&query.domain)
+                .map(std::net::IpAddr::V6),
             _ => None,
         };
 

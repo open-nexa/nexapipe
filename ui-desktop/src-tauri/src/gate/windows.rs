@@ -26,7 +26,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 // directly under `Win32::Security`, and it writes the token through an out
 // parameter rather than returning it.
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, LogonUserW, TokenUser, LOGON32_LOGON_INTERACTIVE,
+    GetTokenInformation, LogonUserW, LookupAccountSidW, TokenUser, LOGON32_LOGON_INTERACTIVE,
     LOGON32_PROVIDER_DEFAULT, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};

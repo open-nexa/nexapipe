@@ -111,20 +111,20 @@ impl IpcClient {
 
         // Checked rather than trusted: a peer that cannot answer for this side's
         // nonce does not hold the token, whatever it accepted above.
-        let proof =
-            match tokio::time::timeout(CHALLENGE_TIMEOUT, Self::read_response(reader)).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(AppError::with_detail(
-                        codes::SERVICE_UNAUTHORIZED,
-                        format!(
-                            "nothing on {IPC_SOCKET_PATH} proved it holds the token within \
+        let proof = match tokio::time::timeout(CHALLENGE_TIMEOUT, Self::read_response(reader)).await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(AppError::with_detail(
+                    codes::SERVICE_UNAUTHORIZED,
+                    format!(
+                        "nothing on {IPC_SOCKET_PATH} proved it holds the token within \
                              {CHALLENGE_TIMEOUT:?}"
-                        ),
-                    ))
-                }
-            };
+                    ),
+                ))
+            }
+        };
         match proof {
             IpcResponse::AuthOk { mac } => {
                 if !crate::service::ipc_token::proof_matches(
