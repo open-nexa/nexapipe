@@ -119,8 +119,18 @@ async function closeNodeFlows(connection: string): Promise<void> {
 
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * Whether the page that asked for the poll is still watching.
+ *
+ * The timer alone cannot answer that: the callback clears `pollTimer` *before* it awaits the
+ * read, so a page closing during that read finds a null timer, cancels nothing, and would be
+ * handed a new one the moment the read came back — a poll every couple of seconds for the rest of
+ * the session, with no page left to show it to.
+ */
+let watching = false;
+
 function schedulePoll(): void {
-  if (pollTimer !== null) return;
+  if (!watching || pollTimer !== null) return;
   pollTimer = setTimeout(async () => {
     pollTimer = null;
     await refresh();
@@ -130,12 +140,14 @@ function schedulePoll(): void {
 
 /** Called by the page when it opens. Reads immediately, then keeps reading. */
 async function startPolling(): Promise<void> {
+  watching = true;
   await refresh();
   schedulePoll();
 }
 
 /** Called by the page when it closes: a list nobody is looking at is not worth asking for. */
 function stopPolling(): void {
+  watching = false;
   if (pollTimer !== null) {
     clearTimeout(pollTimer);
     pollTimer = null;
