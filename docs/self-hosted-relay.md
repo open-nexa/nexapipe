@@ -42,7 +42,8 @@ two upstream sources and neither of them is an image: the crate source
 releases publish one archive per target — at the version this tree locks, that
 is `iroh-relay-v1.2.0-x86_64-unknown-linux-gnu.tar.gz` (a `musl` build and
 `aarch64` and Darwin builds ship alongside it), so the honest deployment shape
-today is a binary plus your own unit file, not `docker compose up`.
+today is a binary plus your own unit file, not `docker compose up` — [one is
+written out below](#running-it-under-systemd).
 
 If you would rather build than download, upstream's own instructions do it from
 the iroh checkout — note the `cd ../`, which makes this a workspace build rather
@@ -115,6 +116,88 @@ are `"Manual"` (reads `./default.crt` and `./default.key`, or whatever `manual_c
 `manual_key_path` name — useful behind your own reverse proxy or automation) and
 `"Reloading"`, which is `Manual` plus re-reading the same pair of files on a
 timer so a rotation does not need a restart.
+
+### Running it under systemd
+
+Everything above leaves the relay in the foreground, which is the right way to
+find out whether it works and the wrong way to leave it running. There is no
+unit file in the release archive — upstream ships a binary — so one goes in
+`/etc/systemd/system/iroh-relay.service`:
+
+```ini
+[Unit]
+Description=iroh relay server
+Documentation=https://github.com/n0-computer/iroh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/iroh-relay --config-path /etc/iroh-relay.toml
+Restart=on-failure
+RestartSec=5s
+
+# Optional, and read only if it exists: the leading `-` is what makes it
+# optional. Keep it `chmod 600` — this is where the relay's own token goes if
+# you would rather not have it in the config file.
+EnvironmentFile=-/etc/iroh-relay.env
+
+# An identity systemd invents for this process and discards when it stops, so
+# the relay owns nothing else on the machine. CAP_NET_BIND_SERVICE is what
+# lets it hold 80 and 443 without running as root.
+DynamicUser=yes
+StateDirectory=iroh-relay
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now iroh-relay
+sudo systemctl status iroh-relay
+```
+
+Three things to know before this starts cleanly rather than after it has failed
+once.
+
+`ProtectSystem=strict` makes every path read-only except the ones the unit names.
+`StateDirectory=iroh-relay` gives it `/var/lib/iroh-relay` to write in, which is
+enough for a relay that keeps nothing; if your build writes a certificate cache
+anywhere else, that path needs a `ReadWritePaths=` of its own or the first
+renewal will fail on a read-only file system.
+
+The token can stay out of `/etc/iroh-relay.toml`. The relay reads
+`IROH_RELAY_ACCESS_TOKEN` from its environment and that value replaces the list
+in the file and wins over it, so putting it in the `EnvironmentFile` above
+(`IROH_RELAY_ACCESS_TOKEN=…`) is one fewer place a credential sits — and one
+more file to keep at `600`.
+
+A change to the config still takes a restart. There is no reload: the relay
+reads its file once, at startup, and `systemctl reload` against a unit with no
+`ExecReload` gets you a warning and nothing else.
+
+Logs go to the journal, which is where to look when a relay does not come up:
+
+```bash
+journalctl -u iroh-relay -f
+```
+
+**The unit above has not been run in this project's CI** — the same caveat the
+top of this page makes about every command on it. The systemd directives are
+generic and version-independent; what this page cannot tell you is which paths
+your build of `iroh-relay` wants to write.
 
 ### What to open
 
