@@ -19,6 +19,15 @@
     "restore": "Restore",
     "close": "Close"
   },
+  "quit": {
+    "titleProcess": "Closing stops the proxy",
+    "messageProcess": "The proxy is running inside the app, so closing this window stops it. Disconnect and quit, or stay here and keep it running.",
+    "titleService": "Keep the proxy running?",
+    "messageService": "The proxy is running in the system service, so it keeps forwarding traffic once this window is gone. You can disconnect it before quitting instead.",
+    "disconnect": "Disconnect & quit",
+    "keep": "Keep the proxy",
+    "kept": "The proxy is still running, so the app stays open."
+  },
   "common": {
     "save": "Save",
     "cancel": "Cancel",
