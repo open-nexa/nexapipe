@@ -808,6 +808,56 @@ fn resolvectl_domains_for(link: &str) -> Option<Vec<String>> {
     )))
 }
 
+/// The sources other than `link` that are themselves a DNS route for some
+/// domain, as `resolvectl domain` reports them when it is given no link: every
+/// link the machine has, plus the `Global` line.
+///
+/// A root route does not make this link the only one resolving asks. It keeps
+/// the longest matching suffix, so a `~corp.example` on the office uplink still
+/// takes every name under it — and takes those names to its own resolver,
+/// which answers with the real address the tunnel exists to replace.
+#[cfg(any(target_os = "linux", test))]
+fn parse_resolvectl_competing_routes(output: &str, link: &str) -> Vec<(String, Vec<String>)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (source, domains) = line.split_once(':')?;
+            let source = source.trim();
+            // `Link 5 (nexa0)` names the link in parentheses; `Link 5` alone
+            // covers a caller that addressed it by index.
+            if source.contains(&format!("({link})")) || source.starts_with(&format!("Link {link} "))
+            {
+                return None;
+            }
+            // Only `~` domains route. A search domain affects how a bare name
+            // is completed, not who is asked.
+            let domains: Vec<String> = domains
+                .split_whitespace()
+                .filter(|token| token.starts_with('~'))
+                .map(|token| token.trim_start_matches('~').to_string())
+                .collect();
+            if domains.is_empty() {
+                return None;
+            }
+            Some((source.to_string(), domains))
+        })
+        .collect()
+}
+
+/// Every source other than `link` that routes some domain today, or `None` when
+/// they could not be read. Not knowing is not evidence that they are quiet.
+#[cfg(target_os = "linux")]
+fn competing_routes_for(link: &str) -> Option<Vec<(String, Vec<String>)>> {
+    let output = Command::new("resolvectl").arg("domain").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_resolvectl_competing_routes(
+        &String::from_utf8_lossy(&output.stdout),
+        link,
+    ))
+}
+
 /// Whether `routed` is every one of `domains`, and not merely one of them: a
 /// domain left out keeps resolving outside the proxy while the caller is told
 /// the hijack is scoped, which is the one thing the fallback is for.
@@ -846,11 +896,43 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
                 Some(servers) if servers.iter().any(|server| server == dns_ip) => {
                     match set_resolvectl_default_route_domain(interface) {
                         Ok(()) => {
-                            tracing::info!(
-                                "resolvectl set DNS for {} to {} and routed every query to it",
-                                interface,
-                                dns_ip
-                            );
+                            // Routing every query here and being the only
+                            // resolver asked are two claims. They come apart the
+                            // moment another link routes some name more
+                            // specifically, and "the proxy is up" is what the
+                            // tray shows while that name quietly goes outside
+                            // it — so say which of the two it is.
+                            match competing_routes_for(interface) {
+                                Some(routes) if !routes.is_empty() => {
+                                    let others = routes
+                                        .iter()
+                                        .map(|(source, domains)| {
+                                            format!("{source} routes {}", domains.join(", "))
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("; ");
+                                    tracing::warn!(
+                                        "routed every query to {} on {}, but resolved keeps the \
+                                         longest match, so these keep their own resolver: {}",
+                                        dns_ip,
+                                        interface,
+                                        others
+                                    );
+                                }
+                                Some(_) => tracing::info!(
+                                    "routed every query to {} on {}, and no other link routes \
+                                     anything more specifically",
+                                    dns_ip,
+                                    interface
+                                ),
+                                None => tracing::warn!(
+                                    "routed every query to {} on {}, but the other links' routing \
+                                     domains could not be read back — one of them may still own \
+                                     some names",
+                                    dns_ip,
+                                    interface
+                                ),
+                            }
                             return Ok(());
                         }
                         Err(e) => {
@@ -1881,9 +1963,9 @@ mod tests {
     // parser for a file this code rewrites is not something to ship unexercised.
     #[cfg(any(target_os = "linux", test))]
     use super::{
-        DEFAULT_ROUTE_DOMAIN, parse_resolvectl_dns, parse_resolvectl_domains,
-        resolv_conf_names_a_tun_address, resolv_conf_nameservers, resolv_conf_without_nameservers,
-        routes_every_domain,
+        DEFAULT_ROUTE_DOMAIN, parse_resolvectl_competing_routes, parse_resolvectl_dns,
+        parse_resolvectl_domains, resolv_conf_names_a_tun_address, resolv_conf_nameservers,
+        resolv_conf_without_nameservers, routes_every_domain,
     };
 
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -2140,6 +2222,65 @@ mod tests {
         // The token it is written as, and the one it is read back as.
         assert_eq!(DEFAULT_ROUTE_DOMAIN, ".");
         assert_eq!(format!("~{DEFAULT_ROUTE_DOMAIN}"), "~.");
+    }
+
+    /// Routing every query to this link and being the only resolver asked are
+    /// two claims, and only one of them follows from `~.`: resolved keeps the
+    /// longest matching suffix, so a `~corp.example` on another link keeps
+    /// answering those names with the addresses the tunnel exists to replace.
+    /// Calling the hijack exclusive while that is true is how a name walks out
+    /// through the proxy's front door without anybody seeing it leave.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn a_more_specific_route_elsewhere_keeps_its_own_resolver() {
+        let output = "\
+Global:
+Link 2 (eth0): corp.example
+Link 5 (nexa0): ~.
+Link 7 (wg0): ~corp.example ~corp.internal
+";
+        assert_eq!(
+            parse_resolvectl_competing_routes(output, "nexa0"),
+            vec![(
+                "Link 7 (wg0)".to_string(),
+                vec!["corp.example".to_string(), "corp.internal".to_string()]
+            )]
+        );
+
+        // The route this hijack installs is never a competing one.
+        assert!(
+            parse_resolvectl_competing_routes(output, "wg0")
+                .iter()
+                .all(|(source, _)| source != "Link 7 (wg0)")
+        );
+
+        // A search domain is not a route: it decides how a bare name is
+        // completed, not who is asked, so eth0 above counts for nothing.
+        assert_eq!(
+            parse_resolvectl_competing_routes("Link 2 (eth0): corp.example\n", "nexa0"),
+            Vec::new()
+        );
+
+        // The global list routes too, and belongs to no link.
+        assert_eq!(
+            parse_resolvectl_competing_routes(
+                "Global: ~corp.example\nLink 5 (nexa0): ~.\n",
+                "nexa0"
+            ),
+            vec![("Global".to_string(), vec!["corp.example".to_string()])]
+        );
+
+        // Addressed by index rather than by name.
+        assert_eq!(
+            parse_resolvectl_competing_routes("Link 5 (nexa0): ~.\n", "5"),
+            Vec::new()
+        );
+
+        // Nothing routes anywhere else, so the hijack really is the only one.
+        assert_eq!(
+            parse_resolvectl_competing_routes("Link 5 (nexa0): ~.\n", "nexa0"),
+            Vec::new()
+        );
     }
 
     /// What the scoped hijack writes has to be what its restore reads: a file
