@@ -3,6 +3,7 @@
 //!
 //! - Windows: PowerShell Set-DnsClientServerAddress (netsh fallback), verified afterwards
 //! - Linux:   resolvectl (systemd-resolved), falling back to overwriting /etc/resolv.conf
+//!   (with a backup, which the restore puts back)
 //! - macOS:   networksetup (iterating over every network service), with the pre-hijack
 //!   servers kept on file so a restore can put them back
 //!
@@ -12,11 +13,15 @@
 use anyhow::Result;
 use std::process::Command;
 
-#[cfg(target_os = "macos")]
+// The candidate blocks, and the two tests that separate a stale hijack from a live
+// one, are shared by the platforms that write a DNS setting somewhere outside this
+// process: macOS into the system configuration, Linux into a file. Both of them
+// keep it across a reboot, which is what makes a missed restore permanent.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -262,14 +267,18 @@ fn restore_system_dns_windows(interface: &str, _dns_ip: &str) -> Result<()> {
 /// nobody configures those legitimately — or its IPv6 DNS is exactly ::1 while nothing
 /// listens on [::1]:53 (the hijack's marker; a real localhost resolver holds that socket).
 ///
-/// On macOS the same question is asked of every network service, and an address that is
-/// still held by an interface is left alone — see [`cleanup_stale_hijack_macos`].
+/// On macOS and Linux the same question is asked of the system resolver, and an address
+/// that is still held by an interface is left alone — see [`cleanup_stale_hijack_macos`]
+/// and [`cleanup_stale_hijack_linux`].
 pub fn cleanup_stale_hijack() {
     #[cfg(windows)]
     cleanup_stale_hijack_windows();
 
     #[cfg(target_os = "macos")]
     cleanup_stale_hijack_macos();
+
+    #[cfg(target_os = "linux")]
+    cleanup_stale_hijack_linux();
 }
 
 /// Resets network services whose DNS still points at a TUN address no interface holds.
@@ -410,21 +419,68 @@ const RESOLV_CONF_BACKUP: &str = "/etc/resolv.conf.nexapipe.bak";
 
 #[cfg(target_os = "linux")]
 fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
-    // Prefer resolvectl (systemd-resolved)
-    if let Ok(output) = Command::new("resolvectl")
+    // Prefer resolvectl (systemd-resolved): it leaves the machine's own resolver in
+    // the loop, so only the proxied domains go through the TUN.
+    match Command::new("resolvectl")
         .args(["dns", interface, dns_ip])
         .output()
     {
-        if output.status.success() {
-            tracing::info!("resolvectl set DNS for {}: {}", interface, dns_ip);
-            return Ok(());
+        Ok(output) if output.status.success() => {
+            // Read back rather than trusting the exit code: a hijack that silently
+            // did not take looks exactly like a proxy that cannot resolve anything,
+            // and the fallback below would paper over it by rewriting a file the
+            // resolver may not even be reading.
+            match resolvectl_dns_for(interface) {
+                Some(servers) if servers.iter().any(|server| server == dns_ip) => {
+                    tracing::info!("resolvectl set DNS for {}: {}", interface, dns_ip);
+                    return Ok(());
+                }
+                Some(servers) => tracing::warn!(
+                    "resolvectl dns {} {} exited 0 but the link has {:?}",
+                    interface,
+                    dns_ip,
+                    servers
+                ),
+                None => tracing::warn!(
+                    "could not read back the DNS resolvectl set on {}",
+                    interface
+                ),
+            }
+        }
+        Ok(output) => tracing::warn!(
+            "resolvectl dns {} {}: {}",
+            interface,
+            dns_ip,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(_) => {
+            tracing::debug!("resolvectl is not available; falling back to writing /etc/resolv.conf")
         }
     }
 
-    // Fallback: back up and overwrite /etc/resolv.conf
-    let _ = std::fs::copy("/etc/resolv.conf", RESOLV_CONF_BACKUP);
+    // Fallback: back up and overwrite /etc/resolv.conf. The copy is the only record
+    // of what the machine used before — a hand-written resolver is not something
+    // NetworkManager hands out again on the next connection.
+    if let Err(e) = std::fs::copy("/etc/resolv.conf", RESOLV_CONF_BACKUP) {
+        tracing::warn!(
+            "could not back up /etc/resolv.conf to {}: {}",
+            RESOLV_CONF_BACKUP,
+            e
+        );
+    }
     std::fs::write("/etc/resolv.conf", format!("nameserver {}\n", dns_ip))
         .map_err(|e| anyhow::anyhow!("Failed to write /etc/resolv.conf: {}", e))?;
+
+    let written = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    if !resolv_conf_nameservers(&written)
+        .iter()
+        .any(|server| server == dns_ip)
+    {
+        anyhow::bail!(
+            "/etc/resolv.conf does not name {} — DNS hijack is NOT in effect",
+            dns_ip
+        );
+    }
     tracing::info!("Wrote /etc/resolv.conf with nameserver {}", dns_ip);
     Ok(())
 }
@@ -432,16 +488,232 @@ fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn restore_system_dns_linux(interface: &str, _dns_ip: &str) -> Result<()> {
     // Prefer reverting via resolvectl
-    let _ = Command::new("resolvectl")
+    match Command::new("resolvectl")
         .args(["revert", interface])
-        .output();
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!("resolvectl reverted the DNS of {}", interface)
+        }
+        Ok(output) => tracing::warn!(
+            "resolvectl revert {}: {}",
+            interface,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(_) => tracing::debug!("resolvectl is not available; nothing to revert"),
+    }
 
     // Restore from the resolv.conf backup if it exists
-    if let Ok(backup) = std::fs::read(RESOLV_CONF_BACKUP) {
-        let _ = std::fs::write("/etc/resolv.conf", backup);
-        let _ = std::fs::remove_file(RESOLV_CONF_BACKUP);
+    match std::fs::read(RESOLV_CONF_BACKUP) {
+        Ok(backup) => match std::fs::write("/etc/resolv.conf", backup) {
+            Ok(()) => {
+                tracing::info!("Restored /etc/resolv.conf from {}", RESOLV_CONF_BACKUP);
+                // Spent: a later hijack has to record its own starting point.
+                let _ = std::fs::remove_file(RESOLV_CONF_BACKUP);
+            }
+            Err(e) => tracing::warn!(
+                "could not restore /etc/resolv.conf from {}: {}",
+                RESOLV_CONF_BACKUP,
+                e
+            ),
+        },
+        Err(_) => tracing::debug!("no {} to restore /etc/resolv.conf from", RESOLV_CONF_BACKUP),
+    }
+
+    // The hijack's whole point is that the machine no longer resolves against its
+    // address. One that still does is a machine left without name resolution after a
+    // disconnect, so it is reported instead of being assumed away.
+    let left_behind =
+        resolv_conf_nameservers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+            .into_iter()
+            .filter(|server| is_tun_dns_address(server))
+            .collect::<Vec<_>>();
+    if !left_behind.is_empty() {
+        anyhow::bail!(
+            "/etc/resolv.conf still names a TUN address after the restore: {}",
+            left_behind.join(", ")
+        );
     }
     Ok(())
+}
+
+/// Undoes what a run that never reached its restore left behind, in the two places
+/// a Linux hijack lives.
+///
+/// `resolvectl` state belongs to the resolved daemon, so a reboot clears it — but
+/// only a reboot does, and until then every query goes to a TUN address that this
+/// machine does not route any more. `/etc/resolv.conf` is a plain file, so nothing
+/// short of writing it back ever clears that one: NetworkManager rewrites it when
+/// the next connection comes up, and a machine that boots into the same connection
+/// keeps resolving against a dead address indefinitely.
+#[cfg(target_os = "linux")]
+fn cleanup_stale_hijack_linux() {
+    revert_stale_resolvectl_links();
+    restore_stale_resolv_conf();
+}
+
+/// Reverts every link systemd-resolved still points at a TUN address nothing holds.
+///
+/// Only the links that exist now are asked: a setting for a link that has since gone
+/// went with it, so what is left to revert is exactly what the machine is still
+/// using.
+#[cfg(target_os = "linux")]
+fn revert_stale_resolvectl_links() {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return;
+    };
+
+    for link in entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+    {
+        let Some(servers) = resolvectl_dns_for(&link) else {
+            continue;
+        };
+        let stale: Vec<String> = servers
+            .into_iter()
+            .filter(|server| is_tun_dns_address(server) && !address_is_held(server))
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        match Command::new("resolvectl").args(["revert", &link]).output() {
+            Ok(output) if output.status.success() => tracing::warn!(
+                "stale DNS hijack on {}: reverted {} to the resolver's own default",
+                link,
+                stale.join(", ")
+            ),
+            // Expected when this process is not root: the desktop only reaches TUN
+            // mode when it was launched elevated, and an unprivileged one cannot move
+            // the system resolver.
+            Ok(output) => tracing::warn!(
+                "could not revert the stale DNS of {}: {}",
+                link,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(_) => {
+                // No systemd-resolved here, so the per-link path was never the one
+                // that could have left something behind.
+                tracing::debug!("resolvectl is not available; skipping the per-link DNS check");
+                return;
+            }
+        }
+    }
+}
+
+/// Puts `/etc/resolv.conf` back when it still names a TUN address nothing holds.
+#[cfg(target_os = "linux")]
+fn restore_stale_resolv_conf() {
+    let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
+        return;
+    };
+    let stale: Vec<String> = resolv_conf_nameservers(&contents)
+        .into_iter()
+        .filter(|server| is_tun_dns_address(server) && !address_is_held(server))
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+
+    // What `set_system_dns` copied before it overwrote the file — the only record of
+    // a hand-picked resolver, and the reason the fallback copies rather than
+    // remembering: a machine can be told to use a DNS server that nothing else knows.
+    if let Ok(backup) = std::fs::read_to_string(RESOLV_CONF_BACKUP) {
+        match std::fs::write("/etc/resolv.conf", &backup) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(RESOLV_CONF_BACKUP);
+                tracing::warn!(
+                    "stale DNS hijack in /etc/resolv.conf: restored the file saved before it (was {})",
+                    stale.join(", ")
+                );
+                return;
+            }
+            Err(e) => tracing::warn!(
+                "could not restore /etc/resolv.conf from {}: {}",
+                RESOLV_CONF_BACKUP,
+                e
+            ),
+        }
+    }
+
+    // Nothing on file: drop the lines that are ours and keep everything else — a
+    // `search` domain, `options`, a real resolver listed next to ours. A file this
+    // code did not write is not this code's to rewrite wholesale.
+    let cleaned = resolv_conf_without_nameservers(&contents, &stale);
+    match std::fs::write("/etc/resolv.conf", &cleaned) {
+        Ok(()) => tracing::warn!(
+            "stale DNS hijack in /etc/resolv.conf: dropped {} with nothing on file to restore",
+            stale.join(", ")
+        ),
+        Err(e) => tracing::warn!(
+            "could not drop {} from /etc/resolv.conf: {}",
+            stale.join(", "),
+            e
+        ),
+    }
+}
+
+/// The DNS servers `resolvectl dns <link>` reports for a link.
+///
+/// `None` when the answer is not one this code understands — no resolved on this
+/// machine, a command that was refused, or output in a shape it has never seen.
+#[cfg(target_os = "linux")]
+fn resolvectl_dns_for(link: &str) -> Option<Vec<String>> {
+    let output = Command::new("resolvectl")
+        .args(["dns", link])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_resolvectl_dns(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The addresses in `resolvectl dns` output: `Link 2 (eth0): 198.18.0.254` or a bare
+/// list, depending on whether the command was given a link. Taking every token that
+/// reads as an address covers both without depending on how the line is punctuated,
+/// and no part of the `Link …` prefix can be mistaken for one.
+#[cfg(any(target_os = "linux", test))]
+fn parse_resolvectl_dns(output: &str) -> Vec<String> {
+    output
+        .split_whitespace()
+        .filter(|token| token.parse::<IpAddr>().is_ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `nameserver` addresses a resolv.conf names.
+#[cfg(any(target_os = "linux", test))]
+fn resolv_conf_nameservers(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next()? == "nameserver").then(|| parts.next().map(str::to_string))?
+        })
+        .collect()
+}
+
+/// `contents` with the `nameserver` lines naming one of `addresses` removed, and
+/// every other line kept exactly as it was.
+#[cfg(any(target_os = "linux", test))]
+fn resolv_conf_without_nameservers(contents: &str, addresses: &[String]) -> String {
+    let mut kept = String::with_capacity(contents.len());
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        let names_a_stale_server = parts.next() == Some("nameserver")
+            && parts
+                .next()
+                .is_some_and(|address| addresses.iter().any(|stale| stale == address));
+        if names_a_stale_server {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
 }
 
 // ============================================================
@@ -647,7 +919,7 @@ fn set_dns_servers(service: &str, servers: &[String]) -> Result<()> {
 /// never the whole /24 around it: `10.0.0.0/24` is both a candidate block and the
 /// subnet a great many home LANs sit in, so treating every address in it as ours
 /// would wipe the DNS of anyone whose router hands out 10.0.0.1.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_tun_dns_address(address: &str) -> bool {
     let Ok(ip) = address.parse::<Ipv4Addr>() else {
         return false;
@@ -662,7 +934,7 @@ fn is_tun_dns_address(address: &str) -> bool {
 /// What separates a stale hijack from a live one: the tunnel is gone before its
 /// restore ran, so its address is no longer bindable here, while a tunnel that is
 /// still up answers and must not be "cleaned up" from under it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn address_is_held(address: &str) -> bool {
     let Ok(ip) = address.parse::<Ipv4Addr>() else {
         return false;
@@ -761,6 +1033,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{is_tun_dns_address, parse_getdnsservers, parse_network_services, NO_DNS_SERVERS};
 
+    // The resolv.conf and resolvectl readers are pure, so they are compiled under
+    // `test` on every platform: the Linux code cannot be built or run here, and a
+    // parser for a file this code rewrites is not something to ship unexercised.
+    #[cfg(any(target_os = "linux", test))]
+    use super::{parse_resolvectl_dns, resolv_conf_nameservers, resolv_conf_without_nameservers};
 
     /// The legend `-listallnetworkservices` prints ahead of its list is not a service.
     /// Handing it to `-setdnsservers` anyway is where every startup's worth of
@@ -847,5 +1124,51 @@ mod tests {
 
         assert_eq!(read, backup);
         assert_eq!(read["Wi-Fi"], Vec::<String>::new());
+    }
+
+    /// A resolv.conf is more than its nameservers: `search` and `options` are part of
+    /// what the machine was told to do, and dropping the address this code put there
+    /// must not take them — or a real resolver listed next to it — with it.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn dropping_our_nameserver_keeps_the_rest_of_the_file() {
+        let contents = "# written by hand\n\
+                        search example.internal\n\
+                        nameserver 198.18.0.254\n\
+                        nameserver 8.8.8.8\n\
+                        options edns0\n";
+
+        assert_eq!(
+            resolv_conf_nameservers(contents),
+            vec!["198.18.0.254".to_string(), "8.8.8.8".to_string()]
+        );
+        assert_eq!(
+            resolv_conf_without_nameservers(contents, &["198.18.0.254".to_string()]),
+            "# written by hand\nsearch example.internal\nnameserver 8.8.8.8\noptions edns0\n"
+        );
+    }
+
+    /// `resolvectl dns` answers with a `Link …` prefix when asked about one link and
+    /// with a bare list when asked about all of them. Only the addresses matter, and
+    /// no part of that prefix reads as one — including the link index.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn resolvectl_dns_reads_as_addresses_in_either_shape() {
+        assert_eq!(
+            parse_resolvectl_dns("Link 2 (eth0): 198.18.0.254\n"),
+            vec!["198.18.0.254".to_string()]
+        );
+        assert_eq!(
+            parse_resolvectl_dns("Link 3 (wlan0): 8.8.8.8 1.1.1.1\n"),
+            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        );
+        assert_eq!(
+            parse_resolvectl_dns("198.18.0.254\n"),
+            vec!["198.18.0.254".to_string()]
+        );
+        assert_eq!(
+            parse_resolvectl_dns("Link 2 (eth0):\n"),
+            Vec::<String>::new()
+        );
     }
 }
