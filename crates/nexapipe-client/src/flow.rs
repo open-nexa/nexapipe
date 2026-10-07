@@ -366,8 +366,13 @@ mod tests {
     use super::*;
     use crate::traffic::{Flow, NodeTraffic};
 
-    fn node(seed: u8) -> EndpointId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    /// A node no test has seen before, which is all the tests ask of it.
+    ///
+    /// Generated rather than derived from a fixed seed: a seed committed to the tree is signing
+    /// key material anyone reading it can reconstruct, and nothing here needs the ids to be
+    /// stable across runs — only different from each other.
+    fn node() -> EndpointId {
+        iroh::SecretKey::generate().public()
     }
 
     fn meta(kind: FlowKind, target: &str) -> FlowMeta {
@@ -383,7 +388,7 @@ mod tests {
     #[test]
     fn an_open_flow_appears_in_the_view() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(1);
+        let backend = node();
 
         let flow = Flow::listed(
             Arc::new(NodeTraffic::new()),
@@ -407,7 +412,7 @@ mod tests {
     #[test]
     fn a_dropped_flow_leaves_the_view() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(1);
+        let backend = node();
 
         {
             let _flow = Flow::listed(
@@ -429,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn close_wakes_the_flow_and_leaves_it_open_until_it_goes() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(1);
+        let backend = node();
         let flow = Flow::listed(
             Arc::new(NodeTraffic::new()),
             &registry,
@@ -474,7 +479,7 @@ mod tests {
         let flow = Flow::listed(
             Arc::new(NodeTraffic::new()),
             &registry,
-            node(2),
+            node(),
             meta(FlowKind::Http, "a.example"),
         );
 
@@ -513,7 +518,7 @@ mod tests {
         let flow = Flow::listed(
             traffic.clone(),
             &registry,
-            node(9),
+            node(),
             meta(FlowKind::Http, "a.example"),
         );
 
@@ -538,7 +543,7 @@ mod tests {
     #[test]
     fn two_flows_are_counted_separately() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(3);
+        let backend = node();
 
         let one = Flow::listed(
             Arc::new(NodeTraffic::new()),
@@ -571,7 +576,7 @@ mod tests {
     #[test]
     fn ids_are_not_reused() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(4);
+        let backend = node();
 
         let first = Flow::listed(
             Arc::new(NodeTraffic::new()),
@@ -596,7 +601,7 @@ mod tests {
     #[test]
     fn the_view_is_capped_but_the_count_is_not() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(5);
+        let backend = node();
         let traffic = Arc::new(NodeTraffic::new());
 
         let flows: Vec<Flow> = (0..11)
@@ -621,8 +626,8 @@ mod tests {
     #[test]
     fn closing_a_node_leaves_other_nodes_flows_alone() {
         let registry = Arc::new(FlowRegistry::new());
-        let backend = node(6);
-        let other = node(7);
+        let backend = node();
+        let other = node();
 
         let _theirs = Flow::listed(
             Arc::new(NodeTraffic::new()),
@@ -666,7 +671,7 @@ mod tests {
         let _flow = Flow::listed(
             Arc::new(NodeTraffic::new()),
             &shared,
-            node(8),
+            node(),
             meta(FlowKind::TlsPassthrough, "c.example"),
         );
 
