@@ -1037,16 +1037,27 @@ fn wait_for_service_state_linux(expected: ServiceState, failure: &str) -> Result
 /// The launchd job definition.
 ///
 /// `ExitTimeOut` is how long launchd lets a job spend on SIGTERM before it sends SIGKILL.
-/// The default is 20s and the teardown is bounded by the same 20s
-/// (`TunProxy::stop_and_wait`), so a slow stop used to be killed right at the edge of
-/// finishing — taking the system-DNS restore with it. 30s leaves room.
+/// The default is only documented as "system-defined" and is shorter than the 20s the
+/// teardown allows itself (`TunProxy::stop_and_wait`) — 5s on this machine, read back from
+/// `launchctl print system/<label>`. A job without an explicit, longer one is therefore
+/// killed well before the system-DNS restore can finish. 30s leaves room.
+///
+/// `KeepAlive` asks to survive *failure*, not every exit. The plain `<true/>` form is the
+/// one that made a stop impossible: `launchctl stop` sends SIGTERM, the teardown answers
+/// it, the process leaves with 0, and launchd immediately brings it back — so the panel
+/// said "stopped" for about a second before its next poll. The dictionary form keeps the
+/// crash protection and nothing else; per `launchd.plist(5)`, `SuccessfulExit` false means
+/// the job restarts only when the exit status is *not* zero, which is also the condition
+/// Linux spells `Restart=on-failure`. It is deliberately the only key here: the conditions
+/// in a `KeepAlive` dictionary are OR'd, so a second one can restart the job for a reason
+/// nobody asked for.
 ///
 /// A plist already on disk keeps whatever it was installed with, so this only takes
 /// effect from the next install onwards.
 ///
-/// Kept out of the installer and compiled under `test` on every platform because that
-/// key is both easy to lose and invisible when lost: nothing fails, and a slow stop
-/// simply stops restoring the machine's DNS.
+/// Kept out of the installer and compiled under `test` on every platform because those
+/// keys are both easy to lose and invisible when lost: nothing fails, and a slow stop
+/// simply stops restoring the machine's DNS — or a stopped job simply comes back.
 #[cfg(any(target_os = "macos", test))]
 fn macos_plist_content(exe_path: &str) -> String {
     format!(
@@ -1064,7 +1075,10 @@ fn macos_plist_content(exe_path: &str) -> String {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ExitTimeOut</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
@@ -1078,6 +1092,30 @@ fn macos_plist_content(exe_path: &str) -> String {
     )
 }
 
+/// How the job is addressed in the modern `launchctl` subcommands — `system/<label>`, both to
+/// remove it and to ask what it is doing.
+#[cfg(any(target_os = "macos", test))]
+fn macos_job_target() -> String {
+    format!("system/com.nexa.{}", SERVICE_NAME)
+}
+
+/// The `launchctl` invocations an install needs, in the order it needs them.
+///
+/// `bootout` coming first is the whole point. launchd reads a job definition once, when it is
+/// told about the job, and neither `load` nor `kickstart` reads it again — so writing the plist
+/// over a job that is already registered changes nothing at all: the daemon keeps whatever it
+/// loaded last. That is how an upgrade stayed on its first-ever `KeepAlive` and never picked up
+/// `ExitTimeOut`. Taking the job out first is what makes the rest of the install mean anything,
+/// and it is safe to attempt unconditionally: on a machine that has nothing installed it simply
+/// fails, which is exactly the state a normal install starts from.
+#[cfg(any(target_os = "macos", test))]
+fn macos_install_commands(plist_path: &str) -> [Vec<String>; 2] {
+    [
+        vec!["bootout".into(), macos_job_target()],
+        vec!["bootstrap".into(), "system".into(), plist_path.into()],
+    ]
+}
+
 #[cfg(target_os = "macos")]
 fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     use std::fs::{self, File};
@@ -1085,10 +1123,21 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
     use std::path::Path;
     use std::process::Command;
 
-    let plist_content = macos_plist_content(exe_path);
-
     let plist_path =
         Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
+    let plist_content = macos_plist_content(exe_path);
+
+    let [bootout, bootstrap] = macos_install_commands(plist_path.to_str().unwrap_or_default());
+
+    // Taking the job out before the file is rewritten — see `macos_install_commands`. A
+    // failure just means there was nothing to remove, which is the ordinary case.
+    let _ = Command::new("launchctl").args(&bootout).output();
+
+    // `bootout` stops the job with SIGTERM, and the teardown that restores the system DNS is
+    // what answers it — see `uninstall_service_macos`, which waits for the same reason. This
+    // wait is also what makes the write safe: nothing races an incoming definition against a
+    // process that is still coming down from the old one.
+    wait_for_service_exit(|| !is_service_running_macos());
 
     fs::create_dir_all("/Library/LaunchDaemons")
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
@@ -1100,7 +1149,7 @@ fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
 
     let output = Command::new("launchctl")
-        .args(["load", plist_path.to_str().unwrap()])
+        .args(&bootstrap)
         .output()
         .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
 
@@ -1147,9 +1196,8 @@ fn is_service_running_macos() -> bool {
     // session queries the user's GUI domain and answers "Could not find service" (exit 1) even
     // while the daemon is running — which had the service panel show "stopped" forever.
     // `launchctl print system/<label>` is readable without root and names the state outright.
-    let label = format!("com.nexa.{}", SERVICE_NAME);
     let Ok(output) = Command::new("launchctl")
-        .args(["print", format!("system/{label}").as_str()])
+        .args(["print", &macos_job_target()])
         .output()
     else {
         return false;
@@ -1208,6 +1256,13 @@ fn stop_service_macos() -> Result<(), AppError> {
         .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
 
     if output.status.success() {
+        // `launchctl stop` only asks. The process still has to come down, and the teardown
+        // that restores the system DNS is what takes the time — the process is the only
+        // thing that can do it, so a stop reported before it has run leaves the machine
+        // resolving against a tunnel that is going away. Nothing waited here before: the
+        // job was `KeepAlive: true` (see `macos_plist_content`), so the process came
+        // straight back and no wait could ever have been satisfied.
+        wait_for_service_exit(|| !is_service_running_macos());
         Ok(())
     } else {
         Err(AppError::with_detail(
@@ -1219,11 +1274,12 @@ fn stop_service_macos() -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_plist_content, SERVICE_NAME};
+    use super::{macos_install_commands, macos_job_target, macos_plist_content, SERVICE_NAME};
 
-    /// launchd's own default for `ExitTimeOut` is 20s, which is also what the teardown
-    /// allows itself — so a job without an explicit, longer one gets SIGKILLed right
-    /// around the moment the system-DNS restore is finishing.
+    /// launchd's own default for `ExitTimeOut` is documented as no more than
+    /// "system-defined" and is shorter than the teardown allows itself — 5s on this
+    /// machine — so a job without an explicit, longer one gets SIGKILLed well before
+    /// the system-DNS restore can finish.
     #[test]
     fn the_job_is_allowed_longer_than_the_teardown_takes() {
         let plist = macos_plist_content("/Applications/Nexa.app/Contents/MacOS/nexa");
@@ -1240,6 +1296,61 @@ mod tests {
         assert!(
             seconds > 20,
             "an ExitTimeOut of {seconds}s leaves the teardown no room to restore the system DNS"
+        );
+    }
+
+    /// An install that only overwrote the plist installed nothing: launchd keeps running the
+    /// definition it read when the job was last presented to it, so the job has to come out
+    /// before the new file goes in.
+    #[test]
+    fn installing_presents_the_job_again_rather_than_only_the_file() {
+        let plist = "/Library/LaunchDaemons/com.nexa.nexa-service.plist";
+        let [removal, registration] = macos_install_commands(plist);
+
+        assert_eq!(
+            removal[0], "bootout",
+            "without taking the job out first, launchd never re-reads the rewritten file"
+        );
+        assert_eq!(removal[1], macos_job_target());
+
+        assert_eq!(registration[0], "bootstrap");
+        assert_eq!(registration[2], plist);
+    }
+
+    /// A job kept alive in the plain `<true/>` form is restarted after *every* exit —
+    /// including the one the user asked for. `launchctl stop` sends SIGTERM, the teardown
+    /// answers it and the process leaves with 0, and launchd brings it straight back: measured
+    /// at 60ms between the two log lines. Restarts-as-failure is what was wanted.
+    ///
+    /// `SuccessfulExit` false is that condition — "restart the job in the inverse [of
+    /// exit status zero]", per `launchd.plist(5)` — and it has to be alone in the
+    /// dictionary because the conditions there are OR'd: a second one would restart the
+    /// job again for a reason nobody asked for.
+    #[test]
+    fn the_job_survives_a_crash_without_surviving_a_stop() {
+        let plist = macos_plist_content("/Applications/Nexa.app/Contents/MacOS/nexa");
+
+        assert!(
+            !plist.contains("<key>KeepAlive</key>\n    <true/>"),
+            "an unconditional KeepAlive restarts the job after a deliberate stop too"
+        );
+
+        let keep_alive = plist
+            .split("<key>KeepAlive</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</dict>").next())
+            .expect("the job is kept alive by condition, not unconditionally");
+
+        let conditions = keep_alive.matches("<key>").count();
+        assert_eq!(
+            conditions, 1,
+            "{conditions} conditions are OR'd together; only restart-on-failure belongs here"
+        );
+
+        let successful_exit = keep_alive.contains("<key>SuccessfulExit</key>\n        <false/>");
+        assert!(
+            successful_exit,
+            "a clean exit is what a stop produces, so it must be the one that is not restarted"
         );
     }
 
