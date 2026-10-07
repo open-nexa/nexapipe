@@ -74,7 +74,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let runner = ServiceRunner::new();
+
+    // Unix: a service manager stops a job with SIGTERM, and handling it is what lets the
+    // teardown — the system-DNS restore — run at all. Windows has no equivalent on this
+    // path: `--foreground` there is a manual run, and a real stop arrives through the
+    // control manager instead (see `start_windows_service`).
+    #[cfg(unix)]
+    runner.run_until_signalled().await?;
+    #[cfg(not(unix))]
     runner.run().await?;
+
     Ok(())
 }
 

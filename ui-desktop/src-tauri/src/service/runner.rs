@@ -100,6 +100,44 @@ impl ServiceRunner {
         }
     }
 
+    /// Runs the IPC server until the process is asked to stop, then winds the proxy down.
+    ///
+    /// A service manager has exactly one way to stop a job: it sends SIGTERM. Leaving it
+    /// unhandled — which is what calling [`Self::run`] on its own amounts to — lets the
+    /// default disposition end the process where it stands, and the teardown that
+    /// restores the system DNS never runs. On macOS that setting lives in the system
+    /// configuration and survives the reboot; on Linux it is `/etc/resolv.conf`, a plain
+    /// file. So every one of uninstall, stop and machine shutdown used to leave the
+    /// machine resolving against a TUN address that nothing answers any more.
+    ///
+    /// SIGINT is handled the same way so a service started by hand — `--foreground`,
+    /// and `--daemon` before it detached — also comes down cleanly.
+    #[cfg(unix)]
+    pub async fn run_until_signalled(&self) -> Result<()> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // Registered before `run()` is polled: a signal that arrived during start-up
+        // would otherwise still end the process outright.
+        let mut terminate =
+            signal(SignalKind::terminate()).context("Failed to listen for SIGTERM")?;
+        let mut interrupt =
+            signal(SignalKind::interrupt()).context("Failed to listen for SIGINT")?;
+
+        tokio::select! {
+            result = self.run() => result,
+            _ = terminate.recv() => {
+                tracing::info!("SIGTERM received; stopping the proxy so the system DNS is restored");
+                self.shutdown().await;
+                Ok(())
+            }
+            _ = interrupt.recv() => {
+                tracing::info!("SIGINT received; stopping the proxy so the system DNS is restored");
+                self.shutdown().await;
+                Ok(())
+            }
+        }
+    }
+
     /// Winds the proxy down because the process itself is exiting.
     ///
     /// Not the same thing as answering [`IpcMessage::StopProxy`]: that leaves the service up and

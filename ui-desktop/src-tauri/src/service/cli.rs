@@ -93,7 +93,23 @@ fn run_service() -> anyhow::Result<()> {
         .build()
         .expect("failed to build tokio runtime");
 
-    runtime.block_on(ServiceRunner::new().run())
+    runtime.block_on(async {
+        let runner = ServiceRunner::new();
+
+        // Unix: a service manager stops a job with SIGTERM, and handling it is the only
+        // thing that lets the teardown — the system-DNS restore — run. Windows has no
+        // equivalent here: a stop reaches a service through the control manager, whose
+        // handler is registered by whichever entry point the SCM started, so this path
+        // simply serves until that handler ends the process.
+        #[cfg(unix)]
+        {
+            runner.run_until_signalled().await
+        }
+        #[cfg(not(unix))]
+        {
+            runner.run().await
+        }
+    })
 }
 
 /// Entry point used by the Windows service control manager (`--service`).
