@@ -478,16 +478,77 @@ fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: std::net::IpAddr) 
     response
 }
 
+/// A configured proxy domain reduced to the bare suffix it matches: no leading
+/// `*`, no leading or trailing dot, lower case.
+///
+/// Shared with the per-domain DNS hijack, which has to spell the same suffix in
+/// a place the operating system reads it — a file under `/etc/resolver`, a
+/// systemd-resolved routing domain. The two halves only work as long as they
+/// mean the same thing: a suffix this server matches but no resolver routes is
+/// a domain that silently is not proxied, and one a resolver routes but this
+/// server does not match is a domain the machine can no longer resolve at all.
+pub fn normalize_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_lowercase()
+}
+
+/// The configured domains as a per-domain hijack, or `None` when they cannot be
+/// written as one.
+///
+/// Such a hijack has to name every domain to the OS, so `None` is the answer for
+/// a configuration containing one that cannot be named — a bare `*`, which means
+/// every domain and is the global hijack this replaces, or a label with no dot,
+/// which is a hostname rather than a domain. It is also the answer for no
+/// domains at all, which is a proxy that resolves nothing and is left to behave
+/// exactly as it does today.
+///
+/// All or nothing, then: a hijack covering part of the configured domains would
+/// leave the rest unproxied and unreported, where a global hijack at least
+/// resolves them all.
+pub fn scoped_domains(proxy_domains: &[String]) -> Option<Vec<String>> {
+    if proxy_domains.is_empty() {
+        return None;
+    }
+    let mut scoped: Vec<String> = Vec::new();
+    for domain in proxy_domains {
+        let normalized = normalize_domain(domain);
+        if !is_scoped_domain(&normalized) {
+            return None;
+        }
+        if !scoped.contains(&normalized) {
+            scoped.push(normalized);
+        }
+    }
+    Some(scoped)
+}
+
+/// Whether a normalized suffix can be named to the OS as a domain of its own.
+///
+/// Kept to what a domain can contain, because on at least one platform the
+/// suffix becomes a path: `/etc/resolver/<domain>`. A name that could reach
+/// outside that directory is not a domain this machine ever had.
+fn is_scoped_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 /// Checks whether a domain should be proxied (DOMAIN-SUFFIX semantics):
 /// - `example.com` matches `example.com` and all of its subdomains (e.g. `fn.example.com`)
 /// - the `*.example.com` / `.example.com` spellings are accepted with the same meaning
 fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     let host_lower = host.to_lowercase();
     for domain in proxy_domains {
-        let domain_lower = domain
-            .trim_start_matches('*')
-            .trim_start_matches('.')
-            .to_lowercase();
+        let domain_lower = normalize_domain(domain);
         if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower)) {
             return true;
         }
@@ -646,5 +707,70 @@ mod tests {
     #[test]
     fn something_that_is_not_an_address_is_not_a_forwarding_target() {
         assert!(forwardable_resolvers(&["There aren't any".to_string()], &[], 2).is_empty());
+    }
+
+    /// The spellings a domain can be configured in all name the same suffix.
+    #[test]
+    fn the_wildcard_spellings_normalize_to_the_same_suffix() {
+        for spelling in [
+            "example.com",
+            "*.example.com",
+            ".example.com",
+            "EXAMPLE.com",
+            "example.com.",
+        ] {
+            assert_eq!(normalize_domain(spelling), "example.com");
+        }
+    }
+
+    /// The two halves of the hijack have to agree: whatever the resolver is told
+    /// to route is exactly what this server answers for, and vice versa.
+    #[test]
+    fn a_scoped_domain_is_the_same_suffix_the_server_matches() {
+        for spelling in ["example.com", "*.example.com", ".example.com"] {
+            assert!(should_proxy_domain(
+                "a.b.example.com",
+                &[spelling.to_string()]
+            ));
+            assert!(should_proxy_domain("example.com", &[spelling.to_string()]));
+            assert!(!should_proxy_domain(
+                "notexample.com",
+                &[spelling.to_string()]
+            ));
+        }
+    }
+
+    /// One domain the OS cannot be told about takes the whole configuration out
+    /// of the per-domain hijack. Splitting it would leave some domains unproxied
+    /// and unreported, which is worse than resolving all of them globally.
+    #[test]
+    fn one_domain_that_cannot_be_named_takes_the_whole_set_with_it() {
+        // A wildcard means every domain; a bare label is a hostname; and the
+        // slash is the one that matters most — on the platform that writes a
+        // file per domain, a suffix carrying one would reach outside that
+        // directory, and it has to be turned down by the characters it carries
+        // rather than by some other rule happening to catch it first.
+        for unusable in ["*", "", "localhost", "a..b", "bad/domain.com", "-"] {
+            assert_eq!(scoped_domains(&[unusable.to_string()]), None);
+        }
+        for unusable in ["*", "localhost", "bad/domain"] {
+            assert_eq!(
+                scoped_domains(&["example.com".to_string(), unusable.to_string()]),
+                None
+            );
+        }
+        assert_eq!(scoped_domains(&[]), None);
+    }
+
+    #[test]
+    fn scoped_domains_keep_the_suffixes_and_drop_the_repeats() {
+        assert_eq!(
+            scoped_domains(&[
+                "*.example.com".to_string(),
+                "EXAMPLE.com".to_string(),
+                "foo.io".to_string(),
+            ]),
+            Some(vec!["example.com".to_string(), "foo.io".to_string()])
+        );
     }
 }

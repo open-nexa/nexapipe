@@ -438,10 +438,19 @@ impl TunProxy {
             }
         };
 
-        // 4. Point system DNS at the virtual IP — only after the DNS server bound successfully
-        if let Err(e) = dns_config::set_system_dns(&interface, &dns_ip) {
-            tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
-        }
+        // 4. Point system DNS at the virtual IP — only after the DNS server bound
+        //    successfully. Scoped to the proxied domains where the OS can say so:
+        //    everything else on this machine — an internal zone, another tunnel's
+        //    names — then keeps resolving wherever it was resolving before.
+        let hijack =
+            dns_config::set_system_dns(&interface, &dns_ip, &self.config.dns.proxy_domains)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
+                    // Best effort: the teardown below still has to undo whatever
+                    // the attempt left in place, and the global places are the
+                    // ones a failed scoped attempt falls through to.
+                    dns_config::DnsHijack::Global
+                });
 
         // 5. Start the smoltcp stack over the device. Each AsyncRead/AsyncWrite call
         //    on the device carries exactly one IP packet; the stack demultiplexes TCP
@@ -512,7 +521,7 @@ impl TunProxy {
         // system DNS, stop the local DNS server, remove the routes — all while the
         // device (still held by the stack's pumps) keeps the interface alive — and
         // only then stop the stack, which drops the device and the adapter.
-        if let Err(e) = dns_config::restore_system_dns(&interface, &dns_ip) {
+        if let Err(e) = dns_config::restore_system_dns(&interface, &dns_ip, hijack) {
             tracing::warn!("Failed to restore system DNS: {}", e);
         }
         dns_stopped.store(true, Ordering::Release);
