@@ -14,6 +14,14 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ### Changed
 
+- **`/metrics` reports request latency as a histogram.**
+  `nexapipe_request_duration_ms_bucket{le="…"}` beside `_sum` and `_count`
+  replaces `nexapipe_request_duration_ms_total`, which carried the same sum
+  under a name a histogram cannot have: anything that divided it by
+  `nexapipe_requests_total` for a mean can read `_sum` the same way, and a
+  p99 no longer takes arithmetic. The boundaries are fixed at 1, 5, 10, 25,
+  50, 100, 250, 500, 1000, 2500, 5000 and 10000 milliseconds, plus `+Inf`.
+  A scrape looking for the old counter will not find it.
 - **The desktop credential door now stands in front of the whole Config page.**
   Confirming who is at the keyboard — Touch ID or the account password on macOS,
   Windows Hello or the account password on Windows, PAM on Linux — is what opens
