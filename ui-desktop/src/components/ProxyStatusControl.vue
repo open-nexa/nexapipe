@@ -302,6 +302,11 @@ async function copyNodeId(): Promise<void> {
 
 .proxy-status__ring.starting .proxy-status__dot {
   background: var(--accent);
+  /* Promoted to its own layer, for the same reason as the button spinner in
+     AppButton.vue: a dot whose scale and opacity are recalculated by the main
+     thread is the first thing to stall once the status poll re-renders the
+     panel around it, which leaves a starting indicator that sits still. */
+  will-change: transform, opacity;
   animation: proxy-status-pulse 1.5s ease-in-out infinite;
 }
 
@@ -314,6 +319,35 @@ async function copyNodeId(): Promise<void> {
   50% {
     transform: scale(1.2);
     opacity: 0.7;
+  }
+}
+
+/* What "still working" looks like when the surroundings must not move. Scaling
+   is the part Reduce Motion exists to suppress, so this swaps in a breath that
+   changes nothing but opacity: no size, no position, no reflow of the ring
+   around it, and still visibly doing something. */
+@keyframes proxy-status-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The blanket stop in base.css stills this dot too, leaving a starting proxy to
+   be told apart from a stuck one by reading the text next to it. What is kept
+   here is not information — "Starting" is already spelled out beside the ring —
+   but the difference between a dot that is working and one that has given up,
+   which is the same reason the button's spinner keeps turning. Only the name
+   changes; `!important` is what answers the `!important` on the universal rule,
+   and the scoped selector is what outranks it. */
+@media (prefers-reduced-motion: reduce) {
+  .proxy-status__ring.starting .proxy-status__dot {
+    animation-name: proxy-status-breathe !important;
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 

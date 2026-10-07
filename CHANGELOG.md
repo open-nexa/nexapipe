@@ -67,13 +67,17 @@ For what comes next, and for why some things are deliberately not planned, see
   asynchronous API and then a selection with the legacy command. A value that
   never arrived also stopped being reported as a clipboard failure, which sent
   the user looking at the wrong thing.
-- **The loading spinner never turned on a Mac with Reduce Motion on.** The
+- **The connecting spinner never turned on a Mac with Reduce Motion on.** The
   accessibility rule that stills every animation flattened it along with
   everything ornamental, and a spinner that does not turn is a button that
-  looks dead. A spinner is the state rather than decoration — there is no other
-  way to say "working" — so it is exempt from the stop now. The pulse next to
-  the proxy's status is not: the status text already says "Starting", so that
-  one is decoration and still respects the setting.
+  looks dead. Both indicators of "still working" answer it now — the button's
+  spinner keeps turning, and the dot inside the connecting ring keeps moving —
+  but not in the same way: scaling is the part the setting exists to suppress,
+  so with Reduce Motion on the dot only breathes, changing nothing but its
+  opacity. It still has to be seen to move, because a dot that stops leaves a
+  proxy that is still starting indistinguishable from one that has given up,
+  and "Starting" beside it is an assertion rather than a sign of life.
+  Everything purely ornamental still respects the setting.
 - **macOS ran the window with a title bar of its own on top of the app's.** The
   macOS build asked for native decorations without the title bar style that makes
   them transparent, so the system's bar sat above the one the app draws — two
