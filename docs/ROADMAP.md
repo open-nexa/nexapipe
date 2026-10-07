@@ -49,12 +49,13 @@ The gap is not architectural, it is maturity:
 
 - Identity is one shared TOTP secret per client, so revoking one device means
   rotating every device using that client.
-- Platform coverage has real holes: no IPv6 inside the TUN, a single Android
-  ABI. (The desktop TUN does UDP; this list used to claim it did not. See
-  [4.5](#45-protocols-and-transport-p1p2).)
-- Release hygiene is thin: `CHANGELOG.md` arrived with v0.3.0, but there is
-  still no published container image (the Dockerfiles build locally only), no
-  package manager distribution, and no documented way to run your own relay.
+- Platform coverage has closed both of its holes: IPv6 inside the TUN and a
+  second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
+  list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
+- Release hygiene is thinner than the rest: `CHANGELOG.md` arrived with v0.3.0,
+  and a published container image and a documented self-hosted relay came with
+  v0.5.0. What is still missing is a package manager — nothing in Homebrew,
+  winget or scoop.
 
 Until those are addressed, "you do not need to rent a server" is a claim that
 benefits a narrow audience, because the fallback path (relay) is undocumented
@@ -187,14 +188,18 @@ What follows is what is *missing*, i.e. capability work.
 |---|---|---|
 | C3 | **Still open.** HTTP/1.1 only towards backends: the client is `legacy::Client<HttpConnector>` with only `http1_*` configuration, `https://` backends are rejected at load time, and there is no retry and no circuit breaking. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`, each optional and defaulted to the constant it replaced. | `http/mod.rs:13-32` |
 | C4 | **Partly closed in v0.4.0.** `least_conn` exists, and an all-unhealthy pool now refuses instead of falling back to the first — except a pool of one, which is still handed out because there is nothing to choose between. Still open: no retry, no circuit breaking, and `least_conn` counts requests rather than sockets (see the note at `http::proxy_request`). | `lb/mod.rs` |
-| C7 | **Narrower than it read.** `passthrough`, `tcp` and `udp` routes are never probed, but a route serving `http` *and* another mode shares one pool, so the other modes do inherit its health — and in v0.4.0 they answer `BackendFailed` / hang up when it is empty. What is missing is a probe for the modes that cannot answer `GET /health`. | `proxy/mod.rs:58-65` |
+| C7 | **Closed in v0.5.0, apart from the one mode that cannot be.** A route serving `http` *and* another mode shares one pool, so the other modes always did inherit its health — and since v0.4.0 they answer `BackendFailed` / hang up when it is empty. `passthrough` and `tcp` routes are probed now, by connecting to them: a TLS backend by completing its handshake, which says a process is listening and nothing about whether it works. A `udp`-only route is still not probed, because there is nothing to connect to and a probe that invented a datagram would report an answer no backend gave. | `health/mod.rs` |
 
 ### 4.2 Observability beyond the access log (P1)
 
 The access log now covers every path, and `/metrics`, `/healthz`, a request ID
-and a span per request cover the instance: see R7. What is still missing is an
-OpenTelemetry exporter, and a desktop UI that shows no traffic, latency or
-per-node health view.
+and a span per request cover the instance: see R7. v0.5.0 added the two things a
+dashboard reads: `/metrics` carries `nexapipe_traffic_bytes_total` for what this
+instance has served and accepted, and the desktop lists, per node, whether it
+answered its last probe and how much it has carried. What is still missing is an
+OpenTelemetry exporter, and latency — `/metrics` sums the milliseconds spent
+answering requests but carries no buckets, and neither client shows how long a
+request took.
 
 ### 4.3 Identity and authorization (P1)
 
@@ -216,27 +221,39 @@ with TOTP as a human second factor rather than the device identity itself.
   or generating an invite from the CLI. Writes wait on R5's identity model.
 - Hot reload rules are one table in both READMEs as of v0.3.0, including what
   needs a restart. What is still uneven is enforcement, not documentation.
-- Distribution is download-only: GitHub release archives, a signed APK and
-  desktop bundles. No container image publication, no systemd unit in the docs,
-  no Homebrew / winget / scoop packages, no documented self-hosted relay.
-- Engineering hygiene: `CHANGELOG.md` exists as of v0.3.0; the test suite runs
-  on Linux and macOS runners, while Windows is `cargo check` only; the Android
-  lint baseline still pins 32 historical findings; no fuzzing, no benchmarks;
-  the vendored smoltcp patch needs long-term tracking.
+- Distribution stopped being download-only in v0.5.0: a container image is
+  published to GHCR with the release archives, and `docs/self-hosted-relay.md`
+  takes a relay from nothing to running. Still missing: a systemd unit in the
+  docs, and any of Homebrew / winget / scoop. See R6.
+- Engineering hygiene: `CHANGELOG.md` exists as of v0.3.0; tests run on Linux
+  and macOS; the root workspace is compiled on Windows as of v0.5.0, which it
+  never was before — the desktop crate had a Windows job, and it is `cargo
+  check` only; the Android lint baseline still pins 32 historical findings; no
+  fuzzing, no benchmarks; the vendored smoltcp patch needs long-term tracking.
 
 ### 4.5 Protocols and transport (P1/P2)
 
-- **No IPv6 inside the TUN**: AAAA queries are answered empty (`ANCOUNT=0`).
-  `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`
+- **IPv6 inside the TUN shipped in v0.4.0** — R10, on both clients. An AAAA
+  query in the Internet class now gets a real answer, 16 bytes of RDATA out of
+  a virtual pool (`crates/nexapipe-client/src/tun_proxy.rs:1324-1340`,
+  `:1472-1475`). Android routes `fd00:10:0:1::/64` into the TUN and always has
+  a pool (`:135-146`, `:430-438`). The desktop is best effort: `configure_ipv6`
+  has to set the address per platform and may be refused, and when it is, AAAA
+  is answered with nothing — which a resolver reads as "use A", not as an
+  address no route leads to
+  (`ui-desktop/src-tauri/src/proxy/tun_proxy.rs:307-337`).
 - **The desktop TUN does UDP** — one `l4::open_udp` bi-stream per flow, through
   the same smoltcp stack the Android client runs
   (`ui-desktop/src-tauri/src/proxy/tun_proxy.rs`). This list used to claim
   otherwise and was wrong. The local proxy, which is the `--local-proxy` mode
   rather than the TUN, still speaks `CONNECT` only — a different path, and not
-  the same gap. What is actually missing here is IPv6, above, which makes R10
-  smaller than this section once made it look.
-- The iroh endpoint binds `0.0.0.0` unconditionally; there is no IPv6 knob.
-  `proxy/mod.rs:220`
+  the same gap.
+- The iroh endpoint binds `0.0.0.0` on the configured port, and `[::]` beside
+  it when `[iroh] bind_ipv6` is set — a second socket rather than a
+  replacement, and one that is allowed to fail so a host without IPv6 still
+  starts. Both need `bind_port`: without a fixed port there is nothing to keep
+  the two families on, and the flag is ignored
+  (`crates/nexapipe/src/config.rs:101`, `proxy/mod.rs:326-345`).
 
 The iroh dependency boundaries used to belong on this list — discovery via
 `dns.iroh.link`, far-side n0 relays. They are documented in
@@ -245,18 +262,27 @@ not the absence of a description of it.
 
 ### 4.6 Client resilience (P1)
 
-No background reconnect loop, no node health probing, and dead nodes are never
-removed from rotation (`endpoint_group.rs` keeps no health state). Multi-node
-failover is request-level only: drop the stale connection and retry three times
-— `open_stream_with_retry` at `local_proxy.rs:473`, `OPEN_ATTEMPTS = 3` at
-`:119`, each attempt bounded by `[timeouts] connect_secs`. Health is consulted
-exactly once, before anything starts: `endpoint_group.rs:577-679`
-`preconnect_report` decides whether startup succeeded and is never asked again.
+Health is probed every 30 s and, as of v0.5.0, it is read: which node the next
+request goes to is decided by who answered last, and a node that could not be
+dialled is marked down where the request noticed rather than waiting for the
+next probe to find out. Failover is still request-level — drop the stale
+connection and retry three times, `open_stream_with_retry` at
+`local_proxy.rs:473`, `OPEN_ATTEMPTS = 3` at `:119`, each attempt bounded by
+`[timeouts] connect_secs` — and `preconnect_report` still decides only whether
+startup succeeded.
 
-*Not started as of v0.4.0* — R9, and the item this phase drops first. The
-structural cost is that `EndpointGroup` has no interior mutability
-(`endpoint_group.rs:106-109`), so nothing can add or remove a node while it is
-in use.
+**R9 shipped in v0.5.0, by a narrower route than this section proposed.** It
+asked for dead nodes to be *removed* from rotation, which needs `EndpointGroup`
+to have interior mutability (`endpoint_group.rs:106-109`) and so changes the
+ownership of all nine places that hold an `Arc` of it. Choosing among the nodes
+that are up gets the same behaviour for the cost of a signature: `select` takes
+one flag per candidate and answers `Option<usize>`, so "none of them" is a
+distinguishable answer for the first time — index `0` was always a working
+answer to "which backend". A single backend that is down is still dialled,
+because refusing to dial the only node turns "down" into "no service at all" for
+a deployment with nothing to fail over to. The group is still not mutable, so
+what this bought is selection, not removal: a node that is down keeps its slot
+in the list and is skipped.
 
 ### 4.7 Client-side credential protection (P0)
 
@@ -456,6 +482,10 @@ contributed iOS client would be accepted and clearly marked community-maintained
   That is the half that did not ship, and the reason is structural rather than
   a matter of time. The results are also **not** exposed through the R7 metrics:
   those are the server's, and the client has no metrics module of its own.
+  **The second half shipped in v0.5.0**, by the narrower route in
+  [4.6](#46-client-resilience-p1); the results are now read by whoever picks the
+  next node, and the desktop shows them. The client still has no metrics module —
+  its counters are read over IPC, not scraped.
 
 One more thing landed in v0.4.0 that is not one of the five: the desktop half of
 **R14**, which came here from Phase 0 (§4.7, C8 and C9). It is counted
@@ -468,10 +498,37 @@ and **shipped in v0.4.0**, though it has only been verified by unit tests and
 on macOS by hand, since CI has no routable IPv6 — and no desktop surface renders
 a full credential without the operating system having authenticated the user
 first, which is the half of R14 that came here from Phase 0 and **shipped in
-v0.4.0**. The one thing still open from this phase is the second half of R9
-above.
+v0.4.0**. The second half of R9 above shipped in v0.5.0, so this phase is
+closed.
 
-### Phase 2 — v1.0, "reachable without our client" (exploratory)
+### Phase 2 — v0.5.0, "observable"
+
+No deliverable was opened for this release. It is what the sections above had
+left standing, and the one thing Phase 1 handed over half-done:
+
+| ID | What it was | Notes |
+|---|---|---|
+| R9 | **Client resilience, the second half** | Health decides which node the next request goes to, and a node that could not be dialled is marked down by the request that found out rather than by the probe thirty seconds later. `select` answers `Option<usize>`, so "none of them" is sayable for the first time. The group is still not mutable, so a down node is skipped rather than removed. See [4.6](#46-client-resilience-p1) |
+| C7 | **A probe for the backends that cannot answer `GET /health`** | `passthrough` and `tcp` routes are probed by connecting, a TLS backend by completing its handshake. A `udp`-only route is deliberately still unprobed. See [4.1](#41-backend-handling-p2) |
+| — | **Traffic you can see** | The client counts what each node carried, the desktop shows it per node, the Android notification shows live rates, and the server's `/metrics` gained `nexapipe_traffic_bytes_total`. The number is tunnel payload: no headers, nothing discarded, and nothing counted twice — the TUN interface pump is deliberately not instrumented. See [4.2](#42-observability-beyond-the-access-log-p1) |
+| R6 | **Distribution, two of its four parts** | A container image published to GHCR with the release archives, and a self-hosted relay documented end to end. Still open: a systemd unit in the docs, and any of Homebrew, winget and scoop. See [4.4](#44-operations-and-distribution-p1) |
+| — | **The root workspace compiles on Windows** | It had no Windows job at all, so `crates/*` had never been built for `x86_64-pc-windows-msvc` outside a release tag. Check only, no tests: the integration tests spawn the binary and reach for `cfg(unix)` fixtures. See [4.4](#44-operations-and-distribution-p1) |
+
+The desktop credential door is not one of these either, though it ships in the
+same release: it is the rest of R14 — the whole Config page, rather than the two
+commands that could answer with a whole value — so it belongs to the phase that
+opened R14, not to this one.
+
+**Done when:** a node that stops answering stops receiving requests without
+waiting for the next probe; an operator can say how much an instance carried
+without reading the access log; and a newcomer brings up their own relay from
+the docs without asking anyone. The first two are shipped. The relay page is
+written but has not been followed end to end on a machine that had nothing on it
+— which is the one claim here nobody has tested. Nor has the Android
+notification been watched running on a device: its rates are verified by unit
+tests and by compilation only.
+
+### Phase 3 — v1.0, "reachable without our client" (exploratory)
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -493,12 +550,20 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
       R9 resilience ── R15 DNS cache ──┬── R10 transport ── R11 Android ABI ──► v0.4.0
                                        └── R12 backends ──────────────────────►
                                               │
+                                              ├── R9 second half ─────────────► v0.5.0
+                                              ├── C7 probe ───────────────────► v0.5.0
+                                              ├── R6 image + relay docs ──────► v0.5.0
+                                              ├── R7 byte counters ──────────► v0.5.0
+                                              │
                               R13 edge (after validation) ──► v1.0
 ```
 
 Of that row, R15, R12, R10 and R11 shipped in v0.4.0. R9 shipped its probing
-half; the half that removes a dead backend from rotation did not, and stays
-here for the next release. See the progress note under Phase 1.
+half there and its selection half in v0.5.0 — see the progress note under
+Phase 1 and the table under [Phase 2](#phase-2--v050-observable). R6 is half
+done: the image and the relay docs landed, the systemd unit and the package
+managers did not. R13 keeps its id and its gate; what moved is the phase number
+above it, because v0.5.0 took the number this one used to have.
 
 ---
 
@@ -540,12 +605,12 @@ side by side. The three fixed defects are recorded in
 |---|---|
 | HTTP/1.1-only backend client | `crates/nexapipe/src/http/mod.rs:13-32` |
 | Load balancing strategies and fallback | `crates/nexapipe/src/lb/mod.rs:6-9,83-90` |
-| Health checks skipped for three route modes | `crates/nexapipe/src/proxy/mod.rs:58-65` |
-| No IPv6 in the TUN | `crates/nexapipe-client/src/tun_proxy.rs:1178-1180` |
+| Health checks skipped for three route modes | *closed in v0.5.0, apart from the one mode that cannot be.* Was "`passthrough`, `tcp` and `udp` routes are never probed" at `crates/nexapipe/src/proxy/mod.rs:58-65`. Now `passthrough` and `tcp` routes get a TCP connect probe — liveness rather than health, and a TLS listener is hung up on mid-handshake — while a `udp`-only route is deliberately left unprobed, because inventing a datagram would report an answer no backend gave (`crates/nexapipe/src/health/mod.rs:30-47`, `:193-197`). |
+| No IPv6 in the TUN | *closed in v0.4.0.* Was "AAAA queries are answered empty (`ANCOUNT=0`)" at `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`. Now an AAAA query in the Internet class gets a 16-byte answer out of a virtual pool (`:1324-1340`, `:1472-1475`), on both clients; the desktop's pool is best effort, since `configure_ipv6` may be refused per platform. |
 | Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
 | Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. The same release added what R7 asked for beside the gauges: a request ID per request (`log::next_request_id`, on the access line and as `x-request-id`) and a span around each one. |
-| CHANGELOG, image publication | *half closed in v0.3.0.* `CHANGELOG.md` exists at the repository root; image publication does not, and `.github/workflows/release.yml` still produces archives, desktop bundles and the APK only. |
+| CHANGELOG, image publication | *closed in v0.5.0.* `CHANGELOG.md` has been at the repository root since v0.3.0; the image half lands with this release, where `build-image` pushes one leg per architecture by digest and `publish-image` merges them into a single multi-arch manifest under `ghcr.io/open-nexa/nexapipe` — `:latest` only for a tag with no prerelease suffix (`.github/workflows/release.yml:1018`, `:1097`). |
 | iroh version and boundary conditions | `Cargo.toml:38` asks for `^1.0.1` and `Cargo.lock` resolves 1.2.0 — a caret range, not the pin an earlier note here claimed. The boundaries themselves are documented in `docs/iroh-boundaries.md`, linked from the `[iroh]` section of both READMEs. |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
