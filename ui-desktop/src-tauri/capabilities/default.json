@@ -28,6 +28,7 @@
     "allow-get-logs",
     "allow-get-node-health",
     "allow-get-node-id-display",
+    "allow-get-node-traffic",
     "allow-get-proxy-status",
     "allow-get-service-status",
     "allow-get-startup-error",

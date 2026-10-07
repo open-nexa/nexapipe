@@ -87,6 +87,11 @@
     "hours": "{count}h",
     "days": "{count}d"
   },
+  "traffic": {
+    "sent": "Sent",
+    "received": "Received",
+    "flows": "{count} flows"
+  },
   "connect": {
     "title": "Connect",
     "started": "Proxy started",

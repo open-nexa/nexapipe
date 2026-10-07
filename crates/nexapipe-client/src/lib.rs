@@ -10,6 +10,7 @@ pub mod http;
 pub mod lb;
 pub mod provisioning;
 pub mod relay;
+pub mod traffic;
 pub mod transport;
 
 // L4 tunnel: TCP and UDP to a server route's backend. Shares the local proxy's

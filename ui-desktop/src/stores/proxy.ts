@@ -21,6 +21,7 @@ import type {
   LinkKind,
   NodeConfig,
   NodeHealth,
+  NodeTraffic,
   ProxyMode,
   ProxyStatus,
 } from '../types';
@@ -86,6 +87,17 @@ const endpointLinks = ref<EndpointLink[]>([]);
 const nodeHealth = ref<NodeHealth[]>([]);
 
 /**
+ * What each node has carried since the counters started, filled in from the Rust side while the
+ * proxy is up. Empty whenever nothing is running: the counters reset with the proxy, so keeping
+ * the last reading around would present this session's figures as though they were the previous
+ * one's.
+ *
+ * A node that is *absent* from this list is not a node at zero — it is one nothing has been handed
+ * a connection for, and it is drawn without figures rather than with a `0 B`. See `trafficFor`.
+ */
+const nodeTraffic = ref<NodeTraffic[]>([]);
+
+/**
  * Set when the last few status reads failed, so the UI can admit the numbers on screen may be
  * out of date rather than presenting them with the same confidence as a live reading.
  */
@@ -117,6 +129,9 @@ async function refresh(): Promise<boolean> {
     // changed — which is what left the main thread too busy to keep a spinner
     // turning. `running` and `mode` are the whole of `ProxyStatus`.
     if (result.running !== status.value.running || result.mode !== status.value.mode) {
+      // Bumped on the transition, not on every answer: starting and stopping are the moments a
+      // reply about the previous run can still be on its way. See `session`.
+      if (result.running !== status.value.running) session += 1;
       status.value = result;
     }
     if (result.running) {
@@ -127,6 +142,7 @@ async function refresh(): Promise<boolean> {
       nodeId.value = '';
       if (endpointLinks.value.length > 0) endpointLinks.value = [];
       if (nodeHealth.value.length > 0) nodeHealth.value = [];
+      if (nodeTraffic.value.length > 0) nodeTraffic.value = [];
     }
     return true;
   } catch (error) {
@@ -161,13 +177,38 @@ async function refreshEndpointLinks(): Promise<void> {
  * and a failure here must never become an error over an otherwise healthy proxy.
  */
 async function refreshNodeHealth(): Promise<void> {
+  const asked = session;
   try {
-    nodeHealth.value = await invoke<NodeHealth[]>('get_node_health', {
+    const health = await invoke<NodeHealth[]>('get_node_health', {
       useService: config.useService,
     });
+    if (asked !== session) return;
+    nodeHealth.value = health;
   } catch (error) {
     console.debug('[proxy] node health unavailable:', error);
+    if (asked !== session) return;
     nodeHealth.value = [];
+  }
+}
+
+/**
+ * Reads what every node has carried.
+ *
+ * Infallible for the same reason the links are: an empty answer means "nothing has moved yet",
+ * and a failure here must never become an error over an otherwise healthy proxy.
+ */
+async function refreshNodeTraffic(): Promise<void> {
+  const asked = session;
+  try {
+    const traffic = await invoke<NodeTraffic[]>('get_node_traffic', {
+      useService: config.useService,
+    });
+    if (asked !== session) return;
+    nodeTraffic.value = traffic;
+  } catch (error) {
+    console.debug('[proxy] node traffic unavailable:', error);
+    if (asked !== session) return;
+    nodeTraffic.value = [];
   }
 }
 
@@ -194,6 +235,26 @@ function healthFor(node: NodeConfig): NodeHealth | null {
   const connection = node.connectionType === 'ticket' ? node.ticket : node.endpointId;
   if (!connection) return null;
   return nodeHealth.value.find((health) => health.connection === connection) ?? null;
+}
+
+/**
+ * What one node has carried, or `null` when the backend has said nothing about it.
+ *
+ * `null` covers three cases that look identical here and are worth keeping distinct in prose:
+ * nothing is running, the node has not been handed a connection yet, and the last poll failed. In
+ * every one of them the honest thing to draw is no figures at all, not a row of zeroes.
+ *
+ * Keyed on the connection string, the same key `linkKindFor` and `healthFor` look their own
+ * answers up by.
+ *
+ * Nothing here subtracts one reading from another: the counters are cumulative and reset when the
+ * proxy restarts, so a figure that came back lower is simply a new count from zero — which is why
+ * the page prints totals and never a difference.
+ */
+function trafficFor(node: NodeConfig): NodeTraffic | null {
+  const connection = node.connectionType === 'ticket' ? node.ticket : node.endpointId;
+  if (!connection) return null;
+  return nodeTraffic.value.find((traffic) => traffic.connection === connection) ?? null;
 }
 
 async function refreshNodeId(): Promise<void> {
@@ -302,11 +363,13 @@ async function start(): Promise<void> {
     });
 
     await waitForStart();
-    // A fresh session means fresh paths: read them now instead of waiting out the poll, which
-    // otherwise leaves the link badges empty for the first few seconds after every start.
+    // A fresh session means fresh paths, and fresh counters: read them now instead of waiting out
+    // the poll, which otherwise leaves the link badges empty for the first few seconds after every
+    // start.
     if (status.value.running) {
       await refreshEndpointLinks();
       await refreshNodeHealth();
+      await refreshNodeTraffic();
     }
 
     if (!status.value.running) {
@@ -449,6 +512,21 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let servicePollTimer: ReturnType<typeof setTimeout> | null = null;
 let inFlight = false;
 let consecutiveFailures = 0;
+/**
+ * Which run of the proxy the numbers below describe.
+ *
+ * Bumped whenever the proxy starts or stops. Every read takes the value it had when it asked and
+ * drops the answer if it has moved since, because a request that was already in flight when `stop()`
+ * ran comes back with the totals from before it — and writing those back was how a stopped session
+ * kept reporting traffic: `stopped` clears the counters, the reply lands a moment later and
+ * refills them, and the dashboard shows bytes moving across a tunnel that is down until some later
+ * poll happens to clear them again. Starting is the same argument in the other direction: whatever
+ * a previous session was carrying is not this session's history.
+ *
+ * Not a lock and not an abort: the request still completes, because cancelling an `invoke` is not
+ * something this layer can do. What is refused is writing its answer.
+ */
+let session = 0;
 
 function nextInterval(): number {
   if (consecutiveFailures >= FAILURES_BEFORE_BACKOFF) return POLL_BACKOFF_MS;
@@ -466,6 +544,7 @@ async function pollOnce(): Promise<void> {
     if (status.value.running) {
       await refreshEndpointLinks();
       await refreshNodeHealth();
+      await refreshNodeTraffic();
     }
   } finally {
     inFlight = false;
@@ -537,10 +616,12 @@ export function useProxyStore() {
     startupError,
     serviceRunning,
     serviceInstalled,
-    /** What each node's traffic is actually doing right now. */
+    /** How each node is currently reaching its backend. */
     endpointLinks,
     /** Whether each node answered its last probe. */
     nodeHealth,
+    /** What each node has carried since the counters started. */
+    nodeTraffic,
     /** The mode the last start asked for; compared against what actually runs. */
     requestedMode,
     /** True when the status could not be read for a while; the panel says so out loud. */
@@ -557,6 +638,7 @@ export function useProxyStore() {
     setUseTun,
     linkKindFor,
     healthFor,
+    trafficFor,
     startPolling,
     stopPolling,
   };

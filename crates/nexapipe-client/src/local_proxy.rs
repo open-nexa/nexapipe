@@ -561,10 +561,6 @@ pub(crate) async fn open_stream_with_retry(
     // reading left, and it is the reading the next request needs: continuing to
     // hand out these backends would spend another three attempts each on
     // connections nobody asked for. The next successful probe clears it.
-    //
-    // Every failure exit above says the same thing before it returns, which is
-    // what makes this one line the loop's only failure path rather than the
-    // exit it happens to reach most often.
     endpoint_group.record_request_failures(&tried);
 
     Err(last_err.unwrap_or_else(|| {
@@ -756,6 +752,13 @@ where
                 }
             };
 
+        // One tunnel is one flow for as long as this handler lives, however it
+        // ends: EOF, either direction failing, or this task being cancelled
+        // because the proxy stopped.
+        let _flow = pooled_conn.enter_flow();
+        let count_to_backend = pooled_conn.clone();
+        let count_from_backend = pooled_conn.clone();
+
         let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -775,6 +778,7 @@ where
                             tracing::debug!("Tunnel client_to_iroh write error: {}", e);
                             break;
                         }
+                        count_to_backend.record_sent(n as u64);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing")]
@@ -801,6 +805,7 @@ where
                             tracing::debug!("Tunnel iroh_to_client flush error: {}", e);
                             break;
                         }
+                        count_from_backend.record_received(n as u64);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing")]
@@ -910,6 +915,13 @@ where
                 let (pooled_conn, mut send, mut recv) =
                     open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
 
+                // One tunnel is one flow, and it stays counted until the
+                // handler this sits in returns — see the CONNECT branch.
+                let _flow = pooled_conn.enter_flow();
+                pooled_conn.record_sent(request_to_send.len() as u64);
+                let count_to_backend = pooled_conn.clone();
+                let count_from_backend = pooled_conn.clone();
+
                 let (mut client_read, mut client_write) = tokio::io::split(stream);
                 jni_log!(
                     "[DEBUG:local-proxy] WebSocket request sent to iroh: {} bytes",
@@ -960,6 +972,7 @@ where
                                     jni_log!("[DEBUG:local-proxy] WS client->backend err: {}", e);
                                     return "client_write_error";
                                 }
+                                count_to_backend.record_sent(n as u64);
                             }
                             Err(e) => {
                                 jni_log!("[DEBUG:local-proxy] WS client read error: {}", e);
@@ -1004,6 +1017,7 @@ where
                                 if client_write.write_all(&buf[..n]).await.is_err() {
                                     return "client_write_error";
                                 }
+                                count_from_backend.record_received(n as u64);
                                 let _ = client_write.flush().await;
                             }
                             Err(e) => {
@@ -1066,6 +1080,15 @@ where
     let (pooled_conn, mut send, mut recv) =
         open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
 
+    // The helper wrote the request — headers and whatever body had already
+    // arrived — before this line was reached. Counting the copy loop alone
+    // would therefore be counting everything except a large upload, which for
+    // a POST is most of it.
+    let _flow = pooled_conn.enter_flow();
+    pooled_conn.record_sent(request_to_send.len() as u64);
+    let count_to_backend = pooled_conn.clone();
+    let count_from_backend = pooled_conn.clone();
+
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     let client_to_backend = async move {
@@ -1079,6 +1102,7 @@ where
                         tracing::debug!("Client to backend write error: {}", e);
                         break;
                     }
+                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     #[cfg(feature = "tracing")]
@@ -1115,6 +1139,7 @@ where
                         tracing::debug!("Backend to client flush error: {}", e);
                         break;
                     }
+                    count_from_backend.record_received(n as u64);
                     if !response_sent {
                         response_sent = true;
                         jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
@@ -1252,6 +1277,13 @@ where
     let (pooled_conn, mut send, mut recv) =
         open_stream_with_retry(&endpoint_group, &sni, Some(&data)).await?;
 
+    // Same accounting as the HTTP path: the helper already wrote the
+    // ClientHello it was handed.
+    let _flow = pooled_conn.enter_flow();
+    pooled_conn.record_sent(data.len() as u64);
+    let count_to_backend = pooled_conn.clone();
+    let count_from_backend = pooled_conn.clone();
+
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     // Bidirectional raw data forwarding (TCP tunnel)
@@ -1268,6 +1300,7 @@ where
                         );
                         break;
                     }
+                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     jni_log!("[DEBUG:local-proxy] TLS tunnel client read error: {}", e);
@@ -1294,6 +1327,7 @@ where
                         jni_log!("[DEBUG:local-proxy] TLS tunnel flush error: {}", e);
                         break;
                     }
+                    count_from_backend.record_received(n as u64);
                 }
                 Err(e) => {
                     jni_log!("[DEBUG:local-proxy] TLS tunnel backend read error: {}", e);

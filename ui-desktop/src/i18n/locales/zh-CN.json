@@ -87,6 +87,11 @@
     "hours": "{count} 小时",
     "days": "{count} 天"
   },
+  "traffic": {
+    "sent": "已发送",
+    "received": "已接收",
+    "flows": "{count} 条连接"
+  },
   "connect": {
     "title": "连接",
     "started": "代理已启动",

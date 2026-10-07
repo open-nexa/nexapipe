@@ -205,6 +205,24 @@ object IrohProxy {
     external fun nativeLinkKinds(): String?
 
     /**
+     * What each backend has carried, and how many flows are open to it right now: one
+     * `<endpointId>=<sent>/<received>/<active>` entry per node, joined with `;` — the same
+     * entry shape [nativeLinkKinds] uses, so both are parsed the same way.
+     *
+     * `sent` and `received` are cumulative bytes counted since the proxy started, not rates:
+     * a caller wanting a rate has to sample twice. `active` is the number of flows open to
+     * that node at the moment of the call. The key is the raw endpoint ID, as in
+     * [nativeLinkKinds]. A node that has carried nothing is absent rather than zero, so
+     * "no entry" means nothing has flowed through it, not that it is down. The counters
+     * reset when the proxy is stopped and started again, so a later sample that is lower
+     * than an earlier one is a restart, not negative throughput.
+     *
+     * Must be called after nativeStartProxy (which creates the EndpointGroup).
+     * @return the encoded list, or null when nothing has been started yet.
+     */
+    external fun nativeTraffic(): String?
+
+    /**
      * Closes and forgets every cached backend connection, keeping the iroh endpoint.
      *
      * The recovery step for a network switch (Wi-Fi <-> cellular, or a network that came

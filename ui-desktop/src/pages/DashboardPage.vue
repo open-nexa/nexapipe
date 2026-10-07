@@ -5,11 +5,11 @@ import ProxyStatusControl from "../components/ProxyStatusControl.vue";
 import AppIcon from "../components/base/AppIcon.vue";
 import { useConfigStore } from "../stores/config";
 import { useProxyStore } from "../stores/proxy";
-import type { LinkKind, NodeConfig, NodeHealth } from "../types";
+import type { LinkKind, NodeConfig, NodeHealth, NodeTraffic } from "../types";
 
 const { t } = useI18n();
 const { config, connectionMask } = useConfigStore();
-const { status, linkKindFor, healthFor } = useProxyStore();
+const { status, linkKindFor, healthFor, trafficFor } = useProxyStore();
 
 /**
  * The endpoints traffic is actually going through right now, each with the kind of path it is
@@ -102,6 +102,43 @@ function healthLabel(health: NodeHealth): string {
   if (health.reachable) return t("health.up");
   if (health.downForSecs === null) return t("health.down");
   return t("health.downFor", { duration: downDuration(health.downForSecs) });
+}
+
+/**
+ * Every node paired with what it has carried, so the template asks each once.
+ *
+ * `traffic` is `null` for a node the backend has said nothing about: nothing is running, nothing
+ * has opened a connection to it, or a poll failed. None of those is "this node moved no bytes",
+ * which is why nothing below draws a zero for one.
+ */
+const nodeRows = computed(() => nodes.value.map((node) => ({ node, traffic: trafficFor(node) })));
+
+/**
+ * Bytes, at the largest unit that still leaves something to say.
+ *
+ * Binary units and not decimal ones — this is memory-and-wire arithmetic, and a MiB is what both
+ * ends mean by it. Three digits before the comma is enough: a figure nobody is going to compare
+ * byte for byte does not need five significant ones.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  // One decimal while the number is small enough for it to mean something, whole otherwise: the
+  // row has room for 3.4 MiB and none for 34.5678 MiB.
+  const scaled = value < 100 ? value.toFixed(1) : Math.round(value).toString();
+  return `${scaled} ${units[unit]}`;
+}
+
+/** "3 flows" — the only traffic figure that is a count rather than a volume. */
+function flowLabel(traffic: NodeTraffic): string {
+  return t("traffic.flows", { count: traffic.active });
 }
 
 const connectionLabel = computed(() => {
@@ -242,7 +279,7 @@ const uniqueDomains = computed(() => {
 
       <div v-else class="nodes-list">
         <div
-          v-for="(node, index) in nodes"
+          v-for="({ node, traffic }, index) in nodeRows"
           :key="node.id"
           class="node-item"
         >
@@ -259,6 +296,22 @@ const uniqueDomains = computed(() => {
             </div>
             <div class="node-value">
               {{ endpointLabel(node) }}
+            </div>
+            <!-- Only while the counters have something to say about this node; see `nodeRows`. -->
+            <div v-if="traffic" class="node-traffic">
+              <span class="traffic-figure sent">
+                <AppIcon name="arrow-up" :size="11" />
+                <span>{{ t('traffic.sent') }}</span>
+                <span class="traffic-amount">{{ formatBytes(traffic.sent) }}</span>
+              </span>
+              <span class="traffic-figure received">
+                <AppIcon name="arrow-down" :size="11" />
+                <span>{{ t('traffic.received') }}</span>
+                <span class="traffic-amount">{{ formatBytes(traffic.received) }}</span>
+              </span>
+              <span class="traffic-figure flows">
+                <span>{{ flowLabel(traffic) }}</span>
+              </span>
             </div>
           </div>
         </div>
@@ -569,6 +622,43 @@ const uniqueDomains = computed(() => {
 .health-badge.down {
   background: var(--error-subtle);
   color: var(--error-text);
+}
+
+/* Cumulative bytes and an open-flow count: the same quiet figures as the badges above, kept
+   dimmer still because nothing here is actionable. */
+.node-traffic {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.traffic-figure {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.traffic-figure.sent {
+  color: var(--warning-600);
+}
+
+.traffic-figure.received {
+  color: var(--primary-600);
+}
+
+.traffic-figure.flows {
+  color: var(--text-muted);
+}
+
+/* Monospace so successive polls do not shift the row as digits change width. */
+.traffic-amount {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .node-value {

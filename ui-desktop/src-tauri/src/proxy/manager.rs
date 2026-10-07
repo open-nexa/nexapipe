@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::status::{EndpointLink, NodeHealthStatus};
+use crate::status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus};
 
 /// Why a start attempt failed.
 ///
@@ -728,6 +728,59 @@ impl ProxyManager {
                     since_last_probe_secs: probed
                         .and_then(|node| node.last_probe)
                         .map(|last| last.elapsed().as_secs()),
+                })
+            })
+            .collect()
+    }
+
+    /// What each node has carried since these counters started, and how many flows are open to
+    /// it.
+    ///
+    /// Keyed by the same `connection` string as [`Self::endpoint_links`] and
+    /// [`Self::node_health`], so the UI lines a volume up next to the link kind and the health of
+    /// one node. Empty when nothing is running, as both of those are: nothing is being forwarded,
+    /// so there is nothing to count.
+    ///
+    /// Unlike those two this may carry **no entry for a configured node**: the counters only hold
+    /// nodes this group has actually handed a connection out to, and inventing a row of zeros
+    /// here would turn "nothing has gone through it yet" into "nothing went through it", which is
+    /// not the same claim. Whoever shows the figure is the one that can say which it is looking
+    /// at — see [`NodeTrafficStatus`].
+    ///
+    /// Cumulative, and deliberately not a rate: a rate is two readings and a division, and the
+    /// one caller already polls on its own interval.
+    pub async fn node_traffic(&self) -> Vec<NodeTrafficStatus> {
+        // Cloned out of the lock and dropped before the first await: a parking_lot guard must
+        // not be held across a suspension point.
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+
+        let Some(group) = group else {
+            return Vec::new();
+        };
+
+        let volumes = group.traffic_snapshot();
+
+        self.config
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let connection = match &node.connection {
+                    ConnectionConfig::Ticket(ticket) => ticket.clone(),
+                    ConnectionConfig::EndpointId(id) => id.clone(),
+                };
+                // Same filter as the links and the health: a node the group could not parse has
+                // no pool, so nothing carries traffic for it.
+                let addr = backend_addr(&node.connection)?;
+                let volume = volumes.get(&addr.id)?;
+                Some(NodeTrafficStatus {
+                    connection,
+                    sent: volume.sent,
+                    received: volume.received,
+                    active: volume.active,
                 })
             })
             .collect()

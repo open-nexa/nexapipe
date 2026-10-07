@@ -2,6 +2,7 @@ use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
 use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
+use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::collections::HashMap;
@@ -44,6 +45,10 @@ pub struct PooledConnection {
     /// else out; naming the backend at every failure path instead would mean
     /// every one of them knowing how health is recorded.
     node: Option<EndpointId>,
+    /// Where to count what this connection carries. Also `None` for a pool
+    /// standing on its own — the two are set together and absent together,
+    /// because neither means anything about a node nobody is tracking.
+    traffic: Option<Arc<NodeTraffic>>,
 }
 
 impl PooledConnection {
@@ -52,16 +57,63 @@ impl PooledConnection {
             conn,
             pool_index,
             node: None,
+            traffic: None,
         }
     }
 
-    /// A connection whose backend the group keeps health for.
-    pub(crate) fn tracked(conn: Connection, pool_index: usize, node: EndpointId) -> Self {
+    /// A connection whose volume and backend the group keeps track of.
+    pub(crate) fn tracked(
+        conn: Connection,
+        pool_index: usize,
+        node: EndpointId,
+        traffic: TrafficTable,
+    ) -> Self {
         Self {
             conn,
             pool_index,
             node: Some(node),
+            traffic: Some(traffic::of(&traffic, node)),
         }
+    }
+
+    /// Counts `bytes` leaving this machine towards the node this connection
+    /// reaches.
+    ///
+    /// Nothing happens when nothing is being tracked: a pool standing on its
+    /// own has no node to charge, and a copy loop should not need to know
+    /// whether it is inside a group to count correctly. This is the one call a
+    /// copy site makes, and it cannot be pointed at the wrong place: the
+    /// connection decided where its bytes go.
+    pub fn record_sent(&self, bytes: u64) {
+        if let Some(traffic) = &self.traffic {
+            traffic.record_sent(bytes);
+        }
+    }
+
+    /// Counts `bytes` arriving back from that node.
+    pub fn record_received(&self, bytes: u64) {
+        if let Some(traffic) = &self.traffic {
+            traffic.record_received(bytes);
+        }
+    }
+
+    /// Holds one flow through this connection open until the guard is dropped.
+    ///
+    /// `None` for a connection nobody is tracking, so the caller holding it has
+    /// nothing to count and nothing to forget.
+    ///
+    /// The guard is why this returns a value at all: a flow ends on EOF, on any
+    /// of several errors, or on being cancelled because the proxy stopped, and
+    /// only `Drop` covers all of them. See [`Flow`].
+    pub fn enter_flow(&self) -> Option<Flow> {
+        self.traffic
+            .as_ref()
+            .map(|traffic| Flow::open(traffic.clone()))
+    }
+
+    /// The node this connection reaches, when somebody is tracking it.
+    pub fn node(&self) -> Option<EndpointId> {
+        self.node
     }
 
     pub fn into_inner(self) -> Connection {
@@ -70,12 +122,6 @@ impl PooledConnection {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    /// The backend this connection reaches, when somebody is keeping health for
-    /// it.
-    pub fn node(&self) -> Option<EndpointId> {
-        self.node
     }
 
     /// Closes the connection instead of just letting go of it.
@@ -93,7 +139,7 @@ impl PooledConnection {
     /// here would take a healthy backend out of rotation for as long as the
     /// next probe is away, and on the paths with no probe at all, permanently.
     /// The failure worth recording is the one no attempt outlived: see
-    /// [`EndpointGroup::record_request_failure`].
+    /// [`EndpointGroup::record_request_failures`].
     pub fn discard(self, reason: &'static [u8]) {
         self.conn.close(0u32.into(), reason);
     }
@@ -178,6 +224,9 @@ pub struct DomainPools {
     /// asks each backend once whoever serves it, so there is one table and
     /// every domain reads it.
     health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
+    /// Same sharing, same reason: a backend is charged by whoever served it,
+    /// so its counters live with the group and not with this domain.
+    traffic: TrafficTable,
 }
 
 impl DomainPools {
@@ -185,6 +234,7 @@ impl DomainPools {
         pools: Vec<Arc<IrohConnectionPool>>,
         strategy: LoadBalancingStrategy,
         health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
+        traffic: TrafficTable,
     ) -> Self {
         let balancer: Box<dyn LoadBalancer + Sync + Send> = match strategy {
             LoadBalancingStrategy::RoundRobin => Box::new(RoundRobinBalancer::new()),
@@ -194,6 +244,7 @@ impl DomainPools {
             pools,
             balancer,
             health,
+            traffic,
         }
     }
 
@@ -280,7 +331,12 @@ impl DomainPools {
         // about nobody's backend. Calling it "down" would paint the whole node
         // list unreachable each time a tunnel stops.
         match pool.get_connection().await {
-            Ok(conn) => Ok(PooledConnection::tracked(conn, index, backend_id)),
+            Ok(conn) => Ok(PooledConnection::tracked(
+                conn,
+                index,
+                backend_id,
+                self.traffic.clone(),
+            )),
             Err(e @ ClientError::InvalidConfig(_)) => Err(e),
             Err(e) => {
                 record_outcome(&self.health, backend_id, false);
@@ -323,6 +379,17 @@ pub struct EndpointGroup {
     /// a request is decided per domain, and the domain's pools need the answer
     /// the probe wrote for that backend.
     health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
+    /// What each backend has carried, and how many flows it carries right now.
+    ///
+    /// Its own table rather than fields on the pools for the same reason as the
+    /// health one: this is not connection state, nothing serving a request reads
+    /// it, and it has to outlive every connection. It also has to be readable
+    /// from outside the request path entirely — a UI asking how much traffic is
+    /// moving is not a request, and does not belong on their critical path.
+    ///
+    /// Shared rather than owned so a connection can carry the one entry it is
+    /// meant to charge. See [`crate::traffic`].
+    traffic: TrafficTable,
     /// Set for good by [`Self::close_all`], and read by the probe before it
     /// dials anything.
     ///
@@ -521,6 +588,7 @@ impl EndpointGroup {
         // Built here and shared with every pool: the health table is one fact
         // per backend, not one per domain, so it cannot live inside a pool.
         let health = Arc::new(Mutex::new(HashMap::new()));
+        let traffic = traffic::table();
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
@@ -534,8 +602,12 @@ impl EndpointGroup {
                 .filter_map(|k| pool_by_key.get(&k).cloned())
                 .collect();
             if !pools.is_empty() {
-                let domain_pools =
-                    Arc::new(DomainPools::new(pools, default_strategy, health.clone()));
+                let domain_pools = Arc::new(DomainPools::new(
+                    pools,
+                    default_strategy,
+                    health.clone(),
+                    traffic.clone(),
+                ));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
                     "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
@@ -555,6 +627,7 @@ impl EndpointGroup {
                 vec![Arc::new(pool)],
                 default_strategy,
                 health.clone(),
+                traffic.clone(),
             )))
         } else {
             None
@@ -564,6 +637,7 @@ impl EndpointGroup {
             domains,
             default_pools,
             health,
+            traffic,
             probe_stopped: AtomicBool::new(false),
         })
     }
@@ -635,6 +709,7 @@ impl EndpointGroup {
         // Built here and shared with every pool: the health table is one fact
         // per backend, not one per domain, so it cannot live inside a pool.
         let health = Arc::new(Mutex::new(HashMap::new()));
+        let traffic = traffic::table();
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
@@ -648,8 +723,12 @@ impl EndpointGroup {
                 .filter_map(|k| pool_by_key.get(&k).cloned())
                 .collect();
             if !pools.is_empty() {
-                let domain_pools =
-                    Arc::new(DomainPools::new(pools, default_strategy, health.clone()));
+                let domain_pools = Arc::new(DomainPools::new(
+                    pools,
+                    default_strategy,
+                    health.clone(),
+                    traffic.clone(),
+                ));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
                     "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
@@ -669,6 +748,7 @@ impl EndpointGroup {
                 vec![Arc::new(pool)],
                 default_strategy,
                 health.clone(),
+                traffic.clone(),
             )))
         } else {
             None
@@ -678,21 +758,25 @@ impl EndpointGroup {
             domains,
             default_pools,
             health,
+            traffic,
             probe_stopped: AtomicBool::new(false),
         })
     }
 
     pub async fn new_with_single_pool(conn_pool: IrohConnectionPool) -> Self {
         let health = Arc::new(Mutex::new(HashMap::new()));
+        let traffic = traffic::table();
         let default_pools = Some(Arc::new(DomainPools::new(
             vec![Arc::new(conn_pool)],
             LoadBalancingStrategy::RoundRobin,
             health.clone(),
+            traffic.clone(),
         )));
         Self {
             domains: HashMap::new(),
             default_pools,
             health,
+            traffic,
             probe_stopped: AtomicBool::new(false),
         }
     }
@@ -1148,6 +1232,16 @@ impl EndpointGroup {
             .collect();
         nodes.sort_by_key(|n| n.node.to_string());
         HealthSnapshot { nodes }
+    }
+
+    /// What each backend has carried since this group was built, and how many
+    /// flows are open to it right now.
+    ///
+    /// Keyed by node, and only contains nodes this group has served something
+    /// through: a quiet node is absent rather than zero, which a caller showing
+    /// per-node figures has to say rather than leave looking like "down".
+    pub fn traffic_snapshot(&self) -> HashMap<EndpointId, NodeVolume> {
+        traffic::snapshot(&self.traffic)
     }
 
     /// How traffic is currently reaching each backend: direct, or via a relay.

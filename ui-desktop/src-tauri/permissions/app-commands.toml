@@ -67,6 +67,11 @@ description = "Enables the get_node_id_display command without any pre-configure
 commands.allow = ["get_node_id_display"]
 
 [[permission]]
+identifier = "allow-get-node-traffic"
+description = "Enables the get_node_traffic command without any pre-configured scope."
+commands.allow = ["get_node_traffic"]
+
+[[permission]]
 identifier = "allow-get-proxy-status"
 description = "Enables the get_proxy_status command without any pre-configured scope."
 commands.allow = ["get_proxy_status"]
