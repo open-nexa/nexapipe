@@ -1392,6 +1392,18 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|_app| {
+            // Same reason the service runner does it: a hijack whose process died
+            // before its teardown left the machine's DNS pointing at a TUN address
+            // that no longer exists, and nothing else will ever undo that. Doing it
+            // here as well matters because the tunnel is not always the service's —
+            // the desktop can run one itself when it was launched elevated — and a
+            // LaunchDaemon is not what that process becomes. Best effort: an
+            // unprivileged desktop cannot change system DNS and the service, which
+            // runs as root, cleans up on its own start.
+            crate::proxy::dns_config::cleanup_stale_hijack();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_proxy,
             stop_proxy,
