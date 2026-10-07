@@ -11,9 +11,11 @@
  *     here, and saying so is the honest thing to offer;
  *   - **in the system service** — it outlives the window on purpose, so closing can leave it up.
  *
- * Registering the close listener is itself the interception: Tauri holds the window open whenever
- * the renderer is listening, which is why closing for real goes through `destroy()` and not
- * `close()` — the latter would ask again, forever.
+ * Holding the window is two separate things, and both are needed. Rust keeps the native close
+ * from going through, but only for as long as the renderer is listening; the JS wrapper then
+ * destroys the window itself once the handler resolves, unless the event says otherwise. So the
+ * listener says no every time and leaving for real goes through `destroy()` — not `close()`, which
+ * would ask again, forever.
  */
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
@@ -56,7 +58,7 @@ async function proxyOutlivesApp(): Promise<boolean> {
  * refuses to reach without being told.
  */
 async function decide(): Promise<boolean> {
-  const { isRunning, stop } = useProxyStore();
+  const { isRunning, stop, refresh } = useProxyStore();
   const toast = useToast();
 
   if (!isRunning.value) return true;
@@ -78,6 +80,17 @@ async function decide(): Promise<boolean> {
   }
 
   await stop();
+
+  // Not what `stop()` says — it reports a failure with a toast and then resolves like nothing
+  // happened, and while another start or stop is in flight it skips the work entirely. Only what
+  // actually stopped earns the quit: leaving now would abandon a proxy that is still forwarding,
+  // right after promising to disconnect it.
+  await refresh();
+  if (isRunning.value) {
+    toast.fromKey('error.proxy.stop_failed');
+    return false;
+  }
+
   return true;
 }
 
@@ -120,7 +133,10 @@ export async function initQuitGuard(): Promise<() => void> {
 
   try {
     cleanup.push(
-      await getCurrentWindow().onCloseRequested(() => {
+      await getCurrentWindow().onCloseRequested((event) => {
+        // Answering takes a promise, and the wrapper destroys the window the moment this handler
+        // resolves otherwise — so the close is refused outright and `destroy()` below decides.
+        event.preventDefault();
         void handleCloseRequested();
       }),
     );
