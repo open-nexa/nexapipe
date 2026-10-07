@@ -998,6 +998,25 @@ async fn get_service_status() -> ServiceState {
         .unwrap_or(ServiceState::NotInstalled)
 }
 
+/// The build the installed service reports, when it can say.
+///
+/// `None` covers "no service is answering" and "the service predates the question", which the
+/// caller cannot tell apart: a build that does not know [`IpcMessage::GetVersion`] refuses it
+/// and closes the connection. Both mean the same thing to the UI, which compares this against
+/// the app's own version and offers to reinstall when they differ — an older service answers
+/// the requests it does understand with whatever it has, which is how an upgrade that never
+/// happened looked like a page with nothing in it.
+#[tauri::command]
+async fn get_service_version() -> Option<String> {
+    match IpcClient::get_version().await {
+        Ok(version) => Some(version),
+        Err(e) => {
+            tracing::debug!("Could not ask the service which build it is: {e}");
+            None
+        }
+    }
+}
+
 /// Starts the service, asking for administrator rights when the unprivileged call is refused.
 #[tauri::command]
 async fn start_service() -> Result<(), AppError> {
@@ -1641,6 +1660,7 @@ pub fn run() {
             start_service,
             stop_service,
             get_service_status,
+            get_service_version,
             is_service_running,
             get_startup_error,
             get_logs,

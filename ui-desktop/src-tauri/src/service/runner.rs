@@ -5,7 +5,8 @@ use crate::proxy::{
     StartError,
 };
 use crate::service::ipc::{
-    IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, IPC_SOCKET_PATH, MAX_IPC_LINE,
+    IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, BUILD_VERSION, IPC_SOCKET_PATH,
+    MAX_IPC_LINE,
 };
 use crate::status::{ActiveFlowPage, ProxyStatus, FLOW_PAGE_LIMIT};
 use anyhow::{Context, Result};
@@ -387,6 +388,7 @@ impl ServiceRunner {
                 IpcMessage::GetStartupError => {
                     IpcResponse::StartupError(startup_error_slot().read().await.clone())
                 }
+                IpcMessage::GetVersion => IpcResponse::Version(BUILD_VERSION.to_string()),
                 // Handled above, when the caller introduced itself. A second
                 // handshake on a connection that already has one is refused
                 // rather than answered: there is nothing it could establish, and
