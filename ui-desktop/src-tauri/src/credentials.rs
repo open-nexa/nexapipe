@@ -597,7 +597,7 @@ impl Store {
     }
 
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.master.key))
+        Aes256Gcm::new(&Key::<Aes256Gcm>::from(self.master.key))
     }
 
     fn encrypt(&self, key: &str, value: &str) -> Result<String, AppError> {
@@ -605,7 +605,7 @@ impl Store {
         let blob = self
             .cipher()
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 // The key is authenticated as well as encrypted: moving one entry's
                 // value under another key has to fail, not silently re-label a secret.
                 Payload {
@@ -633,14 +633,18 @@ impl Store {
 
         // Nonce first, then the ciphertext, both hex: one blob, no separator to
         // disagree about, and a wrong length is caught before anything is fed to
-        // the cipher.
+        // the cipher. Decoding straight into `[u8; NONCE_LEN]` rather than a `Vec`
+        // is what lets the nonce move into `Nonce` without a length check the
+        // slice above has already made.
         if body.len() < NONCE_LEN * 2 {
             return Err(AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
                 format!("the entry for {key:?} is truncated"),
             ));
         }
-        let nonce = unhex(&body[..NONCE_LEN * 2]).ok_or_else(|| {
+        let nonce = unhex(&body[..NONCE_LEN * 2])
+            .and_then(|bytes| <[u8; NONCE_LEN]>::try_from(bytes).ok())
+            .ok_or_else(|| {
             AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
                 format!("the entry for {key:?} has an unreadable nonce"),
@@ -656,7 +660,7 @@ impl Store {
         let plaintext = self
             .cipher()
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &sealed,
                     aad: key.as_bytes(),
