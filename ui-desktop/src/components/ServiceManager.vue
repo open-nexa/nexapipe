@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { useI18n } from "vue-i18n";
 import { errorDetail, errorKey } from "../api/errors";
 import type { ServiceState } from "../types";
@@ -15,9 +16,16 @@ const { refreshServiceRunning } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
-const busyWith = ref<"" | "install" | "uninstall" | "start" | "stop">("");
+const busyWith = ref<"" | "install" | "upgrade" | "uninstall" | "start" | "stop">("");
 const message = ref("");
 const messageType = ref<"success" | "error" | "info">("info");
+
+/// This build, which is what the service is compared against. Empty until the app has said,
+/// and a comparison against nothing is one the panel does not draw.
+const appVersion = ref("");
+/// Which build the service says it is. `null` when it cannot say: nothing is answering, or the
+/// service predates the question and drops the connection instead.
+const serviceVersion = ref<string | null>(null);
 
 /// A service can die on its own, so the panel re-reads the state instead of trusting the last
 /// action it performed.
@@ -43,14 +51,39 @@ async function refresh() {
     console.error("[service] failed to read the service state:", errorDetail(e));
     state.value = "not_installed";
   }
+
+  try {
+    serviceVersion.value = await invoke<string | null>("get_service_version");
+  } catch (e) {
+    console.error("[service] failed to read the service version:", errorDetail(e));
+    serviceVersion.value = null;
+  }
 }
+
+/// A service answering with a build other than this app's — or with none at all, which is what
+/// a build predating the question does — is not running what installing would put there.
+///
+/// Only asked while one is up: a stopped service cannot answer, and "cannot answer" is not
+/// evidence that it is out of date.
+const needsUpgrade = computed(
+  () =>
+    appVersion.value !== "" &&
+    state.value === "running" &&
+    serviceVersion.value !== appVersion.value,
+);
+
+const needsUpgradeMessage = computed(() =>
+  serviceVersion.value
+    ? t("service.versionMismatch", { service: serviceVersion.value, app: appVersion.value })
+    : t("service.versionUnknown", { app: appVersion.value }),
+);
 
 /**
  * Every one of these elevates through UAC / sudo / polkit when the process is not already
  * privileged, so the call can legitimately stay pending until the user answers the prompt.
  */
 async function run(
-  action: "install" | "uninstall" | "start" | "stop",
+  action: "install" | "upgrade" | "uninstall" | "start" | "stop",
   command: string,
   successKey: string,
   fallbackKey: string,
@@ -86,6 +119,12 @@ function installService() {
   return run("install", "install_service", "service.installed", "error.service.install_failed");
 }
 
+/// Reinstalling *is* the upgrade: installing re-points the service at this build and restarts
+/// it, so a service left behind by an earlier version of the app ends up running this one.
+function upgradeService() {
+  return run("upgrade", "install_service", "service.upgraded", "error.service.install_failed");
+}
+
 function uninstallService() {
   return run("uninstall", "uninstall_service", "service.uninstalled", "error.service.uninstall_failed");
 }
@@ -99,6 +138,14 @@ function stopService() {
 }
 
 onMounted(() => {
+  // Read once: it is this build's own version, and outside a Tauri window there is none — in
+  // which case the panel simply stops drawing the comparison.
+  void getVersion()
+    .then((value) => {
+      appVersion.value = value;
+    })
+    .catch((e) => console.debug("[service] app version unavailable:", e));
+
   refresh();
   poll = window.setInterval(refresh, POLL_INTERVAL_MS);
 });
@@ -129,6 +176,25 @@ onBeforeUnmount(() => {
             {{ stateLabel }}
           </span>
         </div>
+      </div>
+    </div>
+
+    <div v-if="needsUpgrade" class="outdated">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+      </svg>
+      <div class="outdated-body">
+        <span>{{ needsUpgradeMessage }}</span>
+        <button
+          class="btn btn-outline"
+          :disabled="isLoading"
+          @click="upgradeService"
+        >
+          <svg v-if="busyWith === 'upgrade'" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+          </svg>
+          <span>{{ busyWith === 'upgrade' ? t("service.upgrading") : t("service.upgrade") }}</span>
+        </button>
       </div>
     </div>
 
@@ -353,6 +419,44 @@ onBeforeUnmount(() => {
   50% {
     opacity: 0.5;
   }
+}
+
+.outdated {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  margin-bottom: 16px;
+  font-size: 13px;
+  background: var(--warning-subtle);
+  color: var(--warning-text);
+  border-left: 3px solid var(--warning);
+}
+
+.outdated svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.outdated-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.outdated-body .btn {
+  padding: 8px 14px;
+  font-size: 13px;
+  border-color: var(--warning);
+  color: var(--warning-text);
+}
+
+.outdated-body .btn:hover:not(:disabled) {
+  background: var(--warning-subtle);
 }
 
 .message {

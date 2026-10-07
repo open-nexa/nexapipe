@@ -225,7 +225,20 @@ pub enum IpcMessage {
     /// only returns when the tunnel goes down — so a start that fails a second later would
     /// otherwise leave the caller with nothing but "it stopped again".
     GetStartupError,
+    /// Which build is answering, so a caller can tell an older service from its own.
+    ///
+    /// Nothing else can say it: a build that does not know a request refuses it and drops the
+    /// connection, which the caller cannot tell apart from a service that is not running — so
+    /// the app goes on asking a service that predates it, and every question it does not
+    /// understand comes back as an empty answer rather than as a reason to reinstall.
+    GetVersion,
 }
+
+/// The version this build reports over the channel — see [`IpcMessage::GetVersion`].
+///
+/// Both sides are built from the same package, so on a machine where the app and the service
+/// are in step the answer is the caller's own version.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What the service sends back.
 ///
@@ -272,6 +285,8 @@ pub enum IpcResponse {
     StartupError(Option<AppError>),
     /// `None` means nothing has enrolled, or the credential was already taken.
     IssuedCredential(Option<IssuedCredentialPayload>),
+    /// The build the service is — see [`IpcMessage::GetVersion`].
+    Version(String),
 }
 
 #[cfg(test)]
@@ -312,6 +327,35 @@ mod tests {
         assert_eq!(two_factor.client_id, "client-001");
         assert_eq!(two_factor.secret, "jbswy3dpehpk3pxp");
         assert_eq!(two_factor.algorithm, "sha1");
+    }
+
+    /// The name on the wire is the name a *deployed* service answers to. Renaming the variant
+    /// breaks nothing in this build, where both ends are compiled together — it breaks every
+    /// app talking to a service that predates the rename, which is precisely the drift
+    /// [`IpcMessage::GetVersion`] exists to detect.
+    #[test]
+    fn the_version_exchange_keeps_its_wire_names() {
+        let request = serde_json::to_string(&IpcMessage::GetVersion).expect("it serializes");
+        assert_eq!(request, "\"GetVersion\"");
+
+        let response = serde_json::to_string(&IpcResponse::Version("0.5.0".to_string()))
+            .expect("it serializes");
+        assert_eq!(response, r#"{"Version":"0.5.0"}"#);
+    }
+
+    /// The app compares the service's answer against the version the frontend reads out of
+    /// `tauri.conf.json`, which is a different file from the manifest this constant comes
+    /// from. A bump that updated one and not the other would declare every installed service
+    /// out of date.
+    #[test]
+    fn the_reported_version_is_the_one_the_frontend_reads() {
+        let conf = include_str!("../../tauri.conf.json");
+
+        assert!(
+            conf.contains(&format!("\"version\": \"{BUILD_VERSION}\"")),
+            "tauri.conf.json and Cargo.toml disagree; the service would look out of date on \
+             every machine"
+        );
     }
 
     /// Two nodes in one request carry two different keys; nothing here flattens them.
