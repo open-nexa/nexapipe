@@ -2,6 +2,7 @@
 pub mod error;
 pub mod gate;
 mod proxy;
+pub mod quit;
 pub mod service;
 pub mod status;
 
@@ -1409,7 +1410,7 @@ pub fn run() {
     let shutdown = handle.clone();
     tauri::async_runtime::set(handle);
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1457,8 +1458,30 @@ pub fn run() {
             put_credential,
             delete_credential,
             clear_credentials,
-            credential_store_status
-        ])
+            credential_store_status,
+            quit::finish_quit
+        ]);
+
+    // macOS only: the predefined Quit item terminates the process before any event carrying a
+    // `prevent_exit()` exists, so nothing about it can be intercepted — see the module doc in
+    // `quit`. Ours asks instead and leaves the deciding to the renderer, which is the same answer
+    // closing the window gets. If asking itself fails the process still has to go, or Cmd+Q would
+    // quietly stop working.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(quit::menu_bar).on_menu_event(|app, event| {
+        if event.id() != quit::QUIT_ITEM_ID {
+            return;
+        }
+        match tauri::Emitter::emit(app, quit::QUIT_REQUESTED_EVENT, ()) {
+            Ok(()) => tracing::info!("Quit chosen from the menu; waiting for the answer"),
+            Err(error) => {
+                tracing::warn!("Could not ask about quitting ({error}); exiting as asked");
+                app.exit(0);
+            }
+        }
+    });
+
+    let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
