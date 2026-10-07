@@ -149,7 +149,7 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     #[cfg(target_os = "macos")]
     {
         match hijack {
-            DnsHijack::Scoped => restore_scoped_dns_macos(dns_ip),
+            DnsHijack::Scoped => restore_scoped_dns_macos(),
             DnsHijack::Global => restore_system_dns_macos(dns_ip),
         }
     }
@@ -663,7 +663,7 @@ fn set_scoped_dns_linux(interface: &str, dns_ip: &str, proxy_domains: &[String])
     let resolver_in_place = resolvectl_dns_for(interface)
         .is_some_and(|servers| servers.iter().any(|server| server == dns_ip));
     let routed = resolvectl_domains_for(interface)
-        .is_some_and(|routed| domains.iter().any(|domain| routed.contains(domain)));
+        .is_some_and(|routed| routes_every_domain(&routed, &domains));
     if !resolver_in_place || !routed {
         revert_resolvectl(interface);
         tracing::warn!(
@@ -736,6 +736,14 @@ fn resolvectl_domains_for(link: &str) -> Option<Vec<String>> {
     Some(parse_resolvectl_domains(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+/// Whether `routed` is every one of `domains`, and not merely one of them: a
+/// domain left out keeps resolving outside the proxy while the caller is told
+/// the hijack is scoped, which is the one thing the fallback is for.
+#[cfg(any(target_os = "linux", test))]
+fn routes_every_domain(routed: &[String], domains: &[String]) -> bool {
+    domains.iter().all(|domain| routed.contains(domain))
 }
 
 /// The domains in `resolvectl domain` output, without the `~` that marks them
@@ -1117,16 +1125,37 @@ fn resolv_conf_without_nameservers(contents: &str, addresses: &[String]) -> Stri
 #[cfg(target_os = "macos")]
 const RESOLVER_DIR: &str = "/etc/resolver";
 
+/// The line that marks a resolver file as one this code wrote.
+///
+/// Ownership cannot be read off the `nameserver` line. The addresses a hijack
+/// hands out end in `.254`, and `10.0.0.254` — the last candidate block — is
+/// also a router address, which a hand-written split-DNS rule points at just
+/// as plausibly. A file naming one and carrying no marker is somebody else's,
+/// and is neither overwritten nor removed: nothing here keeps a copy of what
+/// it would destroy.
+///
+/// A comment is safe here: the parser configd reads these files with skips
+/// lines starting with `;` or `#`.
+#[cfg(any(target_os = "macos", test))]
+const RESOLVER_MARKER: &str = "# managed by nexapipe";
+
+/// Whether `contents` carry [`RESOLVER_MARKER`] — the only test this code
+/// trusts before it overwrites or removes a resolver file.
+#[cfg(any(target_os = "macos", test))]
+fn is_our_resolver_file(contents: &str) -> bool {
+    contents.lines().any(|line| line.trim() == RESOLVER_MARKER)
+}
+
 /// The contents of a `/etc/resolver/<domain>` file.
 #[cfg(any(target_os = "macos", test))]
 fn resolver_file_contents(dns_ip: &str) -> String {
-    format!("nameserver {dns_ip}\n")
+    format!("{RESOLVER_MARKER}\nnameserver {dns_ip}\n")
 }
 
 /// The address a `/etc/resolver` file hands its domain to.
 ///
-/// `None` when the file names none, which is a file this code did not write and
-/// must therefore leave alone.
+/// `None` when the file names none. Whether the file is one this code wrote is
+/// a separate question, answered by [`is_our_resolver_file`].
 #[cfg(any(target_os = "macos", test))]
 fn resolver_nameserver(contents: &str) -> Option<String> {
     contents.lines().find_map(|line| {
@@ -1164,7 +1193,7 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
     // Read back rather than trusting the writes: a hijack that silently did not
     // happen looks exactly like a proxy that resolves nothing.
     let in_effect = count_resolvers_in_effect(&written, dns_ip);
-    if in_effect != written.len() {
+    if !scoped_install_is_complete(in_effect, written.len()) {
         for path in &written {
             if count_resolvers_in_effect(std::slice::from_ref(path), dns_ip) == 0 {
                 tracing::warn!(
@@ -1174,15 +1203,14 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
                 );
             }
         }
-    }
-    if in_effect == 0 {
         for path in &written {
             let _ = std::fs::remove_file(path);
         }
         tracing::warn!(
-            "no resolver under {} names {} — every query goes to the TUN instead",
-            RESOLVER_DIR,
-            dns_ip
+            "{} of {} resolver(s) under {} took effect — every query goes to the TUN instead",
+            in_effect,
+            written.len(),
+            RESOLVER_DIR
         );
         return Ok(false);
     }
@@ -1206,11 +1234,12 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
 /// Writes one resolver file per domain under `dir`, and returns the paths
 /// written together with the domains that were left alone.
 ///
-/// A file already there that does not hand its domain to us is somebody else's:
-/// a container runtime, another tunnel, a hand-written split-DNS rule.
+/// A file already there that is not marked as ours is somebody else's: a
+/// container runtime, another tunnel, a hand-written split-DNS rule.
 /// Overwriting it would break whatever it is there for, so the domain keeps
-/// resolving where it resolves. One that names our own address — including an
-/// address from an earlier block — is a leftover of ours and is rewritten.
+/// resolving where it resolves — and the file keeps the address it named,
+/// including one of the addresses a hijack of ours uses. A marked file is a
+/// leftover of ours, from this run or an earlier one, and is rewritten.
 #[cfg(any(target_os = "macos", test))]
 fn write_resolver_files(
     dir: &Path,
@@ -1222,12 +1251,9 @@ fn write_resolver_files(
     for domain in domains {
         let path = dir.join(domain);
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            match resolver_nameserver(&contents) {
-                Some(server) if server == dns_ip || is_tun_dns_address(&server) => {}
-                other => {
-                    left_alone.push(format!("{} ({:?})", domain, other));
-                    continue;
-                }
+            if !is_our_resolver_file(&contents) {
+                left_alone.push(format!("{} ({:?})", domain, resolver_nameserver(&contents)));
+                continue;
             }
         }
         match std::fs::write(&path, resolver_file_contents(dns_ip)) {
@@ -1254,12 +1280,24 @@ fn count_resolvers_in_effect(written: &[PathBuf], dns_ip: &str) -> usize {
         .count()
 }
 
+/// Whether a scoped install covers every domain it was asked to cover.
+///
+/// All of them or none of them: a domain whose file did not take would go on
+/// resolving outside the proxy while the caller is told the hijack is scoped,
+/// which is the one thing falling back to the global hijack is for.
+#[cfg(any(target_os = "macos", test))]
+fn scoped_install_is_complete(in_effect: usize, written: usize) -> bool {
+    in_effect == written
+}
+
 /// Takes back the per-domain resolvers a scoped hijack installed.
+///
+/// Every file carrying [`RESOLVER_MARKER`] is ours whichever address it names,
+/// including the one a run that used another block left behind. Files without
+/// it are not touched, whatever they name.
 #[cfg(target_os = "macos")]
-fn restore_scoped_dns_macos(dns_ip: &str) -> Result<()> {
-    let left = remove_resolver_files(Path::new(RESOLVER_DIR), |server| {
-        server == dns_ip || is_tun_dns_address(server)
-    });
+fn restore_scoped_dns_macos() -> Result<()> {
+    let left = remove_resolver_files(Path::new(RESOLVER_DIR), is_our_resolver_file);
     if left.is_empty() {
         return Ok(());
     }
@@ -1271,12 +1309,13 @@ fn restore_scoped_dns_macos(dns_ip: &str) -> Result<()> {
     )
 }
 
-/// Removes every file under `dir` whose `nameserver` `is_ours` accepts, and
+/// Removes every file under `dir` whose contents `is_ours` accepts, and
 /// returns the ones that could not be removed.
 ///
-/// The files that name no resolver at all, and the ones naming somebody else's,
-/// are left untouched: a directory the machine shares with other resolvers is
-/// not one this code gets to clean out.
+/// `is_ours` is handed the whole file rather than its `nameserver` line because
+/// what decides ownership here is the marker, not the address — see
+/// [`RESOLVER_MARKER`]. Files it rejects are left untouched: a directory the
+/// machine shares with other resolvers is not one this code gets to clean out.
 #[cfg(any(target_os = "macos", test))]
 fn remove_resolver_files(dir: &Path, is_ours: impl Fn(&str) -> bool) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1292,10 +1331,7 @@ fn remove_resolver_files(dir: &Path, is_ours: impl Fn(&str) -> bool) -> Vec<Stri
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Some(server) = resolver_nameserver(&contents) else {
-            continue;
-        };
-        if !is_ours(&server) {
+        if !is_ours(&contents) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -1316,13 +1352,15 @@ fn remove_resolver_files(dir: &Path, is_ours: impl Fn(&str) -> bool) -> Vec<Stri
 /// behind.
 ///
 /// The same test as the network-service half of this cleanup separates a stale
-/// hijack from a live one: a file pointing at an address no interface holds
-/// belongs to a tunnel that is gone, and until it is removed every query for
-/// that domain goes nowhere.
+/// hijack from a live one: a marked file pointing at an address no interface
+/// holds belongs to a tunnel that is gone, and until it is removed every query
+/// for that domain goes nowhere. An unmarked one is not ours however stale its
+/// address looks — a router's own `10.0.0.254` is the case that matters.
 #[cfg(target_os = "macos")]
 fn remove_stale_resolver_files() {
-    let left = remove_resolver_files(Path::new(RESOLVER_DIR), |server| {
-        is_tun_dns_address(server) && !address_is_held(server)
+    let left = remove_resolver_files(Path::new(RESOLVER_DIR), |contents| {
+        is_our_resolver_file(contents)
+            && resolver_nameserver(contents).is_some_and(|server| !address_is_held(&server))
     });
     if !left.is_empty() {
         tracing::warn!(
@@ -1676,15 +1714,16 @@ mod tests {
     #[cfg(any(target_os = "linux", test))]
     use super::{
         parse_resolvectl_dns, parse_resolvectl_domains, resolv_conf_names_a_tun_address,
-        resolv_conf_nameservers, resolv_conf_without_nameservers,
+        resolv_conf_nameservers, resolv_conf_without_nameservers, routes_every_domain,
     };
 
     // Same for the per-domain resolver file: what this code writes has to be
     // what it reads back, or a restore would leave its own files behind.
     #[cfg(any(target_os = "macos", test))]
     use super::{
-        count_resolvers_in_effect, is_tun_dns_address, remove_resolver_files,
-        resolver_file_contents, resolver_nameserver, write_resolver_files,
+        RESOLVER_MARKER, count_resolvers_in_effect, is_our_resolver_file, is_tun_dns_address,
+        remove_resolver_files, resolver_file_contents, resolver_nameserver,
+        scoped_install_is_complete, write_resolver_files,
     };
     #[cfg(any(target_os = "macos", test))]
     use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
@@ -1886,6 +1925,19 @@ mod tests {
         );
     }
 
+    /// The Linux twin of `a_partial_install_is_not_a_scoped_one`: a link given
+    /// two domains and routing one of them has not routed them.
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn a_link_routing_one_domain_has_not_routed_them_all() {
+        let domains = vec!["example.com".to_string(), "foo.io".to_string()];
+        let routed = vec!["example.com".to_string(), "foo.io".to_string()];
+        assert!(routes_every_domain(&routed, &domains));
+        assert!(!routes_every_domain(&["example.com".to_string()], &domains));
+        assert!(!routes_every_domain(&[], &domains));
+        assert!(routes_every_domain(&[], &[]));
+    }
+
     /// `~` is what makes a domain routing-only: resolved sends it to that link's
     /// DNS server without putting it in any search list.
     #[cfg(any(target_os = "linux", test))]
@@ -1907,10 +1959,17 @@ mod tests {
     #[cfg(any(target_os = "macos", test))]
     #[test]
     fn a_resolver_file_is_read_back_as_our_own() {
+        let contents = resolver_file_contents("198.18.0.254");
         assert_eq!(
-            resolver_nameserver(&resolver_file_contents("198.18.0.254")).as_deref(),
+            resolver_nameserver(&contents).as_deref(),
             Some("198.18.0.254")
         );
+        assert!(is_our_resolver_file(&contents));
+
+        // The marker is the whole test: without it the same file is a stranger.
+        assert!(contents.starts_with(RESOLVER_MARKER));
+        assert!(!is_our_resolver_file("nameserver 198.18.0.254\n"));
+        assert!(!is_our_resolver_file(""));
     }
 
     /// A file that names no resolver is not ours, and neither is one whose
@@ -1968,7 +2027,56 @@ mod tests {
             "nameserver 172.17.0.1\n"
         );
 
-        assert!(remove_resolver_files(&dir, |server| server == "198.18.0.254").is_empty());
+        assert!(remove_resolver_files(&dir, is_our_resolver_file).is_empty());
+        assert!(theirs.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scoped install that reached only some of the domains is not a scoped
+    /// install: the rest would keep resolving outside the proxy while the caller
+    /// is told they do not.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn a_partial_install_is_not_a_scoped_one() {
+        assert!(scoped_install_is_complete(2, 2));
+        // Nothing asked for, nothing missing.
+        assert!(scoped_install_is_complete(0, 0));
+        assert!(!scoped_install_is_complete(2, 3));
+        assert!(!scoped_install_is_complete(0, 3));
+    }
+
+    /// Why ownership cannot be read off the address: `10.0.0.254` is the last of
+    /// the candidate blocks and it is also a router address, so a split-DNS rule
+    /// for an internal zone can name it without having anything to do with this
+    /// proxy. Such a file is neither rewritten nor removed, and this directory is
+    /// not the only place it can be at risk — the startup cleanup looks here too.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn an_unmarked_file_naming_a_hijack_address_is_left_alone() {
+        let dir = scratch_dir("resolver-unmarked");
+        let theirs = dir.join("corp.example");
+        std::fs::write(&theirs, "nameserver 10.0.0.254\n").unwrap();
+        assert!(is_tun_dns_address("10.0.0.254"));
+
+        let (written, left_alone) =
+            write_resolver_files(&dir, "198.18.0.254", &["corp.example".to_string()]);
+        assert!(written.is_empty());
+        assert_eq!(left_alone.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            "nameserver 10.0.0.254\n"
+        );
+
+        // Both shapes of removal: the restore's, and the stale cleanup's, which
+        // would otherwise match this address and find no interface holding it.
+        assert!(remove_resolver_files(&dir, is_our_resolver_file).is_empty());
+        assert!(
+            remove_resolver_files(&dir, |contents| {
+                is_our_resolver_file(contents)
+                    && resolver_nameserver(contents).is_some_and(|server| server == "10.0.0.254")
+            })
+            .is_empty()
+        );
         assert!(theirs.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1983,7 +2091,9 @@ mod tests {
         let stale = dir.join("example.com");
         let other_block =
             Ipv4Addr::from(u32::from(TUN_BASE_CANDIDATES[1]) | 0x0000_00FE).to_string();
-        std::fs::write(&stale, format!("nameserver {other_block}\n")).unwrap();
+        // Marked, because the run that left it wrote it: the marker is the only
+        // thing that still says so once the address belongs to no live tunnel.
+        std::fs::write(&stale, resolver_file_contents(&other_block)).unwrap();
         assert!(is_tun_dns_address(&other_block));
 
         let (written, left_alone) =
@@ -1991,7 +2101,7 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert!(left_alone.is_empty());
 
-        assert!(remove_resolver_files(&dir, is_tun_dns_address).is_empty());
+        assert!(remove_resolver_files(&dir, is_our_resolver_file).is_empty());
         assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

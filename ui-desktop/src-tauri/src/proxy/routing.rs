@@ -1073,9 +1073,17 @@ fn foreign_route_prefixes(skip: &str) -> Vec<(Ipv4Addr, u8)> {
 }
 
 /// IPv4 route prefixes installed on interfaces other than `skip`. See the macOS twin.
+///
+/// `table all` and not the default main table: a route in any other table claims its prefix
+/// just as loudly while a lookup reaches it through an `ip rule`, which is how a tunnel that
+/// wants to sit in front of the default route installs itself. What that adds — the host and
+/// broadcast addresses of the local table — is dropped by the parser, not by luck.
 #[cfg(target_os = "linux")]
 fn foreign_route_prefixes(skip: &str) -> Vec<(Ipv4Addr, u8)> {
-    match Command::new("ip").args(["-4", "route", "show"]).output() {
+    match Command::new("ip")
+        .args(["-4", "route", "show", "table", "all"])
+        .output()
+    {
         Ok(output) => parse_ip_route_prefixes(&String::from_utf8_lossy(&output.stdout), skip),
         Err(_) => Vec::new(),
     }
@@ -1172,24 +1180,39 @@ fn parse_shortened_prefix(field: &str) -> Option<(Ipv4Addr, u8)> {
     (len <= 32).then_some((Ipv4Addr::from(octets), len))
 }
 
-/// `ip -4 route show` lines: `<prefix> [via <gw>] dev <ifname> ...`.
+/// The route types `ip` prints ahead of the destination — the ones that stand for a prefix
+/// rather than for an address of this host. Each of them keeps the packets its prefix names,
+/// which is what makes it a claim on a block.
+#[cfg(any(target_os = "linux", test))]
+const IP_ROUTE_TYPES: [&str; 5] = ["blackhole", "unreachable", "prohibit", "throw", "nat"];
+
+/// `ip -4 route show` lines: `[<type>] <prefix> [via <gw>] dev <ifname> ...`.
 ///
 /// The default route is dropped for the same reason as on macOS: every host has one, and
 /// counting it would disqualify every block. It is spelled `default` here, or `0.0.0.0/0` on a
 /// table that prints it numerically; the first parses as nothing, the second is filtered by its
 /// prefix length. A route with no `dev` — a blackhole, for instance — belongs to nobody, which
-/// still leaves the prefix spoken for.
+/// still leaves the prefix spoken for, so its type is read past rather than read as the
+/// destination.
 #[cfg(any(target_os = "linux", test))]
 fn parse_ip_route_prefixes(text: &str, skip: &str) -> Vec<(Ipv4Addr, u8)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(dest) = tokens.first().copied() else {
-            continue;
-        };
         if tokens.windows(2).any(|pair| pair == ["dev", skip]) {
             continue;
         }
+        // `ip` prints the type of a route that has one ahead of its prefix, and
+        // those are exactly the routes with no interface to exclude: a blackhole
+        // swallows the block it names as surely as a device does.
+        let dest = match tokens.split_first() {
+            Some((first, rest)) if IP_ROUTE_TYPES.contains(first) => match rest.first().copied() {
+                Some(next) => next,
+                None => continue,
+            },
+            Some((first, _)) => *first,
+            None => continue,
+        };
         let prefix = match dest.split_once('/') {
             Some((addr, len)) => len
                 .parse::<u8>()
@@ -1431,6 +1454,50 @@ default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.83 metric 100
         assert!(
             !routes.iter().any(|(_, len)| *len == 0),
             "the default route must not be collected: {routes:?}"
+        );
+    }
+
+    /// The two ways a route used to hide: one installed in a table other than
+    /// main, reached through an `ip rule`, and one whose type `ip` prints ahead
+    /// of its prefix. Both claim the block they name — a blackhole more loudly
+    /// than most — and neither carries a `dev` to be excluded by.
+    #[test]
+    fn a_route_from_another_table_or_of_another_type_still_claims() {
+        let text = "\
+default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.83 metric 100
+blackhole 100.100.0.0/24
+unreachable 198.18.0.0/16
+172.26.0.0/16 dev wg0 table 51820 proto static scope link
+local 10.0.0.83 dev eth0 table local proto kernel scope host src 10.0.0.83
+broadcast 10.0.0.255 dev eth0 table local proto kernel scope link src 10.0.0.83
+198.18.0.0/24 dev nexa-tun proto kernel scope link src 198.18.0.254
+";
+        let routes = super::parse_ip_route_prefixes(text, "nexa-tun");
+        assert!(
+            routes.contains(&(Ipv4Addr::new(100, 100, 0, 0), 24)),
+            "a blackhole route was not collected: {routes:?}"
+        );
+        assert!(
+            routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 16)),
+            "an unreachable route was not collected: {routes:?}"
+        );
+        assert!(
+            routes.contains(&(Ipv4Addr::new(172, 26, 0, 0), 16)),
+            "a route from another table was not collected: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 24)),
+            "our own route must be excluded: {routes:?}"
+        );
+        // What `table all` adds and this does not want: the host and broadcast
+        // addresses of the local table, which name no block.
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(10, 0, 0, 83), 32)),
+            "a local address is not a route: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(10, 0, 0, 255), 32)),
+            "a broadcast address is not a route: {routes:?}"
         );
     }
 

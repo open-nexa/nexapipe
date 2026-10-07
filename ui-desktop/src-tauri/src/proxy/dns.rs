@@ -200,6 +200,9 @@ async fn handle_dns_query(
 ///   and not a lookup;
 /// - it is one of the TUN addresses the hijack points system DNS at, which is
 ///   the same loop left over from a run that never restored;
+/// - it is loopback, which on a machine running a local stub is the stub the
+///   hijack itself feeds: rewriting `/etc/resolv.conf` makes dnsmasq or
+///   resolved forward at the TUN, so asking it is asking ourselves;
 /// - it is unspecified, or link-local (a `fe80::` address cannot be dialled
 ///   without the scope id this process does not know).
 ///
@@ -215,7 +218,7 @@ pub(crate) fn forwardable_resolvers(
         let Ok(ip) = candidate.parse::<IpAddr>() else {
             continue;
         };
-        if ours.contains(&ip) || ip.is_unspecified() || is_link_local(&ip) {
+        if ours.contains(&ip) || ip.is_loopback() || ip.is_unspecified() || is_link_local(&ip) {
             continue;
         }
         if crate::proxy::dns_config::is_tun_dns_address(candidate) {
@@ -276,6 +279,20 @@ fn resolver_chain(previous: &[String], configured: &str) -> Vec<String> {
     chain
 }
 
+/// The address a socket is bound to before it dials `upstream`.
+///
+/// A socket can only reach an address of its own family: an IPv6 resolver
+/// dialled from an IPv4 socket fails at `send_to`, so it would spend one of the
+/// two slots on the machine's own resolvers and take a usable IPv4 one down
+/// with it, and the failure would look like a resolver that does not answer.
+fn bind_addr_for(upstream: &std::net::SocketAddr) -> &'static str {
+    if upstream.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    }
+}
+
 /// Fallback upstream resolvers, tried in order when the configured upstream times out or is
 /// unreachable.
 /// The default 8.8.8.8 is unreachable on some networks (e.g. direct connections in mainland
@@ -304,7 +321,7 @@ async fn forward_to_upstream(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let upstream_socket = match UdpSocket::bind("0.0.0.0:0").await {
+        let upstream_socket = match UdpSocket::bind(bind_addr_for(&upstream_addr)).await {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -636,6 +653,17 @@ mod tests {
         assert_eq!(with_default_port("8.8.8.8:53"), "8.8.8.8:53");
     }
 
+    /// The socket that dials an upstream has to be of the upstream's family, or
+    /// every IPv6 resolver in the chain fails at `send_to` without a word.
+    #[test]
+    fn a_socket_is_bound_to_the_family_of_the_upstream_it_dials() {
+        assert_eq!(
+            bind_addr_for(&"192.168.1.1:53".parse().unwrap()),
+            "0.0.0.0:0"
+        );
+        assert_eq!(bind_addr_for(&"[fd00::1]:53".parse().unwrap()), "[::]:0");
+    }
+
     /// Asking an address this process answers on itself is a loop, not a lookup:
     /// the query would come straight back and be forwarded again.
     #[test]
@@ -678,6 +706,11 @@ mod tests {
                 "169.254.1.1".to_string(),
                 "0.0.0.0".to_string(),
                 "::".to_string(),
+                // What a Linux host running a local stub names in
+                // /etc/resolv.conf: the stub the hijack itself feeds.
+                "127.0.0.1".to_string(),
+                "127.0.0.53".to_string(),
+                "::1".to_string(),
                 "192.168.1.1".to_string(),
             ],
             &[],
