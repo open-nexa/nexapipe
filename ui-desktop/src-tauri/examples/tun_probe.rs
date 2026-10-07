@@ -30,10 +30,18 @@ mod windows_probe {
             .ok()?
             .parent()
             .map(|p| p.to_path_buf())?;
-        let arch = if cfg!(target_arch = "x86_64") { "amd64" } else { "x86" };
+        let arch = if cfg!(target_arch = "x86_64") {
+            "amd64"
+        } else {
+            "x86"
+        };
         [
             exe_dir.join("wintun.dll"),
-            exe_dir.join("wintun").join("bin").join(arch).join("wintun.dll"),
+            exe_dir
+                .join("wintun")
+                .join("bin")
+                .join(arch)
+                .join("wintun.dll"),
             PathBuf::from(
                 r"C:\Users\eason\rust\nexapipe\ui-desktop\src-tauri\target\debug\wintun.dll",
             ),
@@ -48,7 +56,13 @@ mod windows_probe {
 
     fn run_netsh(name: &str, args: &[&str]) -> std::io::Result<bool> {
         let mut cmd = std::process::Command::new("netsh");
-        cmd.args(["interface", "ip", "set", "address", &format!("name={}", name)]);
+        cmd.args([
+            "interface",
+            "ip",
+            "set",
+            "address",
+            &format!("name={}", name),
+        ]);
         cmd.args(args);
         let out = cmd.output()?;
         println!(
@@ -82,7 +96,9 @@ mod windows_probe {
         println!("  bind 10.0.0.1:0 -> {}", bind_check("10.0.0.1"));
         println!(
             "  bind 10.0.0.1:53 -> {:?}",
-            UdpSocket::bind("10.0.0.1:53").map(|_| "OK").map_err(|e| e.to_string())
+            UdpSocket::bind("10.0.0.1:53")
+                .map(|_| "OK")
+                .map_err(|e| e.to_string())
         );
 
         // Scenario B: the new command (no gateway)
@@ -92,7 +108,9 @@ mod windows_probe {
         println!("  bind 10.0.0.1:0 -> {}", bind_check("10.0.0.1"));
         println!(
             "  bind 10.0.0.1:53 -> {:?}",
-            UdpSocket::bind("10.0.0.1:53").map(|_| "OK").map_err(|e| e.to_string())
+            UdpSocket::bind("10.0.0.1:53")
+                .map(|_| "OK")
+                .map_err(|e| e.to_string())
         );
 
         // Scenario C: retry semantics (5 consecutive set + bind checks, simulating the new configure_interface)

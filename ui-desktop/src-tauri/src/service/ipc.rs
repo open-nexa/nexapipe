@@ -371,7 +371,9 @@ mod tests {
         second.two_factor_secret = Some("mfrggzdfmztwq2lk".to_string());
 
         let first = first.two_factor().expect("the first node has credentials");
-        let second = second.two_factor().expect("the second node has credentials");
+        let second = second
+            .two_factor()
+            .expect("the second node has credentials");
         assert_ne!(first.secret, second.secret);
         assert_eq!(first.algorithm, "sha256");
         assert_eq!(second.algorithm, "sha1");

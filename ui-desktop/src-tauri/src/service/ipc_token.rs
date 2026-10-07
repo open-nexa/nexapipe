@@ -87,7 +87,10 @@ pub fn ensure_token() -> Result<String, AppError> {
 /// [`ensure_token`] against an explicit path.
 pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
     let parent = path.parent().ok_or_else(|| {
-        AppError::with_detail(codes::SERVICE_IPC_TOKEN, "token path has no parent directory")
+        AppError::with_detail(
+            codes::SERVICE_IPC_TOKEN,
+            "token path has no parent directory",
+        )
     })?;
     std::fs::create_dir_all(parent).map_err(|e| {
         AppError::cause(
@@ -111,7 +114,10 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             let token = generate_token()?;
             write_private(path, &token).map_err(|e| {
-                AppError::cause(codes::SERVICE_IPC_TOKEN, format!("cannot write {path:?}: {e}"))
+                AppError::cause(
+                    codes::SERVICE_IPC_TOKEN,
+                    format!("cannot write {path:?}: {e}"),
+                )
             })?;
             Ok(token)
         }
@@ -481,9 +487,7 @@ fn permissions(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .ok()
-            .map(|m| m.permissions().mode())
+        std::fs::metadata(path).ok().map(|m| m.permissions().mode())
     }
     #[cfg(not(unix))]
     {
@@ -494,12 +498,12 @@ fn permissions(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::profile_roots_from;
     use super::{
         auth_mac, ensure_token_at, generate_token, proof_mac, proof_matches, random_nonce,
         read_token_at, service_token_paths, token_for_auth,
     };
-    #[cfg(windows)]
-    use super::profile_roots_from;
     #[cfg(not(windows))]
     use super::{unix_home_roots, unix_service_token_paths_from};
     use std::path::PathBuf;
@@ -559,7 +563,10 @@ mod tests {
         std::env::set_var(super::TOKEN_PATH_ENV, &path);
 
         let candidates = service_token_paths();
-        assert_eq!(candidates.first().map(PathBuf::as_path), Some(path.as_path()));
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(path.as_path())
+        );
         assert_eq!(
             super::read_tokens().unwrap().first().map(String::as_str),
             Some(token.as_str())
@@ -677,7 +684,12 @@ mod tests {
             "{candidates:?}"
         );
         assert!(
-            candidates.contains(&home.join(".cache").join(super::TOKEN_DIR).join(super::TOKEN_FILE)),
+            candidates.contains(
+                &home
+                    .join(".cache")
+                    .join(super::TOKEN_DIR)
+                    .join(super::TOKEN_FILE)
+            ),
             "{candidates:?}"
         );
 
@@ -717,7 +729,10 @@ mod tests {
         }
 
         let scanned = unix_service_token_paths_from(unix_home_roots());
-        let expected = home.join(".cache").join(super::TOKEN_DIR).join(super::TOKEN_FILE);
+        let expected = home
+            .join(".cache")
+            .join(super::TOKEN_DIR)
+            .join(super::TOKEN_FILE);
 
         assert!(
             scanned.contains(&expected),
@@ -750,7 +765,9 @@ mod tests {
         );
 
         assert!(
-            roots.iter().any(|root| root == std::path::Path::new(r"C:\Users")),
+            roots
+                .iter()
+                .any(|root| root == std::path::Path::new(r"C:\Users")),
             "the real profiles root must be a candidate: {roots:?}"
         );
         // The misleading one is still tried — it costs a directory scan and nothing else.

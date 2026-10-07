@@ -176,7 +176,11 @@ impl AppError {
         let detail = detail.into();
         Self {
             code: code.to_string(),
-            detail: if detail.is_empty() { None } else { Some(detail) },
+            detail: if detail.is_empty() {
+                None
+            } else {
+                Some(detail)
+            },
         }
     }
 
@@ -205,7 +209,10 @@ mod tests {
 
     #[test]
     fn empty_detail_is_dropped() {
-        assert_eq!(AppError::with_detail(codes::SERVICE_FAILED, "").detail, None);
+        assert_eq!(
+            AppError::with_detail(codes::SERVICE_FAILED, "").detail,
+            None
+        );
         assert_eq!(
             AppError::with_detail(codes::SERVICE_FAILED, "boom").detail,
             Some("boom".to_string())

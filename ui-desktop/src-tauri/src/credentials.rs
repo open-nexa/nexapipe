@@ -461,10 +461,7 @@ impl MasterKey {
         match parse_key(contents.trim()) {
             Some(key) => Some(key),
             None => {
-                tracing::warn!(
-                    "{} is not a 32-byte key; not replacing it",
-                    path.display()
-                );
+                tracing::warn!("{} is not a 32-byte key; not replacing it", path.display());
                 None
             }
         }
@@ -549,7 +546,9 @@ impl Store {
     /// Writes one credential, leaving the rest alone.
     fn put(&self, key: &str, value: &str) -> Result<(), AppError> {
         let mut entries = self.load()?;
-        entries.entries.insert(key.to_string(), self.encrypt(key, value)?);
+        entries
+            .entries
+            .insert(key.to_string(), self.encrypt(key, value)?);
         self.save(&entries)
     }
 
@@ -645,11 +644,11 @@ impl Store {
         let nonce = unhex(&body[..NONCE_LEN * 2])
             .and_then(|bytes| <[u8; NONCE_LEN]>::try_from(bytes).ok())
             .ok_or_else(|| {
-            AppError::with_detail(
-                codes::CREDENTIALS_STORE_FAILED,
-                format!("the entry for {key:?} has an unreadable nonce"),
-            )
-        })?;
+                AppError::with_detail(
+                    codes::CREDENTIALS_STORE_FAILED,
+                    format!("the entry for {key:?} has an unreadable nonce"),
+                )
+            })?;
         let sealed = unhex(&body[NONCE_LEN * 2..]).ok_or_else(|| {
             AppError::with_detail(
                 codes::CREDENTIALS_STORE_FAILED,
@@ -873,7 +872,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nexapipe-creds-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nexapipe-creds-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the scratch directory is created");
         dir
@@ -895,7 +895,10 @@ mod tests {
             .expect("the write succeeds");
 
         assert_eq!(
-            store.get("totp:node-1").expect("the read succeeds").as_deref(),
+            store
+                .get("totp:node-1")
+                .expect("the read succeeds")
+                .as_deref(),
             Some("JBSWY3DPEHPK3PXP")
         );
     }
@@ -925,7 +928,9 @@ mod tests {
     fn the_secret_is_not_in_the_file() {
         let (dir, store) = store("on-disk");
 
-        store.put("totp:node-1", "JBSWY3DPEHPK3PXP").expect("written");
+        store
+            .put("totp:node-1", "JBSWY3DPEHPK3PXP")
+            .expect("written");
 
         let raw = std::fs::read_to_string(dir.join(super::STORE_FILE)).expect("the file is there");
         assert!(!raw.contains("JBSWY3DPEHPK3PXP"), "{raw}");
@@ -992,7 +997,9 @@ mod tests {
         let (_dir, store) = store("foreign");
 
         assert!(store.decrypt("totp:node-1", "not-ours").is_err());
-        assert!(store.decrypt("totp:node-1", &format!("{ENTRY_PREFIX}zz")).is_err());
+        assert!(store
+            .decrypt("totp:node-1", &format!("{ENTRY_PREFIX}zz"))
+            .is_err());
     }
 
     #[test]
@@ -1142,7 +1149,10 @@ mod tests {
             super::secret_key(CredentialKind::EnrollmentToken, "node-1"),
             "enrollment:node-1"
         );
-        assert_eq!(super::secret_key(CredentialKind::RelayToken, "ignored"), "relay:global");
+        assert_eq!(
+            super::secret_key(CredentialKind::RelayToken, "ignored"),
+            "relay:global"
+        );
     }
 
     #[test]

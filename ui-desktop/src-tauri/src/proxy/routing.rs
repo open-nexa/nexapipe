@@ -1,4 +1,4 @@
-﻿//! Cross-platform TUN interface address and route management.
+//! Cross-platform TUN interface address and route management.
 //!
 //! After creating the TUN device, call `configure_interface` + `add_routes` to make the
 //! virtual subnet routable; call `remove_routes` on shutdown to clean up. Every command is
@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::process::Command;
 
 #[cfg(windows)]
-use crate::proxy::tun_proxy::{TUN_BASE_CANDIDATES, TUN_NETMASK, set_tun_base, tun_network};
+use crate::proxy::tun_proxy::{set_tun_base, tun_network, TUN_BASE_CANDIDATES, TUN_NETMASK};
 #[cfg(windows)]
 use std::net::Ipv4Addr;
 #[cfg(windows)]
@@ -197,11 +197,17 @@ pub fn remove_ipv6(interface: &str) -> Result<()> {
 /// interface gets no connected route for an address it was only just given.
 #[cfg(target_os = "macos")]
 fn configure_ipv6_macos(interface: &str) -> bool {
-    use crate::proxy::tun_proxy::{TUN_V6_BASE, TUN_V6_PREFIX_LEN, tun_v6_ip};
+    use crate::proxy::tun_proxy::{tun_v6_ip, TUN_V6_BASE, TUN_V6_PREFIX_LEN};
 
     let prefix = TUN_V6_PREFIX_LEN.to_string();
     let out = Command::new("ifconfig")
-        .args([interface, "inet6", &tun_v6_ip().to_string(), "prefixlen", &prefix])
+        .args([
+            interface,
+            "inet6",
+            &tun_v6_ip().to_string(),
+            "prefixlen",
+            &prefix,
+        ])
         .output();
     match out {
         Ok(out) if out.status.success() => {}
@@ -260,7 +266,7 @@ fn configure_ipv6_macos(interface: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn remove_ipv6_macos(interface: &str) -> Result<()> {
-    use crate::proxy::tun_proxy::{TUN_V6_BASE, TUN_V6_PREFIX_LEN, tun_v6_ip};
+    use crate::proxy::tun_proxy::{tun_v6_ip, TUN_V6_BASE, TUN_V6_PREFIX_LEN};
 
     let prefix = TUN_V6_PREFIX_LEN.to_string();
     let _ = Command::new("route")
@@ -288,7 +294,7 @@ fn remove_ipv6_macos(interface: &str) -> Result<()> {
 /// route itself, and the explicit replace covers the cases where it does not.
 #[cfg(target_os = "linux")]
 fn configure_ipv6_linux(interface: &str) -> bool {
-    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip, tun_v6_network};
+    use crate::proxy::tun_proxy::{tun_v6_ip, tun_v6_network, TUN_V6_PREFIX_LEN};
 
     let addr = format!("{}/{}", tun_v6_ip(), TUN_V6_PREFIX_LEN);
     let out = Command::new("ip")
@@ -335,7 +341,7 @@ fn configure_ipv6_linux(interface: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn remove_ipv6_linux(interface: &str) -> Result<()> {
-    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip};
+    use crate::proxy::tun_proxy::{tun_v6_ip, TUN_V6_PREFIX_LEN};
 
     let _ = Command::new("ip")
         .args([
@@ -356,7 +362,7 @@ fn remove_ipv6_linux(interface: &str) -> Result<()> {
 /// need a second unsafe call to ask the same question.
 #[cfg(windows)]
 fn configure_ipv6_windows(interface: &str) -> bool {
-    use crate::proxy::tun_proxy::{TUN_V6_PREFIX_LEN, tun_v6_ip};
+    use crate::proxy::tun_proxy::{tun_v6_ip, TUN_V6_PREFIX_LEN};
 
     let addr = tun_v6_ip().to_string();
     // Already there is success — every command here is idempotent.
@@ -478,7 +484,12 @@ fn configure_interface_windows(interface: &str) -> Result<()> {
         for attempt in 1..=3 {
             match assign_address_iphelper(interface, &ip) {
                 Ok(()) => {
-                    tracing::info!("IP Helper set {} on {} (attempt {})", ip, interface, attempt);
+                    tracing::info!(
+                        "IP Helper set {} on {} (attempt {})",
+                        ip,
+                        interface,
+                        attempt
+                    );
                     assigned = true;
                     break;
                 }
@@ -610,8 +621,8 @@ fn bindable(ip: &str) -> std::io::Result<()> {
 fn tun_block_collides(base: Ipv4Addr, tun_interface: &str) -> Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
 
@@ -798,8 +809,8 @@ fn delete_address_iphelper(interface: &str, ip: &str) {
 fn adapter_index_by_friendly_name(friendly: &str) -> Result<u32> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_SKIP_ANYCAST,
-        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
 

@@ -1,8 +1,8 @@
-﻿use crate::error::{codes, AppError};
+use crate::error::{codes, AppError};
 use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 use crate::proxy::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
-    StartError,
+    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ProxyNodeConfig, StartError,
 };
 use crate::service::ipc::{
     IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, BUILD_VERSION, IPC_SOCKET_PATH,
@@ -262,10 +262,8 @@ impl ServiceRunner {
                         tracing::warn!("Dropping an unauthenticated IPC client: {}", e);
                         break;
                     }
-                    let response = IpcResponse::Error(AppError::cause(
-                        codes::SERVICE_MALFORMED_REQUEST,
-                        e,
-                    ));
+                    let response =
+                        IpcResponse::Error(AppError::cause(codes::SERVICE_MALFORMED_REQUEST, e));
                     Self::write_response(reader.get_mut(), &response).await?;
                     continue;
                 }
@@ -278,10 +276,8 @@ impl ServiceRunner {
                         tracing::warn!("Dropping an unauthenticated IPC client: {}", e);
                         break;
                     }
-                    let response = IpcResponse::Error(AppError::cause(
-                        codes::SERVICE_MALFORMED_REQUEST,
-                        e,
-                    ));
+                    let response =
+                        IpcResponse::Error(AppError::cause(codes::SERVICE_MALFORMED_REQUEST, e));
                     Self::write_response(reader.get_mut(), &response).await?;
                     continue;
                 }
@@ -535,10 +531,7 @@ impl ServiceRunner {
         let load_balancing: ProxyLoadBalancingStrategy = match load_balancing.parse() {
             Ok(lb) => lb,
             Err(e) => {
-                return IpcResponse::Error(AppError::cause(
-                    codes::PROXY_INVALID_LOAD_BALANCING,
-                    e,
-                ))
+                return IpcResponse::Error(AppError::cause(codes::PROXY_INVALID_LOAD_BALANCING, e))
             }
         };
 
@@ -803,9 +796,9 @@ impl fmt::Display for IpcReadError {
 /// handed to either runner, and the service repeats it on its own side because
 /// a service binary built before that call existed may still be installed.
 pub fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
-    let parsed = addr.parse::<SocketAddr>().map_err(|e| {
-        AppError::cause(code, format!("{addr:?} is not a host:port address ({e})"))
-    })?;
+    let parsed = addr
+        .parse::<SocketAddr>()
+        .map_err(|e| AppError::cause(code, format!("{addr:?} is not a host:port address ({e})")))?;
     if parsed.ip().is_loopback() {
         Ok(())
     } else {
@@ -856,7 +849,7 @@ pub fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IpcReadError, ServiceRunner, MAX_IPC_LINE, require_loopback, require_tun_subnet};
+    use super::{require_loopback, require_tun_subnet, IpcReadError, ServiceRunner, MAX_IPC_LINE};
     use crate::error::codes;
 
     /// A caller that has not authenticated yet must not be able to make this
@@ -951,7 +944,10 @@ mod tests {
         .await
         .expect("the caller reads the reply");
 
-        assert!(read > 0, "the reply must arrive without waiting for a close");
+        assert!(
+            read > 0,
+            "the reply must arrive without waiting for a close"
+        );
         assert_eq!(line.trim(), "\"Ok\"");
     }
 

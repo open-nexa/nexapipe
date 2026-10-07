@@ -1,4 +1,4 @@
-﻿pub mod credentials;
+pub mod credentials;
 pub mod error;
 pub mod gate;
 mod proxy;
@@ -9,16 +9,16 @@ pub mod status;
 use error::{codes, AppError};
 use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use proxy::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
-    StartError,
+    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ProxyNodeConfig, StartError,
 };
+use serde::Serialize;
 use service::ipc::{IssuedCredentialPayload, NodeInput, StartProxyRequest};
 use service::platform::ServiceState;
 use service::IpcClient;
 use status::{
     ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus, FLOW_PAGE_LIMIT,
 };
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -112,7 +112,10 @@ pub fn service_log_dir() -> std::path::PathBuf {
 ///
 /// Logging is allowed to degrade to stdout when the directory or file cannot be created. A
 /// missing log file must never prevent either binary from starting.
-pub fn init_tracing_in(dir: std::path::PathBuf, prefix: &str) -> tracing_appender::non_blocking::WorkerGuard {
+pub fn init_tracing_in(
+    dir: std::path::PathBuf,
+    prefix: &str,
+) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -940,14 +943,16 @@ async fn take_issued_credential(
     // Cloned out of the lock first: the guard must not be held across the await below.
     let manager = PROXY_MANAGER.read().await.as_ref().cloned();
     Ok(match manager {
-        Some(manager) => manager
-            .take_issued_credential()
-            .await
-            .map(|credential| IssuedCredentialPayload {
-                client_id: credential.client_id,
-                secret: credential.secret,
-                algorithm: credential.algorithm,
-            }),
+        Some(manager) => {
+            manager
+                .take_issued_credential()
+                .await
+                .map(|credential| IssuedCredentialPayload {
+                    client_id: credential.client_id,
+                    secret: credential.secret,
+                    algorithm: credential.algorithm,
+                })
+        }
         None => None,
     })
 }
@@ -1154,7 +1159,10 @@ async fn get_logs(limit: Option<usize>, append: Option<bool>) -> Result<LogPage,
             path,
             offset: offset + consumed as u64,
         });
-        (lines.into_iter().map(String::from).collect::<Vec<_>>(), false)
+        (
+            lines.into_iter().map(String::from).collect::<Vec<_>>(),
+            false,
+        )
     } else {
         // Only read the tail so that large files are not loaded in full. When the window starts
         // mid-line, drop the partial first line instead of showing it as garbled output.
@@ -1436,9 +1444,10 @@ async fn unlock_credentials(
         // just said it.
         gate::Outcome::Refused => Err(AppError::new(codes::CREDENTIALS_LOCKED)),
         gate::Outcome::Unavailable => Err(AppError::new(codes::CREDENTIALS_GATE_UNAVAILABLE)),
-        gate::Outcome::Failed(detail) => {
-            Err(AppError::with_detail(codes::CREDENTIALS_GATE_FAILED, detail))
-        }
+        gate::Outcome::Failed(detail) => Err(AppError::with_detail(
+            codes::CREDENTIALS_GATE_FAILED,
+            detail,
+        )),
     }
 }
 
@@ -1774,9 +1783,14 @@ mod tests {
 
         let payload = parse_invite(invite.to_uri()).unwrap();
         assert_eq!(payload.kind, "ticket");
-        assert_eq!(payload.target_masked, credentials::mask(&target.to_string()));
+        assert_eq!(
+            payload.target_masked,
+            credentials::mask(&target.to_string())
+        );
         assert!(
-            !payload.target_masked.contains(&target.to_string()[8..target.to_string().len() - 8]),
+            !payload
+                .target_masked
+                .contains(&target.to_string()[8..target.to_string().len() - 8]),
             "the middle of the ticket must not reach the renderer"
         );
         assert!(payload.domains.is_empty());
@@ -1794,7 +1808,9 @@ mod tests {
         // What is *not* here is the point: a secret the renderer cannot show is
         // one it cannot leak, and `accept_invite` files it without asking.
         let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
-        let totp = json["totp"].as_object().expect("the 2FA block travels whole");
+        let totp = json["totp"]
+            .as_object()
+            .expect("the 2FA block travels whole");
         assert_eq!(totp["clientId"], "client-001");
         assert_eq!(totp["algorithm"], "sha1");
         assert!(
@@ -1815,9 +1831,14 @@ mod tests {
 
         let payload = parse_invite(invite.to_uri()).unwrap();
         let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
-        let totp = json["totp"].as_object().expect("the 2FA block travels whole");
+        let totp = json["totp"]
+            .as_object()
+            .expect("the 2FA block travels whole");
         assert_eq!(totp["clientId"], "client-001");
-        assert!(totp.get("client_id").is_none(), "keys must reach the UI as camelCase");
+        assert!(
+            totp.get("client_id").is_none(),
+            "keys must reach the UI as camelCase"
+        );
     }
 
     /// A registration invite carries a token instead of a secret, and the UI has to be able
@@ -1849,7 +1870,10 @@ mod tests {
         let error = parse_invite("https://example.com".to_string()).unwrap_err();
 
         assert_eq!(error.code, codes::INVITE_PARSE_FAILED);
-        assert!(error.detail.is_some(), "the parser's reason travels as detail");
+        assert!(
+            error.detail.is_some(),
+            "the parser's reason travels as detail"
+        );
     }
 
     #[test]
@@ -1857,7 +1881,10 @@ mod tests {
         let (lines, consumed) = complete_lines("one\ntwo\nthree");
 
         assert_eq!(lines, vec!["one", "two"]);
-        assert_eq!(consumed, 8, "only the bytes up to and including the last newline");
+        assert_eq!(
+            consumed, 8,
+            "only the bytes up to and including the last newline"
+        );
     }
 
     #[test]
