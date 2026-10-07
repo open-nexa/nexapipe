@@ -5,6 +5,10 @@ name: CI
 # jobs that used to live in the open-nexa/nexa-desktop / nexa-android repos.
 # Multi-platform builds are verified by release.yml when a tag is pushed.
 #
+# The container image is built here as well, without pushing: the Dockerfiles
+# and the job that publishes them only ever run from a tag, so this is the one
+# place a broken Dockerfile is caught before a release depends on it.
+#
 # The `test` job runs on Linux and macOS. Windows gets `windows-check`, a
 # `cargo check` of the root workspace: the integration tests spawn the built
 # binary, and the cfg(unix) halves of the config watcher and of shutdown have no
@@ -609,6 +613,60 @@ jobs:
             ui-android/app/build/reports/lint-results-debug.html
             ui-android/app/build/reports/lint-results-debug.xml
           if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Container image, build only: the mirror of the build-image job in
+  # release.yml with the push taken out. Same Dockerfiles, same runners,
+  # same platform list — only `push: false` differs, and no manifest is
+  # assembled, because there is nothing to publish.
+  # ------------------------------------------------------------------
+  build-image:
+    name: image ${{ matrix.arch }} (build only)
+    # Pull requests only: this is the check that runs before a tag exists. A
+    # push to main is already followed by the tag build that publishes the
+    # image, so building twice there only spends runner minutes.
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            # Native arm64 runner: Dockerfile compiles for the host triple, so
+            # an arm64 image needs an arm64 CPU (or QEMU over the whole build).
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+
+      # No docker/login-action: nothing is pushed, so no credentials are asked
+      # for — a pull request from a fork gets none either way.
+
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 @ 2026-02-12
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          # --load so the result can be started below instead of only compiled;
+          # provenance is off because an attestation manifest cannot be loaded
+          # into the local daemon.
+          provenance: false
+          load: true
+          tags: nexapipe:ci-${{ matrix.arch }}
+
+      # Compiling is not running: ENTRYPOINT is the binary itself, so --version
+      # is one process start in the image that a user would pull.
+      - name: Smoke test
+        run: docker run --rm "nexapipe:ci-${{ matrix.arch }}" --version
 
   # Optional: AI review. Nothing here runs until a key is configured.
   #

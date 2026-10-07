@@ -181,6 +181,21 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 reachable. Moving an existing deployment over is one command:
 `mkdir -p config && mv config.toml config/config.toml`.
 
+Published images are on GHCR (`linux/amd64` and `linux/arm64`), named the same
+as what `docker-compose.yaml` builds. To run one instead of building locally,
+pull it and start the stack **without** `--build` — `--build` rebuilds from the
+`Dockerfile` whatever is already there:
+
+```bash
+docker pull ghcr.io/open-nexa/nexapipe:latest
+docker compose up -d
+```
+
+Pinning a version instead of following it: replace `:latest` with a tag such as
+`:0.5.0` in both lines, or set `image:` in a `docker-compose.override.yml` so
+you are not editing a tracked file. `latest` only ever follows releases; a
+pre-release tag never takes it.
+
 #### Editing the config file
 
 The file is re-read every 5 seconds, so an edit needs no restart — but **run

@@ -163,6 +163,19 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
+镜像也已发布到 GHCR（`linux/amd64` 与 `linux/arm64`），名字与 `docker-compose.yaml`
+本地构建的产物相同。想直接运行官方镜像而不是本地构建，先拉取，然后**不要**加 `--build`
+启动 —— `--build` 会无视已有镜像，按 `Dockerfile` 重新构建：
+
+```bash
+docker pull ghcr.io/open-nexa/nexapipe:latest
+docker compose up -d
+```
+
+想锁定版本而不是跟随最新版：把两处的 `:latest` 换成 `:0.5.0` 这样的标签，或者在
+`docker-compose.override.yml` 里设置 `image:`，以免改动被版本跟踪的文件。`latest`
+只跟随正式发布，预发布标签不会占用它。
+
 #### 修改配置文件
 
 配置文件每 5 秒重新读取一次，改动无需重启 —— 但**凡是会写入这个文件的操作，
