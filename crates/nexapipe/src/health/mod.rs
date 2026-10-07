@@ -25,13 +25,48 @@ fn startup_jitter(interval: Duration) -> Duration {
     Duration::from_nanos(jitter)
 }
 
+/// What a probe does to decide whether a backend answers.
+///
+/// `Http` is the only mode that can answer a question, so it is the only one
+/// that gets asked one: `GET {health_path}`. Everything else gets a TCP
+/// connect, which is deliberately a smaller claim — it proves something is
+/// listening on the port, and it says nothing about whether the thing behind it
+/// works. A TLS listener accepts the connection and is then hung up on mid-
+/// handshake, and a UDP backend cannot be probed at all without speaking
+/// whatever protocol it serves, so a `udp`-only route gets no probe rather
+/// than a fake one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// `GET` the configured health path.
+    ///
+    /// The path belongs to this variant and not to the checker, because the TCP
+    /// probe has no use for one — carrying it alongside would be a field that
+    /// only means something half the time.
+    Http { path: String },
+    /// Connect, then close. Liveness, not health.
+    Tcp,
+}
+
+/// What one route wants probed: the pool its traffic goes through, and how to
+/// ask.
+///
+/// The two belong together because a probe is only worth running on the pool
+/// traffic actually uses, and only in the mode that pool's backends can answer.
+/// Carrying them separately is how a reload ends up asking the HTTP question of
+/// a backend that never speaks HTTP.
+#[derive(Debug, Clone)]
+pub struct ProbeTarget {
+    pub pool: Arc<BackendPool>,
+    pub kind: ProbeKind,
+}
+
 pub struct HealthChecker {
     backend_pool: Arc<BackendPool>,
     client: Arc<HttpClient>,
     interval: Duration,
     timeout: Duration,
     failure_threshold: usize,
-    health_path: String,
+    kind: ProbeKind,
     /// Shared with the config watcher so `[health_check] enabled` can be
     /// switched while the process runs: a probe already spawned outlives the
     /// reload that would otherwise have to cancel it, so it is paused instead.
@@ -49,7 +84,7 @@ impl HealthChecker {
         interval: Duration,
         timeout: Duration,
         failure_threshold: usize,
-        health_path: &str,
+        kind: ProbeKind,
         enabled: Arc<AtomicBool>,
     ) -> Self {
         HealthChecker {
@@ -58,7 +93,7 @@ impl HealthChecker {
             interval,
             timeout,
             failure_threshold: failure_threshold.max(1),
-            health_path: health_path.to_string(),
+            kind,
             failures: Mutex::new(HashMap::new()),
             enabled,
         }
@@ -156,7 +191,53 @@ impl HealthChecker {
     }
 
     async fn check_backend(&self, url: &str) -> bool {
-        let health_url = format!("{}{}", url, self.health_path);
+        match &self.kind {
+            ProbeKind::Http { path } => self.check_http(url, path).await,
+            ProbeKind::Tcp => self.check_tcp(url).await,
+        }
+    }
+
+    /// Connects and closes: is anything listening.
+    ///
+    /// The backend string is parsed with the same function the passthrough and
+    /// L4 paths dial with, so a probe cannot accept a backend the route itself
+    /// would fail to connect to — and cannot disagree with it about what the
+    /// address is.
+    async fn check_tcp(&self, url: &str) -> bool {
+        let Some((host, port)) = crate::passthrough::parse_backend_addr(url) else {
+            // A backend the route could never dial is not one that answered.
+            tracing::error!(
+                "Health check for {} cannot be dialled: not a host and a port",
+                url
+            );
+            return false;
+        };
+
+        match tokio::time::timeout(
+            self.timeout,
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            // Dropped straight away. Anything more would be speaking the
+            // protocol, which is the one thing this probe is not doing.
+            Ok(Ok(_stream)) => {
+                tracing::debug!("Backend {} accepted a connection", url);
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("Backend {} refused a connection: {}", url, e);
+                false
+            }
+            Err(_) => {
+                tracing::debug!("Backend {} did not answer a connection", url);
+                false
+            }
+        }
+    }
+
+    async fn check_http(&self, url: &str, health_path: &str) -> bool {
+        let health_url = format!("{}{}", url, health_path);
 
         // `health_path` comes from the config, and a character the URI parser
         // rejects used to panic here — which took the whole probe loop down
@@ -174,7 +255,7 @@ impl HealthChecker {
                 tracing::error!(
                     "Health check for {} cannot be built from path {:?}: {}",
                     url,
-                    self.health_path,
+                    health_path,
                     e
                 );
                 return false;
@@ -244,15 +325,18 @@ impl HealthProbes {
     /// one that changed its backends gets a new pool and therefore a new
     /// probe — the old task would otherwise outlive the process's interest in
     /// it, since nothing else owns it.
-    pub fn stop_stale(&mut self, wanted: &HashMap<String, Arc<BackendPool>>) {
+    pub fn stop_stale(&mut self, wanted: &HashMap<String, ProbeTarget>) {
+        let same_pool = |key: &String, pool: &Arc<BackendPool>| {
+            wanted
+                .get(key)
+                .is_some_and(|target| Arc::ptr_eq(&target.pool, pool))
+        };
         for (key, (pool, handle)) in self.running.iter() {
-            let still_wanted = wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool));
-            if !still_wanted {
+            if !same_pool(key, pool) {
                 handle.abort();
             }
         }
-        self.running
-            .retain(|key, (pool, _)| wanted.get(key).is_some_and(|live| Arc::ptr_eq(live, pool)));
+        self.running.retain(|key, (pool, _)| same_pool(key, pool));
     }
 
     /// Starts a probe and keeps its handle, so it can be stopped later.
@@ -292,8 +376,26 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(200),
             threshold,
-            "/health",
+            ProbeKind::Http {
+                path: "/health".to_string(),
+            },
             enabled,
+        )
+    }
+
+    /// A checker that asks a port instead of a path, over a pool the caller
+    /// built for it.
+    fn tcp_checker(pool: Arc<BackendPool>) -> HealthChecker {
+        HealthChecker::new(
+            pool,
+            Arc::new(http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
+            Duration::from_millis(10),
+            Duration::from_millis(500),
+            1,
+            ProbeKind::Tcp,
+            Arc::new(AtomicBool::new(true)),
         )
     }
 
@@ -302,6 +404,16 @@ mod tests {
             vec![DEAD_BACKEND.to_string()],
             LoadBalancingStrategy::RoundRobin,
         ))
+    }
+
+    fn target(pool: Arc<BackendPool>, kind: ProbeKind) -> ProbeTarget {
+        ProbeTarget { pool, kind }
+    }
+
+    fn http_probe() -> ProbeKind {
+        ProbeKind::Http {
+            path: "/health".to_string(),
+        }
     }
 
     async fn healthy(pool: &BackendPool, url: &str) -> bool {
@@ -330,7 +442,7 @@ mod tests {
 
         // The route is unchanged: same key, same pool, probe stays.
         let mut wanted = HashMap::new();
-        wanted.insert("key".to_string(), pool.clone());
+        wanted.insert("key".to_string(), target(pool.clone(), http_probe()));
         probes.stop_stale(&wanted);
         assert!(probes.contains("key"), "an unchanged route keeps its probe");
 
@@ -340,7 +452,7 @@ mod tests {
             vec!["http://10.0.0.9:8080".to_string()],
             LoadBalancingStrategy::RoundRobin,
         ));
-        wanted.insert("key".to_string(), rebuilt);
+        wanted.insert("key".to_string(), target(rebuilt, http_probe()));
         probes.stop_stale(&wanted);
         assert!(
             probes.is_empty(),
@@ -384,6 +496,61 @@ mod tests {
         // Reachable only through a direct call, but the guard is what keeps
         // `run()` from sleeping on an interval that is already zero.
         assert!(startup_jitter(Duration::ZERO).is_zero());
+    }
+
+    /// A passthrough or L4 backend answers no HTTP request, so the probe for one
+    /// is a connection: something listening is the whole claim it can make.
+    #[tokio::test]
+    async fn a_tcp_probe_reaches_a_port_that_is_listening() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local port needs no network");
+        let backend = listener.local_addr().unwrap().to_string();
+
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        tcp_checker(pool.clone()).check_all_backends().await;
+
+        assert!(
+            healthy(&pool, &backend).await,
+            "a port that accepted the connection answers"
+        );
+    }
+
+    /// The same probe against a port nothing listens on: `127.0.0.1:1` refuses
+    /// at once, so this needs no network either.
+    #[tokio::test]
+    async fn a_tcp_probe_fails_a_port_nothing_listens_on() {
+        let backend = "127.0.0.1:1".to_string();
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        tcp_checker(pool.clone()).check_all_backends().await;
+
+        assert!(
+            !healthy(&pool, &backend).await,
+            "a connection nobody accepted is not a backend that answered"
+        );
+    }
+
+    /// A backend string the route itself could not dial must fail the probe
+    /// rather than be skipped: failing is how it reaches the operator.
+    #[tokio::test]
+    async fn a_tcp_probe_fails_a_backend_that_is_not_an_address() {
+        let backend = "not a host and a port".to_string();
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        tcp_checker(pool.clone()).check_all_backends().await;
+
+        assert!(
+            !healthy(&pool, &backend).await,
+            "a backend that cannot be dialled has not answered"
+        );
     }
 
     #[tokio::test]
@@ -452,7 +619,9 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(200),
             1,
-            "/health check",
+            ProbeKind::Http {
+                path: "/health check".to_string(),
+            },
             Arc::new(AtomicBool::new(true)),
         );
 

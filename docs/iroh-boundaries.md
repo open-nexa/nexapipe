@@ -77,10 +77,15 @@ it fails outright when punching does not succeed.
 
 ## 3. What is left to do
 
-Running your own relay is possible today but is not yet a first-class
-deployment: no image, no compose file, no guide. That is roadmap item **R6**.
-Wiring the address filter so `custom` also bounds peer-advertised relays is the
-same shape of gap — the pieces exist, the wiring does not.
+Running your own relay is a documented deployment — see
+[Running your own relay](self-hosted-relay.md), which covers getting the relay
+server up and pointing both ends of a connection at it. It is not yet a
+packaged one: there is no official container image upstream, so what you get is
+a binary and whatever unit file, reverse proxy or firewall you put around it,
+and that guide has not been verified end to end by this project. That packaging
+gap is the rest of roadmap item **R6**. Wiring the address filter so `custom`
+also bounds peer-advertised relays is the same shape of gap — the pieces exist,
+the wiring does not.
 
 ## 4. Checking what your instance actually did
 
