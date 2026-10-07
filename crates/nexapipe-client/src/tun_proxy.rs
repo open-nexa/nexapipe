@@ -51,6 +51,7 @@
 
 use crate::ClientError;
 use crate::EndpointGroup;
+use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
 use crate::local_proxy::{handle_local_connection, should_proxy_domain};
 use crate::virtual_ip::IpMapping;
@@ -772,12 +773,16 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
         // of being dropped. DNS answers only live 60 s, so this is a short tail.
         // (Android only — the desktop never handed out a fixed proxy address.)
         if ctx.legacy_proxy_ip == Some(dest_ip) {
+            // Read before the stream moves: `client_addr_hint` needs it whole,
+            // and the flow this opens is listed with where it came from.
+            let peer = Some(client_addr_hint(&stream));
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_local_connection(
                     stream,
                     ctx.proxy_domains.clone(),
                     ctx.endpoint_group.clone(),
+                    peer,
                 )
                 .await
                 {
@@ -824,9 +829,13 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
 
     // One TCP flow is what an application would call a connection, so it is
     // what the counters call one: open until this task ends, whatever ends it.
-    let _flow = pooled.enter_flow();
-    let count_to_tunnel = pooled.clone();
-    let count_from_tunnel = pooled.clone();
+    let flow = pooled.enter_flow(FlowMeta {
+        kind: FlowKind::TunTcp,
+        target: Some(format!("{domain}:{port}")),
+        source: Some(client_addr_hint(&stream)),
+    });
+    let count_to_tunnel = flow.counter();
+    let count_from_tunnel = flow.counter();
 
     let (mut app_read, mut app_write) = tokio::io::split(stream);
 
@@ -898,6 +907,11 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
                 tokio::time::sleep(STOP_POLL_INTERVAL).await;
             }
         } => (),
+        // Asked to end, which is the fourth way out and the only one that is
+        // somebody's decision rather than something that happened to the socket.
+        // It lands here rather than anywhere else because this select is the
+        // only thing that owns both halves.
+        _ = flow.cancelled() => (),
     }
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,
@@ -932,6 +946,8 @@ enum Activity {
     Application(Option<Vec<u8>>),
     /// Bytes from the tunnel, or why it ended.
     Tunnel(Result<Option<usize>, String>),
+    /// Somebody asked for this flow to end. Neither side spoke.
+    Cancelled,
 }
 
 /// Write every datagram the proxy has for the application back into the stack.
@@ -1115,7 +1131,11 @@ async fn run_udp_flow(
     // rather than one per datagram. That is deliberately not the same unit as
     // the TCP one, and it is the honest one — an application holding a QUIC
     // socket open has one thing in flight, not thousands.
-    let _flow = pooled.enter_flow();
+    let flow = pooled.enter_flow(FlowMeta {
+        kind: FlowKind::TunUdp,
+        target: Some(format!("{domain}:{port}")),
+        source: Some(client_addr.to_string()),
+    });
 
     let mut read_buf = vec![0u8; MAX_UDP_PAYLOAD + FRAME_HEADER_LEN];
     // A bi-stream has no message boundaries, so a datagram can start in one read
@@ -1133,6 +1153,10 @@ async fn run_udp_flow(
                 read = tunnel_recv.read(&mut read_buf) => {
                     Activity::Tunnel(read.map_err(|e| e.to_string()))
                 }
+                // Asked to end. Inside the idle timeout with the other two,
+                // because silence in either direction is what ends a flow and a
+                // request to end one is just a third way of going quiet.
+                _ = flow.cancelled() => Activity::Cancelled,
             }
         })
         .await
@@ -1166,7 +1190,7 @@ async fn run_udp_flow(
                             jni_log!("[tun-proxy] UDP flow to {}:{} is gone", domain, port);
                             break;
                         }
-                        pooled.record_sent(datagram.len() as u64);
+                        flow.record_sent(datagram.len() as u64);
                     }
                     Err(e) => {
                         jni_log!(
@@ -1209,7 +1233,7 @@ async fn run_udp_flow(
                         tun_gone = true;
                         break;
                     }
-                    pooled.record_received(payload.len() as u64);
+                    flow.record_received(payload.len() as u64);
                     consumed += frame_len;
                 }
                 partial.drain(..consumed);
@@ -1223,6 +1247,15 @@ async fn run_udp_flow(
             }
             Activity::Tunnel(Err(e)) => {
                 jni_log!("[tun-proxy] UDP flow to {}:{} ended: {}", domain, port, e);
+                break;
+            }
+            Activity::Cancelled => {
+                jni_log!(
+                    "[tun-proxy] UDP flow {} -> {}:{} closed by request",
+                    client_addr,
+                    domain,
+                    port
+                );
                 break;
             }
         }
