@@ -175,6 +175,36 @@ export interface NodeTraffic {
 }
 
 /**
+ * Every node's counters added together.
+ *
+ * Nothing on the backend reports this — it is the sum of what `NodeTraffic` already carries, so
+ * the total on screen cannot disagree with the per-node figures beside it.
+ *
+ * `null` while there is nothing to add up, which is not the same as a total of zero: no counters
+ * have been read yet, and printing `0 B` would read as a tunnel that connects and moves nothing.
+ */
+export interface TrafficTotals {
+  sent: number;
+  received: number;
+  active: number;
+}
+
+/**
+ * Bytes per second in each direction, as two totals and a division.
+ *
+ * Deliberately computed here and not on the backend: the counters there are cumulative and
+ * deliberately hold no rate (see `crates/nexapipe-client/src/traffic.rs`), and every consumer
+ * already polls, so a second clock in Rust would have nothing to say that two samples do not.
+ *
+ * `up` is towards the backends, `down` is what comes back — the same direction [`NodeTraffic`]
+ * counts them in, so a total and a rate can be read side by side.
+ */
+export interface TrafficRate {
+  up: number;
+  down: number;
+}
+
+/**
  * The 2FA half of an invite *as it is shown*. Mirrors `InviteTotpPayload` in
  * `src-tauri/src/lib.rs`, which deliberately carries no secret: an invite is shown to be
  * recognised, and the secret stays a credential after the connection it authorises is set up.

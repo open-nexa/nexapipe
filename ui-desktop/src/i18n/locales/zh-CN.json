@@ -90,7 +90,9 @@
   "traffic": {
     "sent": "已发送",
     "received": "已接收",
-    "flows": "{count} 条连接"
+    "flows": "{count} 条连接",
+    "totalSent": "总发送",
+    "totalReceived": "总接收"
   },
   "connect": {
     "title": "连接",

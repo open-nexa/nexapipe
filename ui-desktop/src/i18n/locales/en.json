@@ -90,7 +90,9 @@
   "traffic": {
     "sent": "Sent",
     "received": "Received",
-    "flows": "{count} flows"
+    "flows": "{count} flows",
+    "totalSent": "Total sent",
+    "totalReceived": "Total received"
   },
   "connect": {
     "title": "Connect",
