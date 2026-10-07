@@ -22,6 +22,16 @@ description = "Enables the clear_credentials command without any pre-configured 
 commands.allow = ["clear_credentials"]
 
 [[permission]]
+identifier = "allow-close-flow"
+description = "Enables the close_flow command without any pre-configured scope."
+commands.allow = ["close_flow"]
+
+[[permission]]
+identifier = "allow-close-node-flows"
+description = "Enables the close_node_flows command without any pre-configured scope."
+commands.allow = ["close_node_flows"]
+
+[[permission]]
 identifier = "allow-clear-logs"
 description = "Enables the clear_logs command without any pre-configured scope."
 commands.allow = ["clear_logs"]
@@ -42,9 +52,19 @@ description = "Enables the delete_credential command without any pre-configured 
 commands.allow = ["delete_credential"]
 
 [[permission]]
+identifier = "allow-finish-quit"
+description = "Enables the finish_quit command without any pre-configured scope."
+commands.allow = ["finish_quit"]
+
+[[permission]]
 identifier = "allow-gate-status"
 description = "Enables the gate_status command without any pre-configured scope."
 commands.allow = ["gate_status"]
+
+[[permission]]
+identifier = "allow-get-active-flows"
+description = "Enables the get_active_flows command without any pre-configured scope."
+commands.allow = ["get_active_flows"]
 
 [[permission]]
 identifier = "allow-get-endpoint-links"

@@ -157,6 +157,78 @@ pub struct NodeTrafficStatus {
     pub active: u64,
 }
 
+/// How many open flows one `get_active_flows` answer carries at most.
+///
+/// The cap belongs to the payload rather than to the caller: a list is for a person, a browser
+/// opening two hundred sockets at once is ordinary, and a table with thousands of rows redrawn
+/// every few seconds is not a thing anyone can read. `ActiveFlowPage::total` still reports the
+/// real count, so nothing is hidden by it.
+pub const FLOW_PAGE_LIMIT: usize = 200;
+
+/// One connection the proxy has open right now, as a UI lists it.
+///
+/// The counterpart to [`NodeTrafficStatus`], which counts the same bytes added up per node:
+/// this is one row per *connection*, with the node it reaches named the same way a link and a
+/// health reading name theirs, so the two views can be lined up.
+///
+/// `kind` crosses as a string rather than an enum because the list of doors a flow can come in
+/// by is the client library's, and a second vocabulary for it in the shell would be a second
+/// place to change when one is added. See `nexapipe_client::flow::FlowKind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveFlow {
+    /// Stable while the flow is open, and never reused after it ends — so a row that is asked
+    /// to close is the row that was listed, not whichever one now sits at that index.
+    pub id: u64,
+    /// The ticket or endpoint ID exactly as the node was configured — see
+    /// [`EndpointLink::connection`]. `None` when the flow reaches a backend this configuration
+    /// does not name, which the UI shows by the endpoint ID alone rather than by dropping the
+    /// row.
+    pub connection: Option<String>,
+    /// The backend's endpoint ID.
+    pub endpoint_id: String,
+    /// Which door the bytes came in by: `http`, `connect`, `websocket`, `tls`, `tun_tcp`,
+    /// `tun_udp`.
+    pub kind: String,
+    /// Where they are going, as the client named it. `None` when it never said.
+    pub target: Option<String>,
+    /// Where they came from. `None` when the socket did not say.
+    pub source: Option<String>,
+    /// Whole seconds since the flow opened.
+    pub open_for_secs: u64,
+    /// Bytes this machine has put into the tunnel through this flow. Cumulative.
+    pub sent: u64,
+    /// Bytes that have come back through it. Cumulative.
+    pub received: u64,
+}
+
+/// The answer to `get_active_flows`.
+///
+/// `total` and `limit` come back with the rows rather than being left for the caller to infer,
+/// because the rows are capped: a UI that says "200 of 1 431" is telling the truth about a busy
+/// tunnel, and one that printed a round 200 would be quietly claiming otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveFlowPage {
+    pub flows: Vec<ActiveFlow>,
+    /// How many flows are open in total, which may be more than `flows.len()`.
+    pub total: usize,
+    /// The cap this page was read under — the caller's, echoed back so a page can say what it
+    /// was cropped to without keeping a second copy of the number.
+    pub limit: usize,
+}
+
+impl ActiveFlowPage {
+    /// Nothing open, and no cap worth naming: the answer when nothing is running.
+    pub fn empty() -> Self {
+        Self {
+            flows: Vec::new(),
+            total: 0,
+            limit: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +288,41 @@ mod tests {
             serde_json::to_string(&health).unwrap(),
             r#"{"connection":"node1ticket","reachable":false,"consecutiveFailures":3,"downForSecs":90,"sinceLastProbeSecs":null}"#
         );
+    }
+
+    /// The frontend groups rows by `connection`, reads `id` back when it asks for one to be
+    /// closed, and reads the two `Option`s as `string | null` — so the camelCase keys and the
+    /// `null`s both have to hold.
+    #[test]
+    fn serializes_active_flows() {
+        let page = ActiveFlowPage {
+            flows: vec![ActiveFlow {
+                id: 7,
+                connection: Some("node1ticket".to_string()),
+                endpoint_id: "0123456789abcdef".to_string(),
+                kind: "connect".to_string(),
+                target: Some("example.com:443".to_string()),
+                source: None,
+                open_for_secs: 90,
+                sent: 1_048_576,
+                received: 512,
+            }],
+            total: 431,
+            limit: 200,
+        };
+        assert_eq!(
+            serde_json::to_string(&page).unwrap(),
+            r#"{"flows":[{"id":7,"connection":"node1ticket","endpointId":"0123456789abcdef","kind":"connect","target":"example.com:443","source":null,"openForSecs":90,"sent":1048576,"received":512}],"total":431,"limit":200}"#
+        );
+    }
+
+    /// A page with nothing in it still says how many there were and what the cap was: a UI that
+    /// read `0` as "no reading" would draw "no connections" over a backend it never asked.
+    #[test]
+    fn an_empty_page_is_not_the_same_as_no_reading() {
+        let page = ActiveFlowPage::empty();
+        assert_eq!(page.total, 0);
+        assert!(page.flows.is_empty());
     }
 
     /// The frontend pairs a volume with a link and a health reading by `connection`, and reads

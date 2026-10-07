@@ -22,6 +22,7 @@ import { errorKey } from '../api/errors';
 import { confirm } from '../composables/useConfirm';
 import { useToast } from '../composables/useToast';
 import { writeClipboardText } from '../utils/clipboard';
+import { formatBytes, formatRate } from '../utils/format';
 import { useConfigStore } from '../stores/config';
 import { useCredentialGate } from '../stores/gate';
 import { useProxyStore } from '../stores/proxy';
@@ -41,6 +42,8 @@ const {
   endpointLinks,
   stale,
   canStart,
+  totals,
+  rate,
   start,
   stop,
   refreshServiceRunning,
@@ -215,6 +218,35 @@ async function copyNodeId(): Promise<void> {
       </span>
     </div>
 
+    <!--
+      What the tunnel has carried in total, and how fast it is carrying it right now.
+
+      Only while there is something to add up: `totals` is null until the counters have been read,
+      and "not read yet" is not the same as "read, and the answer is zero" — a row of zeroes drawn
+      before the first byte moved reads as a tunnel that connects and forwards nothing.
+
+      The rate is its own condition because it needs two readings, not one: the first poll of a
+      run has nothing to divide against, and saying `0 B/s` then is the same lie in the other
+      direction.
+    -->
+    <div v-if="totals" class="proxy-status__traffic">
+      <span class="traffic-figure traffic-figure--sent">
+        <AppIcon name="arrow-up" :size="13" />
+        <span class="traffic-figure__label">{{ t('traffic.totalSent') }}</span>
+        <span class="traffic-figure__value">{{ formatBytes(totals.sent) }}</span>
+        <span v-if="rate" class="traffic-figure__rate">{{ formatRate(rate.up) }}</span>
+      </span>
+
+      <span class="traffic-figure traffic-figure--received">
+        <AppIcon name="arrow-down" :size="13" />
+        <span class="traffic-figure__label">{{ t('traffic.totalReceived') }}</span>
+        <span class="traffic-figure__value">{{ formatBytes(totals.received) }}</span>
+        <span v-if="rate" class="traffic-figure__rate">{{ formatRate(rate.down) }}</span>
+      </span>
+
+      <span class="pill pill--flows">{{ t('traffic.flows', { count: totals.active }) }}</span>
+    </div>
+
     <div v-if="nodeId" class="proxy-status__node">
       <span class="proxy-status__label">{{ t('connect.nodeId') }}</span>
       <code class="proxy-status__value">{{ nodeId }}</code>
@@ -302,6 +334,11 @@ async function copyNodeId(): Promise<void> {
 
 .proxy-status__ring.starting .proxy-status__dot {
   background: var(--accent);
+  /* Promoted to its own layer, for the same reason as the button spinner in
+     AppButton.vue: a dot whose scale and opacity are recalculated by the main
+     thread is the first thing to stall once the status poll re-renders the
+     panel around it, which leaves a starting indicator that sits still. */
+  will-change: transform, opacity;
   animation: proxy-status-pulse 1.5s ease-in-out infinite;
 }
 
@@ -314,6 +351,35 @@ async function copyNodeId(): Promise<void> {
   50% {
     transform: scale(1.2);
     opacity: 0.7;
+  }
+}
+
+/* What "still working" looks like when the surroundings must not move. Scaling
+   is the part Reduce Motion exists to suppress, so this swaps in a breath that
+   changes nothing but opacity: no size, no position, no reflow of the ring
+   around it, and still visibly doing something. */
+@keyframes proxy-status-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The blanket stop in base.css stills this dot too, leaving a starting proxy to
+   be told apart from a stuck one by reading the text next to it. What is kept
+   here is not information — "Starting" is already spelled out beside the ring —
+   but the difference between a dot that is working and one that has given up,
+   which is the same reason the button's spinner keeps turning. Only the name
+   changes; `!important` is what answers the `!important` on the universal rule,
+   and the scoped selector is what outranks it. */
+@media (prefers-reduced-motion: reduce) {
+  .proxy-status__ring.starting .proxy-status__dot {
+    animation-name: proxy-status-breathe !important;
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 
@@ -378,6 +444,54 @@ async function copyNodeId(): Promise<void> {
 .pill--mixed {
   background: var(--bg-inset);
   color: var(--text-secondary);
+}
+
+/* Pushed to the trailing edge of the traffic row: it is the only figure there that is a count,
+   and it reads as a summary of the two beside it rather than as a third of the same kind. */
+.pill--flows {
+  margin-left: auto;
+}
+
+.proxy-status__traffic {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+/* The same two colours the node list on the Connect page uses for the same two directions, so
+   "sent" is the same colour everywhere it appears. */
+.traffic-figure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--font-size-12);
+}
+
+.traffic-figure--sent {
+  color: var(--warning-text);
+}
+
+.traffic-figure--received {
+  color: var(--accent-text);
+}
+
+/* Monospace and tabular so successive polls do not shift the row as digits change width. */
+.traffic-figure__value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-13);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.traffic-figure__rate {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
 }
 
 .proxy-status__node {

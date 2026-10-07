@@ -1,6 +1,7 @@
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
+use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
 use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
@@ -49,6 +50,11 @@ pub struct PooledConnection {
     /// standing on its own — the two are set together and absent together,
     /// because neither means anything about a node nobody is tracking.
     traffic: Option<Arc<NodeTraffic>>,
+    /// Where the flows opened through this connection are listed. Set and absent
+    /// together with `traffic`, for the same reason: neither means anything about
+    /// a node nobody is tracking, and a flow that is counted but not listed is a
+    /// list with a hole in it.
+    flows: Option<Arc<FlowRegistry>>,
 }
 
 impl PooledConnection {
@@ -58,6 +64,7 @@ impl PooledConnection {
             pool_index,
             node: None,
             traffic: None,
+            flows: None,
         }
     }
 
@@ -67,12 +74,14 @@ impl PooledConnection {
         pool_index: usize,
         node: EndpointId,
         traffic: TrafficTable,
+        flows: Arc<FlowRegistry>,
     ) -> Self {
         Self {
             conn,
             pool_index,
             node: Some(node),
             traffic: Some(traffic::of(&traffic, node)),
+            flows: Some(flows),
         }
     }
 
@@ -99,16 +108,26 @@ impl PooledConnection {
 
     /// Holds one flow through this connection open until the guard is dropped.
     ///
-    /// `None` for a connection nobody is tracking, so the caller holding it has
-    /// nothing to count and nothing to forget.
+    /// `meta` is what the caller knows about the flow and this connection does
+    /// not: which door the bytes came in by, and — having read the client's
+    /// request far enough to know — where they are going. It is read once here
+    /// and never again, which is why it is not something the copy loop carries.
     ///
     /// The guard is why this returns a value at all: a flow ends on EOF, on any
-    /// of several errors, or on being cancelled because the proxy stopped, and
-    /// only `Drop` covers all of them. See [`Flow`].
-    pub fn enter_flow(&self) -> Option<Flow> {
-        self.traffic
-            .as_ref()
-            .map(|traffic| Flow::open(traffic.clone()))
+    /// of several errors, on being cancelled because the proxy stopped, and on
+    /// being asked to end, and only `Drop` covers all of them. See [`Flow`].
+    ///
+    /// A flow on a connection nobody is tracking is still returned, and still
+    /// counts itself out on drop — the caller cannot tell, and does not have to:
+    /// recording through a guard with nothing behind it already does nothing,
+    /// exactly as [`Self::record_sent`] does for an untracked connection.
+    pub fn enter_flow(&self, meta: FlowMeta) -> Flow {
+        match (&self.traffic, &self.flows, self.node) {
+            (Some(traffic), Some(flows), Some(node)) => {
+                Flow::listed(traffic.clone(), flows, node, meta)
+            }
+            _ => Flow::open(self.traffic.clone().unwrap_or_default()),
+        }
     }
 
     /// The node this connection reaches, when somebody is tracking it.
@@ -227,6 +246,10 @@ pub struct DomainPools {
     /// Same sharing, same reason: a backend is charged by whoever served it,
     /// so its counters live with the group and not with this domain.
     traffic: TrafficTable,
+    /// Where the flows opened through these pools are listed. Shared with the
+    /// group for the same reason the traffic table is: one backend's flows are
+    /// one fact, and a domain is only ever a subset of the backends.
+    flows: Arc<FlowRegistry>,
 }
 
 impl DomainPools {
@@ -235,6 +258,7 @@ impl DomainPools {
         strategy: LoadBalancingStrategy,
         health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
         traffic: TrafficTable,
+        flows: Arc<FlowRegistry>,
     ) -> Self {
         let balancer: Box<dyn LoadBalancer + Sync + Send> = match strategy {
             LoadBalancingStrategy::RoundRobin => Box::new(RoundRobinBalancer::new()),
@@ -245,6 +269,7 @@ impl DomainPools {
             balancer,
             health,
             traffic,
+            flows,
         }
     }
 
@@ -336,6 +361,7 @@ impl DomainPools {
                 index,
                 backend_id,
                 self.traffic.clone(),
+                self.flows.clone(),
             )),
             Err(e @ ClientError::InvalidConfig(_)) => Err(e),
             Err(e) => {
@@ -390,6 +416,14 @@ pub struct EndpointGroup {
     /// Shared rather than owned so a connection can carry the one entry it is
     /// meant to charge. See [`crate::traffic`].
     traffic: TrafficTable,
+    /// The flows this group has open right now.
+    ///
+    /// Beside the traffic table rather than inside it because the two answer
+    /// different questions at different depths: one counts bytes per backend,
+    /// the other lists connections, and a reader wanting the list is not a
+    /// reader wanting the totals. Shared so a connection can list the flows it
+    /// opens. See [`crate::flow`].
+    flows: Arc<FlowRegistry>,
     /// Set for good by [`Self::close_all`], and read by the probe before it
     /// dials anything.
     ///
@@ -589,6 +623,7 @@ impl EndpointGroup {
         // per backend, not one per domain, so it cannot live inside a pool.
         let health = Arc::new(Mutex::new(HashMap::new()));
         let traffic = traffic::table();
+        let flows = traffic::flow_registry();
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
@@ -607,6 +642,7 @@ impl EndpointGroup {
                     default_strategy,
                     health.clone(),
                     traffic.clone(),
+                    flows.clone(),
                 ));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
@@ -628,6 +664,7 @@ impl EndpointGroup {
                 default_strategy,
                 health.clone(),
                 traffic.clone(),
+                flows.clone(),
             )))
         } else {
             None
@@ -638,6 +675,7 @@ impl EndpointGroup {
             default_pools,
             health,
             traffic,
+            flows,
             probe_stopped: AtomicBool::new(false),
         })
     }
@@ -710,6 +748,7 @@ impl EndpointGroup {
         // per backend, not one per domain, so it cannot live inside a pool.
         let health = Arc::new(Mutex::new(HashMap::new()));
         let traffic = traffic::table();
+        let flows = traffic::flow_registry();
 
         let mut domains = HashMap::new();
         for (domain, keys) in domain_to_keys {
@@ -728,6 +767,7 @@ impl EndpointGroup {
                     default_strategy,
                     health.clone(),
                     traffic.clone(),
+                    flows.clone(),
                 ));
                 domains.insert(domain.clone(), domain_pools);
                 jni_log!(
@@ -749,6 +789,7 @@ impl EndpointGroup {
                 default_strategy,
                 health.clone(),
                 traffic.clone(),
+                flows.clone(),
             )))
         } else {
             None
@@ -759,6 +800,7 @@ impl EndpointGroup {
             default_pools,
             health,
             traffic,
+            flows,
             probe_stopped: AtomicBool::new(false),
         })
     }
@@ -766,17 +808,20 @@ impl EndpointGroup {
     pub async fn new_with_single_pool(conn_pool: IrohConnectionPool) -> Self {
         let health = Arc::new(Mutex::new(HashMap::new()));
         let traffic = traffic::table();
+        let flows = traffic::flow_registry();
         let default_pools = Some(Arc::new(DomainPools::new(
             vec![Arc::new(conn_pool)],
             LoadBalancingStrategy::RoundRobin,
             health.clone(),
             traffic.clone(),
+            flows.clone(),
         )));
         Self {
             domains: HashMap::new(),
             default_pools,
             health,
             traffic,
+            flows,
             probe_stopped: AtomicBool::new(false),
         }
     }
@@ -1242,6 +1287,62 @@ impl EndpointGroup {
     /// per-node figures has to say rather than leave looking like "down".
     pub fn traffic_snapshot(&self) -> HashMap<EndpointId, NodeVolume> {
         traffic::snapshot(&self.traffic)
+    }
+
+    /// The flows this group has open right now, and how many there are in total.
+    ///
+    /// The count comes back alongside the list rather than being implied by it
+    /// because the list is capped — a UI that says "200 of 1 431" is saying
+    /// something true, and one that said "200" would be quietly lying about how
+    /// busy the tunnel is.
+    ///
+    /// `limit` is the caller's, not the registry's: only a reader knows how many
+    /// rows it can draw, and a fixed cap here would be a second opinion about
+    /// somebody else's screen.
+    pub fn flow_snapshot(&self, limit: usize) -> (usize, Vec<FlowView>) {
+        (self.flows.len(), self.flows.view(limit))
+    }
+
+    /// Asks one flow to end.
+    ///
+    /// `false` when there is no open flow with that id, which covers both "no
+    /// such flow" and "it ended while you were reading the list" — a UI polling
+    /// every few seconds will sometimes click on a row that has already gone, and
+    /// the honest answer is that nothing was asked rather than an error.
+    ///
+    /// Nothing is removed here. The flow lets go of its own sockets and then
+    /// deregisters itself, so a list read immediately afterwards may still show
+    /// it for a moment.
+    pub fn close_flow(&self, id: FlowId) -> bool {
+        self.flows.close(id)
+    }
+
+    /// Asks every flow reaching `node` to end, and drops the connections the
+    /// pool was keeping for it.
+    ///
+    /// The connections as well as the flows, because they are not the same
+    /// thing: a pool holds idle connections that no flow is using, and ending
+    /// the flows while leaving those behind is how a backend that has gone bad
+    /// keeps getting handed out. See [`IrohConnectionPool::drop_connections`].
+    ///
+    /// Returns how many flows were asked, which is the number a UI can show.
+    ///
+    /// The flows are asked first and the pool is dropped second, and the gap between the two is
+    /// accepted rather than waited out: a flow that is still winding down has its connection
+    /// checked out, so the drop does not reach it, and the one it hands back a moment later goes
+    /// back into the pool. Waiting for every copy loop to notice it has been cancelled would mean
+    /// putting a sleep in the middle of a click — and a connection that was carrying traffic a
+    /// moment ago is not the stale one this is meant to clear.
+    pub async fn close_node_flows(&self, node: &EndpointId) -> usize {
+        let asked = self.flows.close_node(node);
+
+        for (backend_id, pool) in self.unique_pools() {
+            if &backend_id == node {
+                pool.drop_connections().await;
+            }
+        }
+
+        asked
     }
 
     /// How traffic is currently reaching each backend: direct, or via a relay.

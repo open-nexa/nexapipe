@@ -6,6 +6,7 @@ pub mod client;
 pub mod connection_pool;
 pub mod endpoint_group;
 pub mod error;
+pub mod flow;
 pub mod http;
 pub mod lb;
 pub mod provisioning;
@@ -48,6 +49,7 @@ pub use endpoint_group::{
     DomainMapping, EndpointGroup, NodeConfig, PooledConnection, PreconnectReport,
 };
 pub use error::ClientError;
+pub use flow::{FlowId, FlowKind, FlowRegistry, FlowView};
 pub use http::{HttpRequest, HttpResponse};
 pub use lb::LoadBalancingStrategy;
 pub use provisioning::{EndpointInvite, EndpointTarget, InviteTotp};

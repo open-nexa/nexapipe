@@ -12,13 +12,31 @@
  * `main.ts` before the first paint, so there is nothing left to inject by the time this component
  * mounts.
  */
+import { onBeforeUnmount, onMounted } from 'vue';
 import AppDialog from '../../components/base/AppDialog.vue';
 import ContextMenu from '../../components/base/ContextMenu.vue';
 import CredentialPasswordDialog from '../../components/CredentialPasswordDialog.vue';
 import ToastHost from '../../components/base/ToastHost.vue';
 import { useConfirmState } from '../../composables/useConfirm';
+import { initQuitGuard } from '../../composables/useQuitGuard';
 
 const { request, settle } = useConfirmState();
+
+/**
+ * The quit guard lives here rather than in the shell because this is the component that owns the
+ * dialog it asks through, and because nothing it needs depends on the route: whatever page is on
+ * screen, leaving has to be offered the same question.
+ */
+let disposeGuard: (() => void) | null = null;
+
+onMounted(async () => {
+  disposeGuard = await initQuitGuard();
+});
+
+onBeforeUnmount(() => {
+  disposeGuard?.();
+  disposeGuard = null;
+});
 </script>
 
 <template>

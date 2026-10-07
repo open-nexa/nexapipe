@@ -1,6 +1,7 @@
 use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
+use crate::flow::{FlowKind, FlowMeta};
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
@@ -287,6 +288,11 @@ impl LocalProxy {
 
                     let proxy_domains_clone = proxy_domains.clone();
                     let endpoint_group_clone = endpoint_group.clone();
+                    // Named here rather than inside the handler, where it is not
+                    // known: a flow listed without where it came from is a row
+                    // with a hole in it, and the socket that accepted it is the
+                    // only thing that ever knows.
+                    let peer = Some(addr.to_string());
 
                     let handle = tokio::spawn(async move {
                         // Released when the task ends, however it ends: this is
@@ -297,6 +303,7 @@ impl LocalProxy {
                             stream,
                             proxy_domains_clone,
                             endpoint_group_clone,
+                            peer,
                         )
                         .await
                         {
@@ -592,6 +599,10 @@ pub(crate) async fn handle_local_connection<S>(
     mut stream: S,
     proxy_domains: Arc<Vec<String>>,
     endpoint_group: Arc<EndpointGroup>,
+    // Where the bytes came from, as whatever accepted the socket named it.
+    // `None` when the caller has no address to give — a stream that was never
+    // a socket, or a caller that never saw one.
+    peer: Option<String>,
 ) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -628,7 +639,7 @@ where
     // Check if this is a TLS connection (ClientHello starts with 0x16 = Handshake content type)
     if !request_buf.is_empty() && request_buf[0] == 0x16 {
         jni_log!("[DEBUG:local-proxy] Detected TLS ClientHello, handling as raw tunnel via SNI");
-        return handle_tls_tunnel(stream, request_buf, endpoint_group, proxy_domains).await;
+        return handle_tls_tunnel(stream, request_buf, endpoint_group, proxy_domains, peer).await;
     }
 
     // Step 2: HTTP — read the complete request header (up to \r\n\r\n)
@@ -755,9 +766,18 @@ where
         // One tunnel is one flow for as long as this handler lives, however it
         // ends: EOF, either direction failing, or this task being cancelled
         // because the proxy stopped.
-        let _flow = pooled_conn.enter_flow();
-        let count_to_backend = pooled_conn.clone();
-        let count_from_backend = pooled_conn.clone();
+        //
+        // The counters are the *flow's* rather than the connection's, which is
+        // what lets a reader ask how much this connection has moved as opposed
+        // to how much the backend has. Two halves of one copy loop each carry a
+        // clone of the same guard, so the two directions land in one total.
+        let flow = pooled_conn.enter_flow(FlowMeta {
+            kind: FlowKind::Connect,
+            target: Some(format!("{host}:{port}")),
+            source: peer.clone(),
+        });
+        let count_to_backend = flow.counter();
+        let count_from_backend = flow.counter();
 
         let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write
@@ -828,8 +848,12 @@ where
         tokio::select! {
             _ = &mut client_task => (),
             _ = &mut backend_task => (),
+            _ = flow.cancelled() => (),
         }
 
+        // Both, whichever branch won: the half that is still running is the one
+        // that outlived its reason to, and the `TunnelTasks` guard above aborts
+        // whatever is left when this handler returns.
         client_task.abort();
         backend_task.abort();
 
@@ -917,10 +941,14 @@ where
 
                 // One tunnel is one flow, and it stays counted until the
                 // handler this sits in returns — see the CONNECT branch.
-                let _flow = pooled_conn.enter_flow();
-                pooled_conn.record_sent(request_to_send.len() as u64);
-                let count_to_backend = pooled_conn.clone();
-                let count_from_backend = pooled_conn.clone();
+                let flow = pooled_conn.enter_flow(FlowMeta {
+                    kind: FlowKind::WebSocket,
+                    target: Some(host.clone()),
+                    source: peer.clone(),
+                });
+                flow.record_sent(request_to_send.len() as u64);
+                let count_to_backend = flow.counter();
+                let count_from_backend = flow.counter();
 
                 let (mut client_read, mut client_write) = tokio::io::split(stream);
                 jni_log!(
@@ -1044,6 +1072,9 @@ where
                     result = &mut backend_task => {
                         ("iroh_to_client", result.unwrap_or("backend_task_panicked"))
                     }
+                    // Asked to end: not an error, and not one of the two
+                    // directions going quiet either.
+                    _ = flow.cancelled() => ("closed", "closed_by_request"),
                 };
 
                 if closed_direction == "client_to_iroh" {
@@ -1084,10 +1115,14 @@ where
     // arrived — before this line was reached. Counting the copy loop alone
     // would therefore be counting everything except a large upload, which for
     // a POST is most of it.
-    let _flow = pooled_conn.enter_flow();
-    pooled_conn.record_sent(request_to_send.len() as u64);
-    let count_to_backend = pooled_conn.clone();
-    let count_from_backend = pooled_conn.clone();
+    let flow = pooled_conn.enter_flow(FlowMeta {
+        kind: FlowKind::Http,
+        target: Some(host.clone()),
+        source: peer.clone(),
+    });
+    flow.record_sent(request_to_send.len() as u64);
+    let count_to_backend = flow.counter();
+    let count_from_backend = flow.counter();
 
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
@@ -1195,7 +1230,13 @@ where
     // would block indefinitely and the iroh connection would never be returned
     // to the pool -- which defeats pre-connect/connection warm-up and leaks
     // pooled connections.
-    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(60), &mut backend_task).await;
+    // The timer and the cancel switch, together: this is the one path here that
+    // is bounded by a clock instead of by a peer going quiet, and being asked to
+    // end has to be able to cut that short rather than wait out the minute.
+    tokio::select! {
+        _ = tokio::time::timeout(tokio::time::Duration::from_secs(60), &mut backend_task) => (),
+        _ = flow.cancelled() => (),
+    }
 
     // Response has been delivered; stop the client->backend relay so the pooled
     // iroh connection is released immediately. Aborting also closes the client
@@ -1220,6 +1261,8 @@ pub(crate) async fn handle_tls_tunnel<S>(
     initial_data: Vec<u8>,
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
+    // Where the bytes came from; see `handle_local_connection`.
+    peer: Option<String>,
 ) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1279,10 +1322,14 @@ where
 
     // Same accounting as the HTTP path: the helper already wrote the
     // ClientHello it was handed.
-    let _flow = pooled_conn.enter_flow();
-    pooled_conn.record_sent(data.len() as u64);
-    let count_to_backend = pooled_conn.clone();
-    let count_from_backend = pooled_conn.clone();
+    let flow = pooled_conn.enter_flow(FlowMeta {
+        kind: FlowKind::TlsPassthrough,
+        target: Some(sni.clone()),
+        source: peer.clone(),
+    });
+    flow.record_sent(data.len() as u64);
+    let count_to_backend = flow.counter();
+    let count_from_backend = flow.counter();
 
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
@@ -1341,6 +1388,7 @@ where
     tokio::select! {
         _ = client_to_iroh => (),
         _ = iroh_to_client => (),
+        _ = flow.cancelled() => (),
     }
 
     endpoint_group.return_connection(&sni, pooled_conn).await;

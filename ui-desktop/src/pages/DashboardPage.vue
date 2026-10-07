@@ -5,6 +5,7 @@ import ProxyStatusControl from "../components/ProxyStatusControl.vue";
 import AppIcon from "../components/base/AppIcon.vue";
 import { useConfigStore } from "../stores/config";
 import { useProxyStore } from "../stores/proxy";
+import { formatBytes } from "../utils/format";
 import type { LinkKind, NodeConfig, NodeHealth, NodeTraffic } from "../types";
 
 const { t } = useI18n();
@@ -112,29 +113,6 @@ function healthLabel(health: NodeHealth): string {
  * which is why nothing below draws a zero for one.
  */
 const nodeRows = computed(() => nodes.value.map((node) => ({ node, traffic: trafficFor(node) })));
-
-/**
- * Bytes, at the largest unit that still leaves something to say.
- *
- * Binary units and not decimal ones — this is memory-and-wire arithmetic, and a MiB is what both
- * ends mean by it. Three digits before the comma is enough: a figure nobody is going to compare
- * byte for byte does not need five significant ones.
- */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-
-  const units = ["KiB", "MiB", "GiB", "TiB"];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  // One decimal while the number is small enough for it to mean something, whole otherwise: the
-  // row has room for 3.4 MiB and none for 34.5678 MiB.
-  const scaled = value < 100 ? value.toFixed(1) : Math.round(value).toString();
-  return `${scaled} ${units[unit]}`;
-}
 
 /** "3 flows" — the only traffic figure that is a count rather than a volume. */
 function flowLabel(traffic: NodeTraffic): string {

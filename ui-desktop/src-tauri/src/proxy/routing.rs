@@ -899,6 +899,10 @@ fn configure_interface_unix(interface: &str) -> Result<()> {
     let fake_ip_claimed = foreign
         .iter()
         .any(|a| matches!(a.octets(), [198, 18..=19, _, _]));
+    // The same question asked of the routing table, which is where a fake-IP tool actually
+    // stakes its claim: its own interface holds a /30 while the range it answers for is routed
+    // at it, so no address of ours ever lands inside an address of theirs.
+    let routes = foreign_route_prefixes(interface);
 
     for base in TUN_BASE_CANDIDATES {
         if matches!(base.octets(), [198, 18 | 19, 0, 0]) && fake_ip_claimed {
@@ -913,6 +917,12 @@ fn configure_interface_unix(interface: &str) -> Result<()> {
             .any(|a| u32::from(*a) & 0xFFFF_FF00 == u32::from(base))
         {
             tracing::warn!("skipping {base}/24: another interface already holds an address in it");
+            continue;
+        }
+        if let Some((network, len)) = route_claiming_block(&routes, base) {
+            tracing::warn!(
+                "skipping {base}/24: {network}/{len} is already routed to another interface"
+            );
             continue;
         }
 
@@ -1051,6 +1061,184 @@ fn interface_field_name(token: Option<&str>) -> Option<&str> {
     token.map(|n| n.split('@').next().unwrap_or(n).trim_end_matches(':'))
 }
 
+// ==========================================================================
+// Routes installed by other interfaces
+//
+// The address check above asks "does somebody already hold an address here". A
+// fake-IP tool does not have to: it puts a sliver of an address on its own
+// interface — a /30 is typical — and routes a range tens of thousands of times
+// wider at it, so no interface holds an address in the blocks it answers for.
+// What claims the block is the route.
+// ==========================================================================
+
+/// IPv4 route prefixes installed on interfaces other than `skip`, as `(network, prefix_len)`.
+///
+/// An enumeration failure yields an empty list, which leaves the address check as the only
+/// guard — the same trade-off [`foreign_interface_addresses`] makes.
+#[cfg(target_os = "macos")]
+fn foreign_route_prefixes(skip: &str) -> Vec<(Ipv4Addr, u8)> {
+    match Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+        Ok(output) => parse_netstat_routes(&String::from_utf8_lossy(&output.stdout), skip),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// IPv4 route prefixes installed on interfaces other than `skip`. See the macOS twin.
+///
+/// `table all` and not the default main table: a route in any other table claims its prefix
+/// just as loudly while a lookup reaches it through an `ip rule`, which is how a tunnel that
+/// wants to sit in front of the default route installs itself. What that adds — the host and
+/// broadcast addresses of the local table — is dropped by the parser, not by luck.
+#[cfg(target_os = "linux")]
+fn foreign_route_prefixes(skip: &str) -> Vec<(Ipv4Addr, u8)> {
+    match Command::new("ip")
+        .args(["-4", "route", "show", "table", "all"])
+        .output()
+    {
+        Ok(output) => parse_ip_route_prefixes(&String::from_utf8_lossy(&output.stdout), skip),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A route this wide is not a claim on an address block, it is a way of taking the default
+/// route: a VPN installs `0.0.0.0/1` and `128.0.0.0/1` to sit in front of every destination
+/// without overwriting the default route itself. Our /24 is more specific than either, so the
+/// two coexist — counting those would disqualify every candidate block on such a host.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const CLAIM_PREFIX_FLOOR: u8 = 8;
+
+/// The mask of the leading `len` bits. A zero-length prefix masks everything, which is the
+/// default route and therefore no block in particular.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn prefix_mask(len: u8) -> u32 {
+    match len {
+        0 => 0,
+        n if n >= 32 => u32::MAX,
+        n => u32::MAX << (32 - n),
+    }
+}
+
+/// The route that makes `base`/24 unusable, if any: one that overlaps it.
+///
+/// Overlap is decided on the *shorter* of the two prefixes. A /16 somebody else routes swallows
+/// the whole candidate /24 — the fake-IP case, where a tool holds one address of its own and
+/// routes a range forty thousand times wider at it. A /32 inside the block claims only its own
+/// address, which is still enough: it is an address the block would have to stay silent about.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn route_claiming_block(routes: &[(Ipv4Addr, u8)], base: Ipv4Addr) -> Option<(Ipv4Addr, u8)> {
+    routes.iter().copied().find(|(network, len)| {
+        if *len < CLAIM_PREFIX_FLOOR {
+            return false;
+        }
+        let shared = (*len).min(24);
+        let mask = prefix_mask(shared);
+        (u32::from(*network) & mask) == (u32::from(base) & mask)
+    })
+}
+
+/// `netstat -rn -f inet` route lines: `Destination Gateway Flags Netif [Expire]`.
+///
+/// The destination is printed shortened — `10/24`, `198.18.0`, `169.254` — with the prefix
+/// length implied by how many bytes are written when no `/len` follows. Two kinds of line are
+/// dropped: anything flagged `L`, which is an ARP cache entry rather than a route, and the
+/// default route — spelled `default`, which parses as nothing at all, but also `0/0` on a table
+/// that prints it numerically, which parses into a route covering every block there is.
+#[cfg(any(target_os = "macos", test))]
+fn parse_netstat_routes(text: &str, skip: &str) -> Vec<(Ipv4Addr, u8)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // Destination, Gateway, Flags, Netif — the header row falls out here, its
+        // destination column being the word "Destination".
+        let (Some(dest), Some(netif)) = (tokens.first().copied(), tokens.get(3).copied()) else {
+            continue;
+        };
+        if netif == skip {
+            continue;
+        }
+        if tokens.get(2).is_some_and(|flags| flags.contains('L')) {
+            continue;
+        }
+        if let Some(prefix) = parse_shortened_prefix(dest).filter(|(_, len)| *len > 0) {
+            out.push(prefix);
+        }
+    }
+    out
+}
+
+/// `10/24`, `198.18.0`, `169.254`, `127`, `224.0.0/4` — the destination column of `netstat -rn`,
+/// where the prefix length is explicit after a slash and otherwise the number of bytes written:
+/// one byte is a /8, two a /16, three a /24, four a host route.
+#[cfg(any(target_os = "macos", test))]
+fn parse_shortened_prefix(field: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, explicit_len) = match field.split_once('/') {
+        Some((addr, len)) => (addr, Some(len.parse::<u8>().ok()?)),
+        None => (field, None),
+    };
+    let mut octets = [0u8; 4];
+    let mut written = 0u8;
+    for (i, part) in addr.split('.').enumerate() {
+        if i > 3 {
+            return None;
+        }
+        octets[i] = part.parse().ok()?;
+        written += 1;
+    }
+    if written == 0 {
+        return None;
+    }
+    let len = explicit_len.unwrap_or(written * 8);
+    (len <= 32).then_some((Ipv4Addr::from(octets), len))
+}
+
+/// The route types `ip` prints ahead of the destination — the ones that stand for a prefix
+/// rather than for an address of this host. Each of them keeps the packets its prefix names,
+/// which is what makes it a claim on a block.
+#[cfg(any(target_os = "linux", test))]
+const IP_ROUTE_TYPES: [&str; 5] = ["blackhole", "unreachable", "prohibit", "throw", "nat"];
+
+/// `ip -4 route show` lines: `[<type>] <prefix> [via <gw>] dev <ifname> ...`.
+///
+/// The default route is dropped for the same reason as on macOS: every host has one, and
+/// counting it would disqualify every block. It is spelled `default` here, or `0.0.0.0/0` on a
+/// table that prints it numerically; the first parses as nothing, the second is filtered by its
+/// prefix length. A route with no `dev` — a blackhole, for instance — belongs to nobody, which
+/// still leaves the prefix spoken for, so its type is read past rather than read as the
+/// destination.
+#[cfg(any(target_os = "linux", test))]
+fn parse_ip_route_prefixes(text: &str, skip: &str) -> Vec<(Ipv4Addr, u8)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.windows(2).any(|pair| pair == ["dev", skip]) {
+            continue;
+        }
+        // `ip` prints the type of a route that has one ahead of its prefix, and
+        // those are exactly the routes with no interface to exclude: a blackhole
+        // swallows the block it names as surely as a device does.
+        let dest = match tokens.split_first() {
+            Some((first, rest)) if IP_ROUTE_TYPES.contains(first) => match rest.first().copied() {
+                Some(next) => next,
+                None => continue,
+            },
+            Some((first, _)) => *first,
+            None => continue,
+        };
+        let prefix = match dest.split_once('/') {
+            Some((addr, len)) => len
+                .parse::<u8>()
+                .ok()
+                .zip(addr.parse().ok())
+                .map(|(len, addr)| (addr, len)),
+            None => dest.parse::<Ipv4Addr>().ok().map(|addr| (addr, 32)),
+        };
+        if let Some(prefix) = prefix.filter(|(_, len)| *len > 0 && *len <= 32) {
+            out.push(prefix);
+        }
+    }
+    out
+}
+
 /// Whether `ip` can be bound within a short grace period — the same test the DNS server has to
 /// pass before it starts. Windows needs this window for duplicate address detection; on Unix
 /// the address is normally usable immediately, so this is a short safety net only.
@@ -1135,6 +1323,8 @@ fn remove_interface_address(interface: &str, ip: &Ipv4Addr) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     /// The conflict the candidate-block check exists for: a fake-IP VPN (Clash/mihomo) holds
     /// 198.18.0.1/30 on its utun while our default candidate block is 198.18.0.0/24.
     #[cfg(target_os = "macos")]
@@ -1193,6 +1383,174 @@ nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
             assert!(
                 !foreign.contains(&"198.18.0.254".parse().unwrap()),
                 "our own interface must be excluded: {foreign:?}"
+            );
+        }
+    }
+
+    /// The hole the route check closes: a fake-IP tool holds 198.18.0.1/30 on its own utun and
+    /// routes 198.18/16 at it, so no interface holds an address in the /24 we would take.
+    #[test]
+    fn a_foreign_route_covering_a_candidate_block_is_collected_macos() {
+        // `netstat -rn -f inet` as it actually prints: shortened destinations, ARP entries
+        // flagged `L`, and our own interface's route sitting among them.
+        let text = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            10.0.0.1           UGScg                 en0
+0/0                10.0.0.1           UGSc                  en0
+10/24              link#12            UCS                   en0      !
+10.0.0.99          8c:d0:b2:19:a8:b2  UHLWI                 en0   1157
+127                127.0.0.1          UCS                   lo0
+169.254            link#12            UCS                   en0      !
+198.18/16          utun8              USc                 utun8
+198.18.0           utun8              USc               nexa-tun
+224.0.0/4          link#12            UmCS                  en0      !
+";
+        let routes = super::parse_netstat_routes(text, "nexa-tun");
+        assert!(
+            routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 16)),
+            "the fake-IP route was not collected: {routes:?}"
+        );
+        // The prefix length is read off the bytes written when no `/len` follows.
+        assert!(
+            routes.contains(&(Ipv4Addr::new(169, 254, 0, 0), 16)),
+            "a shortened destination lost its implied prefix: {routes:?}"
+        );
+        assert!(routes.contains(&(Ipv4Addr::new(10, 0, 0, 0), 24)));
+        // Our own interface is skipped, the ARP entry is a neighbour rather than a destination,
+        // and the default route is not a claim on any block.
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 24)),
+            "our own route must be excluded: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(10, 0, 0, 99), 32)),
+            "an ARP entry is not a route: {routes:?}"
+        );
+        assert!(
+            !routes.iter().any(|(_, len)| *len == 0),
+            "the default route must not be collected: {routes:?}"
+        );
+    }
+
+    /// Linux twin of the above: `ip -4 route show` names the prefix in full and the interface
+    /// after `dev`.
+    #[test]
+    fn a_foreign_route_covering_a_candidate_block_is_collected_linux() {
+        let text = "\
+default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.83 metric 100
+0.0.0.0/0 via 10.0.0.1 dev eth0 proto dhcp
+10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.83 metric 100
+10.0.0.99 dev eth0 scope link
+198.18.0.0/16 dev tun0 proto kernel scope link src 198.18.0.1
+198.18.0.0/24 dev nexa-tun proto kernel scope link src 198.18.0.254
+";
+        let routes = super::parse_ip_route_prefixes(text, "nexa-tun");
+        assert!(
+            routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 16)),
+            "the fake-IP route was not collected: {routes:?}"
+        );
+        assert!(routes.contains(&(Ipv4Addr::new(10, 0, 0, 0), 24)));
+        // A bare address is a host route, not a /24.
+        assert!(
+            routes.contains(&(Ipv4Addr::new(10, 0, 0, 99), 32)),
+            "a host route lost its /32: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 24)),
+            "our own route must be excluded: {routes:?}"
+        );
+        assert!(
+            !routes.iter().any(|(_, len)| *len == 0),
+            "the default route must not be collected: {routes:?}"
+        );
+    }
+
+    /// The two ways a route used to hide: one installed in a table other than
+    /// main, reached through an `ip rule`, and one whose type `ip` prints ahead
+    /// of its prefix. Both claim the block they name — a blackhole more loudly
+    /// than most — and neither carries a `dev` to be excluded by.
+    #[test]
+    fn a_route_from_another_table_or_of_another_type_still_claims() {
+        let text = "\
+default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.83 metric 100
+blackhole 100.100.0.0/24
+unreachable 198.18.0.0/16
+172.26.0.0/16 dev wg0 table 51820 proto static scope link
+local 10.0.0.83 dev eth0 table local proto kernel scope host src 10.0.0.83
+broadcast 10.0.0.255 dev eth0 table local proto kernel scope link src 10.0.0.83
+198.18.0.0/24 dev nexa-tun proto kernel scope link src 198.18.0.254
+";
+        let routes = super::parse_ip_route_prefixes(text, "nexa-tun");
+        assert!(
+            routes.contains(&(Ipv4Addr::new(100, 100, 0, 0), 24)),
+            "a blackhole route was not collected: {routes:?}"
+        );
+        assert!(
+            routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 16)),
+            "an unreachable route was not collected: {routes:?}"
+        );
+        assert!(
+            routes.contains(&(Ipv4Addr::new(172, 26, 0, 0), 16)),
+            "a route from another table was not collected: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(198, 18, 0, 0), 24)),
+            "our own route must be excluded: {routes:?}"
+        );
+        // What `table all` adds and this does not want: the host and broadcast
+        // addresses of the local table, which name no block.
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(10, 0, 0, 83), 32)),
+            "a local address is not a route: {routes:?}"
+        );
+        assert!(
+            !routes.contains(&(Ipv4Addr::new(10, 0, 0, 255), 32)),
+            "a broadcast address is not a route: {routes:?}"
+        );
+    }
+
+    /// A /16 somebody else routes swallows the whole candidate /24.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_route_wider_than_the_block_claims_it() {
+        let routes = [(Ipv4Addr::new(198, 18, 0, 0), 16)];
+        assert_eq!(
+            super::route_claiming_block(&routes, Ipv4Addr::new(198, 18, 0, 0)),
+            Some((Ipv4Addr::new(198, 18, 0, 0), 16))
+        );
+        assert_eq!(
+            super::route_claiming_block(&routes, Ipv4Addr::new(100, 100, 0, 0)),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_host_route_inside_the_block_claims_it_too() {
+        let routes = [(Ipv4Addr::new(100, 100, 0, 7), 32)];
+        assert_eq!(
+            super::route_claiming_block(&routes, Ipv4Addr::new(100, 100, 0, 0)),
+            Some((Ipv4Addr::new(100, 100, 0, 7), 32))
+        );
+    }
+
+    /// `0.0.0.0/1` + `128.0.0.0/1` is how a VPN takes every destination without overwriting the
+    /// default route. Our /24 is more specific than either, so no block is unusable for it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn taking_every_destination_is_not_a_claim_on_any_block() {
+        let routes = [
+            (Ipv4Addr::new(0, 0, 0, 0), 1),
+            (Ipv4Addr::new(128, 0, 0, 0), 1),
+        ];
+        for base in super::TUN_BASE_CANDIDATES {
+            assert_eq!(
+                super::route_claiming_block(&routes, base),
+                None,
+                "{base}/24 was claimed by a route that owns every destination"
             );
         }
     }

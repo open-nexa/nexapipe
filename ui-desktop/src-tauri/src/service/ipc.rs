@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::AppError,
     proxy::{NodeEnrollment, NodeTwoFactor},
-    status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus},
+    status::{ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus},
 };
 
 pub const IPC_SOCKET_PATH: &str = "127.0.0.1:12345";
@@ -202,6 +202,17 @@ pub enum IpcMessage {
     GetNodeHealth,
     /// What each configured node has carried, and how many flows are open to it.
     GetNodeTraffic,
+    /// The connections the proxy has open right now.
+    GetActiveFlows,
+    /// Asks one open flow to end.
+    CloseFlow {
+        id: u64,
+    },
+    /// Asks every flow reaching one configured node to end.
+    CloseNodeFlows {
+        /// The ticket or endpoint ID exactly as the node was configured.
+        connection: String,
+    },
     /// The credential the server issued for an enrollment token, if one was spent.
     ///
     /// Read once and gone: a token can only be spent once, so this is the service's only
@@ -251,6 +262,12 @@ pub enum IpcResponse {
     EndpointLinks(Vec<EndpointLink>),
     NodeHealth(Vec<NodeHealthStatus>),
     NodeTraffic(Vec<NodeTrafficStatus>),
+    ActiveFlows(ActiveFlowPage),
+    /// Whether a flow with that id was open and asked to end.
+    FlowClosed(bool),
+    /// How many flows reaching that node were asked to end. `None` when the connection names a
+    /// node the configuration cannot resolve to.
+    NodeFlowsClosed(Option<usize>),
     /// `None` means the last start settled without a failure.
     StartupError(Option<AppError>),
     /// `None` means nothing has enrolled, or the credential was already taken.

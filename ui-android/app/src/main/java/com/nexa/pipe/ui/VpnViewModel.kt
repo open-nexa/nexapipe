@@ -28,6 +28,10 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -145,6 +149,33 @@ class VpnViewModel : ViewModel() {
      */
     val traffic = kotlinx.coroutines.flow.MutableStateFlow<Map<String, NodeTraffic>>(emptyMap())
 
+    /**
+     * What every backend has carried together: [traffic] summed across the map.
+     *
+     * Derived, not read a second time — the native side is not asked for anything it does not
+     * already report, and there is no way for the row on screen to disagree with the per-node
+     * figures beside it.
+     *
+     * `null` while the map is empty, which is the same distinction [traffic] makes per node:
+     * nothing has been counted yet, which is not the same as a total that happens to be zero.
+     * A screen that drew `0 B` before the first byte would look like a tunnel that works and
+     * carries nothing.
+     */
+    val totalTraffic: StateFlow<NodeTraffic?> =
+        traffic
+            .map { totals ->
+                if (totals.isEmpty()) {
+                    null
+                } else {
+                    NodeTraffic(
+                        sent = totals.values.sumOf { it.sent },
+                        received = totals.values.sumOf { it.received },
+                        active = totals.values.sumOf { it.active },
+                    )
+                }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     // 2FA lives on the endpoint now (`NodeConfig.twoFactor`): one server, one
     // pair of credentials. There is no app-wide setting left to publish here.
 
@@ -166,6 +197,11 @@ class VpnViewModel : ViewModel() {
         NexaVpnService.setRevokedListener { reason ->
             viewModelScope.launch {
                 if (isVpnRunning.value) {
+                    // The counters belong to the session that just ended, and the poll that
+                    // reads them belongs to it too: leaving either running would keep a total
+                    // on screen under "Disconnected", which reads as a tunnel that is up and
+                    // carrying bytes. See `refreshTraffic` — no total outlives its session.
+                    stopLinkPolling()
                     isVpnRunning.value = false
                     errorMessage.value = reason
                     addLog("Tunnel revoked: $reason")
@@ -1215,6 +1251,9 @@ class VpnViewModel : ViewModel() {
         // was recreated): align the UI now instead of showing a stale
         // "Connected".
         if (isVpnRunning.value && !isConnecting.value && NexaVpnService.wasRevoked) {
+            // Same reason as the revoked listener above: the session is over, so its counters
+            // and the poll behind them go with it.
+            stopLinkPolling()
             isVpnRunning.value = false
             errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
             addLog("Synced UI state: tunnel was revoked by another app")

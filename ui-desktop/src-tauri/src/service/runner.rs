@@ -7,7 +7,7 @@ use crate::proxy::{
 use crate::service::ipc::{
     IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, IPC_SOCKET_PATH, MAX_IPC_LINE,
 };
-use crate::status::ProxyStatus;
+use crate::status::{ActiveFlowPage, ProxyStatus, FLOW_PAGE_LIMIT};
 use anyhow::{Context, Result};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -372,6 +372,11 @@ impl ServiceRunner {
                 }
                 IpcMessage::GetNodeHealth => Self::handle_get_node_health(&proxy_manager).await,
                 IpcMessage::GetNodeTraffic => Self::handle_get_node_traffic(&proxy_manager).await,
+                IpcMessage::GetActiveFlows => Self::handle_get_active_flows(&proxy_manager).await,
+                IpcMessage::CloseFlow { id } => Self::handle_close_flow(&proxy_manager, id).await,
+                IpcMessage::CloseNodeFlows { connection } => {
+                    Self::handle_close_node_flows(&proxy_manager, &connection).await
+                }
                 IpcMessage::GetIssuedCredential => {
                     Self::handle_get_issued_credential(&proxy_manager).await
                 }
@@ -711,6 +716,45 @@ impl ServiceRunner {
             None => Vec::new(),
         };
         IpcResponse::NodeTraffic(traffic)
+    }
+
+    /// The connections the proxy has open right now.
+    ///
+    /// An absent manager answers with an empty page rather than an error, as every other reading
+    /// here does: "nothing is running" is a state the caller draws as an empty list, not as a
+    /// failure.
+    async fn handle_get_active_flows(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
+        let pm = proxy_manager.read().await;
+        let page = match pm.as_ref() {
+            Some(manager) => manager.active_flows(FLOW_PAGE_LIMIT).await,
+            None => ActiveFlowPage::empty(),
+        };
+        IpcResponse::ActiveFlows(page)
+    }
+
+    /// Ends one open flow, by id.
+    async fn handle_close_flow(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+        id: u64,
+    ) -> IpcResponse {
+        let pm = proxy_manager.read().await;
+        let closed = pm.as_ref().is_some_and(|manager| manager.close_flow(id));
+        IpcResponse::FlowClosed(closed)
+    }
+
+    /// Ends every flow reaching one configured node.
+    async fn handle_close_node_flows(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+        connection: &str,
+    ) -> IpcResponse {
+        let pm = proxy_manager.read().await;
+        let closed = match pm.as_ref() {
+            Some(manager) => manager.close_node_flows(connection).await,
+            None => None,
+        };
+        IpcResponse::NodeFlowsClosed(closed)
     }
 }
 

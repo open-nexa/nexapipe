@@ -32,6 +32,9 @@
     </plurals>
     <!-- Shown instead when the backend has carried nothing: absent from the answer, not zero. -->
     <string name="node_traffic_none">No traffic yet</string>
+    <!-- The same three figures summed over every backend, on the status card. Reuses the
+         flows plural above, so a total and a per-backend row count flows the same way. -->
+    <string name="total_traffic_line">Total ↑ %1$s · ↓ %2$s · %3$s</string>
 
     <!-- Logs -->
     <string name="logs_title">Logs</string>

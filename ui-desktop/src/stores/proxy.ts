@@ -24,6 +24,8 @@ import type {
   NodeTraffic,
   ProxyMode,
   ProxyStatus,
+  TrafficRate,
+  TrafficTotals,
 } from '../types';
 import { useConfigStore } from './config';
 import { takeIssuedCredential } from '../api/invite';
@@ -98,6 +100,98 @@ const nodeHealth = ref<NodeHealth[]>([]);
 const nodeTraffic = ref<NodeTraffic[]>([]);
 
 /**
+ * Every node's counters added together, and how fast they are moving.
+ *
+ * Both are answers to the question the per-node list raises and cannot answer: the list says
+ * which backend carried what, and what a tunnel is *for* is the sum. Rates are the second half
+ * of the same question — a total of 300 MiB says very different things about a tunnel that has
+ * been up for a minute and one that has been up for a day.
+ *
+ * `totals` is `null` while there is nothing to add up, on the same terms as `nodeTraffic`: no
+ * counters have been read, which is not the same as a total of zero.
+ */
+const totals = computed<TrafficTotals | null>(() => {
+  const list = nodeTraffic.value;
+  if (list.length === 0) return null;
+
+  let sent = 0;
+  let received = 0;
+  let active = 0;
+  for (const entry of list) {
+    sent += entry.sent;
+    received += entry.received;
+    active += entry.active;
+  }
+  return { sent, received, active };
+});
+const rate = ref<TrafficRate | null>(null);
+
+/**
+ * The reading the rate is measured from: the previous totals and when they were taken.
+ *
+ * A rate is two readings and a division, so the first one has nothing to be divided against and
+ * honestly reports no rate at all rather than zero — a tunnel that has just started is moving
+ * bytes, and `0 B/s` would say it is not.
+ */
+let rateSample: { sent: number; received: number; atMs: number } | null = null;
+
+/**
+ * Forgets the reading a rate would be measured from.
+ *
+ * Called when the proxy's run changes, because the counters reset with it: a rate taken across a
+ * restart would divide this session's bytes by an interval that includes the previous one's, and
+ * a total that has gone *down* is a new count from zero rather than a negative rate.
+ */
+function resetRateSample(): void {
+  rateSample = null;
+  rate.value = null;
+}
+
+/**
+ * How fast the totals are moving, from the reading just taken and the one before it.
+ *
+ * Measured over the time between the two samples and not over the poll interval: the poll is a
+ * chain of `setTimeout`s whose wait depends on what the previous read returned, so "3 seconds" is
+ * only ever roughly true, and dividing by the interval it actually was is the difference between
+ * a rate and a guess dressed up as one.
+ */
+function sampleRate(): void {
+  const current = totals.value;
+  if (!current) {
+    resetRateSample();
+    return;
+  }
+
+  const atMs = Date.now();
+  const previous = rateSample;
+  rateSample = { sent: current.sent, received: current.received, atMs };
+
+  // The first reading of a run has nothing to be divided against.
+  if (!previous) {
+    rate.value = null;
+    return;
+  }
+
+  const seconds = (atMs - previous.atMs) / 1000;
+  // Two readings in the same millisecond divide by zero. The rate already on screen is the last
+  // thing measured, and is nearer the truth than anything computed from this pair.
+  if (seconds <= 0) return;
+
+  // Counters only ever go up inside one run. A lower reading means the proxy restarted between
+  // the two samples, so there is no interval these numbers describe — which is not a negative
+  // rate, and not a slow one either.
+  if (current.sent < previous.sent || current.received < previous.received) {
+    rate.value = null;
+    return;
+  }
+
+  rate.value = {
+    up: (current.sent - previous.sent) / seconds,
+    down: (current.received - previous.received) / seconds,
+  };
+}
+
+/**
  * Set when the last few status reads failed, so the UI can admit the numbers on screen may be
  * out of date rather than presenting them with the same confidence as a live reading.
  */
@@ -131,7 +225,12 @@ async function refresh(): Promise<boolean> {
     if (result.running !== status.value.running || result.mode !== status.value.mode) {
       // Bumped on the transition, not on every answer: starting and stopping are the moments a
       // reply about the previous run can still be on its way. See `session`.
-      if (result.running !== status.value.running) session += 1;
+      if (result.running !== status.value.running) {
+        session += 1;
+        // The counters reset with the run, so a rate measured across the boundary would divide
+        // this run's bytes by an interval that includes the last one's. See `sampleRate`.
+        resetRateSample();
+      }
       status.value = result;
     }
     if (result.running) {
@@ -205,10 +304,14 @@ async function refreshNodeTraffic(): Promise<void> {
     });
     if (asked !== session) return;
     nodeTraffic.value = traffic;
+    sampleRate();
   } catch (error) {
     console.debug('[proxy] node traffic unavailable:', error);
     if (asked !== session) return;
     nodeTraffic.value = [];
+    // No reading, so nothing to measure from either. The rate is left as it was rather than
+    // zeroed: it is the last thing that was actually measured, and a dropped poll is not a
+    // tunnel that stopped moving.
   }
 }
 
@@ -622,6 +725,10 @@ export function useProxyStore() {
     nodeHealth,
     /** What each node has carried since the counters started. */
     nodeTraffic,
+    /** Every node's counters added together. `null` while nothing has been counted. */
+    totals,
+    /** How fast those totals are moving. `null` until two readings apart in time exist. */
+    rate,
     /** The mode the last start asked for; compared against what actually runs. */
     requestedMode,
     /** True when the status could not be read for a while; the panel says so out loud. */

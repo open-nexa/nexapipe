@@ -2,6 +2,7 @@ pub mod credentials;
 pub mod error;
 pub mod gate;
 mod proxy;
+pub mod quit;
 pub mod service;
 pub mod status;
 
@@ -15,7 +16,9 @@ use serde::Serialize;
 use service::ipc::{IssuedCredentialPayload, NodeInput, StartProxyRequest};
 use service::platform::ServiceState;
 use service::IpcClient;
-use status::{EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus};
+use status::{
+    ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus, FLOW_PAGE_LIMIT,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -554,6 +557,101 @@ async fn get_node_traffic(use_service: Option<bool>) -> Result<Vec<NodeTrafficSt
     Ok(match proxy_manager.as_ref() {
         Some(manager) => manager.node_traffic().await,
         None => Vec::new(),
+    })
+}
+
+/// The connections the proxy has open right now, one row each.
+///
+/// The per-node counters say how much each backend has carried; this says which connections
+/// those are, so a reader can see what is actually open and end one of them. Empty when the
+/// proxy is not running, like the polls above — no tunnel, no flows.
+///
+/// Capped at [`FLOW_PAGE_LIMIT`] rows, with `total` reported alongside so a UI can say how busy
+/// the tunnel really is without trying to draw thousands of rows.
+#[tauri::command]
+async fn get_active_flows(use_service: Option<bool>) -> Result<ActiveFlowPage, AppError> {
+    let use_service = use_service.unwrap_or(false);
+
+    if use_service {
+        match IpcClient::get_active_flows().await {
+            Ok(page) => return Ok(page),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to list active flows via service, falling back to process mode: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let proxy_manager = PROXY_MANAGER.read().await;
+    Ok(match proxy_manager.as_ref() {
+        Some(manager) => manager.active_flows(FLOW_PAGE_LIMIT).await,
+        None => ActiveFlowPage::empty(),
+    })
+}
+
+/// Asks one open flow to end.
+///
+/// `false` when there is no flow open with that id, which covers both "there never was one" and
+/// "it ended while the list was being read" — a page polling every few seconds will sometimes be
+/// clicked on a row that has already gone, and that is not an error.
+///
+/// The flow is not *gone* when this returns: it wakes the copy loop holding its sockets, and
+/// that loop is what lets go of them. The next poll is where the UI sees it disappear.
+#[tauri::command]
+async fn close_flow(id: u64, use_service: Option<bool>) -> Result<bool, AppError> {
+    let use_service = use_service.unwrap_or(false);
+
+    if use_service {
+        match IpcClient::close_flow(id).await {
+            Ok(closed) => return Ok(closed),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to close a flow via service, falling back to process mode: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let proxy_manager = PROXY_MANAGER.read().await;
+    Ok(match proxy_manager.as_ref() {
+        Some(manager) => manager.close_flow(id),
+        None => false,
+    })
+}
+
+/// Asks every flow reaching one configured node to end.
+///
+/// `connection` is the ticket or endpoint ID exactly as the node was configured — the same key
+/// the links, the health and the traffic are keyed by — and `None` comes back when it names a
+/// node this configuration cannot resolve to. That is deliberately not `Some(0)`: one of those
+/// is a request about a node that is not configured, the other is a configured node that had
+/// nothing open.
+#[tauri::command]
+async fn close_node_flows(
+    connection: String,
+    use_service: Option<bool>,
+) -> Result<Option<usize>, AppError> {
+    let use_service = use_service.unwrap_or(false);
+
+    if use_service {
+        match IpcClient::close_node_flows(&connection).await {
+            Ok(closed) => return Ok(closed),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to close a node's flows via service, falling back to process mode: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let proxy_manager = PROXY_MANAGER.read().await;
+    Ok(match proxy_manager.as_ref() {
+        Some(manager) => manager.close_node_flows(&connection).await,
+        None => None,
     })
 }
 
@@ -1418,7 +1516,7 @@ pub fn run() {
     let shutdown = handle.clone();
     tauri::async_runtime::set(handle);
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1444,6 +1542,9 @@ pub fn run() {
             get_endpoint_links,
             get_node_health,
             get_node_traffic,
+            get_active_flows,
+            close_flow,
+            close_node_flows,
             parse_invite,
             accept_invite,
             take_issued_credential,
@@ -1466,8 +1567,30 @@ pub fn run() {
             put_credential,
             delete_credential,
             clear_credentials,
-            credential_store_status
-        ])
+            credential_store_status,
+            quit::finish_quit
+        ]);
+
+    // macOS only: the predefined Quit item terminates the process before any event carrying a
+    // `prevent_exit()` exists, so nothing about it can be intercepted — see the module doc in
+    // `quit`. Ours asks instead and leaves the deciding to the renderer, which is the same answer
+    // closing the window gets. If asking itself fails the process still has to go, or Cmd+Q would
+    // quietly stop working.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(quit::menu_bar).on_menu_event(|app, event| {
+        if event.id() != quit::QUIT_ITEM_ID {
+            return;
+        }
+        match tauri::Emitter::emit(app, quit::QUIT_REQUESTED_EVENT, ()) {
+            Ok(()) => tracing::info!("Quit chosen from the menu; waiting for the answer"),
+            Err(error) => {
+                tracing::warn!("Could not ask about quitting ({error}); exiting as asked");
+                app.exit(0);
+            }
+        }
+    });
+
+    let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
