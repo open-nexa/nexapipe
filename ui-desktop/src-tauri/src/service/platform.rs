@@ -237,8 +237,22 @@ mod windows_impl {
             Escalation::OnAccessDenied,
             codes::SERVICE_UNINSTALL_FAILED,
         )
-        .and_then(|()| settle(ServiceState::Stopped, codes::SERVICE_UNINSTALL_FAILED))
         .and_then(|()| {
+            // The stop may have taken the service off the register entirely — the
+            // code above already tolerates 1060 from `sc stop`. Absent is the state
+            // an uninstall is trying to reach, so there is nothing to wait for and
+            // nothing left to delete: `settle` would wait out the timeout for a
+            // state a service that is not registered can never reach, and
+            // `sc delete` on it fails with 1060.
+            if !service_exists() {
+                return Ok(());
+            }
+            settle(ServiceState::Stopped, codes::SERVICE_UNINSTALL_FAILED)
+        })
+        .and_then(|()| {
+            if !service_exists() {
+                return Ok(());
+            }
             run(
                 |_| {
                     vec![

@@ -162,14 +162,22 @@ impl ServiceRunner {
     /// The Windows counterpart of [`Self::run_until_signalled`]: the control manager
     /// delivers a stop to the handler the service registered, not as a signal, so the
     /// caller owns that half and hands the receiving end in here.
+    ///
+    /// `on_stopping` runs the moment the stop is seen and before the teardown starts.
+    /// It is the caller's chance to tell the control manager it is stopping: without
+    /// that the SCM keeps showing the state last reported, `Running`, which still
+    /// accepts controls and grants no wait hint — so a teardown that takes a while
+    /// looks like a service that hung and gets killed from outside.
     #[cfg(windows)]
     pub async fn run_until_stop_flag(
         &self,
         stop: tokio::sync::watch::Receiver<bool>,
+        on_stopping: impl FnOnce(),
     ) -> Result<()> {
         tokio::select! {
             result = self.run() => result,
             () = await_stop(stop) => {
+                on_stopping();
                 self.shutdown().await;
                 Ok(())
             }

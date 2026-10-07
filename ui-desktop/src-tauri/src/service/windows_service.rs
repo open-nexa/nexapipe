@@ -107,7 +107,15 @@ fn serve() -> windows_service::Result<()> {
         .expect("failed to build tokio runtime")
         .block_on(async {
             let runner = crate::service::runner::ServiceRunner::new();
-            if let Err(e) = runner.run_until_stop_flag(stop_rx).await {
+            // Announced before the teardown starts, so a slow tunnel shutdown reads as
+            // "stopping" to the SCM — with the 30s wait hint and no further controls
+            // accepted — instead of as a service that stopped answering.
+            let stopping = || {
+                if let Err(e) = set_status(&status_handle, ServiceState::StopPending) {
+                    tracing::error!("Could not report StopPending: {}", e);
+                }
+            };
+            if let Err(e) = runner.run_until_stop_flag(stop_rx, stopping).await {
                 tracing::error!("Service runner error: {}", e);
             }
         });
