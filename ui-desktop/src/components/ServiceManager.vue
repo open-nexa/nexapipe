@@ -12,7 +12,11 @@ const { t } = useI18n();
 // Installing here changes whether the Connect page may offer TUN, and that gate lives in the
 // proxy store. Nothing else refreshes it, so without this the TUN toggle stays switched off —
 // and its "install service" button stays on screen — until the app is restarted.
-const { refreshServiceRunning } = useProxyStore();
+// The same store also answers the question this panel cannot ask the service manager: whether
+// something is *answering* on the IPC port. A registered service is up as far as the OS is
+// concerned well before it listens, and a service that never answers anything cannot be read as
+// one that is out of date.
+const { refreshServiceRunning, serviceRunning } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
@@ -23,8 +27,10 @@ const messageType = ref<"success" | "error" | "info">("info");
 /// This build, which is what the service is compared against. Empty until the app has said,
 /// and a comparison against nothing is one the panel does not draw.
 const appVersion = ref("");
-/// Which build the service says it is. `null` when it cannot say: nothing is answering, or the
-/// service predates the question and drops the connection instead.
+/// Which build the service says it is, once something on the IPC port is answering. `null` when
+/// that answer did not come back — either nothing was reachable, which [`serviceRunning`] has
+/// already ruled out by then, or the service predates the question and closes the connection
+/// instead, which is the case the notice is for.
 const serviceVersion = ref<string | null>(null);
 
 /// A service can die on its own, so the panel re-reads the state instead of trusting the last
@@ -60,15 +66,20 @@ async function refresh() {
   }
 }
 
-/// A service answering with a build other than this app's — or with none at all, which is what
-/// a build predating the question does — is not running what installing would put there.
+/// A service answering the IPC port with a build other than this app's — or with none at all,
+/// which is what a build predating the question does — is not running what installing would put
+/// there. That is the drift worth reporting, and it is only ever the answer of a service we are
+/// actually talking to.
 ///
-/// Only asked while one is up: a stopped service cannot answer, and "cannot answer" is not
-/// evidence that it is out of date.
+/// Reachable is a different question from registered, and only the first one carries evidence.
+/// A service that has just been started answers nothing yet, and neither does one whose socket
+/// we failed to reach this time: both would otherwise be reported as stale builds for as long
+/// as the panel's own poll takes. Nothing has to answer twice for this either — the proxy store
+/// already polls whether something is on the IPC port, because TUN is gated on it.
 const needsUpgrade = computed(
   () =>
     appVersion.value !== "" &&
-    state.value === "running" &&
+    serviceRunning.value &&
     serviceVersion.value !== appVersion.value,
 );
 
