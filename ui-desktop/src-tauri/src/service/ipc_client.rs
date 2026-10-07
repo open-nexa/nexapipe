@@ -320,6 +320,20 @@ impl IpcClient {
         }
     }
 
+    /// The build the installed service is.
+    ///
+    /// `Err` when it cannot be asked, which includes the case this exists for: a service that
+    /// predates [`IpcMessage::GetVersion`] refuses the request at its own deserializer and
+    /// drops the connection, so from here it looks like a service that is not answering. A
+    /// caller that wants "whose build is running, if anybody knows" should read that as `None`.
+    pub async fn get_version() -> Result<String, AppError> {
+        match Self::send_message(IpcMessage::GetVersion).await? {
+            IpcResponse::Version(version) => Ok(version),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     pub async fn get_startup_error() -> Result<Option<AppError>, AppError> {
         match Self::send_message(IpcMessage::GetStartupError).await? {
             IpcResponse::StartupError(e) => Ok(e),

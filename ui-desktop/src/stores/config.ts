@@ -516,7 +516,8 @@ function dropNodesWithoutAConnectionString(nodes: NodeConfig[]): NodeConfig[] {
  * asynchronous.
  *
  * Awaited before the app mounts, so no page ever renders a node's credentials as absent and then
- * fills them in.
+ * fills them in. What is *not* awaited here is [`initConfigStoreDeferred`] — the display masks and
+ * the store's protection level, which nothing on the first screen renders.
  */
 export async function initConfigStore(): Promise<void> {
   try {
@@ -527,7 +528,6 @@ export async function initConfigStore(): Promise<void> {
     // Now, and only now, that the store has answered: see
     // `dropNodesWithoutAConnectionString`.
     config.nodes = dropNodesWithoutAConnectionString(config.nodes);
-    await refreshConnectionMasks();
 
     // Only from here may a save touch the store. Nothing before this line has
     // read it, so nothing before this line may delete from it — a failure
@@ -555,6 +555,28 @@ export async function initConfigStore(): Promise<void> {
     // stays true, so the legacy payload is still there to read next launch.
     console.error('[config] failed to load credentials:', error);
   }
+}
+
+/**
+ * What [`initConfigStore`] deliberately leaves for after the first paint.
+ *
+ * Two reads, both of them pure projections and neither of which any first-screen surface
+ * renders: the masks a credential is *displayed* as, and whether the master key ended up in the
+ * OS keychain or in a file beside the store. The settings page is the only thing that prints
+ * either, and it is not where a launch lands.
+ *
+ * They were on the mount path because they sat in the same function as the credential read
+ * that genuinely has to happen first. That cost 2 IPC round-trips per configured node before
+ * anything was on screen — each one re-reading and decrypting the whole store file, serialised
+ * behind `STORE_LOCK` on the Rust side — plus one more for the protection level. On a machine
+ * with a handful of nodes that is hundreds of milliseconds of empty window, which is exactly
+ * what showing the window only after mount is trying to avoid.
+ *
+ * A mask is empty until this runs, which is what a page falling back to it already handles: see
+ * `connectionMask`. Nothing was reading it before, because nothing was painted before either.
+ */
+export async function initConfigStoreDeferred(): Promise<void> {
+  await refreshConnectionMasks();
 
   try {
     credentialProtection.level = await credentialStoreStatus();
