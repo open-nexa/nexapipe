@@ -10,6 +10,7 @@ use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, TotpValidator};
 use nexapipe::config::ProxyConfig;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A 160-bit Base32 secret, the length `--generate-2fa` hands out. The
@@ -48,6 +49,7 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
+            devices: HashMap::new(),
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
@@ -312,6 +314,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
+            devices: HashMap::new(),
             last_used: Some(1),
             failed_attempts: 1,
             locked_until: None,

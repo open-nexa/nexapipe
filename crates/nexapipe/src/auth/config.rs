@@ -119,6 +119,23 @@ pub struct ClientAuth {
     /// by `--generate-invite --registration`, which writes it here.
     #[serde(default)]
     pub pending_enrollment: Option<String>,
+    /// Credentials issued to individual devices under this client.
+    ///
+    /// A device here has a secret of its own, and the `secret` above is the
+    /// credential of the device that has no name — which is every device that
+    /// existed before this table could be written, and why an empty table
+    /// changes nothing about how such a client authenticates.
+    ///
+    /// What the table is for is being able to lose one entry without touching
+    /// the others: a device whose secret is struck out here is the only one
+    /// that has to be re-enrolled, where rotating the one `secret` re-enrolls
+    /// every device at once.
+    ///
+    /// A device that names no device answers with the client's `secret`, so a
+    /// client that wants per-device revocation has to stop handing that one
+    /// out.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub devices: HashMap<String, DeviceAuth>,
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
@@ -147,6 +164,7 @@ impl std::fmt::Debug for ClientAuth {
                 "pending_enrollment",
                 &crate::config::redacted(&self.pending_enrollment),
             )
+            .field("devices", &self.devices)
             .field("last_used", &self.last_used)
             .field("failed_attempts", &self.failed_attempts)
             .field("locked_until", &self.locked_until)
@@ -154,7 +172,41 @@ impl std::fmt::Debug for ClientAuth {
     }
 }
 
-fn default_created_at() -> String {
+/// One device under a client: a TOTP secret of its own.
+///
+/// Everything a [`ClientAuth`] is asked for, this is asked for too, and the
+/// answer is the same shape — a secret issued by the server and a record of
+/// when. What it does not carry is an `allow_hosts` of its own: what a client
+/// may reach is one policy, answered by the client's entry, and a second place
+/// to say it would only be a second place to disagree.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DeviceAuth {
+    /// Base32-encoded secret key, issued when this device enrolled.
+    pub secret: String,
+    /// When this device was issued its secret
+    #[serde(default = "default_created_at")]
+    pub created_at: String,
+    /// Last successful authentication time (Unix timestamp)
+    #[serde(default)]
+    pub last_used: Option<u64>,
+}
+
+/// Same reason as [`ClientAuth`]'s, and the same consequence: the whole config
+/// is logged when it is parsed, and a device secret is as live a credential as
+/// a client's.
+impl std::fmt::Debug for DeviceAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuth")
+            .field("secret", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("last_used", &self.last_used)
+            .finish()
+    }
+}
+
+/// Shared with the loader in `crates/nexapipe/src/config.rs`, which fills in
+/// the same "issued now" for a client or a device the file does not date.
+pub(crate) fn default_created_at() -> String {
     unix_now().to_string()
 }
 
@@ -186,6 +238,14 @@ impl AuthConfig {
                             created_at: String::new(),
                             allow_hosts: None,
                             pending_enrollment: None,
+                            // Empty for the same reason `secret` is: a snapshot
+                            // exists so a wrong code does not copy a
+                            // credential, and every device secret is one.
+                            // Nothing written from a snapshot touches this
+                            // table — `save_auth_state` moves three counters
+                            // per client and leaves the rest of the file
+                            // alone — so an empty one costs nothing.
+                            devices: HashMap::new(),
                             last_used: client.last_used,
                             failed_attempts: client.failed_attempts,
                             locked_until: client.locked_until,
@@ -344,9 +404,18 @@ mod tests {
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
+            devices: HashMap::new(),
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+        }
+    }
+
+    fn device(secret: &str) -> DeviceAuth {
+        DeviceAuth {
+            secret: secret.to_string(),
+            created_at: "0".to_string(),
+            last_used: None,
         }
     }
 
@@ -473,5 +542,82 @@ mod tests {
     fn patterns_are_folded_when_the_acl_is_built() {
         let acl = ClientAcl::from_hosts(Some(&["API.Example.Com.".to_string()]));
         assert!(acl.allows("api.example.com"));
+    }
+
+    /// The fallback path, and the only one that existed before: a client with
+    /// no device table keeps authenticating against its own `secret`, because
+    /// an unnamed device has nowhere else to look.
+    #[test]
+    fn a_client_without_a_device_table_has_none() {
+        let parsed: ClientAuth =
+            toml::from_str(r#"secret = "JBSWY3DPEHPK3PXP""#).expect("a plain client still parses");
+
+        assert!(parsed.devices.is_empty(), "{parsed:?}");
+        assert_eq!(parsed.secret, "JBSWY3DPEHPK3PXP");
+    }
+
+    /// The table is spelled the way a `[auth.clients.<id>]` entry nests it, so
+    /// what this test parses is what an operator writes.
+    #[test]
+    fn a_device_table_parses_into_named_devices() {
+        let parsed: ClientAuth = toml::from_str(
+            r#"
+            secret = "CLIENTSECRET"
+
+            [devices.laptop]
+            secret = "LAPTOPSECRET"
+
+            [devices.phone]
+            secret = "PHONESECRET"
+            created_at = "1700000000"
+            "#,
+        )
+        .expect("a device table parses");
+
+        assert_eq!(parsed.devices.len(), 2);
+        assert_eq!(parsed.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(parsed.devices["phone"].created_at, "1700000000");
+        // Issued-at is filled in when the config does not say, the way a
+        // client's is: a device with an empty one looks never-issued.
+        assert!(
+            !parsed.devices["laptop"].created_at.is_empty(),
+            "{parsed:?}"
+        );
+    }
+
+    /// `Debug` is what a log line uses, and the whole config is logged when it
+    /// is parsed. A device secret is as live a credential as a client's — it
+    /// authenticates on its own — so it is redacted for the same reason.
+    #[test]
+    fn a_device_secret_is_no_more_printable_than_a_clients() {
+        let mut c = client();
+        c.secret = "CLIENTSECRET".to_string();
+        c.devices
+            .insert("laptop".to_string(), device("LAPTOPSECRET"));
+
+        let rendered = format!("{c:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("CLIENTSECRET"), "{rendered}");
+        assert!(!rendered.contains("LAPTOPSECRET"), "{rendered}");
+    }
+
+    /// `counter_snapshot` exists so that counting a wrong code does not copy a
+    /// credential, and the table is the place a new field gets forgotten: it
+    /// is one level further from the field the comment was written about.
+    #[test]
+    fn a_counter_snapshot_carries_no_device_secret() {
+        let mut c = client();
+        c.devices
+            .insert("laptop".to_string(), device("LAPTOPSECRET"));
+        let config = AuthConfig {
+            enabled: true,
+            clients: HashMap::from([("alice".to_string(), c)]),
+            ..AuthConfig::default()
+        };
+
+        let snapshot = config.counter_snapshot();
+
+        assert!(snapshot.clients["alice"].devices.is_empty(), "{snapshot:?}");
+        assert!(snapshot.clients["alice"].secret.is_empty());
     }
 }

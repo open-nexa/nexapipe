@@ -215,6 +215,7 @@ mod tests {
             created_at: String::new(),
             allow_hosts: None,
             pending_enrollment: None,
+            devices: HashMap::new(),
             last_used: None,
             failed_attempts: 0,
             locked_until: None,

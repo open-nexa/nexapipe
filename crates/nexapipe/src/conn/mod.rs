@@ -929,6 +929,10 @@ async fn enroll_client(
             algorithm,
             digits,
             period,
+            // Enrollment still writes the client's own `secret`, which is the
+            // credential of the device that has no name — so there is no
+            // device name to answer with yet.
+            device_id: None,
         },
     )
     .await
@@ -1096,7 +1100,9 @@ async fn perform_authentication(
     // enrolled cannot have its AUTH_START mistaken for a data stream.
     let client_id = match start_msg {
         AuthMessage::Start { client_id, .. } => client_id,
-        AuthMessage::EnrollStart { client_id, token } => {
+        AuthMessage::EnrollStart {
+            client_id, token, ..
+        } => {
             enroll_client(auth, &client_id, &token, &mut send).await?;
 
             let start_after_enroll = read_auth_message(&mut recv)
@@ -1154,6 +1160,7 @@ async fn perform_authentication(
             timestamp,
             totp_code,
             signature,
+            ..
         } => (client_id, timestamp, signature, totp_code),
         _ => {
             return Err(AuthFailure::NotStarted(
@@ -1642,6 +1649,7 @@ mod tests {
         find_headers_end,
     };
     use crate::auth::{AuthConfig, ClientAuth};
+    use std::collections::HashMap;
 
     /// A write whose caller gave up still happens, and happens *first*.
     ///
@@ -1728,6 +1736,7 @@ mod tests {
                 created_at: "0".to_string(),
                 allow_hosts: None,
                 pending_enrollment: token.map(|t| t.to_string()),
+                devices: HashMap::new(),
                 last_used: None,
                 failed_attempts: 0,
                 locked_until: None,
