@@ -29,6 +29,7 @@
 //! "backend down" from "connection full" without heuristics.
 
 use crate::auth::ClientAcl;
+use crate::conn::peers::PeerIdentity;
 use crate::metrics;
 use crate::routes::{BackendLookup, RouteConfig};
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
@@ -136,7 +137,9 @@ impl Drop for FlowGuard {
 /// `initial` holds the bytes already read from `recv` (at least the first).
 /// `acl` is the authenticated client's host authorization, if any.
 // See the note on `conn::handle_bidi_stream`: the id is the eighth argument,
-// and it travels through here to reach the access log.
+// and it travels through here to reach the access log. `who`, the ninth and
+// newest, travels the same way — it is the identity the handshake settled on,
+// which only the caller of the caller knows.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
@@ -147,6 +150,8 @@ pub async fn handle_iroh_stream(
     peer: &str,
     acl: Option<&ClientAcl>,
     request_id: &str,
+    // Who the connection authenticated as, for the access log.
+    who: Option<&PeerIdentity>,
 ) -> anyhow::Result<()> {
     serve_stream(
         DuplexIroh::new(send, recv),
@@ -156,6 +161,7 @@ pub async fn handle_iroh_stream(
         peer,
         acl,
         request_id,
+        who,
     )
     .await
 }
@@ -165,6 +171,12 @@ pub async fn handle_iroh_stream(
 /// Generic on purpose: `tokio::io::duplex` gives a test both ends in one process, so
 /// the handshake, the status codes and the UDP framing are covered without an iroh
 /// endpoint — the same reason `passthrough` is written this way.
+/// `who` is who the connection authenticated as, for the access log — `None`
+/// for the plaintext listener, which never runs a handshake.
+// Same reason as `handle_iroh_stream` above, one argument further along: the
+// two things this hands to the access log, the request id and the identity, are
+// both made by the caller of the caller and are only carried through here.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_stream<S>(
     stream: S,
     initial: Vec<u8>,
@@ -173,6 +185,9 @@ pub async fn serve_stream<S>(
     peer: &str,
     acl: Option<&ClientAcl>,
     request_id: &str,
+    // Who the connection authenticated as, for the access log. `None` for a
+    // flow that came in without a handshake — the plaintext L4 listener.
+    who: Option<&PeerIdentity>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -261,6 +276,7 @@ where
             logged_as,
             0,
             0,
+            who,
         );
         return Ok(());
     };
@@ -278,7 +294,16 @@ where
         );
         metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
         span.record("status", 429u64);
-        crate::log::log_access(request_id, peer, preface.proto.name(), &target, 429, 0, 0);
+        crate::log::log_access(
+            request_id,
+            peer,
+            preface.proto.name(),
+            &target,
+            429,
+            0,
+            0,
+            who,
+        );
         return Ok(());
     };
 
@@ -311,6 +336,7 @@ where
                 200,
                 started.elapsed().as_millis() as u64,
                 0,
+                who,
             )
         }
         Err(e) => {
@@ -325,6 +351,7 @@ where
                 502,
                 started.elapsed().as_millis() as u64,
                 0,
+                who,
             );
         }
     }
@@ -733,6 +760,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -775,6 +803,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -809,6 +838,7 @@ mod tests {
                 "test",
                 Some(&acl),
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -851,6 +881,8 @@ mod tests {
                 "test",
                 Some(&acl),
                 "test-request-id",
+                // No handshake in this test: the ACL is handed in directly.
+                None,
             )
             .await
         });
@@ -888,6 +920,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -916,6 +949,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -943,6 +977,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -989,6 +1024,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -1044,6 +1080,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });
@@ -1081,6 +1118,7 @@ mod tests {
                 "test",
                 None,
                 "test-request-id",
+                None,
             )
             .await
         });

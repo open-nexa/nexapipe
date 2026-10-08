@@ -679,6 +679,20 @@ turns up in `tracing` output too, alongside `method`, `uri` and `status`. An L4
 flow and a TLS passthrough are tunnels rather than requests: they get an id on
 the access line and the span, but there is no HTTP response to put a header on.
 
+**A line also says whose request it was.** The client and the device the
+connection authenticated as are appended last, so nothing before them moves:
+
+```text
+203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "GET /api/v1/items" 200 512 12ms id=3f9ac1… client=acme device=laptop
+```
+
+A device that authenticated without naming itself is `device=-` — the one
+holding the client's own secret, which is the same secret every unnamed device
+of that client has. A request that never authenticated gets neither field: 2FA
+off, and the plaintext HTTP listener, do not run a handshake, and a line
+answering "whose request was this" with a dash on all of them is noise rather
+than an answer.
+
 ### `[acme]`
 
 Removed. Certificates belong to the backend now; the section is still parsed but

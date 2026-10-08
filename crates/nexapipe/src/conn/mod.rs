@@ -163,6 +163,10 @@ pub async fn handle_bidi_stream(
     peer: &str,
     acl: Option<Arc<ClientAcl>>,
     request_id: &str,
+    // Who the connection authenticated as, for the access log. Empty with 2FA
+    // off, and for a library embedder that never built an `AuthState`, which is
+    // what the access log prints nothing for.
+    who: PeerIdentity,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
     // Doubling on demand, so a head that fits in one read never pays for a
@@ -197,6 +201,7 @@ pub async fn handle_bidi_stream(
                         peer,
                         acl.as_deref(),
                         request_id,
+                        Some(&who),
                     )
                     .await;
                 }
@@ -332,6 +337,7 @@ pub async fn handle_bidi_stream(
                     status,
                     0,
                     0,
+                    Some(&who),
                 );
             }
             Err(e) => {
@@ -408,6 +414,7 @@ pub async fn handle_bidi_stream(
                 summary.status,
                 elapsed_ms,
                 summary.bytes_sent,
+                Some(&who),
             );
             Ok(())
         }
@@ -433,6 +440,7 @@ pub async fn handle_bidi_stream(
                 status,
                 elapsed_ms,
                 bytes_sent,
+                Some(&who),
             );
             Err(failure.error)
         }
@@ -1696,7 +1704,9 @@ pub async fn handle_connection(
     // refused its handshake never got a connection, and `GET /v1/connections`
     // is asked "who is connected", not "who tried". The path may be corrected a
     // moment later by the tracker above, which keeps following it.
-    let _peer = peers.insert(peer_id, initial_kind, identity);
+    // The registry keeps its own copy: the identity below is also what every
+    // stream of this connection writes into the access log.
+    let _peer = peers.insert(peer_id, initial_kind, identity.clone());
 
     loop {
         match conn.accept_bi().await {
@@ -1719,6 +1729,10 @@ pub async fn handle_connection(
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
                 let acl_clone = client_acl.clone();
+                // Who the connection turned out to be, for the access log.
+                // Cloned per stream rather than shared, because the task owns
+                // everything it reads.
+                let who_clone = identity.clone();
                 // One id per request, and one span wrapping it. Both are made
                 // here rather than inside the handler: `method`, `uri` and
                 // `status` are not known until the head has been read, and a
@@ -1746,6 +1760,7 @@ pub async fn handle_connection(
                         &peer_clone,
                         acl_clone,
                         &request_id,
+                        who_clone,
                     )
                     .instrument(span)
                     .await
