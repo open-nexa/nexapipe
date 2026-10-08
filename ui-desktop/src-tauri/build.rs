@@ -185,7 +185,7 @@ fn check_acl_alignment() {
             eprintln!("    - {name}");
         }
     }
-    eprintln!("");
+    eprintln!();
     eprintln!("Fix: add a matching `[[permission]]` block in app-commands.toml, or include `allow-<name>` in capabilities/default.json, then rebuild.");
     std::process::exit(1);
 }
