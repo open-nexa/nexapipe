@@ -20,4 +20,15 @@ regexes = [
     # comparison and asserts on the boundaries. The constant has to be a real
     # string of bytes, and calling it a secret is the point of the test.
     '''^0123456789abcdef$''',
+
+    # `config_with_one_device` (crates/nexapipe/src/auth/totp.rs) gives the
+    # enrolled device a secret of its own, which is what the lookup is then
+    # shown to answer with: signed under the device's name, the client's own
+    # secret is a mismatch rather than a fallback. The fixture has to be a real
+    # Base32 string of 160 bits — `totp-rs` will not build a validator from
+    # anything shorter than 128 bits, and these tests do reach the TOTP check —
+    # and a string that long and that evenly distributed is over the
+    # `generic-api-key` entropy threshold, so the scanner reads it as a
+    # credential. It is a fixture: it appears only in this test module.
+    '''^KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP$''',
 ]

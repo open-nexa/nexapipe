@@ -1,5 +1,6 @@
 use crate::auth::{
     AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
+    is_presentable_device_id,
 };
 use crate::config::Timeouts;
 use crate::config_watcher::save_auth_state;
@@ -1154,14 +1155,15 @@ async fn perform_authentication(
     let response_msg = AuthMessage::from_bytes(&response_bytes)
         .map_err(|_| AuthFailure::NotStarted("expected AUTH_RESPONSE message".to_string()))?;
 
-    let (resp_client_id, resp_timestamp, signature, totp_code) = match response_msg {
+    let (resp_client_id, resp_device_id, resp_timestamp, signature, totp_code) = match response_msg
+    {
         AuthMessage::Response {
             client_id,
+            device_id,
             timestamp,
             totp_code,
             signature,
-            ..
-        } => (client_id, timestamp, signature, totp_code),
+        } => (client_id, device_id, timestamp, signature, totp_code),
         _ => {
             return Err(AuthFailure::NotStarted(
                 "expected AUTH_RESPONSE message".to_string(),
@@ -1172,6 +1174,19 @@ async fn perform_authentication(
     if resp_client_id != client_id {
         return Err(AuthFailure::Rejected(
             "client ID mismatch in AUTH_RESPONSE".to_string(),
+        ));
+    }
+
+    // Checked before the name is used for anything, for the reason a client id
+    // is: it ends up in the log line for the outcome, and a peer that names
+    // itself with a trailing CRLF writes the rest of that line itself. `None`
+    // is not a failure to name one — it is the unnamed device, which is what a
+    // client with no device table has always been.
+    if let Some(name) = resp_device_id.as_deref()
+        && !is_presentable_device_id(name)
+    {
+        return Err(AuthFailure::Rejected(
+            "device id is not printable ASCII".to_string(),
         ));
     }
 
@@ -1196,6 +1211,7 @@ async fn perform_authentication(
 
     let outcome = TotpValidator::new(&cfg).verify_response(
         &client_id,
+        resp_device_id.as_deref(),
         &nonce,
         resp_timestamp,
         &signature,
@@ -1273,6 +1289,18 @@ async fn perform_authentication(
             match &e {
                 AuthError::ClientNotFound => {
                     tracing::warn!("2FA: unknown client '{}' from {}", client_id, peer);
+                }
+                AuthError::UnknownDevice => {
+                    // Printable ASCII, because the name was checked before it
+                    // was used for anything — and it is the one thing about
+                    // this refusal an operator can act on.
+                    tracing::warn!(
+                        "2FA: client '{}' from {} names device {:?}, which has no credential: \
+                         either it never enrolled or its entry was dropped",
+                        client_id,
+                        peer,
+                        resp_device_id.as_deref()
+                    );
                 }
                 AuthError::InvalidSecret | AuthError::TotpCreationFailed => {
                     tracing::error!(
