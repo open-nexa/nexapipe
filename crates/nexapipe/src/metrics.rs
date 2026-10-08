@@ -103,12 +103,21 @@ pub struct Metrics {
     requests: [AtomicU64; STATUS_CLASSES],
     /// Milliseconds spent answering them, summed.
     request_duration_ms: AtomicU64,
-    /// Requests by how long they took: one cumulative counter per upper bound
-    /// in [`DURATION_BUCKET_LE_MS`], so a request is counted in every bound it
-    /// is under and not only in the narrowest one. A request slower than the
-    /// widest bound lands in none of them, which is why the `+Inf` series is
-    /// rendered from the request count instead of being kept as one more
-    /// bucket.
+    /// Requests by how long they took: one counter per upper bound in
+    /// [`DURATION_BUCKET_LE_MS`], **exclusive** — a request is counted in the
+    /// narrowest bound it is under and nowhere else, and Prometheus's
+    /// cumulative series is summed while rendering.
+    ///
+    /// Storing the cumulative counts instead would mean one request touching up
+    /// to twelve counters, and a scrape that read between two of those updates
+    /// would see a bucket go *down* as `le` rises: `le="10"` at 1 and
+    /// `le="25"` at 0. A histogram whose buckets are not monotonic is one
+    /// `histogram_quantile` has to repair before it can answer. Summing at
+    /// render time cannot produce that, because the running total only ever
+    /// grows as the loop walks the bounds.
+    /// A request slower than the widest bound lands in none of them, which is
+    /// why the `+Inf` series is rendered from the request count instead of
+    /// being kept as one more bucket.
     request_duration_buckets: [AtomicU64; DURATION_BUCKETS],
     /// Bytes served to clients. See the module docs for where these come from.
     bytes_sent: AtomicU64,
@@ -225,16 +234,18 @@ impl Metrics {
         self.requests[status_class(status)].fetch_add(1, Ordering::Relaxed);
         self.request_duration_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
-        // Every bound the duration is under, not just the narrowest one: a
-        // Prometheus bucket is cumulative, so a request of 7 ms belongs to
-        // `le="10"` and to every bound above it. `partition_point` needs the
-        // slice sorted, which this const is, and answers with the index of the
-        // first entry that is *not* below the duration — so the `skip` starts
-        // at the first bucket that holds it, and something slower than every
-        // bound starts past the end and lands in `+Inf` only, which is what
-        // `+Inf` is for.
+        // One counter, the narrowest bound that holds the duration. These are
+        // exclusive counts and the cumulative series Prometheus wants is summed
+        // as the exposition walks the bounds — see the field, and the reason
+        // there, for why the addition is not done here.
+        //
+        // `partition_point` needs the slice sorted, which this const is, and
+        // answers with the index of the first entry that is *not* below the
+        // duration. Something slower than every bound comes back as the length,
+        // so the `get` below answers `None` and the request lands in `+Inf`
+        // only — which is what `+Inf` is for.
         let index = DURATION_BUCKET_LE_MS.partition_point(|le| *le < duration_ms);
-        for bucket in self.request_duration_buckets.iter().skip(index) {
+        if let Some(bucket) = self.request_duration_buckets.get(index) {
             bucket.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -415,11 +426,15 @@ impl Metrics {
             "# HELP nexapipe_request_duration_ms How long requests took to answer, in milliseconds."
         );
         let _ = writeln!(out, "# TYPE nexapipe_request_duration_ms histogram");
+        // Cumulative, summed from the exclusive counts as the bounds are walked
+        // out, so every series is at least the one before it however many
+        // requests land mid-scrape.
+        let mut cumulative = 0u64;
         for (index, le) in DURATION_BUCKET_LE_MS.iter().enumerate() {
+            cumulative += self.request_duration_buckets[index].load(Ordering::Relaxed);
             let _ = writeln!(
                 out,
-                "nexapipe_request_duration_ms_bucket{{le=\"{le}\"}} {}",
-                self.request_duration_buckets[index].load(Ordering::Relaxed)
+                "nexapipe_request_duration_ms_bucket{{le=\"{le}\"}} {cumulative}"
             );
         }
         // Every request is inside `+Inf`, including one slower than the widest
@@ -832,6 +847,49 @@ mod tests {
             body.contains("nexapipe_request_duration_ms_count 1"),
             "{body}"
         );
+    }
+
+    /// Two requests in different bounds, and the counters hold each of them
+    /// once: the buckets are stored exclusive and summed on the way out.
+    ///
+    /// Storing the cumulative counts instead would put the 7 ms request in
+    /// eleven counters, and a scrape reading between two of those updates would
+    /// see a bucket go down as `le` rises — `le="10"` at one, `le="25"` at
+    /// zero — which is not a histogram `histogram_quantile` can read. Summing
+    /// as the bounds are walked cannot do that, whatever lands mid-scrape.
+    #[test]
+    fn a_request_lands_in_one_bucket_and_the_series_is_cumulative_on_the_way_out() {
+        let metrics = Metrics::new();
+        metrics.record_request(200, 7);
+        metrics.record_request(200, 300);
+
+        let stored: Vec<u64> = metrics
+            .request_duration_buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            stored.iter().sum::<u64>(),
+            2,
+            "each request belongs to one bucket: {stored:?}"
+        );
+
+        let body = metrics.render(&empty_view());
+        let mut previous = 0;
+        for le in DURATION_BUCKET_LE_MS {
+            let series = format!("nexapipe_request_duration_ms_bucket{{le=\"{le}\"}} ");
+            let value: u64 = body
+                .lines()
+                .find_map(|line| line.strip_prefix(&series))
+                .and_then(|rest| rest.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {series}series in {body}"));
+            assert!(
+                value >= previous,
+                "le=\"{le}\" is {value}, less than the bound before it"
+            );
+            previous = value;
+        }
+        assert_eq!(previous, 2, "the widest bound holds both requests: {body}");
     }
 
     /// A request slower than the widest finite bound is still counted. It is
