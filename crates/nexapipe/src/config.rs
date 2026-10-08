@@ -1476,6 +1476,79 @@ impl ProxyConfig {
 
         write_config_file(path, &doc.to_string())
     }
+
+    /// Spends the token for one named device: writes that device's own secret
+    /// into `[auth.clients.<id>.devices.<name>]` and drops
+    /// `pending_enrollment`, leaving the client's `secret` as it was.
+    ///
+    /// The client's secret is deliberately untouched. It is the credential of
+    /// the device that has no name — every device that enrolled before this
+    /// table existed — so rotating it is what re-enrolls all of them at once,
+    /// and an enrollment that names a device is the one case where that is
+    /// known not to be what was asked for. [`Self::complete_enrollment`] is
+    /// still the answer for an enrollment that names none, and still rotates it.
+    ///
+    /// Both keys move in one pass, for the reason given there: a secret on disk
+    /// with the token still beside it would leave the window open for a second
+    /// device to trade the same link for the same credential.
+    pub fn complete_device_enrollment(
+        path: &str,
+        client_id: &str,
+        device: &str,
+        secret: &str,
+    ) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::complete_device_enrollment_unlocked(path, client_id, device, secret)
+        })
+    }
+
+    fn complete_device_enrollment_unlocked(
+        path: &str,
+        client_id: &str,
+        device: &str,
+        secret: &str,
+    ) -> anyhow::Result<()> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, enrollment not saved ({e})"))?;
+
+        let auth = sub_table(doc.as_table_mut(), "auth", path)?;
+        let clients = sub_table(auth, "clients", path)?;
+        let client = sub_table(clients, client_id, path)?;
+
+        // Not `sub_table`, which makes an implicit table: a device added under
+        // one would be written as `devices.laptop = { … }` on a line of the
+        // client's own section, and a table that says what it holds reads
+        // better than a dotted key that does not.
+        let devices = match client.entry("devices") {
+            toml_edit::Entry::Occupied(entry) => entry.into_mut(),
+            toml_edit::Entry::Vacant(entry) => {
+                entry.insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            }
+        };
+        let devices = devices.as_table_like_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{path}: [auth.clients.{client_id}.devices] is not a table, enrollment not saved"
+            )
+        })?;
+
+        // An inline entry rather than a sub-table of its own, because the table
+        // above may itself be an inline one an operator wrote, and a sub-table
+        // cannot be put inside one.
+        let mut entry = toml_edit::InlineTable::new();
+        entry.insert("secret", toml_edit::Value::from(secret));
+        entry.insert(
+            "created_at",
+            toml_edit::Value::from(crate::auth::config::default_created_at()),
+        );
+        devices.insert(device, toml_edit::value(entry));
+
+        client.remove("pending_enrollment");
+
+        write_config_file(path, &doc.to_string())
+    }
 }
 
 /// Runs `work` while holding an exclusive lock on the config file at `path`.
@@ -2314,6 +2387,71 @@ domains = ["fn.iroh.iakl.top"]
         let path = dir.path().join("config.toml");
         fs::write(&path, source).expect("write scratch config");
         (dir, path.to_string_lossy().into_owned())
+    }
+
+    /// A client with a secret of its own and a token outstanding, which is the
+    /// state an enrollment invitation leaves behind.
+    fn scratch_client_with_token() -> (tempfile::TempDir, String) {
+        scratch_config(
+            r#"
+[auth]
+enabled = true
+
+[auth.clients.alice]
+secret = "CLIENTSECRET"
+pending_enrollment = "TOKEN"
+"#,
+        )
+    }
+
+    /// Enrolling a device writes that device's own entry and leaves the
+    /// client's `secret` alone: the two are different credentials, and
+    /// rotating the shared one is what re-enrolls every device at once.
+    ///
+    /// Read back through the loader rather than by looking at the text, because
+    /// what matters is not where the entry lands in the file but that a restart
+    /// sees the device and verifies it against its own secret.
+    #[test]
+    fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
+        let (_dir, path) = scratch_client_with_token();
+
+        ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "LAPTOPSECRET")
+            .expect("the device enrollment is saved");
+
+        let on_disk = fs::read_to_string(&path).expect("read the config back");
+        assert!(
+            !on_disk.contains("pending_enrollment"),
+            "the token was left spendable: {on_disk}"
+        );
+
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
+        let auth = auth.expect("auth is enabled");
+        let alice = &auth.clients["alice"];
+        assert_eq!(alice.secret, "CLIENTSECRET", "the shared secret rotated");
+        assert_eq!(alice.devices["laptop"].secret, "LAPTOPSECRET");
+        assert!(
+            !alice.devices["laptop"].created_at.is_empty(),
+            "a device with no issued-at looks never issued"
+        );
+    }
+
+    /// A second device enrolling alongside the first leaves the first one's
+    /// credential where it is — which is the whole of what the table is for.
+    #[test]
+    fn a_second_device_enrolling_leaves_the_first_one_alone() {
+        let (_dir, path) = scratch_client_with_token();
+
+        ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "LAPTOPSECRET")
+            .expect("the first device enrolls");
+        ProxyConfig::complete_device_enrollment(&path, "alice", "phone", "PHONESECRET")
+            .expect("the second device enrolls");
+
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
+        let auth = auth.expect("auth is enabled");
+        let devices = &auth.clients["alice"].devices;
+        assert_eq!(devices.len(), 2, "{devices:?}");
+        assert_eq!(devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(devices["phone"].secret, "PHONESECRET");
     }
 
     /// Two writers that both read before either writes lose one of the two
