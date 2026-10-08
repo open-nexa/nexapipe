@@ -256,6 +256,32 @@ impl AuthConfig {
     }
 }
 
+impl DeviceAuth {
+    /// Decode the Base32 secret into bytes.
+    ///
+    /// A device secret is spelled the way a client's is, because it is issued
+    /// the same way and written by the same hand — so it is normalised by the
+    /// same rule, and an un-decodable one is the same misconfiguration.
+    pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
+        decode_base32_secret(&self.secret)
+    }
+}
+
+/// Decodes a stored Base32 secret, shared by [`ClientAuth`] and
+/// [`DeviceAuth`].
+///
+/// The stored spelling is normalised first. An invite puts the secret through
+/// `otpauth::normalize_secret`, which tolerates lower case and `=` padding, so
+/// a secret written either of those ways in the config has to work as well —
+/// otherwise it fails to decode here and the client is stuck at "Invalid
+/// Base32 secret" with nothing saying the spelling is why.
+fn decode_base32_secret(stored: &str) -> Result<Vec<u8>, anyhow::Error> {
+    let secret = crate::auth::otpauth::normalize_secret(stored)
+        .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
+    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret)
+        .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
+}
+
 /// Seconds since the Unix epoch.
 ///
 /// The fallible `SystemTime` dance is centralised here so the lockout rules
@@ -311,10 +337,7 @@ impl ClientAuth {
     /// work as well — otherwise it fails to decode here and the client is stuck
     /// at "Invalid Base32 secret" with nothing saying the spelling is why.
     pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        let secret = crate::auth::otpauth::normalize_secret(&self.secret)
-            .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
-        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret)
-            .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
+        decode_base32_secret(&self.secret)
     }
 
     /// The host authorization for a connection authenticated as this client.
@@ -539,6 +562,26 @@ mod tests {
     fn patterns_are_folded_when_the_acl_is_built() {
         let acl = ClientAcl::from_hosts(Some(&["API.Example.Com.".to_string()]));
         assert!(acl.allows("api.example.com"));
+    }
+
+    /// A device secret is issued and spelled the way a client's is, so it has
+    /// to decode under the same rule — a device stuck at "Invalid Base32
+    /// secret" is stuck regardless of which table its secret came from.
+    #[test]
+    fn a_device_secret_decodes_the_way_a_clients_does() {
+        assert_eq!(
+            device("JBSWY3DPEHPK3PXP").decode_secret().unwrap(),
+            b"Hello!\xde\xad\xbe\xef"
+        );
+        assert_eq!(
+            device("jbswy3dpehpk3pxp").decode_secret().unwrap(),
+            device("JBSWY3DPEHPK3PXP").decode_secret().unwrap(),
+            "the case an invite writes is the case this has to read"
+        );
+        assert!(
+            device("JBSWY3DPEHPK3PX1").decode_secret().is_err(),
+            "a character outside the alphabet is not a near miss"
+        );
     }
 
     /// The fallback path, and the only one that existed before: a client with

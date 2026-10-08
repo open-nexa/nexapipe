@@ -49,9 +49,23 @@ impl<'a> TotpValidator<'a> {
     /// `Ok(false)`: a wrong code is a user mistake and counts toward the
     /// lockout, while every `Err` is a refusal the caller logs instead of
     /// counting.
+    ///
+    /// `device_id` says which credential under that client is being proven:
+    /// `None` is the device that has no name and answers with the client's own
+    /// `secret`, which is what every device used before a client could carry a
+    /// table of them. A name selects that device's secret, and a name the
+    /// table does not carry is refused rather than falling back — dropping a
+    /// device from the table is how it is revoked, and a fallback would let it
+    /// back in under the name it no longer has.
+    ///
+    /// Which device authenticated changes nothing about the lockout: the
+    /// counter is the client's, so a device cannot escape it by naming itself
+    /// something new, and a device nobody has ever issued cannot be used to
+    /// walk the counter up.
     pub fn verify_response(
         &self,
         client_id: &str,
+        device_id: Option<&str>,
         nonce: &[u8],
         timestamp: i64,
         signature: &[u8],
@@ -71,9 +85,20 @@ impl<'a> TotpValidator<'a> {
             return Err(AuthError::LockedOut);
         }
 
-        let secret = client
-            .decode_secret()
-            .map_err(|_| AuthError::InvalidSecret)?;
+        // A name that is not in the table is "no such device", not "no name" —
+        // the two are told apart by `Option` on the wire, and only the second
+        // one falls back. A name that is not printable ASCII is not in the
+        // table either, so it lands here as well; what keeps it out of the log
+        // is that this error carries no name.
+        let secret = match device_id {
+            None => client.decode_secret(),
+            Some(name) => client
+                .devices
+                .get(name)
+                .ok_or(AuthError::UnknownDevice)?
+                .decode_secret(),
+        }
+        .map_err(|_| AuthError::InvalidSecret)?;
 
         // `timestamp` arrives from the client, so the subtraction is attacker
         // controlled: `now - i64::MIN` overflows, which panics in a debug build
@@ -168,6 +193,12 @@ fn current_timestamp() -> i64 {
 #[derive(Debug, Clone)]
 pub enum AuthError {
     ClientNotFound,
+    /// The response names a device this client has no credential for — either
+    /// one was never issued to it, or its entry has been dropped.
+    ///
+    /// Deliberately carries no name: it is answered to a name the peer chose,
+    /// which is not a name this process has agreed to print.
+    UnknownDevice,
     InvalidSecret,
     TotpCreationFailed,
     LockedOut,
@@ -183,6 +214,7 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthError::ClientNotFound => write!(f, "Client not found"),
+            AuthError::UnknownDevice => write!(f, "No device of that name under this client"),
             AuthError::InvalidSecret => write!(f, "Invalid secret configuration"),
             AuthError::TotpCreationFailed => write!(f, "Failed to create TOTP validator"),
             AuthError::LockedOut => {
@@ -228,6 +260,35 @@ mod tests {
         }
     }
 
+    /// A client that has issued a credential to one named device. 160-bit
+    /// secrets, because `totp-rs` refuses to build a validator from anything
+    /// shorter than 128 bits — and the tests below reach the TOTP check.
+    fn config_with_one_device() -> AuthConfig {
+        let client = ClientAuth {
+            secret: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            created_at: String::new(),
+            allow_hosts: None,
+            pending_enrollment: None,
+            devices: HashMap::from([(
+                "laptop".to_string(),
+                crate::auth::DeviceAuth {
+                    secret: "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP".to_string(),
+                    created_at: String::new(),
+                    last_used: None,
+                },
+            )]),
+            last_used: None,
+            failed_attempts: 0,
+            locked_until: None,
+        };
+
+        AuthConfig {
+            enabled: true,
+            clients: HashMap::from([("alice".to_string(), client)]),
+            ..AuthConfig::default()
+        }
+    }
+
     /// The nonce a test signs over, minted the way the connection layer mints
     /// its challenge (`conn::perform_authentication` draws 32 random bytes).
     ///
@@ -248,7 +309,8 @@ mod tests {
 
         // i64::MIN overflows `now - timestamp` — a panic in a debug build, a
         // wrap in release, and reachable without authenticating.
-        let outcome = validator.verify_response("alice", &nonce, i64::MIN, b"signature", "000000");
+        let outcome =
+            validator.verify_response("alice", None, &nonce, i64::MIN, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
     }
@@ -259,8 +321,115 @@ mod tests {
         let validator = TotpValidator::new(&config);
 
         let nonce = fresh_nonce();
-        let outcome = validator.verify_response("alice", &nonce, i64::MAX, b"signature", "000000");
+        let outcome =
+            validator.verify_response("alice", None, &nonce, i64::MAX, b"signature", "000000");
 
         assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
+    }
+
+    /// Which secret a named device is checked against: its own, not the
+    /// client's. This is the whole of what revoking a device rests on — a
+    /// device whose entry is dropped must not be able to answer with the
+    /// client's secret instead, and it cannot, because the name it sends is
+    /// what decides which key the signature is compared with.
+    #[test]
+    fn a_named_device_is_checked_against_its_own_secret() {
+        let config = config_with_one_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let laptop = hmac_signature(
+            &config.clients["alice"].devices["laptop"]
+                .decode_secret()
+                .unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+        let clients_own = hmac_signature(
+            &config.clients["alice"].decode_secret().unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        // Signed with the laptop's secret under the laptop's name: the
+        // signature is the one expected, so the verdict is the code's.
+        let outcome = validator.verify_response(
+            "alice",
+            Some("laptop"),
+            &nonce,
+            timestamp,
+            &laptop,
+            "000000",
+        );
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+
+        // The same name, signed with the client's own secret: a mismatch, not
+        // a fallback.
+        let outcome = validator.verify_response(
+            "alice",
+            Some("laptop"),
+            &nonce,
+            timestamp,
+            &clients_own,
+            "000000",
+        );
+        assert!(
+            matches!(outcome, Err(AuthError::ChallengeMismatch)),
+            "{outcome:?}"
+        );
+    }
+
+    /// A name the table does not carry is refused rather than falling back to
+    /// the client's secret. Falling back would make a revoked device's name
+    /// its way back in, and would let a peer that never enrolled answer as
+    /// the device that has no name.
+    #[test]
+    fn a_device_name_the_client_does_not_carry_is_refused() {
+        let config = config_with_one_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        // A name nothing will ever match, including one that is not printable
+        // ASCII: it is not in the table either, so it is refused here without
+        // ever reaching a log line that would print it.
+        for name in ["phone", "laptop\r\nINFO: enrolled", ""] {
+            let outcome = validator.verify_response(
+                "alice",
+                Some(name),
+                &nonce,
+                timestamp,
+                b"signature",
+                "000000",
+            );
+            assert!(
+                matches!(outcome, Err(AuthError::UnknownDevice)),
+                "{name:?} must not resolve, got {outcome:?}"
+            );
+        }
+    }
+
+    /// The fallback, and the only path that existed before: no name sent means
+    /// the device that has none, and it answers with the client's own secret.
+    #[test]
+    fn an_unnamed_device_is_checked_against_the_clients_secret() {
+        let config = config_with_one_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let clients_own = hmac_signature(
+            &config.clients["alice"].decode_secret().unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        let outcome =
+            validator.verify_response("alice", None, &nonce, timestamp, &clients_own, "000000");
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
     }
 }

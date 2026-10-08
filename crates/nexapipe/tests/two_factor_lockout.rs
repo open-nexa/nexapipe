@@ -6,7 +6,7 @@
 //! each other, plus the `save_auth_state` round trip that makes a lockout
 //! survive a restart.
 
-use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, TotpValidator};
+use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator};
 use nexapipe::config::ProxyConfig;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
@@ -17,6 +17,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// example configs carry an 80-bit one for brevity, but `totp-rs` refuses to
 /// build a validator from anything shorter than 128 bits.
 const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+/// Two more of the same length, for the devices under that client. Distinct
+/// from `SECRET` on purpose: a device that could authenticate with the
+/// client's secret would not be a separate credential.
+const LAPTOP_SECRET: &str = "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP";
+const PHONE_SECRET: &str = "MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA";
 
 fn now() -> i64 {
     SystemTime::now()
@@ -58,6 +64,49 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
     config
 }
 
+/// One client with two devices under it — the shape per-device revocation
+/// exists for. The client keeps its own `secret`, which is the credential of
+/// the device that has no name.
+fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthConfig {
+    let mut config = AuthConfig {
+        enabled: true,
+        max_attempts,
+        lockout_duration,
+        ..AuthConfig::default()
+    };
+    config.clients.insert(
+        "client-001".to_string(),
+        ClientAuth {
+            secret: SECRET.to_string(),
+            created_at: "0".to_string(),
+            allow_hosts: None,
+            pending_enrollment: None,
+            devices: HashMap::from([
+                (
+                    "laptop".to_string(),
+                    DeviceAuth {
+                        secret: LAPTOP_SECRET.to_string(),
+                        created_at: "0".to_string(),
+                        last_used: None,
+                    },
+                ),
+                (
+                    "phone".to_string(),
+                    DeviceAuth {
+                        secret: PHONE_SECRET.to_string(),
+                        created_at: "0".to_string(),
+                        last_used: None,
+                    },
+                ),
+            ]),
+            last_used: None,
+            failed_attempts: 0,
+            locked_until: None,
+        },
+    );
+    config
+}
+
 /// A response the client signed over the nonce the server issued verifies.
 ///
 /// This is the cross-crate contract of the signed AUTH_RESPONSE: both halves
@@ -78,6 +127,7 @@ fn accepts_a_signed_current_response() {
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
+        None,
         &nonce,
         timestamp,
         &signature,
@@ -107,6 +157,7 @@ fn rejects_a_response_signed_over_a_different_nonce() {
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
+        None,
         &fresh_nonce(),
         timestamp,
         &signature,
@@ -129,8 +180,14 @@ fn rejects_a_stale_timestamp() {
         .expect("HMAC takes a key of any length");
     let code = client.generate_code().unwrap();
 
-    let outcome =
-        TotpValidator::new(&config).verify_response("client-001", &nonce, stale, &signature, &code);
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        None,
+        &nonce,
+        stale,
+        &signature,
+        &code,
+    );
     assert!(matches!(outcome, Err(AuthError::StaleTimestamp)));
 }
 
@@ -150,6 +207,7 @@ fn reports_a_wrong_code_as_a_counted_failure() {
 
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
+        None,
         &nonce,
         timestamp,
         &signature,
@@ -177,6 +235,7 @@ fn locks_out_after_max_attempts() {
     for _ in 0..3 {
         let outcome = TotpValidator::new(&config).verify_response(
             "client-001",
+            None,
             &nonce,
             timestamp,
             &signature,
@@ -197,6 +256,7 @@ fn locks_out_after_max_attempts() {
 
     let locked = TotpValidator::new(&config).verify_response(
         "client-001",
+        None,
         &nonce,
         timestamp,
         &signature,
@@ -214,6 +274,7 @@ fn locks_out_after_max_attempts() {
         .record_success();
     let outcome = TotpValidator::new(&config).verify_response(
         "client-001",
+        None,
         &nonce,
         timestamp,
         &signature,
@@ -328,4 +389,260 @@ fn does_not_resurrect_a_client_removed_from_disk() {
         !on_disk.contains("client-002"),
         "a client removed from the file must not come back"
     );
+}
+
+/// A device authenticates with its own secret, not the client's: signed with
+/// the laptop's it verifies as the laptop, and the same signature offered
+/// under another device's name does not.
+#[test]
+fn a_device_authenticates_with_its_own_secret() {
+    let config = auth_config_with_devices(3, 60);
+    let laptop = TwoFactorAuth::new("client-001", LAPTOP_SECRET, TotpAlgorithm::SHA1).unwrap();
+
+    let nonce = fresh_nonce();
+    let timestamp = now();
+    let signature = laptop.sign_challenge(&nonce, timestamp).unwrap();
+    let code = laptop.generate_code().unwrap();
+
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        Some("laptop"),
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Ok(true)),
+        "the laptop's own response must verify, got {outcome:?}"
+    );
+
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        Some("phone"),
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Err(AuthError::ChallengeMismatch)),
+        "the laptop's signature is not the phone's credential, got {outcome:?}"
+    );
+}
+
+/// The promise of the whole feature: dropping a device's entry stops that
+/// device, and the one next to it keeps working — which is what rotating the
+/// one shared `secret` could not do.
+#[test]
+fn revoking_one_device_leaves_the_other_authenticating() {
+    let mut config = auth_config_with_devices(3, 60);
+    config
+        .clients
+        .get_mut("client-001")
+        .unwrap()
+        .devices
+        .remove("phone");
+
+    let phone = TwoFactorAuth::new("client-001", PHONE_SECRET, TotpAlgorithm::SHA1).unwrap();
+    let nonce = fresh_nonce();
+    let timestamp = now();
+    let signature = phone.sign_challenge(&nonce, timestamp).unwrap();
+    let code = phone.generate_code().unwrap();
+
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        Some("phone"),
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Err(AuthError::UnknownDevice)),
+        "a revoked device is refused even with a perfect response, got {outcome:?}"
+    );
+
+    let laptop = TwoFactorAuth::new("client-001", LAPTOP_SECRET, TotpAlgorithm::SHA1).unwrap();
+    let nonce = fresh_nonce();
+    let timestamp = now();
+    let signature = laptop.sign_challenge(&nonce, timestamp).unwrap();
+    let code = laptop.generate_code().unwrap();
+
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        Some("laptop"),
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Ok(true)),
+        "the laptop is untouched by the phone's revocation, got {outcome:?}"
+    );
+}
+
+/// The fallback: a device table does not take the client's own `secret` out of
+/// service, because that is the credential of the device that has no name —
+/// every device that existed before tables could be written.
+#[test]
+fn an_unnamed_device_still_answers_with_the_clients_secret() {
+    let config = auth_config_with_devices(3, 60);
+    let unnamed = TwoFactorAuth::new("client-001", SECRET, TotpAlgorithm::SHA1).unwrap();
+
+    let nonce = fresh_nonce();
+    let timestamp = now();
+    let signature = unnamed.sign_challenge(&nonce, timestamp).unwrap();
+    let code = unnamed.generate_code().unwrap();
+
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        None,
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Ok(true)),
+        "no name sent is the unnamed device, got {outcome:?}"
+    );
+}
+
+/// The lockout is the client's, not the device's: a device that burns the
+/// counter takes its siblings down with it. The alternative — one counter per
+/// device, keyed by a name the peer chooses — would let a peer escape by
+/// naming a device nobody has heard of.
+#[test]
+fn a_device_shares_its_clients_lockout_counter() {
+    let mut config = auth_config_with_devices(3, 60);
+    let laptop = TwoFactorAuth::new("client-001", LAPTOP_SECRET, TotpAlgorithm::SHA1).unwrap();
+
+    for _ in 0..3 {
+        let nonce = fresh_nonce();
+        let timestamp = now();
+        let signature = laptop.sign_challenge(&nonce, timestamp).unwrap();
+        let outcome = TotpValidator::new(&config).verify_response(
+            "client-001",
+            Some("laptop"),
+            &nonce,
+            timestamp,
+            &signature,
+            "000000",
+        );
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        config
+            .clients
+            .get_mut("client-001")
+            .unwrap()
+            .record_failure(config.max_attempts, config.lockout_duration);
+    }
+
+    assert!(
+        config.clients["client-001"].is_locked_out(),
+        "three wrong codes from one device lock the client out"
+    );
+
+    // Naming a device that has never been issued does not unlock anything.
+    let phone = TwoFactorAuth::new("client-001", PHONE_SECRET, TotpAlgorithm::SHA1).unwrap();
+    let nonce = fresh_nonce();
+    let timestamp = now();
+    let signature = phone.sign_challenge(&nonce, timestamp).unwrap();
+    let code = phone.generate_code().unwrap();
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        Some("phone"),
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(
+        matches!(outcome, Err(AuthError::LockedOut)),
+        "the lockout is the client's, so another device hits it too: {outcome:?}"
+    );
+
+    // And so does the device that has no name.
+    let outcome = TotpValidator::new(&config).verify_response(
+        "client-001",
+        None,
+        &nonce,
+        timestamp,
+        &signature,
+        &code,
+    );
+    assert!(matches!(outcome, Err(AuthError::LockedOut)), "{outcome:?}");
+}
+
+/// `save_auth_state` rewrites the file on every counted failure — which is
+/// also the file the device table lives in. A write that dropped the table
+/// would revoke every device the first time somebody mistyped a code, and it
+/// would do it on disk only, where the running server still has them.
+#[test]
+fn keeps_the_device_table_when_it_writes_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap();
+    std::fs::write(
+        &path,
+        "# operator comment that must survive\n\
+         [auth]\n\
+         enabled = true\n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         created_at = \"1723756800\"\n\
+         [auth.clients.client-001.devices.laptop]\n\
+         secret = \"KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP\"\n\
+         created_at = \"1723756801\"\n\
+         [auth.clients.client-001.devices.phone]\n\
+         secret = \"MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA\"\n",
+    )
+    .unwrap();
+
+    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let mut auth = auth.expect("the config declares [auth]");
+    assert_eq!(
+        auth.clients["client-001"].devices.len(),
+        2,
+        "the fixture carries two devices"
+    );
+
+    auth.clients
+        .get_mut("client-001")
+        .unwrap()
+        .record_failure(3, 60);
+    save_auth_state(path_str, &auth).unwrap();
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("failed_attempts = 1"),
+        "the counter was written: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"),
+        "the laptop's secret survives a counter write: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA"),
+        "so does the phone's: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("created_at = \"1723756801\""),
+        "a device's own keys are not the server's to rewrite: {on_disk}"
+    );
+
+    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let reloaded = reloaded.unwrap();
+    let client = &reloaded.clients["client-001"];
+    assert_eq!(client.devices.len(), 2, "{client:?}");
+    assert_eq!(
+        client.devices["laptop"].secret,
+        "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"
+    );
+    assert_eq!(
+        client.devices["phone"].secret,
+        "MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA"
+    );
+    assert_eq!(client.failed_attempts, 1);
 }
