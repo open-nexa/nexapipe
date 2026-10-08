@@ -22,6 +22,15 @@
 //! answer, so it is read at exposition time from the live routing table; a
 //! counter maintained by the probes could only drift from it.
 //!
+//! # Why latency is a histogram
+//!
+//! Request duration is exposed as fixed buckets rather than as the sum it used
+//! to be, because the mean is the only question a sum answers and it is not the
+//! one a proxy gets asked. The boundaries are fixed rather than fitted to what
+//! has been served: two scrapes can only be compared if the boundaries are the
+//! same in both, and a bucket edge that moves under a dashboard is worse than
+//! one that was picked once and left alone.
+//!
 //! # Where bytes come from
 //!
 //! Bytes are counted on the **client leg** of every conversation and nowhere
@@ -94,6 +103,22 @@ pub struct Metrics {
     requests: [AtomicU64; STATUS_CLASSES],
     /// Milliseconds spent answering them, summed.
     request_duration_ms: AtomicU64,
+    /// Requests by how long they took: one counter per upper bound in
+    /// [`DURATION_BUCKET_LE_MS`], **exclusive** — a request is counted in the
+    /// narrowest bound it is under and nowhere else, and Prometheus's
+    /// cumulative series is summed while rendering.
+    ///
+    /// Storing the cumulative counts instead would mean one request touching up
+    /// to twelve counters, and a scrape that read between two of those updates
+    /// would see a bucket go *down* as `le` rises: `le="10"` at 1 and
+    /// `le="25"` at 0. A histogram whose buckets are not monotonic is one
+    /// `histogram_quantile` has to repair before it can answer. Summing at
+    /// render time cannot produce that, because the running total only ever
+    /// grows as the loop walks the bounds.
+    /// A request slower than the widest bound lands in none of them, which is
+    /// why the `+Inf` series is rendered from the request count instead of
+    /// being kept as one more bucket.
+    request_duration_buckets: [AtomicU64; DURATION_BUCKETS],
     /// Bytes served to clients. See the module docs for where these come from.
     bytes_sent: AtomicU64,
     /// Bytes accepted from clients.
@@ -113,6 +138,23 @@ const L4_LABELS: [&str; L4_PROTOS] = ["tcp", "udp"];
 
 /// Label for a response's status class, in the order of [`Metrics::requests`].
 const CLASS_LABELS: [&str; STATUS_CLASSES] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// Upper bounds of the request-duration buckets, in milliseconds, ascending.
+///
+/// Spaced so that both halves of the range someone asks about are covered: a
+/// few milliseconds apart while responses are fast enough to argue about, and
+/// coarser once a request is slow enough that the difference between 4 and 5
+/// seconds is not what anybody is measuring. `+Inf` is deliberately not here.
+const DURATION_BUCKET_LE_MS: [u64; DURATION_BUCKETS] =
+    [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
+/// How many finite buckets [`DURATION_BUCKET_LE_MS`] defines.
+///
+/// Written out rather than taken from `DURATION_BUCKET_LE_MS.len()`, which
+/// would be a cycle: the array's type is spelled with this. The two still
+/// cannot drift — an array literal that does not match its declared length
+/// does not compile.
+const DURATION_BUCKETS: usize = 12;
 
 /// The metrics of this process.
 pub static METRICS: Metrics = Metrics::new();
@@ -138,6 +180,20 @@ impl Metrics {
                 AtomicU64::new(0),
             ],
             request_duration_ms: AtomicU64::new(0),
+            request_duration_buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             flows: [
@@ -178,6 +234,20 @@ impl Metrics {
         self.requests[status_class(status)].fetch_add(1, Ordering::Relaxed);
         self.request_duration_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
+        // One counter, the narrowest bound that holds the duration. These are
+        // exclusive counts and the cumulative series Prometheus wants is summed
+        // as the exposition walks the bounds — see the field, and the reason
+        // there, for why the addition is not done here.
+        //
+        // `partition_point` needs the slice sorted, which this const is, and
+        // answers with the index of the first entry that is *not* below the
+        // duration. Something slower than every bound comes back as the length,
+        // so the `get` below answers `None` and the request lands in `+Inf`
+        // only — which is what `+Inf` is for.
+        let index = DURATION_BUCKET_LE_MS.partition_point(|le| *le < duration_ms);
+        if let Some(bucket) = self.request_duration_buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Records one L4 flow that ended, with the status it was answered with.
@@ -217,6 +287,18 @@ impl Metrics {
         self.direct.load(Ordering::Relaxed)
             + self.relayed.load(Ordering::Relaxed)
             + self.unknown.load(Ordering::Relaxed)
+    }
+
+    /// Requests answered, every class summed.
+    ///
+    /// Derived from the class counters rather than counted again: the
+    /// histogram's `_count` and its `+Inf` series are both this number, and a
+    /// third counter kept alongside them is a counter waiting to disagree.
+    fn requests_total(&self) -> u64 {
+        self.requests
+            .iter()
+            .map(|class| class.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Every counter as values, in the shape the management surface reads.
@@ -332,16 +414,50 @@ impl Metrics {
             );
         }
 
-        // A sum, not a histogram: the count to divide by is
-        // `nexapipe_requests_total`, and buckets would mean choosing boundaries
-        // for a traffic mix this process knows nothing about.
-        counter(
-            &mut out,
-            "nexapipe_request_duration_ms_total",
-            "Milliseconds spent answering requests, summed. Divide by nexapipe_requests_total \
-             for a mean.",
-            self.request_duration_ms.load(Ordering::Relaxed),
+        // A histogram rather than the sum this used to be. The sum is still
+        // here as `_sum` — the counter it replaced carried the same number
+        // under a name a histogram cannot have — but on its own it could only
+        // answer "what is the mean", and not one of them is what a proxy gets
+        // asked. Buckets are cumulative the way `histogram_quantile` expects:
+        // a request is counted in every bound it is under, not in the range it
+        // falls into.
+        let _ = writeln!(
+            out,
+            "# HELP nexapipe_request_duration_ms How long requests took to answer, in milliseconds."
         );
+        let _ = writeln!(out, "# TYPE nexapipe_request_duration_ms histogram");
+        // Cumulative, summed from the exclusive counts as the bounds are walked
+        // out, so every series is at least the one before it however many
+        // requests land mid-scrape.
+        let mut cumulative = 0u64;
+        for (index, le) in DURATION_BUCKET_LE_MS.iter().enumerate() {
+            cumulative += self.request_duration_buckets[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "nexapipe_request_duration_ms_bucket{{le=\"{le}\"}} {cumulative}"
+            );
+        }
+        // Every request is inside `+Inf`, including one slower than the widest
+        // finite bound, so this series is the request count rather than a
+        // bucket of its own — as is `_count`, for the same reason.
+        //
+        // Clamped to what the bounds above have counted: `record_request` raises
+        // the class counter first and the bucket second, both relaxed, so on a
+        // weakly ordered machine a scrape can read the second without the first
+        // and count fewer requests than the buckets hold. Read that way, `+Inf`
+        // and `_count` would come out below the widest finite bound — exactly
+        // the descending series the exclusive counts are stored to avoid.
+        let requests = self.requests_total().max(cumulative);
+        let _ = writeln!(
+            out,
+            "nexapipe_request_duration_ms_bucket{{le=\"+Inf\"}} {requests}"
+        );
+        let _ = writeln!(
+            out,
+            "nexapipe_request_duration_ms_sum {}",
+            self.request_duration_ms.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "nexapipe_request_duration_ms_count {requests}");
 
         // One metric with a label rather than two counters: they are the same
         // number seen from either side, and a dashboard should be able to ask
@@ -579,6 +695,15 @@ mod tests {
     /// cannot see what another test is doing.
     static TEST_METRICS: Metrics = Metrics::new();
 
+    /// Nothing live, for the tests that only read counters.
+    fn empty_view() -> InstanceView {
+        InstanceView {
+            in_flight: 0,
+            backends_up: 0,
+            backends_down: 0,
+        }
+    }
+
     /// A status class has to survive the statuses the server can actually
     /// produce, including the ones that are not HTTP: the L4 path answers with
     /// a status byte of its own, and `0` is what a request nobody answered is
@@ -613,7 +738,7 @@ mod tests {
             "nexapipe_connections_active",
             "nexapipe_connections_by_path",
             "nexapipe_requests_total",
-            "nexapipe_request_duration_ms_total",
+            "nexapipe_request_duration_ms",
             "nexapipe_traffic_bytes_total",
             "nexapipe_l4_flows_total",
             "nexapipe_backends_up",
@@ -633,6 +758,10 @@ mod tests {
         assert!(body.contains("nexapipe_traffic_bytes_total{direction=\"sent\"} 0"));
         assert!(body.contains("nexapipe_traffic_bytes_total{direction=\"received\"} 0"));
         assert!(body.contains("nexapipe_l4_flows_total{proto=\"udp\",status_class=\"4xx\"} 0"));
+        assert!(body.contains("nexapipe_request_duration_ms_bucket{le=\"1\"} 0"));
+        assert!(body.contains("nexapipe_request_duration_ms_bucket{le=\"+Inf\"} 0"));
+        assert!(body.contains("nexapipe_request_duration_ms_sum 0"));
+        assert!(body.contains("nexapipe_request_duration_ms_count 0"));
     }
 
     /// The two directions are separate numbers about the same transfer, so each
@@ -688,6 +817,144 @@ mod tests {
             0
         );
         assert_eq!(metrics.request_duration_ms.load(Ordering::Relaxed), 15);
+    }
+
+    /// A bucket is cumulative: one request of 7 ms is inside `le="10"` and every
+    /// bound above it, and outside `le="5"`. A bucket that counted only its own
+    /// range would not fail — `histogram_quantile` would answer with the wrong
+    /// quantile and nothing would say so.
+    #[test]
+    fn a_duration_is_counted_in_every_bound_it_is_under() {
+        let metrics = Metrics::new();
+        metrics.record_request(200, 7);
+
+        let body = metrics.render(&empty_view());
+
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"5\"} 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"10\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"25\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"10000\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"+Inf\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_count 1"),
+            "{body}"
+        );
+    }
+
+    /// Two requests in different bounds, and the counters hold each of them
+    /// once: the buckets are stored exclusive and summed on the way out.
+    ///
+    /// Storing the cumulative counts instead would put the 7 ms request in
+    /// eleven counters, and a scrape reading between two of those updates would
+    /// see a bucket go down as `le` rises — `le="10"` at one, `le="25"` at
+    /// zero — which is not a histogram `histogram_quantile` can read. Summing
+    /// as the bounds are walked cannot do that, whatever lands mid-scrape.
+    #[test]
+    fn a_request_lands_in_one_bucket_and_the_series_is_cumulative_on_the_way_out() {
+        let metrics = Metrics::new();
+        metrics.record_request(200, 7);
+        metrics.record_request(200, 300);
+
+        let stored: Vec<u64> = metrics
+            .request_duration_buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            stored.iter().sum::<u64>(),
+            2,
+            "each request belongs to one bucket: {stored:?}"
+        );
+
+        let body = metrics.render(&empty_view());
+        let mut previous = 0;
+        for le in DURATION_BUCKET_LE_MS {
+            let series = format!("nexapipe_request_duration_ms_bucket{{le=\"{le}\"}} ");
+            let value: u64 = body
+                .lines()
+                .find_map(|line| line.strip_prefix(&series))
+                .and_then(|rest| rest.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {series}series in {body}"));
+            assert!(
+                value >= previous,
+                "le=\"{le}\" is {value}, less than the bound before it"
+            );
+            previous = value;
+        }
+        assert_eq!(previous, 2, "the widest bound holds both requests: {body}");
+    }
+
+    /// A request slower than the widest finite bound is still counted. It is
+    /// inside `+Inf` and inside nothing else, and letting it fall out of the
+    /// histogram entirely would leave `_count` disagreeing with
+    /// `nexapipe_requests_total`.
+    #[test]
+    fn a_duration_past_the_widest_bound_is_still_counted() {
+        let metrics = Metrics::new();
+        let past = DURATION_BUCKET_LE_MS[DURATION_BUCKETS - 1] + 1;
+        metrics.record_request(200, past);
+        metrics.record_request(200, 3);
+
+        let body = metrics.render(&empty_view());
+
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"10000\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"+Inf\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_count 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("nexapipe_request_duration_ms_sum {}", past + 3)),
+            "{body}"
+        );
+    }
+
+    /// `+Inf` and `_count` are the request count, and they may never come out
+    /// below the widest finite bucket. `record_request` raises the class counter
+    /// before the bucket and both are relaxed, so a scrape racing a record can
+    /// read the bucket without the count that came with it. That window is far
+    /// too narrow to hit on purpose, so the state is written by hand instead:
+    /// three requests counted in a bucket, none of them in a class yet.
+    #[test]
+    fn the_request_count_is_never_below_the_widest_bound() {
+        let metrics = Metrics::new();
+        metrics.request_duration_buckets[0].store(3, Ordering::Relaxed);
+
+        let body = metrics.render(&empty_view());
+
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"10000\"} 3"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"+Inf\"} 3"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_count 3"),
+            "{body}"
+        );
     }
 
     /// A connection that changes path stays counted once: relayed, then direct,
