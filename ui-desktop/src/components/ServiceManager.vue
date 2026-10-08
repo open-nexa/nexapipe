@@ -66,21 +66,40 @@ async function refresh() {
   }
 }
 
-/// A service answering the IPC port with a build other than this app's — or with none at all,
-/// which is what a build predating the question does — is not running what installing would put
-/// there. That is the drift worth reporting, and it is only ever the answer of a service we are
-/// actually talking to.
+/// The service is up and said which build it is, and that build is not this app's. The single
+/// drift that reinstalling actually fixes, and the only one worth a banner.
 ///
-/// Reachable is a different question from registered, and only the first one carries evidence.
-/// A service that has just been started answers nothing yet, and neither does one whose socket
-/// we failed to reach this time: both would otherwise be reported as stale builds for as long
-/// as the panel's own poll takes. Nothing has to answer twice for this either — the proxy store
-/// already polls whether something is on the IPC port, because TUN is gated on it.
-const needsUpgrade = computed(
+/// Pre-PR # this was conflated with [`versionUnknown`] — `null !== "0.5.0"` is true, so a service
+/// that simply hadn't answered was reported as drift. That conflation was platform-agnostic but
+/// hit macOS / Linux first when the desktop's webview ACL refused the version query (PR #100),
+/// and it would still bite whenever the daemon's IPC handshake is older than the question.
+const versionMismatch = computed(
   () =>
     appVersion.value !== "" &&
     serviceRunning.value &&
+    serviceVersion.value !== null &&
     serviceVersion.value !== appVersion.value,
+);
+
+/// The service is up but did not answer which build it is. A build that predates the question
+/// closes the connection instead of answering it (and on macOS / Linux, anything that prevents
+/// the IPC client from getting a version through `IpcClient::get_version` lands here too). The
+/// action is the same as a mismatch (reinstall this app's build), but the wording has to make
+/// clear that an unknown build is not the same as a known-outdated one — otherwise a user with
+/// both an old service and a working one would reinstall the wrong machine.
+///
+/// Drawn as its own computed so the [`needsUpgradeMessage`] can branch on it and the future-
+/// debugging surface stays one boolean away.
+const versionUnknown = computed(
+  () =>
+    appVersion.value !== "" &&
+    serviceRunning.value &&
+    serviceVersion.value === null,
+);
+
+/// Either drift state warrants the banner; the wording is what tells them apart.
+const needsUpgrade = computed(
+  () => versionMismatch.value || versionUnknown.value,
 );
 
 const needsUpgradeMessage = computed(() =>
