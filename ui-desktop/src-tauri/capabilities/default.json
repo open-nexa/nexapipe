@@ -42,6 +42,7 @@
     "allow-install-service",
     "allow-is-service-running",
     "allow-lock-credentials",
+    "allow-log-startup-timing",
     "allow-parse-invite",
     "allow-put-credential",
     "allow-reveal-credential",

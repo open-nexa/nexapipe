@@ -27,12 +27,17 @@ import { readStoredLocale } from './stores/prefs';
 import { initProxyState, onAppFocused } from './stores/proxy';
 import { initGate, refreshGate } from './stores/gate';
 import { initConfigStore, initConfigStoreDeferred } from './stores/config';
+import { flushStartupTiming, mark } from './app/startup';
 
 import './styles/tokens.css';
 import './styles/themes.css';
 import './styles/base.css';
 // Temporary: the token names the not-yet-migrated pages still use. Removed with them (§7).
 import './styles/legacy.css';
+
+// Every static import above has been evaluated by now, so this is where the bundle's own cost
+// ends. Measured from the document navigation: see `app/startup.ts`.
+mark('module-start');
 
 applyStoredTheme();
 
@@ -44,28 +49,50 @@ applyStoredTheme();
  * the app's own background filling it. Waiting until the app has mounted and painted means the
  * window appears already drawn instead.
  *
- * A frame is asked for first so the paint being *finished* is what the user sees, not merely
- * scheduled: showing on the same tick as `mount()` would put a window up that still has nothing
- * in it, which is the thing this is here to avoid.
+ * The window is shown *before* a frame is waited for, not after.
+ *
+ * It used to be the other way round, and that never worked: the window is hidden until this
+ * call, and a hidden window is not composited, so `requestAnimationFrame` is not scheduled for
+ * it. Waiting for a frame before showing waited for the one thing it was there to enable — and
+ * resolved only ten seconds later, when the backend's fallback showed the window anyway. Until
+ * then the application was indistinguishable from one that had not started.
+ *
+ * Showing straight after `mount()` is safe for a different reason: `mount()` is synchronous, so
+ * the tree is already in the document, and the window carries the app's own background colour
+ * from `tauri.conf.json` — the frame the user sees first is never a white one.
+ *
+ * A frame is still awaited, after the show rather than before it, so the log records how long
+ * the first real paint took: that is the number the frontend's own timings are here to produce,
+ * and `show()` cannot report it.
  *
  * Failure is not fatal and neither is a plain browser: `vite dev` has no Tauri window and the
  * call rejects, which is expected and says nothing about the app.
+ *
+ * `shown` is the moment the user has been waiting for, so it is also the moment the timings are
+ * worth sending: a measurement that added its own round-trip to the wait would be measuring
+ * itself.
  */
 async function showWindow(): Promise<void> {
   try {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     await getCurrentWindow().show();
+    mark('shown');
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    mark('first-frame');
   } catch (error) {
     console.warn('[window] could not show the window:', error);
+  } finally {
+    void flushStartupTiming();
   }
 }
 
 async function bootstrap(): Promise<void> {
   await initPlatform();
+  mark('platform-done');
 
   // Credentials are read from the encrypted store, which is asynchronous, so this is awaited
   // before mount: a page must never render a node's 2FA as absent and then fill it in.
   await initConfigStore();
+  mark('credentials-done');
 
   // The composition root owns the *initial* locale; `useLocale` owns every later change, so the
   // two cannot fight over the value — both resolve it the same way.
@@ -75,6 +102,7 @@ async function bootstrap(): Promise<void> {
   app.use(i18n);
   app.use(router);
   app.mount('#app');
+  mark('mounted');
 
   // The window exists from the start but is not shown until there is something in it.
   void showWindow();
