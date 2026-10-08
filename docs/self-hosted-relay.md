@@ -70,9 +70,10 @@ sudo install -m 0755 target/optimized-release/iroh-relay /usr/local/bin/iroh-rel
 
 Keeping to **the same version your endpoints speak** is worth doing: this tree's
 `Cargo.lock` resolves `iroh` and `iroh-relay` at 1.3.0, and pinning the relay to
-that tag is the only combination anyone here can reason about. Upstream's
-current release is newer than what this tree links, and whether the two ends
-still agree across that gap is not something this page can tell you.
+that tag is the only combination anyone here can reason about. Upstream keeps
+cutting releases, so the tag this tree links will not stay the newest one
+forever; if a newer one has appeared, whether the two ends still agree across
+that gap is not something this page can tell you.
 
 ## Starting it
 
