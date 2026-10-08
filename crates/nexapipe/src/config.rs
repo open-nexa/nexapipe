@@ -1081,11 +1081,32 @@ pub struct ClientAuthToml {
     /// written back by `save_auth_state`: it belongs to the operator, not to
     /// the runtime.
     pub pending_enrollment: Option<String>,
+    /// `[auth.clients.<id>.devices.<name>]` — credentials issued to individual
+    /// devices, each with a secret of its own so one can be dropped without
+    /// rotating the others. Absent means this client has never issued one, and
+    /// every device then shares the `secret` above.
+    pub devices: Option<HashMap<String, DeviceAuthToml>>,
     /// Runtime counters written back by the server (see
     /// `config_watcher::save_auth_state`); read here so a lockout survives a
     /// restart.
     pub failed_attempts: Option<u32>,
     pub locked_until: Option<u64>,
+    pub last_used: Option<u64>,
+}
+
+/// One `[auth.clients.<id>.devices.<name>]` entry.
+///
+/// Unknown keys are refused for the same reason as in [`ClientAuthToml`]. There
+/// is no `allow_hosts` here on purpose: what a client may reach is answered by
+/// the client's entry alone, and a second place to say it is a second place for
+/// it to disagree.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceAuthToml {
+    pub secret: String,
+    pub created_at: Option<String>,
+    /// Written back by the server, read here, so "when did this device last
+    /// connect" survives a restart.
     pub last_used: Option<u64>,
 }
 
@@ -1229,18 +1250,59 @@ impl ProxyConfig {
                                     );
                                 }
                             }
+                            // A name in this table is a credential's whole
+                            // identity: it is what the device sends, what the
+                            // log line for every outcome carries, and what an
+                            // operator names when revoking one. An empty one
+                            // is not a name — the unnamed device is what the
+                            // client's own `secret` is for — and an empty
+                            // secret would key its HMAC with nothing, which is
+                            // a signature anybody can forge.
+                            let mut devices = HashMap::new();
+                            for (device_id, device_toml) in client_toml.devices.unwrap_or_default()
+                            {
+                                if device_id.is_empty() {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}.devices]: a device needs a name; a \
+                                         client's own `secret` is the credential of the device \
+                                         that has none"
+                                    );
+                                }
+                                if !crate::auth::is_presentable_device_id(&device_id) {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}.devices.{device_id}]: a device name is \
+                                         printable ASCII of at most {} characters — it is written \
+                                         into the log line for everything that happens to it",
+                                        crate::auth::MAX_DEVICE_ID_LEN
+                                    );
+                                }
+                                if device_toml.secret.is_empty() {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}.devices.{device_id}]: secret is empty; \
+                                         an empty one keys this device's HMAC with nothing"
+                                    );
+                                }
+                                devices.insert(
+                                    device_id,
+                                    crate::auth::DeviceAuth {
+                                        secret: device_toml.secret,
+                                        created_at: device_toml.created_at.unwrap_or_else(
+                                            crate::auth::config::default_created_at,
+                                        ),
+                                        last_used: device_toml.last_used,
+                                    },
+                                );
+                            }
                             clients.insert(
                                 id,
                                 crate::auth::ClientAuth {
                                     secret: client_toml.secret,
-                                    created_at: client_toml.created_at.unwrap_or_else(|| {
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs().to_string())
-                                            .unwrap_or_else(|_| "0".to_string())
-                                    }),
+                                    created_at: client_toml
+                                        .created_at
+                                        .unwrap_or_else(crate::auth::config::default_created_at),
                                     allow_hosts: client_toml.allow_hosts,
                                     pending_enrollment: client_toml.pending_enrollment,
+                                    devices,
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
@@ -2747,5 +2809,98 @@ allow_hosts = ["*iakl.top"]
     fn an_unknown_auth_key_is_refused_rather_than_ignored() {
         let err = load_from("[auth]\nenable = true\n").expect_err("a typo must not disable 2FA");
         assert!(err.to_string().contains("enable"), "{err}");
+    }
+
+    /// The table an operator writes under a client, read back the way the
+    /// server reads it — and the client's own `secret` is still there beside
+    /// it, because that is the credential of the device with no name.
+    #[test]
+    fn a_device_table_loads_without_disturbing_the_client() {
+        let (_, auth) = load_from(
+            r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+
+[auth.clients.client-001.devices.laptop]
+secret = "LAPTOPSECRET"
+
+[auth.clients.client-001.devices.phone]
+secret = "PHONESECRET"
+created_at = "1700000000"
+"#,
+        )
+        .expect("a device table loads");
+
+        let client = &auth.expect("auth section present").clients["client-001"];
+        assert_eq!(client.secret, "CLIENTSECRET");
+        assert_eq!(client.devices.len(), 2);
+        assert_eq!(client.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(client.devices["phone"].created_at, "1700000000");
+        assert!(
+            !client.devices["laptop"].created_at.is_empty(),
+            "an undated device is dated the moment it is issued"
+        );
+    }
+
+    /// A device secret keys that device's HMAC, so an empty one is a signature
+    /// anybody can forge — refused at load rather than read as "a device that
+    /// authenticates nobody".
+    #[test]
+    fn an_empty_device_secret_is_refused() {
+        let err = load_from(
+            r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+
+[auth.clients.client-001.devices.laptop]
+secret = ""
+"#,
+        )
+        .expect_err("an empty secret must not load");
+
+        assert!(err.to_string().contains("devices.laptop"), "{err}");
+    }
+
+    /// Why a device entry refuses keys it does not know, which is the reason
+    /// every `[auth]` table does: `secrets` for `secret` would leave the device
+    /// with no credential at all, and nothing would say so.
+    #[test]
+    fn an_unknown_device_key_is_refused_rather_than_ignored() {
+        let err = load_from(
+            r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+
+[auth.clients.client-001.devices.laptop]
+secrets = "LAPTOPSECRET"
+"#,
+        )
+        .expect_err("a typo must not leave a device without a credential");
+
+        assert!(err.to_string().contains("secrets"), "{err}");
+    }
+
+    /// A device name is written into the log line for everything that happens
+    /// to it, and it is what an operator names when revoking one — so it is
+    /// held to what a client id is before it is ever accepted.
+    #[test]
+    fn a_device_name_is_refused_before_it_reaches_a_log_line() {
+        let client = r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+"#;
+
+        let err = load_from(&format!(
+            "{client}\n[auth.clients.client-001.devices.\"\"]\nsecret = \"LAPTOPSECRET\"\n"
+        ))
+        .expect_err("an unnamed device is not a device");
+        assert!(err.to_string().contains("needs a name"), "{err}");
+
+        let err = load_from(&format!(
+            "{client}\n[auth.clients.client-001.devices.\"laptop\\r\\nINFO: connected\"]\n\
+             secret = \"LAPTOPSECRET\"\n"
+        ))
+        .expect_err("a name that ends its own log line must not load");
+        assert!(err.to_string().contains("printable ASCII"), "{err}");
     }
 }
