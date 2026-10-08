@@ -1,6 +1,6 @@
 use crate::auth::{
-    AuthConfig, AuthError, AuthMessage, ClientAcl, TotpValidator, is_presentable_client_id,
-    is_presentable_device_id,
+    AuthConfig, AuthError, AuthMessage, ClientAcl, DeviceAuth, TotpValidator,
+    is_presentable_client_id, is_presentable_device_id,
 };
 use crate::config::Timeouts;
 use crate::config_watcher::save_auth_state;
@@ -14,7 +14,7 @@ use ::http::Request;
 use futures_util::StreamExt;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
-use peers::PeerRegistry;
+use peers::{PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -771,6 +771,21 @@ fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> Enrollm
     EnrollmentVerdict::Accept
 }
 
+/// What a successful handshake established.
+///
+/// Carried as both halves because a client id on its own cannot tell two
+/// devices of the same client apart, and telling them apart is the only thing
+/// a per-device credential is for: what the peer list, the access log and —
+/// later — the revocation that has to close one device's connections all need
+/// to know is whose connection this is, not merely whose client's.
+struct AuthenticatedPeer {
+    client_id: String,
+    /// The device name the peer sent. `None` is the device that has none,
+    /// which answered with the client's own secret.
+    device: Option<String>,
+    acl: ClientAcl,
+}
+
 /// Exchanges a one-time enrollment token for a freshly generated secret.
 ///
 /// This is what makes an enrollment invite worth handing out: the link carries
@@ -779,13 +794,109 @@ fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> Enrollm
 /// transit is therefore a credential only until it is used once, instead of
 /// until somebody remembers to rotate it.
 ///
+/// Where an enrollment puts the secret it issues, and what undoing it has to
+/// put back.
+///
+/// Two slots, because a client's own `secret` and its device table are not the
+/// same credential and an enrollment names which of the two it is asking about:
+/// a device that sends a name wants an entry of its own, and a device that
+/// sends none is one that predates the table, for whom the client's `secret` is
+/// the only credential there is.
+enum EnrollmentSlot {
+    /// A named device. The client's `secret` is left alone, so the other
+    /// devices keep theirs — which is the whole point of the table.
+    Device {
+        name: String,
+        /// The entry this enrollment replaced, if the device was enrolled
+        /// before. Re-enrolling one device is how its credential is rotated
+        /// without touching the others.
+        previous: Option<DeviceAuth>,
+    },
+    /// The device that has no name: the client's own `secret`, which is also
+    /// what every peer that predates the device table answers with.
+    Shared {
+        /// The secret this enrollment rotated away.
+        previous: String,
+    },
+}
+
+/// Writes the issued secret into the slot this enrollment named, in memory.
+///
+/// The caller persists it and, if that fails, hands what this returns to
+/// [`undo_enrolled_secret`]: a secret that is live in memory but missing from
+/// disk is one that silently reverts at the next restart, putting the old one
+/// back in service.
+fn issue_enrolled_secret(
+    cfg: &mut AuthConfig,
+    client_id: &str,
+    device: Option<&str>,
+    secret: &str,
+) -> EnrollmentSlot {
+    let Some(client) = cfg.clients.get_mut(client_id) else {
+        // Accepted tokens only exist on a client that is in the table, so this
+        // is unreachable; a shared slot with nothing to restore keeps the
+        // caller's rollback simple rather than making it handle a third case.
+        return EnrollmentSlot::Shared {
+            previous: String::new(),
+        };
+    };
+
+    let slot = match device {
+        Some(name) => EnrollmentSlot::Device {
+            previous: client.devices.insert(
+                name.to_string(),
+                DeviceAuth {
+                    secret: secret.to_string(),
+                    created_at: crate::auth::config::default_created_at(),
+                    last_used: None,
+                },
+            ),
+            name: name.to_string(),
+        },
+        None => EnrollmentSlot::Shared {
+            previous: std::mem::replace(&mut client.secret, secret.to_string()),
+        },
+    };
+    client.pending_enrollment = None;
+    slot
+}
+
+/// Puts back what [`issue_enrolled_secret`] replaced, and the token with it.
+///
+/// The token goes back because the write that would have spent it failed: the
+/// link is still the only credential the client has for this enrollment, and
+/// dropping it would leave a client that cannot enroll at all.
+fn undo_enrolled_secret(cfg: &mut AuthConfig, client_id: &str, slot: EnrollmentSlot, token: &str) {
+    let Some(client) = cfg.clients.get_mut(client_id) else {
+        return;
+    };
+
+    match slot {
+        EnrollmentSlot::Device { name, previous } => match previous {
+            Some(previous) => {
+                client.devices.insert(name, previous);
+            }
+            None => {
+                client.devices.remove(&name);
+            }
+        },
+        EnrollmentSlot::Shared { previous } => client.secret = previous,
+    }
+    client.pending_enrollment = Some(token.to_string());
+}
+
 /// The secret is rotated rather than handed out as-is, so enrolling is also how
 /// a client recovers from a secret that leaked — at the cost of every device
 /// already using that client id, which has to scan again.
+///
+/// `device` is the name the client asked to be issued under. A name means the
+/// credential goes into the device table and no other device's is touched;
+/// no name is the case above, and the only one that existed before the table.
 async fn enroll_client(
     auth: &AuthState,
     client_id: &str,
     token: &str,
+    device: Option<&str>,
     send: &mut iroh::endpoint::SendStream,
 ) -> Result<(), AuthFailure> {
     // One reply for every way this can fail, for the same reason AUTH_FAILED
@@ -844,16 +955,8 @@ async fn enroll_client(
         cfg.digits,
         cfg.time_step as u64,
     );
-    let previous_secret = cfg
-        .clients
-        .get(client_id)
-        .map(|client| client.secret.clone())
-        .unwrap_or_default();
     let secret = crate::auth::TotpValidator::generate_secret();
-    if let Some(client) = cfg.clients.get_mut(client_id) {
-        client.secret = secret.clone();
-        client.pending_enrollment = None;
-    }
+    let slot = issue_enrolled_secret(&mut cfg, client_id, device, &secret);
 
     // Persisted before anything is promised to the client: a secret that is
     // live in memory but missing from disk is a secret that silently reverts
@@ -861,17 +964,27 @@ async fn enroll_client(
     let enrollment_path = auth.path().to_string();
     let enrolled_client = client_id.to_string();
     let issued_secret = secret.clone();
+    let enrolled_device = device.map(|name| name.to_string());
     if let Err(e) = blocking_config_write(enrollment_path, move |path| {
-        crate::config::ProxyConfig::complete_enrollment(path, &enrolled_client, &issued_secret)
+        match enrolled_device.as_deref() {
+            Some(name) => crate::config::ProxyConfig::complete_device_enrollment(
+                path,
+                &enrolled_client,
+                name,
+                &issued_secret,
+            ),
+            None => crate::config::ProxyConfig::complete_enrollment(
+                path,
+                &enrolled_client,
+                &issued_secret,
+            ),
+        }
     })
     .await
     {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
-        if let Some(client) = cfg.clients.get_mut(client_id) {
-            client.secret = previous_secret;
-            client.pending_enrollment = Some(token.to_string());
-        }
+        undo_enrolled_secret(&mut cfg, client_id, slot, token);
         drop(cfg);
         let reason = format!("enrollment could not be saved: {e}");
         write_auth_message(
@@ -917,10 +1030,16 @@ async fn enroll_client(
     // can have been widened by an editor or a mount since — and the startup
     // check is not going to run again until a restart.
     crate::config::warn_world_readable_config(auth.path());
-    tracing::info!(
-        "2FA: client '{client_id}' enrolled; its secret was rotated, so every device \
-         holding the old one has to scan again"
-    );
+    match device {
+        Some(name) => tracing::info!(
+            "2FA: client '{client_id}' enrolled device '{name}'; its own secret was left \
+             alone, so the other devices keep theirs"
+        ),
+        None => tracing::info!(
+            "2FA: client '{client_id}' enrolled; its secret was rotated, so every device \
+             holding the old one has to scan again"
+        ),
+    }
 
     write_auth_message(
         send,
@@ -930,10 +1049,11 @@ async fn enroll_client(
             algorithm,
             digits,
             period,
-            // Enrollment still writes the client's own `secret`, which is the
-            // credential of the device that has no name — so there is no
-            // device name to answer with yet.
-            device_id: None,
+            // The name this credential was issued under, which is the name the
+            // client has to send back to be checked against it. None when the
+            // device named none: it answered with the client's own secret, and
+            // a client that predates the table reads that as "the shared one".
+            device_id: device.map(|name| name.to_string()),
         },
     )
     .await
@@ -1064,7 +1184,7 @@ async fn perform_authentication(
     conn: &Connection,
     auth: &AuthState,
     peer: &str,
-) -> Result<(String, ClientAcl), AuthFailure> {
+) -> Result<AuthenticatedPeer, AuthFailure> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -1095,6 +1215,22 @@ async fn perform_authentication(
         ));
     }
 
+    // The same test on the name a device asks to be enrolled under, and refused
+    // rather than read as "no name": it becomes a key in the config and the
+    // subject of the log line for everything that happens to it, so a name that
+    // cannot be printed is one nobody can revoke by hand either. Not counted
+    // against the client — a malformed request is not a guess at the token.
+    if let AuthMessage::EnrollStart {
+        device_id: Some(device_id),
+        ..
+    } = &start_msg
+        && !is_presentable_device_id(device_id)
+    {
+        return Err(AuthFailure::Rejected(
+            "device id is not printable ASCII".to_string(),
+        ));
+    }
+
     // Enrollment, when the client asked for it: the token is exchanged for a
     // freshly generated secret ahead of the ordinary handshake, on the same
     // stream — the two messages are read in order here, so a client that
@@ -1102,9 +1238,11 @@ async fn perform_authentication(
     let client_id = match start_msg {
         AuthMessage::Start { client_id, .. } => client_id,
         AuthMessage::EnrollStart {
-            client_id, token, ..
+            client_id,
+            token,
+            device_id,
         } => {
-            enroll_client(auth, &client_id, &token, &mut send).await?;
+            enroll_client(auth, &client_id, &token, device_id.as_deref(), &mut send).await?;
 
             let start_after_enroll = read_auth_message(&mut recv)
                 .await
@@ -1371,7 +1509,11 @@ async fn perform_authentication(
     }
 
     if is_valid {
-        Ok((client_id, verified_acl))
+        Ok(AuthenticatedPeer {
+            client_id,
+            device: resp_device_id,
+            acl: verified_acl,
+        })
     } else {
         Err(AuthFailure::Rejected(format!(
             "authentication failed for client '{client_id}': {fail_reason}"
@@ -1493,6 +1635,10 @@ pub async fn handle_connection(
     // handshake and carried by every stream this connection opens. `None`
     // means no 2FA ran, which is the unrestricted case anyway.
     let mut client_acl: Option<Arc<ClientAcl>> = None;
+    // Who the connection turned out to be, for the peer list. Filled in only
+    // when 2FA ran and passed: with it off there is no handshake, and no
+    // identity to report.
+    let mut identity = PeerIdentity::default();
 
     if let Some(auth) = auth {
         let outcome = tokio::time::timeout(
@@ -1501,13 +1647,17 @@ pub async fn handle_connection(
         )
         .await;
         match outcome {
-            Ok(Ok((client_id, acl))) => {
+            Ok(Ok(authenticated)) => {
                 tracing::info!(
                     "Client '{}' authenticated successfully from {}",
-                    client_id,
+                    authenticated.client_id,
                     peer_id
                 );
-                client_acl = Some(Arc::new(acl));
+                identity = PeerIdentity {
+                    client_id: Some(authenticated.client_id.clone()),
+                    device: authenticated.device,
+                };
+                client_acl = Some(Arc::new(authenticated.acl));
             }
             Ok(Err(AuthFailure::Rejected(reason))) => {
                 tracing::warn!("Authentication failed for {}: {}", peer_id, reason);
@@ -1546,7 +1696,7 @@ pub async fn handle_connection(
     // refused its handshake never got a connection, and `GET /v1/connections`
     // is asked "who is connected", not "who tried". The path may be corrected a
     // moment later by the tracker above, which keeps following it.
-    let _peer = peers.insert(peer_id, initial_kind);
+    let _peer = peers.insert(peer_id, initial_kind, identity);
 
     loop {
         match conn.accept_bi().await {
@@ -1673,10 +1823,10 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentVerdict, blocking_config_write, constant_time_eq, enrollment_verdict,
-        find_headers_end,
+        EnrollmentSlot, EnrollmentVerdict, blocking_config_write, constant_time_eq,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, undo_enrolled_secret,
     };
-    use crate::auth::{AuthConfig, ClientAuth};
+    use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use std::collections::HashMap;
 
     /// A write whose caller gave up still happens, and happens *first*.
@@ -1805,6 +1955,95 @@ mod tests {
             enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
             EnrollmentVerdict::Accept
         );
+    }
+
+    /// An enrollment that names a device writes that device's own entry and
+    /// leaves the client's `secret` alone: the two are different credentials,
+    /// and rotating the shared one is what re-enrolls every device at once.
+    #[test]
+    fn an_enrollment_that_names_a_device_writes_only_its_own_entry() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+        let shared = cfg.clients["alice"].secret.clone();
+
+        let slot = issue_enrolled_secret(&mut cfg, "alice", Some("laptop"), "LAPTOPSECRET");
+
+        let alice = &cfg.clients["alice"];
+        assert_eq!(alice.secret, shared, "the shared secret was rotated too");
+        assert_eq!(alice.devices["laptop"].secret, "LAPTOPSECRET");
+        assert!(
+            alice.pending_enrollment.is_none(),
+            "the token was left spendable"
+        );
+        assert!(matches!(slot, EnrollmentSlot::Device { .. }));
+    }
+
+    /// The path that existed before there was a table: no name is the device
+    /// that has none, and it answers with the client's own `secret`.
+    #[test]
+    fn an_enrollment_that_names_no_device_rotates_the_clients_secret() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+
+        let slot = issue_enrolled_secret(&mut cfg, "alice", None, "NEWSECRET");
+
+        assert_eq!(cfg.clients["alice"].secret, "NEWSECRET");
+        assert!(cfg.clients["alice"].devices.is_empty());
+        assert!(matches!(slot, EnrollmentSlot::Shared { .. }));
+    }
+
+    /// What the rollback is for: a device that was enrolled before keeps the
+    /// credential it had, because the write that was to replace it failed and
+    /// the new secret exists nowhere but in this process's memory.
+    #[test]
+    fn a_failed_write_puts_the_device_it_replaced_back() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+        cfg.clients.get_mut("alice").unwrap().devices.insert(
+            "laptop".to_string(),
+            DeviceAuth {
+                secret: "OLDSECRET".to_string(),
+                created_at: "0".to_string(),
+                last_used: None,
+            },
+        );
+
+        let slot = issue_enrolled_secret(&mut cfg, "alice", Some("laptop"), "NEWSECRET");
+        assert_eq!(cfg.clients["alice"].devices["laptop"].secret, "NEWSECRET");
+
+        undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+        let alice = &cfg.clients["alice"];
+        assert_eq!(alice.devices["laptop"].secret, "OLDSECRET");
+        assert_eq!(
+            alice.pending_enrollment.as_deref(),
+            Some("0123456789abcdef"),
+            "the token is still the client's only way to enroll"
+        );
+    }
+
+    /// The same, for a device that had no entry: taking back the credential
+    /// means removing it, not leaving a device behind that no config on disk
+    /// carries.
+    #[test]
+    fn a_failed_write_takes_back_a_device_that_had_no_entry() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+
+        let slot = issue_enrolled_secret(&mut cfg, "alice", Some("phone"), "NEWSECRET");
+        undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+        let alice = &cfg.clients["alice"];
+        assert!(alice.devices.is_empty(), "{:?}", alice.devices.keys());
+    }
+
+    /// The unnamed path rolls back to the secret it rotated away, or this
+    /// process would keep accepting a credential that is on no disk.
+    #[test]
+    fn a_failed_write_puts_the_clients_secret_back() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+        let shared = cfg.clients["alice"].secret.clone();
+
+        let slot = issue_enrolled_secret(&mut cfg, "alice", None, "NEWSECRET");
+        undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+        assert_eq!(cfg.clients["alice"].secret, shared);
     }
 
     /// The token is a credential like any other: guessing at it has to cost

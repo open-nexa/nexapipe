@@ -28,7 +28,7 @@
 //! | `GET /v1/status` | token | Uptime, counters, backend health, what is enabled. |
 //! | `GET /v1/routes` | token | The live route table, as reloaded. |
 //! | `GET /v1/clients` | token | Which clients exist — never their secrets. |
-//! | `GET /v1/connections` | token | The peers connected right now. |
+//! | `GET /v1/connections` | token | The peers connected right now, and which client and device each authenticated as. |
 //! | `GET /v1/health` | token | Backend pools, in and out of rotation. |
 //!
 //! The `/v1/*` half is guarded by a generated token (see [`token`]). It is
@@ -380,6 +380,13 @@ fn connections_json(peers: &Arc<PeerRegistry>) -> serde_json::Value {
         .map(|peer| {
             serde_json::json!({
                 "endpoint_id": peer.endpoint_id.to_string(),
+                // Who it authenticated as. Null for a connection with 2FA off,
+                // which never had a handshake to answer.
+                "client_id": peer.identity.client_id,
+                // Null for the device that has no name, which is every peer
+                // that predates the device table, and for one that never
+                // authenticated at all.
+                "device": peer.identity.device,
                 "connected_for_seconds": peer.connected_for.as_secs(),
                 "path": match peer.path {
                     crate::metrics::PathKind::Direct => "direct",
@@ -605,6 +612,32 @@ mod tests {
                 "{path} escaped the management prefix"
             );
         }
+    }
+
+    /// What `GET /v1/connections` is asked that a count cannot answer: whose
+    /// connection this is. A client id alone does not tell two devices of one
+    /// client apart, which is the only thing a per-device credential is for.
+    #[test]
+    fn the_peer_list_says_which_client_and_device_each_peer_is() {
+        use crate::conn::peers::PeerIdentity;
+        use crate::metrics::PathKind;
+
+        let peers = PeerRegistry::new();
+        let endpoint_id = iroh::SecretKey::generate().public();
+        let _guard = peers.insert(
+            endpoint_id,
+            PathKind::Direct,
+            PeerIdentity {
+                client_id: Some("alice".to_string()),
+                device: Some("laptop".to_string()),
+            },
+        );
+
+        let body = connections_json(&Arc::new(peers));
+        let listed = body["peers"].as_array().expect("a peers array");
+        assert_eq!(listed.len(), 1, "{body}");
+        assert_eq!(listed[0]["client_id"], "alice");
+        assert_eq!(listed[0]["device"], "laptop");
     }
 
     /// A management answer is JSON, and a refusal is not: the two are read by

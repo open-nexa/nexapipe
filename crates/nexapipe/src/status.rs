@@ -315,11 +315,20 @@ fn print_connections(body: &Value) {
     };
 
     for peer in peers {
+        // The device after the client, and only when there is one: "-" for a
+        // peer with 2FA off is the same "-" the endpoint id would get for a
+        // field the server did not answer, and printing it twice says nothing.
+        let device = match peer["device"].as_str() {
+            Some(device) => format!("/{device}"),
+            None => String::new(),
+        };
         println!(
-            "  {}  {}  for {}s",
+            "  {}  {}  for {}s  {}{}",
             text(peer, "endpoint_id"),
             text(peer, "path"),
             num(peer, "connected_for_seconds"),
+            text(peer, "client_id"),
+            device,
         );
     }
     println!();
