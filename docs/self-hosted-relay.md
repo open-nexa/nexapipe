@@ -15,8 +15,8 @@ those two, because owning the relay does not change either of them.
 
 | | |
 |---|---|
-| Applies to | The relay server is `iroh-relay` 1.2.0 — `Cargo.lock` resolves `iroh` and `iroh-relay` at 1.2.0 |
-| Upstream sources | [iroh-relay 1.2.0 on docs.rs](https://docs.rs/crate/iroh-relay/1.2.0), the [README at tag v1.2.0](https://github.com/n0-computer/iroh/blob/v1.2.0/iroh-relay/README.md), [`src/main.rs` at v1.2.0](https://github.com/n0-computer/iroh/blob/v1.2.0/iroh-relay/src/main.rs), [`src/defaults.rs` at v1.2.0](https://github.com/n0-computer/iroh/blob/v1.2.0/iroh-relay/src/defaults.rs) |
+| Applies to | The relay server is `iroh-relay` 1.3.0 — `Cargo.lock` resolves `iroh` and `iroh-relay` at 1.3.0 |
+| Upstream sources | [iroh-relay 1.3.0 on docs.rs](https://docs.rs/crate/iroh-relay/1.3.0), the [README at tag v1.3.0](https://github.com/n0-computer/iroh/blob/v1.3.0/iroh-relay/README.md), [`src/main.rs` at v1.3.0](https://github.com/n0-computer/iroh/blob/v1.3.0/iroh-relay/src/main.rs), [`src/defaults.rs` at v1.3.0](https://github.com/n0-computer/iroh/blob/v1.3.0/iroh-relay/src/defaults.rs) |
 | Last verified | 2026-10-01, against the upstream sources above and this tree |
 
 **This page has not been verified end to end by the maintainers; the NexaPipe
@@ -40,10 +40,19 @@ two upstream sources and neither of them is an image: the crate source
 (`n0-computer/iroh` under `iroh-relay/`) and
 [the binary releases](https://github.com/n0-computer/iroh/releases). The
 releases publish one archive per target — at the version this tree locks, that
-is `iroh-relay-v1.2.0-x86_64-unknown-linux-gnu.tar.gz` (a `musl` build and
+is `iroh-relay-v1.3.0-x86_64-unknown-linux-gnu.tar.gz` (a `musl` build and
 `aarch64` and Darwin builds ship alongside it), so the honest deployment shape
 today is a binary plus your own unit file, not `docker compose up` — [one is
 written out below](#running-it-under-systemd).
+
+The archive holds one file, `iroh-relay`, and neither it nor the build below
+puts it where the unit starts it from, so it has to be installed:
+
+```bash
+curl -fLO https://github.com/n0-computer/iroh/releases/download/v1.3.0/iroh-relay-v1.3.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf iroh-relay-v1.3.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 iroh-relay /usr/local/bin/iroh-relay
+```
 
 If you would rather build than download, upstream's own instructions do it from
 the iroh checkout — note the `cd ../`, which makes this a workspace build rather
@@ -56,10 +65,11 @@ cargo build \
   --package iroh-relay \
   --features server
 # binary lands at target/optimized-release/iroh-relay
+sudo install -m 0755 target/optimized-release/iroh-relay /usr/local/bin/iroh-relay
 ```
 
 Keeping to **the same version your endpoints speak** is worth doing: this tree's
-`Cargo.lock` resolves `iroh` and `iroh-relay` at 1.2.0, and pinning the relay to
+`Cargo.lock` resolves `iroh` and `iroh-relay` at 1.3.0, and pinning the relay to
 that tag is the only combination anyone here can reason about. Upstream's
 current release is newer than what this tree links, and whether the two ends
 still agree across that gap is not something this page can tell you.
@@ -195,9 +205,13 @@ journalctl -u iroh-relay -f
 ```
 
 **The unit above has not been run in this project's CI** — the same caveat the
-top of this page makes about every command on it. The systemd directives are
-generic and version-independent; what this page cannot tell you is which paths
-your build of `iroh-relay` wants to write.
+top of this page makes about every command on it. The directives are not all the
+same age, and systemd ignores one it does not recognise with a line in the
+journal rather than refusing to start: `ProtectProc=invisible` needs 247,
+`StateDirectory=` needs 235, `DynamicUser=` and `ProtectSystem=strict` need 232.
+On something older the unit comes up anyway with the protections it could not
+read quietly missing, which `systemd-analyze verify` will name. What this page
+cannot tell you is which paths your build of `iroh-relay` wants to write.
 
 ### What to open
 
@@ -220,7 +234,7 @@ explicitly and open what you set.
 open UDP 3478 for STUN and put `stun_port = 3478` in the config — see, for
 example, the old
 [local relay node doc](https://github.com/n0-computer/iroh/blob/730f71736e863c9f310960f29c971dc5afdea1e2/iroh-net/docs/local_relay_node.md).
-`ServerConfig` in 1.2.0 has three fields — `relay`, `quic`, `metrics_addr` — and
+`ServerConfig` in 1.3.0 has three fields — `relay`, `quic`, `metrics_addr` — and
 none of them is STUN. Do not go looking for it, and treat any relay tutorial
 that mentions `stun_port` as written for a different generation.
 
@@ -370,7 +384,7 @@ part people assume:
 - **Endpoint ID discovery still goes to n0.** Turning a Node ID into "where do
   I send QUIC packets" queries `dns.iroh.link`, over HTTPS and over DNS, and it
   does that regardless of `relay_mode`; no NexaPipe setting turns it off. iroh
-  1.2.0 has `clear_address_lookup()`; NexaPipe does not call it.
+  1.3.0 has `clear_address_lookup()`; NexaPipe does not call it.
 - **A peer's advertised relay is still dialled.** `allowed_relay_urls()` — the
   set you would build an address filter from — has no production caller, so
   `custom` bounds *this* endpoint and nothing else. If your requirement is "no
