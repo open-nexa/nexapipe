@@ -599,11 +599,26 @@ mod tests {
 
         // What a reload that turns `[health_check] enabled` back on does.
         enabled.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            !healthy(&pool, DEAD_BACKEND).await,
-            "enabling the check starts probing again"
-        );
+
+        // Waited for rather than slept a fixed time through. The loop probes
+        // every 10 ms here, but it first waits out a random part of that
+        // interval (`startup_jitter`), and a runner slower than the one this
+        // was written on can need longer than 150 ms to get one round done —
+        // which is what it did on windows-latest the first time the tests ran
+        // there. A deadline keeps the assertion, that enabling the check starts
+        // probing again, and drops the assumption about how fast the machine
+        // is. The 100 ms above stays a sleep: "it never probed" is an absence,
+        // and an absence can only be read over a window.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut probed = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !healthy(&pool, DEAD_BACKEND).await {
+                probed = true;
+                break;
+            }
+        }
+        assert!(probed, "enabling the check starts probing again");
     }
 
     #[tokio::test]

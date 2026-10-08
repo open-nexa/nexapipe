@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-09-29 (phases renumbered for v0.3.0; entries closed by it marked in §9) |
+| Last updated | 2026-10-07 (Phase 3 opened for v0.6.0; the exploratory edge phase renumbered to Phase 4; entries closed by v0.3.0 marked in §9) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -48,7 +48,8 @@ part no SaaS can copy.
 The gap is not architectural, it is maturity:
 
 - Identity is one shared TOTP secret per client, so revoking one device means
-  rotating every device using that client.
+  rotating every device using that client. Giving each device a credential of
+  its own is what [Phase 3](#phase-3--v060-one-device-at-a-time) opens.
 - Platform coverage has closed both of its holes: IPv6 inside the TUN and a
   second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
   list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
@@ -199,7 +200,9 @@ instance has served and accepted, and the desktop lists, per node, whether it
 answered its last probe and how much it has carried. What is still missing is an
 OpenTelemetry exporter, and latency — `/metrics` sums the milliseconds spent
 answering requests but carries no buckets, and neither client shows how long a
-request took.
+request took. The buckets come in v0.6.0
+([Phase 3](#phase-3--v060-one-device-at-a-time)); the exporter, and latency on
+either client, do not.
 
 ### 4.3 Identity and authorization (P1)
 
@@ -213,6 +216,13 @@ downgraded "leaked URL means leaked credential forever" to "leaked URL is
 revocable and short-lived". The next step is per-device keys signed by the server,
 with TOTP as a human second factor rather than the device identity itself.
 
+**Phase 3 takes the first half of that step: one credential per device**, issued
+at enrollment and revocable on its own, with the credential still a TOTP secret
+and the handshake still the HMAC it is today. What it leaves alone is the *kind*
+of credential — per-device key pairs, and TOTP demoted to a second factor a human
+supplies, are the release after, because they also mean new material in both
+credential stores and a factor an unattended service cannot answer.
+
 ### 4.4 Operations and distribution (P1)
 
 - The management surface is read-only for now: `/v1/*` and `nexapipe status`
@@ -224,12 +234,14 @@ with TOTP as a human second factor rather than the device identity itself.
 - Distribution stopped being download-only in v0.5.0: a container image is
   published to GHCR with the release archives, and `docs/self-hosted-relay.md`
   takes a relay from nothing to running. Still missing: a systemd unit in the
-  docs, and any of Homebrew / winget / scoop. See R6.
+  docs, which v0.6.0 adds, and any of Homebrew / winget / scoop, which it does
+  not. See R6.
 - Engineering hygiene: `CHANGELOG.md` exists as of v0.3.0; tests run on Linux
   and macOS; the root workspace is compiled on Windows as of v0.5.0, which it
   never was before — the desktop crate had a Windows job, and it is `cargo
-  check` only; the Android lint baseline still pins 32 historical findings; no
-  fuzzing, no benchmarks; the vendored smoltcp patch needs long-term tracking.
+  check` only, which v0.6.0 turns into a run; the Android lint baseline still
+  pins 32 historical findings; no fuzzing, no benchmarks; the vendored smoltcp
+  patch needs long-term tracking.
 
 ### 4.5 Protocols and transport (P1/P2)
 
@@ -528,7 +540,47 @@ written but has not been followed end to end on a machine that had nothing on it
 notification been watched running on a device: its rates are verified by unit
 tests and by compilation only.
 
-### Phase 3 — v1.0, "reachable without our client" (exploratory)
+### Phase 3 — v0.6.0, "one device at a time"
+
+No new deliverable is opened for this release. It is the one item Phase 0 left
+that has never started — R5 — and the write half of R4 that has been waiting on
+it, plus three things small enough that deferring them costs more than doing
+them.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| R5 | **Per-device credentials** | One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`. The credential stays a TOTP secret and the handshake stays HMAC-SHA256 over `nonce ‖ timestamp`: what changes is which secret is looked up, and that a device can be struck out — while it is connected, not only the next time it dials — without touching the others. A `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it does today: that is the path a peer that names no device takes, and the path every config written before this release is on. See [4.3](#43-identity-and-authorization-p1) |
+| R5 | **A minimal audit log** | Who — client *and* device — reached which host, when, and with what outcome. A `client_id` does not get past the handshake today: a connection carries an ACL snapshot and a Node ID and nothing else, so no access line, no metric and no `/v1/connections` entry can say whose request it was (`conn/mod.rs:1235-1241`, `admin/mod.rs:376-400`). Threading the identity through is the same plumbing revocation needs, so the two land together rather than one waiting for the other |
+| R4 | **The write half, as CLI subcommands** | `nexapipe client list\|add\|revoke`, device-scoped. The writers already exist and already take the config lock (`config.rs:1298-1416`); the loopback endpoints stay GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in (`admin/mod.rs:34-37`) |
+| — | **Latency you can read** | `/metrics` sums the milliseconds and carries no buckets, so nothing here can answer what its own p99 is — the reason it is a sum is written down at `metrics.rs:335-344`. Hand-rendered `_bucket{le="…"}` beside `_sum` and `_count`, keeping the exposition dependency-free. See [4.2](#42-observability-beyond-the-access-log-p1) |
+| — | **A systemd unit in the docs** | `docs/self-hosted-relay.md` takes a relay from nothing to a foreground command and stops there, and no unit for the server itself exists anywhere in the tree. The desktop service already writes the shape this would copy, hardened (`ui-desktop/src-tauri/src/service/platform.rs:887-906`). See [4.4](#44-operations-and-distribution-p1) |
+| — | **Windows runs the tests** | `windows-check` is `cargo check --workspace --all-targets`, so the integration tests compile for `x86_64-pc-windows-msvc` and nothing executes them — a bug that only appears when they run reaches a tag before CI sees one. One step in a job that is already there, and a rename of that job to `windows-test` along with it, because its `name:` is what a PR shows. See [4.4](#44-operations-and-distribution-p1) |
+
+**Progress.** Nothing here is started.
+
+**Done when:** revoking one of three devices leaves the other two working,
+without anybody editing `config.toml` by hand, and a connection that device
+already had open closes when it happens; `nexapipe status` and the access log
+can both say which device reached which host; and a p99 can be read off
+`/metrics` without summing anything by hand.
+
+Three things are deliberately *not* in this release, and saying which is the
+point of listing them:
+
+- **Not per-device key pairs.** §4.3's direction is keys signed by the server,
+  with TOTP as a human second factor. This release makes revocation true and
+  leaves the kind of credential alone: a key pair also means new material in both
+  credential stores and a factor an unattended service cannot supply, and putting
+  both in one release is how "revoke one device" turns into a release that ships
+  nothing.
+- **Not a write API.** `client add\|revoke` arrives as subcommands, not as
+  `POST /v1/clients`. The admin token is one opaque value with no scope and no
+  rotation, and giving it something to change is a decision of its own.
+- **Not package managers.** Homebrew, winget and scoop are each a day of
+  manifest and then a tap or bucket that somebody has to own. After this release
+  they are the only part of R6 still open.
+
+### Phase 4 — v1.0, "reachable without our client" (exploratory)
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -555,6 +607,13 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── R6 image + relay docs ──────► v0.5.0
                                               ├── R7 byte counters ──────────► v0.5.0
                                               │
+                                              ├── R5 per-device ─────────────► v0.6.0
+                                              ├── R5 audit log ──────────────► v0.6.0
+                                              ├── R4 client CLI ─────────────► v0.6.0
+                                              ├── latency buckets ───────────► v0.6.0
+                                              ├── systemd unit ──────────────► v0.6.0
+                                              ├── Windows runs the tests ────► v0.6.0
+                                              │
                               R13 edge (after validation) ──► v1.0
 ```
 
@@ -562,8 +621,11 @@ Of that row, R15, R12, R10 and R11 shipped in v0.4.0. R9 shipped its probing
 half there and its selection half in v0.5.0 — see the progress note under
 Phase 1 and the table under [Phase 2](#phase-2--v050-observable). R6 is half
 done: the image and the relay docs landed, the systemd unit and the package
-managers did not. R13 keeps its id and its gate; what moved is the phase number
-above it, because v0.5.0 took the number this one used to have.
+managers did not — the unit comes in
+[Phase 3](#phase-3--v060-one-device-at-a-time), the package managers do not. R5
+and the write half of R4 are the two that have never started, and they are what
+that phase opens. R13 keeps its id and its gate; what moved is the phase number
+above it, because v0.6.0 was inserted beneath it.
 
 ---
 
@@ -587,6 +649,7 @@ above it, because v0.5.0 took the number this one used to have.
 | Time to locate a failing backend | the access log covers every path, but there is nothing to aggregate | 5 minutes with metrics and structured logs |
 | Direct-connection rate | unmeasured | opt-in client telemetry: direct vs relayed, one-way latency — so "nothing to rent" becomes a number we can publish |
 | Platform coverage | Android (one ABI) + desktop | TUN speaks IPv6, Android ships a second ABI (the desktop TUN already does UDP) |
+| Revoking one device | rotating the shared secret, which is every device using that client | one device, including a connection it already holds; the others keep working |
 | Full secret rendered without authentication | both clients ask the operating system first — Android as of v0.3.0, desktop as of v0.4.0 — and both have been watched running on every platform they support | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
 | Release rhythm | one `CHANGELOG.md` as of v0.3.0, and no released version carries an entry older than its own tag | regular minor releases, each with a readable CHANGELOG |
 
@@ -596,6 +659,8 @@ above it, because v0.5.0 took the number this one used to have.
 
 Every gap listed above was confirmed against the tree on 2026-09-28, and each
 entry here was re-checked on 2026-09-29 against what v0.3.0 actually shipped.
+The gaps [Phase 3](#phase-3--v060-one-device-at-a-time) opens were confirmed
+the same way on 2026-10-07, against the tree at `8abc38c`.
 Entries closed since the audit are marked in place rather than deleted: the
 audit that found them stays reproducible, and the before and after stay visible
 side by side. The three fixed defects are recorded in
@@ -616,3 +681,8 @@ side by side. The three fixed defects are recorded in
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
 | Masking that is not masking | `ui-desktop/src/app/shell/SideBarFooter.vue:59` puts the full node ID in a tooltip while showing the short form; the dashboard and config pages return short values in full |
 | Android: encrypted at rest, no gate in front | `ui-android/.../SecretStore.kt` (Keystore AES-256-GCM, `v1:` prefix) versus `ui/EndpointDetailScreen.kt` (shows and edits the 2FA secret, ~349-416, and exports an `otpauth` URI) |
+| One credential per client, not per device | `crates/nexapipe/src/auth/config.rs:54` (`clients: HashMap<String, ClientAuth>`), `:102` (the one `secret`); `auth/totp.rs:66` (looked up by the name off the wire, with no binding to the connecting peer); `conn/mod.rs:784-936` (`enroll_client` overwrites that one secret, which is why enrolling a device rotates every other one). Nothing is keyed by device: every `device` match in `crates/nexapipe/` is prose — a comment, a log line, the CLI's own banner at `main.rs:819` ("there is no per-device revocation") — or a client id in a test fixture (`config.rs:2706`) |
+| No audit trail | the two `audit` matches under `crates/` are both unrelated — `metrics.rs:8`
+("an audit surface", about a dependency) and `nexapipe-client/src/transport.rs:201`. `client_id` does not survive the handshake: `conn/mod.rs:156-165` hands `handle_bidi_stream` an ACL snapshot and a Node ID, so the three `log_access` calls at `:326`, `:402` and `:427` cannot say whose request they are logging, and `/v1/connections` (`admin/mod.rs:376-400`) reports no client at all |
+| Latency as a sum, not buckets | `crates/nexapipe/src/metrics.rs:96` (one `AtomicU64`), `:177-181` (the single `fetch_add`), `:335-344` (rendered as a plain counter, with the reason for that written immediately above it). No `histogram`, `bucket` or `prometheus` crate anywhere in the tree, and no `opentelemetry`/`otlp` match outside this document |
+| No unit, and Windows compiles only | no `*.service` in the repository or the docs; `docs/self-hosted-relay.md:103-107` starts the relay as a foreground command, and the only unit generated anywhere is the desktop service's, at runtime (`ui-desktop/src-tauri/src/service/platform.rs:887-906`, `Restart=on-failure`). Windows: `.github/workflows/ci.yml:122-140` runs `cargo check --workspace --all-targets --locked`, with the note at `:138` that the tests are compiled and not run |

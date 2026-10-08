@@ -9,13 +9,14 @@ name: CI
 # and the job that publishes them only ever run from a tag, so this is the one
 # place a broken Dockerfile is caught before a release depends on it.
 #
-# The `test` job runs on Linux and macOS. Windows gets `windows-check`, a
-# `cargo check` of the root workspace: the integration tests spawn the built
-# binary, and the cfg(unix) halves of the config watcher and of shutdown have no
-# Windows counterpart to run them against, so a Windows *test* job would report
-# a platform nobody has committed to supporting. Checking is the part that pays:
-# without this job the root workspace was not compiled on Windows at all, and a
-# platform-specific break in it surfaced only when release.yml built a tag.
+# The `test` job runs the root workspace on Linux and macOS. Windows is covered
+# by `windows-test` below, which used to be `windows-check`, a `cargo check`:
+# the integration tests spawn the built binary, and the cfg(unix) halves of the
+# config watcher and of shutdown have no Windows counterpart to run them
+# against. Those halves are `#[cfg(unix)]` gated rather than left to fail, so
+# what a Windows run reports is the half that does exist, which is the half
+# release.yml builds from a tag. A check only catches what stops compiling;
+# anything that fails once it runs still reached a tag.
 #
 # Jobs that exist purely because the default feature set cannot see the code they cover:
 #   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
@@ -118,11 +119,15 @@ jobs:
 
   # The root workspace's only Windows coverage. release.yml does build Windows
   # binaries, but only from a tag, so this is what tells a PR that the crates
-  # still compile there.
-  windows-check:
-    name: cargo check (windows-latest)
+  # still work there — and `cargo test` is what tells it: the integration tests
+  # are where the crates' public surface is used the way a caller uses it, and
+  # compiling them without running them only ever caught half a break.
+  windows-test:
+    name: cargo test (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # 60 rather than the 45 the other jobs use: a Windows runner compiles the
+    # same dependency tree more slowly, and this one now links and runs as well.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Set up Rust
@@ -131,13 +136,13 @@ jobs:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
-          key: windows-check
-      # --all-targets so the integration tests are compiled as well: they are
-      # where the crates' public surface is used the way a caller uses it, and
-      # a change that broke them would otherwise wait for a tag to be noticed.
-      # They are not run here — see the note at the top of this file.
-      - name: cargo check
-        run: cargo check --workspace --all-targets --locked
+          key: windows-test
+      # The same command the Linux and macOS runners run, so the three agree on
+      # what "the tests pass" means. `--all-targets` is gone because `cargo
+      # test` already compiles the test targets that used to be the reason for
+      # it; there is no bench target in this workspace to add back.
+      - name: cargo test
+        run: cargo test --workspace --locked
 
   features:
     name: client features (${{ matrix.features }})
