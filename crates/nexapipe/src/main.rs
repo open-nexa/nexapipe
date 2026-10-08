@@ -830,8 +830,10 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             enrollment.client_id
         );
         println!(" copy of this link stops being a credential the moment it is used.");
-        println!(" Enrolling also rotates that client's secret, so every device");
-        println!(" already using it has to scan again.");
+        println!(" Enrolling replaces the credential the device that scans it");
+        println!(" will use: one that names a device gets a secret of its own,");
+        println!(" and one that does not gets this client's shared secret —");
+        println!(" which every device already using it has to scan again for.");
         println!();
         println!(" A link you did not deliver is revoked by generating another one");
         println!(" -- this command again -- which replaces the outstanding token.");

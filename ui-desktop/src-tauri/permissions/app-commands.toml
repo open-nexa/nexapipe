@@ -102,6 +102,11 @@ description = "Enables the get_service_status command without any pre-configured
 commands.allow = ["get_service_status"]
 
 [[permission]]
+identifier = "allow-get-service-version"
+description = "Enables the get_service_version command without any pre-configured scope."
+commands.allow = ["get_service_version"]
+
+[[permission]]
 identifier = "allow-get-startup-error"
 description = "Enables the get_startup_error command without any pre-configured scope."
 commands.allow = ["get_startup_error"]

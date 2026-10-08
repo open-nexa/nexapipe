@@ -37,6 +37,7 @@
     "allow-get-node-traffic",
     "allow-get-proxy-status",
     "allow-get-service-status",
+    "allow-get-service-version",
     "allow-get-startup-error",
     "allow-install-service",
     "allow-is-service-running",
