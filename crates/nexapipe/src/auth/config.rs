@@ -121,16 +121,19 @@ pub struct ClientAuth {
     pub pending_enrollment: Option<String>,
     /// Credentials issued to individual devices under this client.
     ///
-    /// A device here authenticates with its own secret, and the `secret` above
-    /// is the credential of the device that has no name — which is every device
-    /// that existed before this table could be written, and why an empty table
+    /// A device here has a secret of its own, and the `secret` above is the
+    /// credential of the device that has no name — which is every device that
+    /// existed before this table could be written, and why an empty table
     /// changes nothing about how such a client authenticates.
     ///
-    /// What the table buys is the ability to drop one entry: a phone whose
-    /// secret is removed here stops authenticating while the laptop next to it
-    /// keeps its own, which is what rotating the one `secret` could not do.
-    /// A device still falls back to the client's `secret`, so a client that
-    /// wants per-device revocation has to stop handing that one out.
+    /// What the table is for is being able to lose one entry without touching
+    /// the others: a device whose secret is struck out here is the only one
+    /// that has to be re-enrolled, where rotating the one `secret` re-enrolls
+    /// every device at once.
+    ///
+    /// A device that names no device answers with the client's `secret`, so a
+    /// client that wants per-device revocation has to stop handing that one
+    /// out.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub devices: HashMap<String, DeviceAuth>,
     /// Last successful authentication time (Unix timestamp)

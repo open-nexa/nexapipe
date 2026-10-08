@@ -65,7 +65,7 @@ pub enum AuthMessage {
         signature: Vec<u8>,
         /// The same device [`AuthMessage::Start`] named. It is signed over
         /// nowhere, so it is not proof of anything on its own — what it does is
-        /// tell the server which secret to check the signature against.
+        /// say which device's secret the response is to be checked against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
     },
