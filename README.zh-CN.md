@@ -243,6 +243,30 @@ docker compose logs -f --tail=50 nexapipe | grep -i reload
 | `--invite-relay <URL>` | 邀请码中的中继 URL（默认：`[iroh] relay_url`）。 |
 | `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。 |
 
+### `nexapipe client`
+
+管理接口的"写"那一半，以子命令而不是 `POST /v1/clients` 的形式提供：admin token
+是一个没有作用域、也没有轮换机制的不透明值，让它能改东西，等于把一个只读接口变成
+进入凭据库的入口。每个子命令都在服务端所用的同一把锁下编辑配置文件，运行中的服务
+端会在下一次重载时读到改动。
+
+| 命令 | 说明 |
+| --- | --- |
+| `client list [--json]` | 列出 `[auth.clients]` 中的客户端及其设备。**不打印任何密钥** —— 那件事由 `--show-2fa` 负责。 |
+| `client add <CLIENT_ID>` | 签发凭据：写入客户端自己的 `secret`，也就是"未命名设备"所用的那个凭据。已存在时拒绝替换，除非带 `--force`。 |
+| `client add <CLIENT_ID> --device <NAME>` | 给单个设备签发凭据，客户端自己的 `secret` 不动 —— 因此已经在用它的设备继续可用。客户端必须先存在。 |
+| `client revoke <CLIENT_ID>` | 删除一个客户端及其下所有设备凭据。 |
+| `client revoke <CLIENT_ID> --device <NAME>` | 只删除某一个设备的凭据，保留客户端和它的其他设备。 |
+
+```bash
+nexapipe client list --config config.toml
+nexapipe client add laptop-1 --device laptop --config config.toml
+nexapipe client revoke laptop-1 --device laptop --config config.toml
+```
+
+吊销是删除而不是改写，因为"条目不存在"正是握手时读作"这个设备没有凭据"的那一
+种状态 —— 和一个从未注册过的设备得到的答案相同，所以从外部分不出它经历过什么。
+
 ---
 
 ## 配置
@@ -886,9 +910,10 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 - 让二维码保持在约 400 字符以内，以便扫描；超出时命令会给出警告。
 - 带 `secret=` 的邀请码是**明文密码**，它的二维码渲染同样如此 —— 任何扫到它的人都
   持有该客户端的凭证。
-- **吊销即轮换。** 没有按设备吊销：`--generate-2fa client-001 --force` 会就地重写
-  `config.toml`，所有用旧密钥注册过的设备都必须重新扫描；删除
-  `[auth.clients.client-001]` 这一段则一次性吊销所有人。
+- **吊销曾经等于全部轮换。** 删除 `[auth.clients.client-001]` 这一段，或者
+  `--generate-2fa client-001 --force`，仍然会连该客户端下所有已注册设备一起带走。
+  报了名字的设备现在可以单独吊销，其余设备不受影响：见
+  [`nexapipe client`](#nexapipe-client)。
 - 两种吊销都只作用于**之后建立的连接**：握手里拿到的授权是当时的快照，已经通过认证的
   连接会一直用到它自己结束，轮换或删除都不会把它掐断。要立刻断开，重启服务端。
 
