@@ -873,6 +873,9 @@ async fn proxy_handler(
                 hyper::StatusCode::BAD_GATEWAY.as_u16(),
                 duration.as_millis() as u64,
                 0,
+                // The plaintext listener does not authenticate: no 2FA runs
+                // here, so there is no client and no device to name.
+                None,
             );
             return Ok(with_request_id(
                 http::create_error_response(hyper::StatusCode::BAD_GATEWAY, "Bad Gateway"),
@@ -917,6 +920,10 @@ async fn proxy_handler(
         status,
         duration.as_millis() as u64,
         content_length,
+        // No handshake on this listener, so no identity: the line the same
+        // request would get on the authenticated one carries the two fields
+        // this one cannot answer.
+        None,
     );
 
     Ok(with_request_id(response, &request_id))

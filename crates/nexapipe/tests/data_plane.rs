@@ -239,6 +239,8 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
                     // reply carries has to be the id of this request, not a
                     // constant, or a test that reads the header proves nothing.
                     let request_id = nexapipe::log::next_request_id();
+                    // No handshake in front of this one, so no client or
+                    // device for the access log to name.
                     let _ = conn::handle_bidi_stream(
                         send,
                         recv,
@@ -248,6 +250,7 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
                         "data-plane-test",
                         None,
                         &request_id,
+                        nexapipe::conn::peers::PeerIdentity::default(),
                     )
                     .await;
                 }

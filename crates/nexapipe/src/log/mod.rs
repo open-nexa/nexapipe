@@ -29,6 +29,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::LogConfig;
+use crate::conn::peers::PeerIdentity;
 
 /// Timestamp format of every log line, in local time.
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
@@ -668,6 +669,30 @@ fn redact_query(uri: &str) -> String {
     out
 }
 
+/// The ` client=… device=…` suffix of one access line: whose request it was.
+///
+/// Both fields are printable ASCII by the time they get here — `conn` rejects a
+/// client id or a device id that is not before it is used for anything, which
+/// is what keeps a peer from ending its own name with a CRLF and writing the
+/// next line itself — so neither can break a line into more columns than it
+/// has.
+///
+/// Empty when there is no client to name, which is every request of a
+/// deployment with 2FA off and every one on the plaintext listener: a line
+/// answering "whose request was this" with `-` on all of them is noise, not an
+/// answer. `device=-` is not the same silence — it says the client
+/// authenticated and named no device, which is the one the client's own secret
+/// is for.
+fn access_identity(who: Option<&PeerIdentity>) -> String {
+    let Some(client_id) = who.and_then(|identity| identity.client_id.as_deref()) else {
+        return String::new();
+    };
+    let device = who
+        .and_then(|identity| identity.device.as_deref())
+        .unwrap_or("-");
+    format!(" client={client_id} device={device}")
+}
+
 /// One id per request: 32 lowercase hex digits, 128 bits.
 ///
 /// Random rather than a counter for two reasons — a counter publishes how many
@@ -687,6 +712,13 @@ pub fn next_request_id() -> String {
     out
 }
 
+/// `who` is who the request came from, when anybody asked: `None` for the
+/// plaintext listener and for a deployment with 2FA off, which never learn it.
+// One field of the line per argument, which is the shape a log call has had
+// since it was written; bundling them into a struct would move the list into a
+// builder without making any of the dozen call sites shorter. `who` is last
+// because it is the newest thing the line carries.
+#[allow(clippy::too_many_arguments)]
 pub fn log_access(
     request_id: &str,
     remote_addr: &str,
@@ -695,6 +727,7 @@ pub fn log_access(
     status: u16,
     duration_ms: u64,
     bytes_sent: usize,
+    who: Option<&PeerIdentity>,
 ) {
     // Decided before anything is formatted: a proxy with the access log turned
     // off used to build the line for every request and then drop it, paying for
@@ -722,12 +755,15 @@ pub fn log_access(
         uri.to_string()
     };
 
+    // Printed last, so everything before it keeps the column it had.
+    let identity = access_identity(who);
+
     if let Some(target) = target {
         // The id goes last, not first: everything before it keeps the column
         // it had, so a script that splits this line on spaces still finds the
         // host, the status and the duration where it always did.
         let line = format!(
-            "{} - - [{}] \"{} {}\" {} {} {}ms id={}",
+            "{} - - [{}] \"{} {}\" {} {} {}ms id={}{}",
             remote_addr,
             Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
             method,
@@ -735,7 +771,8 @@ pub fn log_access(
             status,
             bytes_sent,
             duration_ms,
-            request_id
+            request_id,
+            identity
         );
 
         match target {
@@ -892,6 +929,10 @@ mod tests {
             200,
             12,
             512,
+            Some(&PeerIdentity {
+                client_id: Some("acme".to_string()),
+                device: Some("laptop".to_string()),
+            }),
         );
 
         let path = dir.path().join("access.log");
@@ -911,12 +952,56 @@ mod tests {
                     contents.contains(&format!("id={id}")),
                     "the request id is missing from the line: {contents}"
                 );
+                // Whose request it was, which is the one thing the line could
+                // not answer before: the client and device the connection
+                // authenticated as.
+                assert!(
+                    contents.contains("client=acme device=laptop"),
+                    "the client and device are missing from the line: {contents}"
+                );
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         panic!("the access line never reached {}", path.display());
+    }
+
+    /// The three shapes the suffix takes. Tested apart from the line itself
+    /// because two of them never reach a sink in a test: whether the logger is
+    /// armed is global state, and two tests arming it at once would race.
+    #[test]
+    fn the_access_line_names_the_client_and_the_device_it_came_from() {
+        assert_eq!(
+            access_identity(Some(&PeerIdentity {
+                client_id: Some("acme".to_string()),
+                device: Some("laptop".to_string()),
+            })),
+            " client=acme device=laptop"
+        );
+
+        // Authenticated but unnamed: the device that carries the client's own
+        // secret. A dash rather than an empty field, because "no name" and "no
+        // client" are not the same answer.
+        assert_eq!(
+            access_identity(Some(&PeerIdentity {
+                client_id: Some("acme".to_string()),
+                device: None,
+            })),
+            " client=acme device=-"
+        );
+
+        // No handshake: the plaintext listener, and 2FA off.
+        assert_eq!(access_identity(None), "");
+        assert_eq!(access_identity(Some(&PeerIdentity::default())), "");
+        assert_eq!(
+            access_identity(Some(&PeerIdentity {
+                client_id: None,
+                device: Some("laptop".to_string()),
+            })),
+            "",
+            "a device with no client is not something a line should assert"
+        );
     }
 
     #[test]
