@@ -7,8 +7,9 @@
 //!   everything else keeps resolving wherever the machine was resolving it. This is
 //!   what makes running alongside another tunnel possible — the other app's names,
 //!   and the machine's own internal ones, are none of our business.
-//!   - macOS: a file per domain under `/etc/resolver`
-//!   - Linux:  `resolvectl` routing domains on the TUN link
+//!   - macOS:   a file per domain under `/etc/resolver`
+//!   - Linux:   `resolvectl` routing domains on the TUN link
+//!   - Windows: NRPT rules (PowerShell `Add-DnsClientNrptRule`), read back afterwards
 //! - **Global**: every query on the machine goes to the TUN resolver. The fallback,
 //!   for a platform with no per-domain mechanism and for one where the scoped attempt
 //!   could not be installed.
@@ -117,15 +118,16 @@ pub fn set_system_dns(
 
     #[cfg(windows)]
     {
-        // No per-domain mechanism on this platform: the DNS client resolves
-        // against whatever the adapters carry, and there is no place to say
-        // "this domain, this server" that a client SKU honours. (NRPT rules
-        // exist, but they are a DirectAccess feature and are not reliably
-        // applied on client builds, which is not something to find out on a
-        // user's machine.) Every adapter is pointed at the TUN instead, and
-        // the machine's own resolvers stay reachable through the forwarding
-        // chain the local server builds — see `dns::resolver_chain`.
-        let _ = proxy_domains;
+        // Per-domain first, like the other two platforms: the NRPT names a
+        // resolver for a namespace, and a name that matches no rule is resolved
+        // against the adapters — which still carry the DNS this machine was
+        // using, so nothing outside the configured domains moves. Rules are
+        // verified by reading them back, because a machine that takes its NRPT
+        // from a domain policy ignores the local ones entirely, and that is not
+        // something to discover by having the proxy resolve nothing.
+        if set_scoped_dns_windows(dns_ip, proxy_domains)? {
+            return Ok(DnsHijack::Scoped);
+        }
         set_system_dns_windows(interface, dns_ip)?;
         Ok(DnsHijack::Global)
     }
@@ -185,8 +187,10 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
 
     #[cfg(windows)]
     {
-        let _ = hijack;
-        restore_system_dns_windows(interface, dns_ip)
+        match hijack {
+            DnsHijack::Scoped => remove_nrpt_rules(dns_ip),
+            DnsHijack::Global => restore_system_dns_windows(interface, dns_ip),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -258,8 +262,8 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
 ///
 /// Unfiltered: dropping the addresses that would send a query back to us is the
 /// caller's job, see `dns::forwardable_resolvers`. An empty answer is a fine one
-/// — "the machine has no static DNS" just leaves the chain to the configured
-/// upstream and the fallbacks.
+/// — a machine whose resolvers cannot be read just leaves the chain to the
+/// configured upstream and the fallbacks.
 pub fn current_dns_servers() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
@@ -282,9 +286,287 @@ pub fn current_dns_servers() -> Vec<String> {
     }
 }
 
+/// The pre-hijack resolvers this program already has on file: what an earlier
+/// run recorded before it moved the system DNS, kept in
+/// [`DNS_BACKUP_PATH`] on macOS and in [`RESOLV_CONF_BACKUP`] on Linux.
+///
+/// A second source rather than a correction to [`current_dns_servers`], and the
+/// reason is the case the live read cannot answer: a run that was killed before
+/// its restore leaves the machine pointing at a TUN address, so asking the
+/// system what it resolves against now returns the hijack itself — which the
+/// caller filters out, and the chain then starts at the public resolvers. The
+/// file is the only surviving record of what that machine was actually using.
+///
+/// Tried behind the live read, so it only contributes when those did not fill
+/// the slots on their own. A stale entry costs one 1.5s window when it does not
+/// answer, which is cheaper than answering an internal name from a public one.
+/// Windows keeps no such record — its restore hands adapters back to DHCP — so
+/// it has nothing to contribute.
+pub fn recorded_dns_servers() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut servers: Vec<String> = Vec::new();
+        for recorded in read_dns_backup().values() {
+            for server in recorded {
+                if !servers.contains(server) {
+                    servers.push(server.clone());
+                }
+            }
+        }
+        servers
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        resolv_conf_nameservers(&std::fs::read_to_string(RESOLV_CONF_BACKUP).unwrap_or_default())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
 // ============================================================
-// Windows — PowerShell Set-DnsClientServerAddress, netsh fallback
+// Windows — NRPT rules per domain, else Set-DnsClientServerAddress
 // ============================================================
+
+/// Marks an NRPT rule as one this process wrote.
+///
+/// Put in the rule's comment so `Get-DnsClientNrptRule` on the machine says
+/// which rules are ours. Not what the code recognises them by: a comment is a
+/// string an administrator or a policy can rewrite, and what makes a rule ours
+/// is that it names the TUN resolver, an address nobody configures by hand
+/// (see `crate::proxy::tun_proxy::TUN_BASE_CANDIDATES`).
+#[cfg(any(windows, test))]
+const NRPT_COMMENT: &str = "nexapipe";
+
+/// The namespaces one configured domain needs in the NRPT.
+///
+/// Two, because the NRPT reads a leading dot as a suffix and no dot as an
+/// exact name: `example.com` alone leaves `www.example.com` resolving outside
+/// the proxy, and `.example.com` alone is a *suffix* rule, which the name
+/// `example.com` itself does not end in. Writing both is the only spelling
+/// that covers a domain and everything under it either way the client reads it.
+#[cfg(any(windows, test))]
+fn nrpt_namespaces(domains: &[String]) -> Vec<String> {
+    let mut namespaces = Vec::with_capacity(domains.len() * 2);
+    for domain in domains {
+        namespaces.push(domain.clone());
+        namespaces.push(format!(".{domain}"));
+    }
+    namespaces
+}
+
+/// One NRPT rule, as the PowerShell below prints it: what it covers, and who
+/// it asks. Nothing else is needed — a rule is removed by name, and the name
+/// is asked for again at that point rather than carried around.
+#[cfg(any(windows, test))]
+struct NrptRule {
+    namespaces: Vec<String>,
+    servers: Vec<String>,
+}
+
+/// Reads a dump of the NRPT: one rule per line, `<namespaces>|<servers>`,
+/// each a comma-separated list.
+///
+/// A rule the dump leaves half-empty still parses: an exemption rule carries no
+/// servers at all, and it is not ours, but it has to be skipped rather than end
+/// the parse. So does an empty dump, which is what a machine with no NRPT
+/// rules prints — and which must not read as one nameless rule.
+#[cfg(any(windows, test))]
+fn parse_nrpt_rules(output: &str) -> Vec<NrptRule> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (namespaces, servers) = line.split_once('|')?;
+            Some(NrptRule {
+                namespaces: namespaces
+                    .split(',')
+                    .map(|namespace| namespace.trim().to_string())
+                    .collect(),
+                servers: servers
+                    .split(',')
+                    .map(|server| server.trim().to_string())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// The namespaces the NRPT routes to `dns_ip`.
+///
+/// Matched exactly, and not by substring: `110.7.0.254` contains `10.7.0.254`
+/// and is a different resolver on a different network.
+#[cfg(any(windows, test))]
+fn nrpt_namespaces_for(rules: &[NrptRule], dns_ip: &str) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|rule| rule.servers.iter().any(|server| server == dns_ip))
+        .flat_map(|rule| rule.namespaces.iter().cloned())
+        .collect()
+}
+
+/// Runs a PowerShell script with no console window and returns its stdout.
+///
+/// A non-zero exit is an error: what these scripts have to say they say on
+/// stdout, and one that failed has nothing there. Stderr is only a warning —
+/// the scripts report per rule that could not be added or removed, which is a
+/// partial result worth logging, not a failure of the whole command.
+#[cfg(windows)]
+fn windows_ps(script: &str) -> Result<String> {
+    let output = win_console_tool("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run powershell: {}", e))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        tracing::warn!("powershell stderr: {}", stderr.trim());
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "powershell exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// The script that adds one rule per namespace and dumps the table back.
+///
+/// `Get-DnsClientNrptRule` rather than `Get-DnsClientNrptPolicy` for the
+/// read-back, because a rule is removed by name and only the former reports
+/// it: the same dump has to serve as the list a restore or a cleanup would
+/// delete from.
+#[cfg(any(windows, test))]
+fn nrpt_add_script(namespaces: &[String], dns_ip: &str) -> String {
+    // `dns::scoped_domains` has already kept these to what a domain can
+    // contain, so none of them can end the single quotes they go into.
+    let list = namespaces
+        .iter()
+        .map(|namespace| format!("'{namespace}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$namespaces = @({list});\
+         foreach ($namespace in $namespaces) {{\
+           try {{ Add-DnsClientNrptRule -Namespace $namespace -NameServers '{ip}' -Comment '{comment}' -ErrorAction Stop }} \
+           catch {{ Write-Warning ('add ' + $namespace + ': ' + $_.Exception.Message) }}\
+         }};\
+         Clear-DnsClientCache;\
+         Get-DnsClientNrptRule | ForEach-Object {{ ($_.Namespace -join ',') + '|' + ($_.NameServers -join ',') }}",
+        list = list,
+        ip = dns_ip,
+        comment = NRPT_COMMENT,
+    )
+}
+
+/// The script that removes every rule naming `dns_ip` — or carrying our
+/// comment, for one whose server an earlier version wrote differently — and
+/// dumps what is left.
+#[cfg(any(windows, test))]
+fn nrpt_remove_script(dns_ip: &str) -> String {
+    format!(
+        "$ours = @(Get-DnsClientNrptRule | Where-Object {{ ($_.NameServers -contains '{ip}') -or ($_.Comment -eq '{comment}') }});\
+         foreach ($rule in $ours) {{\
+           try {{ Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop; Write-Output ('removed ' + ($rule.Namespace -join ',')) }} \
+           catch {{ Write-Warning ('remove ' + $rule.Name + ': ' + $_.Exception.Message) }}\
+         }};\
+         Clear-DnsClientCache;\
+         Get-DnsClientNrptRule | ForEach-Object {{ ($_.Namespace -join ',') + '|' + ($_.NameServers -join ',') }}",
+        ip = dns_ip,
+        comment = NRPT_COMMENT,
+    )
+}
+
+/// Points the configured domains at the TUN resolver with one NRPT rule each,
+/// and leaves every other name to the DNS servers the adapters carry.
+///
+/// This is the Windows shape of what `/etc/resolver` does on macOS and a
+/// routing domain does on Linux, and it is what the global hijack cannot be: a
+/// name that matches no rule is resolved against the adapters, which still
+/// carry whatever this machine was using before the tunnel came up — its own
+/// internal resolvers, and another tunnel's, if one is running. No adapter is
+/// touched, so there is no IPv6 race to lose either.
+///
+/// `Ok(false)` means "not installed", which is a call to fall back to the
+/// global hijack rather than a failure: whatever was added up to that point is
+/// taken back first, so the two cannot be in place at once.
+#[cfg(windows)]
+fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> {
+    let Some(domains) = crate::proxy::dns::scoped_domains(proxy_domains) else {
+        tracing::info!(
+            "the configured domains cannot each be given a rule of their own; \
+             every query goes to the TUN instead"
+        );
+        return Ok(false);
+    };
+    let namespaces = nrpt_namespaces(&domains);
+
+    // Read back rather than trust the exit code, which is what the doubt about
+    // this mechanism comes down to: NRPT settings live in the registry and a
+    // machine that takes them from a domain policy ignores the local ones
+    // entirely. A rule that is in the table but not in force looks exactly like
+    // a proxy that resolves nothing.
+    let dump = match windows_ps(&nrpt_add_script(&namespaces, dns_ip)) {
+        Ok(dump) => dump,
+        Err(e) => {
+            tracing::warn!(
+                "Add-DnsClientNrptRule failed: {} — every query goes to the TUN instead",
+                e
+            );
+            let _ = remove_nrpt_rules(dns_ip);
+            return Ok(false);
+        }
+    };
+    let routed = nrpt_namespaces_for(&parse_nrpt_rules(&dump), dns_ip);
+    if !routes_every_domain(&routed, &namespaces) {
+        let _ = remove_nrpt_rules(dns_ip);
+        tracing::warn!(
+            "{} of {} namespace(s) route to {} — every query goes to the TUN instead: {}",
+            routed.len(),
+            namespaces.len(),
+            dns_ip,
+            dump.trim().replace('\n', "; ")
+        );
+        return Ok(false);
+    }
+
+    tracing::info!(
+        "{} configured domain(s) resolve through {} via the NRPT; every other name \
+         keeps the resolvers the adapters carry",
+        domains.len(),
+        dns_ip
+    );
+    Ok(true)
+}
+
+/// Removes the NRPT rules that name `dns_ip`, and reports any that stayed.
+///
+/// Rules outlive the process that wrote them — they are registry entries, and
+/// they survive a reboot — so this is what a scoped restore runs, and one of
+/// the two things the startup cleanup does. A rule left behind keeps its
+/// domains resolving against a TUN address nothing answers from, which is
+/// worse than no hijack at all: those names fail outright.
+#[cfg(windows)]
+fn remove_nrpt_rules(dns_ip: &str) -> Result<()> {
+    let dump = windows_ps(&nrpt_remove_script(dns_ip))?;
+    let left = nrpt_namespaces_for(&parse_nrpt_rules(&dump), dns_ip);
+    if left.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} namespace(s) still route to {} after the NRPT rules were removed: {}",
+        left.len(),
+        dns_ip,
+        left.join(", ")
+    )
+}
 
 #[cfg(windows)]
 fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()> {
@@ -502,6 +784,9 @@ fn restore_system_dns_windows(interface: &str, _dns_ip: &str) -> Result<()> {
 /// An adapter counts as stale when its IPv4 DNS is one of the TUN candidate addresses —
 /// nobody configures those legitimately — or its IPv6 DNS is exactly ::1 while nothing
 /// listens on [::1]:53 (the hijack's marker; a real localhost resolver holds that socket).
+/// An NRPT rule naming one of those addresses is stale for the same reason and is
+/// removed too — a rule is a registry entry, so it survives the reboot as well, and it
+/// keeps its domains resolving against a TUN address nothing answers from.
 ///
 /// On macOS and Linux the same question is asked of the system resolver, and an address
 /// that is still held by an interface is left alone — see [`cleanup_stale_hijack_macos`]
@@ -654,8 +939,17 @@ fn cleanup_stale_hijack_windows() {
          foreach ($i in $reset) {{\
            try {{ Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses -ErrorAction Stop; Write-Output ('reset ifindex ' + $i) }} catch {{ Write-Warning ('reset ifindex ' + $i + ': ' + $_.Exception.Message) }}\
          }};\
-         if ($reset.Count -gt 0) {{ Clear-DnsClientCache }};\
-         Write-Output ('stale adapters reset: ' + $reset.Count)",
+         $nrpt = @(Get-DnsClientNrptRule | Where-Object {{\
+           $hit = $false;\
+           foreach ($s in $_.NameServers) {{ if ($stale -contains $s) {{ $hit = $true }} }};\
+           $hit\
+         }});\
+         foreach ($r in $nrpt) {{\
+           try {{ Remove-DnsClientNrptRule -Name $r.Name -Force -ErrorAction Stop; Write-Output ('removed nrpt rule ' + ($r.Namespace -join ',')) }} catch {{ Write-Warning ('remove nrpt ' + $r.Name + ': ' + $_.Exception.Message) }}\
+         }};\
+         if (($reset.Count + $nrpt.Count) -gt 0) {{ Clear-DnsClientCache }};\
+         Write-Output ('stale adapters reset: ' + $reset.Count);\
+         Write-Output ('stale NRPT rules removed: ' + $nrpt.Count)",
         list
     );
     match win_console_tool("powershell")
@@ -891,7 +1185,7 @@ fn competing_routes_for(link: &str) -> Option<Vec<(String, Vec<String>)>> {
 /// Whether `routed` is every one of `domains`, and not merely one of them: a
 /// domain left out keeps resolving outside the proxy while the caller is told
 /// the hijack is scoped, which is the one thing the fallback is for.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn routes_every_domain(routed: &[String], domains: &[String]) -> bool {
     domains.iter().all(|domain| routed.contains(domain))
 }
@@ -1827,11 +2121,69 @@ fn parse_getdnsservers(output: &str) -> Option<Vec<String>> {
     Some(servers)
 }
 
-/// The DNS servers every network service is using, deduplicated in the order
-/// the services are listed.
+/// The `nameserver[n]` lines of `scutil --dns`, in the order they are printed.
 ///
-/// A service with no static DNS contributes nothing: it takes whatever DHCP
-/// hands out, which is not an address this process can be told to ask.
+/// `scutil` is the only thing on macOS that names the resolvers a machine is
+/// *actually* resolving against. On a machine that takes whatever DHCP hands
+/// out — every machine nobody configured by hand — those addresses exist
+/// nowhere else: `networksetup -getdnsservers` answers "what is statically
+/// configured" and prints [`NO_DNS_SERVERS`] instead. Reading nothing there is
+/// what quietly turns the fallback chain into `8.8.8.8` and the public
+/// resolvers, which for an internal zone or a split-horizon name is not a slow
+/// answer but a wrong one.
+///
+/// There is no grammar to reject here: the output is a run of `resolver #N`
+/// blocks and this takes the nameserver lines out of all of them — mDNS blocks
+/// name none — deduplicated in order, because the "for scoped queries" section
+/// repeats the global one.
+#[cfg(any(target_os = "macos", test))]
+fn parse_scutil_dns(output: &str) -> Vec<String> {
+    let mut servers: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(address) = line
+            .strip_prefix("nameserver[")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(_, address)| address.trim())
+        else {
+            continue;
+        };
+        if address.parse::<IpAddr>().is_err() {
+            continue;
+        }
+        if !servers.iter().any(|server| server == address) {
+            servers.push(address.to_string());
+        }
+    }
+    servers
+}
+
+/// The resolvers `scutil --dns` reports, or nothing when it cannot be run.
+///
+/// An empty answer is a fine one: it leaves the chain to the configured
+/// upstream and the fallbacks, which is where it stood before this source
+/// existed.
+#[cfg(target_os = "macos")]
+fn effective_dns_servers_macos() -> Vec<String> {
+    match Command::new("scutil").arg("--dns").output() {
+        Ok(output) if output.status.success() => {
+            parse_scutil_dns(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::debug!("scutil --dns could not be run: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The DNS servers every network service is using, deduplicated in the order
+/// the services are listed, followed by the ones `scutil --dns` says are in
+/// effect.
+///
+/// A service with no static DNS contributes nothing from `networksetup`: it
+/// takes whatever DHCP hands out, which is not an address that command will
+/// print. [`parse_scutil_dns`] is what supplies it, and it is the common case.
 #[cfg(target_os = "macos")]
 fn current_dns_servers_macos() -> Vec<String> {
     let mut servers: Vec<String> = Vec::new();
@@ -1840,6 +2192,11 @@ fn current_dns_servers_macos() -> Vec<String> {
             if !servers.contains(&server) {
                 servers.push(server);
             }
+        }
+    }
+    for server in effective_dns_servers_macos() {
+        if !servers.contains(&server) {
+            servers.push(server);
         }
     }
     servers
@@ -1988,6 +2345,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{backup_is_spent, parse_getdnsservers, parse_network_services, NO_DNS_SERVERS};
 
+    // Compiled under `test` on every platform, like the resolv.conf readers: it
+    // is a pure parser for a command this machine cannot otherwise exercise, and
+    // the whole point of it is the case this machine cannot produce.
+    #[cfg(any(target_os = "macos", test))]
+    use super::parse_scutil_dns;
+
     // The resolv.conf and resolvectl readers are pure, so they are compiled under
     // `test` on every platform: the Linux code cannot be built or run here, and a
     // parser for a file this code rewrites is not something to ship unexercised.
@@ -1996,6 +2359,14 @@ mod tests {
         DEFAULT_ROUTE_DOMAIN, parse_resolvectl_competing_routes, parse_resolvectl_dns,
         parse_resolvectl_domains, resolv_conf_names_a_tun_address, resolv_conf_nameservers,
         resolv_conf_without_nameservers, routes_every_domain,
+    };
+
+    // The NRPT reader is pure, and the machine that has to read it back is not
+    // the one the tests run on: a rule that is in the table but does not name
+    // our resolver is the difference between a scoped hijack and a global one.
+    #[cfg(any(windows, test))]
+    use super::{
+        nrpt_add_script, nrpt_namespaces, nrpt_namespaces_for, nrpt_remove_script, parse_nrpt_rules,
     };
 
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -2066,6 +2437,162 @@ mod tests {
             None
         );
         assert_eq!(parse_getdnsservers("garbage\n"), None);
+    }
+
+    /// `scutil --dns` is read for one reason: on a machine that takes whatever
+    /// DHCP hands out, it is the only thing that names the router's DNS. A
+    /// resolver block the command prints without a nameserver — the mDNS one
+    /// always is — contributes nothing rather than poisoning the list.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn scutil_dns_reads_the_resolvers_in_effect_and_skips_the_ones_naming_none() {
+        let output = "\
+DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : 8.8.8.8
+  if_index : 15 (en0)
+  flags    : Request A records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : local
+  options  : mdns
+  timeout  : 5
+  order    : 300000
+";
+        assert_eq!(
+            parse_scutil_dns(output),
+            vec!["192.168.1.1".to_string(), "8.8.8.8".to_string()]
+        );
+    }
+
+    /// The "for scoped queries" section repeats the global one, and so does
+    /// every interface that was given the same servers: the chain tries one
+    /// address at a time and pays 1.5s for each that does not answer, so the
+    /// repeats have to collapse rather than fill both slots with one resolver.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn scutil_dns_names_each_resolver_once_across_the_sections_that_repeat_it() {
+        let output = "\
+DNS configuration
+
+resolver #1
+  nameserver[0] : 192.168.1.1
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 192.168.1.1
+";
+        assert_eq!(parse_scutil_dns(output), vec!["192.168.1.1".to_string()]);
+    }
+
+    /// A nameserver line is only ever taken as an address: an IPv6 one carries
+    /// colons of its own, so the split has to be on the first colon — the one
+    /// after the index — and not on any of the ones inside the address.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn scutil_dns_reads_an_ipv6_nameserver_whole() {
+        assert_eq!(
+            parse_scutil_dns("resolver #1\n  nameserver[0] : 2001:db8::1\n"),
+            vec!["2001:db8::1".to_string()]
+        );
+    }
+
+    /// Output this code has never seen — a refused command, or a shape that
+    /// changed — is not a resolver. Guessing an address and forwarding a
+    /// machine's queries to it is worse than having no answer.
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn scutil_dns_output_naming_no_address_reads_as_no_resolvers() {
+        assert!(parse_scutil_dns("").is_empty());
+        assert!(parse_scutil_dns("** Error: command not recognized.\n").is_empty());
+        assert!(parse_scutil_dns("  nameserver[0] : not-an-address\n").is_empty());
+    }
+
+    /// One rule per line, `<namespaces>|<servers>`, which is what the two NRPT
+    /// scripts print. PowerShell ends these lines with CRLF, and a rule can name
+    /// more than one server — the read-back has to survive both before it is
+    /// trusted to say whether the hijack is in place.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn nrpt_rules_read_back_as_the_namespaces_they_route_and_who_they_ask() {
+        let rules =
+            parse_nrpt_rules("example.com|10.7.0.254\r\n.foo.io|10.7.0.254,192.168.1.1\r\n");
+        assert_eq!(
+            nrpt_namespaces_for(&rules, "10.7.0.254"),
+            vec!["example.com".to_string(), ".foo.io".to_string()]
+        );
+    }
+
+    /// A rule that names another resolver is not one of ours, and neither is an
+    /// exemption rule, which carries no server at all. `110.7.0.254` is the
+    /// address the exact match is worth writing: it contains this one, and it is
+    /// somebody else's resolver.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn an_nrpt_rule_naming_another_resolver_is_not_ours() {
+        let rules =
+            parse_nrpt_rules("example.com|110.7.0.254\r\n.corp.example.com|\r\nnas|10.7.0.254");
+        assert_eq!(
+            nrpt_namespaces_for(&rules, "10.7.0.254"),
+            vec!["nas".to_string()]
+        );
+    }
+
+    /// A machine with no NRPT rules prints nothing at all, which has to read as
+    /// "no rules" rather than as one rule covering no namespace.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn an_empty_nrpt_dump_reads_as_no_rules() {
+        assert!(parse_nrpt_rules("").is_empty());
+        assert!(parse_nrpt_rules("\r\n").is_empty());
+        assert!(nrpt_namespaces_for(&parse_nrpt_rules(""), "10.7.0.254").is_empty());
+    }
+
+    /// The two commands a Windows machine will run and this one cannot. Pinned
+    /// because a broken escape — a `{{` that survives into the script — reaches
+    /// that machine as a PowerShell syntax error, and there is no other way to
+    /// see it coming from here.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn nrpt_scripts_are_pinned() {
+        assert_eq!(
+            nrpt_add_script(&nrpt_namespaces(&["example.com".to_string()]), "10.7.0.254"),
+            "$namespaces = @('example.com','.example.com');\
+             foreach ($namespace in $namespaces) {\
+             try { Add-DnsClientNrptRule -Namespace $namespace -NameServers '10.7.0.254' -Comment 'nexapipe' -ErrorAction Stop } \
+             catch { Write-Warning ('add ' + $namespace + ': ' + $_.Exception.Message) }\
+             };\
+             Clear-DnsClientCache;\
+             Get-DnsClientNrptRule | ForEach-Object { ($_.Namespace -join ',') + '|' + ($_.NameServers -join ',') }"
+        );
+        assert_eq!(
+            nrpt_remove_script("10.7.0.254"),
+            "$ours = @(Get-DnsClientNrptRule | Where-Object { ($_.NameServers -contains '10.7.0.254') -or ($_.Comment -eq 'nexapipe') });\
+             foreach ($rule in $ours) {\
+             try { Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop; Write-Output ('removed ' + ($rule.Namespace -join ',')) } \
+             catch { Write-Warning ('remove ' + $rule.Name + ': ' + $_.Exception.Message) }\
+             };\
+             Clear-DnsClientCache;\
+             Get-DnsClientNrptRule | ForEach-Object { ($_.Namespace -join ',') + '|' + ($_.NameServers -join ',') }"
+        );
+    }
+
+    /// The apex and everything under it, as two rules. One namespace alone is
+    /// the half a scoped hijack fails on: `.example.com` is a suffix rule, which
+    /// the name `example.com` does not end in.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn nrpt_namespaces_cover_a_domain_and_everything_under_it() {
+        assert_eq!(
+            nrpt_namespaces(&["example.com".to_string()]),
+            vec!["example.com".to_string(), ".example.com".to_string()]
+        );
+        assert!(nrpt_namespaces(&[]).is_empty());
     }
 
     /// Only the host address the hijack actually uses counts as ours. Widening this

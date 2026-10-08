@@ -370,8 +370,18 @@ impl TunProxy {
         // not handle is answered by the resolver the machine was already using,
         // which is the only one that knows its internal and split-horizon names
         // — and on a host that runs another tunnel, that tunnel's resolver.
+        //
+        // The second source is what an earlier run wrote down before it moved
+        // the system DNS. It is the answer to the one case the live read cannot
+        // cover: a run that was killed before its restore leaves the machine
+        // resolving against a TUN address, so asking the system now returns the
+        // hijack itself, which the filter below drops.
         let previous_resolvers = dns::forwardable_resolvers(
-            &dns_config::current_dns_servers(),
+            &[
+                dns_config::current_dns_servers(),
+                dns_config::recorded_dns_servers(),
+            ]
+            .concat(),
             &own_dns_addresses(&dns_listen),
             dns::MAX_PREVIOUS_RESOLVERS,
         );
@@ -386,6 +396,12 @@ impl TunProxy {
                 previous_resolvers.join(", ")
             );
         }
+
+        // The chain the stack's own DNS branch asks, in the same order the local
+        // server asks them — see `dns::resolver_chain`. Built here, while
+        // `previous_resolvers` is still in hand, and used further down.
+        let upstream_chain =
+            dns::resolver_chain(&previous_resolvers, &self.config.dns.upstream_dns);
 
         let dns_server = DnsServer::new(
             DnsServerConfig {
@@ -459,12 +475,13 @@ impl TunProxy {
         let dns_ip_v4: Ipv4Addr = retarget(&self.config.dns_ip)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid DNS IP '{}': {}", self.config.dns_ip, e))?;
-        // The stack's own DNS branch forwards through the same upstream + fallback
-        // chain as the local DNS server (see dns.rs).
+        // The stack's own DNS branch asks the same servers in the same order as
+        // the local DNS server does: the machine's own resolvers first, then the
+        // configured upstream, then the public fallbacks (see dns.rs). It used to
+        // get the configured upstream and the fallbacks only, so a query that
+        // reached the TUN skipped the resolvers this machine was already using.
         let mut dns_servers: Vec<SocketAddr> = Vec::new();
-        for upstream in std::iter::once(self.config.dns.upstream_dns.as_str())
-            .chain(crate::proxy::dns::FALLBACK_UPSTREAMS.iter().copied())
-        {
+        for upstream in &upstream_chain {
             if let Ok(addr) = upstream.parse::<SocketAddr>() {
                 if !dns_servers.contains(&addr) {
                     dns_servers.push(addr);
