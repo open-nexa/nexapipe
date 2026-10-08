@@ -9,14 +9,14 @@ name: CI
 # and the job that publishes them only ever run from a tag, so this is the one
 # place a broken Dockerfile is caught before a release depends on it.
 #
-# The `test` job runs the root workspace on Linux, macOS and Windows. Windows
-# used to get `windows-check`, a `cargo check`: the integration tests spawn the
-# built binary, and the cfg(unix) halves of the config watcher and of shutdown
-# have no Windows counterpart to run them against. Those halves are `#[cfg(unix)]`
-# gated rather than left to fail, so what a Windows run reports is the half that
-# does exist, which is the half release.yml builds from a tag. A check only
-# catches what stops compiling; anything that fails once it runs still reached
-# a tag.
+# The `test` job runs the root workspace on Linux and macOS. Windows is covered
+# by `windows-test` below, which used to be `windows-check`, a `cargo check`:
+# the integration tests spawn the built binary, and the cfg(unix) halves of the
+# config watcher and of shutdown have no Windows counterpart to run them
+# against. Those halves are `#[cfg(unix)]` gated rather than left to fail, so
+# what a Windows run reports is the half that does exist, which is the half
+# release.yml builds from a tag. A check only catches what stops compiling;
+# anything that fails once it runs still reached a tag.
 #
 # Jobs that exist purely because the default feature set cannot see the code they cover:
 #   - android-ndk: the fd-based entry point of crates/nexapipe-client/src/tun_proxy.rs is
