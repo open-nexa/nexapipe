@@ -17,6 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# The ACL alignment check (see `check_acl_alignment` in `build.rs`) keeps the three command
+# lists honest: every `#[tauri::command]` in `src/lib.rs` must be granted in
+# `permissions/app-commands.toml`, and every entry there must be present in
+# `capabilities/default.json`. Missing either layer is what silently hides a command from the
+# webview — the same failure mode PR #100 fixed for `get_service_version`.
+serde_json = "1"
+toml = "0.8"
 
 [dependencies]
 tauri = { version = "2", features = [] }
