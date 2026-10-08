@@ -440,7 +440,14 @@ impl Metrics {
         // Every request is inside `+Inf`, including one slower than the widest
         // finite bound, so this series is the request count rather than a
         // bucket of its own — as is `_count`, for the same reason.
-        let requests = self.requests_total();
+        //
+        // Clamped to what the bounds above have counted: `record_request` raises
+        // the class counter first and the bucket second, both relaxed, so on a
+        // weakly ordered machine a scrape can read the second without the first
+        // and count fewer requests than the buckets hold. Read that way, `+Inf`
+        // and `_count` would come out below the widest finite bound — exactly
+        // the descending series the exclusive counts are stored to avoid.
+        let requests = self.requests_total().max(cumulative);
         let _ = writeln!(
             out,
             "nexapipe_request_duration_ms_bucket{{le=\"+Inf\"}} {requests}"
@@ -919,6 +926,33 @@ mod tests {
         );
         assert!(
             body.contains(&format!("nexapipe_request_duration_ms_sum {}", past + 3)),
+            "{body}"
+        );
+    }
+
+    /// `+Inf` and `_count` are the request count, and they may never come out
+    /// below the widest finite bucket. `record_request` raises the class counter
+    /// before the bucket and both are relaxed, so a scrape racing a record can
+    /// read the bucket without the count that came with it. That window is far
+    /// too narrow to hit on purpose, so the state is written by hand instead:
+    /// three requests counted in a bucket, none of them in a class yet.
+    #[test]
+    fn the_request_count_is_never_below_the_widest_bound() {
+        let metrics = Metrics::new();
+        metrics.request_duration_buckets[0].store(3, Ordering::Relaxed);
+
+        let body = metrics.render(&empty_view());
+
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"10000\"} 3"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_bucket{le=\"+Inf\"} 3"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nexapipe_request_duration_ms_count 3"),
             "{body}"
         );
     }
