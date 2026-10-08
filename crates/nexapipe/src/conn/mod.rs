@@ -14,7 +14,7 @@ use ::http::Request;
 use futures_util::StreamExt;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
-use peers::PeerRegistry;
+use peers::{PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -771,6 +771,21 @@ fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> Enrollm
     EnrollmentVerdict::Accept
 }
 
+/// What a successful handshake established.
+///
+/// Carried as both halves because a client id on its own cannot tell two
+/// devices of the same client apart, and telling them apart is the only thing
+/// a per-device credential is for: what the peer list, the access log and —
+/// later — the revocation that has to close one device's connections all need
+/// to know is whose connection this is, not merely whose client's.
+struct AuthenticatedPeer {
+    client_id: String,
+    /// The device name the peer sent. `None` is the device that has none,
+    /// which answered with the client's own secret.
+    device: Option<String>,
+    acl: ClientAcl,
+}
+
 /// Exchanges a one-time enrollment token for a freshly generated secret.
 ///
 /// This is what makes an enrollment invite worth handing out: the link carries
@@ -1169,7 +1184,7 @@ async fn perform_authentication(
     conn: &Connection,
     auth: &AuthState,
     peer: &str,
-) -> Result<(String, ClientAcl), AuthFailure> {
+) -> Result<AuthenticatedPeer, AuthFailure> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -1494,7 +1509,11 @@ async fn perform_authentication(
     }
 
     if is_valid {
-        Ok((client_id, verified_acl))
+        Ok(AuthenticatedPeer {
+            client_id,
+            device: resp_device_id,
+            acl: verified_acl,
+        })
     } else {
         Err(AuthFailure::Rejected(format!(
             "authentication failed for client '{client_id}': {fail_reason}"
@@ -1616,6 +1635,10 @@ pub async fn handle_connection(
     // handshake and carried by every stream this connection opens. `None`
     // means no 2FA ran, which is the unrestricted case anyway.
     let mut client_acl: Option<Arc<ClientAcl>> = None;
+    // Who the connection turned out to be, for the peer list. Filled in only
+    // when 2FA ran and passed: with it off there is no handshake, and no
+    // identity to report.
+    let mut identity = PeerIdentity::default();
 
     if let Some(auth) = auth {
         let outcome = tokio::time::timeout(
@@ -1624,13 +1647,17 @@ pub async fn handle_connection(
         )
         .await;
         match outcome {
-            Ok(Ok((client_id, acl))) => {
+            Ok(Ok(authenticated)) => {
                 tracing::info!(
                     "Client '{}' authenticated successfully from {}",
-                    client_id,
+                    authenticated.client_id,
                     peer_id
                 );
-                client_acl = Some(Arc::new(acl));
+                identity = PeerIdentity {
+                    client_id: Some(authenticated.client_id.clone()),
+                    device: authenticated.device,
+                };
+                client_acl = Some(Arc::new(authenticated.acl));
             }
             Ok(Err(AuthFailure::Rejected(reason))) => {
                 tracing::warn!("Authentication failed for {}: {}", peer_id, reason);
@@ -1669,7 +1696,7 @@ pub async fn handle_connection(
     // refused its handshake never got a connection, and `GET /v1/connections`
     // is asked "who is connected", not "who tried". The path may be corrected a
     // moment later by the tracker above, which keeps following it.
-    let _peer = peers.insert(peer_id, initial_kind);
+    let _peer = peers.insert(peer_id, initial_kind, identity);
 
     loop {
         match conn.accept_bi().await {

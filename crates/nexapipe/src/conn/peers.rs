@@ -33,6 +33,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Who a connection authenticated as.
+///
+/// Both halves, because a client id on its own cannot tell two devices of the
+/// same client apart, and telling them apart is the only thing per-device
+/// credentials are for. `None` is the honest answer for a connection that was
+/// never asked to authenticate: 2FA is optional, and a peer that connects with
+/// it off has no identity to report — the same as a device that has no name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// The client id the handshake was answered for.
+    pub client_id: Option<String>,
+    /// The device name it sent, `None` for the device that has none.
+    pub device: Option<String>,
+}
+
 /// One peer currently being served.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -42,16 +57,19 @@ pub struct PeerInfo {
     pub connected_for: Duration,
     /// How its traffic is currently reaching us.
     pub path: PathKind,
+    /// Who it authenticated as, if anybody asked it to.
+    pub identity: PeerIdentity,
 }
 
 /// What the registry keeps per connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Peer {
     /// Tells two connections from the same peer apart, so ending one does not
     /// end the other. Never reused.
     id: u64,
     since: Instant,
     path: PathKind,
+    identity: PeerIdentity,
 }
 
 /// The set of peers with a connection being served right now.
@@ -78,7 +96,12 @@ impl PeerRegistry {
     /// handshake — because a peer that was refused is not connected, and
     /// listing it would make "who is connected" include peers that were turned
     /// away.
-    pub fn insert(&self, endpoint_id: EndpointId, path: PathKind) -> PeerGuard {
+    pub fn insert(
+        &self,
+        endpoint_id: EndpointId,
+        path: PathKind,
+        identity: PeerIdentity,
+    ) -> PeerGuard {
         // Starts at 1 so a default-initialised id is never a real one.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut peers = write(&self.peers);
@@ -86,6 +109,7 @@ impl PeerRegistry {
             id,
             since: Instant::now(),
             path,
+            identity,
         });
         PeerGuard {
             registry: self.clone(),
@@ -120,7 +144,7 @@ impl PeerRegistry {
         let mut entries: Vec<(EndpointId, Peer)> = peers
             .iter()
             .flat_map(|(endpoint_id, entries)| {
-                entries.iter().map(move |peer| (*endpoint_id, *peer))
+                entries.iter().map(move |peer| (*endpoint_id, peer.clone()))
             })
             .collect();
         // Ordered by when a connection was added, not by how long it has been
@@ -134,6 +158,7 @@ impl PeerRegistry {
                 endpoint_id,
                 connected_for: peer.since.elapsed(),
                 path: peer.path,
+                identity: peer.identity.clone(),
             })
             .collect()
     }
@@ -215,8 +240,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, b) = ids();
 
-        let guard_a = registry.insert(a, PathKind::Relay);
-        let _guard_b = registry.insert(b, PathKind::Direct);
+        let guard_a = registry.insert(a, PathKind::Relay, PeerIdentity::default());
+        let _guard_b = registry.insert(b, PathKind::Direct, PeerIdentity::default());
         assert_eq!(registry.len(), 2);
 
         drop(guard_a);
@@ -237,8 +262,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let first = registry.insert(a, PathKind::Relay);
-        let second = registry.insert(a, PathKind::Direct);
+        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default());
+        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default());
         assert_eq!(registry.len(), 2, "one peer, two connections");
 
         drop(second);
@@ -263,8 +288,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let first = registry.insert(a, PathKind::Relay);
-        let second = registry.insert(a, PathKind::Direct);
+        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default());
+        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default());
 
         let listed = registry.snapshot();
         assert_eq!(listed.len(), 2);
@@ -281,6 +306,34 @@ mod tests {
         drop(second);
     }
 
+    /// Two devices of one client differ only by the name they answered under,
+    /// which is why the identity is carried as both halves: a client id on its
+    /// own cannot tell them apart, and telling them apart is the whole of what
+    /// a per-device credential is for.
+    #[test]
+    fn two_devices_of_one_client_are_told_apart_by_name() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let laptop = PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: Some("laptop".to_string()),
+        };
+        let phone = PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: Some("phone".to_string()),
+        };
+
+        let _first = registry.insert(a, PathKind::Relay, laptop);
+        let _second = registry.insert(a, PathKind::Direct, phone);
+
+        let listed = registry.snapshot();
+        assert_eq!(listed[0].identity.client_id.as_deref(), Some("alice"));
+        assert_eq!(listed[0].identity.device.as_deref(), Some("laptop"));
+        assert_eq!(listed[1].identity.client_id.as_deref(), Some("alice"));
+        assert_eq!(listed[1].identity.device.as_deref(), Some("phone"));
+    }
+
     /// The path is updated in place, because a connection that starts relayed
     /// and hole punches is still one peer.
     #[test]
@@ -288,7 +341,7 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let _guard = registry.insert(a, PathKind::Relay);
+        let _guard = registry.insert(a, PathKind::Relay, PeerIdentity::default());
         registry.set_path(&a, PathKind::Direct);
 
         let listed = registry.snapshot();
@@ -303,7 +356,7 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        drop(registry.insert(a, PathKind::Relay));
+        drop(registry.insert(a, PathKind::Relay, PeerIdentity::default()));
         registry.set_path(&a, PathKind::Direct);
 
         assert!(registry.is_empty(), "a removed peer came back");
