@@ -895,14 +895,18 @@ export function useConfigStore() {
   function setNodeTwoFactor(nodeId: string, patch: Partial<NodeTwoFactor>): void {
     const node = config.nodes.find((candidate) => candidate.id === nodeId);
     if (!node) return;
-    const device = patch.device ?? node.twoFactor?.device;
+    // A name belongs to the secret it was filed under, so it survives an edit that leaves the
+    // secret alone — client id, algorithm — and goes when the secret is replaced: what the
+    // field accepts is typed by hand, and a hand-typed secret is the client's shared one.
+    // Answering with it under a device's name asks the server for a key it does not have.
+    const device =
+      patch.secret !== undefined ? patch.device : (patch.device ?? node.twoFactor?.device);
     node.twoFactor = {
       clientId: patch.clientId ?? node.twoFactor?.clientId ?? '',
       secret: patch.secret ?? node.twoFactor?.secret ?? '',
       algorithm: patch.algorithm ?? node.twoFactor?.algorithm ?? 'sha1',
-      // Carried across an edit, because a secret typed by hand is the client's and a secret
-      // that came back from an enrollment is a device's, and which one this is decides which
-      // key the server checks it against. Cleared when a node has neither.
+      // Kept only when there is a name to keep: an unnamed credential is not one with an
+      // empty device, it is one the server has no entry for.
       ...(device?.trim() ? { device } : {}),
     };
   }
