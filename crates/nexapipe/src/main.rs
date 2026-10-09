@@ -1090,7 +1090,9 @@ fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Re
     }
 
     println!();
-    println!("The config is watched, so a running server stops accepting it on the next reload.");
+    println!("The config is watched, so a running server stops accepting it on the next reload —");
+    println!("and closes the connections already authenticated as it, rather than leaving them");
+    println!("to finish what they were doing.");
     Ok(())
 }
 

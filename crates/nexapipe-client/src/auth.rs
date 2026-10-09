@@ -25,6 +25,11 @@ mod auth_close_code {
     /// Sent right after the QUIC handshake, so the client never gets as far as
     /// sending credentials.
     pub const PEER_NOT_ALLOWED: u32 = 5;
+    /// This credential was struck out of `[auth]` *while this connection was
+    /// open* — `nexapipe client revoke`, aimed at this client or at this one
+    /// device of it. Unlike the four above this does not arrive during the
+    /// handshake: a connection has to have authenticated to be revoked.
+    pub const REVOKED: u32 = 6;
 }
 
 /// HMAC-SHA256 keyed by the TOTP secret, used to sign auth challenges.
@@ -257,6 +262,21 @@ impl TwoFactorAuth {
                  its operator to add it (the reason itself never arrived, the close did)"
                     .to_string(),
             ),
+            Ok(auth_close_code::REVOKED) => {
+                let subject = if self.client_id.is_empty() {
+                    "the credentials this connection authenticated with".to_string()
+                } else {
+                    format!("the credentials of client '{}'", self.client_id)
+                };
+                // Re-authenticating on a fresh connection will not help, and
+                // saying so is the point: this is not a wrong code that a retry
+                // could fix, it is an entry the server no longer has.
+                ClientError::AuthenticationFailed(format!(
+                    "the server revoked {subject} while this connection was open — an operator ran \
+                     `nexapipe client revoke` against it. Import a credential again to reconnect; \
+                     retrying this connection only repeats the refusal"
+                ))
+            }
             _ => ClientError::ConnectionFailed(detail),
         }
     }

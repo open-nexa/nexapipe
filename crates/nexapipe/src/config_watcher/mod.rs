@@ -1,6 +1,7 @@
-use crate::auth::AuthConfig;
+use crate::auth::{AuthConfig, ClientAuth};
 use crate::config::ProxyConfig;
 use crate::conn::AuthState;
+use crate::conn::peers::PeerRegistry;
 use crate::health::HealthProbes;
 use crate::proxy::{HttpClient, sync_health_checks};
 use crate::routes::RouteConfig;
@@ -43,6 +44,12 @@ pub struct ConfigWatcher {
     /// The live 2FA state, when 2FA is configured. Its `RwLock` is what makes a
     /// client-table reload possible without dropping an existing connection.
     auth: Option<AuthState>,
+    /// The connections being served right now, so a reload can tell one about
+    /// the credential it authenticated with going away. See
+    /// [`PeerRegistry::close_where`]: removing a client — or one device of it —
+    /// from `[auth]` has to stop the traffic it is carrying now, not only the
+    /// next dial.
+    peers: Arc<PeerRegistry>,
     /// Where the plaintext listener ended up, when it is bound at all.
     ///
     /// Carried here for one check: turning 2FA on is only sound if the plaintext
@@ -80,6 +87,7 @@ impl ConfigWatcher {
         health_probes: Arc<Mutex<HealthProbes>>,
         health_enabled: Arc<std::sync::atomic::AtomicBool>,
         auth: Option<AuthState>,
+        peers: Arc<PeerRegistry>,
     ) -> Self {
         ConfigWatcher {
             config_path,
@@ -88,6 +96,7 @@ impl ConfigWatcher {
             health_probes,
             health_enabled,
             auth,
+            peers,
             plaintext: std::sync::OnceLock::new(),
         }
     }
@@ -215,6 +224,16 @@ impl ConfigWatcher {
         // merge" one step nothing can land in the middle of.
         let mut live = state.config().write().await;
 
+        // What was here before the merge replaces it. Taken now rather than
+        // derived afterwards because the merge overwrites each client whole:
+        // a client survives losing a device, so after it there is nothing to
+        // compare against and no way to notice the device is gone.
+        let before: HashMap<String, Vec<String>> = live
+            .clients
+            .iter()
+            .map(|(id, client)| (id.clone(), client.devices.keys().cloned().collect()))
+            .collect();
+
         let new_auth = match ProxyConfig::load_with_auth(&self.config_path) {
             Ok((_, auth)) => auth,
             Err(e) => {
@@ -272,6 +291,67 @@ impl ConfigWatcher {
                 removed.len()
             );
         }
+
+        // A client that survived losing one of its devices is not in `removed`,
+        // so the devices are diffed against the snapshot from before the merge.
+        let removed_devices = Self::removed_devices(&before, &live.clients);
+        for (client_id, device) in &removed_devices {
+            tracing::info!(
+                "2FA device '{device}' of client '{client_id}' removed by config reload"
+            );
+        }
+
+        if !removed.is_empty() {
+            let closed = self.peers.close_where(|identity| {
+                removed
+                    .iter()
+                    .any(|id| identity.client_id.as_deref() == Some(id))
+            });
+            if closed > 0 {
+                tracing::info!(
+                    "Closed {} connection(s) authenticating as a client that is no longer in [auth]",
+                    closed
+                );
+            }
+        }
+        if !removed_devices.is_empty() {
+            let closed = self.peers.close_where(|identity| {
+                removed_devices.iter().any(|(client_id, device)| {
+                    identity.client_id.as_deref() == Some(client_id)
+                        && identity.device.as_deref() == Some(device)
+                })
+            });
+            if closed > 0 {
+                tracing::info!(
+                    "Closed {} connection(s) authenticating as a device that is no longer in [auth]",
+                    closed
+                );
+            }
+        }
+    }
+
+    /// Which `(client, device)` pairs the merge dropped, for clients that are
+    /// still there.
+    ///
+    /// Only clients on both sides are asked: one that disappeared takes every
+    /// device under it with it, and those connections are already closed by
+    /// the client-level pass — diffing it here too would count them twice.
+    fn removed_devices(
+        before: &HashMap<String, Vec<String>>,
+        after: &HashMap<String, ClientAuth>,
+    ) -> Vec<(String, String)> {
+        let mut removed = Vec::new();
+        for (client_id, devices) in before {
+            let Some(client) = after.get(client_id) else {
+                continue;
+            };
+            for device in devices {
+                if !client.devices.contains_key(device) {
+                    removed.push((client_id.clone(), device.clone()));
+                }
+            }
+        }
+        removed
     }
 
     /// Why this reload must not move `enabled`, when it must not.
@@ -603,6 +683,7 @@ mod tests {
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),
+            Arc::new(PeerRegistry::new()),
         );
 
         assert!(!state.config().read().await.enabled);
@@ -825,6 +906,7 @@ mod tests {
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),
+            Arc::new(PeerRegistry::new()),
         );
 
         let enrolled = state.clone();
