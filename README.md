@@ -247,6 +247,133 @@ docker compose logs -f --tail=50 nexapipe | grep -i reload
 # Config not reloaded, keeping the current routes: ... → refused, old routes still serve
 ```
 
+### systemd
+
+The commands above leave the server in the foreground of whichever shell started
+it. To run it as a service, install the binary and give it an account:
+
+```bash
+sudo install -m 0755 target/release/nexapipe /usr/local/bin/nexapipe
+sudo useradd --system --shell /usr/sbin/nologin nexapipe
+sudo mkdir -p /etc/nexapipe
+sudo cp config.toml.example /etc/nexapipe/config.toml
+sudo chown -R nexapipe:nexapipe /etc/nexapipe
+sudo chmod 700 /etc/nexapipe
+sudo chmod 600 /etc/nexapipe/config.toml
+```
+
+Then `/etc/systemd/system/nexapipe.service`:
+
+```ini
+[Unit]
+Description=NexaPipe server
+Documentation=https://github.com/open-nexa/nexapipe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexapipe
+Group=nexapipe
+ExecStart=/usr/local/bin/nexapipe --config /etc/nexapipe/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# Read only if it exists: the leading `-` is what makes it optional. The only
+# two settings the server reads from its environment are NEXAPIPE_LOG_DIR and
+# NEXAPIPE_MAX_CONNS_PER_PEER — nothing else can be moved out of config.toml,
+# so a secret stays in the config and the config stays 0600.
+EnvironmentFile=-/etc/nexapipe/nexapipe.env
+
+# ProtectSystem=strict makes every path read-only except the ones named here.
+# The config directory has to stay writable; see the second note below.
+ReadWritePaths=/etc/nexapipe
+LogsDirectory=nexapipe
+
+# Only for a [server] listen_addr below 1024. The tunnel holds no privileged
+# port, and a non-loopback listener is refused while [auth] is on, so most
+# deployments leave both of these commented out.
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+# AF_UNIX because a hostname in `backends` still goes through the C library's
+# resolver, which some configurations answer from a local socket: a family the
+# unit does not list is a name that fails to resolve, not a warning.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now nexapipe
+sudo systemctl status nexapipe
+journalctl -u nexapipe -f
+```
+
+**A named account rather than `DynamicUser=yes`.** This process owns files under
+`/etc/nexapipe` — the config it rewrites and the token it writes beside it — and
+a dynamic user is for a service that owns nothing outside the directories
+systemd makes for it. systemd allocates that UID for one start and can hand the
+same one to a different service later, which is why it relocates
+`StateDirectory`, `CacheDirectory` and `LogsDirectory` of its own accord: a
+credential file in `/etc` is not one of them.
+
+**The config directory has to stay writable.** The server writes back into
+`config.toml` — the 2FA `failed_attempts` / `locked_until` counters, an enrolled
+device's secret and its `last_used` — and writes `config.toml.admin-token`
+beside it the first time it starts. `ReadWritePaths` is that one directory and
+nothing wider. A deployment that never needs it is one with 2FA off and no
+enrollment.
+
+**`0600` and owned by `nexapipe`, after every edit.** A config holding `[auth]`
+secrets, an `[iroh] secret_key` or a `relay_auth_token` that any other account
+can read is **refused at startup** — the process exits 1 rather than serving with
+credentials every account can copy — and a reload cannot turn 2FA on until the
+mode is fixed. Editing as root is the ordinary way to lose this: `sudo -u
+nexapipe $EDITOR /etc/nexapipe/config.toml`, or `chown` and `chmod` when you did
+not.
+
+**A config edit needs no reload.** The file is re-read every 5 seconds, and
+`systemctl reload` against a unit with no `ExecReload` gets you a warning and
+nothing else. The watcher is also what refuses a bad edit: a change that does
+not parse, or one that left the file readable by others, is reported and the
+routes already serving stay up.
+
+Two things that are not systemd's. **Open the tunnel's UDP port** — set `[iroh]
+bind_port`, because without it the endpoint takes an ephemeral one and there is
+no port to write a rule for. And **run `nexapipe status` as an account that can
+read the token file**, since that is where it reads the token from:
+
+```bash
+sudo -u nexapipe nexapipe --config /etc/nexapipe/config.toml status
+```
+
+`[log]` files are separate from the journal, and `dir` defaults to `./logs`
+relative to the working directory — which under systemd is `/`, so the default
+names a directory the service cannot create. It is not fatal: one line on stderr
+and file logging is off for that run. Point it at the directory the unit owns:
+
+```toml
+[log]
+dir = "/var/log/nexapipe"      # LogsDirectory=nexapipe above creates and owns it
+```
+
+**The unit above has not been run in this project's CI** — the same caveat
+`docs/self-hosted-relay.md` makes about the relay's. The directives are not all
+the same age, and systemd ignores one it does not recognise with a line in the
+journal rather than refusing to start: `ProtectProc=invisible` needs 247,
+`StateDirectory=` and the rest of the `*Directory=` family 235, and
+`ProtectSystem=strict` 232. On something older the unit comes up anyway with the
+protections it could not read quietly missing, which `systemd-analyze verify`
+will name.
+
 ---
 
 ## CLI
