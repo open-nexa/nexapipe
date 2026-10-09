@@ -122,7 +122,7 @@ windows = { version = "0.62", features = [
 ] }
 # Hello is a WinRT API, so its answers arrive asynchronously; this is how one is
 # waited out. The version pair `windows` 0.62 generates its bindings against.
-windows-future = "0.3"
+windows-future = "0.100"
 
 windows-service = "0.8"
 # Only for the TUN address: `netsh` silently does nothing when this runs as a service
