@@ -149,6 +149,13 @@
     <string name="two_factor_sha512">SHA512</string>
     <string name="two_factor_scan">Scan QR code</string>
     <string name="two_factor_share_qr">Share as QR</string>
+    <string name="two_factor_device_label">Device:</string>
+    <string name="two_factor_device_none">unnamed</string>
+    <string name="two_factor_reenroll">Re-enroll this device</string>
+    <string name="two_factor_reenroll_hint">This credential predates device names, so it presents the client\'s shared secret rather than one device\'s. Re-enrolling gives this device a name of its own, which is what lets the server revoke it on its own.</string>
+    <string name="two_factor_reenroll_title">Re-enroll this device?</string>
+    <string name="two_factor_reenroll_body">This drops the credential saved for this endpoint. It is the only copy, so nothing can bring it back: enrolling again means importing this endpoint\'s registration invite once more, which asks the server for a credential under this device\'s name.\n\nUntil then this endpoint cannot connect.</string>
+    <string name="two_factor_reenroll_confirm">Drop it</string>
     <string name="two_factor_per_endpoint_note">These credentials are this endpoint\'s own; every other endpoint keeps whatever it was given.</string>
     <string name="two_factor_imported">2FA imported for \"%1$s\"</string>
     <string name="two_factor_replace_title">Replace 2FA Configuration</string>

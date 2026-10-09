@@ -2,6 +2,7 @@ package com.nexa.pipe
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import android.util.Log
 import androidx.core.content.edit
 import com.nexa.pipe.ui.NodeConfig
@@ -54,6 +55,18 @@ class SettingsManager(context: Context) {
         const val KEY_2FA_SECRET = "two_factor_secret"
         const val KEY_2FA_ALGORITHM = "two_factor_algorithm"
         const val KEY_2FA_MIGRATED = "two_factor_migrated"
+
+        /**
+         * The name this install answers as when it authenticates.
+         *
+         * It lives in [secretPrefs] rather than the backed-up file: it names
+         * *this* device, and a configuration restored onto another phone must
+         * not turn up claiming to be the one it was copied from. Sealed like
+         * the credentials beside it, because that file being ciphertext
+         * throughout is the property its exclusion from backups rests on —
+         * the name itself is not a secret.
+         */
+        const val KEY_DEVICE_ID = "device_id"
 
         // Language tag of the app UI, e.g. "zh-CN". Empty means "follow the
         // system", which is the default.
@@ -211,6 +224,25 @@ class SettingsManager(context: Context) {
      * instead of finding out from a backup they assumed was encrypted.
      */
     fun credentialProtection(): SecretStore.Protection = secrets.protection()
+
+    /**
+     * The name this install answers as, generated on first call and then kept.
+     *
+     * A server can revoke one device of a client — or rate-limit it — only if
+     * that device answers with a name of its own, so every install gets one
+     * whether or not anything was asked of it.
+     *
+     * Kept rather than regenerated, because a name that changed between runs
+     * would leave the server holding a row for every device this phone has
+     * ever claimed to be.
+     */
+    fun deviceId(): String {
+        val saved = secrets.unseal(secretPrefs.getString(KEY_DEVICE_ID, "") ?: "")
+        if (saved.isNotBlank()) return saved
+        val generated = DeviceName.generate(Build.MODEL)
+        secretPrefs.edit { putString(KEY_DEVICE_ID, secrets.seal(generated)) }
+        return generated
+    }
 
     /** Loads the endpoints, re-attaching each secret and token from [secretPrefs]. */
     fun loadNodes(): List<NodeConfig> {

@@ -71,6 +71,7 @@ fun EndpointDetailScreen(
     // the user explicitly agrees to replace them.
     var pendingTwoFactorImport by remember { mutableStateOf<OtpAuthConfig?>(null) }
     var twoFactorImportWarning by remember { mutableStateOf<String?>(null) }
+    var showReenrollConfirm by remember { mutableStateOf(false) }
 
     // The node can disappear while this page is open (deleted from here,
     // which also calls onBack); guard so a stale nodeId never renders an
@@ -659,6 +660,35 @@ fun EndpointDetailScreen(
                                 }
                             }
 
+                            Spacer(modifier = Modifier.height(12.dp))
+                            DeviceRow(device = twoFactor.device)
+
+                            if (twoFactor.device.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = stringResource(R.string.two_factor_reenroll_hint),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = { showReenrollConfirm = true },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(
+                                        Icons.Default.Refresh,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.two_factor_reenroll),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = stringResource(R.string.two_factor_per_endpoint_note),
@@ -917,6 +947,33 @@ fun EndpointDetailScreen(
         }
     }
 
+    if (showReenrollConfirm) {
+        AlertDialog(
+            onDismissRequest = { showReenrollConfirm = false },
+            title = { Text(stringResource(R.string.two_factor_reenroll_title)) },
+            text = { Text(stringResource(R.string.two_factor_reenroll_body)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showReenrollConfirm = false
+                    // Dropped rather than emptied: an endpoint with no
+                    // credential at all performs no handshake, so a failure to
+                    // enroll again leaves a connection that fails closed
+                    // instead of one that still answers under a shared secret
+                    // nobody intended to hand out.
+                    viewModel.updateNodeTwoFactor(nodeId, null)
+                    viewModel.addLog("Re-enrolling: dropped the credential of " + nodeId.take(8))
+                }) {
+                    Text(stringResource(R.string.two_factor_reenroll_confirm))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showReenrollConfirm = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
     if (showTwoFactorExport) {
         TwoFactorExportDialog(
             clientId = twoFactor.clientId,
@@ -938,6 +995,32 @@ fun EndpointDetailScreen(
  * cannot be used to measure the credential behind it.
  */
 private val SECRET_MASK = "•".repeat(16)
+
+/**
+ * The device this endpoint's credential belongs to, or the absence of one.
+ *
+ * Read-only, and shown even when there is nothing to say, because "no name" is
+ * the answer the user has to be able to see in order to act on it: it is the
+ * state that leaves this pair answering as the client rather than as one device
+ * of it, which is the one thing on this card re-enrolling changes.
+ */
+@Composable
+private fun DeviceRow(device: String?) {
+    val name = device?.takeIf { it.isNotBlank() }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = stringResource(R.string.two_factor_device_label),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = name ?: stringResource(R.string.two_factor_device_none),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
 
 /**
  * One domain row: a monogram so long lists scan visually, the domain itself
