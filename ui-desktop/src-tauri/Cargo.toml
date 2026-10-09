@@ -56,7 +56,7 @@ fastrand = "2"
 # The IPC token is the only thing standing between an elevated service and any
 # local process, so it is drawn from the OS CSPRNG rather than `fastrand` —
 # which is a fast non-cryptographic generator seeded from time and ASLR.
-getrandom = "0.3"
+getrandom = "0.4"
 # The IPC handshake answers a challenge with HMAC-SHA256(token, nonces) instead
 # of sending the token, so both sides prove they hold it without revealing it.
 hmac = "0.13"
