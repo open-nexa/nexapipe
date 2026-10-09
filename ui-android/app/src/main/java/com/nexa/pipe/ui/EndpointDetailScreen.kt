@@ -672,7 +672,18 @@ fun EndpointDetailScreen(
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 OutlinedButton(
-                                    onClick = { showReenrollConfirm = true },
+                                    onClick = {
+                                        // Credentials are dropped here, not
+                                        // edited, so the door stands in front
+                                        // of the tap that asks — the way it
+                                        // does for every other action on this
+                                        // page that touches what is saved.
+                                        // The dialog only confirms it.
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_reenroll_subtitle
+                                        ) { showReenrollConfirm = true }
+                                    },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Icon(
@@ -944,6 +955,7 @@ fun EndpointDetailScreen(
             showTwoFactorScanner = false
             showTwoFactorExport = false
             pendingTwoFactorImport = null
+            showReenrollConfirm = false
         }
     }
 

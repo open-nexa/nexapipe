@@ -173,6 +173,7 @@
     <string name="credential_lock_export_subtitle">分享该端点的两步验证配置</string>
     <string name="credential_lock_relay_subtitle">更改本设备的流量中继设置</string>
     <string name="credential_lock_two_factor_subtitle">开启或关闭该端点的两步验证</string>
+    <string name="credential_lock_reenroll_subtitle">删除该端点已保存的凭据并重新注册</string>
     <string name="credential_lock_scan_secret_subtitle">扫描该端点的两步验证二维码</string>
     <string name="credential_lock_scan_invite_subtitle">扫描端点邀请二维码</string>
     <string name="credential_lock_paste_invite_subtitle">导入端点邀请链接</string>

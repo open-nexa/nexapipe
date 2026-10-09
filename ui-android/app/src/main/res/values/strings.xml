@@ -188,6 +188,7 @@
     <string name="credential_lock_export_subtitle">Share this endpoint\'s 2FA configuration</string>
     <string name="credential_lock_relay_subtitle">Change where this device relays traffic</string>
     <string name="credential_lock_two_factor_subtitle">Switch this endpoint\'s 2FA on or off</string>
+    <string name="credential_lock_reenroll_subtitle">Drop this endpoint\'s saved credential and enroll again</string>
     <string name="credential_lock_scan_secret_subtitle">Scan a 2FA QR code for this endpoint</string>
     <string name="credential_lock_scan_invite_subtitle">Scan an endpoint invite QR code</string>
     <string name="credential_lock_paste_invite_subtitle">Import an endpoint invite link</string>
