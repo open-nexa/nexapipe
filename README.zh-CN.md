@@ -542,8 +542,10 @@ nexapipe status --config config.toml --json   # 单个 JSON 文档，给脚本�
 重载。`nexapipe status` 读同一个文件，且绝不创建它 —— 它自己造的 token 服务端并不
 认识。要轮换就删掉文件再重启。
 
-`/v1/*` 有意只做只读。`client add` 和 `client revoke` 依赖尚未落地的按设备身份模型，
-而一个只回答问题的接口，是没法被说服去改动任何东西的。
+`/v1/*` 只回答问题，别的什么也不做。增删凭据走上面的 `nexapipe client add` 与
+`client revoke`，它们在服务端所用的同一把锁下编辑这个接口所读的那份配置。admin
+token 是一个没有作用域、也没有轮换机制的不透明值，不该被赋予写权限——一个只回答
+问题的接口，是没法被说服去改动任何东西的。
 
 `[metrics] enabled` 默认是关的，因为它所依附的监听没有认证：必须**同时**开启它
 并绑定地址，才会有东西暴露出来。只开 `enabled` 而没有 `[admin]` 段会记一条警告且

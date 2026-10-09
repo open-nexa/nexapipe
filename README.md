@@ -601,9 +601,11 @@ trip the watcher that reloads on the config's mtime. `nexapipe status` reads the
 same file and never creates one — a token it minted itself would be one the
 server does not know about. Delete the file and restart to rotate it.
 
-`/v1/*` is read-only on purpose. `client add` and `client revoke` need the
-per-device identity model that is not here yet, and a surface that only answers
-questions cannot be talked into changing anything.
+`/v1/*` answers questions and nothing else. Adding and revoking are `nexapipe
+client add` and `client revoke` above, which write the config through the same
+lock this reads. A token that is one opaque value, with no scope and no
+rotation, is not something to hand write access to — a surface that only
+answers questions cannot be talked into changing anything.
 
 `[metrics] enabled` is off by default because the unauthenticated half carries
 no credential check: nothing is exposed until you ask for it *and* bind an
