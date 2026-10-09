@@ -655,7 +655,7 @@ jobs:
       # for — a pull request from a fork gets none either way.
 
       - name: Build image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 @ 2026-02-12
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v6 @ 2026-02-12
         with:
           context: .
           file: Dockerfile
