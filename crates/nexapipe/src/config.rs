@@ -1524,7 +1524,7 @@ impl ProxyConfig {
         let client = sub_table(clients, client_id, path)?;
 
         let devices = device_table(client, client_id, path)?;
-        devices.insert(device, device_entry(secret));
+        devices.insert(device, device_entry(secret, path)?);
 
         client.remove("pending_enrollment");
 
@@ -1606,7 +1606,7 @@ impl ProxyConfig {
             );
         }
 
-        devices.insert(device, device_entry(secret));
+        devices.insert(device, device_entry(secret, path)?);
 
         write_config_file(path, &doc.to_string())?;
 
@@ -1761,14 +1761,25 @@ fn device_table<'a>(
 /// Inline rather than a sub-table of its own, because the table it goes into
 /// may itself be an inline one an operator wrote, and a sub-table cannot be
 /// put inside one.
-fn device_entry(secret: &str) -> toml_edit::Item {
+///
+/// An empty secret is refused rather than written: the loader rejects one — it
+/// would key this device's HMAC with nothing — so an entry holding `""` is not
+/// a device that cannot authenticate, it is a config that cannot be read again,
+/// and both writers would have reported success while doing it.
+fn device_entry(secret: &str, path: &str) -> anyhow::Result<toml_edit::Item> {
+    if secret.is_empty() {
+        anyhow::bail!(
+            "{path}: a device secret cannot be empty; an empty one keys this device's HMAC with \
+             nothing and leaves a config that cannot be loaded"
+        );
+    }
     let mut entry = toml_edit::InlineTable::new();
     entry.insert("secret", toml_edit::Value::from(secret));
     entry.insert(
         "created_at",
         toml_edit::Value::from(crate::auth::config::default_created_at()),
     );
-    toml_edit::value(entry)
+    Ok(toml_edit::value(entry))
 }
 
 /// Runs `work` while holding an exclusive lock on the config file at `path`.
@@ -2672,6 +2683,38 @@ pending_enrollment = "TOKEN"
         assert_eq!(devices.len(), 2, "{devices:?}");
         assert_eq!(devices["laptop"].secret, "LAPTOPSECRET");
         assert_eq!(devices["phone"].secret, "PHONESECRET");
+    }
+
+    /// Neither writer may hand a device an empty secret.
+    ///
+    /// The loader refuses one, so writing it is not "a device that cannot
+    /// authenticate" but "a config that no longer loads at all" — and both
+    /// writers would have reported success while doing it. Neither may touch
+    /// the file first: the token has to stay spendable for a real enrollment.
+    #[test]
+    fn an_empty_device_secret_is_refused_by_both_writers() {
+        let (_dir, path) = scratch_client_with_token();
+        let before = fs::read_to_string(&path).expect("read the config first");
+
+        let enrollment = ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "")
+            .expect_err(
+                "an empty secret is not a credential, it is a config that cannot be read again",
+            );
+        assert!(enrollment.to_string().contains("empty"), "{enrollment:#}");
+
+        let operator = ProxyConfig::write_device_secret(&path, "alice", "laptop", "", true)
+            .expect_err("the same for the operator CLI");
+        assert!(operator.to_string().contains("empty"), "{operator:#}");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the config back"),
+            before,
+            "a refused write still changed the file"
+        );
+        assert!(
+            ProxyConfig::load_with_auth(&path).is_ok(),
+            "the config was left in a state that cannot be loaded"
+        );
     }
 
     /// Two writers that both read before either writes lose one of the two
