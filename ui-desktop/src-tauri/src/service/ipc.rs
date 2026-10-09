@@ -316,8 +316,10 @@ mod tests {
             two_factor_client_id: None,
             two_factor_secret: None,
             two_factor_algorithm: None,
+            two_factor_device: None,
             enrollment_client_id: None,
             enrollment_token: None,
+            enrollment_device: None,
         }
     }
 

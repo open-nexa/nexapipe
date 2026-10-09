@@ -900,10 +900,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceId(
             return -1;
         }
         let name = read_jstring(env, &device_id).unwrap_or_default();
-        jni_log!(
-            "[DEBUG:jni] nativeSetDeviceId: {} chars",
-            name.trim().len()
-        );
+        jni_log!("[DEBUG:jni] nativeSetDeviceId: {} chars", name.trim().len());
         if let Ok(mut slot) = DEVICE_ID.lock() {
             *slot = Some(name);
         }
