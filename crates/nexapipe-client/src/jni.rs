@@ -27,12 +27,21 @@ static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
 // 2FA config: Kotlin injects (client_id, secret, algorithm) via nativeSetTwoFactor before startup.
 static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+
+/// One endpoint's TOTP credentials, as Kotlin filed them: client id, secret,
+/// algorithm, and the device the secret was issued to.
+///
+/// The last field is what decides whether a handshake claims a device name, so
+/// it travels with the triple rather than being read from `DEVICE_ID` at apply
+/// time: a pair issued to the client has to keep answering as the client.
+type NodeCredential = (String, String, String, Option<String>);
+
 // 2FA credentials per backend, keyed by endpoint ID. Kotlin registers one entry
 // per endpoint that carries 2FA (nativeSetTwoFactorForNode); a backend without
 // an entry keeps none, so it never opens an auth stream. That is what lets one
 // client talk to several servers with different secrets — the single global
 // TWO_FACTOR above cannot express it.
-static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, (String, String, String)>>> =
+static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, NodeCredential>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 // One-time enrollment tokens per backend, keyed by endpoint ID. An entry here means the
 // endpoint has no credentials yet: the token is spent by the first connection, which comes
@@ -40,6 +49,16 @@ static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, (String, String, String)>>> =
 // holding a token must not present it as its TOTP secret.
 static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, String)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// The name this install answers as, injected once by Kotlin
+/// (`nativeSetDeviceId`) rather than per credential.
+///
+/// One name for the whole install, because the device is the phone and not the
+/// server. It names **enrollments only** — see `two_factor_auth` for why every
+/// other credential answers unnamed — and it is set from its own entry point
+/// rather than as one more argument on the calls that already exist, so a
+/// Kotlin side that has never heard of devices keeps calling them as it does
+/// and simply enrolls as the unnamed one.
+static DEVICE_ID: Mutex<Option<String>> = Mutex::new(None);
 
 // Generation counter: incremented each time nativeStopProxy releases the endpoint.
 // nativeStartIroh compares this before/after bind(); if a stop happened in between, the late
@@ -758,17 +777,43 @@ fn read_jstring(env: &Env<'_>, s: &JString<'_>) -> Option<String> {
     s.try_to_string(env).ok()
 }
 
-/// Builds a [`TwoFactorAuth`] from a stored (client id, secret, algorithm) triple.
+/// The name this install answers as, if Kotlin gave it one.
+///
+/// An empty name is not a name: it is a field left blank, and sending it would
+/// have the server refuse the handshake for a reason about printable ASCII
+/// rather than about this side.
+fn device_id() -> Option<String> {
+    DEVICE_ID
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Builds a [`TwoFactorAuth`] from a stored (client id, secret, algorithm) record
+/// and, for one that was issued to a device, that device's name.
 ///
 /// An empty secret means "no 2FA", which is how an endpoint that was never
 /// given credentials — or whose credentials were cleared — is represented.
-fn two_factor_auth(cfg: &(String, String, String)) -> Option<TwoFactorAuth> {
-    let (client_id, secret, algorithm) = cfg;
+///
+/// `device` names the device **this secret was issued to**, and is `None` for
+/// everything else. It is not filled from the install's own name: what a plain
+/// invite carries is the client's secret, filed under the client, and answering
+/// with a device name would make the server look that device up and refuse with
+/// `UnknownDevice` — a connected pair that worked yesterday, broken by a name
+/// neither side asked for. Only a credential a server issued *to* a device is
+/// presented as that device, which is exactly when Kotlin knows the name.
+fn two_factor_auth(cfg: &NodeCredential) -> Option<TwoFactorAuth> {
+    let (client_id, secret, algorithm, device) = cfg;
     if secret.trim().is_empty() {
         return None;
     }
     match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
-        Ok(auth) => Some(auth),
+        Ok(auth) => Some(match device.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => auth.with_device(name),
+            _ => auth,
+        }),
         Err(e) => {
             jni_log!("2FA auth config invalid: {}", e);
             None
@@ -779,12 +824,12 @@ fn two_factor_auth(cfg: &(String, String, String)) -> Option<TwoFactorAuth> {
 /// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
 fn current_two_factor_auth() -> Option<TwoFactorAuth> {
     let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
-    two_factor_auth(&cfg)
+    two_factor_auth(&(cfg.0, cfg.1, cfg.2, None))
 }
 
 /// A snapshot of the per-endpoint credentials, so the mutex is not held across
 /// the async calls that apply them.
-fn node_two_factor_snapshot() -> Vec<(String, (String, String, String))> {
+fn node_two_factor_snapshot() -> Vec<(String, NodeCredential)> {
     match NODE_TWO_FACTOR.lock() {
         Ok(map) => map
             .iter()
@@ -795,7 +840,7 @@ fn node_two_factor_snapshot() -> Vec<(String, (String, String, String))> {
 }
 
 /// The credentials registered for one endpoint, if any.
-fn node_two_factor_for(node_id: &str) -> Option<(String, String, String)> {
+fn node_two_factor_for(node_id: &str) -> Option<NodeCredential> {
     NODE_TWO_FACTOR
         .lock()
         .ok()
@@ -824,6 +869,43 @@ fn node_enrollment_snapshot() -> Vec<(String, (String, String))> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Names this device, once, for every **enrollment** it spends.
+///
+/// deviceId: printable ASCII without spaces, as `SettingsManager.deviceId()`
+/// generates it.
+///
+/// An enrollment is where a name is asked for: what comes back is filed under
+/// it on the server, and `nativeTakeIssuedCredential` hands the name back so
+/// Kotlin can keep it beside the secret and send it from then on. Credentials
+/// acquired any other way are answered unnamed, because a name the server's
+/// table does not carry is refused rather than falling back — see
+/// `two_factor_auth` — and the pairs an install already holds were issued to
+/// the client, not to a device.
+///
+/// Must be called before nativeStartProxy. Its own entry point rather than one
+/// more argument on the 2FA calls, which already have enough of them and which
+/// every credential would then have to answer for itself.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceId(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    device_id: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        if env.exception_check() {
+            jni_log!("JNI exception pending before nativeSetDeviceId");
+            env.exception_clear();
+            return -1;
+        }
+        let name = read_jstring(env, &device_id).unwrap_or_default();
+        jni_log!("[DEBUG:jni] nativeSetDeviceId: {} chars", name.trim().len());
+        if let Ok(mut slot) = DEVICE_ID.lock() {
+            *slot = Some(name);
+        }
+        0
+    })
 }
 
 /// Configure the client's 2FA credentials. Must be called before nativeStartProxy.
@@ -882,6 +964,8 @@ fn set_two_factor(
 /// client_id: must match the ID configured in that server's [auth.clients].
 /// secret:    Base32-encoded TOTP key (generated by `nexapipe --generate-2fa`).
 /// algorithm: "sha1" / "sha256" / "sha512".
+/// device:    the device this secret was issued to, or empty for one that
+///            belongs to the client itself.
 ///
 /// Only the pools of that backend get the credentials; every other endpoint is
 /// left alone, so servers that do not share a secret — or that have 2FA turned
@@ -898,9 +982,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetTwoFactorForNode(
     client_id: JString,
     secret: JString,
     algorithm: JString,
+    device: JString,
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| {
-        set_two_factor_for_node(env, node_id, client_id, secret, algorithm)
+        set_two_factor_for_node(env, node_id, client_id, secret, algorithm, device)
     })
 }
 
@@ -910,6 +995,7 @@ fn set_two_factor_for_node(
     client_id: JString,
     secret: JString,
     algorithm: JString,
+    device: JString,
 ) -> jint {
     if env.exception_check() {
         jni_log!("JNI exception pending before nativeSetTwoFactorForNode");
@@ -933,6 +1019,12 @@ fn set_two_factor_for_node(
     };
     let secret = read_jstring(env, &secret).unwrap_or_default();
     let algorithm = read_jstring(env, &algorithm).unwrap_or_else(|| "sha1".to_string());
+    // Empty is not the unnamed device, it is a field nobody filled in, and
+    // answering with "" is refused for a reason about printable ASCII rather
+    // than about this side.
+    let device = read_jstring(env, &device)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
 
     if node_id.is_empty() {
         jni_log!("nativeSetTwoFactorForNode: empty node_id");
@@ -948,7 +1040,7 @@ fn set_two_factor_for_node(
     );
 
     if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
-        map.insert(node_id, (client_id, secret, algorithm));
+        map.insert(node_id, (client_id, secret, algorithm, device));
     }
     0
 }
@@ -1112,9 +1204,17 @@ fn take_issued_credential(env: &mut Env<'_>) -> jstring {
     let Some(issued) = issued else {
         return std::ptr::null_mut();
     };
+    // Four lines, the last one only since devices existed: the name the server
+    // filed this secret under, which Kotlin has to write down beside it — a
+    // secret kept without its name is one that no longer answers. Empty when
+    // the server answered an enrollment that named no device, and a caller
+    // that reads three lines still reads an unnamed credential.
     let encoded = format!(
-        "{}\n{}\n{}",
-        issued.client_id, issued.secret, issued.algorithm
+        "{}\n{}\n{}\n{}",
+        issued.client_id,
+        issued.secret,
+        issued.algorithm,
+        issued.device.unwrap_or_default()
     );
     match env.new_string(encoded) {
         Ok(value) => value.into_raw(),
@@ -1442,8 +1542,18 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 if node_has_two_factor(&node_id) {
                     continue;
                 }
+                // Named where the token is spent, which is the only moment a
+                // name means anything: it is what makes the credential that
+                // comes back this phone's alone, and enrolling without one is
+                // how a device ends up sharing the client's secret — the thing
+                // that makes revoking one rotate every other one.
+                let enrollment = Enrollment::new(&client_id, &token);
+                let enrollment = match device_id() {
+                    Some(name) => enrollment.with_device(&name),
+                    None => enrollment,
+                };
                 endpoint_group
-                    .set_enrollment_for(&node_id, Some(Enrollment::new(&client_id, &token)))
+                    .set_enrollment_for(&node_id, Some(enrollment))
                     .await;
                 jni_log!("[DEBUG:jni] enrollment armed for node '{}'", node_id);
             }

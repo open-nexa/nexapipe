@@ -134,6 +134,13 @@
     <string name="two_factor_sha512">SHA512</string>
     <string name="two_factor_scan">扫描二维码</string>
     <string name="two_factor_share_qr">以二维码分享</string>
+    <string name="two_factor_device_label">设备：</string>
+    <string name="two_factor_device_none">未命名</string>
+    <string name="two_factor_reenroll">重新注册此设备</string>
+    <string name="two_factor_reenroll_hint">这份凭据早于设备名出现，因此它出示的是客户端共享密钥，而不是某一台设备自己的。重新注册会让这台设备获得自己的名字，服务端也才能单独吊销它。</string>
+    <string name="two_factor_reenroll_title">重新注册此设备？</string>
+    <string name="two_factor_reenroll_body">此操作会丢弃该端点已保存的凭据，且它是唯一副本，无法恢复：之后需要再次导入该端点的注册邀请，让服务端以这台设备的名字下发新凭据。\n\n在那之前，该端点无法连接。</string>
+    <string name="two_factor_reenroll_confirm">丢弃</string>
     <string name="two_factor_per_endpoint_note">这些凭据只属于该端点，其他端点仍各自使用自己的凭据。</string>
     <string name="two_factor_imported">已为“%1$s”导入两步验证</string>
     <string name="two_factor_replace_title">替换两步验证配置</string>
@@ -166,6 +173,7 @@
     <string name="credential_lock_export_subtitle">分享该端点的两步验证配置</string>
     <string name="credential_lock_relay_subtitle">更改本设备的流量中继设置</string>
     <string name="credential_lock_two_factor_subtitle">开启或关闭该端点的两步验证</string>
+    <string name="credential_lock_reenroll_subtitle">删除该端点已保存的凭据并重新注册</string>
     <string name="credential_lock_scan_secret_subtitle">扫描该端点的两步验证二维码</string>
     <string name="credential_lock_scan_invite_subtitle">扫描端点邀请二维码</string>
     <string name="credential_lock_paste_invite_subtitle">导入端点邀请链接</string>

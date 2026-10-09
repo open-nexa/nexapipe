@@ -547,6 +547,30 @@ function clearConfig() {
                     <option value="sha512">SHA512</option>
                   </select>
                 </div>
+                <div class="node-2fa-field">
+                  <label class="form-label">{{ t('node.twoFactorDevice') }}</label>
+                  <!-- Read-only: which secret this node answers with is decided by what the
+                       server filed it under, and a name edited here would be a name the
+                       server does not have. What changes it is a registration invite. -->
+                  <input
+                    :value="node.twoFactor.device ?? ''"
+                    :placeholder="node.twoFactor.device ? '' : t('node.deviceNone')"
+                    type="text"
+                    readonly
+                    class="form-input"
+                  />
+                </div>
+                <p v-if="!node.twoFactor.device" class="node-2fa-hint">
+                  {{ t('node.deviceHint') }}
+                </p>
+                <button
+                  v-if="!node.twoFactor.device"
+                  type="button"
+                  class="node-2fa-reveal"
+                  @click="showInviteDialog = true"
+                >
+                  {{ t('node.deviceReenroll') }}
+                </button>
                 <p class="node-2fa-hint">{{ t('node.twoFactorHint') }}</p>
               </div>
               <!-- A token is not a credential yet, so there is nothing to edit here: it is spent

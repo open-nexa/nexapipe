@@ -126,6 +126,15 @@ pub struct NodeTwoFactor {
     pub secret: String,
     /// Lowercase algorithm name, as `TotpAlgorithm::from_name` expects it.
     pub algorithm: String,
+    /// Which device of this client this secret belongs to.
+    ///
+    /// `None` is the device that was never given a name, which answers with the
+    /// client's own secret — the only kind that existed before a client could
+    /// have several, and still what a server that predates devices issues.
+    /// `Some` is a name the server filed this secret under, so sending it is
+    /// what makes the handshake check the right one: the same secret under two
+    /// names is two credentials, and revoking one leaves the other alone.
+    pub device: Option<String>,
 }
 
 /// A one-time enrollment token, which is what a `--registration` invite carries.
@@ -140,6 +149,11 @@ pub struct NodeTwoFactor {
 pub struct NodeEnrollment {
     pub client_id: String,
     pub token: String,
+    /// The name to be enrolled under, rather than taking the client's own
+    /// secret: it is what turns this into a credential the server can revoke on
+    /// its own. Absent enrolls as the unnamed device, which is the behaviour a
+    /// server that predates per-device credentials still has.
+    pub device: Option<String>,
 }
 
 /// The address a configured node resolves to.
@@ -390,7 +404,20 @@ impl ProxyManager {
                 // No algorithm to agree on: the server sends the parameters it generated
                 // the secret with in ENROLL_ISSUE, and the exchange builds its TOTP from
                 // those rather than from anything configured here.
+                // Taken before the name below shadows it: an empty device is not
+                // the unnamed device, it is a field left blank, and enrolling
+                // as "" would be refused by the server with a message about
+                // printable ASCII that says nothing about this side.
+                let device = enrollment
+                    .device
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
                 let enrollment = Enrollment::new(&enrollment.client_id, &enrollment.token);
+                let enrollment = match device {
+                    Some(device) => enrollment.with_device(device),
+                    None => enrollment,
+                };
                 endpoint_group
                     .set_enrollment_for(&addr.id.to_string(), Some(enrollment))
                     .await;
@@ -424,6 +451,14 @@ impl ProxyManager {
                 TotpAlgorithm::from_name(&two_factor.algorithm),
             )
             .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?;
+            // Named only when the node carries a name: an empty one is not the
+            // unnamed device, it is a field somebody left blank, and enrolling
+            // or answering as "" would be refused by the server with a message
+            // about printable ASCII that says nothing about this side.
+            let auth = match two_factor.device.as_deref().map(str::trim) {
+                Some(device) if !device.is_empty() => auth.with_device(device),
+                _ => auth,
+            };
             endpoint_group
                 .set_two_factor_for(&addr.id.to_string(), Some(auth))
                 .await;

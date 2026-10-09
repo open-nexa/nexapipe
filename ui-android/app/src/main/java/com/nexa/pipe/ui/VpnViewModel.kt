@@ -56,7 +56,16 @@ data class NodeTwoFactor(
     val enabled: Boolean = true,
     val clientId: String = "",
     val secret: String = "",
-    val algorithm: String = "sha1" // "sha1", "sha256", "sha512"
+    val algorithm: String = "sha1", // "sha1", "sha256", "sha512"
+    /**
+     * The device this credential was issued to, when the server said which.
+     *
+     * Null or blank means it is the client's shared secret rather than one
+     * device's — what every pair saved before this existed is, and what the
+     * field stays until the endpoint is enrolled under a name. The server
+     * cannot revoke one device of a client through a credential nobody owns.
+     */
+    val device: String? = null
 )
 
 /**
@@ -109,6 +118,17 @@ class VpnViewModel : ViewModel() {
     val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
     // Bearer token for a custom relay that asks for one. Never logged.
     val relayAuthToken = kotlinx.coroutines.flow.MutableStateFlow("")
+
+    /**
+     * What this install calls itself when it authenticates.
+     *
+     * Generated once on the device and then kept: a server can only revoke, or
+     * rate-limit, one device of a client if that device has a name of its own,
+     * and a name that changed between runs would leave a stale row behind on
+     * every single connect. Empty until [loadSettings] has run, which is also
+     * what leaves nothing to send on a handshake made before then.
+     */
+    val deviceId = kotlinx.coroutines.flow.MutableStateFlow("")
 
     /**
      * Whether the credentials on this device are actually encrypted at rest.
@@ -389,6 +409,7 @@ class VpnViewModel : ViewModel() {
             relayUrl.value = manager.loadRelayUrl()
             relayAuthToken.value = manager.loadRelayAuthToken()
             vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
+            deviceId.value = manager.deviceId()
             // Read after the load, because building a SettingsManager runs the
             // migration that re-seals whatever older versions left in plaintext —
             // on a device with a broken keystore that is the write that fails.
@@ -453,6 +474,12 @@ class VpnViewModel : ViewModel() {
         val clientId = parts[0]
         val secret = parts[1]
         val algorithm = parts[2]
+        // A fourth line names the device the server enrolled; it answers with
+        // three when it does not name devices at all. Left null rather than
+        // blank, because what it records is "no name was given" — the state
+        // that leaves this pair indistinguishable from the client's shared
+        // secret, and the one the page offers to re-enroll out of.
+        val device = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
         val node = nodes.value.firstOrNull { it.enrollment?.clientId == clientId }
             ?: nodes.value.firstOrNull { it.enrollment != null }
         if (node == null) {
@@ -463,7 +490,13 @@ class VpnViewModel : ViewModel() {
         }
         updateNodeTwoFactor(
             node.nodeId,
-            NodeTwoFactor(enabled = true, clientId = clientId, secret = secret, algorithm = algorithm)
+            NodeTwoFactor(
+                enabled = true,
+                clientId = clientId,
+                secret = secret,
+                algorithm = algorithm,
+                device = device
+            )
         )
         updateNodeEnrollment(node.nodeId, null)
         addLog("Enrolled: the token is spent and the issued secret is saved")
@@ -962,13 +995,29 @@ class VpnViewModel : ViewModel() {
                             // an earlier connect for as long as the process
                             // lives.
                             IrohProxy.nativeClearNodeTwoFactor()
+                            // One name for this install, however many endpoints
+                            // it authenticates to, read when the enrollment
+                            // below is armed. Before any credential is
+                            // registered rather than after: what is in the
+                            // native tables at nativeStartProxy is what goes
+                            // on the wire.
+                            IrohProxy.nativeSetDeviceId(deviceId.value)
                             for (node in nodes.value) {
                                 val otp = node.twoFactor?.takeIf { it.enabled } ?: continue
                                 IrohProxy.nativeSetTwoFactorForNode(
                                     node.nodeId,
                                     otp.clientId,
                                     otp.secret,
-                                    otp.algorithm
+                                    otp.algorithm,
+                                    // The device this secret was issued to, or
+                                    // empty for one issued to the client —
+                                    // which is every pair this app could hold
+                                    // before devices existed, and every pair a
+                                    // plain invite will ever hand over. Those
+                                    // must keep answering unnamed: a server
+                                    // asked for a device it does not know
+                                    // refuses rather than falling back.
+                                    otp.device.orEmpty()
                                 )
                             }
                             // A token instead of credentials, for an endpoint that was
