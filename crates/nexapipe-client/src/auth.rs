@@ -555,13 +555,16 @@ impl Enrollment {
                         "the server issued a credential for a different client id".to_string(),
                     ));
                 }
-                // The name the server filed this secret under wins over the one
-                // that was asked for. They are the same name on a server that
-                // accepted the request; they differ when the server answered an
-                // enrollment that named none, and carrying that `None` forward
-                // is what keeps the app's stored credential and the server's
-                // table from disagreeing about which secret this is.
-                let device = device_id.or_else(|| self.device_id.clone());
+                // The name the server filed this secret under is the only
+                // name this credential has, and it is whatever came back
+                // here — asked for in ENROLL_START, answered in this one.
+                //
+                // An answer that names no device is a server that filed it
+                // under no device: it predates the table, or it was asked
+                // for none. Either way it has nothing to match a name
+                // against, and putting the one that was asked for back
+                // sends it on every handshake from here on — which the
+                // server answers by refusing a device it does not know.
                 let issued = TwoFactorAuth::with_params(
                     &client_id,
                     &secret,
@@ -569,7 +572,7 @@ impl Enrollment {
                     period as u32,
                     digits,
                 )?;
-                match device {
+                match device_id {
                     Some(name) => issued.with_device(&name),
                     None => issued,
                 }
