@@ -167,21 +167,27 @@ fun EndpointDetailScreen(
      * accepted. Only this endpoint is touched: every other one keeps whatever
      * it had.
      *
-     * The device name does not survive it: see the write below.
+     * The device name survives only a scan of the credential that is already
+     * here: see the write below.
      */
     fun applyTwoFactorImport(config: OtpAuthConfig) {
         updateTwoFactor { current ->
+            // A QR code carries no device name, so anything it brings is the
+            // client's shared secret — unless it is the secret this endpoint
+            // already holds, which is what scanning a code exported from
+            // here looks like. That one is still filed under the device it
+            // was issued to, and dropping the name would answer with it as
+            // the shared secret instead, which the server does not have it
+            // as. A different client id or secret is a different row in the
+            // table, and the name goes with it.
+            val sameCredential =
+                current.clientId == config.clientId && current.secret == config.secret
             current.copy(
                 enabled = true,
                 clientId = config.clientId,
                 secret = config.secret,
                 algorithm = config.algorithm,
-                // Dropped, because a QR code carries no device name: what it
-                // brings is the client's shared secret. Keeping the name the
-                // previous credential was enrolled under would present this
-                // one as a device the server has no entry for, and a name
-                // nobody can point at is also one nobody can revoke.
-                device = null
+                device = if (sameCredential) current.device else null
             )
         }
         // The secret in the field now came from the camera, not from storage,
