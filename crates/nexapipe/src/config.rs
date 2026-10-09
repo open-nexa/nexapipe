@@ -1491,6 +1491,11 @@ impl ProxyConfig {
     /// Both keys move in one pass, for the reason given there: a secret on disk
     /// with the token still beside it would leave the window open for a second
     /// device to trade the same link for the same credential.
+    ///
+    /// The entry lands where [`Self::write_device_secret`] puts one: both
+    /// writers go through [`device_table`] and [`device_entry`], so a device
+    /// that spent a token and one an operator wrote by hand are the same shape
+    /// on disk.
     pub fn complete_device_enrollment(
         path: &str,
         client_id: &str,
@@ -1518,37 +1523,263 @@ impl ProxyConfig {
         let clients = sub_table(auth, "clients", path)?;
         let client = sub_table(clients, client_id, path)?;
 
-        // Not `sub_table`, which makes an implicit table: a device added under
-        // one would be written as `devices.laptop = { … }` on a line of the
-        // client's own section, and a table that says what it holds reads
-        // better than a dotted key that does not.
-        let devices = match client.entry("devices") {
-            toml_edit::Entry::Occupied(entry) => entry.into_mut(),
-            toml_edit::Entry::Vacant(entry) => {
-                entry.insert(toml_edit::Item::Table(toml_edit::Table::new()))
-            }
-        };
-        let devices = devices.as_table_like_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{path}: [auth.clients.{client_id}.devices] is not a table, enrollment not saved"
-            )
-        })?;
-
-        // An inline entry rather than a sub-table of its own, because the table
-        // above may itself be an inline one an operator wrote, and a sub-table
-        // cannot be put inside one.
-        let mut entry = toml_edit::InlineTable::new();
-        entry.insert("secret", toml_edit::Value::from(secret));
-        entry.insert(
-            "created_at",
-            toml_edit::Value::from(crate::auth::config::default_created_at()),
-        );
-        devices.insert(device, toml_edit::value(entry));
+        let devices = device_table(client, client_id, path)?;
+        devices.insert(device, device_entry(secret, path)?);
 
         client.remove("pending_enrollment");
 
         write_config_file(path, &doc.to_string())
     }
+
+    /// Writes `secret` under `[auth.clients.<client_id>.devices.<device>]`,
+    /// which is what gives one device of a client a credential of its own.
+    ///
+    /// The client's own `secret` is deliberately left alone: it is the
+    /// credential of the device that names none, so rotating it re-enrolls
+    /// every unnamed device at once, and issuing one device a secret of its own
+    /// is exactly the case where that is known not to be what was asked for.
+    ///
+    /// `force` is what allows an existing device to be issued another one, for
+    /// the reason [`Self::write_client_secret`] needs it: a device already
+    /// using the old secret stops authenticating the moment it changes.
+    ///
+    /// What it writes is the entry [`Self::complete_device_enrollment`] writes
+    /// when a device spends a token — one shape on disk, reached the same way.
+    /// The two differ only in what has to be true first: an enrollment has a
+    /// token to spend, and this has an operator, who has to say `--force`
+    /// before an existing credential is replaced.
+    ///
+    /// The client has to be there first — a device table under a client with no
+    /// secret of its own is a config that will not load.
+    pub fn write_device_secret(
+        path: &str,
+        client_id: &str,
+        device: &str,
+        secret: &str,
+        force: bool,
+    ) -> anyhow::Result<ClientSecretWrite> {
+        with_config_lock(path, || {
+            Self::write_device_secret_unlocked(path, client_id, device, secret, force)
+        })
+    }
+
+    fn write_device_secret_unlocked(
+        path: &str,
+        client_id: &str,
+        device: &str,
+        secret: &str,
+        force: bool,
+    ) -> anyhow::Result<ClientSecretWrite> {
+        // The name becomes a key in this file and the subject of every log line
+        // about the device, so it is checked here rather than on its way into
+        // either. An empty one is not a name: the unnamed device is what the
+        // client's own `secret` is for.
+        if !crate::auth::is_presentable_device_id(device) {
+            anyhow::bail!(
+                "device name {device:?} is printable ASCII of at most {} characters — it is a key \
+                 in {path} and the subject of every log line about it",
+                crate::auth::MAX_DEVICE_ID_LEN
+            );
+        }
+
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, secret not written ({e})"))?;
+
+        let auth = sub_table(doc.as_table_mut(), "auth", path)?;
+        let clients = sub_table(auth, "clients", path)?;
+        let client = sub_table(clients, client_id, path)?;
+        if !client.contains_key("secret") {
+            anyhow::bail!(
+                "client \"{client_id}\" has no [auth.clients.{client_id}] secret in {path}; \
+                 run --generate-2fa {client_id} first"
+            );
+        }
+
+        let devices = device_table(client, client_id, path)?;
+        let replaced = devices.contains_key(device);
+        if replaced && !force {
+            anyhow::bail!(
+                "device \"{device}\" of client \"{client_id}\" already has a secret in {path}"
+            );
+        }
+
+        devices.insert(device, device_entry(secret, path)?);
+
+        write_config_file(path, &doc.to_string())?;
+
+        Ok(if replaced {
+            ClientSecretWrite::Replaced
+        } else {
+            ClientSecretWrite::Added
+        })
+    }
+    /// Drops one device's credential: `[auth.clients.<client_id>.devices.<device>]`.
+    ///
+    /// Revoking is a delete and not a rotation, because a deleted entry is the
+    /// one thing the handshake reads as "this device has no credential" — the
+    /// same answer a device that never enrolled gets, so what happened cannot be
+    /// told apart from outside. The client's own `secret` is left alone: it
+    /// belongs to the device that names none, and a client with one is not
+    /// revoked by dropping a device that named itself.
+    pub fn remove_device(path: &str, client_id: &str, device: &str) -> anyhow::Result<()> {
+        with_config_lock(path, || {
+            Self::remove_device_unlocked(path, client_id, device)
+        })
+    }
+
+    fn remove_device_unlocked(path: &str, client_id: &str, device: &str) -> anyhow::Result<()> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, nothing revoked ({e})"))?;
+
+        // Not `sub_table`: revoking must never create the thing it is about to
+        // delete, and an absent section is the operator naming something that
+        // is not there, which is worth saying.
+        let clients = auth_clients(doc.as_table_mut());
+        let Some(clients) = clients else {
+            anyhow::bail!("{path} has no [auth.clients] table, nothing revoked");
+        };
+        let Some(client) = clients
+            .get_mut(client_id)
+            .and_then(|item| item.as_table_like_mut())
+        else {
+            anyhow::bail!(
+                "client \"{client_id}\" has no [auth.clients.{client_id}] section in {path}, \
+                 nothing revoked"
+            );
+        };
+        let Some(devices) = client
+            .get_mut("devices")
+            .and_then(|item| item.as_table_like_mut())
+        else {
+            anyhow::bail!("client \"{client_id}\" has no devices in {path}, nothing revoked");
+        };
+        if devices.remove(device).is_none() {
+            anyhow::bail!(
+                "client \"{client_id}\" has no device \"{device}\" in {path}; its devices are {}",
+                device_names(devices)
+            );
+        }
+
+        write_config_file(path, &doc.to_string())
+    }
+
+    /// Drops a client and every device under it: all of
+    /// `[auth.clients.<client_id>]`.
+    pub fn remove_client(path: &str, client_id: &str) -> anyhow::Result<()> {
+        with_config_lock(path, || Self::remove_client_unlocked(path, client_id))
+    }
+
+    fn remove_client_unlocked(path: &str, client_id: &str) -> anyhow::Result<()> {
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, nothing revoked ({e})"))?;
+
+        let clients = auth_clients(doc.as_table_mut());
+        let Some(clients) = clients else {
+            anyhow::bail!("{path} has no [auth.clients] table, nothing revoked");
+        };
+        if clients.remove(client_id).is_none() {
+            anyhow::bail!(
+                "client \"{client_id}\" has no [auth.clients.{client_id}] section in {path}, \
+                 nothing revoked"
+            );
+        }
+
+        write_config_file(path, &doc.to_string())
+    }
+}
+
+/// The `[auth.clients]` table of `doc`, when the document has one.
+///
+/// Shared by the two revoking writers, which must find the table without ever
+/// creating it: a revoke that invented an empty `[auth.clients]` to delete from
+/// would leave the file changed while reporting that nothing was revoked.
+fn auth_clients(doc: &mut toml_edit::Table) -> Option<&mut dyn toml_edit::TableLike> {
+    doc.get_mut("auth")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|auth| auth.get_mut("clients"))
+        .and_then(|item| item.as_table_like_mut())
+}
+
+/// The names of the devices in `devices`, for the message a revoke leaves
+/// behind when it is asked for one that is not there.
+fn device_names(devices: &dyn toml_edit::TableLike) -> String {
+    let mut names: Vec<&str> = devices.iter().map(|(name, _)| name).collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `[auth.clients.<client_id>.devices]` as a table, created when it is missing.
+///
+/// Where a device's credential goes, for both of the writers that put one
+/// there: the enrollment that spends a token, and the operator CLI behind
+/// [`ProxyConfig::write_device_secret`]. One table either way, so a device that
+/// enrolled and one that was handed a secret by hand are the same shape on
+/// disk, and the handshake does not have to know which of the two it is.
+///
+/// Not `sub_table`, which makes an implicit table: a device added under one
+/// would be written as `devices.laptop = { … }` on a line of the client's own
+/// section, and a table that says what it holds reads better than a dotted key
+/// that does not.
+fn device_table<'a>(
+    client: &'a mut dyn toml_edit::TableLike,
+    client_id: &str,
+    path: &str,
+) -> anyhow::Result<&'a mut dyn toml_edit::TableLike> {
+    let item = match client.entry("devices") {
+        toml_edit::Entry::Occupied(entry) => entry.into_mut(),
+        toml_edit::Entry::Vacant(entry) => {
+            entry.insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        }
+    };
+    item.as_table_like_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{path}: [auth.clients.{client_id}.devices] is not a table, the device secret was \
+             not written"
+        )
+    })
+}
+
+/// The entry a device's credential is stored as: its `secret` and when it was
+/// issued, which is the one thing the file says about a device besides its name.
+///
+/// Inline rather than a sub-table of its own, because the table it goes into
+/// may itself be an inline one an operator wrote, and a sub-table cannot be
+/// put inside one.
+///
+/// An empty secret is refused rather than written: the loader rejects one — it
+/// would key this device's HMAC with nothing — so an entry holding `""` is not
+/// a device that cannot authenticate, it is a config that cannot be read again,
+/// and both writers would have reported success while doing it.
+fn device_entry(secret: &str, path: &str) -> anyhow::Result<toml_edit::Item> {
+    if secret.is_empty() {
+        anyhow::bail!(
+            "{path}: a device secret cannot be empty; an empty one keys this device's HMAC with \
+             nothing and leaves a config that cannot be loaded"
+        );
+    }
+    let mut entry = toml_edit::InlineTable::new();
+    entry.insert("secret", toml_edit::Value::from(secret));
+    entry.insert(
+        "created_at",
+        toml_edit::Value::from(crate::auth::config::default_created_at()),
+    );
+    Ok(toml_edit::value(entry))
 }
 
 /// Runs `work` while holding an exclusive lock on the config file at `path`.
@@ -2454,6 +2685,38 @@ pending_enrollment = "TOKEN"
         assert_eq!(devices["phone"].secret, "PHONESECRET");
     }
 
+    /// Neither writer may hand a device an empty secret.
+    ///
+    /// The loader refuses one, so writing it is not "a device that cannot
+    /// authenticate" but "a config that no longer loads at all" — and both
+    /// writers would have reported success while doing it. Neither may touch
+    /// the file first: the token has to stay spendable for a real enrollment.
+    #[test]
+    fn an_empty_device_secret_is_refused_by_both_writers() {
+        let (_dir, path) = scratch_client_with_token();
+        let before = fs::read_to_string(&path).expect("read the config first");
+
+        let enrollment = ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "")
+            .expect_err(
+                "an empty secret is not a credential, it is a config that cannot be read again",
+            );
+        assert!(enrollment.to_string().contains("empty"), "{enrollment:#}");
+
+        let operator = ProxyConfig::write_device_secret(&path, "alice", "laptop", "", true)
+            .expect_err("the same for the operator CLI");
+        assert!(operator.to_string().contains("empty"), "{operator:#}");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the config back"),
+            before,
+            "a refused write still changed the file"
+        );
+        assert!(
+            ProxyConfig::load_with_auth(&path).is_ok(),
+            "the config was left in a state that cannot be loaded"
+        );
+    }
+
     /// Two writers that both read before either writes lose one of the two
     /// edits: the second one's document is built from contents the first one has
     /// already replaced. The lock is what sequences them — and it has to be a
@@ -2792,6 +3055,248 @@ pending_enrollment = "TOKEN"
         let err = ProxyConfig::write_pending_enrollment(&path, "ghost", "deadbeef")
             .expect_err("a missing client must not be silently created");
         assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    /// The devices of a client, as the server would read them back.
+    fn devices_of(path: &str, client_id: &str) -> HashMap<String, crate::auth::DeviceAuth> {
+        let (_, auth) = ProxyConfig::load_with_auth(path).expect("config still parses");
+        auth.and_then(|auth| auth.clients.get(client_id).map(|c| c.devices.clone()))
+            .unwrap_or_default()
+    }
+
+    /// A device credential goes under the client's own `devices` table, and the
+    /// client's `secret` — the credential of the device that names none — stays
+    /// exactly as it was.
+    #[test]
+    fn a_device_secret_lands_under_the_clients_devices_table() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+
+        let outcome =
+            ProxyConfig::write_device_secret(&path, "acme", "laptop", "MFRGGZDFMZTWQ2LK", false)
+                .expect("the device secret should be written");
+        assert_eq!(outcome, ClientSecretWrite::Added);
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("[auth.clients.acme.devices]"),
+            "the devices table has to say what it holds: {written}"
+        );
+        assert_eq!(
+            secret_of(&path, "acme").as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "the unnamed device keeps the credential it had"
+        );
+        let devices = devices_of(&path, "acme");
+        assert_eq!(
+            devices.get("laptop").map(|d| d.secret.as_str()),
+            Some("MFRGGZDFMZTWQ2LK")
+        );
+    }
+
+    /// Issuing a device a second secret would lock the one already using it out,
+    /// so it takes `--force` — the same refusal replacing a client's secret does.
+    #[test]
+    fn a_device_secret_needs_force_to_replace_one() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             \n\
+             [auth.clients.acme.devices.laptop]\n\
+             secret = \"OLDOLDOLDOLDOLD\"\n",
+        );
+
+        let err =
+            ProxyConfig::write_device_secret(&path, "acme", "laptop", "NEWNEWNEWNEWNEW", false)
+                .expect_err("a device must not lose its credential by accident");
+        assert!(err.to_string().contains("already has a secret"), "{err}");
+        assert_eq!(
+            devices_of(&path, "acme")
+                .get("laptop")
+                .map(|d| d.secret.as_str()),
+            Some("OLDOLDOLDOLDOLD")
+        );
+
+        let outcome =
+            ProxyConfig::write_device_secret(&path, "acme", "laptop", "NEWNEWNEWNEWNEW", true)
+                .expect("with force the secret is replaced");
+        assert_eq!(outcome, ClientSecretWrite::Replaced);
+        assert_eq!(
+            devices_of(&path, "acme")
+                .get("laptop")
+                .map(|d| d.secret.as_str()),
+            Some("NEWNEWNEWNEWNEW")
+        );
+    }
+
+    /// A device under a client with no secret of its own is a config that cannot
+    /// be loaded, so the write is refused rather than creating one.
+    #[test]
+    fn a_device_secret_needs_a_client_with_a_secret() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.other]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+
+        let err =
+            ProxyConfig::write_device_secret(&path, "ghost", "laptop", "MFRGGZDFMZTWQ2LK", false)
+                .expect_err("a device of a client that is not there must not be created");
+        assert!(err.to_string().contains("ghost"), "{err}");
+        assert!(
+            devices_of(&path, "ghost").is_empty(),
+            "nothing was written for it"
+        );
+    }
+
+    /// The name becomes a key here and the subject of every log line about the
+    /// device, so one that is not printable ASCII is refused rather than read as
+    /// "no name".
+    #[test]
+    fn an_unprintable_device_name_is_refused() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+
+        for name in ["", "lap top", "laptop\nsecret = \"x\""] {
+            let err =
+                ProxyConfig::write_device_secret(&path, "acme", name, "MFRGGZDFMZTWQ2LK", false)
+                    .expect_err("an unusable device name must not be written");
+            assert!(err.to_string().contains("printable ASCII"), "{err}");
+        }
+        assert!(devices_of(&path, "acme").is_empty());
+    }
+
+    /// Revoking one device leaves the client and every other device alone —
+    /// which is the whole point of the table.
+    #[test]
+    fn revoking_a_device_leaves_the_others_alone() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             \n\
+             [auth.clients.acme.devices.laptop]\n\
+             secret = \"AAAAAAAAAAAAAAAA\"\n\
+             \n\
+             [auth.clients.acme.devices.phone]\n\
+             secret = \"BBBBBBBBBBBBBBBB\"\n",
+        );
+
+        ProxyConfig::remove_device(&path, "acme", "laptop").expect("the device should be revoked");
+
+        let devices = devices_of(&path, "acme");
+        assert_eq!(devices.len(), 1, "one device went, {devices:?}");
+        assert_eq!(
+            devices.get("phone").map(|d| d.secret.as_str()),
+            Some("BBBBBBBBBBBBBBBB")
+        );
+        assert_eq!(
+            secret_of(&path, "acme").as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "the client's own credential is not a device's to revoke"
+        );
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("AAAAAAAAAAAAAAAA"), "{written}");
+    }
+
+    /// Naming a device that is not there says which ones are, so a typo does not
+    /// look like a successful revocation.
+    #[test]
+    fn revoking_a_device_that_is_not_there_says_which_ones_are() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             \n\
+             [auth.clients.acme.devices.laptop]\n\
+             secret = \"AAAAAAAAAAAAAAAA\"\n",
+        );
+
+        let err = ProxyConfig::remove_device(&path, "acme", "tablet")
+            .expect_err("a missing device must not be reported as revoked");
+        assert!(err.to_string().contains("tablet"), "{err}");
+        assert!(err.to_string().contains("laptop"), "{err}");
+        assert_eq!(devices_of(&path, "acme").len(), 1);
+    }
+
+    /// Revoking a client drops its devices with it: a device credential left
+    /// behind under a client that is gone is a credential nobody can revoke,
+    /// because `client list` no longer has a client to list it under.
+    #[test]
+    fn revoking_a_client_takes_its_devices_with_it() {
+        let source = "[auth]\n\
+                      enabled = true\n\
+                      \n\
+                      [auth.clients.acme]\n\
+                      secret = \"JBSWY3DPEHPK3PXP\"\n\
+                      \n\
+                      [auth.clients.acme.devices.laptop]\n\
+                      secret = \"AAAAAAAAAAAAAAAA\"\n\
+                      \n\
+                      [auth.clients.other]\n\
+                      secret = \"CCCCCCCCCCCCCCCC\"\n";
+        let (_dir, path) = scratch_config(source);
+
+        ProxyConfig::remove_client(&path, "acme").expect("the client should be revoked");
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("acme"), "{written}");
+        assert!(!written.contains("AAAAAAAAAAAAAAAA"), "{written}");
+        assert_eq!(
+            secret_of(&path, "other").as_deref(),
+            Some("CCCCCCCCCCCCCCCC"),
+            "the neighbouring client is untouched"
+        );
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+        assert_eq!(auth.expect("[auth] exists").clients.len(), 1);
+    }
+
+    /// A revoke that names something absent changes nothing, which is also why
+    /// it cannot create the section it is about to delete.
+    #[test]
+    fn revoking_something_absent_leaves_the_file_alone() {
+        let source = "default_backend = \"http://127.0.0.1:15666\"\n\
+                      \n\
+                      [auth.clients.acme]\n\
+                      secret = \"JBSWY3DPEHPK3PXP\"\n";
+        let (_dir, path) = scratch_config(source);
+
+        let err = ProxyConfig::remove_client(&path, "ghost")
+            .expect_err("a missing client must not be reported as revoked");
+        assert!(err.to_string().contains("ghost"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            source,
+            "the file is byte for byte what it was"
+        );
+
+        // No [auth.clients] at all, and the same answer.
+        let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
+        assert!(ProxyConfig::remove_client(&path, "acme").is_err());
+        assert!(ProxyConfig::remove_device(&path, "acme", "laptop").is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "default_backend = \"http://127.0.0.1:15666\"\n"
+        );
     }
 
     /// A Node ID to write into `[peers] allow`.

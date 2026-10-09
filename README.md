@@ -271,6 +271,33 @@ docker compose logs -f --tail=50 nexapipe | grep -i reload
 | `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
 | `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). |
 
+### `nexapipe client`
+
+The write half of the management surface, as subcommands rather than
+`POST /v1/clients`: the admin token is one opaque value with no scope and no
+rotation, and giving it something to change is how a read-only surface becomes
+the way into the credential store. Each one edits the config file under the same
+lock the server takes, and a running server picks up the change on its next
+reload.
+
+| Command | Meaning |
+| --- | --- |
+| `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. |
+| `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of the device that names none. Refuses to replace one without `--force`. |
+| `client add <CLIENT_ID> --device <NAME>` | Issue a credential to one device, leaving the client's own `secret` alone — so the devices already using it keep working. The client has to exist first. |
+| `client revoke <CLIENT_ID>` | Drop a client and every device credential under it. |
+| `client revoke <CLIENT_ID> --device <NAME>` | Drop one device's credential, keeping the client and its other devices. |
+
+```bash
+nexapipe client list --config config.toml
+nexapipe client add laptop-1 --device laptop --config config.toml
+nexapipe client revoke laptop-1 --device laptop --config config.toml
+```
+
+A revoke deletes rather than rewriting, because a missing entry is what the
+handshake reads as "this device has no credential" — the same answer a device
+that never enrolled gets, so what happened to it cannot be told from outside.
+
 ---
 
 ## Configuration
@@ -996,10 +1023,11 @@ code stays valid across restarts. Override any of it with `--invite-domains`,
   when it is longer.
 - An invite that carries `secret=` is a **password in the clear**, and so is its
   QR rendering — anyone who scans it holds that client's credentials.
-- **Revoking one is rotating.** There is no per-device revocation:
-  `--generate-2fa client-001 --force` rewrites `config.toml` in place and every
-  device enrolled with the old secret has to scan again; deleting the
-  `[auth.clients.client-001]` section revokes everyone at once.
+- **Revoking one used to mean rotating all.** Deleting the
+  `[auth.clients.client-001]` section, or `--generate-2fa client-001 --force`,
+  still takes every device enrolled under that client with it. A device that
+  enrolled with a name can now be dropped on its own, and the rest left alone:
+  see [`nexapipe client`](#nexapipe-client).
 
 ### Inviting a client that does not exist yet (`--create-client`)
 

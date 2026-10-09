@@ -65,6 +65,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "NAME",
+        global = true,
         help = "Issuer label shown by the authenticator app (default: [auth] issuer)"
     )]
     issuer: Option<String>,
@@ -73,16 +74,18 @@ struct Cli {
         long,
         value_enum,
         default_value_t = QrFormat::Unicode,
+        global = true,
         help = "How to draw the QR code"
     )]
     qr_format: QrFormat,
 
-    #[arg(long, help = "Draw the QR code light on dark")]
+    #[arg(long, global = true, help = "Draw the QR code light on dark")]
     qr_invert: bool,
 
     #[arg(
         long,
         value_name = "PATH",
+        global = true,
         help = "Also write the QR code to a file (.svg, anything else is ASCII)"
     )]
     qr_out: Option<String>,
@@ -165,6 +168,59 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// List, add and revoke the 2FA clients in [auth.clients]
+    Client {
+        #[command(subcommand)]
+        action: ClientAction,
+    },
+}
+
+/// The write half of the management surface.
+///
+/// Subcommands rather than `POST /v1/clients`: the admin token is one opaque
+/// value with no scope and no rotation, and giving it something to change is
+/// how a read-only surface becomes the way into the credential store. A
+/// subcommand writes the same file the server watches instead, and needs no
+/// token — but it does need to be able to write that file, which is the access
+/// an operator adding a client already has.
+#[derive(Subcommand, Debug)]
+enum ClientAction {
+    /// List the clients in [auth.clients], and the devices of each
+    List {
+        /// Print one JSON document instead of the reading below, for anything
+        /// that has to parse it
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Issue a credential to a client, or to one device of it
+    Add {
+        /// The client id: the key under [auth.clients]
+        #[arg(value_name = "CLIENT_ID")]
+        client_id: String,
+
+        /// Give this device a secret of its own, leaving the client's alone
+        #[arg(long, value_name = "NAME")]
+        device: Option<String>,
+
+        /// Replace the credential that is already there, enrolling out whatever
+        /// is using it now
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Drop a client's credentials, or one device's
+    Revoke {
+        /// The client id: the key under [auth.clients]
+        #[arg(value_name = "CLIENT_ID")]
+        client_id: String,
+
+        /// Drop only this device's credential, keeping the client and every
+        /// other device of it
+        #[arg(long, value_name = "NAME")]
+        device: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -213,6 +269,29 @@ async fn main() {
     // Handle --generate-invite
     if cli.generate_invite.is_some() {
         if let Err(e) = print_endpoint_invite(&cli) {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // `client` reads and writes the config file, which is the other half of the
+    // management surface. It is handled here rather than after the config load
+    // below because it does not start a proxy: a `revoke` has to work while one
+    // is running, and it takes the same lock the server does.
+    if let Some(Commands::Client { action }) = &cli.command {
+        let outcome = match action {
+            ClientAction::List { json } => list_clients(&cli, *json),
+            ClientAction::Add {
+                client_id,
+                device,
+                force,
+            } => add_client(&cli, client_id, device.as_deref(), *force),
+            ClientAction::Revoke { client_id, device } => {
+                revoke_client(&cli, client_id, device.as_deref())
+            }
+        };
+        if let Err(e) = outcome {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -559,6 +638,460 @@ fn save_generated_secret(cli: &Cli, client_id: &str, secret: &str, auth_enabled:
     println!("The 2FA settings are read once at startup, so restart the server to pick");
     println!("up the new client. Scanning the code above only imports the credentials");
     println!("into the app; it does not change anything on the server.");
+}
+
+/// `[auth]` as the server reads it, or `None` when the file has no `[auth]`
+/// section.
+///
+/// Not `load_auth_config`, which falls back to built-in defaults and prints a
+/// warning: that is right for enrollment, which has to work before a config file
+/// exists, and wrong here. `list` and `revoke` are about the file as it stands,
+/// and reporting defaults for a file that could not be read would describe a
+/// client table that may not be the one on disk.
+fn load_auth_or_none(path: &str) -> anyhow::Result<Option<AuthConfig>> {
+    let (_, auth) =
+        ProxyConfig::load_with_auth(path).map_err(|e| anyhow::anyhow!("{path}: {e:#}"))?;
+    Ok(auth)
+}
+
+/// A unix timestamp as it reads where the operator is, or `-`.
+///
+/// Zero is not 1970 here: the counter writeback writes `last_used = 0` for a
+/// client that has never authenticated, and `0` as `created_at` is the value an
+/// entry carries when the file was written by hand. Both mean "never"/"unknown",
+/// and a wall of 1970 dates would say the opposite.
+fn stamp(seconds: Option<i64>) -> String {
+    let Some(seconds) = seconds.filter(|at| *at > 0) else {
+        return "-".to_string();
+    };
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// `created_at` is carried as a string, and one written by hand may be anything.
+fn seconds_of(value: &str) -> Option<i64> {
+    value.trim().parse().ok()
+}
+
+/// Prints the clients in `[auth.clients]`, and under each the devices that have
+/// a credential of their own.
+///
+/// No secret is printed, in either form. This is the command that gets run to
+/// see what is configured, and a terminal's scrollback, a paste into a ticket
+/// and a screenshot are all places a secret printed once ends up living;
+/// `--show-2fa` draws the code for one client for the one time it is needed.
+fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let Some(auth) = load_auth_or_none(&cli.config)? else {
+        if json {
+            println!("[]");
+        } else {
+            println!("{} has no [auth] section, so no clients", cli.config);
+        }
+        return Ok(());
+    };
+
+    let mut ids: Vec<&String> = auth.clients.keys().collect();
+    ids.sort();
+
+    if json {
+        let clients: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let client = &auth.clients[*id];
+                let mut devices: Vec<serde_json::Value> = client
+                    .devices
+                    .iter()
+                    .map(|(name, device)| {
+                        serde_json::json!({
+                            "name": name,
+                            "created_at": seconds_of(&device.created_at),
+                            "last_used": device.last_used,
+                        })
+                    })
+                    .collect();
+                devices.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                serde_json::json!({
+                    "id": id,
+                    "has_secret": !client.secret.is_empty(),
+                    "created_at": seconds_of(&client.created_at),
+                    "last_used": client.last_used,
+                    "allow_hosts": client.allow_hosts,
+                    "invite_outstanding": client.pending_enrollment.is_some(),
+                    "failed_attempts": client.failed_attempts,
+                    "locked_out": client.is_locked_out(),
+                    "devices": devices,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&clients)?);
+        return Ok(());
+    }
+
+    println!(
+        "{} {} in {} ([auth] enabled = {})",
+        ids.len(),
+        if ids.len() == 1 { "client" } else { "clients" },
+        cli.config,
+        auth.enabled
+    );
+    if ids.is_empty() {
+        return Ok(());
+    }
+    println!();
+
+    for id in &ids {
+        let client = &auth.clients[*id];
+        println!("  {id}");
+        println!(
+            "    secret      {}",
+            if client.secret.is_empty() {
+                "missing"
+            } else {
+                "set"
+            }
+        );
+        println!("    created     {}", stamp(seconds_of(&client.created_at)));
+        println!(
+            "    last used   {}",
+            stamp(client.last_used.map(|at| at as i64))
+        );
+        if let Some(hosts) = &client.allow_hosts
+            && !hosts.is_empty()
+        {
+            println!("    allow hosts {}", hosts.join(", "));
+        }
+        if client.pending_enrollment.is_some() {
+            println!("    invite      outstanding");
+        }
+        if client.failed_attempts > 0 {
+            println!(
+                "    attempts    {} failed since the last success",
+                client.failed_attempts
+            );
+        }
+        if client.is_locked_out() {
+            println!(
+                "    lockout     until {}",
+                stamp(client.locked_until.map(|at| at as i64))
+            );
+        }
+
+        let mut devices: Vec<_> = client.devices.iter().collect();
+        devices.sort_by(|a, b| a.0.cmp(b.0));
+        if devices.is_empty() {
+            println!("    devices     none");
+        } else {
+            println!("    devices     {}", devices.len());
+            let width = devices
+                .iter()
+                .map(|(name, _)| name.len())
+                .max()
+                .unwrap_or(0)
+                .max(8);
+            for (name, device) in devices {
+                let mut line = format!("created {}", stamp(seconds_of(&device.created_at)));
+                if let Some(used) = device.last_used {
+                    line.push_str(&format!(", last used {}", stamp(Some(used as i64))));
+                }
+                println!("      {name:width$}  {line}");
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "No secret is printed here: `nexapipe --show-2fa <CLIENT_ID>` draws the code for one."
+    );
+    Ok(())
+}
+
+/// Issues a credential and writes it into the config, for a client or for one
+/// device of it.
+///
+/// The two differ in what they rotate, and that is the whole reason the device
+/// table exists: `client add <id>` rewrites the client's own `secret`, which is
+/// the credential of the device that names none — every device that enrolled
+/// before the table existed — while `client add <id> --device <name>` writes a
+/// secret of its own under that device and leaves the client's alone, so the
+/// other devices keep working.
+fn add_client(cli: &Cli, client_id: &str, device: Option<&str>, force: bool) -> anyhow::Result<()> {
+    use nexapipe::auth::OtpAuthUri;
+    use nexapipe::auth::otpauth::DEFAULT_ISSUER;
+
+    let client_id = client_id.trim();
+    // Both ids are checked before anything is written, for the reason the
+    // handshake checks them: either one becomes a key in this file, is sent by a
+    // device, and is the subject of every log line about it. An id the server
+    // would refuse on the wire is no use in the config either.
+    if !nexapipe::auth::is_presentable_client_id(client_id) {
+        anyhow::bail!(
+            "client id {client_id:?} is printable ASCII of at most {} characters and not empty — \
+             it is the key under [auth.clients], the name a device sends in its handshake, and \
+             the subject of every log line about it",
+            nexapipe::auth::protocol::MAX_CLIENT_ID_LEN
+        );
+    }
+    if let Some(device) = device
+        && !nexapipe::auth::is_presentable_device_id(device)
+    {
+        anyhow::bail!(
+            "device name {device:?} is printable ASCII of at most {} characters and not empty — \
+             it is a key under [auth.clients.{}.devices] and the subject of every log line about \
+             it",
+            nexapipe::auth::MAX_DEVICE_ID_LEN,
+            toml_key(client_id)
+        );
+    }
+
+    let (auth_config, config_loaded) = load_auth_config(&cli.config);
+
+    // A device cannot be the first thing a client gets: a device table under a
+    // client with no secret of its own is a config that will not load, and
+    // saying so here beats writing a file that cannot be read back.
+    let client = auth_config.clients.get(client_id);
+    if device.is_some() && client.is_none() {
+        anyhow::bail!(
+            "client \"{client_id}\" has no [auth.clients.{}] secret in {}; add the client first \
+             with `nexapipe client add {client_id}`",
+            toml_key(client_id),
+            cli.config
+        );
+    }
+    let already = match device {
+        Some(name) => client.is_some_and(|client| client.devices.contains_key(name)),
+        None => client.is_some(),
+    };
+    if already && !force {
+        match device {
+            Some(name) => anyhow::bail!(
+                "device \"{name}\" of client \"{client_id}\" already has a credential in {}; \
+                 pass --force to issue it another one, which enrolls the device using the \
+                 current one out",
+                cli.config
+            ),
+            None => anyhow::bail!(
+                "client \"{client_id}\" already has a secret in {}; pass --force to rotate it, \
+                 which enrolls out every device using it",
+                cli.config
+            ),
+        }
+    }
+
+    let issuer = match &cli.issuer {
+        Some(issuer) => issuer.trim().to_string(),
+        None => auth_config.issuer.clone(),
+    };
+    let issuer = if issuer.is_empty() {
+        DEFAULT_ISSUER.to_string()
+    } else {
+        issuer
+    };
+
+    let secret = nexapipe::auth::TotpValidator::generate_secret();
+    // The label is the client id even for a device: that is what the app takes
+    // from the URI and sends as the client id, so a label carrying the device
+    // name would authenticate as a client nobody configured. The device names
+    // itself in the handshake, where the server can tell the two apart.
+    let uri = OtpAuthUri::from_auth_config(&issuer, client_id, &secret, &auth_config)?;
+    let link = uri.to_uri();
+
+    println!();
+    match device {
+        Some(name) => println!(
+            "Credential for device \"{name}\" of client \"{}\"",
+            uri.client_id
+        ),
+        None => println!("Credential for client \"{}\"", uri.client_id),
+    }
+    println!("  Secret     {}", uri.secret);
+    println!("  Algorithm  {}", uri.algorithm);
+    println!(
+        "  Code       {} digits, {} second step",
+        uri.digits, uri.period
+    );
+    println!("  Issuer     {}", uri.issuer);
+    if !config_loaded {
+        println!("             (built-in 2FA defaults)");
+    }
+    println!();
+
+    for warning in uri.client_warnings() {
+        eprintln!("warning: {warning}");
+    }
+
+    println!("otpauth:// URI, for manual entry:");
+    println!("  {link}");
+    println!();
+
+    render_qr(
+        &link,
+        cli,
+        "Scan this with the NexaPipe app (2FA settings -> scan QR code):",
+    )?;
+    println!();
+
+    write_issued_secret(
+        cli,
+        client_id,
+        device,
+        &uri.secret,
+        auth_config.enabled,
+        force,
+    )
+}
+
+/// Puts the secret that was just printed into the config, so the server ends up
+/// holding the same credential the QR code carries.
+///
+/// `force` is passed through rather than assumed: whether the credential is
+/// already there is decided under the config lock by the writer, which is the
+/// only place that can answer it without racing a second writer.
+fn write_issued_secret(
+    cli: &Cli,
+    client_id: &str,
+    device: Option<&str>,
+    secret: &str,
+    auth_enabled: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    // Spelled the way the file is written: a device goes under the client's
+    // `devices` table as an inline entry rather than as a section of its own,
+    // because that table may be one an operator wrote inline.
+    let (section, entry) = match device {
+        None => (
+            format!("[auth.clients.{}]", toml_key(client_id)),
+            format!("secret = \"{secret}\""),
+        ),
+        Some(name) => (
+            format!("[auth.clients.{}.devices]", toml_key(client_id)),
+            format!("{} = {{ secret = \"{secret}\" }}", toml_key(name)),
+        ),
+    };
+    let what = match device {
+        None => section.clone(),
+        Some(name) => format!("\"{name}\" under {section}"),
+    };
+    let outcome = match device {
+        None => ProxyConfig::write_client_secret(&cli.config, client_id, secret, force),
+        Some(name) => ProxyConfig::write_device_secret(&cli.config, client_id, name, secret, force),
+    };
+
+    let written = match outcome {
+        Ok(ClientSecretWrite::Added) => {
+            println!("Wrote the secret to {} as {}.", cli.config, what);
+            Some(false)
+        }
+        Ok(ClientSecretWrite::Replaced) => {
+            println!("Replaced the secret of {} in {}.", what, cli.config);
+            Some(true)
+        }
+        Err(e) => {
+            // Loud rather than fatal: the secret is on screen either way, and
+            // the operator can still put it in the file by hand.
+            eprintln!("warning: {e:#}, so add it by hand:");
+            println!("{section}");
+            println!("{entry}");
+            None
+        }
+    };
+    println!();
+
+    if written.is_some() && !auth_enabled {
+        eprintln!(
+            "warning: [auth] enabled is not true in {}, so the server will not ask for this \
+             secret; add enabled = true under [auth]",
+            cli.config
+        );
+    }
+    println!(
+        "The config is watched, so a running server picks this up without a restart. \
+         What changed is the file, not the server: nothing is revoked by issuing a credential."
+    );
+    match (device, written) {
+        (Some(_), _) => println!(
+            "Only this device's credential changed. The client's own secret is untouched, so \
+             every other device of it keeps working."
+        ),
+        (None, Some(true)) => println!(
+            "The client's own secret is the credential of the device that names none, so every \
+             device using it has to scan again."
+        ),
+        (None, _) => println!(
+            "Nothing was using it yet: scan the code above on the device that should carry \
+             this client."
+        ),
+    }
+    Ok(())
+}
+
+/// Drops a client, or one device of it, from `[auth.clients]`.
+///
+/// A revoke deletes rather than rewriting, because a missing entry is what the
+/// handshake reads as "this device has no credential" — the same answer a device
+/// that never enrolled gets, so what happened to it cannot be told from outside.
+///
+/// The `[auth]` section is read best-effort and only for the counts the message
+/// prints: the removal itself edits the TOML directly and needs no typed auth,
+/// so a config that no longer parses — an `allow_hosts` that is not a list, say
+/// — must still be revocable. Refusing it would leave the one operator remedy
+/// for a bad hand edit behind the very edit that broke it.
+fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Result<()> {
+    let client_id = client_id.trim();
+    // Counts are for the message only; a config that fails to load must still be revocable.
+    let auth = load_auth_or_none(&cli.config).ok().flatten();
+    let client = auth.as_ref().and_then(|auth| auth.clients.get(client_id));
+
+    match device {
+        Some(name) => {
+            let others = client.map(|client| client.devices.len()).unwrap_or(0);
+            ProxyConfig::remove_device(&cli.config, client_id, name)?;
+            println!(
+                "Removed [auth.clients.{}.devices.{}] from {}.",
+                toml_key(client_id),
+                toml_key(name),
+                cli.config
+            );
+            match others {
+                0 | 1 => println!(
+                    "The client's own secret is untouched: that is the credential of the device \
+                     that names none, so one can still authenticate as this client."
+                ),
+                2 => println!("1 other device of it keeps its credential."),
+                left => println!("{} other devices of it keep their credentials.", left - 1),
+            }
+        }
+        None => {
+            let devices = client.map(|client| client.devices.len()).unwrap_or(0);
+            ProxyConfig::remove_client(&cli.config, client_id)?;
+            println!(
+                "Removed [auth.clients.{}] from {}.",
+                toml_key(client_id),
+                cli.config
+            );
+            match devices {
+                0 => {}
+                1 => println!(
+                    "Its 1 device credential went with it — a device entry under a client that \
+                     is gone is one nobody can revoke, because there is no client left to list \
+                     it under."
+                ),
+                many => println!(
+                    "Its {many} device credentials went with it — a device entry under a client \
+                     that is gone is one nobody can revoke, because there is no client left to \
+                     list it under."
+                ),
+            }
+        }
+    }
+
+    println!();
+    println!("The config is watched, so a running server stops accepting it on the next reload.");
+    Ok(())
 }
 
 /// Prints (and, with `--qr-out`, writes) a QR code of `link` in whatever format
