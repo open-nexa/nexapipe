@@ -330,6 +330,7 @@ impl IrohConnectionPool {
                 client_id: auth.client_id().to_string(),
                 secret: auth.secret_base32(),
                 algorithm: auth.algorithm_name().to_string(),
+                device: auth.device_id().map(str::to_string),
             })
     }
 

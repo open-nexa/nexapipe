@@ -123,6 +123,12 @@ pub struct TwoFactorAuth {
     algorithm: TotpAlgorithm,
     time_step: u32,
     digits: u32,
+    /// Which of this client's devices this credential belongs to. `None` is the
+    /// device that was never given a name, which is what every client was
+    /// before a client could have several — it answers with the client's own
+    /// secret, and it is the only thing a server that predates per-device
+    /// credentials understands.
+    device_id: Option<String>,
 }
 
 impl TwoFactorAuth {
@@ -140,6 +146,7 @@ impl TwoFactorAuth {
             algorithm,
             time_step: 30,
             digits: 6,
+            device_id: None,
         })
     }
 
@@ -159,7 +166,31 @@ impl TwoFactorAuth {
             algorithm,
             time_step,
             digits,
+            device_id: None,
         })
+    }
+
+    /// The same credential, answering as one named device of its client.
+    ///
+    /// What this changes is which secret the server checks the response
+    /// against: a device carries one of its own, issued at enrollment, instead
+    /// of sharing the client's with every other device that names it — which is
+    /// what made revoking one of them rotate all of them. The name is sent on
+    /// both AUTH_START and AUTH_RESPONSE, because the response is the one the
+    /// server looks the secret up from; sending it on the first alone would
+    /// authenticate against the client's secret while claiming a device.
+    ///
+    /// Nothing checks the name here. The server does, and refuses one that is
+    /// not printable ASCII; [`device_id_is_usable`] is the same rule, for a
+    /// caller that would rather find out before a handshake than during one.
+    pub fn with_device(mut self, device_id: &str) -> Self {
+        self.device_id = Some(device_id.to_string());
+        self
+    }
+
+    /// The device this credential answers as, if it was given one.
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 
     /// Generate current TOTP code
@@ -314,6 +345,7 @@ impl TwoFactorAuth {
         let start_msg = AuthMessage::Start {
             client_id: self.client_id.clone(),
             timestamp,
+            device_id: self.device_id.clone(),
         };
 
         let start_bytes = start_msg
@@ -350,11 +382,16 @@ impl TwoFactorAuth {
             .unwrap_or(0);
         let signature = self.sign_challenge(&nonce, response_timestamp)?;
 
+        // The same name AUTH_START carried, and not for politeness: this is the
+        // message the server reads the device from when it picks which secret
+        // to check against, so a response that omits it proves possession of
+        // the client's own secret while asking to be counted as a device.
         let response_msg = AuthMessage::Response {
             client_id: self.client_id.clone(),
             timestamp: response_timestamp,
             totp_code,
             signature,
+            device_id: self.device_id.clone(),
         };
 
         let response_bytes = response_msg
@@ -413,6 +450,13 @@ pub struct IssuedCredential {
     /// Base32, exactly as it goes into [`TwoFactorAuth::new`] next time.
     pub secret: String,
     pub algorithm: String,
+    /// The device this credential was issued for, which has to be persisted
+    /// with it: the server filed the secret under that name, so an app that
+    /// writes down the secret and not the name has a credential it can no
+    /// longer answer with. `None` is the unnamed device — a server that
+    /// answered an enrollment which named none, or one that predates devices
+    /// entirely.
+    pub device: Option<String>,
 }
 
 /// A credential that has not been issued yet.
@@ -426,6 +470,11 @@ pub struct IssuedCredential {
 pub struct Enrollment {
     client_id: String,
     token: String,
+    /// The name to be enrolled under. The token is what authorizes the
+    /// exchange, so this is a request rather than a claim: the server is free
+    /// to answer with it or to refuse it, and what it answers with is what the
+    /// credential is filed under.
+    device_id: Option<String>,
 }
 
 impl Enrollment {
@@ -433,11 +482,23 @@ impl Enrollment {
         Self {
             client_id: client_id.to_string(),
             token: token.to_string(),
+            device_id: None,
         }
+    }
+
+    /// The same enrollment, asking to be issued under one device name.
+    pub fn with_device(mut self, device_id: &str) -> Self {
+        self.device_id = Some(device_id.to_string());
+        self
     }
 
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// The device this enrollment will ask for, if it was given one.
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 
     /// Trades the token for the real credential and authenticates with it, in
@@ -475,6 +536,7 @@ impl Enrollment {
             &AuthMessage::EnrollStart {
                 client_id: self.client_id.clone(),
                 token: self.token.clone(),
+                device_id: self.device_id.clone(),
             },
         )
         .await?;
@@ -486,19 +548,31 @@ impl Enrollment {
                 algorithm,
                 digits,
                 period,
+                device_id,
             } => {
                 if client_id != self.client_id {
                     return Err(ClientError::AuthenticationFailed(
                         "the server issued a credential for a different client id".to_string(),
                     ));
                 }
-                TwoFactorAuth::with_params(
+                // The name the server filed this secret under wins over the one
+                // that was asked for. They are the same name on a server that
+                // accepted the request; they differ when the server answered an
+                // enrollment that named none, and carrying that `None` forward
+                // is what keeps the app's stored credential and the server's
+                // table from disagreeing about which secret this is.
+                let device = device_id.or_else(|| self.device_id.clone());
+                let issued = TwoFactorAuth::with_params(
                     &client_id,
                     &secret,
                     TotpAlgorithm::from_name(&algorithm),
                     period as u32,
                     digits,
-                )?
+                )?;
+                match device {
+                    Some(name) => issued.with_device(&name),
+                    None => issued,
+                }
             }
             // One reply for every way this can fail: an enrollment token is
             // either right or it is not, and saying which would only help
@@ -593,6 +667,26 @@ pub fn generate_secret() -> String {
     Secret::generate().to_base32()
 }
 
+/// Whether a device name the server will accept.
+///
+/// The rule is the server's, mirrored here so an app can tell before it
+/// enrols rather than after: printable ASCII, space excluded, not empty, and
+/// short enough to sit in a config key and a log line. A hostname is the
+/// obvious thing to name a device after and the obvious way to break this —
+/// "MacBook Pro" has a space in it — so whatever builds a name has to put the
+/// rule somewhere it is applied rather than remembered.
+pub fn device_id_is_usable(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_DEVICE_ID_LEN
+        && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// Longest device name the server accepts.
+///
+/// Mirrors `MAX_DEVICE_ID_LEN` in `crates/nexapipe/src/auth/protocol.rs`, which
+/// is where the refusal actually happens.
+pub const MAX_DEVICE_ID_LEN: usize = 255;
+
 /// Protocol messages for authentication handshake
 pub mod auth_protocol {
     use serde::{Deserialize, Serialize};
@@ -601,7 +695,14 @@ pub mod auth_protocol {
     #[serde(tag = "type")]
     pub enum AuthMessage {
         #[serde(rename = "AUTH_START")]
-        Start { client_id: String, timestamp: i64 },
+        Start {
+            client_id: String,
+            timestamp: i64,
+            /// Which of this client's devices is authenticating. Absent is the
+            /// device that was never given a name.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            device_id: Option<String>,
+        },
         #[serde(rename = "AUTH_CHALLENGE")]
         Challenge { nonce: Vec<u8> },
         #[serde(rename = "AUTH_RESPONSE")]
@@ -611,6 +712,10 @@ pub mod auth_protocol {
             totp_code: String,
             /// HMAC-SHA256(secret, nonce || timestamp_le) over the challenge.
             signature: Vec<u8>,
+            /// The device [`AuthMessage::Start`] named. The server picks the
+            /// secret to check this against from here, not from AUTH_START.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            device_id: Option<String>,
         },
         #[serde(rename = "AUTH_OK")]
         Ok,
@@ -621,7 +726,14 @@ pub mod auth_protocol {
         /// Keep in sync with `AuthMessage::EnrollStart` in
         /// `crates/nexapipe/src/auth/protocol.rs`.
         #[serde(rename = "ENROLL_START")]
-        EnrollStart { client_id: String, token: String },
+        EnrollStart {
+            client_id: String,
+            token: String,
+            /// The name the device asking to enroll wants to be issued under.
+            /// Absent keeps the old behaviour: one secret for the client.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            device_id: Option<String>,
+        },
         /// The credential the token stood in for, issued and the token burned.
         #[serde(rename = "ENROLL_ISSUE")]
         EnrollIssue {
@@ -630,6 +742,11 @@ pub mod auth_protocol {
             algorithm: String,
             digits: u32,
             period: u64,
+            /// The device this credential was issued for — the name the client
+            /// has to send back. Absent when the server answered an enrollment
+            /// that named no device.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            device_id: Option<String>,
         },
         /// The token was not accepted.
         #[serde(rename = "ENROLL_FAILED")]
@@ -649,7 +766,10 @@ pub mod auth_protocol {
 
 #[cfg(test)]
 mod tests {
-    use super::{TotpAlgorithm, TwoFactorAuth, auth_protocol::AuthMessage};
+    use super::{
+        Enrollment, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth, auth_protocol::AuthMessage,
+        device_id_is_usable,
+    };
 
     /// The mirror of the test in `crates/nexapipe/src/auth/protocol.rs`: the
     /// two sides define these messages separately, and the tag is all that
@@ -659,6 +779,7 @@ mod tests {
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
             token: "tok".to_string(),
+            device_id: None,
         };
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
@@ -669,6 +790,7 @@ mod tests {
             algorithm: "SHA1".to_string(),
             digits: 6,
             period: 30,
+            device_id: None,
         };
         let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_ISSUE""#), "{json}");
@@ -720,5 +842,99 @@ mod tests {
     fn a_secret_that_is_not_base32_is_still_refused() {
         assert!(TwoFactorAuth::new("client-001", "not-base32!", TotpAlgorithm::SHA1).is_err());
         assert!(TwoFactorAuth::new("client-001", "", TotpAlgorithm::SHA1).is_err());
+    }
+
+    /// A device is named on AUTH_START *and* on AUTH_RESPONSE, because the
+    /// server reads the name off the response when it decides which secret to
+    /// check against. Naming it on the first alone would ask to be counted as a
+    /// device while proving possession of the client's own secret.
+    #[test]
+    fn a_named_device_speaks_on_both_messages() {
+        let auth = TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1)
+            .unwrap()
+            .with_device("laptop-7f3a9c21");
+        assert_eq!(auth.device_id(), Some("laptop-7f3a9c21"));
+
+        let start = AuthMessage::Start {
+            client_id: auth.client_id().to_string(),
+            timestamp: 0,
+            device_id: auth.device_id().map(str::to_string),
+        };
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
+
+        let response = AuthMessage::Response {
+            client_id: auth.client_id().to_string(),
+            timestamp: 0,
+            totp_code: "123456".to_string(),
+            signature: vec![0u8; 32],
+            device_id: auth.device_id().map(str::to_string),
+        };
+        let json = String::from_utf8(response.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
+    }
+
+    /// The device that was never given a name has to look exactly like a client
+    /// that predates devices: no `device_id` on the wire at all, not one set to
+    /// null. A peer that predates this cannot be asked to understand a field it
+    /// has never seen.
+    #[test]
+    fn an_unnamed_device_leaves_the_field_off_the_wire() {
+        let auth =
+            TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1).unwrap();
+        assert_eq!(auth.device_id(), None);
+
+        let start = AuthMessage::Start {
+            client_id: auth.client_id().to_string(),
+            timestamp: 0,
+            device_id: auth.device_id().map(str::to_string),
+        };
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(!json.contains("device_id"), "{json}");
+    }
+
+    /// The mirror of that, in the other direction: a server that predates
+    /// per-device credentials sends no `device_id`, and ENROLL_ISSUE without
+    /// one still has to deserialize.
+    #[test]
+    fn an_issue_from_a_server_that_names_no_device_still_parses() {
+        let wire = br#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30}"#;
+        let issue = AuthMessage::from_bytes(wire).unwrap();
+        match issue {
+            AuthMessage::EnrollIssue { device_id, .. } => assert_eq!(device_id, None),
+            other => panic!("expected ENROLL_ISSUE, got {other:?}"),
+        }
+    }
+
+    /// An enrollment carries the name it was given, and one that was given
+    /// none asks for the client's own secret — which is the only thing a server
+    /// that predates devices will answer.
+    #[test]
+    fn an_enrollment_asks_for_the_device_it_was_given() {
+        assert_eq!(Enrollment::new("client-001", "tok").device_id(), None);
+        let named = Enrollment::new("client-001", "tok").with_device("phone-1a2b3c4d");
+        assert_eq!(named.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(named.client_id(), "client-001");
+    }
+
+    /// What the server will refuse, mirrored so an app can find out before a
+    /// handshake rather than during one. A hostname is the obvious thing to
+    /// name a device after, and "MacBook Pro" is the obvious way to break it.
+    #[test]
+    fn a_device_name_is_printable_ascii_without_spaces() {
+        assert!(device_id_is_usable("laptop-7f3a9c21"));
+        assert!(device_id_is_usable("phone"));
+
+        assert!(!device_id_is_usable(""), "empty");
+        assert!(!device_id_is_usable("MacBook Pro"), "a space");
+        assert!(!device_id_is_usable("laptop\t"), "a tab");
+        assert!(!device_id_is_usable("laptop\n"), "a newline");
+        assert!(!device_id_is_usable("laptop‑pro"), "outside ASCII");
+        assert!(
+            !device_id_is_usable(&"x".repeat(MAX_DEVICE_ID_LEN + 1)),
+            "too long"
+        );
+
+        assert!(device_id_is_usable(&"x".repeat(MAX_DEVICE_ID_LEN)));
     }
 }
