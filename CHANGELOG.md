@@ -12,6 +12,48 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
+### Added
+
+- **One credential per device, rather than one shared by every device that
+  names a client.** `[auth.clients.<id>]` gains a `devices` table: each entry
+  carries a secret of its own, issued at enrollment and revocable on its own, so
+  striking one out no longer rotates the rest — what used to make revoking a
+  laptop mean re-enrolling a phone. The credential is still a TOTP secret and the
+  handshake still HMAC-SHA256 over `nonce ‖ timestamp`; what changed is which
+  secret is looked up. A client entry carrying only `secret` keeps working
+  exactly as it did: that is the path a peer naming no device takes, and the path
+  every config written before this release is on.
+
+- **An access line says whose request it was.** A connection carries the client
+  *and* the device it authenticated as, so every access line ends with
+  `client=… device=…` and `/v1/connections` answers who is connected rather than
+  only how many. A device that authenticated without naming itself is
+  `device=-`; a request that never authenticated — 2FA off, or the plaintext HTTP
+  listener, which runs no handshake — gets neither field, because a line
+  answering "whose request was this" with a dash on all of them is noise rather
+  than an answer.
+
+- **`nexapipe client list|add|revoke`.** The management surface has a write
+  half. Each takes `--device` and writes `config.toml` through the same lock the
+  server reads it with, and a running server picks the change up on its next
+  reload. `/v1/*` stays read-only on purpose: its token is one opaque value, with
+  no scope and no rotation, which is not something to hand write access to in the
+  same release as the identity model it would be changing.
+
+- **A systemd unit for the server.** Both READMEs carry one beside the Docker
+  section. It keeps a named account rather than `DynamicUser=yes`, because this
+  server writes back into its own config — the 2FA counters, an enrolled device —
+  and writes its admin token beside it; and it names one writable directory,
+  because `ProtectSystem=strict` would otherwise take enrollment and lockout
+  persistence with it. The relay has had a unit in `docs/self-hosted-relay.md`
+  since earlier in this release.
+
+- Desktop: session totals, and a page that lists the connections a running proxy
+  is holding (#90).
+- Desktop: a running proxy says what quitting should do (#88).
+- CI: the root workspace is *tested* on Windows, not only compiled (#97).
+- `docs/self-hosted-relay.md`: a systemd unit for the relay (#95).
+
 ### Changed
 
 - **`/metrics` reports request latency as a histogram.**
@@ -22,6 +64,102 @@ For what comes next, and for why some things are deliberately not planned, see
   p99 no longer takes arithmetic. The boundaries are fixed at 1, 5, 10, 25,
   50, 100, 250, 500, 1000, 2500, 5000 and 10000 milliseconds, plus `+Inf`.
   A scrape looking for the old counter will not find it.
+
+- **The desktop TUN shares DNS and address space with other TUN apps**, rather
+  than taking both over (#87).
+- Dependencies: one batched upgrade across the workspace (#85).
+
+### Fixed
+
+- **A device struck out kept the connections it already held.** Revocation
+  rewrote `config.toml` and stopped there: the device could not connect again,
+  but it went on serving on everything it had open until it hung up — which is
+  the one thing revocation is for. The reload that notices what left `[auth]`
+  closes them now. The config watcher already merged the new client table into
+  the live one and reported what was added and removed; what it could not see was
+  a *device* leaving a client that stayed, because the merge replaces the whole
+  entry — so the device tables are snapshotted before the merge and compared
+  after it, and both levels close what they lost: a client that left takes every
+  device under it, a device that left takes only its own. They go with a new
+  close code, `REVOKED = 6`, which the client library turns into an error saying
+  the credential is gone and that trying again is not going to help — the natural
+  reading of a refused connection is a code typed wrong, and there is no code to
+  retype.
+
+- A name outside the hijack is answered through the host's own resolver, instead
+  of the TUN swallowing it (#105).
+- Desktop: an empty window is no longer shown while the app starts (#91).
+- Desktop (Linux): the TUN resolver is the exclusive DNS route (#92).
+- Desktop: the service is put back on the app's build when an upgrade leaves it
+  behind (#93).
+- Desktop (macOS): a service that was stopped stays stopped (#86).
+- Desktop: the connecting indicator breathes with Reduce Motion on, rather than
+  being exempt from the setting (#89).
+- Desktop: the webview is granted the permission it needs to read the service
+  version (#100).
+- Desktop: the window is shown before the first frame is waited for (#106).
+
+## [0.5.0] — 2026-10-07
+
+A readable version of this release, with downloads, is published at
+<https://open-nexa.github.io/nexapipe/v0.5.0.html>. The page itself
+lives in `docs/releases/`, and only that directory reaches the site.
+
+No configuration key changed and no default moved: a `config.toml` that works on
+0.4.0 loads unchanged on 0.5.0. One thing behaves differently without being
+configured to — a `passthrough` or `tcp` backend that refuses TCP connections is
+reported unhealthy now, and skipped in a route with more than one backend, where
+it previously looked healthy and failed on the request.
+
+### Added
+
+- **Health decides which node the next request goes to.** 0.4.0 started probing
+  the nodes and writing down what came back, and nothing read those records: the
+  balancer still picked by index into a list nothing could change, so a node that
+  had been dead for an hour went on receiving its share of the traffic.
+  Selection takes one flag per candidate and answers `Option<usize>`, so "none of
+  them" is an answer it can give — index 0 was always a valid reply to "which
+  node", which is why the old code could never say no. A request that fails to
+  dial marks the node down where the failure was noticed, rather than waiting up
+  to thirty seconds for the probe to find out. A single node that is down is
+  still dialled: refusing to dial the only node turns "down" into "no service at
+  all" for a deployment with nothing to fail over to.
+
+- **A `passthrough` or `tcp` backend is asked whether it answers.** Only `http`
+  routes were probed, so a TLS listener behind a passthrough route had no health
+  at all and surfaced as a connect error on whichever flow tried it first. Both
+  are probed by connecting now — a TLS backend by completing its handshake —
+  which is deliberately the smaller claim: something is listening, not that it
+  works. A `udp`-only route is still not probed, and now for a stated reason:
+  every probe available is one every backend would fail, and a pool emptied by a
+  check that could never have succeeded is worse than an unchecked one.
+
+- **The server counts the bytes it carries.**
+  `nexapipe_traffic_bytes_total{direction="sent"|"received"}` on `/metrics`, and
+  the same two numbers in `/v1/status`. They are counted on the client leg and
+  nowhere else — the one place where one number means one thing across paths
+  this different — and an HTTP response takes its count from what the access log
+  already printed, so the log line and the Prometheus number cannot disagree.
+  What is counted is tunnel payload: no protocol headers, nothing discarded,
+  nothing counted twice.
+
+- **Both clients report what each node carried, and whether it answered.** The
+  desktop lists a node's health beside its traffic — whether it answered the last
+  probe, how long it has been unreachable, how much it has carried — and the
+  Android notification shows live up and down rates.
+
+- **A container image is published with the release.**
+  `ghcr.io/open-nexa/nexapipe`, one multi-arch manifest for `linux/amd64` and
+  `linux/arm64`, under the same tag that already drives the archives, the desktop
+  bundles and the APK. `docker-compose.yaml` names it, so `docker compose up`
+  pulls rather than builds; `--build` still builds locally under the same name.
+
+- **`docs/self-hosted-relay.md`: how to run your own relay**, and how to point
+  NexaPipe at it. It does not remove the third-party dependency — only changes
+  whom you depend on.
+
+### Changed
+
 - **The desktop credential door now stands in front of the whole Config page.**
   Confirming who is at the keyboard — Touch ID or the account password on macOS,
   Windows Hello or the account password on Windows, PAM on Linux — is what opens
@@ -30,10 +168,12 @@ For what comes next, and for why some things are deliberately not planned, see
   secrets, no relay, so there is nothing on the screen and nothing in the
   document to read out of it. The window is still two minutes and still shuts
   itself; the button at the top of the page opens it again, and shuts it early.
+
 - **The relay settings moved from Settings to Config.** Which relay this machine
   dials is part of how it connects, not a preference about how the app looks, and
   a custom relay's bearer token is a credential — so it now sits with the rest of
   the connection configuration, behind the same door.
+
 - **macOS stopped using the keychain.** Reading a keychain entry is an access
   macOS asks about with a sheet of its own — at startup, again whenever the app's
   signature changes, and once more for every prompt — which is how one unlock
@@ -51,6 +191,29 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ### Fixed
 
+- **Service shutdown is graceful on every platform rather than one.** The Unix
+  service process had no signal handling at all, so `launchctl unload`,
+  `systemctl stop` and the shutdown broadcast each simply killed it: UNIX signals
+  are handled now, and DNS restore, self-heal and exit hooks exist on all three
+  platforms rather than on Windows alone. macOS gets an explicit `ExitTimeOut`,
+  and Windows a service entry point matching what the `nexa-service` binary
+  already did.
+
+- **CI compiles the root workspace on Windows**, which it never did — only the
+  desktop crate had a Windows job. Check only, no tests: the integration tests
+  spawn the binary and reach for `cfg(unix)` fixtures.
+
+### Fixed
+
+- **The machine's DNS no longer outlives the tunnel.** Three separate gaps each
+  leaked on their own: a run that died before its teardown left the system DNS
+  pointed at the TUN with nothing to undo it at the next start, and on macOS and
+  Linux there was no self-heal at all; quitting skipped the restore entirely,
+  because nothing handled the exit events, so Cmd+Q left the machine pointed at a
+  tunnel that no longer existed. Only the `…254` host address of a candidate
+  block counts as ours now, never the `/24` around it — `10.0.0.0/24` is both a
+  candidate block and the subnet a great many home LANs use.
+
 - **A password the operating system did not accept said nothing.** Asking and
   being refused came back as "the door is shut", which the UI read as its own
   instruction to stay quiet: a wrong password, a dismissed prompt or a failed
@@ -58,6 +221,7 @@ For what comes next, and for why some things are deliberately not planned, see
   pressed answered for nothing. A press that does nothing now says why — the
   locked page reports whether the password was not accepted or the device did
   not confirm, and the password field carries that line when it opens again.
+
 - **On Linux a password that was not accepted left the page looking unanswered
   for as long as PAM took to refuse it.** The dialog closed the moment the
   password was typed, which made it look as though the answer had already come
@@ -66,6 +230,7 @@ For what comes next, and for why some things are deliberately not planned, see
   loud on the button, and the answer lands in the field it was typed in. PAM
   still takes its time over a password it refuses — that delay is deliberate —
   but nothing looks broken while it does.
+
 - **Copying a value the door had just opened came back as "could not copy".**
   Those copies wrote straight to the asynchronous clipboard API, which WebKit
   refuses once the document is not focused — and confirming who is at the
@@ -75,17 +240,15 @@ For what comes next, and for why some things are deliberately not planned, see
   asynchronous API and then a selection with the legacy command. A value that
   never arrived also stopped being reported as a clipboard failure, which sent
   the user looking at the wrong thing.
-- **The connecting spinner never turned on a Mac with Reduce Motion on.** The
+
+- **The loading spinner never turned on a Mac with Reduce Motion on.** The
   accessibility rule that stills every animation flattened it along with
   everything ornamental, and a spinner that does not turn is a button that
-  looks dead. Both indicators of "still working" answer it now — the button's
-  spinner keeps turning, and the dot inside the connecting ring keeps moving —
-  but not in the same way: scaling is the part the setting exists to suppress,
-  so with Reduce Motion on the dot only breathes, changing nothing but its
-  opacity. It still has to be seen to move, because a dot that stops leaves a
-  proxy that is still starting indistinguishable from one that has given up,
-  and "Starting" beside it is an assertion rather than a sign of life.
-  Everything purely ornamental still respects the setting.
+  looks dead. A spinner is the state rather than decoration — there is no other
+  way to say "working" — so it is exempt from the stop now. The pulse next to
+  the proxy's status is not: the status text already says "Starting", so that
+  one is decoration and still respects the setting.
+
 - **macOS ran the window with a title bar of its own on top of the app's.** The
   macOS build asked for native decorations without the title bar style that makes
   them transparent, so the system's bar sat above the one the app draws — two
@@ -93,6 +256,9 @@ For what comes next, and for why some things are deliberately not planned, see
   window. The window now asks for the overlay style: the traffic lights stay
   where macOS puts them, over the left of the app's own bar, and the app stops
   drawing a second set.
+
+- **Server: an invalid health-check path panicked instead of failing the
+  probe.**
 
 ## [0.4.0] — 2026-09-30
 
