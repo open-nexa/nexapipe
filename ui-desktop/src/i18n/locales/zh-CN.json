@@ -313,6 +313,10 @@
     "twoFactorSecret": "TOTP 密钥",
     "twoFactorAlgorithm": "算法",
     "twoFactorHint": "需与该服务端 [auth.clients] 中的条目一致；服务端未开启 2FA 时保持关闭即可。",
+    "twoFactorDevice": "设备",
+    "deviceNone": "未命名 —— 这台机器正在使用客户端自身的密钥",
+    "deviceHint": "具名设备会拿到属于自己的密钥，撤销它不会波及其他设备。要获得名字需要一张注册邀请：令牌才会签发凭证，手填的密钥属于客户端本身。",
+    "deviceReenroll": "重新注册这台设备",
     "enrollmentPending": "等待以 {id} 完成注册：下次连接时服务端会下发该节点的凭证。"
   },
   "gate": {

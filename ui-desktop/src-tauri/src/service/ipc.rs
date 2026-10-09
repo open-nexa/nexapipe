@@ -32,8 +32,10 @@ impl std::fmt::Debug for NodeInput {
             .field("two_factor_client_id", &self.two_factor_client_id)
             .field("two_factor_secret", &present(&self.two_factor_secret))
             .field("two_factor_algorithm", &self.two_factor_algorithm)
+            .field("two_factor_device", &self.two_factor_device)
             .field("enrollment_client_id", &self.enrollment_client_id)
             .field("enrollment_token", &present(&self.enrollment_token))
+            .field("enrollment_device", &self.enrollment_device)
             .finish()
     }
 }
@@ -52,6 +54,11 @@ pub struct NodeInput {
     pub two_factor_secret: Option<String>,
     #[serde(default)]
     pub two_factor_algorithm: Option<String>,
+    /// The device this secret belongs to, when the node names one. Absent is the
+    /// unnamed device, which answers with the client's own secret — so an older
+    /// UI that knows nothing about devices keeps working untouched.
+    #[serde(default)]
+    pub two_factor_device: Option<String>,
     /// A one-time enrollment token instead of a secret: the service spends it on the first
     /// connection and answers with the credential the server issued. Optional for the same
     /// reason the 2FA fields are — an older UI has nothing to say about enrollment.
@@ -59,6 +66,11 @@ pub struct NodeInput {
     pub enrollment_client_id: Option<String>,
     #[serde(default)]
     pub enrollment_token: Option<String>,
+    /// The name to be enrolled under, when the machine has one. Absent enrolls as
+    /// the unnamed device, which is what a server that predates per-device
+    /// credentials issues.
+    #[serde(default)]
+    pub enrollment_device: Option<String>,
 }
 
 impl NodeInput {
@@ -81,6 +93,7 @@ impl NodeInput {
         Some(NodeEnrollment {
             client_id: self.enrollment_client_id.clone().unwrap_or_default(),
             token: token.to_string(),
+            device: self.enrollment_device.clone(),
         })
     }
     pub fn two_factor(&self) -> Option<NodeTwoFactor> {
@@ -95,6 +108,7 @@ impl NodeInput {
                 .two_factor_algorithm
                 .clone()
                 .unwrap_or_else(|| "sha1".to_string()),
+            device: self.two_factor_device.clone(),
         })
     }
 }

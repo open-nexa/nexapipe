@@ -32,6 +32,7 @@ import {
   takeInvitedNodeCredentials,
   takeRuntimeCredentials,
 } from '../api/credentials';
+import { hostname } from '@tauri-apps/plugin-os';
 import { acceptInvite } from '../api/invite';
 import type {
   ConnectionType,
@@ -84,7 +85,74 @@ const defaultConfig: ProxyConfig = {
   relayMode: 'pinned',
   relayUrl: '',
   relayAuthToken: '',
+  deviceId: '',
 };
+
+/** Longest device name the server accepts; mirrors `MAX_DEVICE_ID_LEN`. */
+const DEVICE_ID_MAX = 255;
+
+/** What a machine with no hostname to give is called. */
+const DEVICE_ID_FALLBACK = 'nexa';
+
+/** Eight hex characters, which is what goes after the hostname. */
+function randomDeviceCode(): string {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * A hostname, made into something the server will accept.
+ *
+ * Spaces become dashes rather than being dropped — "MacBook Pro" should read as
+ * "MacBook-Pro" — and everything outside printable ASCII goes, because the name ends up as a
+ * key in the server's config and in the log line for every handshake.
+ */
+function sanitizeDeviceName(raw: string): string {
+  const printable = Array.from(raw.trim().replace(/\s+/g, '-'))
+    .filter((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code >= 0x21 && code <= 0x7e;
+    })
+    .join('');
+  // Room has to be left for the code that goes after it, or a long hostname would be
+  // truncated mid-name and the code lost — which is the part that keeps two machines apart.
+  return printable.replace(/^-+|-+$/g, '').slice(0, DEVICE_ID_MAX - 9);
+}
+
+/** The server's own rule, mirrored so a refusal is caught here rather than at a handshake. */
+function deviceIdIsUsable(id: string): boolean {
+  return id.length > 0 && id.length <= DEVICE_ID_MAX && /^[\x21-\x7e]+$/.test(id);
+}
+
+/**
+ * The name this machine answers as, generated once and kept.
+ *
+ * A hostname is the obvious thing to name a machine after and the obvious way to break the
+ * rule the server enforces — printable ASCII with the space excluded, which "MacBook Pro" is
+ * not — so it is cleaned before it is used, and a code goes on the end because two machines
+ * can easily share a hostname and a name that collides is a name the server cannot revoke one
+ * of. The code is random rather than read from the machine: there is no cross-platform
+ * identifier in the tree that is not either a credential of its own or a different value after
+ * a reinstall, and a random one is neither.
+ *
+ * Kept rather than regenerated, because a name that changed on every launch would leave the
+ * server holding an entry for every device this machine has ever claimed to be. Module scope
+ * rather than inside the store because `initConfigStore` needs it too, and it runs before any
+ * component has asked the store for anything.
+ */
+async function ensureDeviceIdFor(config: ProxyConfig): Promise<string> {
+  if (deviceIdIsUsable(config.deviceId)) return config.deviceId;
+
+  // A machine with nothing to say about its own name still gets one: an unnamed
+  // device is the one that answers with the client's shared secret, which is
+  // exactly the thing this is here to stop.
+  const host = await hostname().catch(() => '');
+  const name = sanitizeDeviceName(host ?? '') || DEVICE_ID_FALLBACK;
+  config.deviceId = `${name}-${randomDeviceCode()}`.slice(0, DEVICE_ID_MAX);
+  persist(config);
+  return config.deviceId;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -113,7 +181,8 @@ function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
   if (!secret && !clientId) return undefined;
   const algorithm =
     raw.algorithm === 'sha256' || raw.algorithm === 'sha512' ? raw.algorithm : 'sha1';
-  return { clientId, secret, algorithm };
+  const device = asString(raw.device, '').trim();
+  return { clientId, secret, algorithm, ...(device ? { device } : {}) };
 }
 
 /**
@@ -129,7 +198,8 @@ function normalizeEnrollment(raw: unknown): EnrollmentToken | undefined {
   // Same reason as `normalizeTwoFactor`: a spent-or-stored token is an empty string here, and
   // the client id is what says which node is waiting for one.
   if (!token && !clientId) return undefined;
-  return { clientId, token };
+  const device = asString(raw.device, '').trim();
+  return { clientId, token, ...(device ? { device } : {}) };
 }
 
 function normalizeNode(raw: unknown): NodeConfig | null {
@@ -188,6 +258,9 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   config.upstreamDns = asString(raw.upstreamDns, config.upstreamDns);
   config.tunName = asString(raw.tunName, config.tunName) || defaultConfig.tunName;
   config.relayUrl = asString(raw.relayUrl, config.relayUrl);
+  // Empty is the state before it has been generated, not a name: `ensureDeviceId` fills it
+  // in on the first run and a payload that never had one is a payload from before devices.
+  config.deviceId = asString(raw.deviceId, '').trim();
   config.relayAuthToken = asString(raw.relayAuthToken, config.relayAuthToken);
 
   if (raw.loadBalancing === 'random' || raw.loadBalancing === 'round_robin') {
@@ -535,6 +608,11 @@ export async function initConfigStore(): Promise<void> {
     // empty the store to match.
     credentialsHydrated = true;
 
+    // And only from here may the device name be generated, for the same reason:
+    // generating one writes the config, and a write before the store had
+    // answered is a write that could empty it.
+    await ensureDeviceIdFor(config);
+
     // The legacy key goes now, and only because it can be proved redundant:
     // `persist` swallows a write failure, so the payload is read back rather
     // than trusted. A save that did not happen must not cost the user the copy
@@ -696,6 +774,11 @@ export function useConfigStore() {
    *
    * Returns which of the two happened, so the caller can say so.
    */
+  /** The name this machine answers as; see [`ensureDeviceId`] at module scope. */
+  async function ensureDeviceId(): Promise<string> {
+    return ensureDeviceIdFor(config);
+  }
+
   async function applyInvite(
     uri: string,
     options: { applyRelay?: boolean } = {},
@@ -738,6 +821,11 @@ export function useConfigStore() {
     // nowhere else — a second server keeps whatever it was given before. What is set here is the
     // *shape*: the secret and the token are already in the store, and keeping them out of this
     // object is the whole point of `accept_invite`.
+    // No `device` on this branch, on purpose: what a plain invite carries is the client's own
+    // secret, which the server files under the client and not under any device. Claiming a
+    // name while answering with that secret would make the server look up a device's secret
+    // and refuse, for a reason no side would name. A per-device credential is what a
+    // *registration* invite issues, and only that.
     if (accepted.totp) {
       node.twoFactor = {
         clientId: accepted.totp.clientId,
@@ -752,7 +840,12 @@ export function useConfigStore() {
     // `twoFactor` because a token is not a credential — writing it there would make the node
     // present the token as its TOTP secret and be refused.
     if (accepted.enrollment) {
-      node.enrollment = { clientId: accepted.enrollment.clientId, token: '' };
+      // The name is asked for here, at the moment the token is filed: it is what makes the
+      // credential that comes back this machine's and nobody else's, and enrolling without one
+      // is how a device ends up sharing the client's secret — which is the thing that makes
+      // revoking one rotate every other one.
+      const device = await ensureDeviceId();
+      node.enrollment = { clientId: accepted.enrollment.clientId, token: '', device };
       delete node.twoFactor;
     }
 
@@ -784,10 +877,15 @@ export function useConfigStore() {
       ) ?? config.nodes.find((candidate) => candidate.enrollment);
     if (!node) return null;
 
+    // What the server filed this secret under, and not what was asked for: they differ when
+    // the server answered an enrollment that named no device, and writing a name it does not
+    // have would make every later handshake answer with the wrong secret.
+    const device = credential.device?.trim();
     node.twoFactor = {
       clientId: credential.clientId,
       secret: credential.secret,
       algorithm: credential.algorithm,
+      ...(device ? { device } : {}),
     };
     delete node.enrollment;
     return node;
@@ -797,10 +895,15 @@ export function useConfigStore() {
   function setNodeTwoFactor(nodeId: string, patch: Partial<NodeTwoFactor>): void {
     const node = config.nodes.find((candidate) => candidate.id === nodeId);
     if (!node) return;
+    const device = patch.device ?? node.twoFactor?.device;
     node.twoFactor = {
       clientId: patch.clientId ?? node.twoFactor?.clientId ?? '',
       secret: patch.secret ?? node.twoFactor?.secret ?? '',
       algorithm: patch.algorithm ?? node.twoFactor?.algorithm ?? 'sha1',
+      // Carried across an edit, because a secret typed by hand is the client's and a secret
+      // that came back from an enrollment is a device's, and which one this is decides which
+      // key the server checks it against. Cleared when a node has neither.
+      ...(device?.trim() ? { device } : {}),
     };
   }
 
@@ -882,6 +985,8 @@ export function useConfigStore() {
     removeNode,
     updateNode,
     updateNodeDomains,
+    /** The name this machine answers as; generated on first use. */
+    ensureDeviceId,
     applyInvite,
     completeEnrollment,
     setNodeTwoFactor,

@@ -441,9 +441,16 @@ async function start(): Promise<void> {
       two_factor_client_id: node.twoFactor?.clientId ?? null,
       two_factor_secret: node.twoFactor?.secret ?? null,
       two_factor_algorithm: node.twoFactor?.algorithm ?? null,
+      // Which device of this client the secret belongs to. Absent is the unnamed device,
+      // which answers with the client's own secret — the shape every server understood
+      // before a client could have several.
+      two_factor_device: node.twoFactor?.device ?? null,
       // A registration invite's token, spent on the first connection of this run.
       enrollment_client_id: node.enrollment?.clientId ?? null,
       enrollment_token: node.enrollment?.token ?? null,
+      // The name to be enrolled under: without it the server issues the client's own
+      // secret, and this machine is one device it cannot revoke on its own.
+      enrollment_device: node.enrollment?.device ?? null,
     }));
 
   const wantTun = config.useTun;

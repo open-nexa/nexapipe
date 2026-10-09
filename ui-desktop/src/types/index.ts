@@ -32,6 +32,16 @@ export interface NodeTwoFactor {
   clientId: string;
   secret: string;
   algorithm: TwoFactorAlgorithm;
+  /**
+   * Which device of this client this secret belongs to.
+   *
+   * Absent is the device that was never given a name — the one that answers with the client's own
+   * secret, and the only kind there was before a client could have several. Present is a name the
+   * server filed this secret under, so sending it is what makes the handshake check the right
+   * one: without it a server holding several devices cannot tell which of them is speaking, and
+   * revoking one of them rotates all of them.
+   */
+  device?: string;
 }
 
 /**
@@ -47,6 +57,11 @@ export interface NodeTwoFactor {
 export interface EnrollmentToken {
   clientId: string;
   token: string;
+  /**
+   * The name this device asks to be enrolled under. Absent asks for the client's own secret,
+   * which is the only thing a server that predates per-device credentials will answer.
+   */
+  device?: string;
 }
 
 /** What the server issued for a spent token: the credentials to keep from here on. */
@@ -54,6 +69,11 @@ export interface IssuedCredential {
   clientId: string;
   secret: string;
   algorithm: TwoFactorAlgorithm;
+  /**
+   * The device the secret was filed under, which is the name to send from here on. Absent when
+   * the server answered an enrollment that named no device.
+   */
+  device?: string | null;
 }
 
 export interface NodeConfig {
@@ -95,6 +115,15 @@ export interface ProxyConfig {
   relayUrl: string;
   /** Bearer token for a custom relay that requires one. */
   relayAuthToken: string;
+  /**
+   * The name this machine answers as, once per installation rather than once per server: the
+   * device is the machine, and every node belongs to it.
+   *
+   * Generated on first run and kept, because a name that changed would leave the server holding
+   * an entry for a device that no longer exists — a credential nobody can revoke by name. Empty
+   * until it has been generated; see `ensureDeviceId`.
+   */
+  deviceId: string;
 }
 
 /** The persisted shape: user config plus the schema version the migration chain walks. */
