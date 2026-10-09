@@ -26,12 +26,42 @@
 //!
 //! Entries are still grouped by endpoint id, because that is what an operator
 //! recognises: a Node ID they can compare against their client list.
+//!
+//! # How revocation reaches a connection that is already open
+//!
+//! Striking a credential out of `[auth]` must stop the traffic it is carrying
+//! now, not only its next dial — otherwise removing a device changes what it
+//! can do later and nothing else. Each entry therefore carries the sending half
+//! of a [`tokio::sync::watch`] channel the connection task owns the other half
+//! of: [`PeerRegistry::close_where`] flips it, and the task, which is the only
+//! holder of the [`Connection`], is what actually closes.
+//!
+//! A signal rather than a connection handle, because owning the socket from two
+//! places means either can close it and neither learns about it — and because a
+//! `watch::Sender` can be created in a test without an endpoint to dial.
+//! [`PeerRegistry::insert`] takes the sender, so nothing here knows or cares
+//! how the task ends once told.
 use crate::metrics::PathKind;
 use iroh::EndpointId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
+
+/// What [`PeerRegistry::insert`] takes to be able to reach a connection later.
+///
+/// `false` is "keep serving"; [`PeerRegistry::close_where`] sends `true`, and
+/// the connection task closes itself and returns.
+pub type Revoked = watch::Sender<bool>;
+
+/// A sender the task created, for the caller that does not have a real
+/// connection to hand to [`PeerRegistry::insert`]: every test here cares about
+/// who is listed, and none about revoking.
+#[cfg(test)]
+fn no_signal() -> Revoked {
+    watch::channel(false).0
+}
 
 /// Who a connection authenticated as.
 ///
@@ -70,6 +100,10 @@ struct Peer {
     since: Instant,
     path: PathKind,
     identity: PeerIdentity,
+    /// Flipped when `[auth]` stops carrying the credential this connection
+    /// authenticated with. The task watching the other end owns the socket and
+    /// does the closing; nothing else here touches it.
+    revoked: Revoked,
 }
 
 /// The set of peers with a connection being served right now.
@@ -96,11 +130,14 @@ impl PeerRegistry {
     /// handshake — because a peer that was refused is not connected, and
     /// listing it would make "who is connected" include peers that were turned
     /// away.
+    ///
+    /// `revoked` is how this entry is later reached; see [`Self::close_where`].
     pub fn insert(
         &self,
         endpoint_id: EndpointId,
         path: PathKind,
         identity: PeerIdentity,
+        revoked: Revoked,
     ) -> PeerGuard {
         // Starts at 1 so a default-initialised id is never a real one.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -110,6 +147,7 @@ impl PeerRegistry {
             since: Instant::now(),
             path,
             identity,
+            revoked,
         });
         PeerGuard {
             registry: self.clone(),
@@ -135,6 +173,32 @@ impl PeerRegistry {
                 peer.path = path;
             }
         }
+    }
+
+    /// Signals every connection whose identity `matches`, and reports how many.
+    ///
+    /// This is how revocation reaches a credential that is already connected:
+    /// `nexapipe client revoke` edits the config, the next reload notices what
+    /// is gone from `[auth]`, and this tells anything that authenticated as it
+    /// to stop. The connection tasks do the closing themselves — they own the
+    /// sockets — so how many are counted here is how many were told, which is
+    /// not the same instant as how many have finished going away.
+    ///
+    /// Nothing is removed from the map: the task ends on its own and its
+    /// [`PeerGuard`] takes the entry out, exactly as for any other ending.
+    pub fn close_where(&self, matches: impl Fn(&PeerIdentity) -> bool) -> usize {
+        // A read lock, and `send_replace` does not await: revocation must not
+        // queue behind anything long enough for the answer to stop being
+        // useful, and the tasks being told to stop are trying to take the write
+        // lock themselves to drop their entries.
+        let mut signaled = 0;
+        for peer in read(&self.peers).values().flatten() {
+            if matches(&peer.identity) {
+                peer.revoked.send_replace(true);
+                signaled += 1;
+            }
+        }
+        signaled
     }
 
     /// Every connection, oldest first within an endpoint id so the answer is
@@ -240,8 +304,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, b) = ids();
 
-        let guard_a = registry.insert(a, PathKind::Relay, PeerIdentity::default());
-        let _guard_b = registry.insert(b, PathKind::Direct, PeerIdentity::default());
+        let guard_a = registry.insert(a, PathKind::Relay, PeerIdentity::default(), no_signal());
+        let _guard_b = registry.insert(b, PathKind::Direct, PeerIdentity::default(), no_signal());
         assert_eq!(registry.len(), 2);
 
         drop(guard_a);
@@ -262,8 +326,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default());
-        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default());
+        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default(), no_signal());
+        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default(), no_signal());
         assert_eq!(registry.len(), 2, "one peer, two connections");
 
         drop(second);
@@ -288,8 +352,8 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default());
-        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default());
+        let first = registry.insert(a, PathKind::Relay, PeerIdentity::default(), no_signal());
+        let second = registry.insert(a, PathKind::Direct, PeerIdentity::default(), no_signal());
 
         let listed = registry.snapshot();
         assert_eq!(listed.len(), 2);
@@ -324,8 +388,8 @@ mod tests {
             device: Some("phone".to_string()),
         };
 
-        let _first = registry.insert(a, PathKind::Relay, laptop);
-        let _second = registry.insert(a, PathKind::Direct, phone);
+        let _first = registry.insert(a, PathKind::Relay, laptop, no_signal());
+        let _second = registry.insert(a, PathKind::Direct, phone, no_signal());
 
         let listed = registry.snapshot();
         assert_eq!(listed[0].identity.client_id.as_deref(), Some("alice"));
@@ -341,7 +405,7 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        let _guard = registry.insert(a, PathKind::Relay, PeerIdentity::default());
+        let _guard = registry.insert(a, PathKind::Relay, PeerIdentity::default(), no_signal());
         registry.set_path(&a, PathKind::Direct);
 
         let listed = registry.snapshot();
@@ -356,9 +420,125 @@ mod tests {
         let registry = PeerRegistry::new();
         let (a, _) = ids();
 
-        drop(registry.insert(a, PathKind::Relay, PeerIdentity::default()));
+        drop(registry.insert(a, PathKind::Relay, PeerIdentity::default(), no_signal()));
         registry.set_path(&a, PathKind::Direct);
 
         assert!(registry.is_empty(), "a removed peer came back");
+    }
+
+    /// Revoking one device leaves its siblings untouched, which is the whole
+    /// point of the table: `client revoke <id> --device laptop` must not reach
+    /// `phone`, and must not reach the device that names none either — that one
+    /// authenticates against the client's own `secret`, not a device entry.
+    #[test]
+    fn revoking_one_device_leaves_the_others_alone() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let laptop = PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: Some("laptop".to_string()),
+        };
+        let phone = PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: Some("phone".to_string()),
+        };
+        let unnamed = PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: None,
+        };
+
+        let (laptop_tx, mut laptop_rx) = watch::channel(false);
+        let (phone_tx, mut phone_rx) = watch::channel(false);
+        let (unnamed_tx, mut unnamed_rx) = watch::channel(false);
+
+        let laptop = registry.insert(a, PathKind::Relay, laptop, laptop_tx);
+        let phone = registry.insert(a, PathKind::Direct, phone, phone_tx);
+        let unnamed = registry.insert(a, PathKind::Direct, unnamed, unnamed_tx);
+
+        let closed = registry.close_where(|identity| identity.device.as_deref() == Some("laptop"));
+        assert_eq!(closed, 1, "only the one device was signaled");
+
+        assert!(*laptop_rx.borrow_and_update(), "laptop was not signaled");
+        assert!(!*phone_rx.borrow_and_update(), "phone was signaled too");
+        assert!(
+            !*unnamed_rx.borrow_and_update(),
+            "the unnamed device was signaled too"
+        );
+
+        // Still listed: being told to stop and having stopped are two moments,
+        // and the second is the task's to report by dropping its guard.
+        assert_eq!(registry.len(), 3);
+        drop((laptop, phone, unnamed));
+    }
+
+    /// Striking the whole client out reaches every device under it, including
+    /// the device that has no name: it answered with the client's own `secret`,
+    /// and that secret is what goes.
+    #[test]
+    fn revoking_a_client_reaches_every_device_under_it() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let (_device_tx, mut device_rx) = watch::channel(false);
+        let (_unnamed_tx, mut unnamed_rx) = watch::channel(false);
+        let (_other_tx, mut other_rx) = watch::channel(false);
+
+        let device = registry.insert(
+            a,
+            PathKind::Relay,
+            PeerIdentity {
+                client_id: Some("alice".to_string()),
+                device: Some("laptop".to_string()),
+            },
+            _device_tx,
+        );
+        let unnamed = registry.insert(
+            a,
+            PathKind::Direct,
+            PeerIdentity {
+                client_id: Some("alice".to_string()),
+                device: None,
+            },
+            _unnamed_tx,
+        );
+        let other = registry.insert(
+            a,
+            PathKind::Direct,
+            PeerIdentity {
+                client_id: Some("bob".to_string()),
+                device: None,
+            },
+            _other_tx,
+        );
+
+        let closed =
+            registry.close_where(|identity| identity.client_id.as_deref() == Some("alice"));
+        assert_eq!(closed, 2, "every device of alice, and only those");
+
+        assert!(*device_rx.borrow_and_update());
+        assert!(*unnamed_rx.borrow_and_update());
+        assert!(!*other_rx.borrow_and_update(), "bob was signaled too");
+
+        drop((device, unnamed, other));
+    }
+
+    /// A peer that never authenticated has nothing to revoke, so the answer is
+    /// nothing to close rather than everybody: 2FA is optional, and a
+    /// connection with no identity is not a connection `revoke` can name.
+    #[test]
+    fn revocation_skips_connections_that_named_nobody() {
+        let registry = PeerRegistry::new();
+        let (a, _) = ids();
+
+        let (_tx, mut rx) = watch::channel(false);
+        let unnamed = registry.insert(a, PathKind::Relay, PeerIdentity::default(), _tx);
+
+        let closed =
+            registry.close_where(|identity| identity.client_id.as_deref() == Some("alice"));
+        assert_eq!(closed, 0);
+        assert!(!*rx.borrow_and_update());
+
+        drop(unnamed);
     }
 }

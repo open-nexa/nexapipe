@@ -95,7 +95,7 @@ const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 256;
 /// was rejected" — the difference between a misconfigured client and a wrong
 /// TOTP code. Keep in sync with `AUTH_REQUIRED_CLOSE_CODE` in
 /// `crates/nexapipe-client/src/connection_pool.rs`.
-mod auth_close_code {
+pub(crate) mod auth_close_code {
     /// No AUTH_START arrived within the handshake deadline: the server requires
     /// 2FA the client did not perform.
     pub const REQUIRED: u32 = 2;
@@ -104,6 +104,11 @@ mod auth_close_code {
     /// The peer already holds as many connections as it is allowed, so this one
     /// is closed without any traffic being served on it.
     pub const TOO_MANY: u32 = 4;
+    /// The credential this connection authenticated with is gone: `nexapipe
+    /// client revoke` struck the client, or the device, out of `[auth]` while
+    /// this connection was open. Five belongs to `[peers]` in
+    /// [`crate::conn::allow_list`], which is why the numbers are not adjacent.
+    pub const REVOKED: u32 = 6;
 }
 
 /// The live 2FA state a connection authenticates against.
@@ -783,9 +788,9 @@ fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> Enrollm
 ///
 /// Carried as both halves because a client id on its own cannot tell two
 /// devices of the same client apart, and telling them apart is the only thing
-/// a per-device credential is for: what the peer list, the access log and —
-/// later — the revocation that has to close one device's connections all need
-/// to know is whose connection this is, not merely whose client's.
+/// a per-device credential is for: what the peer list, the access log and the
+/// revocation that closes one device's connections all need to know is whose
+/// connection this is, not merely whose client's.
 struct AuthenticatedPeer {
     client_id: String,
     /// The device name the peer sent. `None` is the device that has none,
@@ -1706,10 +1711,33 @@ pub async fn handle_connection(
     // moment later by the tracker above, which keeps following it.
     // The registry keeps its own copy: the identity below is also what every
     // stream of this connection writes into the access log.
-    let _peer = peers.insert(peer_id, initial_kind, identity.clone());
+    //
+    // Its other half is how `client revoke` reaches a connection rather than
+    // only the next dial: the config watcher flips it, and the loop below stops
+    // serving this peer and hangs up.
+    let (revoked_tx, mut revoked_rx) = tokio::sync::watch::channel(false);
+    let _peer = peers.insert(peer_id, initial_kind, identity.clone(), revoked_tx);
 
     loop {
-        match conn.accept_bi().await {
+        // Whichever happens first wins, and a revocation that arrives while a
+        // stream is being accepted loses nothing: the connection is closed in
+        // the next line whether the accept completed or not.
+        let accepted = tokio::select! {
+            accepted = conn.accept_bi() => accepted,
+            // Either the value changed, or every sender is gone — which can
+            // only mean this loop outlived its own registry entry, and both
+            // say the same thing: stop serving this peer.
+            _ = revoked_rx.changed() => {
+                tracing::info!(
+                    "Closing {}: its credential is no longer in [auth]",
+                    peer_id
+                );
+                conn.close(auth_close_code::REVOKED.into(), b"credential revoked");
+                return;
+            }
+        };
+
+        match accepted {
             Ok((send, recv)) => {
                 // Refused rather than queued: waiting for a slot would only move
                 // the unbounded growth into a backlog this loop cannot see, and

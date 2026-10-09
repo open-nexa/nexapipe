@@ -219,6 +219,10 @@ pub async fn run_proxy(
     // the file turns 2FA on. `plaintext` is filled in further down, once the
     // listener has been bound; the watcher is an `Arc` by then, so the field is
     // set through `OnceLock` rather than a constructor argument.
+    //
+    // `peers` is what lets a reload reach a connection rather than only the next
+    // one: `client revoke` edits the file, and the next pass has to tell the
+    // connections already authenticated as what it removed to stop.
     let config_watcher = Arc::new(ConfigWatcher::new(
         config_path.to_string(),
         config.clone(),
@@ -226,6 +230,7 @@ pub async fn run_proxy(
         health_probes,
         health_enabled,
         auth_state.clone(),
+        Arc::clone(&peers),
     ));
     tokio::spawn({
         let config_watcher_clone = config_watcher.clone();

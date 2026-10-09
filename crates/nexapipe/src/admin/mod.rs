@@ -631,6 +631,7 @@ mod tests {
                 client_id: Some("alice".to_string()),
                 device: Some("laptop".to_string()),
             },
+            tokio::sync::watch::channel(false).0,
         );
 
         let body = connections_json(&Arc::new(peers));
