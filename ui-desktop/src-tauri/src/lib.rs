@@ -54,6 +54,18 @@ static RUNTIME_CREDENTIALS_TAKEN: AtomicBool = AtomicBool::new(false);
 static INVITED_NODES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// When this process started: the origin the backend's own start-up timings are measured from.
+///
+/// The frontend reports a series of its own, measured from the document navigation, and the two
+/// have to be read together because neither side can see the other's start. Subtracting the
+/// last frontend mark from this instant's elapsed time is the only way to put a number on the
+/// stretch neither clock covers — the binary loading, the runtime coming up, the webview being
+/// created — which is also the stretch nobody can guess at from the outside.
+///
+/// A `LazyLock` rather than a plain `Instant`, because `Instant::now()` is not `const`; the
+/// first read happens in [`run`], so the gap it misses is the dynamic linker's and not ours.
+static APP_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
 /// How far the log page has read into the newest log file.
 ///
 /// `get_logs` in incremental mode returns only the bytes after this offset, which is what makes
@@ -1318,6 +1330,11 @@ async fn take_runtime_credentials(node_ids: Vec<String>) -> Result<RuntimeCreden
         ));
     }
 
+    // Timed because this is the one call the first paint waits on: it is where the master key
+    // is loaded — the keychain read, on the one launch that still asks — and where the store
+    // file is read and every entry in it decrypted.
+    let started = std::time::Instant::now();
+
     let mut nodes = HashMap::with_capacity(node_ids.len());
     for node_id in &node_ids {
         let node_id = node_id.trim();
@@ -1334,6 +1351,12 @@ async fn take_runtime_credentials(node_ids: Vec<String>) -> Result<RuntimeCreden
         ))?,
         nodes,
     };
+
+    tracing::info!(
+        "[startup] credentials read took {}ms for {} node(s)",
+        started.elapsed().as_millis(),
+        bundle.nodes.len()
+    );
 
     RUNTIME_CREDENTIALS_TAKEN.store(true, Ordering::SeqCst);
     Ok(bundle)
@@ -1511,6 +1534,49 @@ async fn credential_store_status() -> Result<String, AppError> {
     Ok(credentials::status()?.as_str().to_string())
 }
 
+/// Writes the renderer's start-up timings to the log.
+///
+/// The window is created hidden and shown by the frontend, so "the application takes a while
+/// to appear" is a question about code this process cannot see. This is what makes it
+/// answerable: the renderer's own series, in the same file as the backend's, measured from the
+/// document navigation — and, alongside it, how long this process had been running when the
+/// report arrived. The difference is the part neither clock covers.
+///
+/// Bounded on the way in, because a log line is somewhere a caller can write. The caller here
+/// is the renderer, which can reach any other command just as easily, so a mark is treated as
+/// untrusted text: control characters dropped, label and count capped. Nothing about this can
+/// fail a start-up, so it returns nothing.
+#[tauri::command]
+async fn log_startup_timing(marks: Vec<(String, f64)>) {
+    /// Beyond this a label is prose, not a label.
+    const MAX_LABEL_CHARS: usize = 64;
+    /// Generous for every mark the start-up path records, and small enough that a series is
+    /// one line of log rather than a wall of them.
+    const MAX_MARKS: usize = 64;
+
+    let rendered: Vec<String> = marks
+        .iter()
+        .take(MAX_MARKS)
+        .map(|(label, ms)| {
+            let label: String = label
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_LABEL_CHARS)
+                .collect();
+            format!("{label}={ms:.0}ms")
+        })
+        .collect();
+
+    tracing::info!(
+        "[startup] frontend, from the document navigation: {}",
+        rendered.join(", ")
+    );
+    tracing::info!(
+        "[startup] process start to this report: {}ms",
+        APP_START.elapsed().as_millis()
+    );
+}
+
 /// How long the window stays hidden waiting for the frontend to paint, before it is shown
 /// anyway.
 ///
@@ -1587,7 +1653,14 @@ async fn stop_tunnel_on_exit() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Read before anything else this process does, so the elapsed times below are measured
+    // from as close to the real start as a `LazyLock` can get.
+    std::sync::LazyLock::force(&APP_START);
+
     let _guard = init_tracing("nexa.log");
+    // Logged after the subscriber exists rather than before it: a line emitted before
+    // `init_tracing` has nowhere to go.
+    tracing::info!("[startup] process start");
 
     // Increase tokio worker thread stack size to 4 MB (default 2 MB) to
     // prevent stack overflow from deeply nested async state machines in
@@ -1612,6 +1685,15 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
+            // The window exists by the time this runs and is still hidden, so this is the
+            // moment the process stops being "starting up" and starts being "loading the
+            // frontend": everything after it is the webview's, and everything before it was
+            // ours — the binary, the runtime, the window.
+            tracing::info!(
+                "[startup] setup reached, window created: +{}ms",
+                APP_START.elapsed().as_millis()
+            );
+
             // Same reason the service runner does it: a hijack whose process died
             // before its teardown left the machine's DNS pointing at a TUN address
             // that no longer exists, and nothing else will ever undo that. Doing it
@@ -1685,6 +1767,7 @@ pub fn run() {
             delete_credential,
             clear_credentials,
             credential_store_status,
+            log_startup_timing,
             quit::finish_quit
         ]);
 

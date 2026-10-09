@@ -122,6 +122,11 @@ description = "Enables the is_service_running command without any pre-configured
 commands.allow = ["is_service_running"]
 
 [[permission]]
+identifier = "allow-log-startup-timing"
+description = "Enables the log_startup_timing command without any pre-configured scope."
+commands.allow = ["log_startup_timing"]
+
+[[permission]]
 identifier = "allow-lock-credentials"
 description = "Enables the lock_credentials command without any pre-configured scope."
 commands.allow = ["lock_credentials"]
