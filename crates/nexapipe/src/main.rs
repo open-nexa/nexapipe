@@ -1034,9 +1034,16 @@ fn write_issued_secret(
 /// A revoke deletes rather than rewriting, because a missing entry is what the
 /// handshake reads as "this device has no credential" — the same answer a device
 /// that never enrolled gets, so what happened to it cannot be told from outside.
+///
+/// The `[auth]` section is read best-effort and only for the counts the message
+/// prints: the removal itself edits the TOML directly and needs no typed auth,
+/// so a config that no longer parses — an `allow_hosts` that is not a list, say
+/// — must still be revocable. Refusing it would leave the one operator remedy
+/// for a bad hand edit behind the very edit that broke it.
 fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Result<()> {
     let client_id = client_id.trim();
-    let auth = load_auth_or_none(&cli.config)?;
+    // Counts are for the message only; a config that fails to load must still be revocable.
+    let auth = load_auth_or_none(&cli.config).ok().flatten();
     let client = auth.as_ref().and_then(|auth| auth.clients.get(client_id));
 
     match device {

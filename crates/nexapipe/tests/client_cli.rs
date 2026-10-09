@@ -311,3 +311,43 @@ fn revoking_what_is_not_there_is_an_error() {
         "nothing was revoked:\n{written}"
     );
 }
+
+/// A config that no longer loads as typed auth is still revocable.
+///
+/// The counts a revoke prints come from the parsed `[auth]`, but the removal
+/// itself edits the file as TOML and needs no typed auth at all: a hand edit
+/// that broke the section — an `allow_hosts` given as a string where the struct
+/// wants a list — must not lock the one command that takes it back.
+#[test]
+fn revoking_survives_a_config_that_no_longer_loads() {
+    let (_dir, path) = scratch_config(
+        "config.toml",
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.acme]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_hosts = \"example.com\"\n\
+         \n\
+         [auth.clients.acme.devices.laptop]\n\
+         secret = \"MFRGGZDFMZTWQ2LK\"\n",
+    );
+
+    // The premise: this is a config the typed load rejects. Without it the
+    // assertions below would pass for the wrong reason.
+    let (ok, listed) = run(&path, &["client", "list"]);
+    assert!(!ok, "the config should not load:\n{listed}");
+
+    let (ok, text) = run(&path, &["client", "revoke", "acme"]);
+    assert!(
+        ok,
+        "a config that fails to load must still be revocable:\n{text}"
+    );
+
+    let written = fs::read_to_string(&path).expect("read back");
+    assert!(!written.contains("acme"), "nothing was revoked:\n{written}");
+    assert!(
+        written.contains("[auth]"),
+        "the section itself stays:\n{written}"
+    );
+}
