@@ -266,7 +266,11 @@ fn with_default_port(address: &str) -> String {
 /// the same question answers NXDOMAIN for all of them. The configured upstream
 /// and the fallbacks stay behind them so the chain still ends somewhere when the
 /// machine's own resolvers are unreachable.
-fn resolver_chain(previous: &[String], configured: &str) -> Vec<String> {
+///
+/// Shared with the TUN stack, which forwards along the same list — see
+/// `tun_proxy::run`. Both have to ask the same servers in the same order, or
+/// the same name gets two answers depending on which path carried the query.
+pub(crate) fn resolver_chain(previous: &[String], configured: &str) -> Vec<String> {
     let mut chain: Vec<String> = Vec::new();
     let candidates = previous
         .iter()
