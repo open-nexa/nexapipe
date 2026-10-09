@@ -1045,7 +1045,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v3 @ 2025-12-16
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
@@ -1114,7 +1114,7 @@ jobs:
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v3 @ 2025-12-16
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
