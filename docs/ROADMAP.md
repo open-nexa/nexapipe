@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-09 (four of Phase 3's six deliverables have shipped in main; the two that remain are named there; entries closed by v0.6.0 marked in §4 and §9) |
+| Last updated | 2026-10-09 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §4 and §9) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -217,11 +217,10 @@ exporter, and client-side latency, are not planned for this release.
 Authentication is a TOTP secret. **The shared-secret half closed in v0.6.0:**
 what a `client_id` carries now is its own `secret` plus a table of devices, each
 with a secret of its own issued at enrollment, and each revocable without
-touching the others. The README stopped saying that too. Two things about the
-model are still open, both named under
-[Phase 3](#phase-3--v060-one-device-at-a-time): a revoked device keeps the
-connections it already holds, and no client sends a device name yet, so the model
-is reachable from `--device` and from nothing else. There is still no mTLS, no
+touching the others. The README stopped saying that too, and both halves that
+[Phase 3](#phase-3--v060-one-device-at-a-time) still owed the model have landed
+since: a revoked device no longer keeps the connections it already holds, and
+every client answers as one named device of itself. There is still no mTLS, no
 OIDC and no API keys.
 
 The same release closed the audit trail half for the server side: an access line
@@ -241,9 +240,10 @@ is the *kind* of credential — per-device key pairs, and TOTP demoted to a seco
 factor a human supplies — and it stays out of this release because it also means
 new material in both credential stores and a factor an unattended service cannot
 answer. Of the other half of making revocation true, closing the connections a
-revoked device already holds has landed; what is still standing inside this
-release is getting a device name onto the wire from the clients rather than from
-`--device`.
+revoked device already holds has landed. So has putting a name on the wire from
+the clients rather than from `--device` alone: each install answers as one named
+device of itself, which is what makes per-device revocation reachable from
+somewhere other than an operator's shell.
 
 ### 4.4 Operations and distribution (P1)
 
@@ -572,18 +572,18 @@ tests and by compilation only.
 No new deliverable is opened for this release. It is the item Phase 0 left that
 had never started — R5 — and the write half of R4 that was waiting on it, plus
 three things small enough that deferring them costs more than doing them. Four
-are whole now and two are half — see **Progress** below.
+are whole now — see **Progress** below.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| R5 | **Per-device credentials** | **Shipped, apart from a client naming itself.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What no client can do yet is send a device name — see the decision below. See [4.3](#43-identity-and-authorization-p1) |
+| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
 | R5 | **A minimal audit log** | **Shipped.** Who — client *and* device — reached which host, when, and with what outcome. The identity survives the handshake now (`conn/mod.rs`), so an access line and `/v1/connections` can say whose request they are reporting; it used to carry an ACL snapshot and a Node ID and nothing else |
 | R4 | **The write half, as CLI subcommands** | **Shipped.** `nexapipe client list\|add\|revoke`, device-scoped, through the writers that already took the config lock; the loopback endpoints stayed GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in |
 | — | **Latency you can read** | **Shipped.** `/metrics` renders `_bucket{le="…"}` beside `_sum` and `_count`, hand-written to keep the exposition dependency-free, so a p99 is read rather than divided out. It carries no labels beyond `le` and no `{route}`: what it answers is "what is this instance's latency", which is the question the meter was missing |
 | — | **A systemd unit in the docs** | **Shipped.** `docs/self-hosted-relay.md` carries a unit for the relay and both READMEs one for the server, each with the directives dated so a reader can tell what assumes how old a systemd. The server's is the harder of the two to make safe: it writes back into its own config — 2FA counters, an enrolled device — and writes its admin token beside it, so it keeps a named account and one writable directory rather than the `DynamicUser` the relay can run under. See [4.4](#44-operations-and-distribution-p1) |
 | — | **Windows runs the tests** | **Shipped.** The job was `windows-check`, a `cargo check --workspace --all-targets`, so the integration tests compiled for `x86_64-pc-windows-msvc` and nothing executed them — a bug that only appears when they run reached a tag before CI saw one. It is `windows-test` now and runs the same command the Linux and macOS runners do. See [4.4](#44-operations-and-distribution-p1) |
 
-**Progress.** Five of the six are whole. Whole: the identity threading that lets
+**Progress.** All six are whole. Whole: the identity threading that lets
 an access line and `/v1/connections` name client *and* device (R5, audit log),
 `client list|add|revoke` with `--device` (R4), latency buckets on `/metrics`,
 `windows-test` actually running the tests, and a systemd unit for the relay in
@@ -592,16 +592,15 @@ secret per device, looked up per device at the handshake, and a revoke that
 reaches the connections the device already holds, not only the next one it
 dials.
 
-One thing stands between this and **Done when** below, and it is a decision
-rather than a defect: **no client sends a device name.** The
-wire has carried `device_id` since the enrollment work — `Option`, so a peer
-that names none takes the client's own secret exactly as it always did — but the
-client library never grew the field, so every device today is the device that
-names none, and per-device credentials are reachable from `--device` and from
-nothing else. Giving each install a name is small in the library and larger in
-the apps: something has to decide what the name is, keep it stable across
-reinstalls, and carry it beside the credential instead of inside it. This
-release does that rather than shipping a device model nobody can enter.
+What stood here last was a decision rather than a defect: **no client sent a
+device name.** The wire has carried `device_id` since the enrollment work —
+`Option`, so a peer that names none takes the client's own secret exactly as it
+always did — but the client library never grew the field, so every device was
+the device that names none, and per-device credentials were reachable from
+`--device` and from nothing else. Giving each install a name was small in the
+library and larger in the apps: something had to decide what the name is, carry
+it beside the credential rather than inside it, and keep answering as nobody for
+the credentials that were never issued to a device. Each of them does now.
 
 **Done when:** revoking one of three devices leaves the other two working,
 without anybody editing `config.toml` by hand, and a connection that device
@@ -727,7 +726,7 @@ side by side. The three fixed defects are recorded in
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
 | Masking that is not masking | `ui-desktop/src/app/shell/SideBarFooter.vue:59` puts the full node ID in a tooltip while showing the short form; the dashboard and config pages return short values in full |
 | Android: encrypted at rest, no gate in front | `ui-android/.../SecretStore.kt` (Keystore AES-256-GCM, `v1:` prefix) versus `ui/EndpointDetailScreen.kt` (shows and edits the 2FA secret, ~349-416, and exports an `otpauth` URI) |
-| One credential per client, not per device | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/auth/config.rs:54` (`clients: HashMap<String, ClientAuth>`), `:102` (the one `secret`); `auth/totp.rs:66` (looked up by the name off the wire, with no binding to the connecting peer); `conn/mod.rs:784-936` (`enroll_client` overwrites that one secret, which is why enrolling a device rotates every other one). Nothing is keyed by device: every `device` match in `crates/nexapipe/` is prose — a comment, a log line, the CLI's own banner at `main.rs:819` ("there is no per-device revocation") — or a client id in a test fixture (`config.rs:2706`)". Now a client carries a `devices` table beside its own `secret`, each entry with a secret of its own, and the handshake looks up whichever of the two the peer asked for. Enrolling one device rotates that device and leaves the others alone, and a `revoke` reaches the connections it already holds: the reload that notices what left `[auth]` closes them, rather than waiting for the peer to dial again. What no client can yet do is name a device of its own — see **Progress** under [Phase 3](#phase-3--v060-one-device-at-a-time) |
+| One credential per client, not per device | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/auth/config.rs:54` (`clients: HashMap<String, ClientAuth>`), `:102` (the one `secret`); `auth/totp.rs:66` (looked up by the name off the wire, with no binding to the connecting peer); `conn/mod.rs:784-936` (`enroll_client` overwrites that one secret, which is why enrolling a device rotates every other one). Nothing is keyed by device: every `device` match in `crates/nexapipe/` is prose — a comment, a log line, the CLI's own banner at `main.rs:819` ("there is no per-device revocation") — or a client id in a test fixture (`config.rs:2706`)". Now a client carries a `devices` table beside its own `secret`, each entry with a secret of its own, and the handshake looks up whichever of the two the peer asked for. Enrolling one device rotates that device and leaves the others alone, and a `revoke` reaches the connections it already holds: the reload that notices what left `[auth]` closes them, rather than waiting for the peer to dial again. Every client names a device of its own now — see **Progress** under [Phase 3](#phase-3--v060-one-device-at-a-time) |
 | No audit trail | ***closed in v0.6.0, for what the server can say from its own side.*** Was "the two `audit` matches under `crates/` are both unrelated — `metrics.rs:8` ("an audit surface", about a dependency) and `nexapipe-client/src/transport.rs:201`. `client_id` does not survive the handshake: `conn/mod.rs:156-165` hands `handle_bidi_stream` an ACL snapshot and a Node ID, so the three `log_access` calls at `:326`, `:402` and `:427` cannot say whose request they are logging, and `/v1/connections` (`admin/mod.rs:376-400`) reports no client at all". Now the connection carries the authenticated client *and* device, so every access line has both to draw on and `/v1/connections` answers who is connected rather than only how many. What is still missing is the *per-request* operator view — nothing aggregates those lines, and there is no exporter to send them anywhere: see [4.2](#42-observability-beyond-the-access-log-p1) |
 | Latency as a sum, not buckets | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/metrics.rs:96` (one `AtomicU64`), `:177-181` (the single `fetch_add`), `:335-344` (rendered as a plain counter, with the reason for that written immediately above it). No `histogram`, `bucket` or `prometheus` crate anywhere in the tree". Now `request_duration_ms` is twelve buckets over fixed boundaries with `+Inf` above them, accumulated per boundary and rendered cumulative on the way out so a partially-collected request cannot make the series non-monotonic (`:105-120`, `:426-459`). Still written by hand, so still no dependency added — and no `opentelemetry`/`otlp` match outside this document, which is a separate gap and still an open one |
 | No unit, and Windows compiles only | ***closed in v0.6.0.*** Was "no `*.service` in the repository or the docs; `docs/self-hosted-relay.md:103-107` starts the relay as a foreground command, and the only unit generated anywhere is the desktop service's, at runtime (`ui-desktop/src-tauri/src/service/platform.rs:887-906`, `Restart=on-failure`). Windows: `.github/workflows/ci.yml:122-140` runs `cargo check --workspace --all-targets --locked`, with the note at `:138` that the tests are compiled and not run". Now `docs/self-hosted-relay.md` carries a unit for the relay and both READMEs one for the server, each with the directives dated so a reader can tell what assumes how old a systemd — and `ci.yml` runs `cargo test --workspace --locked` on `windows-latest` under the name `windows-test`. What R6 still owes is not a unit but a package manager |

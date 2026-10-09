@@ -24,6 +24,21 @@ For what comes next, and for why some things are deliberately not planned, see
   exactly as it did: that is the path a peer naming no device takes, and the path
   every config written before this release is on.
 
+- **A client names the device it is speaking as.** The enrollment above could
+  issue a secret per device, but nothing could ask for one, so every device
+  answered with the client's shared secret and the table stayed empty however
+  many devices there were. Each install now answers as one named device of
+  itself: the desktop after its hostname and Android after the device model,
+  eight random characters behind either so two machines sharing a name do not
+  collide into one entry nobody can revoke for one of them. The name is claimed
+  at enrollment and nowhere else, because the server picks the secret by what
+  the response carries and refuses a device it has none filed for — a
+  credential that answered as a name nobody asked for would be rejected rather
+  than quietly accepted under the client's shared secret. Existing credentials
+  therefore carry on answering exactly as they do today, and nothing re-enrolls
+  on its own: both apps say what an unnamed device costs and offer the one thing
+  that changes it, which is importing a registration invite again.
+
 - **An access line says whose request it was.** A connection carries the client
   *and* the device it authenticated as, so every access line ends with
   `client=… device=…` and `/v1/connections` answers who is connected rather than
