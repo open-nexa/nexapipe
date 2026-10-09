@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-07 (Phase 3 opened for v0.6.0; the exploratory edge phase renumbered to Phase 4; entries closed by v0.3.0 marked in §9) |
+| Last updated | 2026-10-09 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §4 and §9) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -47,9 +47,15 @@ part no SaaS can copy.
 
 The gap is not architectural, it is maturity:
 
-- Identity is one shared TOTP secret per client, so revoking one device means
-  rotating every device using that client. Giving each device a credential of
-  its own is what [Phase 3](#phase-3--v060-one-device-at-a-time) opens.
+- Identity now goes as far as the device. Each device under a client is issued a
+  TOTP secret of its own at enrollment, so revoking one leaves the others
+  working, and `nexapipe client list|add|revoke --device` does it without anyone
+  editing `config.toml`. Two halves are still open: no client yet names itself,
+  so today it is the server's `--device` flag and nothing but it that puts a
+  device on the wire — and a device struck out while it holds a connection keeps
+  that connection until it hangs up. Both are
+  [Phase 3](#phase-3--v060-one-device-at-a-time); the kind of credential stays a
+  TOTP secret for now, which is what §4.3 is about.
 - Platform coverage has closed both of its holes: IPv6 inside the TUN and a
   second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
   list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
@@ -113,8 +119,8 @@ Comparison against NexaPipe specifically:
 | Visitor installs nothing | **no** | yes | yes | yes | yes | no (except Funnel) | yes |
 | TLS termination | **the backend** | yours | yours | Traefik | Cloudflare edge | Funnel / yours | yours |
 | Control plane | **none** | none | none | **strong** | yes | yes | yes |
-| Identity granularity | shared TOTP + host allowlist | bring your own | none | **SSO, OIDC, share links, audit** | Access (SSO) | IdP + ACLs | identity + private shares |
-| Observability | **access log only** | dashboard | none | dashboard + Traefik metrics | rich | rich | some |
+| Identity granularity | shared TOTP + per-device secrets + host allowlist | bring your own | none | **SSO, OIDC, share links, audit** | Access (SSO) | IdP + ACLs | identity + private shares |
+| Observability | access log naming client *and* device, `/metrics` with byte counters and latency buckets | dashboard | none | dashboard + Traefik metrics | rich | rich | some |
 | Embeddable | **rlib / JNI / UniFFI** | no | no | no | no | tsnet (Go) | Go SDK |
 | UDP | yes (Android TUN and desktop TUN) | yes | yes | yes | no | yes | yes |
 | Transport | iroh / QUIC | TCP, KCP, QUIC | TCP + Noise | WireGuard | QUIC | WireGuard | OpenZiti |
@@ -197,51 +203,72 @@ The access log now covers every path, and `/metrics`, `/healthz`, a request ID
 and a span per request cover the instance: see R7. v0.5.0 added the two things a
 dashboard reads: `/metrics` carries `nexapipe_traffic_bytes_total` for what this
 instance has served and accepted, and the desktop lists, per node, whether it
-answered its last probe and how much it has carried. What is still missing is an
-OpenTelemetry exporter, and latency — `/metrics` sums the milliseconds spent
-answering requests but carries no buckets, and neither client shows how long a
-request took. The buckets come in v0.6.0
-([Phase 3](#phase-3--v060-one-device-at-a-time)); the exporter, and latency on
-either client, do not.
+answered its last probe and how much it has carried. **The latency buckets
+shipped in v0.6.0.** Request duration is a histogram —
+`nexapipe_request_duration_ms_bucket{le="…"}` beside `_sum` and `_count`, over
+fixed boundaries from 1 ms to 10 s plus `+Inf` — so a p99 is read off the scrape
+rather than divided out by hand. What is still missing is an OpenTelemetry
+exporter, and latency on either client: neither the desktop nor Android shows
+how long a request took, and `/metrics` is still the only place that does. The
+exporter, and client-side latency, are not planned for this release.
 
 ### 4.3 Identity and authorization (P1)
 
-Authentication is a symmetric TOTP secret per `client_id`. Devices sharing a
-client share a secret, so revoking one device rotates all of them — the README
-says so. There is no per-device identity, no mTLS, no OIDC, no API keys, and no
-audit trail of who reached which host.
+Authentication is a TOTP secret. **The shared-secret half closed in v0.6.0:**
+what a `client_id` carries now is its own `secret` plus a table of devices, each
+with a secret of its own issued at enrollment, and each revocable without
+touching the others. The README stopped saying that too, and both halves that
+[Phase 3](#phase-3--v060-one-device-at-a-time) still owed the model have landed
+since: a revoked device no longer keeps the connections it already holds, and
+every client answers as one named device of itself. There is still no mTLS, no
+OIDC and no API keys.
 
-The direction is already right: the `v=2` invite with a one-shot enrollment token
-downgraded "leaked URL means leaked credential forever" to "leaked URL is
-revocable and short-lived". The next step is per-device keys signed by the server,
-with TOTP as a human second factor rather than the device identity itself.
+The same release closed the audit trail half for the server side: an access line
+names the client *and* the device that made the request, which it could not do
+before because a `client_id` did not survive the handshake.
 
-**Phase 3 takes the first half of that step: one credential per device**, issued
-at enrollment and revocable on its own, with the credential still a TOTP secret
-and the handshake still the HMAC it is today. What it leaves alone is the *kind*
-of credential — per-device key pairs, and TOTP demoted to a second factor a human
-supplies, are the release after, because they also mean new material in both
-credential stores and a factor an unattended service cannot answer.
+The `v=2` invite, with its one-shot enrollment token, is what downgraded "leaked
+URL means leaked credential forever" to "leaked URL is revocable and
+short-lived", and enrollment is where a device name comes from now. The direction
+it points at is unchanged: per-device keys signed by the server, with TOTP as a
+human second factor rather than the device identity itself.
+
+**Phase 3 took the first half of that step, and it has landed: one credential per
+device**, issued at enrollment and revocable on its own, with the credential
+still a TOTP secret and the handshake still the HMAC it is today. The second half
+is the *kind* of credential — per-device key pairs, and TOTP demoted to a second
+factor a human supplies — and it stays out of this release because it also means
+new material in both credential stores and a factor an unattended service cannot
+answer. Of the other half of making revocation true, closing the connections a
+revoked device already holds has landed. So has putting a name on the wire from
+the clients rather than from `--device` alone: each install answers as one named
+device of itself, which is what makes per-device revocation reachable from
+somewhere other than an operator's shell.
 
 ### 4.4 Operations and distribution (P1)
 
-- The management surface is read-only for now: `/v1/*` and `nexapipe status`
-  answer "which routes are live" and "who is connected", but nothing can change
-  them — adding or revoking a client still means editing `config.toml` by hand
-  or generating an invite from the CLI. Writes wait on R5's identity model.
+- **The write half of the management surface shipped in v0.6.0**, as CLI
+  subcommands: `nexapipe client list|add|revoke`, each device-scoped with
+  `--device`, writing through the same config lock the writers already used.
+  `/v1/*` stays GET-only on purpose — the admin token is one opaque value with
+  no scope and no rotation, and giving it something to change in the same release
+  as the thing it would change is how a read-only surface becomes the way in.
 - Hot reload rules are one table in both READMEs as of v0.3.0, including what
   needs a restart. What is still uneven is enforcement, not documentation.
 - Distribution stopped being download-only in v0.5.0: a container image is
   published to GHCR with the release archives, and `docs/self-hosted-relay.md`
-  takes a relay from nothing to running. Still missing: a systemd unit in the
-  docs, which v0.6.0 adds, and any of Homebrew / winget / scoop, which it does
-  not. See R6.
+  takes a relay from nothing to running — including a systemd unit for it, which
+  v0.6.0 added, and the server has one of its own in both READMEs as of the same
+  release. Still missing: any of Homebrew / winget / scoop, which it does not.
+  See R6.
 - Engineering hygiene: `CHANGELOG.md` exists as of v0.3.0; tests run on Linux
-  and macOS; the root workspace is compiled on Windows as of v0.5.0, which it
-  never was before — the desktop crate had a Windows job, and it is `cargo
-  check` only, which v0.6.0 turns into a run; the Android lint baseline still
-  pins 32 historical findings; no fuzzing, no benchmarks; the vendored smoltcp
-  patch needs long-term tracking.
+  and macOS; **the root workspace is *tested* on Windows as of v0.6.0** — the
+  job used to be `windows-check`, a `cargo check`, so the integration tests
+  compiled for `x86_64-pc-windows-msvc` and nothing ever ran them, and a bug
+  that only surfaces in a running test reached a tag before CI saw one. It is
+  `windows-test` now and runs the same `cargo test --workspace --locked` the
+  other two do; the Android lint baseline still pins 32 historical findings; no
+  fuzzing, no benchmarks; the vendored smoltcp patch needs long-term tracking.
 
 ### 4.5 Protocols and transport (P1/P2)
 
@@ -523,7 +550,7 @@ left standing, and the one thing Phase 1 handed over half-done:
 | R9 | **Client resilience, the second half** | Health decides which node the next request goes to, and a node that could not be dialled is marked down by the request that found out rather than by the probe thirty seconds later. `select` answers `Option<usize>`, so "none of them" is sayable for the first time. The group is still not mutable, so a down node is skipped rather than removed. See [4.6](#46-client-resilience-p1) |
 | C7 | **A probe for the backends that cannot answer `GET /health`** | `passthrough` and `tcp` routes are probed by connecting, a TLS backend by completing its handshake. A `udp`-only route is deliberately still unprobed. See [4.1](#41-backend-handling-p2) |
 | — | **Traffic you can see** | The client counts what each node carried, the desktop shows it per node, the Android notification shows live rates, and the server's `/metrics` gained `nexapipe_traffic_bytes_total`. The number is tunnel payload: no headers, nothing discarded, and nothing counted twice — the TUN interface pump is deliberately not instrumented. See [4.2](#42-observability-beyond-the-access-log-p1) |
-| R6 | **Distribution, two of its four parts** | A container image published to GHCR with the release archives, and a self-hosted relay documented end to end. Still open: a systemd unit in the docs, and any of Homebrew, winget and scoop. See [4.4](#44-operations-and-distribution-p1) |
+| R6 | **Distribution, three of its four parts** | A container image published to GHCR with the release archives, a self-hosted relay documented end to end, and a systemd unit for the relay there and for the server in both READMEs. Still open: any of Homebrew, winget and scoop. See [4.4](#44-operations-and-distribution-p1) |
 | — | **The root workspace compiles on Windows** | It had no Windows job at all, so `crates/*` had never been built for `x86_64-pc-windows-msvc` outside a release tag. Check only, no tests: the integration tests spawn the binary and reach for `cfg(unix)` fixtures. See [4.4](#44-operations-and-distribution-p1) |
 
 The desktop credential door is not one of these either, though it ships in the
@@ -542,21 +569,38 @@ tests and by compilation only.
 
 ### Phase 3 — v0.6.0, "one device at a time"
 
-No new deliverable is opened for this release. It is the one item Phase 0 left
-that has never started — R5 — and the write half of R4 that has been waiting on
-it, plus three things small enough that deferring them costs more than doing
-them.
+No new deliverable is opened for this release. It is the item Phase 0 left that
+had never started — R5 — and the write half of R4 that was waiting on it, plus
+three things small enough that deferring them costs more than doing them. Four
+are whole now — see **Progress** below.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| R5 | **Per-device credentials** | One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`. The credential stays a TOTP secret and the handshake stays HMAC-SHA256 over `nonce ‖ timestamp`: what changes is which secret is looked up, and that a device can be struck out — while it is connected, not only the next time it dials — without touching the others. A `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it does today: that is the path a peer that names no device takes, and the path every config written before this release is on. See [4.3](#43-identity-and-authorization-p1) |
-| R5 | **A minimal audit log** | Who — client *and* device — reached which host, when, and with what outcome. A `client_id` does not get past the handshake today: a connection carries an ACL snapshot and a Node ID and nothing else, so no access line, no metric and no `/v1/connections` entry can say whose request it was (`conn/mod.rs:1235-1241`, `admin/mod.rs:376-400`). Threading the identity through is the same plumbing revocation needs, so the two land together rather than one waiting for the other |
-| R4 | **The write half, as CLI subcommands** | `nexapipe client list\|add\|revoke`, device-scoped. The writers already exist and already take the config lock (`config.rs:1298-1416`); the loopback endpoints stay GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in (`admin/mod.rs:34-37`) |
-| — | **Latency you can read** | `/metrics` sums the milliseconds and carries no buckets, so nothing here can answer what its own p99 is — the reason it is a sum is written down at `metrics.rs:335-344`. Hand-rendered `_bucket{le="…"}` beside `_sum` and `_count`, keeping the exposition dependency-free. See [4.2](#42-observability-beyond-the-access-log-p1) |
-| — | **A systemd unit in the docs** | `docs/self-hosted-relay.md` takes a relay from nothing to a foreground command and stops there, and no unit for the server itself exists anywhere in the tree. The desktop service already writes the shape this would copy, hardened (`ui-desktop/src-tauri/src/service/platform.rs:887-906`). See [4.4](#44-operations-and-distribution-p1) |
-| — | **Windows runs the tests** | `windows-check` is `cargo check --workspace --all-targets`, so the integration tests compile for `x86_64-pc-windows-msvc` and nothing executes them — a bug that only appears when they run reaches a tag before CI sees one. One step in a job that is already there, and a rename of that job to `windows-test` along with it, because its `name:` is what a PR shows. See [4.4](#44-operations-and-distribution-p1) |
+| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
+| R5 | **A minimal audit log** | **Shipped.** Who — client *and* device — reached which host, when, and with what outcome. The identity survives the handshake now (`conn/mod.rs`), so an access line and `/v1/connections` can say whose request they are reporting; it used to carry an ACL snapshot and a Node ID and nothing else |
+| R4 | **The write half, as CLI subcommands** | **Shipped.** `nexapipe client list\|add\|revoke`, device-scoped, through the writers that already took the config lock; the loopback endpoints stayed GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in |
+| — | **Latency you can read** | **Shipped.** `/metrics` renders `_bucket{le="…"}` beside `_sum` and `_count`, hand-written to keep the exposition dependency-free, so a p99 is read rather than divided out. It carries no labels beyond `le` and no `{route}`: what it answers is "what is this instance's latency", which is the question the meter was missing |
+| — | **A systemd unit in the docs** | **Shipped.** `docs/self-hosted-relay.md` carries a unit for the relay and both READMEs one for the server, each with the directives dated so a reader can tell what assumes how old a systemd. The server's is the harder of the two to make safe: it writes back into its own config — 2FA counters, an enrolled device — and writes its admin token beside it, so it keeps a named account and one writable directory rather than the `DynamicUser` the relay can run under. See [4.4](#44-operations-and-distribution-p1) |
+| — | **Windows runs the tests** | **Shipped.** The job was `windows-check`, a `cargo check --workspace --all-targets`, so the integration tests compiled for `x86_64-pc-windows-msvc` and nothing executed them — a bug that only appears when they run reached a tag before CI saw one. It is `windows-test` now and runs the same command the Linux and macOS runners do. See [4.4](#44-operations-and-distribution-p1) |
 
-**Progress.** Nothing here is started.
+**Progress.** All six are whole. Whole: the identity threading that lets
+an access line and `/v1/connections` name client *and* device (R5, audit log),
+`client list|add|revoke` with `--device` (R4), latency buckets on `/metrics`,
+`windows-test` actually running the tests, and a systemd unit for the relay in
+that page and for the server in both READMEs. R5's device table is whole too: a
+secret per device, looked up per device at the handshake, and a revoke that
+reaches the connections the device already holds, not only the next one it
+dials.
+
+What stood here last was a decision rather than a defect: **no client sent a
+device name.** The wire has carried `device_id` since the enrollment work —
+`Option`, so a peer that names none takes the client's own secret exactly as it
+always did — but the client library never grew the field, so every device was
+the device that names none, and per-device credentials were reachable from
+`--device` and from nothing else. Giving each install a name was small in the
+library and larger in the apps: something had to decide what the name is, carry
+it beside the credential rather than inside it, and keep answering as nobody for
+the credentials that were never issued to a device. Each of them does now.
 
 **Done when:** revoking one of three devices leaves the other two working,
 without anybody editing `config.toml` by hand, and a connection that device
@@ -619,13 +663,14 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
 
 Of that row, R15, R12, R10 and R11 shipped in v0.4.0. R9 shipped its probing
 half there and its selection half in v0.5.0 — see the progress note under
-Phase 1 and the table under [Phase 2](#phase-2--v050-observable). R6 is half
-done: the image and the relay docs landed, the systemd unit and the package
-managers did not — the unit comes in
-[Phase 3](#phase-3--v060-one-device-at-a-time), the package managers do not. R5
-and the write half of R4 are the two that have never started, and they are what
-that phase opens. R13 keeps its id and its gate; what moved is the phase number
-above it, because v0.6.0 was inserted beneath it.
+Phase 1 and the table under [Phase 2](#phase-2--v050-observable). R6 is nearly
+done: the image, the relay docs and both systemd units landed — only the package
+managers are still open after them. R5's
+credentials and the write half of R4 are in `main`; what that phase still owes
+is the other half of making revocation true, which the dependencies graph does
+not separate out because the two halves share a deliverable. R13 keeps its id
+and its gate; what moved is the phase number above it, because v0.6.0 was
+inserted beneath it.
 
 ---
 
@@ -674,15 +719,14 @@ side by side. The three fixed defects are recorded in
 | No IPv6 in the TUN | *closed in v0.4.0.* Was "AAAA queries are answered empty (`ANCOUNT=0`)" at `crates/nexapipe-client/src/tun_proxy.rs:1178-1180`. Now an AAAA query in the Internet class gets a 16-byte answer out of a virtual pool (`:1324-1340`, `:1472-1475`), on both clients; the desktop's pool is best effort, since `configure_ipv6` may be refused per platform. |
 | Client DNS cache semantics | `crates/nexapipe-client/src/tun_proxy.rs:1269` (question parsed without QCLASS), `:1542-1543` with the clamp at `:1664` (TTL bounds), `:1551` (cache key), `:1571-1587` (a hit rewrites the transaction ID only) |
 | No node health or reconnect | `crates/nexapipe-client/src/endpoint_group.rs` (no health state); retry at `local_proxy.rs:267` |
-| Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). The write subcommands (`client add\|revoke`) are still absent. The same release added what R7 asked for beside the gauges: a request ID per request (`log::next_request_id`, on the access line and as `x-request-id`) and a span around each one. |
+| Metrics and admin surface | *closed in v0.3.0.* Was "no `prometheus`/`metrics` match anywhere in the tree; CLI subcommands limited to those in `main.rs:30-144`". Now `crates/nexapipe/src/metrics.rs` (counters and hand-written exposition), `src/admin/` (`/healthz`, `/metrics`, `/v1/*` behind `<config>.admin-token`) and `src/status.rs` (`nexapipe status`). **The write subcommands arrived in v0.6.0** — `client add\|revoke`, device-scoped, as subcommands rather than as endpoints, so the token stayed GET-only. The same release added what R7 asked for beside the gauges: a request ID per request (`log::next_request_id`, on the access line and as `x-request-id`) and a span around each one. |
 | CHANGELOG, image publication | *closed in v0.5.0.* `CHANGELOG.md` has been at the repository root since v0.3.0; the image half lands with this release, where `build-image` pushes one leg per architecture by digest and `publish-image` merges them into a single multi-arch manifest under `ghcr.io/open-nexa/nexapipe` — `:latest` only for a tag with no prerelease suffix (`.github/workflows/release.yml:1018`, `:1097`). |
 | iroh version and boundary conditions | `Cargo.toml:38` asks for `^1.0.1` and `Cargo.lock` resolves 1.2.0 — a caret range, not the pin an earlier note here claimed. The boundaries themselves are documented in `docs/iroh-boundaries.md`, linked from the `[iroh]` section of both READMEs. |
 | No iOS answer despite the bindings | `crates/nexapipe-client/Cargo.toml:58-59` carries an iOS-scoped `webpki-roots` dependency; no Apple target or app exists |
 | Desktop: credentials encrypted, but ungated | `ui-desktop/src-tauri/src/credentials.rs` (keychain master key + `credentials.v1.json`, covers TOTP secret, enrollment token, relay token) versus `ui-desktop/src/stores/config.ts` (`ticket` and `endpointId` still persisted in cleartext `localStorage`; nothing prompts before a read) |
 | Masking that is not masking | `ui-desktop/src/app/shell/SideBarFooter.vue:59` puts the full node ID in a tooltip while showing the short form; the dashboard and config pages return short values in full |
 | Android: encrypted at rest, no gate in front | `ui-android/.../SecretStore.kt` (Keystore AES-256-GCM, `v1:` prefix) versus `ui/EndpointDetailScreen.kt` (shows and edits the 2FA secret, ~349-416, and exports an `otpauth` URI) |
-| One credential per client, not per device | `crates/nexapipe/src/auth/config.rs:54` (`clients: HashMap<String, ClientAuth>`), `:102` (the one `secret`); `auth/totp.rs:66` (looked up by the name off the wire, with no binding to the connecting peer); `conn/mod.rs:784-936` (`enroll_client` overwrites that one secret, which is why enrolling a device rotates every other one). Nothing is keyed by device: every `device` match in `crates/nexapipe/` is prose — a comment, a log line, the CLI's own banner at `main.rs:819` ("there is no per-device revocation") — or a client id in a test fixture (`config.rs:2706`) |
-| No audit trail | the two `audit` matches under `crates/` are both unrelated — `metrics.rs:8`
-("an audit surface", about a dependency) and `nexapipe-client/src/transport.rs:201`. `client_id` does not survive the handshake: `conn/mod.rs:156-165` hands `handle_bidi_stream` an ACL snapshot and a Node ID, so the three `log_access` calls at `:326`, `:402` and `:427` cannot say whose request they are logging, and `/v1/connections` (`admin/mod.rs:376-400`) reports no client at all |
-| Latency as a sum, not buckets | `crates/nexapipe/src/metrics.rs:96` (one `AtomicU64`), `:177-181` (the single `fetch_add`), `:335-344` (rendered as a plain counter, with the reason for that written immediately above it). No `histogram`, `bucket` or `prometheus` crate anywhere in the tree, and no `opentelemetry`/`otlp` match outside this document |
-| No unit, and Windows compiles only | no `*.service` in the repository or the docs; `docs/self-hosted-relay.md:103-107` starts the relay as a foreground command, and the only unit generated anywhere is the desktop service's, at runtime (`ui-desktop/src-tauri/src/service/platform.rs:887-906`, `Restart=on-failure`). Windows: `.github/workflows/ci.yml:122-140` runs `cargo check --workspace --all-targets --locked`, with the note at `:138` that the tests are compiled and not run |
+| One credential per client, not per device | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/auth/config.rs:54` (`clients: HashMap<String, ClientAuth>`), `:102` (the one `secret`); `auth/totp.rs:66` (looked up by the name off the wire, with no binding to the connecting peer); `conn/mod.rs:784-936` (`enroll_client` overwrites that one secret, which is why enrolling a device rotates every other one). Nothing is keyed by device: every `device` match in `crates/nexapipe/` is prose — a comment, a log line, the CLI's own banner at `main.rs:819` ("there is no per-device revocation") — or a client id in a test fixture (`config.rs:2706`)". Now a client carries a `devices` table beside its own `secret`, each entry with a secret of its own, and the handshake looks up whichever of the two the peer asked for. Enrolling one device rotates that device and leaves the others alone, and a `revoke` reaches the connections it already holds: the reload that notices what left `[auth]` closes them, rather than waiting for the peer to dial again. Every client names a device of its own now — see **Progress** under [Phase 3](#phase-3--v060-one-device-at-a-time) |
+| No audit trail | ***closed in v0.6.0, for what the server can say from its own side.*** Was "the two `audit` matches under `crates/` are both unrelated — `metrics.rs:8` ("an audit surface", about a dependency) and `nexapipe-client/src/transport.rs:201`. `client_id` does not survive the handshake: `conn/mod.rs:156-165` hands `handle_bidi_stream` an ACL snapshot and a Node ID, so the three `log_access` calls at `:326`, `:402` and `:427` cannot say whose request they are logging, and `/v1/connections` (`admin/mod.rs:376-400`) reports no client at all". Now the connection carries the authenticated client *and* device, so every access line has both to draw on and `/v1/connections` answers who is connected rather than only how many. What is still missing is the *per-request* operator view — nothing aggregates those lines, and there is no exporter to send them anywhere: see [4.2](#42-observability-beyond-the-access-log-p1) |
+| Latency as a sum, not buckets | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/metrics.rs:96` (one `AtomicU64`), `:177-181` (the single `fetch_add`), `:335-344` (rendered as a plain counter, with the reason for that written immediately above it). No `histogram`, `bucket` or `prometheus` crate anywhere in the tree". Now `request_duration_ms` is twelve buckets over fixed boundaries with `+Inf` above them, accumulated per boundary and rendered cumulative on the way out so a partially-collected request cannot make the series non-monotonic (`:105-120`, `:426-459`). Still written by hand, so still no dependency added — and no `opentelemetry`/`otlp` match outside this document, which is a separate gap and still an open one |
+| No unit, and Windows compiles only | ***closed in v0.6.0.*** Was "no `*.service` in the repository or the docs; `docs/self-hosted-relay.md:103-107` starts the relay as a foreground command, and the only unit generated anywhere is the desktop service's, at runtime (`ui-desktop/src-tauri/src/service/platform.rs:887-906`, `Restart=on-failure`). Windows: `.github/workflows/ci.yml:122-140` runs `cargo check --workspace --all-targets --locked`, with the note at `:138` that the tests are compiled and not run". Now `docs/self-hosted-relay.md` carries a unit for the relay and both READMEs one for the server, each with the directives dated so a reader can tell what assumes how old a systemd — and `ci.yml` runs `cargo test --workspace --locked` on `windows-latest` under the name `windows-test`. What R6 still owes is not a unit but a package manager |

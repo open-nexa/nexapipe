@@ -219,6 +219,120 @@ docker compose logs -f --tail=50 nexapipe | grep -i reload
 # Config not reloaded, keeping the current routes: ... → 被拒绝，旧路由继续服务
 ```
 
+### systemd
+
+上面的命令都把服务端留在启动它的那个 shell 的前台。要作为服务运行，先装好二进制
+并给它一个账号：
+
+```bash
+sudo install -m 0755 target/release/nexapipe /usr/local/bin/nexapipe
+sudo useradd --system --shell /usr/sbin/nologin nexapipe
+sudo mkdir -p /etc/nexapipe
+sudo cp config.toml.example /etc/nexapipe/config.toml
+sudo chown -R nexapipe:nexapipe /etc/nexapipe
+sudo chmod 700 /etc/nexapipe
+sudo chmod 600 /etc/nexapipe/config.toml
+```
+
+然后写 `/etc/systemd/system/nexapipe.service`：
+
+```ini
+[Unit]
+Description=NexaPipe server
+Documentation=https://github.com/open-nexa/nexapipe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexapipe
+Group=nexapipe
+ExecStart=/usr/local/bin/nexapipe --config /etc/nexapipe/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# 只在文件存在时读取：前面的 `-` 就是「可选」的意思。服务端从环境里读的只有
+# NEXAPIPE_LOG_DIR 和 NEXAPIPE_MAX_CONNS_PER_PEER 两项 —— 别的都挪不出
+# config.toml，所以密钥留在配置里，配置保持 0600。
+EnvironmentFile=-/etc/nexapipe/nexapipe.env
+
+# ProtectSystem=strict 之下，除这里列出的路径外全部只读。配置目录必须可写，
+# 原因见下面第二条。
+ReadWritePaths=/etc/nexapipe
+LogsDirectory=nexapipe
+
+# 只有 [server] listen_addr 低于 1024 才需要。隧道不占特权端口，而 2FA 开启时
+# 非回环监听会被拒绝，所以多数部署这两行都保持注释。
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+# 带上 AF_UNIX 是因为 backends 里的主机名仍走 C 库的解析器，某些配置下它要连
+# 本地套接字：没被列进来的协议族不是一条警告，而是解析失败。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now nexapipe
+sudo systemctl status nexapipe
+journalctl -u nexapipe -f
+```
+
+**用具名账号，而不是 `DynamicUser=yes`。** 这个进程在 `/etc/nexapipe` 下拥有
+文件——它要重写的配置，以及首次启动时写在配置旁边的令牌——而动态用户是给「除
+systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UID 只为一次启动分配，
+之后可能交给另一个服务，所以 systemd 会把 `StateDirectory`、`CacheDirectory`
+和 `LogsDirectory` 自行挪到别处。`/etc` 下的凭据文件不在这三者之中。
+
+**配置目录必须保持可写。** 服务端会把 2FA 的 `failed_attempts` /
+`locked_until` 计数、已注册设备的密钥和它的 `last_used` 写回 `config.toml`，
+并在首次启动时在旁边写出 `config.toml.admin-token`。`ReadWritePaths` 只放开
+这一个目录。只有关掉 2FA 且不做注册的部署才用不上它。
+
+**每次改完都要是 `0600`、属主 `nexapipe`。** 配置里带 `[auth]` 密钥、
+`[iroh] secret_key` 或 `relay_auth_token`，且能被其他账号读到时，服务端
+**拒绝启动**——进程以 1 退出，而不是带着一份谁都能复制的凭据继续服务；在权限
+修好之前，reload 也开不了 2FA。用 root 编辑是最常见的丢法：改成
+`sudo -u nexapipe $EDITOR /etc/nexapipe/config.toml`，或者事后 `chown` +
+`chmod`。
+
+**改配置不需要 reload。** 文件每 5 秒重读一次；对没有 `ExecReload` 的 unit
+执行 `systemctl reload` 只会得到一条警告，什么也不会发生。拒绝错误改动也是
+watcher 的职责：解析不了的改动，或者把文件权限改松的改动，会被记录下来，
+而已经在服务的路由继续服务。
+
+另有两件与 systemd 无关的事。**打开隧道的 UDP 端口**——设置 `[iroh] bind_port`，
+否则端点用的是临时端口，没有端口可写规则。以及 **用能读令牌文件的账号执行
+`nexapipe status`**，因为它是从那里读令牌的：
+
+```bash
+sudo -u nexapipe nexapipe --config /etc/nexapipe/config.toml status
+```
+
+`[log]` 的文件日志与 journal 是两回事，`dir` 默认是相对工作目录的 `./logs`，
+而 systemd 下的工作目录是 `/`——所以默认值指向一个该服务建不出来的目录。这不致
+命：stderr 上一行，这一次启动没有文件日志。把它指到 unit 拥有的目录：
+
+```toml
+[log]
+dir = "/var/log/nexapipe"      # 上面的 LogsDirectory=nexapipe 会创建并属主化
+```
+
+**上面的 unit 没有在本项目的 CI 里跑过**——`docs/self-hosted-relay.md` 对
+relay 那份也是同样的声明。这些指令不是同一时期引入的，systemd 遇到不认识的指令
+只是在 journal 里写一行，不会拒绝启动：`ProtectProc=invisible` 需要 247，
+`StateDirectory=` 及其所在的 `*Directory=` 一族需要 235，`ProtectSystem=strict`
+需要 232。更旧的系统上 unit 照样起来，只是读不懂的保护项静默缺失，
+`systemd-analyze verify` 会把它们点出来。
+
 ---
 
 ## 命令行
@@ -542,8 +656,10 @@ nexapipe status --config config.toml --json   # 单个 JSON 文档，给脚本�
 重载。`nexapipe status` 读同一个文件，且绝不创建它 —— 它自己造的 token 服务端并不
 认识。要轮换就删掉文件再重启。
 
-`/v1/*` 有意只做只读。`client add` 和 `client revoke` 依赖尚未落地的按设备身份模型，
-而一个只回答问题的接口，是没法被说服去改动任何东西的。
+`/v1/*` 只回答问题，别的什么也不做。增删凭据走上面的 `nexapipe client add` 与
+`client revoke`，它们在服务端所用的同一把锁下编辑这个接口所读的那份配置。admin
+token 是一个没有作用域、也没有轮换机制的不透明值，不该被赋予写权限——一个只回答
+问题的接口，是没法被说服去改动任何东西的。
 
 `[metrics] enabled` 默认是关的，因为它所依附的监听没有认证：必须**同时**开启它
 并绑定地址，才会有东西暴露出来。只开 `enabled` 而没有 `[admin]` 段会记一条警告且

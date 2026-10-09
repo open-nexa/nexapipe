@@ -31,10 +31,12 @@
 //! | `GET /v1/connections` | token | The peers connected right now, and which client and device each authenticated as. |
 //! | `GET /v1/health` | token | Backend pools, in and out of rotation. |
 //!
-//! The `/v1/*` half is guarded by a generated token (see [`token`]). It is
-//! read-only on purpose: `client add` and `client revoke` need the per-device
-//! identity model that is not here yet, and a management surface that only
-//! answers questions is one that cannot be talked into changing anything.
+//! The `/v1/*` half is guarded by a generated token (see [`token`]). It answers
+//! questions and nothing else: adding and revoking are `nexapipe client add` and
+//! `client revoke`, which write the config through the same lock this reads. A
+//! token that is one opaque value, with no scope and no rotation, is not something
+//! to hand write access to — a management surface that only answers questions is
+//! one that cannot be talked into changing anything.
 use crate::config::RouteMode;
 use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
