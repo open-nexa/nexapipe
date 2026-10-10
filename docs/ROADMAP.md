@@ -572,9 +572,9 @@ waiting for the next probe; an operator can say how much an instance carried
 without reading the access log; and a newcomer brings up their own relay from
 the docs without asking anyone. The first two are shipped. The relay page is
 written but has not been followed end to end on a machine that had nothing on it
-— which is the one claim here nobody has tested. Nor has the Android
-notification been watched running on a device: its rates are verified by unit
-tests and by compilation only.
+— which is the one claim here nobody has tested. The Android notification is
+not in that position: its rates have been watched running on a device, rather
+than resting on unit tests and compilation alone.
 
 ### Phase 3 — v0.6.0, "one device at a time"
 
