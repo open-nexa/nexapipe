@@ -451,6 +451,16 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// without it the probe also runs in lockstep with the pool's 5 s cleanup.
 const PROBE_JITTER: Duration = Duration::from_secs(5);
 
+/// Ceiling for a whole preconnect phase, across every pool at once.
+///
+/// [`PRECONNECT_TIMEOUT`] is what one pool may spend; this is what the phase
+/// may. It has to stay above the former or a backend that used its full budget
+/// is cut off here instead — counted unreachable for being slow, which is the
+/// same confusion the per-pool budget exists to avoid. The slack is for
+/// scheduling and for assembling the report, not for more dialling.
+pub(crate) const PRECONNECT_PHASE_CAP: Duration =
+    PRECONNECT_TIMEOUT.saturating_add(Duration::from_secs(2));
+
 /// A persistently dead backend is reported once, then every this-many probes.
 ///
 /// A backend that has been down for an hour has failed a hundred probes. Saying
@@ -1011,8 +1021,9 @@ impl EndpointGroup {
     ///   caller-owned endpoint, and would collapse all backends into a single
     ///   probe
     /// - Runs all connectivity tests in parallel via `JoinSet`
-    /// - Applies a short per-pool timeout (PRECONNECT_TIMEOUT = 5s)
-    /// - Caps the overall phase at 10s
+    /// - Applies a per-pool budget of [`PRECONNECT_TIMEOUT`], which covers the
+    ///   connect and the wait for a 2FA refusal together
+    /// - Caps the whole phase at [`PRECONNECT_PHASE_CAP`]
     ///
     /// This ensures that a single unreachable backend node does not block the
     /// entire connection flow.
@@ -1082,8 +1093,9 @@ impl EndpointGroup {
             });
         }
 
-        // Overall cap: 10s for the entire preconnect phase.
-        let overall_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        // Overall cap: the per-pool budget plus a little slack, so a pool that
+        // used its whole budget is still what decided the answer.
+        let overall_deadline = tokio::time::Instant::now() + PRECONNECT_PHASE_CAP;
         let mut probed = 0usize;
         while let Ok(result) = tokio::time::timeout_at(overall_deadline, join_set.join_next()).await
         {

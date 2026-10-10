@@ -20,13 +20,6 @@ const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 /// Interval of the background watcher that removes closed/stale connections from the pool.
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-/// Per-pool timeout for preconnect / warm-up. Much shorter than CONNECTION_TIMEOUT
-/// so that a single unreachable node does not hold up the entire preconnect phase.
-///
-/// Sized to fit a slow relay handshake plus [`AUTH_REQUIRED_GRACE`]: cutting the
-/// observation short would turn a backend that demands 2FA into one that merely
-/// looks unreachable, with the real reason lost.
-pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
 /// Budget for the connect half of a preconnect.
 ///
 /// Deliberately shorter than [`PRECONNECT_TIMEOUT`]: the caller cancels the whole
@@ -47,6 +40,27 @@ const PRECONNECT_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration:
 /// above the server's constant — raising one without the other silently turns
 /// "the server requires 2FA" back into "the backend looks unreachable".
 const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(6);
+
+/// Budget for one preconnect / warm-up, covering both of its halves.
+///
+/// This is the whole of what [`IrohConnectionPool::preconnect`] may spend, not
+/// only the connect: [`AUTH_REQUIRED_GRACE`] belongs *inside* the preconnect
+/// rather than after it. It used to sit outside, with the connect alone
+/// budgeted at 8s, so a backend that took more than two seconds to answer was
+/// cancelled in the middle of being observed and reported unreachable for
+/// being slow.
+///
+/// It has to hold both halves. Shortening the observation is its own failure —
+/// a backend that demands 2FA starts to look like one that is merely
+/// unreachable, with the reason lost — which is why this is the sum and not
+/// something tighter.
+pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(12);
+
+/// Both halves have to fit, or the observation is what gets cut.
+const _: () = assert!(
+    PRECONNECT_TIMEOUT.as_secs()
+        >= PRECONNECT_CONNECT_TIMEOUT.as_secs() + AUTH_REQUIRED_GRACE.as_secs()
+);
 
 /// The application error code the server closes a connection with when it
 /// requires 2FA the client never performed. Must match `auth_close_code::REQUIRED`
@@ -522,12 +536,19 @@ impl IrohConnectionPool {
             }
         }
 
+        // One deadline for the whole preconnect. The observation below is part
+        // of it, not a wait that starts once the connect is over: a backend that
+        // was merely slow used to be cancelled in the middle of that
+        // observation and reported unreachable.
+        let started = tokio::time::Instant::now();
+        let deadline = started + PRECONNECT_TIMEOUT;
+
         let conn = {
             let Some(ep) = self.endpoint().await else {
                 return false;
             };
-            match tokio::time::timeout(
-                PRECONNECT_TIMEOUT,
+            match tokio::time::timeout_at(
+                deadline,
                 self.connect_and_auth(&ep, PRECONNECT_CONNECT_TIMEOUT),
             )
             .await
@@ -553,15 +574,21 @@ impl IrohConnectionPool {
         // ever carry traffic is the server's call, and it answers by closing
         // once its handshake deadline passes. Watch for that instead of
         // reporting a connection the server already refused as a warm one.
-        if self.inner.two_factor.lock().await.is_none()
-            && let Some(reason) = wait_for_auth_required(&conn).await
-        {
-            #[cfg(feature = "tracing")]
-            tracing::warn!("preconnect refused by the server: {}", reason);
-            #[cfg(not(feature = "tracing"))]
-            let _ = &reason;
-            *self.inner.auth_required.lock().await = Some(reason);
-            return false;
+        if self.inner.two_factor.lock().await.is_none() {
+            // Only what is left of the budget, so the observation is never what
+            // pushes the preconnect past it. It still gets the whole grace
+            // whenever the connect kept to its own, which is the case that has
+            // to work.
+            let grace =
+                AUTH_REQUIRED_GRACE.min(PRECONNECT_TIMEOUT.saturating_sub(started.elapsed()));
+            if let Some(reason) = wait_for_auth_required(&conn, grace).await {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("preconnect refused by the server: {}", reason);
+                #[cfg(not(feature = "tracing"))]
+                let _ = &reason;
+                *self.inner.auth_required.lock().await = Some(reason);
+                return false;
+            }
         }
 
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
@@ -661,9 +688,13 @@ impl IrohConnectionPool {
 /// Returns the reason the server gave when it closes the connection with
 /// [`AUTH_REQUIRED_CLOSE_CODE`], and `None` when the connection stays up — or
 /// dies for any other reason, which is not what this is looking for.
-async fn wait_for_auth_required(conn: &Connection) -> Option<String> {
+/// `grace` is however much of the preconnect budget is left rather than
+/// [`AUTH_REQUIRED_GRACE`] itself: the caller owns the deadline, so it decides
+/// how much of it this wait may spend. Passing the full constant is only right
+/// when the connect has kept to its own budget.
+async fn wait_for_auth_required(conn: &Connection, grace: tokio::time::Duration) -> Option<String> {
     let closed = tokio::select! {
-        _ = tokio::time::sleep(AUTH_REQUIRED_GRACE) => return None,
+        _ = tokio::time::sleep(grace) => return None,
         error = conn.closed() => error,
     };
 

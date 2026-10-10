@@ -96,7 +96,14 @@ const IROH_BIND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_sec
 const START_PROXY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 const CLOSE_ALL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(8);
 /// Pre-connect / warm-up timeout for establishing iroh connections to all backends.
-const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+///
+/// Derived from what the phase itself allows rather than written down: at a flat
+/// 15s it left one second for a phase that may now spend fourteen, so a
+/// start-up that legitimately used its budget was cancelled here instead of by
+/// the pools that were still working. The slack covers setting the proxy up
+/// around the probe.
+const PRECONNECT_TIMEOUT: tokio::time::Duration =
+    crate::endpoint_group::PRECONNECT_PHASE_CAP.saturating_add(tokio::time::Duration::from_secs(6));
 
 // Why "pinned" exists at all, and why it is the default: iroh otherwise picks a home relay from
 // the 4 N0 relays by latency, and here aps1-1 (Asia-Pacific) and euc1-1 (Europe) measure
