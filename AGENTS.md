@@ -65,6 +65,25 @@ No approval is needed for read-only work: answering questions, reading files, se
 - The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "commit it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
+## Pre-Push Review (MANDATORY)
+
+- **A subagent must review the change before any push.** Before `git push` — including a branch that opens or updates a PR — dispatch a review subagent (`Agent` with `subagent_type: "general-purpose"`) and hand it the base ref. It reviews correctness, not style.
+- **Hand it everything the push would carry: the committed range *and* whatever is still uncommitted.** The agent does not commit on its own, so the change usually sits in the working tree, and a three-dot `git diff <base>...HEAD` omits it entirely:
+
+  ```bash
+  git diff <base>...HEAD   # the committed commits on top of <base>
+  git diff <base>          # the same, plus staged and unstaged working-tree changes
+  git status --porcelain   # untracked files, which neither diff form can show
+  ```
+
+  Never review a three-dot diff alone: against a branch whose change is uncommitted it returns an empty diff, the reviewer has nothing to look at, and the push goes out unreviewed.
+- **What the reviewer must produce:** a verdict of `APPROVED` or `CHANGES REQUESTED`, and every finding carrying `file:line`, why it is a bug, and a concrete failure scenario. "Looks fine to me" is not a verdict.
+- **`APPROVED` may still carry non-blocking observations; `CHANGES REQUESTED` means at least one blocking finding is open.** Style, formatting, naming and refactors — anything `cargo fmt` and `cargo clippy` already cover — are reported as non-blocking and never turn the verdict into `CHANGES REQUESTED`.
+- **A blocking finding stops the push.** Fix it, re-run the affected build/test/lint, review again, then push. Repeat until the verdict is `APPROVED`. Never push while a blocking finding is open.
+- **Report the verdict.** State the verdict, the findings and the fixes in the reply that accompanies the push, so the owner sees what was checked.
+- **A green review is not permission to push.** This gate is a precondition for pushing, not an authorization: the commit and the push still need the explicit instruction described in Git Safety Rules.
+- **Documentation-only changes still get a skim** — a reviewer may pass them quickly, but a change is never pushed unreviewed.
+
 ## Git Workflow — Worktrees & Branch Base (MANDATORY)
 
 - **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `/Users/ipine/rust/nexapipe` and stays on `main`. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
@@ -80,6 +99,7 @@ No approval is needed for read-only work: answering questions, reading files, se
 
   If the upstream lookup is unreachable, degrade to a fast-forward update of the local `main` (`git fetch --no-tags origin main`, fast-forward only — never `reset --hard`) and state explicitly in the reply which commit was used as the base.
 - **Worktree location:** `/Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch-name>` for every working branch. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+- **Exception — a fix to an open PR reuses that PR's branch and worktree.** When the task is fixing a bug in an existing open PR, work on that PR's own head branch, in that branch's existing worktree. Do not open a fresh branch and do not create a second worktree for it: the fix belongs in the PR that carries the defect, not in a parallel branch that has to be cherry-picked afterwards. Locate the worktree with `git worktree list` before starting, and check `git status` in it — if it holds unrelated uncommitted work, stop and ask instead of mixing the fix into it. The "newest `main`" rule above governs new branches only; a PR branch keeps its own base and history.
 - Set the worktree up only after the plan is approved; until then stay read-only.
 - **Never delete a worktree on your own initiative**, least of all one holding unpushed commits — ask first. After a reboot, `/private/tmp` is gone, so run `git worktree prune` before rebuilding anything that referenced it.
 
