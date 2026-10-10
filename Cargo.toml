@@ -10,6 +10,13 @@ resolver = "3"
 [workspace.package]
 version = "0.6.0"
 edition = "2024"
+# 1.89 is where `File::lock` / `File::unlock` were stabilised, which the config
+# lock uses for `flock(2)` and `LockFileEx`. Declared rather than left implicit:
+# without it an older toolchain fails somewhere inside the dependency graph, on
+# an error that names neither this crate nor the standard-library call that
+# raised it — and every crate in the workspace is built by the same toolchain,
+# so this is one number for all of them.
+rust-version = "1.89"
 
 # Vendor smoltcp 0.12.0 with a minimal patch guarding the unguarded
 # `remote_last_seq - local_seq_no` subtraction in the TCP transmit path.
