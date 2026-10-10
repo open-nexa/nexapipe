@@ -212,15 +212,25 @@ impl PeerRegistry {
             })
             .collect();
         // Ordered by when a connection was added, not by how long it has been
-        // open: `elapsed()` is read while this runs, so sorting by it puts the
-        // shortest-lived connection first and lets two calls a moment apart
-        // disagree about the order. `since` is fixed at insert time.
+        // open: `since` is fixed at insert time, whereas a lifetime read from a
+        // clock moves between two entries, so two calls a moment apart could
+        // order them differently.
         entries.sort_by_key(|(_, peer)| peer.since);
+        // One reading for every entry, taken before any of them are measured.
+        // Reading the clock per entry instead compares two lives that were
+        // taken at different moments: the gap between them is the gap between
+        // the two reads subtracted from the gap between the two inserts, which
+        // is negative whenever a write maps slower than a peer reconnects — a
+        // preemption between the two `elapsed()` calls is enough, so this is
+        // the listing reporting an older connection as younger under load, and
+        // nothing about either connection has changed. A snapshot answers what
+        // was true at one instant; reading the clock once is what makes it one.
+        let now = Instant::now();
         entries
             .into_iter()
             .map(|(endpoint_id, peer)| PeerInfo {
                 endpoint_id,
-                connected_for: peer.since.elapsed(),
+                connected_for: now.duration_since(peer.since),
                 path: peer.path,
                 identity: peer.identity.clone(),
             })
