@@ -226,6 +226,16 @@ class SettingsManager(context: Context) {
     fun credentialProtection(): SecretStore.Protection = secrets.protection()
 
     /**
+     * Whether credentials written from here on would be sealed at rest.
+     *
+     * [credentialProtection] says what became of the last one; this says what
+     * would become of the next, which is what a caller holding a credential it
+     * has not written yet needs in order to ask first rather than report
+     * afterwards.
+     */
+    fun canProtectCredentials(): Boolean = secrets.canSeal()
+
+    /**
      * The name this install answers as, generated on first call and then kept.
      *
      * A server can revoke one device of a client — or rate-limit it — only if

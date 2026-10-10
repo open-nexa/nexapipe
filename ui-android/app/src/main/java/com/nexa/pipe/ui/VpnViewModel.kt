@@ -141,6 +141,21 @@ class VpnViewModel : ViewModel() {
         kotlinx.coroutines.flow.MutableStateFlow(SecretStore.Protection.Sealed)
 
     /**
+     * Set when a credential is about to be written to a device that cannot
+     * protect it. The write waits for the answer: nothing reaches storage
+     * while this is true.
+     */
+    val plaintextConsentPending = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * Whether storing credentials in the clear has already been agreed to on
+     * this device. Asked once rather than per credential — a device that cannot
+     * seal one cannot seal the next either, and asking again on every write
+     * would teach the user to stop reading the question.
+     */
+    private var plaintextAccepted = false
+
+    /**
      * What to do when another VPN app owns the slot, as the user last decided.
      *
      * [VpnTakeoverChoice.Ask] until one is made, and resettable from the
@@ -419,11 +434,51 @@ class VpnViewModel : ViewModel() {
     }
 
     private fun saveSettings() {
-        settingsManager?.let { manager ->
-            manager.saveNodes(nodes.value)
-            manager.saveRelayConfig(relayMode.value, relayUrl.value, relayAuthToken.value)
-            credentialProtection.value = manager.credentialProtection()
+        val manager = settingsManager ?: return
+        if (needsPlaintextConsent(manager)) {
+            plaintextConsentPending.value = true
+            return
         }
+        manager.saveNodes(nodes.value)
+        manager.saveRelayConfig(relayMode.value, relayUrl.value, relayAuthToken.value)
+        credentialProtection.value = manager.credentialProtection()
+    }
+
+    /**
+     * Whether writing now would put a credential in the clear with nobody
+     * having agreed to it.
+     *
+     * Only a write that actually carries a credential counts: adding an
+     * endpoint, renaming one or switching relay mode stores nothing that needs
+     * protecting, and asking about those would make the question meaningless
+     * long before it was needed.
+     */
+    private fun needsPlaintextConsent(manager: SettingsManager): Boolean {
+        if (plaintextAccepted) return false
+        if (manager.canProtectCredentials()) return false
+        return nodes.value.any {
+            !it.enrollment?.token.isNullOrBlank() || !it.twoFactor?.secret.isNullOrBlank()
+        } || relayAuthToken.value.isNotBlank()
+    }
+
+    /**
+     * Agrees that credentials may be stored unencrypted. The write that was
+     * waiting goes through, and later ones no longer ask.
+     */
+    fun acceptPlaintextCredentials() {
+        plaintextAccepted = true
+        plaintextConsentPending.value = false
+        saveSettings()
+    }
+
+    /**
+     * Declines. The waiting write is dropped rather than deferred: a credential
+     * nobody agreed to store stays out of storage. The endpoint it belonged to
+     * is left as the user last saw it, still unsaved.
+     */
+    fun declinePlaintextCredentials() {
+        plaintextConsentPending.value = false
+        addLog("Credential not stored: this device cannot encrypt it")
     }
 
     fun updateRelayConfig(mode: String, url: String, authToken: String = relayAuthToken.value) {
@@ -449,10 +504,17 @@ class VpnViewModel : ViewModel() {
         val updated = nodes.value.toMutableList()
         updated[index] = nodes.value[index].copy(enrollment = enrollment)
         nodes.value = updated
-        settingsManager?.saveNodes(nodes.value)
+        val manager = settingsManager
+        // An enrollment token is a credential, and this is the one write that
+        // does not go through `saveSettings`, so it asks here or not at all.
+        if (manager != null && needsPlaintextConsent(manager)) {
+            plaintextConsentPending.value = true
+            return
+        }
+        manager?.saveNodes(nodes.value)
         // A token is a credential, so this write is one of the two places the
         // answer can change without going through `saveSettings`.
-        settingsManager?.let { credentialProtection.value = it.credentialProtection() }
+        manager?.let { credentialProtection.value = it.credentialProtection() }
         addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
     }
 

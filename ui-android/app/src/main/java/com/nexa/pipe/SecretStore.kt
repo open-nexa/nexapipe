@@ -43,6 +43,9 @@ class SecretStore {
          * time it was saved.
          */
         const val MARKER = "v1:"
+
+        /** Sealed and thrown away by [canSeal]. Never stored. */
+        private const val PROBE = "probe"
     }
 
     /**
@@ -76,6 +79,34 @@ class SecretStore {
     private var lastProtection: Protection = Protection.Sealed
 
     fun protection(): Protection = lastProtection
+
+    /**
+     * Whether this device can seal a credential at all, right now.
+     *
+     * [protection] reports what last happened; this answers *before* anything
+     * is stored, which is what a caller needs in order to ask first instead of
+     * discovering afterwards that a credential went down in the clear.
+     *
+     * Deliberately not [seal] on a throwaway value: that would report the
+     * failure in the log and move [protection], so the act of asking would
+     * itself look like a credential having been stored unprotected. This
+     * repeats the steps instead, and stays quiet whatever the answer is.
+     */
+    fun canSeal(): Boolean {
+        val key = key() ?: return false
+        return try {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            cipher.doFinal(PROBE.toByteArray(Charsets.UTF_8))
+            true
+        } catch (e: GeneralSecurityException) {
+            false
+        } catch (e: ProviderException) {
+            false
+        } catch (e: IllegalStateException) {
+            false
+        }
+    }
 
     private val keyStore: KeyStore? = try {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
