@@ -1,10 +1,19 @@
+# Version-update PRs are deliberately switched off: every ecosystem below sets
+# open-pull-requests-limit: 0, so Dependabot stops raising one PR per bump. Stale
+# dependencies surface once a week in a single issue instead, refreshed in place
+# by .github/workflows/dependency-report.yml.
+#
+# The limit does not apply to security updates: when a dependency has a known
+# advisory Dependabot still opens a PR on its own (its own internal cap is ten).
+# To stop those as well, either delete this file or turn "Dependabot security
+# updates" off under Settings -> Advanced Security.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     # A major iroh / quinn bump usually carries breaking changes, so it is easier to review as its own PR.
     groups:
       rust-patch:
@@ -18,7 +27,7 @@ updates:
     directory: "/ui-desktop/src-tauri"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     allow:
       - dependency-type: direct
 
@@ -26,7 +35,7 @@ updates:
     directory: "/ui-desktop"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       npm-dev:
         patterns: ["*"]
@@ -36,14 +45,16 @@ updates:
     directory: "/ui-android"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
 
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0

@@ -1,0 +1,80 @@
+name: Dependency report
+
+# Dependabot no longer opens version-update PRs (open-pull-requests-limit: 0 in
+# .github/dependabot.yml). This job is what replaces them: once a week it lists
+# every dependency that has a newer version and refreshes one issue in place, so
+# dependency drift lands in the issue tracker instead of the PR queue.
+on:
+  schedule:
+    # Mondays at 06:23 UTC. Deliberately off the hour: everything else in GitHub
+    # cron runs on :00 and the queue backs up there.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: dependency-report
+  cancel-in-progress: true
+
+jobs:
+  dependency-report:
+    name: weekly dependency report
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # The issue is filed in whichever repository this workflow runs in, i.e. the
+    # upstream one once the change lands there. Forks normally have issues
+    # switched off, so skip there instead of failing every Monday.
+    if: ${{ github.repository == 'open-nexa/nexapipe' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo update --dry-run needs the resolver, not a build: no cache, no compile.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      # npm outdated compares against the installed tree, so the lockfile has to
+      # be materialised before it can say anything.
+      - name: npm ci
+        working-directory: ui-desktop
+        run: npm ci
+
+      - name: Collect the outdated dependencies
+        run: |
+          set -uo pipefail
+          bash .github/scripts/dependency-report.sh > dependency-report.md
+          cat dependency-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refresh the report issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Weekly dependency report"
+
+          # Reuse last week's issue instead of filing a new one every Monday: the
+          # report is a snapshot, not a conversation.
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == "'"$title"'") | .number] | .[0] // empty')"
+
+          args=(--title "$title" --body-file dependency-report.md)
+          if gh label list --json name --jq '.[].name' | grep -qx dependencies; then
+            args+=(--label dependencies)
+          fi
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file dependency-report.md
+            echo "Refreshed #$existing"
+          else
+            gh issue create "${args[@]}"
+          fi
