@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-09 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §4 and §9) |
+| Last updated | 2026-10-10 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §1, §4, §5 and §9) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -55,12 +55,14 @@ The gap is not architectural, it is maturity:
 - Identity now goes as far as the device. Each device under a client is issued a
   TOTP secret of its own at enrollment, so revoking one leaves the others
   working, and `nexapipe client list|add|revoke --device` does it without anyone
-  editing `config.toml`. Two halves are still open: no client yet names itself,
-  so today it is the server's `--device` flag and nothing but it that puts a
-  device on the wire — and a device struck out while it holds a connection keeps
-  that connection until it hangs up. Both are
-  [Phase 3](#phase-3--v060-one-device-at-a-time); the kind of credential stays a
-  TOTP secret for now, which is what §4.3 is about.
+  editing `config.toml`. Every install asks for that secret under a name of its
+  own — the desktop after its hostname, Android after the device model — so a
+  device is reachable from somewhere other than an operator's shell, and one
+  that is struck out loses the connections it already holds instead of keeping
+  them until it hangs up. Both were the halves
+  [Phase 3](#phase-3--v060-one-device-at-a-time) still owed, and both shipped in
+  v0.6.0; the kind of credential stays a TOTP secret for now, which is what
+  §4.3 is about.
 - Platform coverage has closed both of its holes: IPv6 inside the TUN and a
   second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
   list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
@@ -417,7 +419,7 @@ no answer.
 ## 5. Platform policy
 
 Supported targets today are **Linux, macOS and Windows** (server and desktop app)
-and **Android** (only `arm64-v8a` is shipped).
+and **Android** (`arm64-v8a` and `x86_64`, one APK per ABI).
 
 **iOS is not a supported platform and will not be developed or maintained by this
 project.** The UniFFI bindings exist because they cost nothing to keep compiling,
@@ -438,8 +440,9 @@ Community-contributed iOS code is welcome, with these expectations:
    maintainers. Contributions that cannot be kept compiling by their author will
    eventually be removed.
 
-Widening Android beyond `arm64-v8a` (at minimum `x86_64`, for emulators and the
-long tail of Intel-based devices) is treated as normal roadmap work, unlike iOS.
+Android was widened beyond `arm64-v8a` in v0.4.0 — one APK per ABI, `arm64-v8a`
+and `x86_64`, so an emulator has something to install — as normal roadmap work,
+unlike iOS. `run_android.ps1 -Abi x86_64` builds and installs that one.
 
 ---
 
@@ -490,8 +493,9 @@ computed in Rust, and a native prompt on each of macOS, Windows and Linux. See
 [4.7](#47-client-side-credential-protection-p0).
 
 **Done when:** revoke one of three devices and the other two keep working —
-which is R5, **not yet started**, and the read-only half of R4 shipped without
-it; a newcomer brings up a self-hosted relay from the docs without asking
+which is R5, **shipped in v0.6.0**, and the read-only half of R4 shipped
+without it, its write half landing with it as `nexapipe client list|add|revoke`;
+a newcomer brings up a self-hosted relay from the docs without asking
 anyone; and no *Android* surface renders a full secret without the operating
 system having authenticated the user first (shipped in v0.3.0). The desktop
 equivalent is carried by Phase 1 below, and shipped in v0.4.0.
