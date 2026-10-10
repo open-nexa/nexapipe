@@ -1527,6 +1527,8 @@ fn load_auth_config(path: &str) -> (AuthConfig, bool) {
 /// QR code left at the default mode is a credential anybody with access to the
 /// machine can read back.
 fn write_qr_file(path: &str, link: &str, invert: bool) -> anyhow::Result<()> {
+    use std::io::Write;
+
     let is_svg = path.to_ascii_lowercase().ends_with(".svg");
     let content = if is_svg {
         nexapipe::qr::render_svg(link, invert)?
@@ -1537,16 +1539,31 @@ fn write_qr_file(path: &str, link: &str, invert: bool) -> anyhow::Result<()> {
         )
     };
 
-    std::fs::write(path, content)
-        .map_err(|e| anyhow::anyhow!("failed to write the QR code to {path}: {e}"))?;
-
+    // Opened with the mode in the same call that creates it, rather than
+    // written and then made private. `fs::write` truncates whatever is already
+    // at the path and follows a symlink to reach it, so a `--qr-out` naming a
+    // file another account got there first could aim the write at something the
+    // operator owns; and between the create and the chmod the file is readable
+    // by anyone watching. `create_new` refuses to open a path that already
+    // exists, which closes both, and the mode is applied by the same open.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!("wrote the QR code to {path} but could not make it private: {e}")
-        })?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+
+    let mut file = options.open(path).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            " (refusing to overwrite a file that is already there)"
+        } else {
+            ""
+        };
+        anyhow::anyhow!("failed to write the QR code to {path}: {e}{hint}")
+    })?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write the QR code to {path}: {e}"))?;
 
     println!();
     println!(
