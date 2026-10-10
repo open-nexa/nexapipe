@@ -137,3 +137,11 @@ windows-sys = { version = "0.61", features = [
 [[bin]]
 name = "nexa-service"
 path = "src/bin/nexa-service.rs"
+
+# The vendored smoltcp carries a patch for a `subtract with underflow` panic on
+# the transmit path — see `third_party/smoltcp/PATCHES.md`. This crate is its own
+# workspace, excluded from the root one, so the root `[patch.crates-io]` never
+# reached it and this build resolved 0.12.0 straight from crates.io: the desktop
+# TUN, which is the whole reason the dependency is here, ran the unpatched code.
+[patch.crates-io]
+smoltcp = { path = "../../third_party/smoltcp" }
