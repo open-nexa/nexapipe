@@ -636,7 +636,7 @@ are whole now — see **Progress** below.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
+| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on, though a client that has moved every device into the table can now close it: `unnamed_device_allowed = false` refuses a peer that names no device rather than answering it under the shared secret, and it defaults to `true`, so nothing changes until it is set. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
 | R5 | **A minimal audit log** | **Shipped.** Who — client *and* device — reached which host, when, and with what outcome. The identity survives the handshake now (`conn/mod.rs`), so an access line and `/v1/connections` can say whose request they are reporting; it used to carry an ACL snapshot and a Node ID and nothing else |
 | R4 | **The write half, as CLI subcommands** | **Shipped.** `nexapipe client list\|add\|revoke`, device-scoped, through the writers that already took the config lock; the loopback endpoints stayed GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in |
 | — | **Latency you can read** | **Shipped.** `/metrics` renders `_bucket{le="…"}` beside `_sum` and `_count`, hand-written to keep the exposition dependency-free, so a p99 is read rather than divided out. It carries no labels beyond `le` and no `{route}`: what it answers is "what is this instance's latency", which is the question the meter was missing |
@@ -650,7 +650,11 @@ an access line and `/v1/connections` name client *and* device (R5, audit log),
 that page and for the server in both READMEs. R5's device table is whole too: a
 secret per device, looked up per device at the handshake, and a revoke that
 reaches the connections the device already holds, not only the next one it
-dials.
+dials. Two gaps in it closed after the first pass at it: enrolling a name the
+table already holds is refused rather than re-issuing that device's secret, and
+each device is stamped with the `last_used` of its own last successful
+connection instead of sharing the client's, so a row that has stopped being
+seen can be told from one that has not.
 
 What stood here last was a decision rather than a defect: **no client sent a
 device name.** The wire has carried `device_id` since the enrollment work —
@@ -822,9 +826,27 @@ A second audit, read-only and covering the whole tree including CI and the
 Dockerfiles, was run on 2026-10-10 against `24937db`. Most of its findings are
 **open rather than fixed**, so they are recorded in
 [4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and in the last row
-below — the four fixed later that day are marked where they sit; the three that
-are capability work rather than defects are in
+below — the nine fixed over the days that followed are marked where they sit;
+the three that are capability work rather than defects are in
 [§6](#hardening-sweep--after-v060) as R16–R18.
+
+A third reading, of the v0.6.0 release itself rather than of the whole tree, was
+made on 2026-10-11. It is a different kind of review from the two above — it
+asks what the release changed and whether each change holds, not what the tree
+is missing — and everything it raised has a fix rather than a plan: the
+revocation race between the auth check and the peer registration, a
+`config.toml` written readable by everyone and through a symlink, an enrollment
+that replaced a device already in the table, a client with no way to refuse a
+peer naming no device, a device that was never stamped with a `last_used` of its
+own, a CLI that reported a secret it had not written, a desktop DNS hijack that
+failed silently, a device id that could not be stored, a TOTP period narrowed by
+a cast, and a workspace that never said which Rust it needs. Eight of them are
+merged as #140, #141, #142, #143, #146, #147, #148 and #149; #144 and #145 were
+still open as this was written. They are listed in the 0.6.0 entry in
+`CHANGELOG.md` and on the release page, which is where a reader of the release
+will look for them; none of them appears in
+[4.9](#49-security-and-stability-audit-2026-10-10-p0p1), because that section is
+the tree-wide audit and a separate reading of the same code.
 
 | Topic | Location |
 |---|---|
