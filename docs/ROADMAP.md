@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-09 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §4 and §9) |
+| Last updated | 2026-10-10 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §1, §4, §5 and §9; a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -55,12 +55,14 @@ The gap is not architectural, it is maturity:
 - Identity now goes as far as the device. Each device under a client is issued a
   TOTP secret of its own at enrollment, so revoking one leaves the others
   working, and `nexapipe client list|add|revoke --device` does it without anyone
-  editing `config.toml`. Two halves are still open: no client yet names itself,
-  so today it is the server's `--device` flag and nothing but it that puts a
-  device on the wire — and a device struck out while it holds a connection keeps
-  that connection until it hangs up. Both are
-  [Phase 3](#phase-3--v060-one-device-at-a-time); the kind of credential stays a
-  TOTP secret for now, which is what §4.3 is about.
+  editing `config.toml`. Every install asks for that secret under a name of its
+  own — the desktop after its hostname, Android after the device model — so a
+  device is reachable from somewhere other than an operator's shell, and one
+  that is struck out loses the connections it already holds instead of keeping
+  them until it hangs up. Both were the halves
+  [Phase 3](#phase-3--v060-one-device-at-a-time) still owed, and both shipped in
+  v0.6.0; the kind of credential stays a TOTP secret for now, which is what
+  §4.3 is about.
 - Platform coverage has closed both of its holes: IPv6 inside the TUN and a
   second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
   list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
@@ -192,7 +194,9 @@ by the audit that produced this document are already fixed:
   spawned and waits for them, with a bound so a stuck peer cannot hold the
   process open.
 
-What follows is what is *missing*, i.e. capability work.
+What follows is what is *missing*, i.e. capability work. [4.9](#49-security-and-stability-audit-2026-10-10-p0p1) is the exception: it holds
+the defects a later audit found *open*, because an audit's findings belong
+somewhere even though they are fixed rather than scheduled.
 
 ### 4.1 Backend handling (P2)
 
@@ -412,12 +416,61 @@ answer is not cached at all, the table is bounded, and the transaction ID is
 rewritten on every hit so a cached answer does not look to the application like
 no answer.
 
+### 4.9 Security and stability audit, 2026-10-10 (P0/P1)
+
+A read-only review of the whole tree — server, client library, wire format, both
+apps, the Dockerfiles and CI — run on 2026-10-10 at `24937db`. It found 7 high,
+30 medium and 20 low findings; the review itself is at
+`.workbuddy/CODE_REVIEW-2026-10-10.md`, a working file rather than part of the
+repository tree, which is why the record of it lives here.
+
+Two things about it are worth saying up front.
+
+The first is what it did **not** find. There is no open-proxy or SSRF surface on
+the server: the address an L4 flow dials comes from the route's `backends`, and
+the host and port a client sends are a selector, never a destination. No
+credential is committed to the repository, and the real `config.toml` is not
+tracked. The server has no `unsafe` and no `unwrap` on a production path. The
+authentication, 2FA and ACL work holds up under reading: constant-time
+comparison, a per-handshake nonce that makes a captured response unreplayable,
+lockout accounting held under the same write lock as the verification it counts,
+and a refusal that is indistinguishable from having no route. The vendored
+smoltcp patch is minimal, documented, and still load-bearing — upstream has not
+fixed what it works around.
+
+The second is that **most of what it did find is defects, and defects are not
+scheduled.** They are listed below so the audit stays reproducible; each one is
+fixed rather than sequenced, and none of them appears in
+[section 6](#6-roadmap). Nine of them were fixed over the days that followed,
+on branches cut from `c1db94b` and later, and the table marks them; the rest
+are open and unscheduled. Three items from the same audit are capability work,
+and those are in [§6](#hardening-sweep--after-v060).
+
+| P | Defect, open as of the audit | Where |
+|---|---|---|
+| P0 | **The desktop build never gets the smoltcp patch.** `ui-desktop/src-tauri` is its own workspace — the root `Cargo.toml` excludes it — so `[patch.crates-io]` does not reach it and its lockfile resolves smoltcp 0.12.0 from crates.io. `tun-proxy` is precisely the feature that runs the patched transmit path, so the panic `third_party/smoltcp/PATCHES.md` exists to prevent is reachable on the one client that ships a desktop TUN. | `Cargo.toml:7`, `:24-25`; `ui-desktop/src-tauri/Cargo.lock` (`source = registry`) — fixed on `fix/desktop-smoltcp-patch` |
+| P0 | **The macOS build deletes the CSP.** Platform configs merge as JSON Merge Patch, where `null` means *remove*, so `"csp": null` drops the baseline policy — on the build whose webview holds 35 command permissions, `put_credential` and `clear_credentials` among them. The other two platforms keep it. | `ui-desktop/src-tauri/tauri.macos.conf.json:28-30`, `tauri.conf.json:29`, `capabilities/default.json:22-58` — fixed on `fix/desktop-macos-csp` |
+| P0 | **No global ceiling on connections or streams.** The only limit is per `EndpointId`, and an endpoint id is a public key: 64 connections × 256 streams, times as many peers as an attacker cares to generate, is unbounded tasks and memory taken from every tenant on the process. The comment in `limits.rs` says so — per-peer is what it is for. | `crates/nexapipe/src/conn/limits.rs:1-21`, `conn/mod.rs:1596-1597` |
+| P0 | **TUN flows have no budget on the client.** The UDP reassembly buffer has no stated bound: `decode_frame` accepts any `u16` length, so a frame can announce 65 535 bytes and then arrive at whatever pace the far side chooses. TCP flows have no cap at all, though UDP has `MAX_UDP_FLOWS`. On Android the TUN is system-wide, so any installed application can exhaust the device. | `crates/nexapipe-client/src/tun_proxy.rs:1211`, `:765`; `crates/nexapipe-proto/src/udp.rs:50` — fixed on `fix/tun-flow-budgets` |
+| P0 | **A Keystore failure falls back to plaintext.** All three fallback branches of `seal` return the input unchanged and the caller writes it straight into `SharedPreferences`; `unseal` returns an unmarked value as it stands, so once a secret is in the clear it stays in the clear. What the fix adds is the question before the write — the fallback itself is kept, because refusing to store would cut the user off from their own endpoint. | `ui-android/.../SecretStore.kt:107-140`, `SettingsManager.kt:209` — fixed on `fix/android-credential-downgrade-confirm` |
+| P1 | **Timeouts that are not deadlines.** The streamed-response loop has none once the headers are in; the plaintext listener never bounds a request-body read, though the iroh path does; the UDP tunnel re-arms its idle timer on every read, so a trickle renews it forever; the local proxy's header loop is per-read rather than total, and its TLS ClientHello read has no timeout at all. Each one pins a slot, a backend lease and a task. | `crates/nexapipe/src/http/mod.rs:646`, `:244-265`, `l4/mod.rs:491`; `crates/nexapipe-client/src/local_proxy.rs:659-697`, `:1275-1286` |
+| P1 | **A control that fails open.** `[peers]` is the section where a typo is a security change rather than a lost setting: `allowd` is dropped by serde, `allow` is then `None`, and an absent allow-list means every peer passes — with no warning at startup. `[auth]` already refuses unknown keys for exactly this reason, in a comment that makes the argument; `[peers]` should meet it. — fixed on `fix/peers-refuse-unknown-keys` | `crates/nexapipe/src/config.rs:490-514`, `conn/allow_list.rs:34-38` |
+| P1 | **Privileged execution through predictable files in a shared directory.** Windows writes the `.bat` it elevates into `temp_dir()` with `File::create` rather than an exclusive one, and `cmd.exe` reads a batch file line by line — so the gap between writing it and the UAC prompt being answered is a gap in which what runs as Administrator can be changed. The installer hook is worse: its script names are fixed, not randomised. The elevation result file sits in the same directory and is written with `fs::write`, which follows a symlink. | `ui-desktop/src-tauri/src/service/platform.rs:486-493`, `:727-739`; `windows/hooks.nsh:41-43`; `src/service/elevate.rs:302-312` |
+| P1 | **No ACL on Windows where there is a mode check on Unix.** `write_private` sets `0o600` on Unix and calls `fs::write` everywhere else, and `reject_world_readable` is a no-op off Unix — so the IPC token and the credential file are created with inherited permissions and never checked before being read. The token path can also be pointed anywhere by an environment variable. | `ui-desktop/src-tauri/src/service/ipc_token.rs:462-480`, `credentials.rs:815-837` |
+| P1 | **`preconnect` counts its grace period outside its own timeout.** `wait_for_auth_required` can wait six seconds *after* the eight-second `PRECONNECT_TIMEOUT` has elapsed, and both callers wrap the whole call in eight — so a handshake slower than about two seconds has its fresh connection dropped unpooled and its backend recorded as unreachable, which a multi-backend group reports as no backend answering. | `crates/nexapipe-client/src/connection_pool.rs:529-549`, `:556-565` — fixed on `fix/preconnect-budget-covers-grace` |
+| P1 | **One JNI entry without a panic barrier.** Every entry point that drives the runtime catches unwinds except `nativeStopTunProxy`; a panic there unwinds out of `extern "system"`, which on Android is a native crash rather than a Java exception — the thing the file's own header comment forbids. — fixed on `fix/android-stop-tun-panic-guard` | `crates/nexapipe-client/src/jni.rs:2566-2572` |
+| P1 | **Blocking the main thread.** `stopVPN` calls `nativeStopTunProxy` directly, and both `onDestroy` and `ACTION_STOP` reach it on the main thread — the two paths `onRevoke` was deliberately moved off it for. | `ui-android/.../vpn/NexaVpnService.kt:159-161`, `:225-227`, `:293-297` — fixed on `fix/android-stop-vpn-off-main-thread` |
+| P1 | **Containers run as root with the configuration writable.** Neither Dockerfile sets `USER`, and `docker-compose.yaml` bind-mounts the host `./config` — the file holding the 2FA secrets — read-write into the container. | `Dockerfile:47`, `Dockerfile-aarch64:48`, `docker-compose.yaml:31` |
+| P1 | **A QR file carrying a secret is written world-readable, and over whatever is already there.** `--qr-out` wrote with `fs::write`, which truncates and follows a symlink, and made the file private only afterwards — so in between it was readable by anyone watching, and a name put there first could aim the write at another file. It now creates with `create_new` and the mode in the same call, and refuses a path that exists. | `crates/nexapipe/src/main.rs:1540-1549` — fixed on `fix/qr-out-create-private` |
+| P2 | **Secrets that outlive their use.** TOTP secrets, enrollment tokens and the relay bearer sit in process-wide `String`s on the client and are never zeroized; `auth.rs` derives `Debug` over them where `provisioning.rs` deliberately does not; a response parser computes its body offset from a lossy UTF-8 conversion and then slices the original bytes. | `crates/nexapipe-client/src/jni.rs:29`, `:44-51`; `auth.rs:76`, `:124`, `:489`; `http.rs:127-144` |
+| P2 | **Supply chain hygiene.** Actions pinned by tag rather than SHA; base images by floating tag, one from a self-hosted registry; `cargo build` in the Dockerfiles without `--locked`, though CI has it everywhere; images published with no signature and no provenance; `workflow_dispatch` input interpolated into a `run:` block. | `.github/workflows/*.yml`; `Dockerfile:1`, `:18`; `Dockerfile-aarch64:24`; `release.yml:137`, `:529`, `:1059-1161` |
+
 ---
 
 ## 5. Platform policy
 
 Supported targets today are **Linux, macOS and Windows** (server and desktop app)
-and **Android** (only `arm64-v8a` is shipped).
+and **Android** (`arm64-v8a` and `x86_64`, one APK per ABI).
 
 **iOS is not a supported platform and will not be developed or maintained by this
 project.** The UniFFI bindings exist because they cost nothing to keep compiling,
@@ -438,8 +491,9 @@ Community-contributed iOS code is welcome, with these expectations:
    maintainers. Contributions that cannot be kept compiling by their author will
    eventually be removed.
 
-Widening Android beyond `arm64-v8a` (at minimum `x86_64`, for emulators and the
-long tail of Intel-based devices) is treated as normal roadmap work, unlike iOS.
+Android was widened beyond `arm64-v8a` in v0.4.0 — one APK per ABI, `arm64-v8a`
+and `x86_64`, so an emulator has something to install — as normal roadmap work,
+unlike iOS. `run_android.ps1 -Abi x86_64` builds and installs that one.
 
 ---
 
@@ -490,8 +544,9 @@ computed in Rust, and a native prompt on each of macOS, Windows and Linux. See
 [4.7](#47-client-side-credential-protection-p0).
 
 **Done when:** revoke one of three devices and the other two keep working —
-which is R5, **not yet started**, and the read-only half of R4 shipped without
-it; a newcomer brings up a self-hosted relay from the docs without asking
+which is R5, **shipped in v0.6.0**, and the read-only half of R4 shipped
+without it, its write half landing with it as `nexapipe client list|add|revoke`;
+a newcomer brings up a self-hosted relay from the docs without asking
 anyone; and no *Android* surface renders a full secret without the operating
 system having authenticated the user first (shipped in v0.3.0). The desktop
 equivalent is carried by Phase 1 below, and shipped in v0.4.0.
@@ -568,9 +623,9 @@ waiting for the next probe; an operator can say how much an instance carried
 without reading the access log; and a newcomer brings up their own relay from
 the docs without asking anyone. The first two are shipped. The relay page is
 written but has not been followed end to end on a machine that had nothing on it
-— which is the one claim here nobody has tested. Nor has the Android
-notification been watched running on a device: its rates are verified by unit
-tests and by compilation only.
+— which is the one claim here nobody has tested. The Android notification is
+not in that position: its rates have been watched running on a device, rather
+than resting on unit tests and compilation alone.
 
 ### Phase 3 — v0.6.0, "one device at a time"
 
@@ -581,7 +636,7 @@ are whole now — see **Progress** below.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
+| R5 | **Per-device credentials** | **Shipped.** One secret per device under a client, issued at enrollment and revocable on its own, instead of one secret shared by every device that names the same `client_id`: the device table, the per-device lookup in the handshake and the `--device` flags are all in `main`, and a `[auth.clients.<id>]` carrying only `secret` keeps working exactly as it did — that is the path a peer naming no device takes, and the path every config written before this release is on, though a client that has moved every device into the table can now close it: `unnamed_device_allowed = false` refuses a peer that names no device rather than answering it under the shared secret, and it defaults to `true`, so nothing changes until it is set. A device struck out no longer keeps the connection it already held: the reload that notices what left `[auth]` closes it. What each client does now is send one — the decision under Phase 3 is how an install decides what to answer as. See [4.3](#43-identity-and-authorization-p1) |
 | R5 | **A minimal audit log** | **Shipped.** Who — client *and* device — reached which host, when, and with what outcome. The identity survives the handshake now (`conn/mod.rs`), so an access line and `/v1/connections` can say whose request they are reporting; it used to carry an ACL snapshot and a Node ID and nothing else |
 | R4 | **The write half, as CLI subcommands** | **Shipped.** `nexapipe client list\|add\|revoke`, device-scoped, through the writers that already took the config lock; the loopback endpoints stayed GET-only, because widening a token that has no scope in the same release as the thing it would be changing is how a management surface becomes the way in |
 | — | **Latency you can read** | **Shipped.** `/metrics` renders `_bucket{le="…"}` beside `_sum` and `_count`, hand-written to keep the exposition dependency-free, so a p99 is read rather than divided out. It carries no labels beyond `le` and no `{route}`: what it answers is "what is this instance's latency", which is the question the meter was missing |
@@ -595,7 +650,11 @@ an access line and `/v1/connections` name client *and* device (R5, audit log),
 that page and for the server in both READMEs. R5's device table is whole too: a
 secret per device, looked up per device at the handshake, and a revoke that
 reaches the connections the device already holds, not only the next one it
-dials.
+dials. Two gaps in it closed after the first pass at it: enrolling a name the
+table already holds is refused rather than re-issuing that device's secret, and
+each device is stamped with the `last_used` of its own last successful
+connection instead of sharing the client's, so a row that has stopped being
+seen can be told from one that has not.
 
 What stood here last was a decision rather than a defect: **no client sent a
 device name.** The wire has carried `device_id` since the enrollment work —
@@ -628,6 +687,24 @@ point of listing them:
 - **Not package managers.** Homebrew, winget and scoop are each a day of
   manifest and then a tap or bucket that somebody has to own. After this release
   they are the only part of R6 still open.
+
+### Hardening sweep — after v0.6.0
+
+Three findings of the [2026-10-10 audit](#49-security-and-stability-audit-2026-10-10-p0p1)
+are not defects. Each is work with a shape of its own rather than a line to
+change, and they are the only part of that audit that belongs in a plan at all.
+They carry high IDs because they were written after R13, like R14 and R15.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| R16 | **A resource budget for the process** | A global ceiling on concurrent connections and in-flight streams to sit beside the per-peer one, plus a global budget for bytes held in request bodies. The per-peer limit answers *"one peer cannot crowd out the rest"*; nothing today answers *"the process cannot be crowded out"*, and an `EndpointId` is a public key. Configurable, defaulted generously enough for a client that opens a connection per in-flight request |
+| R17 | **One deadline per phase** | A single place that says how long a header read, a body read, a response stream, an L4 flow and a tunnel may take, covering both listeners and both clients — so the six timeout gaps in §4.9 close once and stay closed. A per-read timeout that re-arms on every read is what lets a one-byte trickle hold a slot indefinitely; a phase deadline is not |
+| R18 | **Supply chain verification** | `cargo deny` beside the two `cargo audit` jobs — advisories are the only thing `audit` checks, and this tree has a vendored crate, two lockfiles and several duplicate versions — actions pinned to SHAs, base images by digest, `--locked` in the Dockerfiles, and signed images with provenance. None of it changes what NexaPipe does; it decides whether a release can say where it came from |
+
+No phase number is attached to these: it is a sweep, not a release, and it
+competes with R13 for the same attention. What puts it ahead is that R13 is still
+behind its own gate — the premise has not been validated — while this is what the
+tree says about itself today.
 
 ### Phase 4 — v1.0, "reachable without our client" (exploratory)
 
@@ -745,6 +822,32 @@ audit that found them stays reproducible, and the before and after stay visible
 side by side. The three fixed defects are recorded in
 [section 4](#4-self-review-what-is-missing) and in the commit history.
 
+A second audit, read-only and covering the whole tree including CI and the
+Dockerfiles, was run on 2026-10-10 against `24937db`. Most of its findings are
+**open rather than fixed**, so they are recorded in
+[4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and in the last row
+below — the nine fixed over the days that followed are marked where they sit;
+the three that are capability work rather than defects are in
+[§6](#hardening-sweep--after-v060) as R16–R18.
+
+A third reading, of the v0.6.0 release itself rather than of the whole tree, was
+made on 2026-10-11. It is a different kind of review from the two above — it
+asks what the release changed and whether each change holds, not what the tree
+is missing — and everything it raised has a fix rather than a plan: the
+revocation race between the auth check and the peer registration, a
+`config.toml` written readable by everyone and through a symlink, an enrollment
+that replaced a device already in the table, a client with no way to refuse a
+peer naming no device, a device that was never stamped with a `last_used` of its
+own, a CLI that reported a secret it had not written, a desktop DNS hijack that
+failed silently, a device id that could not be stored, a TOTP period narrowed by
+a cast, and a workspace that never said which Rust it needs. Eight of them are
+merged as #140, #141, #142, #143, #146, #147, #148 and #149; #144 and #145 were
+still open as this was written. They are listed in the 0.6.0 entry in
+`CHANGELOG.md` and on the release page, which is where a reader of the release
+will look for them; none of them appears in
+[4.9](#49-security-and-stability-audit-2026-10-10-p0p1), because that section is
+the tree-wide audit and a separate reading of the same code.
+
 | Topic | Location |
 |---|---|
 | HTTP/1.1-only backend client | `crates/nexapipe/src/http/mod.rs:13-32` |
@@ -764,3 +867,4 @@ side by side. The three fixed defects are recorded in
 | No audit trail | ***closed in v0.6.0, for what the server can say from its own side.*** Was "the two `audit` matches under `crates/` are both unrelated — `metrics.rs:8` ("an audit surface", about a dependency) and `nexapipe-client/src/transport.rs:201`. `client_id` does not survive the handshake: `conn/mod.rs:156-165` hands `handle_bidi_stream` an ACL snapshot and a Node ID, so the three `log_access` calls at `:326`, `:402` and `:427` cannot say whose request they are logging, and `/v1/connections` (`admin/mod.rs:376-400`) reports no client at all". Now the connection carries the authenticated client *and* device, so every access line has both to draw on and `/v1/connections` answers who is connected rather than only how many. What is still missing is the *per-request* operator view — nothing aggregates those lines, and there is no exporter to send them anywhere: see [4.2](#42-observability-beyond-the-access-log-p1) |
 | Latency as a sum, not buckets | ***closed in v0.6.0.*** Was "`crates/nexapipe/src/metrics.rs:96` (one `AtomicU64`), `:177-181` (the single `fetch_add`), `:335-344` (rendered as a plain counter, with the reason for that written immediately above it). No `histogram`, `bucket` or `prometheus` crate anywhere in the tree". Now `request_duration_ms` is twelve buckets over fixed boundaries with `+Inf` above them, accumulated per boundary and rendered cumulative on the way out so a partially-collected request cannot make the series non-monotonic (`:105-120`, `:426-459`). Still written by hand, so still no dependency added — and no `opentelemetry`/`otlp` match outside this document, which is a separate gap and still an open one |
 | No unit, and Windows compiles only | ***closed in v0.6.0.*** Was "no `*.service` in the repository or the docs; `docs/self-hosted-relay.md:103-107` starts the relay as a foreground command, and the only unit generated anywhere is the desktop service's, at runtime (`ui-desktop/src-tauri/src/service/platform.rs:887-906`, `Restart=on-failure`). Windows: `.github/workflows/ci.yml:122-140` runs `cargo check --workspace --all-targets --locked`, with the note at `:138` that the tests are compiled and not run". Now `docs/self-hosted-relay.md` carries a unit for the relay and both READMEs one for the server, each with the directives dated so a reader can tell what assumes how old a systemd — and `ci.yml` runs `cargo test --workspace --locked` on `windows-latest` under the name `windows-test`. What R6 still owes is not a unit but a package manager |
+| Security and stability audit, 2026-10-10 | ***mostly open and not scheduled — these are defects, but nine were fixed over the days that followed.*** 7 high, 30 medium and 20 low findings; the five P0s are the desktop build resolving `smoltcp` from crates.io because the root `[patch.crates-io]` never reaches it (`Cargo.toml:7`, `:24-25` versus `ui-desktop/src-tauri/Cargo.lock`), `tauri.macos.conf.json:28-30` removing the baseline CSP from a webview holding 35 command permissions, `crates/nexapipe/src/conn/limits.rs:1-21` limiting per peer and not per process, `crates/nexapipe-client/src/tun_proxy.rs:1211` growing a reassembly buffer with no bound while `:765` spawns TCP flows with no cap, and `ui-android/.../SecretStore.kt:107-140` returning plaintext when the Keystore is unavailable. What the audit cleared is recorded beside them: no open-proxy or SSRF surface, no committed credential, no `unsafe` or production-path `unwrap` in the server, and authentication, 2FA and ACL that hold up under reading. Nine were fixed over the days that followed, on branches cut from `c1db94b` and later: the macOS CSP deletion (`fix/desktop-macos-csp`), the `[peers]` control that failed open (`fix/peers-refuse-unknown-keys`), the JNI entry with no panic barrier (`fix/android-stop-tun-panic-guard`), `--qr-out` writing a secret world-readable and over an existing file (`fix/qr-out-create-private`), the desktop build reaching the vendored `smoltcp` patch (`fix/desktop-smoltcp-patch`), a budget per TUN flow (`fix/tun-flow-budgets`), the native stop leaving the main thread (`fix/android-stop-vpn-off-main-thread`), a credential no longer stored unencrypted without being asked (`fix/android-credential-downgrade-confirm`) and a preconnect budget that covers both of its halves (`fix/preconnect-budget-covers-grace`). Full review with all 63 findings and their fixes: `.workbuddy/CODE_REVIEW-2026-10-10.md`. See [4.9](#49-security-and-stability-audit-2026-10-10-p0p1) |
