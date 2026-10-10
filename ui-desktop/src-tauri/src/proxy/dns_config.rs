@@ -1818,6 +1818,22 @@ fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> 
     }
 
     let install = scoped_install_tally(Path::new(RESOLVER_DIR), dns_ip, &domains);
+
+    // Zero to write is not an install. Every configured domain already has a
+    // resolver owned by somebody else, and this run leaves those alone by
+    // choice, so nothing was taken over: reporting success would leave the UI
+    // saying "running" while every domain the proxy exists for resolves at its
+    // real address and leaves in the clear. Falling back is the honest answer —
+    // it is also the same answer a failed install gives.
+    if install.meant_to_write == 0 {
+        tracing::warn!(
+            "none of the {} configured domain(s) could be given a resolver of their own — \
+             another resolver already owns all of them; every query goes to the TUN instead",
+            domains.len()
+        );
+        return Ok(false);
+    }
+
     if !scoped_install_is_complete(install.in_effect, install.meant_to_write) {
         for path in &install.written {
             if count_resolvers_in_effect(std::slice::from_ref(path), dns_ip) == 0 {
@@ -2107,7 +2123,13 @@ fn set_system_dns_macos(dns_ip: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn restore_system_dns_macos(dns_ip: &str) -> Result<()> {
-    let services = network_services().unwrap_or_default();
+    // Not `unwrap_or_default()`: an empty list looks exactly like a machine
+    // with no network services, and every check below is satisfied by nothing
+    // — no service is left behind because none was looked at, and the backup
+    // is not removed because there was nothing to remove it for. That is a
+    // restore that restored nothing and reported success, leaving this
+    // address as the machine's DNS.
+    let services = network_services()?;
     let recorded = read_dns_backup();
     let mut restored = 0;
 
@@ -2150,6 +2172,16 @@ fn restore_system_dns_macos(dns_ip: &str) -> Result<()> {
             "system DNS still points at a TUN address on {} service(s) after the restore: {}",
             left_behind.len(),
             left_behind.join(", ")
+        );
+    }
+    // Nothing was restored on a machine that has services to restore. The
+    // check above reads the addresses back, and a `networksetup` that refuses
+    // to answer reads as "no TUN address here" — so this is the only place a
+    // restore that silently did nothing says so.
+    if restored == 0 && !services.is_empty() {
+        anyhow::bail!(
+            "system DNS could not be restored on any of {} network service(s)",
+            services.len()
         );
     }
 
@@ -2481,9 +2513,9 @@ mod tests {
     // parser for a file this code rewrites is not something to ship unexercised.
     #[cfg(any(target_os = "linux", test))]
     use super::{
-        DEFAULT_ROUTE_DOMAIN, parse_resolvectl_competing_routes, parse_resolvectl_dns,
-        parse_resolvectl_domains, resolv_conf_names_a_tun_address, resolv_conf_nameservers,
-        resolv_conf_without_nameservers, routes_every_domain,
+        parse_resolvectl_competing_routes, parse_resolvectl_dns, parse_resolvectl_domains,
+        resolv_conf_names_a_tun_address, resolv_conf_nameservers, resolv_conf_without_nameservers,
+        routes_every_domain, DEFAULT_ROUTE_DOMAIN,
     };
 
     // The NRPT reader is pure, and the machine that has to read it back is not
@@ -2501,9 +2533,9 @@ mod tests {
     // what it reads back, or a restore would leave its own files behind.
     #[cfg(any(target_os = "macos", test))]
     use super::{
-        RESOLVER_MARKER, count_resolvers_in_effect, is_our_resolver_file, is_tun_dns_address,
-        remove_resolver_files, resolver_file_contents, resolver_nameserver,
-        scoped_install_is_complete, scoped_install_tally, write_resolver_files,
+        count_resolvers_in_effect, is_our_resolver_file, is_tun_dns_address, remove_resolver_files,
+        resolver_file_contents, resolver_nameserver, scoped_install_is_complete,
+        scoped_install_tally, write_resolver_files, RESOLVER_MARKER,
     };
     #[cfg(any(target_os = "macos", test))]
     use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
@@ -3004,11 +3036,9 @@ Link 7 (wg0): ~corp.example ~corp.internal
         );
 
         // The route this hijack installs is never a competing one.
-        assert!(
-            parse_resolvectl_competing_routes(output, "wg0")
-                .iter()
-                .all(|(source, _)| source != "Link 7 (wg0)")
-        );
+        assert!(parse_resolvectl_competing_routes(output, "wg0")
+            .iter()
+            .all(|(source, _)| source != "Link 7 (wg0)"));
 
         // A search domain is not a route: it decides how a bare name is
         // completed, not who is asked, so eth0 above counts for nothing.
@@ -3228,13 +3258,11 @@ Link 7 (wg0): ~corp.example ~corp.internal
         // Both shapes of removal: the restore's, and the stale cleanup's, which
         // would otherwise match this address and find no interface holding it.
         assert!(remove_resolver_files(&dir, is_our_resolver_file).is_empty());
-        assert!(
-            remove_resolver_files(&dir, |contents| {
-                is_our_resolver_file(contents)
-                    && resolver_nameserver(contents).is_some_and(|server| server == "10.0.0.254")
-            })
-            .is_empty()
-        );
+        assert!(remove_resolver_files(&dir, |contents| {
+            is_our_resolver_file(contents)
+                && resolver_nameserver(contents).is_some_and(|server| server == "10.0.0.254")
+        })
+        .is_empty());
         assert!(theirs.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
