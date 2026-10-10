@@ -33,7 +33,7 @@ NexaPipe 是一个 Rust workspace，由四部分组成：
 [安全边界](#安全边界) ·
 [客户端库](#使用客户端库) · [客户端应用](#客户端应用) ·
 [开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) ·
-[变更日志](CHANGELOG.md) · [v0.5.0 发布说明](https://open-nexa.github.io/nexapipe/v0.5.0.html)
+[变更日志](CHANGELOG.md) · [v0.6.0 发布说明](https://open-nexa.github.io/nexapipe/v0.6.0.html)
 
 ---
 
@@ -172,7 +172,7 @@ docker pull ghcr.io/open-nexa/nexapipe:latest
 docker compose up -d
 ```
 
-想锁定版本而不是跟随最新版：把两处的 `:latest` 换成 `:0.5.0` 这样的标签，或者在
+想锁定版本而不是跟随最新版：把两处的 `:latest` 换成 `:0.6.0` 这样的标签，或者在
 `docker-compose.override.yml` 里设置 `image:`，以免改动被版本跟踪的文件。`latest`
 只跟随正式发布，预发布标签不会占用它。
 
