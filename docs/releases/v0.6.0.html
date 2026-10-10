@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexaPipe 0.6.0 — release notes and downloads</title>
+<meta name="description" content="NexaPipe 0.6.0: one credential per device, revocable on its own and closed out of the connections it already holds; every install answering as one named device of itself; request latency as a histogram; and nexapipe client list|add|revoke. Downloads for Linux, macOS, Windows and Android.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f7f8fa;
+    --panel-hover: #f0f2f5;
+    --border: #e4e7ec;
+    --text: #16181d;
+    --muted: #6b7280;
+    --accent: #1668dc;
+    --accent-text: #ffffff;
+    --accent-soft: #e8f1fd;
+    --warn-bg: #fff6e6;
+    --warn-border: #f0d28a;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-hover: #1e222b;
+      --border: #282d36;
+      --text: #e6e8eb;
+      --muted: #98a1ad;
+      --accent: #4d9dff;
+      --accent-text: #0b1017;
+      --accent-soft: #16243a;
+      --warn-bg: #2a2213;
+      --warn-border: #5d4a22;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 0 20px 72px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.site {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 0;
+    margin-bottom: 40px;
+  }
+  header.site .wrap {
+    padding-bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand { font-weight: 700; font-size: 17px; letter-spacing: -0.2px; }
+  .brand span { color: var(--muted); font-weight: 500; }
+  header.site nav { display: flex; gap: 18px; font-size: 14px; }
+  header.site nav a { color: var(--muted); }
+  header.site nav a:hover { color: var(--accent); }
+
+  .chip {
+    display: inline-block;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-weight: 600;
+  }
+  h1 { font-size: 40px; line-height: 1.15; margin: 16px 0 8px; letter-spacing: -0.8px; }
+  .lede { font-size: 18px; color: var(--muted); margin: 0 0 10px; max-width: 60ch; }
+  .meta { font-size: 14px; color: var(--muted); margin: 0; }
+
+  .detect {
+    margin: 28px 0 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    background: var(--panel);
+  }
+  .detect h3 { margin: 0 0 2px; font-size: 15px; }
+  .detect .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .btnrow { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    background: var(--accent);
+    color: var(--accent-text);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 15px;
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .btn:hover { text-decoration: none; filter: brightness(1.08); }
+  .btn.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { background: var(--panel-hover); }
+
+  h2 { font-size: 22px; margin: 48px 0 4px; letter-spacing: -0.3px; }
+  h2 + .hint { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  h3.subhead { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 28px 0 10px; }
+
+  ul.rows { list-style: none; margin: 0 0 8px; padding: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  ul.rows li { border-bottom: 1px solid var(--border); }
+  ul.rows li:last-child { border-bottom: 0; }
+  ul.rows a.row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 12px 16px; color: var(--text); text-decoration: none;
+  }
+  ul.rows a.row:hover { background: var(--panel-hover); text-decoration: none; }
+  ul.rows .name { font-size: 15px; font-weight: 500; }
+  ul.rows .file { display: block; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  ul.rows .get { font-size: 13px; color: var(--accent); white-space: nowrap; }
+
+  .note {
+    font-size: 14px;
+    color: var(--muted);
+    border-left: 3px solid var(--border);
+    padding: 2px 0 2px 12px;
+    margin: 16px 0 0;
+  }
+  .warn {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 14px;
+    margin: 18px 0 0;
+  }
+  .warn strong { display: block; margin-bottom: 2px; }
+
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 0 0 10px;
+  }
+  pre .c { color: var(--muted); }
+  .cmdblock { position: relative; }
+  .copy {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--bg); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-size: 12px; padding: 3px 9px; cursor: pointer;
+  }
+  .copy:hover { color: var(--accent); border-color: var(--accent); }
+
+  ul.changelog { margin: 0 0 22px; padding-left: 22px; }
+  ul.changelog li { margin-bottom: 7px; }
+  .tagline { font-size: 15px; color: var(--muted); margin: 0 0 14px; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 14px; margin: 0 0 10px; }
+  table.metrics th, table.metrics td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.metrics td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  table.metrics th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Downloads: one row per operating system, one column per architecture. */
+  .dl-wrap { overflow-x: auto; margin: 0 0 8px; }
+  table.dl { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 540px; }
+  table.dl th, table.dl td { text-align: left; padding: 10px 12px; border: 1px solid var(--border); vertical-align: top; }
+  table.dl thead th {
+    background: var(--panel); color: var(--muted);
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  table.dl tbody th { background: var(--panel); font-weight: 500; white-space: nowrap; }
+  table.dl a.pkg { display: block; color: var(--text); text-decoration: none; padding: 3px 0; }
+  table.dl a.pkg:hover .label { color: var(--accent); }
+  table.dl .label { font-weight: 500; }
+  table.dl .file {
+    display: block; font-family: var(--mono); font-size: 11.5px;
+    color: var(--muted); word-break: break-all;
+  }
+  table.dl td.hit { background: var(--panel-hover); box-shadow: inset 0 0 0 1px var(--accent); }
+  table.dl td.hit .file { color: var(--text); }
+
+  footer.site {
+    margin-top: 56px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 14px;
+  }
+  @media (max-width: 560px) {
+    h1 { font-size: 32px; }
+    ul.rows a.row { flex-direction: column; align-items: flex-start; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <div class="brand">NexaPipe <span>0.6.0</span></div>
+    <nav>
+      <a href="https://github.com/open-nexa/nexapipe">GitHub</a>
+      <a href="https://github.com/open-nexa/nexapipe/releases/latest">All releases</a>
+      <a href="https://github.com/open-nexa/nexapipe/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section class="hero">
+    <span class="chip">Release</span>
+    <h1>NexaPipe 0.6.0</h1>
+    <p class="lede">Identity finally goes as far as the device. One credential per device, issued at
+      enrollment and revocable on its own, and every install answering as one named device of itself
+      &mdash; so revoking a laptop no longer means re-enrolling a phone, and a device struck out loses
+      the connections it is already holding instead of keeping them until it hangs up. Alongside it:
+      request latency as a histogram, the write half of the management surface, and a desktop that
+      shares its DNS with the other TUN apps on the machine.</p>
+    <p class="meta">10 October 2026 &middot; one tag ships the server archives, the desktop bundles, the Android APK and the container image.</p>
+
+    <div class="detect" id="detect">
+      <h3 id="detect-title">Download for your platform</h3>
+      <p class="sub" id="detect-sub">Pick a build below if the guess is wrong.</p>
+      <div class="btnrow" id="detect-buttons"></div>
+    </div>
+  </section>
+
+  <h2 id="downloads">Downloads</h2>
+  <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
+
+  <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-windows-x86_64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.6.0-windows-x86_64-setup.exe</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-windows-aarch64-setup.exe"><span class="label">Installer</span><span class="file">nexa-0.6.0-windows-aarch64-setup.exe</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-macos-x86_64.dmg"><span class="label">Disk image &mdash; Intel</span><span class="file">nexa-0.6.0-macos-x86_64.dmg</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-macos-aarch64.dmg"><span class="label">Disk image &mdash; Apple silicon</span><span class="file">nexa-0.6.0-macos-aarch64.dmg</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-x86_64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.6.0-linux-x86_64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-x86_64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.6.0-linux-x86_64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-x86_64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.6.0-linux-x86_64.AppImage</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-aarch64.deb"><span class="label">Debian / Ubuntu</span><span class="file">nexa-0.6.0-linux-aarch64.deb</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-aarch64.rpm"><span class="label">Fedora / RHEL</span><span class="file">nexa-0.6.0-linux-aarch64.rpm</span></a>
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-linux-aarch64.AppImage"><span class="label">AppImage</span><span class="file">nexa-0.6.0-linux-aarch64.AppImage</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Android</th>
+          <td data-os="android" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-android-x86_64.apk"><span class="label">APK &mdash; emulators</span><span class="file">nexa-0.6.0-android-x86_64.apk</span></a>
+          </td>
+          <td data-os="android" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexa-0.6.0-android-arm64.apk"><span class="label">APK</span><span class="file">nexa-0.6.0-android-arm64.apk</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">One APK per ABI: <code>arm64-v8a</code> for every phone, <code>x86_64</code> for the
+    emulator images a development machine can run. Desktop bundles are signed with the Tauri updater
+    key; the in-app updater reads <code>latest.json</code> in the same release. iOS is not a supported
+    platform &mdash; see the
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">roadmap</a>.</p>
+  <p class="note">Checksums for every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h3 class="subhead">Server &amp; client library &mdash; nexapipe</h3>
+  <div class="dl-wrap">
+    <table class="dl">
+      <thead>
+        <tr>
+          <th scope="col">Operating system</th>
+          <th scope="col">x86_64</th>
+          <th scope="col">arm64 / aarch64</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Linux (glibc)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-x86_64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.6.0-x86_64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-aarch64-unknown-linux-gnu.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.6.0-aarch64-unknown-linux-gnu.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Linux (musl, static)</th>
+          <td data-os="linux" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-x86_64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.6.0-x86_64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+          <td data-os="linux" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-aarch64-unknown-linux-musl.tar.gz"><span class="label">tar.gz</span><span class="file">nexapipe-0.6.0-aarch64-unknown-linux-musl.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">macOS</th>
+          <td data-os="macos" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-x86_64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Intel</span><span class="file">nexapipe-0.6.0-x86_64-apple-darwin.tar.gz</span></a>
+          </td>
+          <td data-os="macos" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-aarch64-apple-darwin.tar.gz"><span class="label">tar.gz &mdash; Apple silicon</span><span class="file">nexapipe-0.6.0-aarch64-apple-darwin.tar.gz</span></a>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Windows</th>
+          <td data-os="windows" data-arch="x86_64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-x86_64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.6.0-x86_64-pc-windows-msvc.zip</span></a>
+          </td>
+          <td data-os="windows" data-arch="arm64">
+            <a class="pkg" href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-aarch64-pc-windows-msvc.zip"><span class="label">zip</span><span class="file">nexapipe-0.6.0-aarch64-pc-windows-msvc.zip</span></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Each archive holds the <code>nexapipe</code> binary, the client <code>cdylib</code>
+    for embedding, <code>config.toml.2fa.example</code>, the README and the licence. Checksums for
+    every asset above:
+    <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h2>Container image</h2>
+  <p class="hint">Published with everything else, as one multi-arch manifest for
+    <code>linux/amd64</code> and <code>linux/arm64</code>. Both READMEs carry a
+    <code>systemd</code> unit for the server now as well.</p>
+  <div class="cmdblock">
+    <pre id="cmd-image"><span class="c"># This release exactly</span>
+docker pull ghcr.io/open-nexa/nexapipe:0.6.0
+
+<span class="c"># The newest stable release (:latest never points at a pre-release)</span>
+docker pull ghcr.io/open-nexa/nexapipe:latest</pre>
+    <button class="copy" data-target="cmd-image">Copy</button>
+  </div>
+  <p class="note"><code>docker-compose.yaml</code> names the published image, so <code>docker compose up</code>
+    pulls it rather than building &mdash; <code>--build</code> still builds locally under the same name.</p>
+
+  <h2>Install from a terminal</h2>
+  <p class="hint">No package manager yet &mdash; these are the release assets, straight from the tag.</p>
+  <div class="cmdblock">
+    <pre id="cmd-linux"><span class="c"># Linux x86_64, static binary</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf nexapipe-0.6.0-x86_64-unknown-linux-musl.tar.gz
+cd nexapipe-0.6.0-x86_64-unknown-linux-musl &amp;&amp; ./nexapipe --version</pre>
+    <button class="copy" data-target="cmd-linux">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-macos"><span class="c"># macOS, Apple silicon</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/nexapipe-0.6.0-aarch64-apple-darwin.tar.gz
+tar -xzf nexapipe-0.6.0-aarch64-apple-darwin.tar.gz
+cd nexapipe-0.6.0-aarch64-apple-darwin &amp;&amp; ./nexapipe --version</pre>
+    <button class="copy" data-target="cmd-macos">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-verify"><span class="c"># Linux — verify before extracting: the check looks for the archive beside</span>
+<span class="c"># SHA256SUMS.txt, so it has to run before the cd into the directory</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt</pre>
+    <button class="copy" data-target="cmd-verify">Copy</button>
+  </div>
+  <div class="cmdblock">
+    <pre id="cmd-verify-macos"><span class="c"># macOS — the same check with shasum, which is what ships there. macOS 26</span>
+<span class="c"># added sha256sum, but every release older than that has only shasum, and not</span>
+<span class="c"># every version of it understands --ignore-missing, so grep narrows the list</span>
+<span class="c"># to the one archive you actually downloaded. Still before the cd.</span>
+curl -LO https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt
+grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -c -</pre>
+    <button class="copy" data-target="cmd-verify-macos">Copy</button>
+  </div>
+  <p class="note">All assets: <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
+
+  <h2>What's new</h2>
+  <p class="tagline">0.6.0 follows 0.5.0, released 7 October 2026. One configuration key is added
+    and none is removed, so a <code>config.toml</code> that works on 0.5.0 loads unchanged &mdash; but
+    two things behave differently without being configured to, and both are listed under
+    <a href="#before">before upgrading</a>.</p>
+
+  <h3 class="subhead">One credential per device, rather than one shared by every device</h3>
+  <ul class="changelog">
+    <li><code>[auth.clients.&lt;id&gt;]</code> gains a <code>devices</code> table: each entry carries a
+      secret of its own, issued at enrollment and revocable on its own, so striking one out no longer
+      rotates the rest &mdash; what used to make revoking a laptop mean re-enrolling a phone.</li>
+    <li>The credential is still a TOTP secret and the handshake still HMAC-SHA256 over
+      <code>nonce ‖ timestamp</code>; what changed is which secret is looked up. A client carrying
+      only <code>secret</code> keeps working exactly as it did &mdash; that is the path a peer naming
+      no device takes, and the path every config written before this release is on.</li>
+    <li>A revoked device loses the connections it is already holding. Revocation used to rewrite
+      <code>config.toml</code> and stop there: the device could not connect again, but it went on
+      serving on everything it had open until it hung up &mdash; which is the one thing revocation is
+      for. The reload that notices what left <code>[auth]</code> closes them now, at both levels: a
+      client that left takes every device under it, a device that left takes only its own.</li>
+    <li>They go with a new close code, <code>6</code>, which both clients turn into an error saying the
+      credential is gone and that trying again is not going to help &mdash; the natural reading of a
+      refused connection is a code typed wrong, and there is no code to retype.</li>
+  </ul>
+
+  <h3 class="subhead">Every install answers as one named device of itself</h3>
+  <ul class="changelog">
+    <li>A device name is what makes the table above reachable from somewhere other than an operator's
+      shell. The desktop answers after its hostname, Android after the device model, eight random
+      characters behind either so two machines sharing a name do not collide into one entry nobody can
+      revoke for one of them.</li>
+    <li>The name is claimed at enrollment and nowhere else, because the server picks the secret by what
+      the response carries and refuses a device it has none filed for &mdash; a credential that
+      answered as a name nobody asked for would be rejected rather than quietly accepted under the
+      client's shared secret.</li>
+    <li>Existing credentials therefore carry on answering exactly as they do today, and nothing
+      re-enrolls on its own. Both apps say what an unnamed device costs and offer the one thing that
+      changes it, which is importing a registration invite again.</li>
+  </ul>
+
+  <h3 class="subhead">An access line says whose request it was</h3>
+  <ul class="changelog">
+    <li>A connection carries the client <em>and</em> the device it authenticated as, so every access
+      line ends with <code>client=… device=…</code> and <code>/v1/connections</code> answers who is
+      connected rather than only how many.</li>
+    <li>A device that authenticated without naming itself is <code>device=-</code>; a request that
+      never authenticated &mdash; 2FA off, or the plaintext HTTP listener, which runs no handshake
+      &mdash; gets neither field, because a line answering "whose request was this" with a dash on all
+      of them is noise rather than an answer.</li>
+  </ul>
+
+  <h3 class="subhead"><code>nexapipe client list|add|revoke</code></h3>
+  <ul class="changelog">
+    <li>The management surface has a write half. Each takes <code>--device</code> and writes
+      <code>config.toml</code> through the same lock the server reads it with, and a running server
+      picks the change up on its next reload.</li>
+    <li><code>/v1/*</code> stays read-only on purpose: its token is one opaque value, with no scope and
+      no rotation, which is not something to hand write access to in the same release as the identity
+      model it would be changing.</li>
+  </ul>
+
+  <h3 class="subhead">Request latency as a histogram</h3>
+  <ul class="changelog">
+    <li><code>nexapipe_request_duration_ms_bucket{le="…"}</code>, beside <code>_sum</code> and
+      <code>_count</code>, replaces <code>nexapipe_request_duration_ms_total</code> &mdash; which
+      carried the same sum under a name a histogram cannot have. A p99 no longer takes arithmetic.</li>
+    <li>The boundaries are fixed at 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 and 10000
+      milliseconds, plus <code>+Inf</code>. Anything that divided the old counter by
+      <code>nexapipe_requests_total</code> for a mean can read <code>_sum</code> the same way.</li>
+  </ul>
+
+  <h3 class="subhead">Desktop</h3>
+  <ul class="changelog">
+    <li>A page lists the connections a running proxy is holding, and the session carries its own
+      totals beside them.</li>
+    <li>The TUN shares DNS and address space with the other TUN apps on the machine rather than taking
+      both over, and a name outside the hijack is answered through the host's own resolver instead of
+      being swallowed by the tunnel.</li>
+    <li>A running proxy says what quitting should do, rather than leaving the question unasked.</li>
+    <li>Six smaller fixes: no empty window while the app starts; the TUN resolver is the exclusive DNS
+      route on Linux; a service an upgrade left behind is put back; a macOS service that was stopped
+      stays stopped; the connecting indicator breathes with Reduce Motion on; and the webview is
+      granted the permission it needs to read the service version.</li>
+  </ul>
+
+  <h3 class="subhead">Operations</h3>
+  <ul class="changelog">
+    <li>Both READMEs carry a <code>systemd</code> unit for the server, beside the Docker section. It
+      keeps a named account rather than <code>DynamicUser=yes</code>, because this server writes back
+      into its own config &mdash; the 2FA counters, an enrolled device &mdash; and writes its admin
+      token beside it.</li>
+    <li><code>docs/self-hosted-relay.md</code> gains the same for the relay.</li>
+    <li>The root workspace is <em>tested</em> on Windows in CI, not only compiled. The job was
+      <code>windows-check</code>; it is <code>windows-test</code> now and runs the same command the
+      Linux and macOS runners do, so a bug that only appears when the tests execute no longer reaches a
+      tag before CI sees one.</li>
+  </ul>
+  <div class="warn">
+    <strong>Two things in this release have not been watched running.</strong>
+    The Android notification's rates are still verified by unit tests and by compilation only. So is
+    the device name an install answers with: the handshake, the enrollment path and both apps'
+    persistence of it are covered by tests, but no phone and no desktop has been enrolled against a
+    running server by hand. Everything else here has been compiled and tested.
+  </div>
+
+  <h3 class="subhead">Also in this release</h3>
+  <ul class="changelog">
+    <li>Dependencies: one batched upgrade across the workspace.</li>
+  </ul>
+
+  <h2>Changelog</h2>
+
+  <h3 class="subhead">Added</h3>
+  <ul class="changelog">
+    <li>Server: one credential per device &mdash; a <code>devices</code> table under
+      <code>[auth.clients.&lt;id&gt;]</code>, each entry issued at enrollment and revocable on its
+      own.</li>
+    <li>Client, desktop and Android: every install answers as one named device of itself, the desktop
+      after its hostname and Android after the device model.</li>
+    <li>Server: an access line and <code>/v1/connections</code> say which client and which device a
+      connection belongs to.</li>
+    <li>Server: <code>nexapipe client list|add|revoke</code>, each with <code>--device</code>.</li>
+    <li>Docs: a <code>systemd</code> unit for the server in both READMEs, and one for the relay in
+      <code>docs/self-hosted-relay.md</code>.</li>
+    <li>Desktop: session totals, and a page that lists the connections a running proxy is holding.</li>
+    <li>Desktop: a running proxy says what quitting should do.</li>
+    <li>CI: the root workspace is tested on Windows, not only compiled.</li>
+  </ul>
+
+  <h3 class="subhead">Changed</h3>
+  <ul class="changelog">
+    <li>Server: <code>/metrics</code> reports request latency as a histogram
+      (<code>nexapipe_request_duration_ms_bucket</code>, <code>_sum</code>, <code>_count</code>) rather
+      than as the counter <code>nexapipe_request_duration_ms_total</code>, which no longer exists.</li>
+    <li>Desktop: the TUN shares DNS and address space with the other TUN apps on the machine.</li>
+    <li>Dependencies: one batched upgrade across the workspace.</li>
+  </ul>
+
+  <h3 class="subhead">Fixed</h3>
+  <ul class="changelog">
+    <li>Server: a device struck out kept the connections it already held. It could not connect again,
+      but it went on serving on everything it had open until it hung up &mdash; which is the one thing
+      revocation is for. Those connections are closed now, with close code <code>6</code>.</li>
+    <li>Desktop: a name outside the hijack is answered through the host's own resolver, instead of the
+      TUN swallowing it.</li>
+    <li>Desktop: an empty window is no longer shown while the app starts.</li>
+    <li>Desktop (Linux): the TUN resolver is the exclusive DNS route.</li>
+    <li>Desktop: the service is put back on the app's build when an upgrade leaves it behind.</li>
+    <li>Desktop (macOS): a service that was stopped stays stopped.</li>
+    <li>Desktop: the connecting indicator breathes with Reduce Motion on, rather than being exempt
+      from the setting.</li>
+    <li>Desktop: the webview is granted the permission it needs to read the service version.</li>
+    <li>Desktop: the window is shown before the first frame is waited for.</li>
+  </ul>
+
+  <h2 id="before">Before upgrading</h2>
+  <ul class="changelog">
+    <li>One configuration key is added and none is removed or renamed: a <code>config.toml</code> that
+      works on 0.5.0 loads unchanged on 0.6.0, and a client written before devices existed answers
+      exactly as it did.</li>
+    <li><code>/metrics</code> loses <code>nexapipe_request_duration_ms_total</code> and gains the
+      histogram. A scrape looking for the old counter will not find it: read
+      <code>nexapipe_request_duration_ms_sum</code> instead, and divide by
+      <code>nexapipe_requests_total</code> for the same mean.</li>
+    <li>Revoking a device now closes the connections it already holds. Anything that treated a
+      revocation as "no new connections, but the old ones finish" &mdash; a drain script, a test &mdash;
+      sees them end immediately instead.</li>
+    <li>Both clients turn close code <code>6</code> into "the credential is gone"; an older client
+      library reads it as an unknown code. Mixing versions across a revocation is safe, just less
+      explanatory.</li>
+    <li>A device enrolled before it could name itself keeps answering as nobody, and is still filed
+      under the client's shared <code>secret</code>. Importing a registration invite again is what
+      makes it a named device &mdash; nothing re-enrolls on its own.</li>
+    <li>Docker: pin <code>:0.6.0</code> rather than <code>:latest</code> if you want the version to
+      stay put.</li>
+  </ul>
+
+  <footer class="site">
+    NexaPipe is licensed under the terms in <code>LICENSE</code>. &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/CHANGELOG.md">Changelog</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md">Roadmap</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/iroh-boundaries.md">iroh boundaries</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe/blob/main/docs/self-hosted-relay.md">Your own relay</a> &middot;
+    <a href="index.html">All versions</a> &middot;
+    <a href="https://github.com/open-nexa/nexapipe">Repository</a>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var BASE = "https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/";
+  var ua = navigator.userAgent || "";
+  var title = document.getElementById("detect-title");
+  var sub = document.getElementById("detect-sub");
+  var buttons = document.getElementById("detect-buttons");
+
+  function pick() {
+    if (/Android/i.test(ua)) {
+      // The emulator images a development machine runs are x86_64; everything a
+      // phone runs is arm64-v8a. The UA does not reliably say which one this is,
+      // so the primary button stays arm64 and the other APK is offered beside it.
+      return {
+        title: "Download for Android",
+        sub: "Signed APK, one per ABI. The one a phone wants is highlighted below.",
+        links: [
+          { href: BASE + "nexa-0.6.0-android-arm64.apk", label: "arm64-v8a (phones)" },
+          { href: BASE + "nexa-0.6.0-android-x86_64.apk", label: "x86_64 (emulators)", secondary: true }
+        ],
+        cells: [["android", "arm64"]]
+      };
+    }
+    if (/iPhone|iPad|iPod/i.test(ua)) {
+      return {
+        title: "No iOS build",
+        sub: "iOS is not a supported platform and none is planned. See the roadmap.",
+        links: [{ href: "https://github.com/open-nexa/nexapipe/blob/main/docs/ROADMAP.md", label: "Why", secondary: true }]
+      };
+    }
+    if (/Windows/i.test(ua)) {
+      var arm = /ARM|aarch64/i.test(ua);
+      return {
+        title: "Download for Windows",
+        sub: arm ? "Windows on ARM detected." : "Windows installer, signed for the updater.",
+        links: [
+          { href: BASE + (arm ? "nexa-0.6.0-windows-aarch64-setup.exe" : "nexa-0.6.0-windows-x86_64-setup.exe"), label: "Desktop app" },
+          { href: BASE + (arm ? "nexapipe-0.6.0-aarch64-pc-windows-msvc.zip" : "nexapipe-0.6.0-x86_64-pc-windows-msvc.zip"), label: "Server archive", secondary: true }
+        ],
+        cells: [["windows", arm ? "arm64" : "x86_64"]]
+      };
+    }
+    if (/Macintosh|Mac OS X/i.test(ua)) {
+      // A Mac's user agent says "Macintosh" on both chips, so which one is
+      // wanted cannot be read off it. Offer both rather than guessing: a
+      // guessed architecture is a download that installs and then refuses to
+      // run.
+      return {
+        title: "Download for macOS",
+        sub: "Whether this Mac is Apple silicon or Intel decides which one, and the browser does not say. Both are here; the server archives are in the list below.",
+        links: [
+          { href: BASE + "nexa-0.6.0-macos-aarch64.dmg", label: "Apple silicon" },
+          { href: BASE + "nexa-0.6.0-macos-x86_64.dmg", label: "Intel", secondary: true }
+        ],
+        // Both chips are offered, so both columns light up: the browser will
+        // not say which one this Mac is.
+        cells: [["macos", "x86_64"], ["macos", "arm64"]]
+      };
+    }
+    if (/Linux/i.test(ua)) {
+      // Unlike a Mac, a Linux browser usually does put the architecture in the
+      // user agent, so the same guess is worth making here that Windows gets.
+      var arm = /ARM|aarch64|armv/i.test(ua);
+      return {
+        title: "Download for Linux",
+        sub: arm ? "Linux on arm64 detected." : "Debian package and a static server binary. rpm, AppImage and the arm64 builds are below.",
+        links: [
+          { href: BASE + (arm ? "nexa-0.6.0-linux-aarch64.deb" : "nexa-0.6.0-linux-x86_64.deb"), label: "Desktop app" },
+          { href: BASE + (arm ? "nexapipe-0.6.0-aarch64-unknown-linux-musl.tar.gz" : "nexapipe-0.6.0-x86_64-unknown-linux-musl.tar.gz"), label: "Server archive", secondary: true }
+        ],
+        cells: [["linux", arm ? "arm64" : "x86_64"]]
+      };
+    }
+    return {
+      title: "Pick your platform",
+      sub: "Everything this release ships is listed below.",
+      links: []
+    };
+  }
+
+  var choice = pick();
+  title.textContent = choice.title;
+  sub.textContent = choice.sub;
+  choice.links.forEach(function (link) {
+    var a = document.createElement("a");
+    a.href = link.href;
+    a.className = link.secondary ? "btn secondary" : "btn";
+    a.textContent = link.label;
+    buttons.appendChild(a);
+  });
+  if (choice.links.length === 0) {
+    var a = document.createElement("a");
+    a.href = "#downloads";
+    a.className = "btn";
+    a.textContent = "See all downloads";
+    buttons.appendChild(a);
+  }
+
+  // Mark the cell the guess landed on, in the app table and in the server one.
+  (choice.cells || []).forEach(function (cell) {
+    var td = document.querySelector('table.dl td[data-os="' + cell[0] + '"][data-arch="' + cell[1] + '"]');
+    if (td) { td.classList.add("hit"); }
+  });
+
+  document.querySelectorAll(".copy").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var node = document.getElementById(button.getAttribute("data-target"));
+      var text = node.innerText;
+      var done = function () {
+        var old = button.textContent;
+        button.textContent = "Copied";
+        setTimeout(function () { button.textContent = old; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done);
+      } else {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

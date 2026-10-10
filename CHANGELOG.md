@@ -10,7 +10,21 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [0.6.0] — 2026-10-10
+
+A readable version of this release, with downloads, is published at
+<https://open-nexa.github.io/nexapipe/v0.6.0.html>. The page itself
+lives in `docs/releases/`, and only that directory reaches the site.
+
+One configuration key is added and none is removed or renamed, so a
+`config.toml` that works on 0.5.0 loads unchanged on 0.6.0, and a client written
+before devices existed answers exactly as it did. Three things behave
+differently without being configured to: `/metrics` no longer carries the
+request-duration counter it used to, a device struck out loses the connections
+it is already holding rather than keeping them until it hangs up, and a peer
+revoked underneath a live connection is closed with a new code — `6` — which
+both clients turn into an error saying the credential is gone and that trying
+again will not help.
 
 ### Added
 
