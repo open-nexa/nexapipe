@@ -53,7 +53,7 @@ Do not jump straight into edits. For any task that writes something:
 
 1. **Plan first.** Restate the goal, read the relevant code/config, then produce a concrete plan: which files change, what each change does, what could break, and how it will be verified (build/test/lint commands, CI jobs).
 2. **Ask before acting.** Present that plan and wait for explicit approval. Surface assumptions, alternatives and risks; when several approaches exist, list them and let the owner choose.
-3. **Execute only after approval** and stay inside the agreed scope. Stop and re-ask if the task grows, uncovers a bigger problem, or needs files that were not in the plan.
+3. **Execute only after approval** and stay inside the agreed scope. Stop and re-ask if the task grows, uncovers a bigger problem, or needs files that were not in the plan. Work happens in a worktree created off the newest `main` (see Git Workflow — Worktrees & Branch Base), never in the main checkout.
 
 No approval is needed for read-only work: answering questions, reading files, searching, explaining code, or producing a report / scan-only listing. Anything that writes, deletes, or has external effects does need it.
 
@@ -64,6 +64,24 @@ No approval is needed for read-only work: answering questions, reading files, se
 - Do not run history/discard commands (`git reset --hard`, `git checkout --`, `git clean -fd`, `git stash` without being asked, branch switches that drop work) unless explicitly requested.
 - The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "commit it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
+
+## Git Workflow — Worktrees & Branch Base (MANDATORY)
+
+- **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `/Users/ipine/rust/nexapipe` and stays on `main`. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
+- **Every new branch is based on the newest `main`.** Do not start from the local `main` ref alone: the fork's `main` regularly lags upstream. Resolve the upstream head first, fetch it into the fork, and branch off that commit:
+
+  ```bash
+  gh api repos/open-nexa/nexapipe/commits/main --jq .sha   # -> <sha>
+  git fetch --no-tags origin <sha>
+  git worktree add /Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch> -b <branch> <sha>
+  cd /Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch>
+  git merge-base --is-ancestor <sha> HEAD   # verify the branch really sits on newest main
+  ```
+
+  If the upstream lookup is unreachable, degrade to a fast-forward update of the local `main` (`git fetch --no-tags origin main`, fast-forward only — never `reset --hard`) and state explicitly in the reply which commit was used as the base.
+- **Worktree location:** `/Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch-name>` for every working branch. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+- Set the worktree up only after the plan is approved; until then stay read-only.
+- **Never delete a worktree on your own initiative**, least of all one holding unpushed commits — ask first. After a reboot, `/private/tmp` is gone, so run `git worktree prune` before rebuilding anything that referenced it.
 
 ## Working Files & Plan Documents (MANDATORY)
 
