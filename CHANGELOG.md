@@ -208,6 +208,24 @@ again will not help.
   a teardown scheduled there would be cancelled before it ran and the
   duplicated fd would stay open.
 
+- **Android: a credential is no longer stored unencrypted without being
+  asked.** A device whose keystore is unavailable still had its credentials
+  written in the clear. The fallback was logged and shown as a warning, but
+  that is after the write, and the write is what the warning is about. A save
+  that carries a credential now waits for an answer, and dismissing the
+  question is a refusal, so nothing reaches storage unless it was agreed to.
+  Asked once per device rather than per credential. The fallback itself is
+  unchanged: a device with no keystore can still connect, which is why
+  refusing to store was never the answer — only storing without asking was.
+
+- **A backend that answers slowly is no longer reported unreachable.** The
+  preconnect budget covered the connect alone, and the wait for a 2FA refusal
+  ran outside it for up to six seconds more, while the caller allowed eight in
+  total: a backend taking more than two seconds to answer was cancelled in the
+  middle of being observed, and a group of them reported no backend answering
+  at all. The budget covers both halves now, and the phase ceiling and the JNI
+  timeout follow it rather than being numbers written down separately.
+
 ## [0.5.0] — 2026-10-07
 
 A readable version of this release, with downloads, is published at

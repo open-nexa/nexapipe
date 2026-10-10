@@ -606,6 +606,17 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       a second each &mdash; while both <code>onDestroy</code> and <code>ACTION_STOP</code> reach it on
       the main thread. The flags it clears stay synchronous, because an establish that is already
       running reads them; only the native stop moves.</li>
+    <li>Android: a credential is no longer stored unencrypted without being asked. A device whose
+      keystore is unavailable still had its credentials written in the clear; the fallback was logged
+      and shown as a warning, but that is after the write, and the write is what the warning is
+      about. A save carrying a credential now waits for an answer, and dismissing the question is a
+      refusal. Asked once per device. The fallback itself is unchanged &mdash; a device with no
+      keystore can still connect &mdash; only storing without asking is gone.</li>
+    <li>A backend that answers slowly is no longer reported unreachable. The preconnect budget
+      covered the connect alone, and the wait for a 2FA refusal ran outside it for up to six seconds
+      more, while the caller allowed eight in total: a backend taking more than two seconds to answer
+      was cancelled in the middle of being observed, and a group of them reported no backend
+      answering at all. The budget covers both halves now.</li>
   </ul>
 
   <h2 id="before">Before upgrading</h2>
