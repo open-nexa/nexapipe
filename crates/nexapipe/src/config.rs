@@ -1093,6 +1093,10 @@ pub struct ClientAuthToml {
     /// rotating the others. Absent means this client has never issued one, and
     /// every device then shares the `secret` above.
     pub devices: Option<HashMap<String, DeviceAuthToml>>,
+    /// Whether a peer that names no device may still answer with the `secret`
+    /// above. Defaults to `true`, which is the only spelling a client that
+    /// predates the device table can authenticate under.
+    pub unnamed_device_allowed: Option<bool>,
     /// Runtime counters written back by the server (see
     /// `config_watcher::save_auth_state`); read here so a lockout survives a
     /// restart.
@@ -1310,6 +1314,9 @@ impl ProxyConfig {
                                     allow_hosts: client_toml.allow_hosts,
                                     pending_enrollment: client_toml.pending_enrollment,
                                     devices,
+                                    unnamed_device_allowed: client_toml
+                                        .unnamed_device_allowed
+                                        .unwrap_or(true),
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
@@ -2670,6 +2677,45 @@ pending_enrollment = "TOKEN"
         assert!(
             !alice.devices["laptop"].created_at.is_empty(),
             "a device with no issued-at looks never issued"
+        );
+    }
+
+    /// Revoking a device strikes one entry out of `devices` and leaves the
+    /// client's own `secret` standing, so while that secret is still a
+    /// credential, a peer that simply omits the device name goes on
+    /// authenticating with it. `unnamed_device_allowed = false` is what takes
+    /// it away, and it has to survive the loader — a flag the file carries but
+    /// the server ignores would be worse than none at all.
+    #[test]
+    fn a_client_can_stop_answering_devices_that_name_themselves_not_at_all() {
+        let source = |flag: Option<&str>| {
+            format!(
+                "[auth]\n\
+                 enabled = true\n\
+                 \n\
+                 [auth.clients.alice]\n\
+                 secret = \"CLIENTSECRET\"\n\
+                 {}\
+                 \n\
+                 [auth.clients.alice.devices.laptop]\n\
+                 secret = \"LAPTOPSECRET\"\n",
+                flag.unwrap_or_default()
+            )
+        };
+
+        let (_dir, path) = scratch_config(&source(None));
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+        assert!(
+            auth.expect("auth is enabled").clients["alice"].unnamed_device_allowed,
+            "the default has to stay permissive: every client issued before 0.6.0 has no \
+             device table, and the shared secret is its only credential"
+        );
+
+        let (_dir, path) = scratch_config(&source(Some("unnamed_device_allowed = false\n")));
+        let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+        assert!(
+            !auth.expect("auth is enabled").clients["alice"].unnamed_device_allowed,
+            "a flag the operator set must reach the running server"
         );
     }
 

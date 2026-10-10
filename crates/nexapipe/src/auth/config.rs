@@ -75,6 +75,16 @@ fn default_window() -> u32 {
 fn default_max_attempts() -> u32 {
     5
 }
+/// Whether a peer that names no device may still answer with this client's own
+/// `secret`.
+///
+/// `true` by default, because that is the only spelling a client that predates
+/// the device table can authenticate under, and turning it off without having
+/// enrolled every device would lock out the ones that never named themselves.
+fn default_unnamed_device_allowed() -> bool {
+    true
+}
+
 fn default_lockout_duration() -> u64 {
     300
 }
@@ -136,6 +146,18 @@ pub struct ClientAuth {
     /// out.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub devices: HashMap<String, DeviceAuth>,
+    /// Whether a peer that names no device may still answer with the `secret`
+    /// above.
+    ///
+    /// Revoking a device strikes one entry out of `devices` and leaves this
+    /// secret standing, so a client that has been handing it out — every
+    /// install that enrolled before the table existed, and every invite link
+    /// shared since — keeps a credential no revocation can reach: whoever has
+    /// it only has to omit the device name to go on authenticating. Setting
+    /// this to `false` is what makes per-device revocation mean something for
+    /// such a client; leaving it `true` keeps the behaviour it has always had.
+    #[serde(default = "default_unnamed_device_allowed")]
+    pub unnamed_device_allowed: bool,
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
@@ -165,6 +187,7 @@ impl std::fmt::Debug for ClientAuth {
                 &crate::config::redacted(&self.pending_enrollment),
             )
             .field("devices", &self.devices)
+            .field("unnamed_device_allowed", &self.unnamed_device_allowed)
             .field("last_used", &self.last_used)
             .field("failed_attempts", &self.failed_attempts)
             .field("locked_until", &self.locked_until)
@@ -246,6 +269,10 @@ impl AuthConfig {
                             // per client and leaves the rest of the file
                             // alone — so an empty one costs nothing.
                             devices: HashMap::new(),
+                            // Not a counter, but a snapshot is only ever spent
+                            // writing the three above, so this cannot change
+                            // what a reload sees even though it is carried.
+                            unnamed_device_allowed: client.unnamed_device_allowed,
                             last_used: client.last_used,
                             failed_attempts: client.failed_attempts,
                             locked_until: client.locked_until,
@@ -428,6 +455,7 @@ mod tests {
             allow_hosts: None,
             pending_enrollment: None,
             devices: HashMap::new(),
+            unnamed_device_allowed: true,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
