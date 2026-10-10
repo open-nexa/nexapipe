@@ -76,7 +76,9 @@ class NexaVpnService : VpnService() {
     // a VPN network with the app that owns it, so ours is identified by which
     // network appeared when we called establish() — see trackOwnVpnNetwork.
     // Replaced wholesale rather than mutated in place: establish runs on the IO
-    // dispatcher while stopVPN() and onRevoke() run on the main thread.
+    // dispatcher while stopVPN() and onRevoke() are entered on the main thread.
+    // (stopVPN() only clears flags there — the native stop it used to run
+    // inline is on teardownScope now.)
     @Volatile private var ownVpnNetworks: Set<Network> = emptySet()
     // Whether the last establish could not tell which VPN network was ours.
     // Only then does vpnSlot() fall back to "a single unknown VPN while our own
@@ -87,6 +89,13 @@ class NexaVpnService : VpnService() {
     // must not revoke a VPN that took over while ours was being rebuilt.
     @Volatile private var allowTakeover = false
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // A second scope, deliberately not `serviceScope`: onDestroy() cancels that
+    // one the moment stopVPN() returns, so the teardown stopVPN() schedules
+    // there would be cancelled before it ever ran and the duplicated fd would
+    // stay open. This one is never cancelled — the only thing it runs is a
+    // native stop, which has to finish whether or not the service is still
+    // alive to hear about it.
+    private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var isUserStarted = false
 
     // Reconnect on network switch: keeps the reconnect job. The mutex serializes the rebuilds
@@ -256,8 +265,10 @@ class NexaVpnService : VpnService() {
         reconnectJob?.cancel()
         reconnectJob = null
 
-        // nativeStopTunProxy joins the smoltcp tasks (up to ~500ms each) —
-        // keep the main thread free.
+        // stopVPN() defers the native stop itself, so this is not what keeps
+        // the main thread free any more — but notifyVpnRevoked() and
+        // stopSelf() must still follow it, and they cannot run on the main
+        // thread that onRevoke() was called on either.
         serviceScope.launch {
             stopVPN()
             // Notified before stopping: stopSelf() runs onDestroy(), which
@@ -268,6 +279,15 @@ class NexaVpnService : VpnService() {
         }
     }
 
+    /**
+     * Tear the session down.
+     *
+     * Every flag is cleared synchronously, because an establish or a reconnect
+     * that is already running reads them and has to see this before it goes
+     * any further — that is why this is safe to call from the main thread.
+     * The native stop is not: it joins the smoltcp tasks, up to ~500 ms each,
+     * and is handed to [teardownScope] instead.
+     */
     fun stopVPN() {
         isRunning = false
         isUserStarted = false
@@ -286,6 +306,20 @@ class NexaVpnService : VpnService() {
         // would otherwise keep reading counters of a proxy that is going away.
         stopTrafficPolling()
 
+        teardownScope.launch { stopTunProxyAndLeaveForeground() }
+    }
+
+    /**
+     * The half of the teardown that blocks: stopping the TUN proxy aborts the
+     * smoltcp tasks and closes the duplicated fd, which brings the VPN down
+     * with it.
+     *
+     * Running twice is harmless and expected — the Rust side takes the proxy
+     * out of the state before stopping it, so the second call finds nothing
+     * there — because every caller that stops the service calls [stopVPN] and
+     * then reaches onDestroy(), which calls it again.
+     */
+    private fun stopTunProxyAndLeaveForeground() {
         // Stop the TUN proxy first (abort the smoltcp task + close the
         // duplicated fd -> the VPN is torn down automatically).
         // Must run before touching vpnInterface, because fd ownership has been
