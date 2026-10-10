@@ -174,6 +174,40 @@ again will not help.
   thing that changes for anyone using it: a path that already exists is now
   refused instead of overwritten.
 
+- **Desktop: the desktop build gets the vendored `smoltcp` patch.**
+  `ui-desktop/src-tauri` is its own workspace — the root `Cargo.toml` excludes
+  it — so the root `[patch.crates-io]` never reached it and its lockfile
+  resolved `smoltcp` from crates.io. `tun-proxy` is the feature that runs the
+  transmit path the vendored copy exists to fix, so the desktop TUN ran the
+  upstream code and could reach the subtract-with-overflow panic the patch
+  prevents — on the one client that ships a desktop TUN. The patch section is
+  repeated in the desktop manifest, and its lockfile now carries `smoltcp` with
+  no source at all, which is how a path dependency is recorded.
+
+- **TUN: each flow has a budget.** A UDP flow buffered whatever the far side
+  announced: a length prefix is a `u16`, so one frame could promise 65 535
+  bytes and arrive a byte per idle window, and nothing objected to a length
+  that was not being sent — the loop drained complete frames but set no bound
+  of its own. Two maximum-size frames is the most that buffer can legitimately
+  hold, and past that the flow ends. TCP flows had no ceiling at all, though
+  UDP has had one of 32 since it was written: the stack's socket set grows as
+  connections arrive, and each flow is a socket, a tunnel on the server and a
+  connection out of a pool. 256 now, the same ceiling the local HTTP proxy
+  uses; a connection past it is closed rather than left waiting for a tunnel
+  that will not open.
+
+- **Android: switching the VPN off no longer blocks the main thread.**
+  `stopVPN` called `nativeStopTunProxy` inline, and that joins the smoltcp
+  tasks — up to about half a second each — while both `onDestroy` and
+  `ACTION_STOP` reach it on the main thread. `onRevoke` had been moved off the
+  main thread for exactly this reason; these two paths were missed. The flags
+  `stopVPN` clears stay synchronous, because an establish or a reconnect that
+  is already running reads them and has to see them before it goes further.
+  Only the native stop moves, and it moves to a scope `onDestroy` does not
+  cancel: cancelling the service scope is the next thing `onDestroy` does, so
+  a teardown scheduled there would be cancelled before it ran and the
+  duplicated fd would stay open.
+
 ## [0.5.0] — 2026-10-07
 
 A readable version of this release, with downloads, is published at
