@@ -908,9 +908,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceId(
         }
         let name = read_jstring(env, &device_id).unwrap_or_default();
         jni_log!("[DEBUG:jni] nativeSetDeviceId: {} chars", name.trim().len());
-        if let Ok(mut slot) = DEVICE_ID.lock() {
-            *slot = Some(name);
-        }
+        // A poisoned lock is a failure, not a silent skip. Skipping it left the
+        // name unset while this returned 0, so Kotlin believed the device had
+        // been named and went on connecting unnamed — which on a server that
+        // refuses unnamed peers is a connection that keeps failing for a reason
+        // nothing on either side reported.
+        let Ok(mut slot) = DEVICE_ID.lock() else {
+            jni_log!("[DEBUG:jni] nativeSetDeviceId: the device id lock is poisoned");
+            return -1;
+        };
+        *slot = Some(name);
         0
     })
 }
