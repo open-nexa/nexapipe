@@ -495,7 +495,8 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       both over, and a name outside the hijack is answered through the host's own resolver instead of
       being swallowed by the tunnel.</li>
     <li>A running proxy says what quitting should do, rather than leaving the question unasked.</li>
-    <li>Six smaller fixes: no empty window while the app starts; the TUN resolver is the exclusive DNS
+    <li>Seven smaller fixes: no empty window while the app starts; a launch whose window is never
+      composited sends its start-up timings instead of none; the TUN resolver is the exclusive DNS
       route on Linux; a service an upgrade left behind is put back; a macOS service that was stopped
       stays stopped; the connecting indicator breathes with Reduce Motion on; and the webview is
       granted the permission it needs to read the service version.</li>
@@ -569,6 +570,13 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       from the setting.</li>
     <li>Desktop: the webview is granted the permission it needs to read the service version.</li>
     <li>Desktop: the window is shown before the first frame is waited for.</li>
+    <li>Desktop: a launch that produced no frame sent no start-up timings at all. The wait after
+      <code>show()</code> had no end, so a window the compositor never drew &mdash; a minimized one, or
+      one on a machine that went to sleep &mdash; never reached the <code>finally</code> that sends the
+      timings either. The wait is bounded at two seconds now and reports whether a frame came, so such a
+      launch is logged as one that produced none rather than as one that never happened.</li>
+    <li>A peer listing takes one reading of the clock for the whole list rather than one per entry, so
+      two peers are no longer ordered by when the loop happened to reach them.</li>
   </ul>
 
   <h2 id="before">Before upgrading</h2>

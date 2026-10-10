@@ -128,6 +128,19 @@ again will not help.
   version (#100).
 - Desktop: the window is shown before the first frame is waited for (#106).
 
+- **Desktop: a launch that produced no frame sent no start-up timings at all.**
+  The frame after `show()` is what the `first-frame` mark is for, and waiting
+  for one with no end meant a launch whose webview is never composited — a
+  minimized window, a machine that went to sleep — never reached the `finally`
+  that sends the timings either, so the one launch that most needs a report was
+  the one that never arrived. The wait is bounded at two seconds and reports
+  whether a frame came, so a launch with no frame is logged as one that produced
+  none instead of as one that never happened.
+
+- A peer listing takes one reading of the clock for the whole list rather than
+  one per entry, so two peers are no longer ordered by when the loop happened to
+  reach them.
+
 ## [0.5.0] — 2026-10-07
 
 A readable version of this release, with downloads, is published at
