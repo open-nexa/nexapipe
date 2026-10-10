@@ -585,11 +585,19 @@ impl Enrollment {
                 // against, and putting the one that was asked for back
                 // sends it on every handshake from here on — which the
                 // server answers by refusing a device it does not know.
+                // Narrowed the way `digits` is narrowed in `generate_code`, and
+                // for the same reason: a cast truncates a period that does not
+                // fit into one that looks deliberate — a 90-second step read as
+                // some other number — where a refusal names the value the
+                // server actually sent.
+                let period = u32::try_from(period).map_err(|_| {
+                    ClientError::InvalidConfig(format!("{period} is not a TOTP period"))
+                })?;
                 let issued = TwoFactorAuth::with_params(
                     &client_id,
                     &secret,
                     TotpAlgorithm::from_name(&algorithm),
-                    period as u32,
+                    period,
                     digits,
                 )?;
                 match device_id {
