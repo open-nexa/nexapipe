@@ -2562,13 +2562,24 @@ fn start_tun_proxy(
 ///
 /// Called by `NexaVpnService.stopVPN()` before closing the TUN fd.
 /// `nativeDestroy` also reaches it indirectly via `nativeStopProxy` (Phase 1.5).
+///
+/// The body is wrapped in `catching_panic` because it is the one TUN entry
+/// point with no `with_env_or` around it: `nativeStartTunProxy` gets its unwind
+/// barrier from that helper, while this one takes an `EnvUnowned` and does not
+/// touch the environment at all. Unwinding out of an `extern "system"` frame is
+/// a native crash on Android rather than something the JVM can report, so a
+/// panic while joining the runtime's tasks would take the process down on the
+/// one path that runs while the user is turning the VPN off.
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    stop_tun_proxy()
+    match catching_panic("nativeStopTunProxy", stop_tun_proxy) {
+        Some(code) => code,
+        None => -1,
+    }
 }
 
 fn stop_tun_proxy() -> jint {
