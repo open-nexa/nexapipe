@@ -108,6 +108,7 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 // Virtual IP constants — must match the TUN config in the Kotlin-side NexaVpnService.
@@ -200,6 +201,28 @@ const TUN_WRITE_QUEUE: usize = 1024;
 /// yet, was answered with as many tunnels as it cared to open.
 const MAX_UDP_FLOWS: usize = 32;
 
+/// How many TCP flows may be open at once.
+///
+/// One flow is one smoltcp socket, one tunnel on the server, and one
+/// connection checked out of a group — and nothing bounded how many an
+/// application could start: the stack's socket set grows as connections
+/// arrive, and a flow whose tunnel has to be dialled opens a new connection
+/// when the pool has nothing free. On Android the TUN is system-wide, so any
+/// installed application reaches this. The same ceiling the local HTTP proxy
+/// uses, which is what the numbers here are being compared against rather
+/// than derived from.
+const MAX_TCP_FLOWS: usize = 256;
+
+/// How many bytes one UDP flow may hold of a frame that has not arrived yet.
+///
+/// Two maximum-size frames, which is the most the buffer can legitimately
+/// reach: the tail of one frame left over from the previous read, plus one
+/// read on top of it. A length prefix is a `u16`, so a frame can announce
+/// 65 535 bytes and then arrive however slowly the far side likes, and
+/// nothing in the read loop objects — this is the line that says how much a
+/// flow may be made to wait.
+const MAX_UDP_PARTIAL: usize = 2 * (MAX_UDP_PAYLOAD + FRAME_HEADER_LEN);
+
 /// Buffer size for the byte-copying TCP paths.
 const COPY_BUF_SIZE: usize = 16 * 1024;
 
@@ -235,6 +258,9 @@ struct TunContext {
     /// concurrent reply wait for the lock, so one slow flow delayed the DNS
     /// answers behind it.
     tun_out: mpsc::Sender<UdpMsg>,
+    /// Slots left for TCP flows: one is taken per accepted connection and
+    /// given back when the flow ends, however it ends.
+    tcp_flow_slots: Arc<Semaphore>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -299,6 +325,7 @@ fn start_stack_services(
         dns_ip: net.dns_ip,
         legacy_proxy_ip: net.legacy_proxy_ip,
         tun_out,
+        tcp_flow_slots: Arc::new(Semaphore::new(MAX_TCP_FLOWS)),
         stopped: stopped.clone(),
     };
 
@@ -733,8 +760,38 @@ impl Drop for TunProxy {
 // TCP
 // ============================================================
 
+/// Take one of [`MAX_TCP_FLOWS`] slots for a connection, or refuse it.
+///
+/// Refusing means dropping the stream the caller is holding, which closes it:
+/// the application sees a connection that ends, rather than one that is
+/// accepted and then never opens a tunnel. The permit is owned, so it can be
+/// moved into a spawned task and is given back when that task ends — a flow
+/// that dies before its tunnel opens still returns its slot.
+fn take_tcp_slot(ctx: &TunContext, warned_full: &AtomicBool) -> Option<OwnedSemaphorePermit> {
+    match ctx.tcp_flow_slots.clone().try_acquire_owned() {
+        Ok(permit) => {
+            warned_full.store(false, Ordering::Relaxed);
+            Some(permit)
+        }
+        Err(_) => {
+            if !warned_full.swap(true, Ordering::Relaxed) {
+                jni_log!(
+                    "[tun-proxy] {} TCP flows are open, refusing new connections until one ends",
+                    MAX_TCP_FLOWS
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Accept TCP connections from the stack and route each one by destination address.
 async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
+    // Logged once each time the ceiling is reached, not once per refused
+    // connection: a browser working through a page opens hundreds, and one
+    // line saying the limit was hit is the whole story.
+    let warned_full = AtomicBool::new(false);
+
     while !ctx.stopped.load(Ordering::Acquire) {
         let Some((stream, client_addr, server_addr)) = listener.next().await else {
             jni_log!("[tun-proxy] TCP listener stream ended");
@@ -761,8 +818,16 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
                     jni_log!("[tun-proxy] TCP to {v6}:{dest_port} has no domain mapping, dropping");
                     continue;
                 };
+                let Some(slot) = take_tcp_slot(&ctx, &warned_full) else {
+                    continue;
+                };
                 let ctx = ctx.clone();
-                tokio::spawn(serve_tcp_flow(stream, ctx, domain, dest_port));
+                tokio::spawn(async move {
+                    // Held for as long as the flow runs: dropped with the task,
+                    // however the task ends.
+                    let _slot = slot;
+                    serve_tcp_flow(stream, ctx, domain, dest_port).await;
+                });
                 continue;
             }
         };
@@ -773,11 +838,15 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
         // of being dropped. DNS answers only live 60 s, so this is a short tail.
         // (Android only — the desktop never handed out a fixed proxy address.)
         if ctx.legacy_proxy_ip == Some(dest_ip) {
+            let Some(slot) = take_tcp_slot(&ctx, &warned_full) else {
+                continue;
+            };
             // Read before the stream moves: `client_addr_hint` needs it whole,
             // and the flow this opens is listed with where it came from.
             let peer = Some(client_addr_hint(&stream));
             let ctx = ctx.clone();
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Err(e) = handle_local_connection(
                     stream,
                     ctx.proxy_domains.clone(),
@@ -797,8 +866,14 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
             continue;
         };
 
+        let Some(slot) = take_tcp_slot(&ctx, &warned_full) else {
+            continue;
+        };
         let ctx = ctx.clone();
-        tokio::spawn(serve_tcp_flow(stream, ctx, domain, dest_port));
+        tokio::spawn(async move {
+            let _slot = slot;
+            serve_tcp_flow(stream, ctx, domain, dest_port).await;
+        });
     }
     jni_log!("[tun-proxy] TCP acceptor task exiting");
 }
@@ -1209,6 +1284,23 @@ async fn run_udp_flow(
             Activity::Tunnel(Ok(Some(0))) => {}
             Activity::Tunnel(Ok(Some(n))) => {
                 partial.extend_from_slice(&read_buf[..n]);
+
+                // A frame that is still arriving may ask for up to 65 535
+                // bytes and take as long as it likes to send them, one byte
+                // per idle window if that suits the far side. Two maximum-size
+                // frames is the most this buffer can legitimately hold, so
+                // anything past that is a frame that is never going to
+                // complete: end the flow rather than keep buffering toward a
+                // length nobody is sending.
+                if partial.len() > MAX_UDP_PARTIAL {
+                    jni_log!(
+                        "[tun-proxy] UDP flow to {}:{} buffered {} bytes without a complete frame, ending it",
+                        domain,
+                        port,
+                        partial.len()
+                    );
+                    break;
+                }
 
                 let mut consumed = 0usize;
                 let mut tun_gone = false;
