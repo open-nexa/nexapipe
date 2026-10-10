@@ -21,105 +21,70 @@ Two configuration keys are added and none is removed or renamed, so a
 before devices existed answers exactly as it did. Four things behave
 differently without being configured to: `/metrics` no longer carries the
 request-duration counter it used to, a device struck out loses the connections
-it is already holding rather than keeping them until it hangs up, a peer
-revoked underneath a live connection is closed with a new code — `6` — which
-both clients turn into an error saying the credential is gone and that trying
-again will not help, and an enrollment that would replace a device already in
-the table is refused rather than re-issuing that device's secret.
+it is already holding, a revoked peer is closed with a new code — `6` — and an
+enrollment that would replace a device already in the table is refused.
 
 ### Added
 
 - **One credential per device, rather than one shared by every device that
   names a client.** `[auth.clients.<id>]` gains a `devices` table: each entry
   carries a secret of its own, issued at enrollment and revocable on its own, so
-  striking one out no longer rotates the rest — what used to make revoking a
-  laptop mean re-enrolling a phone. The credential is still a TOTP secret and the
-  handshake still HMAC-SHA256 over `nonce ‖ timestamp`; what changed is which
-  secret is looked up. A client entry carrying only `secret` keeps working
-  exactly as it did: that is the path a peer naming no device takes, and the path
-  every config written before this release is on.
+  striking one out no longer rotates the rest. The credential is still a TOTP
+  secret and the handshake still HMAC-SHA256 over `nonce ‖ timestamp`; what
+  changed is which secret is looked up. A client entry carrying only `secret`
+  keeps working exactly as it did.
 
-- **A client names the device it is speaking as.** The enrollment above could
-  issue a secret per device, but nothing could ask for one, so every device
-  answered with the client's shared secret and the table stayed empty however
-  many devices there were. Each install now answers as one named device of
-  itself: the desktop after its hostname and Android after the device model,
-  eight random characters behind either so two machines sharing a name do not
-  collide into one entry nobody can revoke for one of them. The name is claimed
-  at enrollment and nowhere else, because the server picks the secret by what
-  the response carries and refuses a device it has none filed for — a
-  credential that answered as a name nobody asked for would be rejected rather
-  than quietly accepted under the client's shared secret. Existing credentials
-  therefore carry on answering exactly as they do today, and nothing re-enrolls
-  on its own: both apps say what an unnamed device costs and offer the one thing
-  that changes it, which is importing a registration invite again.
+- **A client names the device it is speaking as.** Each install answers as one
+  named device of itself: the desktop after its hostname, Android after the
+  device model, eight random characters behind either so two machines sharing a
+  name do not collide. The name is claimed at enrollment and nowhere else — the
+  server refuses a device it has no secret filed for — so existing credentials
+  carry on answering as they do today and nothing re-enrolls on its own.
 
-- **An access line says whose request it was.** A connection carries the client
-  *and* the device it authenticated as, so every access line ends with
-  `client=… device=…` and `/v1/connections` answers who is connected rather than
-  only how many. A device that authenticated without naming itself is
-  `device=-`; a request that never authenticated — 2FA off, or the plaintext HTTP
-  listener, which runs no handshake — gets neither field, because a line
-  answering "whose request was this" with a dash on all of them is noise rather
-  than an answer.
+- **An access line says whose request it was.** Every access line ends with
+  `client=… device=…`, and `/v1/connections` answers who is connected rather
+  than only how many. A request that never authenticated gets neither field.
 
-- **`nexapipe client list|add|revoke`.** The management surface has a write
-  half. Each takes `--device` and writes `config.toml` through the same lock the
-  server reads it with, and a running server picks the change up on its next
-  reload. `/v1/*` stays read-only on purpose: its token is one opaque value, with
-  no scope and no rotation, which is not something to hand write access to in the
-  same release as the identity model it would be changing.
+- **`nexapipe client list|add|revoke`**, each with `--device`, writing
+  `config.toml` through the same lock the server reads it with, so a running
+  instance picks the change up on its next reload. `/v1/*` stays read-only on
+  purpose: its token is one opaque value, with no scope and no rotation.
 
-- **A systemd unit for the server.** Both READMEs carry one beside the Docker
-  section. It keeps a named account rather than `DynamicUser=yes`, because this
-  server writes back into its own config — the 2FA counters, an enrolled device —
-  and writes its admin token beside it; and it names one writable directory,
-  because `ProtectSystem=strict` would otherwise take enrollment and lockout
-  persistence with it. The relay has had a unit in `docs/self-hosted-relay.md`
-  since earlier in this release.
+- **`[auth.clients.<id>].unnamed_device_allowed`** (default `true`): set to
+  `false`, a peer that names no device is refused rather than answered under the
+  client's shared secret — the one path a device cannot be taken off by being
+  revoked, since nothing in the table belongs to it alone.
 
-- **`[auth.clients.<id>].unnamed_device_allowed`.** A peer that names no
-  device has always been answered with the client's shared `secret` — the path
-  every config written before this release is on, and the one path a device
-  cannot be taken off by being revoked, since there is nothing in the table
-  that belongs to it alone. A client whose every device has moved into the
-  table can now say so: with the key set to `false`, a response carrying no
-  device name is refused rather than answered under the shared secret. It
-  defaults to `true`, so nothing changes until it is set, and setting it on a
-  client still handing out invites would refuse the devices that have not
-  enrolled yet.
+- **A systemd unit for the server** in both READMEs, beside the Docker section.
+  It keeps a named account and one writable directory, because this server
+  writes back into its own config — the 2FA counters, an enrolled device — and
+  writes its admin token beside it. The relay has had a unit in
+  `docs/self-hosted-relay.md` since earlier in this release.
 
 - Desktop: session totals, and a page that lists the connections a running proxy
   is holding (#90).
 - Desktop: a running proxy says what quitting should do (#88).
 - CI: the root workspace is *tested* on Windows, not only compiled (#97).
-- `docs/self-hosted-relay.md`: a systemd unit for the relay (#95).
-- `docs/ROADMAP.md` and `AGENTS.md`: what v0.6.0 shipped, said in the sections
-  that describe it (#123).
-- Both READMEs: which secret an enrollment rotates, and the device table it
-  writes into (#124).
+- Docs: a systemd unit for the relay (#95); what v0.6.0 shipped, in the roadmap
+  sections that describe it (#123); which secret an enrollment rotates (#124);
+  a size and performance roadmap (#136).
 - CI: dependabot's per-dependency version pull requests are replaced by one
   weekly dependency issue (#127).
-- `docs/ROADMAP.md`: a size and performance roadmap (#136).
 
 ### Changed
 
 - **`/metrics` reports request latency as a histogram.**
   `nexapipe_request_duration_ms_bucket{le="…"}` beside `_sum` and `_count`
-  replaces `nexapipe_request_duration_ms_total`, which carried the same sum
-  under a name a histogram cannot have: anything that divided it by
-  `nexapipe_requests_total` for a mean can read `_sum` the same way, and a
-  p99 no longer takes arithmetic. The boundaries are fixed at 1, 5, 10, 25,
-  50, 100, 250, 500, 1000, 2500, 5000 and 10000 milliseconds, plus `+Inf`.
-  A scrape looking for the old counter will not find it.
-
+  replaces `nexapipe_request_duration_ms_total`, which carried the same sum under
+  a name a histogram cannot have: a p99 no longer takes arithmetic. The
+  boundaries are fixed at 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 and
+  10000 milliseconds, plus `+Inf`. A scrape looking for the old counter will not
+  find it.
 - **The workspace declares the Rust version it needs: 1.89.** The build has
-  depended on it since the config write started taking a file lock —
-  `File::lock` is stable from 1.89 — but nothing said so, and a build on an
-  older toolchain failed with a missing method somewhere in the middle of a
-  crate rather than with the toolchain it was missing it from. `rust-version`
-  in the workspace manifest makes cargo name it.
-
+  depended on it since the config write started taking a file lock — `File::lock`
+  is stable from there — and a build on an older toolchain used to fail with a
+  missing method somewhere in a crate rather than with the toolchain it was
+  missing it from.
 - **The desktop TUN shares DNS and address space with other TUN apps**, rather
   than taking both over (#87).
 - Dependencies: one batched upgrade across the workspace (#85).
@@ -130,197 +95,61 @@ the table is refused rather than re-issuing that device's secret.
   rewrote `config.toml` and stopped there: the device could not connect again,
   but it went on serving on everything it had open until it hung up — which is
   the one thing revocation is for. The reload that notices what left `[auth]`
-  closes them now. The config watcher already merged the new client table into
-  the live one and reported what was added and removed; what it could not see was
-  a *device* leaving a client that stayed, because the merge replaces the whole
-  entry — so the device tables are snapshotted before the merge and compared
-  after it, and both levels close what they lost: a client that left takes every
-  device under it, a device that left takes only its own. They go with a new
-  close code, `REVOKED = 6`, which the client library turns into an error saying
-  the credential is gone and that trying again is not going to help — the natural
-  reading of a refused connection is a code typed wrong, and there is no code to
-  retype.
-
+  closes them now, at both levels: a client that left takes every device under
+  it, a device that left takes only its own. They go with a new close code,
+  `REVOKED = 6`, which both clients turn into an error saying the credential is
+  gone and that trying again is not going to help.
 - A name outside the hijack is answered through the host's own resolver, instead
   of the TUN swallowing it (#105).
-- Desktop: an empty window is no longer shown while the app starts (#91).
-- Desktop (Linux): the TUN resolver is the exclusive DNS route (#92).
-- Desktop: the service is put back on the app's build when an upgrade leaves it
-  behind (#93).
-- Desktop (macOS): a service that was stopped stays stopped (#86).
-- Desktop: the connecting indicator breathes with Reduce Motion on, rather than
-  being exempt from the setting (#89).
-- Desktop: the webview is granted the permission it needs to read the service
-  version (#100).
-- Desktop: the window is shown before the first frame is waited for (#106).
-
-- **Desktop: a launch that produced no frame sent no start-up timings at all.**
-  The frame after `show()` is what the `first-frame` mark is for, and waiting
-  for one with no end meant a launch whose webview is never composited — a
-  minimized window, a machine that went to sleep — never reached the `finally`
-  that sends the timings either, so the one launch that most needs a report was
-  the one that never arrived. The wait is bounded at two seconds and reports
-  whether a frame came, so a launch with no frame is logged as one that produced
-  none instead of as one that never happened.
-
+- Desktop: an empty window is no longer shown while the app starts (#91); the
+  TUN resolver is the exclusive DNS route on Linux (#92); a service an upgrade
+  left behind is put back (#93); a stopped macOS service stays stopped (#86);
+  the connecting indicator breathes with Reduce Motion on (#89); the webview is
+  granted the permission it needs to read the service version (#100); the window
+  is shown before the first frame is waited for (#106).
+- Desktop: a launch that produced no frame sent no start-up timings at all. The
+  wait after `show()` had no end, so a window the compositor never drew never
+  reached the `finally` that sends them either. It is bounded at two seconds now
+  and reports whether a frame came.
+- Desktop (macOS): the bundle carries the content security policy the other two
+  platforms use. Platform configs merge as JSON Merge Patch, in which `null`
+  means *remove the key* — so `app.security.csp = null` deleted the policy
+  rather than relaxing it, and the macOS app ran with none.
+- `[peers]` refuses a key it does not recognise (#130). `allow` is the section's
+  only key and an absent one means unrestricted, so `allowd = [...]` was dropped
+  by serde and left a server that looked restricted and was not.
+- Android: `nativeStopTunProxy` was the one JNI entry point with no barrier
+  against unwinding (#129), and it ran on the main thread while the VPN was
+  being switched off (#135). A device id that could not be stored was reported
+  as stored (#147).
+- Android: a credential is no longer stored unencrypted without being asked
+  (#139). A device with no keystore can still connect; only storing without
+  asking is gone.
+- TUN: each flow has a budget (#134). A UDP frame could promise 65 535 bytes and
+  arrive a byte at a time, and TCP flows had no ceiling at all — 256 now, the
+  same ceiling the local HTTP proxy uses.
+- Desktop: the desktop build gets the vendored `smoltcp` patch (#133).
+  `ui-desktop/src-tauri` is its own workspace, so the root `[patch.crates-io]`
+  never reached it and the desktop TUN ran the upstream code.
+- A backend that answers slowly is no longer reported unreachable (#137): the
+  preconnect budget covered the connect alone and not the wait for a 2FA
+  refusal, which ran for up to six seconds more.
+- Server: an enrollment could take over a device that was already there (#140);
+  a name the table holds is refused now, and `--force` replaces one on purpose.
+  A connection stamped the client rather than the device that made it, so every
+  device under a client shared one `last_used` (#141). A peer could be connected
+  before it was revocable — registration happens under the auth lock now (#144).
+- Server: a write to `config.toml` was readable by everyone for as long as it
+  took and followed a symlink to reach the file (#146); `--qr-out` had both
+  problems and overwrote whatever was at the path (#131); `client add` reported
+  a secret it had not written (#143).
+- Client: a TOTP period that does not fit a `u32` is refused at enrollment
+  (#148) rather than narrowed with `as u32`, which made every code afterwards
+  wrong for a step the two ends disagreed about.
 - A peer listing takes one reading of the clock for the whole list rather than
-  one per entry, so two peers are no longer ordered by when the loop happened to
-  reach them.
-
-- **Desktop (macOS): the bundle carries the content security policy the other
-  two platforms use.** Platform configs merge as JSON Merge Patch, in which
-  `null` means *remove the key* — so `app.security.csp = null` did not relax the
-  policy, it deleted it, and the macOS app ran with no CSP at all while Windows
-  and Linux kept the baseline one. The webview holds every app command
-  permission either way, so on macOS a script that reached any rendered string
-  could call them. The override is gone and all three inherit one policy.
-
-- **`[peers]` refuses a key it does not recognise.** `allow` is the only key the
-  section has, and an absent `allow` means unrestricted, so `allowd = [...]` was
-  dropped by serde and left a server that looked restricted and was not, with
-  nothing in the log to say so. This is the section where a typo is a security
-  change rather than a lost setting, which is why `[auth]` has refused unknown
-  keys since it was written.
-
-- **Android: switching the VPN off no longer risks a native crash.**
-  `nativeStopTunProxy` was the one JNI entry point with no barrier against
-  unwinding: the others get theirs from a helper this one never went through,
-  because it has no environment to unwrap. A panic there unwinds out of an
-  `extern "system"` frame, which on Android is a native crash rather than a Java
-  exception — and it is the path that runs while the user is turning the VPN
-  off.
-
-- **`--qr-out` writes the file private from the moment it exists, and will not
-  write over one.** The file carries the TOTP secret in the clear. It used to be
-  created by `fs::write` and made private afterwards, so in between it was
-  readable by anyone with access to the machine, and `fs::write` truncates
-  whatever is already at the path and follows a symlink to reach it — a name
-  another account got there first could aim the write at a file the operator
-  owns. It now creates with `create_new` and the mode in the same call. The one
-  thing that changes for anyone using it: a path that already exists is now
-  refused instead of overwritten.
-
-- **Desktop: the desktop build gets the vendored `smoltcp` patch.**
-  `ui-desktop/src-tauri` is its own workspace — the root `Cargo.toml` excludes
-  it — so the root `[patch.crates-io]` never reached it and its lockfile
-  resolved `smoltcp` from crates.io. `tun-proxy` is the feature that runs the
-  transmit path the vendored copy exists to fix, so the desktop TUN ran the
-  upstream code and could reach the subtract-with-overflow panic the patch
-  prevents — on the one client that ships a desktop TUN. The patch section is
-  repeated in the desktop manifest, and its lockfile now carries `smoltcp` with
-  no source at all, which is how a path dependency is recorded.
-
-- **TUN: each flow has a budget.** A UDP flow buffered whatever the far side
-  announced: a length prefix is a `u16`, so one frame could promise 65 535
-  bytes and arrive a byte per idle window, and nothing objected to a length
-  that was not being sent — the loop drained complete frames but set no bound
-  of its own. Two maximum-size frames is the most that buffer can legitimately
-  hold, and past that the flow ends. TCP flows had no ceiling at all, though
-  UDP has had one of 32 since it was written: the stack's socket set grows as
-  connections arrive, and each flow is a socket, a tunnel on the server and a
-  connection out of a pool. 256 now, the same ceiling the local HTTP proxy
-  uses; a connection past it is closed rather than left waiting for a tunnel
-  that will not open.
-
-- **Android: switching the VPN off no longer blocks the main thread.**
-  `stopVPN` called `nativeStopTunProxy` inline, and that joins the smoltcp
-  tasks — up to about half a second each — while both `onDestroy` and
-  `ACTION_STOP` reach it on the main thread. `onRevoke` had been moved off the
-  main thread for exactly this reason; these two paths were missed. The flags
-  `stopVPN` clears stay synchronous, because an establish or a reconnect that
-  is already running reads them and has to see them before it goes further.
-  Only the native stop moves, and it moves to a scope `onDestroy` does not
-  cancel: cancelling the service scope is the next thing `onDestroy` does, so
-  a teardown scheduled there would be cancelled before it ran and the
-  duplicated fd would stay open.
-
-- **Android: a credential is no longer stored unencrypted without being
-  asked.** A device whose keystore is unavailable still had its credentials
-  written in the clear. The fallback was logged and shown as a warning, but
-  that is after the write, and the write is what the warning is about. A save
-  that carries a credential now waits for an answer, and dismissing the
-  question is a refusal, so nothing reaches storage unless it was agreed to.
-  Asked once per device rather than per credential. The fallback itself is
-  unchanged: a device with no keystore can still connect, which is why
-  refusing to store was never the answer — only storing without asking was.
-
-- **A backend that answers slowly is no longer reported unreachable.** The
-  preconnect budget covered the connect alone, and the wait for a 2FA refusal
-  ran outside it for up to six seconds more, while the caller allowed eight in
-  total: a backend taking more than two seconds to answer was cancelled in the
-  middle of being observed, and a group of them reported no backend answering
-  at all. The budget covers both halves now, and the phase ceiling and the JNI
-  timeout follow it rather than being numbers written down separately.
-
-- **An enrollment could take over a device that was already there.** The
-  device table is keyed by name, and enrolling wrote into it without looking
-  first, so a second invite — or a first one scanned again after it had been
-  spent — replaced the secret of a device that was already enrolled and left
-  the old credential answering as the new one, with nothing in the log to say
-  the row had changed hands. A name the table already holds is refused now,
-  and the refusal does not count toward the lockout, because the same name
-  arriving twice is a device that was enrolled twice rather than something
-  guessing. `nexapipe client add <id> --device <name> --force` is how one is
-  replaced on purpose.
-
-- **A connection stamped the client, not the device that made it.** `last_used`
-  was one field on the client entry, so every device under a client shared a
-  single timestamp and the table could not answer which of them had stopped
-  being seen — which is the question a stale device row asks. It is recorded
-  under the device now and written back with the rest of the state, so each
-  entry says when that device last authenticated on its own.
-
-- **Desktop: a tunnel whose DNS was never hijacked ran as though it had been.**
-  `set_system_dns` failing was logged and then degraded to `Global`, which
-  resolves without the hijack at all, so a machine that kept its own resolver
-  looked connected while every name went past the tunnel. Starting one stops
-  and says so now. The restore on the way out was the same shape: writing to
-  no network service at all — none found, on macOS — was reported as a
-  successful restore, which left the machine's DNS pointing at an address
-  nothing answers any more. It counts what it wrote and fails when it wrote
-  none.
-
-- **`nexapipe client add` reported a secret it had not written.** A failed
-  write of `config.toml` was a warning, and the command still exited `0` while
-  printing the secret to hand out — so a script saw success and the server,
-  which reads the file, never had the credential. It fails now, and the error
-  carries the TOML that would have been written rather than only a path.
-  `revoke` took the same ids `add` refuses — one with a newline in it, say —
-  and put one into the table it is asked to remove from; both are checked the
-  same way now.
-
-- **A peer could be connected before it was revocable.** The handshake read
-  the credential under the auth lock, let go of it, and registered the
-  connection afterwards, so a reload that struck the device out in between
-  left a connection authenticated as a device the new config no longer has,
-  and nothing watching for the change knew it was there to close. The
-  registration happens under the same lock the check ran under now, and the
-  channel that closes it is handed over with it, so there is no window in
-  which a peer is connected but not yet revocable.
-
-- **A write to `config.toml` was readable by everyone for as long as it took,
-  and followed a symlink to reach the file.** The file holds every TOTP secret
-  and the admin token. It was created and made private afterwards, so in
-  between it was readable by anyone else with access to the machine, and the
-  temporary file beside it had a name anyone could predict — which is what
-  makes a symlink there worth placing. It is created with the mode in the same
-  call now, under a name carrying the pid and a random number. The rename
-  follows a link at the destination rather than writing through it, so a
-  `config.toml` that is a symlink still changes the file it points at.
-
-- **Android: a device id that could not be stored was reported as stored.**
-  `nativeSetDeviceId` ignored a poisoned lock and returned `0` either way, so
-  a caller could not tell a name that was kept from one that was lost, and a
-  name lost on the way in is an install that answers as a device the server
-  has no row for. It returns `-1` now.
-
-- **A TOTP period the server chose could be read as a different one.**
-  Enrollment read the period it was given as a `u64` and narrowed it with `as
-  u32`, which takes the low half rather than refusing: a period that does not
-  fit arrived as some other number, and every code generated afterwards was
-  wrong for a step the two ends disagreed about, with neither saying so. The
-  conversion is checked now, and a period that does not fit is refused at
-  enrollment with the value the server sent.
+  one per entry (#138).
+- Desktop: a tunnel whose DNS was never hijacked ran as though it had been, and
+  a restore that wrote to no network service was reported as a success (#142).
 
 ## [0.5.0] — 2026-10-07
 
