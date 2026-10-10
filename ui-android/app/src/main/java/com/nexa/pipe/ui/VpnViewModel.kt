@@ -27,6 +27,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -152,8 +153,24 @@ class VpnViewModel : ViewModel() {
      * this device. Asked once rather than per credential — a device that cannot
      * seal one cannot seal the next either, and asking again on every write
      * would teach the user to stop reading the question.
+     *
+     * Mirrors what `SettingsManager` recorded rather than being the only copy:
+     * a process that dies must not take the answer with it, because the next
+     * launch would ask again about a decision this device already made.
      */
     private var plaintextAccepted = false
+
+    /**
+     * Whether this device can protect a credential, cached off the main
+     * thread.
+     *
+     * The answer needs the keystore, and a keystore call is slow enough to be
+     * felt as a dropped frame from a text field's `onValueChange`. It also
+     * only changes when the keystore does, so it is probed once and kept
+     * rather than asked per write.
+     */
+    @Volatile
+    private var canProtectCached: Boolean? = null
 
     /**
      * What to do when another VPN app owns the slot, as the user last decided.
@@ -429,37 +446,173 @@ class VpnViewModel : ViewModel() {
             // migration that re-seals whatever older versions left in plaintext —
             // on a device with a broken keystore that is the write that fails.
             credentialProtection.value = manager.credentialProtection()
+            // An answer given in an earlier session is an answer about the
+            // device, so it is read back rather than asked for again on the
+            // first credential this launch writes.
+            plaintextAccepted = manager.plaintextCredentialConsent()
             addLog("Settings loaded: ${loadedNodes.size} nodes, relay=${relayMode.value}")
         }
     }
 
-    private fun saveSettings() {
-        val manager = settingsManager ?: return
-        if (needsPlaintextConsent(manager)) {
-            plaintextConsentPending.value = true
-            return
+    /**
+     * One settings write, captured whole at the moment it was asked for.
+     *
+     * A snapshot rather than a re-read on the far side of the queue: this is
+     * called between two keystrokes, and a write that re-read the state when
+     * it finally ran would store whatever the field held by then rather than
+     * what the user typed.
+     */
+    private data class SettingsWrite(
+        val nodes: List<NodeConfig>,
+        val relayMode: String,
+        val relayUrl: String,
+        val relayToken: String,
+        /**
+         * Set when the user has just answered the consent question, so the
+         * re-queued write is the one thing allowed to store a credential in the
+         * clear. Carried on the write rather than read from the ViewModel at
+         * the moment it runs, because the answer and the write it applies to
+         * have to be the same one.
+         */
+        val allowPlaintextOverride: Boolean = false
+    )
+
+    /**
+     * Writes waiting to run.
+     *
+     * Conflated, so a burst of typing collapses to the last state rather than
+     * a backlog of keystrokes: an older snapshot must never land after a newer
+     * one and undo it. Drained by a single consumer below, which is what
+     * orders the writes without every caller having to take a lock.
+     */
+    private val settingsWrites = Channel<SettingsWrite>(Channel.CONFLATED)
+
+    /**
+     * The write waiting on [plaintextConsentPending], kept so that accepting
+     * stores the one that was asked about.
+     *
+     * Replaced rather than appended to when a later write also has to wait:
+     * the user has by then moved on, and the newer state is the one they mean.
+     */
+    private var pendingCredentialWrite: SettingsWrite? = null
+
+    /**
+     * A connect that stopped to ask before spending an enrollment token.
+     *
+     * Held rather than resumed from the consent handler by closure: the
+     * answer belongs to the device, this belongs to an attempt, and the
+     * attempt is only worth continuing if it was the one that paused.
+     */
+    private var pendingConnect: Pair<Context, Boolean>? = null
+
+    init {
+        // The single writer. Every settings write goes through here, so the
+        // keystore is only ever reached from one coroutine and the order the
+        // files see is the order the writes were asked for.
+        viewModelScope.launch(Dispatchers.IO) {
+            for (write in settingsWrites) {
+                handleSettingsWrite(write)
+            }
         }
-        manager.saveNodes(nodes.value)
-        manager.saveRelayConfig(relayMode.value, relayUrl.value, relayAuthToken.value)
-        credentialProtection.value = manager.credentialProtection()
     }
 
     /**
-     * Whether writing now would put a credential in the clear with nobody
-     * having agreed to it.
+     * Persists the current settings, asking first when that would put a
+     * credential on disk in the clear on a device that cannot protect it.
+     *
+     * Enqueued rather than run inline because this is called straight from a
+     * text field's `onValueChange`, and both the probe and the seal reach the
+     * keystore — not something to do between two characters being typed.
+     */
+    private fun saveSettings() {
+        settingsWrites.trySend(
+            SettingsWrite(
+                nodes = nodes.value,
+                relayMode = relayMode.value,
+                relayUrl = relayUrl.value,
+                relayToken = relayAuthToken.value
+            )
+        )
+    }
+
+    /**
+     * Asks the keystore what it can do, then either writes or puts the write
+     * in front of the user.
+     */
+    private suspend fun handleSettingsWrite(write: SettingsWrite) {
+        if (write.allowPlaintextOverride) {
+            commitSettings(write, allowPlaintext = true)
+            return
+        }
+        if (needsConsentFor(write)) {
+            pendingCredentialWrite = write
+            plaintextConsentPending.value = true
+            return
+        }
+        commitSettings(write, allowPlaintext = plaintextAccepted)
+    }
+
+    /**
+     * Whether [write] has to wait for the user to answer.
      *
      * Only a write that actually carries a credential counts: adding an
      * endpoint, renaming one or switching relay mode stores nothing that needs
      * protecting, and asking about those would make the question meaningless
      * long before it was needed.
      */
-    private fun needsPlaintextConsent(manager: SettingsManager): Boolean {
+    private suspend fun needsConsentFor(write: SettingsWrite): Boolean {
         if (plaintextAccepted) return false
-        if (manager.canProtectCredentials()) return false
-        return nodes.value.any {
-            !it.enrollment?.token.isNullOrBlank() || !it.twoFactor?.secret.isNullOrBlank()
-        } || relayAuthToken.value.isNotBlank()
+        if (!carriesCredential(write.nodes, write.relayToken)) return false
+        val manager = settingsManager ?: return false
+        return !probeCredentialProtection(manager)
     }
+
+    /**
+     * Runs the write itself and reports what became of it.
+     *
+     * [allowPlaintext] is passed down rather than assumed: a device whose
+     * keystore worked when it was asked and fails here is still refused, since
+     * the question was answered for the other outcome. `SettingsManager` drops
+     * a credential it cannot seal instead of storing it readable, so a write
+     * that comes back unsealed left nothing on disk — and is asked about again
+     * rather than reported as saved.
+     */
+    private suspend fun commitSettings(write: SettingsWrite, allowPlaintext: Boolean) {
+        val manager = settingsManager ?: return
+        val sealed = manager.saveNodes(write.nodes, allowPlaintext)
+        val relaySealed = manager.saveRelayConfig(
+            write.relayMode, write.relayUrl, write.relayToken, allowPlaintext
+        )
+        credentialProtection.value = manager.credentialProtection()
+        if (!(sealed && relaySealed) && !allowPlaintext) {
+            pendingCredentialWrite = write
+            plaintextConsentPending.value = true
+        }
+    }
+
+    /**
+     * Whether this device can protect a credential, read off the main thread
+     * and then kept.
+     *
+     * Cached because the answer only changes when the keystore does, and asked
+     * per write it is a keystore round trip on a text field's
+     * `onValueChange`. A failure is not cached: it is exactly the answer most
+     * likely to be stale, since it means the keystore was not ready.
+     */
+    private suspend fun probeCredentialProtection(manager: SettingsManager): Boolean {
+        canProtectCached?.let { return it }
+        val probed = withContext(Dispatchers.IO) { manager.canProtectCredentials() }
+        if (probed) canProtectCached = true
+        return probed
+    }
+
+    /**
+     * Whether writing these settings would put a credential on disk.
+     */
+    private fun carriesCredential(nodes: List<NodeConfig>, relayToken: String): Boolean =
+        nodes.any {
+            !it.enrollment?.token.isNullOrBlank() || !it.twoFactor?.secret.isNullOrBlank()
+        } || relayToken.isNotBlank()
 
     /**
      * Agrees that credentials may be stored unencrypted. The write that was
@@ -468,15 +621,43 @@ class VpnViewModel : ViewModel() {
     fun acceptPlaintextCredentials() {
         plaintextAccepted = true
         plaintextConsentPending.value = false
-        saveSettings()
+        // Recorded rather than kept in this object: an answer given once is
+        // about the device, and the process that asked is not part of it.
+        settingsManager?.savePlaintextCredentialConsent(true)
+        // A connect that paused for this answer resumes first: it is holding
+        // an enrollment token that the user has now agreed to store, and
+        // leaving it paused would strand the endpoint on a dialog that is
+        // already gone. A write that was waiting goes back on the queue
+        // either way — it now passes the gate on its own, and dropping it
+        // would lose whatever the user was asked about.
+        val resume = pendingConnect
+        pendingConnect = null
+        val pending = pendingCredentialWrite
+        pendingCredentialWrite = null
+        if (pending != null) {
+            // Re-queued rather than written here: the single writer owns every
+            // write, and a second writer would be exactly the ordering hazard
+            // that queue exists to prevent.
+            settingsWrites.trySend(pending.copy(allowPlaintextOverride = true))
+        }
+        if (resume != null) {
+            connect(resume.first, resume.second)
+        } else if (pending == null) {
+            saveSettings()
+        }
     }
 
     /**
-     * Declines. The waiting write is dropped rather than deferred: a credential
-     * nobody agreed to store stays out of storage. The endpoint it belonged to
-     * is left as the user last saw it, still unsaved.
+     * Declines. The waiting write is dropped rather than deferred: a
+     * credential nobody agreed to store stays out of storage, and the endpoint
+     * it belonged to is left as the user last saw it, still unsaved.
      */
     fun declinePlaintextCredentials() {
+        pendingCredentialWrite = null
+        // The connect that paused is not resumed. Its token was never spent,
+        // so the endpoint still holds an invite the server has not given up —
+        // which is recoverable, and not this decision to make for the user.
+        pendingConnect = null
         plaintextConsentPending.value = false
         addLog("Credential not stored: this device cannot encrypt it")
     }
@@ -502,20 +683,23 @@ class VpnViewModel : ViewModel() {
         val index = nodes.value.indexOfFirst { it.nodeId == nodeId }
         if (index < 0) return
         val updated = nodes.value.toMutableList()
-        updated[index] = nodes.value[index].copy(enrollment = enrollment)
-        nodes.value = updated
-        val manager = settingsManager
-        // An enrollment token is a credential, and this is the one write that
-        // does not go through `saveSettings`, so it asks here or not at all.
-        if (manager != null && needsPlaintextConsent(manager)) {
-            plaintextConsentPending.value = true
-            return
-        }
-        manager?.saveNodes(nodes.value)
-        // A token is a credential, so this write is one of the two places the
-        // answer can change without going through `saveSettings`.
-        manager?.let { credentialProtection.value = it.credentialProtection() }
+        updated[index] = updated[index].copy(enrollment = enrollment)
+        publishNodes(updated)
         addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
+    }
+
+    /**
+     * Publishes [candidate] as the endpoint list and writes it.
+     *
+     * Publication is immediate and only the write waits: the list is this
+     * process's own memory, and the thing that has to be asked about is the
+     * copy that reaches disk. Holding the list back instead would leave the
+     * screen disagreeing with what the user just did, and — since every write
+     * is gated on its own — would not even keep the credential out of storage.
+     */
+    private fun publishNodes(candidate: List<NodeConfig>) {
+        nodes.value = candidate
+        saveSettings()
     }
 
     /**
@@ -525,6 +709,13 @@ class VpnViewModel : ViewModel() {
      * This is the only moment the secret exists on this device: the token is
      * gone, so without this the endpoint is left with an invite the server has
      * already forgotten and cannot enroll a second time.
+     *
+     * The one moment that cannot be taken back, which is why the consent
+     * question is settled *before* the connect that spends the token rather
+     * than here, after it: see [connect]. A secret that arrived and could not
+     * be stored is still kept in memory and still written if the user agrees,
+     * but the log below says which of those happened, because on a decline the
+     * endpoint can never enroll again and only the user can fix that.
      */
     private fun collectIssuedCredential() {
         val encoded = IrohProxy.nativeTakeIssuedCredential() ?: return
@@ -550,18 +741,21 @@ class VpnViewModel : ViewModel() {
             addLog("A credential was issued but no endpoint is enrolling")
             return
         }
-        updateNodeTwoFactor(
-            node.nodeId,
-            NodeTwoFactor(
-                enabled = true,
-                clientId = clientId,
-                secret = secret,
-                algorithm = algorithm,
-                device = device
-            )
+        val twoFactor = NodeTwoFactor(
+            enabled = true,
+            clientId = clientId,
+            secret = secret,
+            algorithm = algorithm,
+            device = device
         )
+        updateNodeTwoFactor(node.nodeId, twoFactor)
         updateNodeEnrollment(node.nodeId, null)
-        addLog("Enrolled: the token is spent and the issued secret is saved")
+        // Says what happened, not what will happen: the write behind this is
+        // still queued, and on a device that cannot protect the credential it
+        // will stop and ask rather than store anything. Reporting it as saved
+        // here would be a claim about a write that has not run yet — and on the
+        // decline path the token is gone and this secret with it.
+        addLog("Enrolled: the token is spent and the issued secret is being stored")
     }
 
     /**
@@ -580,8 +774,7 @@ class VpnViewModel : ViewModel() {
         val updated = nodes.value.toMutableList().apply {
             set(index, this[index].copy(twoFactor = twoFactor))
         }
-        nodes.value = updated
-        saveSettings()
+        publishNodes(updated)
         addLog(
             "2FA updated for ${nodeId.take(8)}: enabled=${twoFactor?.enabled ?: false}, " +
                 "algorithm=${twoFactor?.algorithm ?: "-"}"
@@ -1014,6 +1207,32 @@ class VpnViewModel : ViewModel() {
                     addLog("connect aborted: $reason")
                     errorMessage.value = reason
                     return@launch
+                }
+
+                // Settle the credential question before anything is spent.
+                //
+                // An enrollment token is consumed by the pre-connect below and
+                // cannot be enrolled twice: if the credential it buys then
+                // cannot be stored, the endpoint is left with neither a token
+                // nor a secret. So on a device that cannot protect a
+                // credential, this stops *before* the token is spent and asks
+                // instead — the one question here that is worth abandoning an
+                // attempt over.
+                val enrolling = nodes.value.any {
+                    !it.enrollment?.token.isNullOrBlank() &&
+                        it.twoFactor?.takeIf { otp -> otp.enabled }?.secret.isNullOrBlank()
+                }
+                if (enrolling) {
+                    val manager = settingsManager
+                    if (manager != null &&
+                        !probeCredentialProtection(manager) &&
+                        !plaintextAccepted
+                    ) {
+                        addLog("connect paused: waiting for permission to store the credential")
+                        pendingConnect = context to allowTakeover
+                        plaintextConsentPending.value = true
+                        return@launch
+                    }
                 }
 
                 var lastError: Exception? = null
