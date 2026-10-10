@@ -196,6 +196,19 @@ created_at = "1723756800"
 # and so does `nexapipe client add client-001 --device <name>`. A client with no
 # `devices` table at all — which is every client written before this existed —
 # authenticates exactly as it always did.
+#
+# The `secret` above is still a credential of its own: it is what a device that
+# names none answers with. Revoking a device strikes one entry out of the table
+# below and leaves it standing, so a secret that has been handed out — in an
+# invite link, or to every install that enrolled before this table existed —
+# keeps working for anyone who simply leaves the device name out. Set
+# `unnamed_device_allowed = false` once every device of this client has one of
+# its own, and that shared secret stops being a way in:
+#
+#   unnamed_device_allowed = false
+#
+# Left out, or true, the client answers as it always has. Turning it off before
+# every device is enrolled locks out the ones that never named themselves.
 [auth.clients.client-001.devices.laptop]
 secret = "LAPTOPSECRET"     # Base32-encoded secret, issued at enrollment
 created_at = "1723756800"

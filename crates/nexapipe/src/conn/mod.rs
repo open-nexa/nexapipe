@@ -1571,6 +1571,18 @@ async fn perform_authentication(
                 AuthError::LockedOut => {
                     tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
                 }
+                AuthError::UnnamedDeviceNotAllowed => {
+                    // The one refusal that is a configuration the operator can
+                    // change, so it is the one that says which knob.
+                    tracing::warn!(
+                        "2FA: client '{}' from {} names no device, and this client answers only \
+                         to named ones: set unnamed_device_allowed = true under \
+                         [auth.clients.{}] to let it use the client's own secret",
+                        client_id,
+                        peer,
+                        client_id
+                    );
+                }
                 _ => {
                     tracing::warn!(
                         "2FA: response from {} for '{}' rejected: {}",
@@ -2108,6 +2120,7 @@ mod tests {
                 allow_hosts: None,
                 pending_enrollment: token.map(|t| t.to_string()),
                 devices: HashMap::new(),
+                unnamed_device_allowed: true,
                 last_used: None,
                 failed_attempts: 0,
                 locked_until: None,

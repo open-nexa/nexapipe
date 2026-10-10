@@ -90,7 +90,18 @@ impl<'a> TotpValidator<'a> {
         // one falls back. A name that is not printable ASCII is not in the
         // table either, so it lands here as well; what keeps it out of the log
         // is that this error carries no name.
+        //
+        // The fallback is the credential no revocation can reach: `client
+        // revoke --device` strikes one entry out of `devices` and leaves the
+        // shared `secret` standing, so a secret that leaked through an invite
+        // link keeps working for as long as whoever has it simply omits the
+        // name. `unnamed_device_allowed = false` is how an operator says this
+        // client has stopped handing that secret out, and makes revoking a
+        // device mean what it reads as meaning.
         let secret = match device_id {
+            None if !client.unnamed_device_allowed => {
+                return Err(AuthError::UnnamedDeviceNotAllowed);
+            }
             None => client.decode_secret(),
             Some(name) => client
                 .devices
@@ -207,6 +218,9 @@ pub enum AuthError {
     StaleTimestamp,
     /// The response signature does not match the challenge that was issued.
     ChallengeMismatch,
+    /// The response names no device and this client has been configured to
+    /// answer only named ones, so the shared `secret` is not a credential here.
+    UnnamedDeviceNotAllowed,
     ProtocolError(String),
 }
 
@@ -228,6 +242,9 @@ impl std::fmt::Display for AuthError {
             AuthError::ChallengeMismatch => {
                 write!(f, "Response signature does not match the challenge")
             }
+            AuthError::UnnamedDeviceNotAllowed => {
+                write!(f, "This client answers only to a named device")
+            }
             AuthError::ProtocolError(msg) => write!(f, "Protocol error: {}", msg),
         }
     }
@@ -248,6 +265,7 @@ mod tests {
             allow_hosts: None,
             pending_enrollment: None,
             devices: HashMap::new(),
+            unnamed_device_allowed: true,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
@@ -277,6 +295,7 @@ mod tests {
                     last_used: None,
                 },
             )]),
+            unnamed_device_allowed: true,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
@@ -431,5 +450,79 @@ mod tests {
         let outcome =
             validator.verify_response("alice", None, &nonce, timestamp, &clients_own, "000000");
         assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+    }
+
+    /// The fallback is a credential no revocation can reach: `client revoke
+    /// --device` strikes one entry out of the device table and leaves the
+    /// client's own `secret` standing, so a secret that leaked keeps working
+    /// for anyone who simply omits the name. `unnamed_device_allowed = false`
+    /// is what closes it, and it has to close it *before* the secret is
+    /// decoded — being refused must not depend on the code being wrong.
+    #[test]
+    fn a_client_that_answers_only_to_named_devices_refuses_an_unnamed_one() {
+        let mut config = config_with_one_device();
+        config
+            .clients
+            .get_mut("alice")
+            .unwrap()
+            .unnamed_device_allowed = false;
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+        let clients_own = hmac_signature(
+            &config.clients["alice"].decode_secret().unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        let outcome =
+            validator.verify_response("alice", None, &nonce, timestamp, &clients_own, "000000");
+        assert!(
+            matches!(outcome, Err(AuthError::UnnamedDeviceNotAllowed)),
+            "{outcome:?}"
+        );
+    }
+
+    /// The same client still answers a device that names itself, which is the
+    /// point: the switch takes away the shared credential, not the client.
+    #[test]
+    fn that_client_still_answers_a_device_that_names_itself() {
+        let mut config = config_with_one_device();
+        config
+            .clients
+            .get_mut("alice")
+            .unwrap()
+            .unnamed_device_allowed = false;
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+        let laptop = hmac_signature(
+            &config.clients["alice"].devices["laptop"]
+                .decode_secret()
+                .unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("laptop"),
+            &nonce,
+            timestamp,
+            &laptop,
+            "000000",
+        );
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+    }
+
+    /// The default has to stay permissive, or every client that predates the
+    /// device table — which is every client issued before 0.6.0 — loses its
+    /// only credential on upgrade.
+    #[test]
+    fn an_unnamed_device_is_allowed_unless_the_config_says_otherwise() {
+        let config = config_with_one_device();
+        assert!(config.clients["alice"].unnamed_device_allowed);
     }
 }

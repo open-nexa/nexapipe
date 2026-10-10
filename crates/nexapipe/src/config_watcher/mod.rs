@@ -606,6 +606,7 @@ mod tests {
             allow_hosts: None,
             pending_enrollment: None,
             devices: HashMap::new(),
+            unnamed_device_allowed: true,
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
