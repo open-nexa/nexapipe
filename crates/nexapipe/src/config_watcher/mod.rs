@@ -597,6 +597,7 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
 mod tests {
     use super::*;
     use crate::auth::{ClientAuth, DeviceAuth};
+    use crate::conn::peers::PeerIdentity;
 
     fn client(secret: &str) -> ClientAuth {
         ClientAuth {
@@ -609,6 +610,113 @@ mod tests {
             failed_attempts: 0,
             locked_until: None,
         }
+    }
+
+    fn device(secret: &str) -> DeviceAuth {
+        DeviceAuth {
+            secret: secret.to_string(),
+            created_at: "0".to_string(),
+            last_used: None,
+        }
+    }
+
+    /// `removed_devices` is the detection half of revocation: a device struck
+    /// out of the file while its client survives is the only case the
+    /// client-level pass cannot see, so what it reports is what a reload then
+    /// closes. Every case below is one an operator reaches by hand-editing —
+    /// `nexapipe client revoke --device` writes exactly this diff.
+    fn removed_devices_of(
+        before: &[(&str, &[&str])],
+        after: &[(&str, &[(&str, &str)])],
+    ) -> Vec<(String, String)> {
+        let before: HashMap<String, Vec<String>> = before
+            .iter()
+            .map(|(id, devices)| {
+                (
+                    id.to_string(),
+                    devices.iter().map(|name| name.to_string()).collect(),
+                )
+            })
+            .collect();
+        let after: HashMap<String, ClientAuth> = after
+            .iter()
+            .map(|(id, devices)| {
+                let mut client = client("SECRETSECRETSECR");
+                client.devices = devices
+                    .iter()
+                    .map(|(name, secret)| (name.to_string(), device(secret)))
+                    .collect();
+                (id.to_string(), client)
+            })
+            .collect();
+        let mut removed = ConfigWatcher::removed_devices(&before, &after);
+        removed.sort();
+        removed
+    }
+
+    #[test]
+    fn a_device_struck_out_of_a_surviving_client_is_reported() {
+        assert_eq!(
+            removed_devices_of(
+                &[("alice", &["laptop", "phone"])],
+                &[("alice", &[("phone", "P")])]
+            ),
+            vec![("alice".to_string(), "laptop".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_device_that_moved_to_another_client_is_reported_where_it_was() {
+        assert_eq!(
+            removed_devices_of(
+                &[("alice", &["laptop"]), ("bob", &[])],
+                &[("alice", &[]), ("bob", &[("laptop", "L")])]
+            ),
+            vec![("alice".to_string(), "laptop".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_renamed_device_reports_the_old_name_only() {
+        assert_eq!(
+            removed_devices_of(
+                &[("alice", &["laptop"])],
+                &[("alice", &[("laptop-2", "L")])]
+            ),
+            vec![("alice".to_string(), "laptop".to_string())]
+        );
+    }
+
+    /// A client that is gone takes every device under it with it, and those
+    /// connections are already closed by the client-level pass. Counting them
+    /// here too would close the same connection twice.
+    #[test]
+    fn a_client_that_disappeared_reports_no_devices() {
+        assert!(
+            removed_devices_of(
+                &[("alice", &["laptop", "phone"])],
+                &[("bob", &[("laptop", "L")])]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unchanged_table_reports_nothing() {
+        assert!(
+            removed_devices_of(
+                &[("alice", &["laptop", "phone"])],
+                &[("alice", &[("laptop", "L"), ("phone", "P")])]
+            )
+            .is_empty()
+        );
+    }
+
+    /// The empty case: no devices anywhere is the pre-0.6.0 shape, and a
+    /// reload of it must not invent a revocation.
+    #[test]
+    fn a_table_with_no_devices_reports_nothing() {
+        assert!(removed_devices_of(&[("alice", &[])], &[("alice", &[])]).is_empty());
     }
 
     fn config_with(clients: &[(&str, ClientAuth)]) -> AuthConfig {
@@ -1006,6 +1114,91 @@ mod tests {
         assert!(
             !live.clients.contains_key("old"),
             "a client the file no longer lists must not survive the reload"
+        );
+    }
+
+    /// A device struck out of the file while its client survives has to reach
+    /// the connection already serving as it, not only the next dial.
+    ///
+    /// This is the far end of the path `removed_devices` feeds: an operator
+    /// runs `nexapipe client revoke alice --device laptop`, the reload diffs
+    /// the device table, and the connection that authenticated as that device
+    /// is told to stop through the channel it was registered with. The sibling
+    /// device is the control — a revocation that took every device of the
+    /// client with it would be a different bug, and a quieter one.
+    #[tokio::test]
+    async fn a_reload_closes_the_connection_authenticated_as_a_removed_device() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        let file = |devices: &[&str]| {
+            let mut out = String::from(
+                "[auth]\n\
+                 [auth.clients.alice]\n\
+                 secret = \"ALICEALICEALICEA\"\n\
+                 created_at = \"1723756800\"\n",
+            );
+            for name in devices {
+                out.push_str(&format!(
+                    "\n[auth.clients.alice.devices.{name}]\n\
+                     secret = \"DEVICEDEVICEDEVIC\"\n\
+                     created_at = \"1723756800\"\n"
+                ));
+            }
+            out
+        };
+
+        std::fs::write(&path, file(&["laptop", "phone"])).expect("write the config");
+
+        let mut alice = client("ALICEALICEALICEA");
+        alice.devices = ["laptop", "phone"]
+            .into_iter()
+            .map(|name| (name.to_string(), device("DEVICEDEVICEDEVIC")))
+            .collect();
+        let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+
+        let peers = Arc::new(PeerRegistry::new());
+        let watcher = ConfigWatcher::new(
+            path_str,
+            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(crate::http::create_http_client(
+                crate::config::Timeouts::default().connect,
+            )),
+            Arc::new(Mutex::new(HealthProbes::new())),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Some(state.clone()),
+            peers.clone(),
+        );
+
+        // Registered the way the handshake registers a connection: identity,
+        // channel and guard in one step.
+        let registered = |seed: u8, device: &str| {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let guard = peers.insert(
+                iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                crate::metrics::PathKind::Direct,
+                PeerIdentity {
+                    client_id: Some("alice".to_string()),
+                    device: Some(device.to_string()),
+                },
+                tx,
+            );
+            (rx, guard)
+        };
+        let (mut laptop_rx, _laptop) = registered(1, "laptop");
+        let (mut phone_rx, _phone) = registered(2, "phone");
+
+        std::fs::write(&path, file(&["phone"])).expect("rewrite without the laptop");
+        watcher.reload_auth().await;
+
+        assert!(
+            *laptop_rx.borrow_and_update(),
+            "a connection serving as a device the file no longer lists must be told to stop"
+        );
+        assert!(
+            !*phone_rx.borrow_and_update(),
+            "a device that is still in the file must not be closed along with it"
         );
     }
 }

@@ -14,7 +14,7 @@ use ::http::Request;
 use futures_util::StreamExt;
 use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
-use peers::{PeerIdentity, PeerRegistry};
+use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -819,6 +819,48 @@ struct AuthenticatedPeer {
     /// which answered with the client's own secret.
     device: Option<String>,
     acl: ClientAcl,
+    /// Keeps the registry entry alive; dropped when the connection ends, which
+    /// is what takes it out of `GET /v1/connections`.
+    guard: PeerGuard,
+    /// Flipped by a reload that dropped the credential this connection
+    /// authenticated with. Owned here rather than created by the caller
+    /// because of when it has to be created — see [`PeerRegistration`].
+    revoked: tokio::sync::watch::Receiver<bool>,
+}
+
+/// What a connection needs to put itself in the peer registry, handed to
+/// [`perform_authentication`] so that the registration happens *inside* the
+/// auth write lock.
+///
+/// Registering after the lock is dropped leaves a window that a reload fits
+/// in. The reload takes the same lock and calls `close_where` over the
+/// registry; a connection that is between "verified" and "registered" is not
+/// in the registry yet, so it is not found, and it goes on to insert itself
+/// with a fresh watch channel that nothing will ever flip. No later reload
+/// reaches it either: `removed` and `removed_devices` are recomputed from the
+/// diff each time and are never replayed, so a credential revoked in that
+/// window keeps serving until the client hangs up on its own.
+///
+/// Doing both under the lock makes "verified" and "registered" one step that a
+/// reload cannot land inside: either the reload's pass runs first and the
+/// connection is closed before it is ever served, or the entry is already
+/// there and has its channel flipped.
+struct PeerRegistration {
+    registry: Arc<PeerRegistry>,
+    endpoint_id: iroh::EndpointId,
+    path: metrics::PathKind,
+}
+
+impl PeerRegistration {
+    /// Puts the connection in the registry and hands back what keeps it there
+    /// and what tells it to stop.
+    fn register(self, identity: PeerIdentity) -> (PeerGuard, tokio::sync::watch::Receiver<bool>) {
+        let (revoked_tx, revoked_rx) = tokio::sync::watch::channel(false);
+        let guard = self
+            .registry
+            .insert(self.endpoint_id, self.path, identity, revoked_tx);
+        (guard, revoked_rx)
+    }
 }
 
 /// Exchanges a one-time enrollment token for a freshly generated secret.
@@ -1233,6 +1275,11 @@ fn message_kind(message: &AuthMessage) -> &'static str {
 /// credentials — a reload landing between the two could otherwise turn a
 /// client whose entry was just removed into an unrestricted one.
 ///
+/// `registration` is spent the same way: a connection that passes is put in
+/// the peer registry before the lock is released, so that the reload which
+/// closes revoked credentials and this handshake cannot be interleaved. See
+/// [`PeerRegistration`] for the window that moving it out would open.
+///
 /// The caller bounds this with a deadline, so every read in here has to be
 /// cancel-safe: [`read_auth_message`] loops over `RecvStream::read` instead of
 /// using `read_exact`.
@@ -1240,6 +1287,7 @@ async fn perform_authentication(
     conn: &Connection,
     auth: &AuthState,
     peer: &str,
+    registration: PeerRegistration,
 ) -> Result<AuthenticatedPeer, AuthFailure> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -1535,6 +1583,20 @@ async fn perform_authentication(
             false
         }
     };
+    // Registered here, while the write lock is still held, for the reason given
+    // on `PeerRegistration`: a reload takes this same lock and closes the
+    // connections whose credential it just dropped, so the entry has to be in
+    // the registry before the lock is released or that pass misses it. Nothing
+    // is registered on a refusal — a peer that was turned away was never
+    // connected, and listing it would answer "who is connected" with peers
+    // that were not.
+    let registered = is_valid.then(|| {
+        registration.register(PeerIdentity {
+            client_id: Some(client_id.clone()),
+            device: resp_device_id.clone(),
+        })
+    });
+
     drop(cfg);
 
     // One fixed string for every refusal, logged apart but sent identically: see
@@ -1581,16 +1643,17 @@ async fn perform_authentication(
         let _ = tokio::time::timeout(AUTH_RESULT_GRACE, drain).await;
     }
 
-    if is_valid {
-        Ok(AuthenticatedPeer {
+    match registered {
+        Some((guard, revoked)) => Ok(AuthenticatedPeer {
             client_id,
             device: resp_device_id,
             acl: verified_acl,
-        })
-    } else {
-        Err(AuthFailure::Rejected(format!(
+            guard,
+            revoked,
+        }),
+        None => Err(AuthFailure::Rejected(format!(
             "authentication failed for client '{client_id}': {fail_reason}"
-        )))
+        ))),
     }
 }
 
@@ -1712,11 +1775,24 @@ pub async fn handle_connection(
     // when 2FA ran and passed: with it off there is no handshake, and no
     // identity to report.
     let mut identity = PeerIdentity::default();
+    // What keeps the connection in the peer registry, filled in by whichever
+    // path registers it: the handshake when 2FA ran, the fallback below when it
+    // did not.
+    let mut registered: Option<(PeerGuard, tokio::sync::watch::Receiver<bool>)> = None;
 
     if let Some(auth) = auth {
         let outcome = tokio::time::timeout(
             AUTH_HANDSHAKE_TIMEOUT,
-            perform_authentication(&conn, auth, &peer),
+            perform_authentication(
+                &conn,
+                auth,
+                &peer,
+                PeerRegistration {
+                    registry: peers.clone(),
+                    endpoint_id: peer_id,
+                    path: initial_kind,
+                },
+            ),
         )
         .await;
         match outcome {
@@ -1731,6 +1807,7 @@ pub async fn handle_connection(
                     device: authenticated.device,
                 };
                 client_acl = Some(Arc::new(authenticated.acl));
+                registered = Some((authenticated.guard, authenticated.revoked));
             }
             Ok(Err(AuthFailure::Rejected(reason))) => {
                 tracing::warn!("Authentication failed for {}: {}", peer_id, reason);
@@ -1775,8 +1852,21 @@ pub async fn handle_connection(
     // Its other half is how `client revoke` reaches a connection rather than
     // only the next dial: the config watcher flips it, and the loop below stops
     // serving this peer and hangs up.
-    let (revoked_tx, mut revoked_rx) = tokio::sync::watch::channel(false);
-    let _peer = peers.insert(peer_id, initial_kind, identity.clone(), revoked_tx);
+    //
+    // When 2FA ran, the channel and the guard come from the handshake, which
+    // registered this connection while it still held the auth lock. Only a
+    // server with 2FA off reaches the fallback, and there is nothing to be
+    // revoked there — no credential was checked, so no reload can drop one.
+    let (mut revoked_rx, _peer) = match registered {
+        Some((guard, revoked)) => (revoked, guard),
+        None => {
+            let (revoked_tx, revoked_rx) = tokio::sync::watch::channel(false);
+            (
+                revoked_rx,
+                peers.insert(peer_id, initial_kind, identity.clone(), revoked_tx),
+            )
+        }
+    };
 
     loop {
         // Whichever happens first wins, and a revocation that arrives while a
