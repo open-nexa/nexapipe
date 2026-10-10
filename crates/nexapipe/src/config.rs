@@ -487,7 +487,14 @@ pub struct ProxyConfig {
 /// a section that server may not even have would bury it, and its semantics do
 /// not depend on `[auth] enabled` either way. `[peers]` is checked on every
 /// inbound connection, before the accept loop sees it.
+///
+/// Unknown keys are refused here, for the reason they are refused under
+/// `[auth]`: the only key this section has is `allow`, and `allow` absent means
+/// unrestricted, so `allowed = [...]` instead of `allow = [...]` would leave a
+/// server that looks restricted and is not, with nothing in the log to say so.
+/// A typo here is a security change rather than a lost setting.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PeersConfig {
     /// Node IDs allowed to connect. `None` (the section present but the key
     /// absent) means unrestricted, like every build before this existed.
