@@ -351,3 +351,33 @@ fn revoking_survives_a_config_that_no_longer_loads() {
         "the section itself stays:\n{written}"
     );
 }
+
+/// A revoke checks the ids it is handed the way an add does.
+///
+/// Either id becomes a key in the file and the subject of a log line, and an id
+/// carrying a newline or an ANSI escape splits the terminal output it is printed
+/// into. A revoke is also the one command here that cannot be undone by running
+/// it again, so a mistyped id is worth refusing before anything is read.
+#[test]
+fn revoking_an_id_the_server_would_refuse_is_an_error() {
+    let (_dir, path) = empty_auth();
+    let (ok, _) = run(&path, &["client", "add", "acme"]);
+    assert!(ok, "the client should be added");
+    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
+    assert!(ok, "the device should be added");
+
+    for id in ["bad\nname", "", " "] {
+        let (ok, text) = run(&path, &["client", "revoke", id]);
+        assert!(!ok, "{id:?} must be refused:\n{text}");
+    }
+    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "lap\ntop"]);
+    assert!(!ok, "a device name with a newline must be refused:\n{text}");
+
+    // Nothing was touched, and the ids that are really there still are.
+    let written = fs::read_to_string(&path).expect("read back");
+    assert!(written.contains("acme"), "nothing was revoked:\n{written}");
+    assert!(
+        written.contains("laptop"),
+        "nothing was revoked:\n{written}"
+    );
+}

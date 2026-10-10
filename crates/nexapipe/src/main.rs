@@ -959,6 +959,7 @@ fn write_issued_secret(
     auth_enabled: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     // Spelled the way the file is written: a device goes under the client's
     // `devices` table as an inline entry rather than as a section of its own,
     // because that table may be one an operator wrote inline.
@@ -984,24 +985,31 @@ fn write_issued_secret(
     let written = match outcome {
         Ok(ClientSecretWrite::Added) => {
             println!("Wrote the secret to {} as {}.", cli.config, what);
-            Some(false)
+            false
         }
         Ok(ClientSecretWrite::Replaced) => {
             println!("Replaced the secret of {} in {}.", what, cli.config);
-            Some(true)
+            true
         }
+        // Fatal rather than a warning. The secret is on screen either way, so
+        // nothing is lost by stopping — but a command that exits 0 after
+        // writing nothing lets `client add acme && deploy` go ahead with no
+        // credential on disk, and the next thing that fails is a handshake
+        // somewhere else, pointing at the client rather than at this write.
+        // The snippet goes with the error for the reason it used to be printed
+        // on its own: the operator can still put it in the file by hand.
         Err(e) => {
-            // Loud rather than fatal: the secret is on screen either way, and
-            // the operator can still put it in the file by hand.
-            eprintln!("warning: {e:#}, so add it by hand:");
-            println!("{section}");
-            println!("{entry}");
-            None
+            return Err(e).context(format!(
+                "the secret was not written to {}; add it by hand:\n\
+                 {section}\n\
+                 {entry}",
+                cli.config
+            ));
         }
     };
     println!();
 
-    if written.is_some() && !auth_enabled {
+    if !auth_enabled {
         eprintln!(
             "warning: [auth] enabled is not true in {}, so the server will not ask for this \
              secret; add enabled = true under [auth]",
@@ -1017,11 +1025,11 @@ fn write_issued_secret(
             "Only this device's credential changed. The client's own secret is untouched, so \
              every other device of it keeps working."
         ),
-        (None, Some(true)) => println!(
+        (None, true) => println!(
             "The client's own secret is the credential of the device that names none, so every \
              device using it has to scan again."
         ),
-        (None, _) => println!(
+        (None, false) => println!(
             "Nothing was using it yet: scan the code above on the device that should carry \
              this client."
         ),
@@ -1042,6 +1050,31 @@ fn write_issued_secret(
 /// for a bad hand edit behind the very edit that broke it.
 fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Result<()> {
     let client_id = client_id.trim();
+    // The checks `add` makes, for the same reason it makes them: either id
+    // arrives on a command line and becomes a key in this file, and an id
+    // carrying a newline or an ANSI escape splits the terminal output it is
+    // printed into. A revoke is also the one command here that cannot be
+    // undone by running it again, so refusing a mistyped id before anything is
+    // read is cheaper than reading it first.
+    if !nexapipe::auth::is_presentable_client_id(client_id) {
+        anyhow::bail!(
+            "client id {client_id:?} is printable ASCII of at most {} characters and not empty — \
+             it is the key under [auth.clients], the name a device sends in its handshake, and \
+             the subject of every log line about it",
+            nexapipe::auth::protocol::MAX_CLIENT_ID_LEN
+        );
+    }
+    if let Some(device) = device
+        && !nexapipe::auth::is_presentable_device_id(device)
+    {
+        anyhow::bail!(
+            "device name {device:?} is printable ASCII of at most {} characters and not empty — \
+             it is a key under [auth.clients.{}.devices] and the subject of every log line about \
+             it",
+            nexapipe::auth::MAX_DEVICE_ID_LEN,
+            toml_key(client_id)
+        );
+    }
     // Counts are for the message only; a config that fails to load must still be revocable.
     let auth = load_auth_or_none(&cli.config).ok().flatten();
     let client = auth.as_ref().and_then(|auth| auth.clients.get(client_id));
