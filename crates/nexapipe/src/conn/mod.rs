@@ -1425,12 +1425,29 @@ async fn perform_authentication(
     let mut verified_acl = ClientAcl::Unrestricted;
     let is_valid = match outcome {
         Ok(true) => {
+            // Which device this was, if it named one, recorded under the same
+            // lock that verified it. This is the stamp `client list` reads to
+            // say whether a device is still in use: without it every named
+            // device reports "never used" forever, and the one question the
+            // device table exists to answer — which of these can be revoked
+            // without disconnecting a live one — has nothing to go on.
+            let device_stamp_moved = match resp_device_id.as_deref() {
+                Some(name) => cfg
+                    .clients
+                    .get_mut(&client_id)
+                    .is_some_and(|client| client.record_device_success(name)),
+                None => false,
+            };
             // Clear the counters only when there is something to clear, so a
             // healthy client does not turn every connection into a disk write.
-            let dirty = cfg
-                .clients
-                .get(&client_id)
-                .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+            // A named device that moved its stamp is worth one: `unix_now` is
+            // whole seconds, so a device reconnecting inside the same second
+            // is not.
+            let dirty = device_stamp_moved
+                || cfg
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
             if dirty {
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();

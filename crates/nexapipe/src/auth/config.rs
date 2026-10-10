@@ -216,9 +216,9 @@ impl AuthConfig {
     /// The whole config used to be cloned on every attempt worth counting, and
     /// a clone copies every client's secret and enrollment token with it — once
     /// per wrong code, from any peer that can name a client id. Only
-    /// `failed_attempts`, `locked_until` and `last_used` are persisted, so only
-    /// those travel. Extend this alongside `save_auth_state`, or a field added
-    /// there is silently written as empty.
+    /// `failed_attempts`, `locked_until`, `last_used` and each device's
+    /// `last_used` are persisted, so only those travel. Extend this alongside
+    /// `save_auth_state`, or a field added there is silently written as empty.
     pub fn counter_snapshot(&self) -> AuthConfig {
         AuthConfig {
             enabled: self.enabled,
@@ -238,14 +238,26 @@ impl AuthConfig {
                             created_at: String::new(),
                             allow_hosts: None,
                             pending_enrollment: None,
-                            // Empty for the same reason `secret` is: a snapshot
-                            // exists so a wrong code does not copy a
-                            // credential, and every device secret is one.
-                            // Nothing written from a snapshot touches this
-                            // table — `save_auth_state` moves three counters
-                            // per client and leaves the rest of the file
-                            // alone — so an empty one costs nothing.
-                            devices: HashMap::new(),
+                            // Names and stamps only. A snapshot exists so a
+                            // wrong code does not copy a credential, and every
+                            // device secret is one — so a device travels with
+                            // its secret emptied and everything else blank,
+                            // and `save_auth_state` writes back the one field
+                            // a connection can change: `last_used`.
+                            devices: client
+                                .devices
+                                .iter()
+                                .map(|(name, device)| {
+                                    (
+                                        name.clone(),
+                                        DeviceAuth {
+                                            secret: String::new(),
+                                            created_at: String::new(),
+                                            last_used: device.last_used,
+                                        },
+                                    )
+                                })
+                                .collect(),
                             last_used: client.last_used,
                             failed_attempts: client.failed_attempts,
                             locked_until: client.locked_until,
@@ -330,6 +342,30 @@ impl ClientAuth {
         self.failed_attempts = 0;
         self.locked_until = None;
         self.last_used = Some(unix_now());
+    }
+
+    /// Note that this device authenticated just now, and report whether the
+    /// stamp moved.
+    ///
+    /// The client-level [`Self::record_success`] does not reach a device: a
+    /// device is a credential of its own, so "which of these devices is still
+    /// in use, and which can be revoked without touching a live one" — the
+    /// question the device table exists to answer — was left unanswered for
+    /// every named device, and `client list` reported "never used" for all of
+    /// them forever.
+    ///
+    /// `false` means the device is not in the table, or its stamp is already
+    /// this second. The caller uses it to decide whether a write is owed:
+    /// `unix_now` is whole seconds, so a device reconnecting inside the same
+    /// second costs nothing.
+    pub fn record_device_success(&mut self, device: &str) -> bool {
+        let now = unix_now();
+        let Some(entry) = self.devices.get_mut(device) else {
+            return false;
+        };
+        let moved = entry.last_used != Some(now);
+        entry.last_used = Some(now);
+        moved
     }
 
     /// Decode the Base32 secret into bytes.
@@ -440,6 +476,49 @@ mod tests {
             created_at: "0".to_string(),
             last_used: None,
         }
+    }
+
+    /// Whether a device is still in use is the question the device table exists
+    /// to answer, and the client-level `record_success` never answered it for a
+    /// device — so `client list` reported "never used" for every named device,
+    /// forever.
+    #[test]
+    fn authenticating_as_a_device_stamps_that_device() {
+        let mut client = client();
+        client
+            .devices
+            .insert("laptop".to_string(), device("LAPTOPSECRET"));
+        client
+            .devices
+            .insert("phone".to_string(), device("PHONESECRET"));
+
+        assert!(
+            client.record_device_success("laptop"),
+            "the first stamp is a change"
+        );
+        let stamped = client.devices["laptop"].last_used;
+        assert!(stamped.is_some(), "the device was not stamped");
+        assert_eq!(
+            client.devices["phone"].last_used, None,
+            "a sibling device must not be stamped with it"
+        );
+
+        // Whole seconds, so the same second is not a change — which is what
+        // keeps a reconnecting device from costing a write every time.
+        assert!(
+            !client.record_device_success("laptop"),
+            "the same second must not count as a new stamp"
+        );
+        assert_eq!(client.devices["laptop"].last_used, stamped);
+    }
+
+    /// A name that is not in the table is not a stamp, and not an error either:
+    /// the handshake has already refused it before this can run.
+    #[test]
+    fn stamping_a_device_that_is_not_there_does_nothing() {
+        let mut client = client();
+        assert!(!client.record_device_success("laptop"));
+        assert!(client.devices.is_empty());
     }
 
     #[test]
@@ -646,7 +725,9 @@ mod tests {
 
     /// `counter_snapshot` exists so that counting a wrong code does not copy a
     /// credential, and the table is the place a new field gets forgotten: it
-    /// is one level further from the field the comment was written about.
+    /// is one level further from the field the comment was written about. The
+    /// device's stamp travels — it is what the writeback persists — but the
+    /// secret it sits next to must not.
     #[test]
     fn a_counter_snapshot_carries_no_device_secret() {
         let mut c = client();
@@ -659,8 +740,11 @@ mod tests {
         };
 
         let snapshot = config.counter_snapshot();
+        let snapshot = &snapshot.clients["alice"];
 
-        assert!(snapshot.clients["alice"].devices.is_empty(), "{snapshot:?}");
-        assert!(snapshot.clients["alice"].secret.is_empty());
+        assert!(snapshot.secret.is_empty());
+        let laptop = &snapshot.devices["laptop"];
+        assert!(laptop.secret.is_empty(), "{snapshot:?}");
+        assert!(laptop.created_at.is_empty(), "{snapshot:?}");
     }
 }
