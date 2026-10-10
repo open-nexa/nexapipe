@@ -10,21 +10,22 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [0.6.0] — 2026-10-10
+## [0.6.0] — 2026-10-11
 
 A readable version of this release, with downloads, is published at
 <https://open-nexa.github.io/nexapipe/v0.6.0.html>. The page itself
 lives in `docs/releases/`, and only that directory reaches the site.
 
-One configuration key is added and none is removed or renamed, so a
+Two configuration keys are added and none is removed or renamed, so a
 `config.toml` that works on 0.5.0 loads unchanged on 0.6.0, and a client written
-before devices existed answers exactly as it did. Three things behave
+before devices existed answers exactly as it did. Four things behave
 differently without being configured to: `/metrics` no longer carries the
 request-duration counter it used to, a device struck out loses the connections
-it is already holding rather than keeping them until it hangs up, and a peer
+it is already holding rather than keeping them until it hangs up, a peer
 revoked underneath a live connection is closed with a new code — `6` — which
 both clients turn into an error saying the credential is gone and that trying
-again will not help.
+again will not help, and an enrollment that would replace a device already in
+the table is refused rather than re-issuing that device's secret.
 
 ### Added
 
@@ -77,11 +78,29 @@ again will not help.
   persistence with it. The relay has had a unit in `docs/self-hosted-relay.md`
   since earlier in this release.
 
+- **`[auth.clients.<id>].unnamed_device_allowed`.** A peer that names no
+  device has always been answered with the client's shared `secret` — the path
+  every config written before this release is on, and the one path a device
+  cannot be taken off by being revoked, since there is nothing in the table
+  that belongs to it alone. A client whose every device has moved into the
+  table can now say so: with the key set to `false`, a response carrying no
+  device name is refused rather than answered under the shared secret. It
+  defaults to `true`, so nothing changes until it is set, and setting it on a
+  client still handing out invites would refuse the devices that have not
+  enrolled yet.
+
 - Desktop: session totals, and a page that lists the connections a running proxy
   is holding (#90).
 - Desktop: a running proxy says what quitting should do (#88).
 - CI: the root workspace is *tested* on Windows, not only compiled (#97).
 - `docs/self-hosted-relay.md`: a systemd unit for the relay (#95).
+- `docs/ROADMAP.md` and `AGENTS.md`: what v0.6.0 shipped, said in the sections
+  that describe it (#123).
+- Both READMEs: which secret an enrollment rotates, and the device table it
+  writes into (#124).
+- CI: dependabot's per-dependency version pull requests are replaced by one
+  weekly dependency issue (#127).
+- `docs/ROADMAP.md`: a size and performance roadmap (#136).
 
 ### Changed
 
@@ -93,6 +112,13 @@ again will not help.
   p99 no longer takes arithmetic. The boundaries are fixed at 1, 5, 10, 25,
   50, 100, 250, 500, 1000, 2500, 5000 and 10000 milliseconds, plus `+Inf`.
   A scrape looking for the old counter will not find it.
+
+- **The workspace declares the Rust version it needs: 1.89.** The build has
+  depended on it since the config write started taking a file lock —
+  `File::lock` is stable from 1.89 — but nothing said so, and a build on an
+  older toolchain failed with a missing method somewhere in the middle of a
+  crate rather than with the toolchain it was missing it from. `rust-version`
+  in the workspace manifest makes cargo name it.
 
 - **The desktop TUN shares DNS and address space with other TUN apps**, rather
   than taking both over (#87).
@@ -225,6 +251,76 @@ again will not help.
   middle of being observed, and a group of them reported no backend answering
   at all. The budget covers both halves now, and the phase ceiling and the JNI
   timeout follow it rather than being numbers written down separately.
+
+- **An enrollment could take over a device that was already there.** The
+  device table is keyed by name, and enrolling wrote into it without looking
+  first, so a second invite — or a first one scanned again after it had been
+  spent — replaced the secret of a device that was already enrolled and left
+  the old credential answering as the new one, with nothing in the log to say
+  the row had changed hands. A name the table already holds is refused now,
+  and the refusal does not count toward the lockout, because the same name
+  arriving twice is a device that was enrolled twice rather than something
+  guessing. `nexapipe client add <id> --device <name> --force` is how one is
+  replaced on purpose.
+
+- **A connection stamped the client, not the device that made it.** `last_used`
+  was one field on the client entry, so every device under a client shared a
+  single timestamp and the table could not answer which of them had stopped
+  being seen — which is the question a stale device row asks. It is recorded
+  under the device now and written back with the rest of the state, so each
+  entry says when that device last authenticated on its own.
+
+- **Desktop: a tunnel whose DNS was never hijacked ran as though it had been.**
+  `set_system_dns` failing was logged and then degraded to `Global`, which
+  resolves without the hijack at all, so a machine that kept its own resolver
+  looked connected while every name went past the tunnel. Starting one stops
+  and says so now. The restore on the way out was the same shape: writing to
+  no network service at all — none found, on macOS — was reported as a
+  successful restore, which left the machine's DNS pointing at an address
+  nothing answers any more. It counts what it wrote and fails when it wrote
+  none.
+
+- **`nexapipe client add` reported a secret it had not written.** A failed
+  write of `config.toml` was a warning, and the command still exited `0` while
+  printing the secret to hand out — so a script saw success and the server,
+  which reads the file, never had the credential. It fails now, and the error
+  carries the TOML that would have been written rather than only a path.
+  `revoke` took the same ids `add` refuses — one with a newline in it, say —
+  and put one into the table it is asked to remove from; both are checked the
+  same way now.
+
+- **A peer could be connected before it was revocable.** The handshake read
+  the credential under the auth lock, let go of it, and registered the
+  connection afterwards, so a reload that struck the device out in between
+  left a connection authenticated as a device the new config no longer has,
+  and nothing watching for the change knew it was there to close. The
+  registration happens under the same lock the check ran under now, and the
+  channel that closes it is handed over with it, so there is no window in
+  which a peer is connected but not yet revocable.
+
+- **A write to `config.toml` was readable by everyone for as long as it took,
+  and followed a symlink to reach the file.** The file holds every TOTP secret
+  and the admin token. It was created and made private afterwards, so in
+  between it was readable by anyone else with access to the machine, and the
+  temporary file beside it had a name anyone could predict — which is what
+  makes a symlink there worth placing. It is created with the mode in the same
+  call now, under a name carrying the pid and a random number. The rename
+  follows a link at the destination rather than writing through it, so a
+  `config.toml` that is a symlink still changes the file it points at.
+
+- **Android: a device id that could not be stored was reported as stored.**
+  `nativeSetDeviceId` ignored a poisoned lock and returned `0` either way, so
+  a caller could not tell a name that was kept from one that was lost, and a
+  name lost on the way in is an install that answers as a device the server
+  has no row for. It returns `-1` now.
+
+- **A TOTP period the server chose could be read as a different one.**
+  Enrollment read the period it was given as a `u64` and narrowed it with `as
+  u32`, which takes the low half rather than refusing: a period that does not
+  fit arrived as some other number, and every code generated afterwards was
+  wrong for a step the two ends disagreed about, with neither saying so. The
+  conversion is checked now, and a period that does not fit is refused at
+  enrollment with the value the server sent.
 
 ## [0.5.0] — 2026-10-07
 

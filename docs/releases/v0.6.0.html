@@ -238,7 +238,7 @@
       the connections it is already holding instead of keeping them until it hangs up. Alongside it:
       request latency as a histogram, the write half of the management surface, and a desktop that
       shares its DNS with the other TUN apps on the machine.</p>
-    <p class="meta">10 October 2026 &middot; one tag ships the server archives, the desktop bundles, the Android APK and the container image.</p>
+    <p class="meta">11 October 2026 &middot; one tag ships the server archives, the desktop bundles, the Android APK and the container image.</p>
 
     <div class="detect" id="detect">
       <h3 id="detect-title">Download for your platform</h3>
@@ -417,9 +417,9 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
   <p class="note">All assets: <a href="https://github.com/open-nexa/nexapipe/releases/download/v0.6.0/SHA256SUMS.txt">SHA256SUMS.txt</a>.</p>
 
   <h2>What's new</h2>
-  <p class="tagline">0.6.0 follows 0.5.0, released 7 October 2026. One configuration key is added
+  <p class="tagline">0.6.0 follows 0.5.0, released 7 October 2026. Two configuration keys are added
     and none is removed, so a <code>config.toml</code> that works on 0.5.0 loads unchanged &mdash; but
-    two things behave differently without being configured to, and both are listed under
+    four things behave differently without being configured to, and all of them are listed under
     <a href="#before">before upgrading</a>.</p>
 
   <h3 class="subhead">One credential per device, rather than one shared by every device</h3>
@@ -538,6 +538,17 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
     <li>Desktop: session totals, and a page that lists the connections a running proxy is holding.</li>
     <li>Desktop: a running proxy says what quitting should do.</li>
     <li>CI: the root workspace is tested on Windows, not only compiled.</li>
+    <li>Server: <code>[auth.clients.&lt;id&gt;].unnamed_device_allowed</code> &mdash; set to
+      <code>false</code>, a peer that names no device is refused rather than answered under the
+      client's shared secret. It defaults to <code>true</code>, so nothing changes until it is
+      set.</li>
+    <li>Docs: <code>docs/ROADMAP.md</code> and <code>AGENTS.md</code> say what v0.6.0 shipped, in
+      the sections that describe it.</li>
+    <li>Docs: both READMEs say which secret an enrollment rotates, and show the device table it
+      writes into.</li>
+    <li>Docs: <code>docs/ROADMAP.md</code> gains a size and performance roadmap.</li>
+    <li>CI: dependabot's per-dependency version pull requests are replaced by one weekly dependency
+      issue.</li>
   </ul>
 
   <h3 class="subhead">Changed</h3>
@@ -547,6 +558,9 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       than as the counter <code>nexapipe_request_duration_ms_total</code>, which no longer exists.</li>
     <li>Desktop: the TUN shares DNS and address space with the other TUN apps on the machine.</li>
     <li>Dependencies: one batched upgrade across the workspace.</li>
+    <li>The workspace declares the Rust version it needs: <code>1.89</code>. A build on an older
+      toolchain used to fail with a missing method somewhere in a crate rather than with the
+      toolchain it was missing it from.</li>
   </ul>
 
   <h3 class="subhead">Fixed</h3>
@@ -617,13 +631,53 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       more, while the caller allowed eight in total: a backend taking more than two seconds to answer
       was cancelled in the middle of being observed, and a group of them reported no backend
       answering at all. The budget covers both halves now.</li>
+    <li>Server: an enrollment could take over a device that was already there. The device table is
+      keyed by name and enrolling wrote into it without looking first, so an invite scanned a second
+      time replaced the secret of a device that was already enrolled, and the old credential went on
+      answering as the new one. A name the table holds is refused now, and does not count toward the
+      lockout. <code>nexapipe client add &lt;id&gt; --device &lt;name&gt; --force</code> replaces one
+      on purpose.</li>
+    <li>Server: a connection stamped the client, not the device that made it, so every device under a
+      client shared one <code>last_used</code> and the table could not say which of them had stopped
+      being seen. It is recorded under the device now.</li>
+    <li>Desktop: a tunnel whose DNS was never hijacked ran as though it had been. The failure was
+      logged and then degraded to <code>Global</code>, which resolves without the hijack at all.
+      Starting one stops and says so now, and a restore that wrote to no network service is reported
+      as a failure rather than as a success.</li>
+    <li>Server: <code>nexapipe client add</code> reported a secret it had not written &mdash; a failed
+      write was a warning and the command still exited <code>0</code>, so a script saw success while
+      the server never had the credential. It fails now. <code>revoke</code> is given the same checks
+      on the ids it is handed.</li>
+    <li>Server: a peer could be connected before it was revocable. The handshake read the credential
+      under the auth lock, let go of it and registered the connection afterwards, so a reload that
+      struck the device out in between left a connection authenticated as a device the new config no
+      longer has. The registration happens under the same lock now.</li>
+    <li>Server: a write to <code>config.toml</code> was readable by everyone for as long as it took,
+      and followed a symlink to reach the file. It is created private in the same call now, under a
+      name nobody can predict, and the rename follows a link at the destination instead of writing
+      through it.</li>
+    <li>Android: a device id that could not be stored was reported as stored.
+      <code>nativeSetDeviceId</code> ignored a poisoned lock and returned <code>0</code> either way;
+      it returns <code>-1</code> now.</li>
+    <li>Client: a TOTP period the server chose could be read as a different one. The period was
+      narrowed with <code>as u32</code>, which takes the low half rather than refusing, so a period
+      that did not fit arrived as some other number and every code generated afterwards was wrong.
+      The conversion is checked now.</li>
   </ul>
 
   <h2 id="before">Before upgrading</h2>
   <ul class="changelog">
-    <li>One configuration key is added and none is removed or renamed: a <code>config.toml</code> that
-      works on 0.5.0 loads unchanged on 0.6.0, and a client written before devices existed answers
-      exactly as it did.</li>
+    <li>Two configuration keys are added and none is removed or renamed: a <code>config.toml</code>
+      that works on 0.5.0 loads unchanged on 0.6.0, and a client written before devices existed
+      answers exactly as it did.</li>
+    <li>Enrolling a name the device table already holds is refused rather than re-issuing that
+      device's secret. Anything that re-enrolls the same device twice &mdash; a provisioning script
+      that hands out one invite per machine and runs twice on one &mdash; now has to pass
+      <code>--force</code> to replace what is there.</li>
+    <li><code>unnamed_device_allowed</code> defaults to <code>true</code>, so a peer naming no device
+      is still answered under the client's shared secret until a client says otherwise. Setting it to
+      <code>false</code> refuses those peers, which includes any device of that client that has not
+      enrolled yet.</li>
     <li><code>/metrics</code> loses <code>nexapipe_request_duration_ms_total</code> and gains the
       histogram. A scrape looking for the old counter will not find it: read
       <code>nexapipe_request_duration_ms_sum</code> instead, and divide by
