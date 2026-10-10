@@ -570,6 +570,24 @@ grep nexapipe-0.6.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       launch is logged as one that produced none rather than as one that never happened.</li>
     <li>A peer listing takes one reading of the clock for the whole list rather than one per entry, so
       two peers are no longer ordered by when the loop happened to reach them.</li>
+    <li>Desktop (macOS): the bundle carries the content security policy the other two platforms use.
+      Platform configs merge as JSON Merge Patch, in which <code>null</code> means <em>remove the
+      key</em> &mdash; so <code>app.security.csp = null</code> deleted the policy rather than relaxing
+      it, and the macOS app ran with none while Windows and Linux kept the baseline. The webview holds
+      every app command permission either way.</li>
+    <li><code>[peers]</code> refuses a key it does not recognise. <code>allow</code> is the section's
+      only key and an absent one means unrestricted, so <code>allowd = [...]</code> was dropped by
+      serde and left a server that looked restricted and was not, with nothing in the log to say
+      so.</li>
+    <li>Android: switching the VPN off no longer risks a native crash.
+      <code>nativeStopTunProxy</code> was the one JNI entry point with no barrier against unwinding,
+      and a panic there leaves an <code>extern "system"</code> frame &mdash; on Android a native crash
+      rather than a Java exception.</li>
+    <li><code>--qr-out</code> writes the file private from the moment it exists, and will not write
+      over one. The file carries the TOTP secret in the clear; it used to be created by
+      <code>fs::write</code> and made private afterwards, so in between it was readable by anyone with
+      access to the machine, and <code>fs::write</code> truncates whatever is at the path and follows
+      a symlink to reach it. A path that already exists is now refused instead of overwritten.</li>
   </ul>
 
   <h2 id="before">Before upgrading</h2>

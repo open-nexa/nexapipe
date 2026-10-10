@@ -141,6 +141,39 @@ again will not help.
   one per entry, so two peers are no longer ordered by when the loop happened to
   reach them.
 
+- **Desktop (macOS): the bundle carries the content security policy the other
+  two platforms use.** Platform configs merge as JSON Merge Patch, in which
+  `null` means *remove the key* — so `app.security.csp = null` did not relax the
+  policy, it deleted it, and the macOS app ran with no CSP at all while Windows
+  and Linux kept the baseline one. The webview holds every app command
+  permission either way, so on macOS a script that reached any rendered string
+  could call them. The override is gone and all three inherit one policy.
+
+- **`[peers]` refuses a key it does not recognise.** `allow` is the only key the
+  section has, and an absent `allow` means unrestricted, so `allowd = [...]` was
+  dropped by serde and left a server that looked restricted and was not, with
+  nothing in the log to say so. This is the section where a typo is a security
+  change rather than a lost setting, which is why `[auth]` has refused unknown
+  keys since it was written.
+
+- **Android: switching the VPN off no longer risks a native crash.**
+  `nativeStopTunProxy` was the one JNI entry point with no barrier against
+  unwinding: the others get theirs from a helper this one never went through,
+  because it has no environment to unwrap. A panic there unwinds out of an
+  `extern "system"` frame, which on Android is a native crash rather than a Java
+  exception — and it is the path that runs while the user is turning the VPN
+  off.
+
+- **`--qr-out` writes the file private from the moment it exists, and will not
+  write over one.** The file carries the TOTP secret in the clear. It used to be
+  created by `fs::write` and made private afterwards, so in between it was
+  readable by anyone with access to the machine, and `fs::write` truncates
+  whatever is already at the path and follows a symlink to reach it — a name
+  another account got there first could aim the write at a file the operator
+  owns. It now creates with `create_new` and the mode in the same call. The one
+  thing that changes for anyone using it: a path that already exists is now
+  refused instead of overwritten.
+
 ## [0.5.0] — 2026-10-07
 
 A readable version of this release, with downloads, is published at
