@@ -63,7 +63,9 @@ applyStoredTheme();
  *
  * A frame is still awaited, after the show rather than before it, so the log records how long
  * the first real paint took: that is the number the frontend's own timings are here to produce,
- * and `show()` cannot report it.
+ * and `show()` cannot report it. The wait is bounded, because a frame is not something this side
+ * can count on being scheduled — see `firstFrame` — and one that never arrives must not be the
+ * reason the timings are never sent.
  *
  * Failure is not fatal and neither is a plain browser: `vite dev` has no Tauri window and the
  * call rejects, which is expected and says nothing about the app.
@@ -72,12 +74,44 @@ applyStoredTheme();
  * worth sending: a measurement that added its own round-trip to the wait would be measuring
  * itself.
  */
+
+/// How long the first frame is waited for before the wait is given up on.
+///
+/// Two seconds: a frame that is slow is not the same as a frame that never comes, and the first
+/// is a machine having a bad day while the second is a webview that is not being composited.
+const FIRST_FRAME_WAIT_MS = 2000;
+
+/**
+ * Resolves `true` on the next animation frame, or `false` when `limit` passes without one.
+ *
+ * A hidden page is not fed frames, and neither is a webview the compositor has stopped drawing —
+ * a minimized window, or one on a machine that has just gone to sleep. Those are exactly the
+ * launches a timing is worth having from, so an unbounded wait would be worse than a slow one:
+ * the `finally` below it would never run, and that launch would send no report at all.
+ */
+function firstFrame(limit: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let frame = 0;
+    const timer = setTimeout(() => {
+      cancelAnimationFrame(frame);
+      resolve(false);
+    }, limit);
+    frame = requestAnimationFrame(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
 async function showWindow(): Promise<void> {
   try {
     await getCurrentWindow().show();
     mark('shown');
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    mark('first-frame');
+    // Marked only when a frame really arrived: a start-up that produced none is one the log
+    // should say so about, not one to fill in with the moment the wait gave up.
+    if (await firstFrame(FIRST_FRAME_WAIT_MS)) {
+      mark('first-frame');
+    }
   } catch (error) {
     console.warn('[window] could not show the window:', error);
   } finally {
