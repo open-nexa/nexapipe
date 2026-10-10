@@ -1233,6 +1233,12 @@ device sharing it with it: they have to scan again. Nothing re-enrolls on its
 own, so a device enrolled before it could name itself keeps answering as nobody
 until its invite is imported again — which is the one thing that changes it.
 
+Enrollment does **not** overwrite a device name that is already there. The token
+proves the invite reached *someone*, not which device it reached, and the name is
+supplied by the client at enrollment time, so accepting any name would let a
+copied link take the place of the real device. Replacing an existing device's
+credential is `nexapipe client add <id> --device <name> --force`.
+
 - `v=2` is a **version of its own**, so an app that only knows `v=1` refuses the
   code rather than reading it as an endpoint share whose credentials went
   missing.
