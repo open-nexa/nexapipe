@@ -425,6 +425,24 @@ A revoke deletes rather than rewriting, because a missing entry is what the
 handshake reads as "this device has no credential" — the same answer a device
 that never enrolled gets, so what happened to it cannot be told from outside.
 
+What those commands read and write is a `devices` table beside the client's own
+`secret`:
+
+```toml
+[auth.clients.client-001]
+secret = "JBSWY3DPEHPK3PXP"        # the credential of the device that names none
+
+[auth.clients.client-001.devices.laptop]
+secret = "MFRGGZDFMZTWQ2LK"        # issued at enrollment, revocable on its own
+created_at = "1723756800"
+```
+
+The server checks a peer against whichever of the two it asked for: a device
+that named itself against its own entry, one that named none against the
+client's `secret`. Neither has to be written by hand — enrollment files a device
+on its own, and `client add --device` issues one from the shell — and a client
+carrying no `devices` table behaves exactly as it did before it existed.
+
 ---
 
 ## Configuration
@@ -1201,10 +1219,19 @@ nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
 
 The first device to connect sends the token, the server answers with a freshly
 generated secret and **burns the token in the same write**, so a link copied in
-transit stops being a credential the moment it is used. Enrolling therefore also
-rotates that client's secret, and every device already using it has to scan
-again; a link you never delivered is revoked by generating another one, which
-replaces the outstanding token.
+transit stops being a credential the moment it is used. A link you never
+delivered is revoked by generating another one, which replaces the outstanding
+token.
+
+**Which secret enrollment rotates depends on whether the device named itself.**
+An install that answers as one named device of itself — the desktop after its
+hostname, Android after the device model — is filed under
+`[auth.clients.<id>.devices.<name>]`, so only that device's credential changes
+and every other one keeps working. An install that names no device is enrolled
+under the client's own `secret`, and *that* is the rotation that takes every
+device sharing it with it: they have to scan again. Nothing re-enrolls on its
+own, so a device enrolled before it could name itself keeps answering as nobody
+until its invite is imported again — which is the one thing that changes it.
 
 - `v=2` is a **version of its own**, so an app that only knows `v=1` refuses the
   code rather than reading it as an endpoint share whose credentials went

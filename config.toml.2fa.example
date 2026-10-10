@@ -149,7 +149,10 @@ issuer = "NexaPipe"
 # used. Until then it is one: an unspent link hands out this client's secret to
 # whoever holds it, so deliver it to the device over a channel you already
 # trust and do not leave it sitting in a chat log or a ticket. Two consequences:
-# enrollment rotates this client's secret, so devices already using it have to
+# which secret enrollment rotates depends on whether the device named itself — a
+# named device is filed under `[auth.clients.client-001.devices.<name>]`, so only
+# its own credential changes, while one that names none is filed under this
+# client's `secret` and takes every device sharing it along, so they all have to
 # scan again; and generating another `--registration` invite replaces the
 # outstanding token, which is how a link that never arrived gets revoked. Never
 # write the key by hand — let the command own it.
@@ -185,6 +188,17 @@ created_at = "1723756800"
 # into a client that has failed a handshake, so a lockout survives a restart.
 # Nothing to configure; and `pending_enrollment`, written by the enrollment
 # command above, should never be edited by hand either.
+#
+# A device that named itself at enrollment is filed below rather than in the
+# `secret` above, which is what lets one be revoked without touching the rest —
+# including the devices still answering as nobody, which is what that one is for.
+# Nothing here is written by hand either: enrollment files a device on its own,
+# and so does `nexapipe client add client-001 --device <name>`. A client with no
+# `devices` table at all — which is every client written before this existed —
+# authenticates exactly as it always did.
+[auth.clients.client-001.devices.laptop]
+secret = "LAPTOPSECRET"     # Base32-encoded secret, issued at enrollment
+created_at = "1723756800"
 
 [auth.clients.client-002]
 secret = "KBSWY3DPEHPK3PXQ"
