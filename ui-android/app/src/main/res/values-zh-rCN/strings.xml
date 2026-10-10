@@ -247,4 +247,8 @@
     <string name="error_connection_failed">连接失败</string>
     <string name="error_all_attempts_failed">所有连接尝试均失败</string>
     <string name="credential_protection_warning">此设备无法加密凭据（密钥库不可用），凭据将以未加密方式存储。</string>
+    <string name="plaintext_consent_title">以未加密方式保存此凭据？</string>
+    <string name="plaintext_consent_body">此设备的密钥库不可用，无法加密凭据。该凭据将以明文写入，任何能够读取本应用文件的内容都可以读到它。无论哪种方式，它都不会被包含在备份中。</string>
+    <string name="plaintext_consent_accept">仍然保存</string>
+    <string name="plaintext_consent_decline">不保存</string>
 </resources>

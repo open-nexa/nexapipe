@@ -78,6 +78,16 @@ class SettingsManager(context: Context) {
         private const val KEY_VPN_TAKEOVER_CHOICE = "vpn_takeover_choice"
 
         /**
+         * Whether this device was ever allowed to store a credential in the
+         * clear.
+         *
+         * In `prefs` and not `secretPrefs`: it is a decision, not a secret,
+         * and a file that must never hold anything readable is no place to
+         * keep the answer to "may this file hold something readable".
+         */
+        private const val KEY_PLAINTEXT_CONSENT = "plaintext_credential_consent"
+
+        /**
          * The saved language tag, or "" for "follow the system".
          *
          * A static read on purpose: `attachBaseContext` needs it before a
@@ -170,8 +180,17 @@ class SettingsManager(context: Context) {
      * each endpoint is written to [secretPrefs] and stripped from the list
      * saved in [prefs], so the backed up copy carries the configuration but
      * never a credential.
+     *
+     * Reports whether every credential it was given is now sealed at rest.
+     * A caller that has not established consent for a plaintext write gets
+     * `false` and no new secret: the credential stays out of storage rather than
+     * going down readable because the keystore failed on the call that
+     * happened to be the one writing it. The endpoint list itself is still
+     * written — it carries no secret — and a credential that was already stored
+     * for that endpoint is left untouched, so a refused write loses the new
+     * value and nothing else.
      */
-    fun saveNodes(nodes: List<NodeConfig>) {
+    fun saveNodes(nodes: List<NodeConfig>, allowPlaintext: Boolean = true): Boolean {
         val editor = secretPrefs.edit()
         // A secret outlives its endpoint otherwise: deleting the endpoint
         // would leave the seed behind, and the next endpoint to reuse that ID
@@ -193,25 +212,71 @@ class SettingsManager(context: Context) {
             }
         }
 
+        var allSealed = true
         val persisted = nodes.map { node ->
             val stripped = node.enrollment?.let { enrollment ->
                 if (enrollment.token.isBlank()) {
                     null
                 } else {
-                    editor.putString(ENROLLMENT_PREFIX + node.nodeId, secrets.seal(enrollment.token))
-                    node.copy(enrollment = enrollment.copy(token = ""))
+                    // Sealed before anything is written, and a refusal drops the
+                    // token instead of writing it: `SecretStore` is asked
+                    // whether it can protect this value instead of being asked
+                    // to store it and being allowed to answer for itself.
+                    val sealed = secrets.sealOrNull(enrollment.token)
+                    when {
+                        sealed != null -> {
+                            editor.putString(ENROLLMENT_PREFIX + node.nodeId, sealed)
+                            node.copy(enrollment = enrollment.copy(token = ""))
+                        }
+                        allowPlaintext -> {
+                            allSealed = false
+                            editor.putString(
+                                ENROLLMENT_PREFIX + node.nodeId,
+                                secrets.seal(enrollment.token)
+                            )
+                            node.copy(enrollment = enrollment.copy(token = ""))
+                        }
+                        else -> {
+                            // Refused: the token is dropped rather than stored
+                            // in the clear, so the endpoint keeps whatever it
+                            // had and the caller can ask before trying again.
+                            allSealed = false
+                            node.copy(enrollment = null)
+                        }
+                    }
                 }
             } ?: node
             val otp = stripped.twoFactor
             if (otp == null || otp.secret.isBlank()) {
                 stripped
             } else {
-                editor.putString(SECRET_PREFIX + node.nodeId, secrets.seal(otp.secret))
-                stripped.copy(twoFactor = otp.copy(secret = ""))
+                val sealed = secrets.sealOrNull(otp.secret)
+                when {
+                    sealed != null -> {
+                        editor.putString(SECRET_PREFIX + node.nodeId, sealed)
+                        stripped.copy(twoFactor = otp.copy(secret = ""))
+                    }
+                    allowPlaintext -> {
+                        allSealed = false
+                        editor.putString(SECRET_PREFIX + node.nodeId, secrets.seal(otp.secret))
+                        stripped.copy(twoFactor = otp.copy(secret = ""))
+                    }
+                    else -> {
+                        // Refused. Written as switched off rather than left
+                        // enabled with no secret: the previous secret for this
+                        // endpoint is still in the file, so an enabled-but-
+                        // blank record would come back on the next launch
+                        // looking like it had kept the credential it never
+                        // received. Off says what happened.
+                        allSealed = false
+                        stripped.copy(twoFactor = otp.copy(secret = "", enabled = false))
+                    }
+                }
             }
         }
         editor.apply()
         prefs.edit().putString(KEY_NODES, json.encodeToString(persisted)).apply()
+        return allSealed
     }
 
     /**
@@ -224,6 +289,39 @@ class SettingsManager(context: Context) {
      * instead of finding out from a backup they assumed was encrypted.
      */
     fun credentialProtection(): SecretStore.Protection = secrets.protection()
+
+    /**
+     * Whether credentials written from here on would be sealed at rest.
+     *
+     * [credentialProtection] says what became of the last one; this says what
+     * would become of the next, which is what a caller holding a credential it
+     * has not written yet needs in order to ask first rather than report
+     * afterwards.
+     *
+     * A probe and not a promise: it repeats the steps [SecretStore.seal]
+     * would take and throws the result away, so the keystore can answer
+     * "yes" here and fail there. [saveNodes] and [saveRelayConfig] therefore
+     * report what they actually wrote, and a caller that asked first still
+     * has to be able to notice a credential going down in the clear.
+     */
+    fun canProtectCredentials(): Boolean = secrets.canSeal()
+
+    /**
+     * Whether storing credentials unencrypted has been agreed to on this
+     * device.
+     *
+     * Remembered rather than asked per credential, so it outlives the process
+     * that asked: a device that cannot seal one credential cannot seal the
+     * next either, and an answer given once should not be demanded again on
+     * every launch.
+     */
+    fun plaintextCredentialConsent(): Boolean =
+        prefs.getBoolean(KEY_PLAINTEXT_CONSENT, false)
+
+    /** Records the answer to [plaintextCredentialConsent] for good. */
+    fun savePlaintextCredentialConsent(accepted: Boolean) {
+        prefs.edit { putBoolean(KEY_PLAINTEXT_CONSENT, accepted) }
+    }
 
     /**
      * The name this install answers as, generated on first call and then kept.
@@ -344,8 +442,20 @@ class SettingsManager(context: Context) {
         }
     }
 
-    /** Saves the relay configuration. */
-    fun saveRelayConfig(relayMode: String, relayUrl: String, authToken: String) {
+    /**
+     * Saves the relay configuration.
+     *
+     * Reports whether the bearer token is sealed at rest, on the same terms
+     * as [saveNodes]: without consent for a plaintext write the token is
+     * dropped rather than stored readable, and the mode and URL — which are
+     * not secrets — are kept either way.
+     */
+    fun saveRelayConfig(
+        relayMode: String,
+        relayUrl: String,
+        authToken: String,
+        allowPlaintext: Boolean = true
+    ): Boolean {
         prefs.edit {
             putString(KEY_RELAY_MODE, relayMode)
             putString(KEY_RELAY_URL, relayUrl)
@@ -354,9 +464,22 @@ class SettingsManager(context: Context) {
         // stored blank, for the reasons given at [KEY_RELAY_AUTH_TOKEN].
         if (authToken.isBlank()) {
             secretPrefs.edit { remove(KEY_RELAY_AUTH_TOKEN) }
-        } else {
-            secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(authToken)) }
+            return true
         }
+        val sealed = secrets.sealOrNull(authToken)
+        if (sealed != null) {
+            secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, sealed) }
+            return true
+        }
+        if (!allowPlaintext) {
+            // Refused. Whatever token was already stored is left exactly as it
+            // was: a write nobody agreed to must not also destroy a credential
+            // this device is holding in the clear already or, more likely, as
+            // ciphertext. The new one is simply not written.
+            return false
+        }
+        secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(authToken)) }
+        return false
     }
 
     /** Loads the relay mode; defaults to "pinned" (pinned to aps1-1). */

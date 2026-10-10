@@ -2,6 +2,7 @@
 name = "nexapipe-client"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 description = "Iroh-based proxy client library supporting multiple platforms"
 keywords = ["iroh", "proxy", "p2p", "quinn"]
 categories = ["network-programming"]

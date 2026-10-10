@@ -263,4 +263,8 @@
     <string name="error_connection_failed">Connection failed</string>
     <string name="error_all_attempts_failed">All connection attempts failed</string>
     <string name="credential_protection_warning">This device cannot encrypt credentials (the keystore is unavailable). They are stored unencrypted.</string>
+    <string name="plaintext_consent_title">Store this credential unencrypted?</string>
+    <string name="plaintext_consent_body">This device cannot encrypt credentials because its keystore is unavailable. The credential would be written as plain text, readable by anything that can read this app\'s files. It stays excluded from backups either way.</string>
+    <string name="plaintext_consent_accept">Store it anyway</string>
+    <string name="plaintext_consent_decline">Do not store it</string>
 </resources>

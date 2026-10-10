@@ -43,6 +43,9 @@ class SecretStore {
          * time it was saved.
          */
         const val MARKER = "v1:"
+
+        /** Sealed and thrown away by [canSeal]. Never stored. */
+        private const val PROBE = "probe"
     }
 
     /**
@@ -77,6 +80,34 @@ class SecretStore {
 
     fun protection(): Protection = lastProtection
 
+    /**
+     * Whether this device can seal a credential at all, right now.
+     *
+     * [protection] reports what last happened; this answers *before* anything
+     * is stored, which is what a caller needs in order to ask first instead of
+     * discovering afterwards that a credential went down in the clear.
+     *
+     * Deliberately not [seal] on a throwaway value: that would report the
+     * failure in the log and move [protection], so the act of asking would
+     * itself look like a credential having been stored unprotected. This
+     * repeats the steps instead, and stays quiet whatever the answer is.
+     */
+    fun canSeal(): Boolean {
+        val key = key() ?: return false
+        return try {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            cipher.doFinal(PROBE.toByteArray(Charsets.UTF_8))
+            true
+        } catch (e: GeneralSecurityException) {
+            false
+        } catch (e: ProviderException) {
+            false
+        } catch (e: IllegalStateException) {
+            false
+        }
+    }
+
     private val keyStore: KeyStore? = try {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     } catch (e: Exception) {
@@ -104,11 +135,29 @@ class SecretStore {
      * startup — `SettingsManager.init` seals on its migration path — instead of
      * the plaintext fallback this class exists to provide.
      */
-    fun seal(plain: String): String {
+    fun seal(plain: String): String = sealOrNull(plain) ?: plain
+
+    /**
+     * Wraps [plain] for storage, or returns null when this device cannot seal
+     * it.
+     *
+     * [seal] falls back to plaintext rather than lose a credential, which is
+     * the right default for a value the app already holds — refusing there
+     * would disconnect the user from their own endpoint — and the wrong one
+     * for a write nobody has agreed to. This is the same work with that
+     * fallback taken away: a caller that must not put a credential on disk in
+     * the clear asks here, instead of sealing and discovering afterwards that
+     * [seal] chose for it.
+     *
+     * A keystore that works on one call and fails on the next is exactly the
+     * case this exists for, so the question is asked of the write itself and
+     * not of a probe that could have been answered by a different call.
+     */
+    fun sealOrNull(plain: String): String? {
         if (plain.isEmpty()) return plain
         val key = key() ?: run {
             lastProtection = Protection.NoKeystore
-            return plain
+            return null
         }
         return try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -124,18 +173,18 @@ class SecretStore {
             lastProtection = Protection.Sealed
             MARKER + Base64.encodeToString(nonce + body, Base64.NO_WRAP)
         } catch (e: GeneralSecurityException) {
-            Log.e(TAG, "Could not seal a credential, storing it in plaintext", e)
+            Log.e(TAG, "Could not seal a credential", e)
             lastProtection = Protection.SealFailed
-            plain
+            null
         } catch (e: ProviderException) {
             // Keymaster unreachable: the key is gone, not merely unusable once.
-            Log.e(TAG, "The keystore failed, storing a credential in plaintext", e)
+            Log.e(TAG, "The keystore failed to seal a credential", e)
             lastProtection = Protection.NoKeystore
-            plain
+            null
         } catch (e: IllegalStateException) {
-            Log.e(TAG, "The keystore is not ready, storing a credential in plaintext", e)
+            Log.e(TAG, "The keystore is not ready, could not seal a credential", e)
             lastProtection = Protection.NoKeystore
-            plain
+            null
         }
     }
 
