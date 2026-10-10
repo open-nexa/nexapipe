@@ -11,6 +11,11 @@ intend to fix it.
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
+Artifact size and performance are tracked separately, in
+[`size-perf-roadmap.md`](size-perf-roadmap.md) — they are engineering
+execution rather than product direction, and a section here would grow to a
+size that buries the product decisions below.
+
 Roadmap items are labelled `P0` / `P1` / `P2` for severity, not for priority of
 implementation — the ordering comes from [Sequencing principles](#sequencing-principles).
 
@@ -633,6 +638,26 @@ point of listing them:
 Gate: validate the premise first. If "visitors must install a client" turns out
 not to be the main reason people walk away, this stays shelved.
 
+### Phase 3.5 — v0.6.1, "weighed"
+
+No new capability is opened for this release, and that is the point: it exists
+because the artifact-size work in [`size-perf-roadmap.md`](size-perf-roadmap.md)
+needs a measurement before it can change anything, and three of the four shipped
+artifacts have never had their size written down. One item, no user-visible
+feature behind it.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| S1 | **Size and benchmark reporting in CI** | A `size-report` job recording every shipped artifact — server archives per target, desktop bundles, both APKs, the `.so` per ABI, `dist` — with `cargo bloat` attribution beside it, plus criterion baselines for the L4 forward, the TUN pump and the end-to-end forwarding path. Nothing is optimized until this lands: the desktop alone is an unknown, because `ui-desktop/src-tauri` is excluded from the root workspace and therefore builds with cargo's default profile, where `opt-level = 3`, LTO and `strip` are set. Full detail and the reasoning behind the ordering is in [`size-perf-roadmap.md`](size-perf-roadmap.md) |
+
+S2 (the desktop release profile), S3 (Android R8) and F2 (optimizing whatever
+the benchmarks find) all follow this, and deliberately not in the same release:
+the desktop profile is a near-free win and the R8 work is not, and bundling
+them means a shrinker regression rolls back the free win too.
+
+**Done when:** every artifact `release.yml` publishes has a size recorded in CI,
+and a PR that adds a dependency says what it cost.
+
 ### Dependencies
 
 ```text
@@ -659,6 +684,10 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── Windows runs the tests ────► v0.6.0
                                               │
                               R13 edge (after validation) ──► v1.0
+
+        S1 measure ──┬── S2 desktop profile ──┐          (size-perf-roadmap.md)
+                     └── S3 Android R8 ───────┴── S4 budget gate
+        F1 benches ──────► F2 targeted work ───► F3 perf budget
 ```
 
 Of that row, R15, R12, R10 and R11 shipped in v0.4.0. R9 shipped its probing
@@ -670,7 +699,11 @@ credentials and the write half of R4 are in `main`; what that phase still owes
 is the other half of making revocation true, which the dependencies graph does
 not separate out because the two halves share a deliverable. R13 keeps its id
 and its gate; what moved is the phase number above it, because v0.6.0 was
-inserted beneath it.
+inserted beneath it. The size and performance chain at the bottom is not part of
+this document's numbering: it is `S*` and `F*` rather than `R*`, and its detail
+lives in [`size-perf-roadmap.md`](size-perf-roadmap.md). Only S1 lands in
+[v0.6.1](#phase-35--v061-weighed), because nothing else in that document can be
+verified until S1 says what the artifacts weigh today.
 
 ---
 
@@ -697,6 +730,7 @@ inserted beneath it.
 | Revoking one device | rotating the shared secret, which is every device using that client | one device, including a connection it already holds; the others keep working |
 | Full secret rendered without authentication | both clients ask the operating system first — Android as of v0.3.0, desktop as of v0.4.0 — and both have been watched running on every platform they support | zero: every surface that can reach a full value asks the operating system to authenticate the user first |
 | Release rhythm | one `CHANGELOG.md` as of v0.3.0, and no released version carries an entry older than its own tag | regular minor releases, each with a readable CHANGELOG |
+| Artifact size and speed | three of the four shipped artifacts have never been weighed, nothing in CI measures size, and there is no benchmark anywhere | every artifact reported per PR, a budget that gates once a release has shipped clean, and three benches — see [`size-perf-roadmap.md`](size-perf-roadmap.md) |
 
 ---
 
