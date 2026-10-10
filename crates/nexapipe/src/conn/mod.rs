@@ -756,7 +756,21 @@ impl EnrollmentVerdict {
 /// runs, so a locked-out client cannot extend its own lockout by retrying, and
 /// a wrong code cannot be traded for extra attempts by going through
 /// enrollment.
-fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> EnrollmentVerdict {
+///
+/// A name that is already in the table is refused too. An enrollment token
+/// proves the invite reached *someone*, not which device it reached — the name
+/// is chosen by the client at enrollment time — so accepting any name turned a
+/// copied link into a takeover: enrolling as the name of a device that is
+/// already there replaces its credential, which locks the real device out while
+/// every log line and the peer list go on showing the real device's name.
+/// Rotating one device's credential is the operator's move and has its own
+/// `--force`; an enrollment is for a device that is not there yet.
+fn enrollment_verdict(
+    cfg: &AuthConfig,
+    client_id: &str,
+    token: &str,
+    device: Option<&str>,
+) -> EnrollmentVerdict {
     let Some(client) = cfg.clients.get(client_id) else {
         return EnrollmentVerdict::Refuse { counted: false };
     };
@@ -780,6 +794,14 @@ fn enrollment_verdict(cfg: &AuthConfig, client_id: &str, token: &str) -> Enrollm
 
     if !constant_time_eq(expected.as_bytes(), token.as_bytes()) {
         return EnrollmentVerdict::Refuse { counted: true };
+    }
+    // Not counted: this is the right token in the wrong hands, not a guess at
+    // one. Whoever is holding it is about to be told the same thing every other
+    // refusal says.
+    if let Some(name) = device
+        && client.devices.contains_key(name)
+    {
+        return EnrollmentVerdict::Refuse { counted: false };
     }
     EnrollmentVerdict::Accept
 }
@@ -863,8 +885,13 @@ enum EnrollmentSlot {
     Device {
         name: String,
         /// The entry this enrollment replaced, if the device was enrolled
-        /// before. Re-enrolling one device is how its credential is rotated
-        /// without touching the others.
+        /// before.
+        ///
+        /// `None` on the enrollment path, where a name that is already in the
+        /// table is refused rather than overwritten — see
+        /// [`enrollment_verdict`]. Rotating a device that exists is the
+        /// operator's move, `client add --device <name> --force`. What this
+        /// carries is what a failed write has to put back.
         previous: Option<DeviceAuth>,
     },
     /// The device that has no name: the client's own `secret`, which is also
@@ -968,8 +995,24 @@ async fn enroll_client(
         client.refresh_lockout();
     }
 
-    let verdict = enrollment_verdict(&cfg, client_id, token);
+    let verdict = enrollment_verdict(&cfg, client_id, token, device);
     if !matches!(verdict, EnrollmentVerdict::Accept) {
+        // The refusal sent on the wire is one string for every reason, so the
+        // only place this one is legible is the log — and it is the one an
+        // operator can act on, because it names the command that rotates the
+        // device properly.
+        if let Some(name) = device
+            && cfg
+                .clients
+                .get(client_id)
+                .is_some_and(|client| client.devices.contains_key(name))
+        {
+            tracing::warn!(
+                "2FA: enrollment for '{client_id}' refused, device '{name}' already has a \
+                 credential; replace it with `nexapipe client add {client_id} --device {name} \
+                 --force`"
+            );
+        }
         if verdict.counted() {
             let (max_attempts, lockout_duration) = (cfg.max_attempts, cfg.lockout_duration);
             if let Some(client) = cfg.clients.get_mut(client_id) {
@@ -1430,12 +1473,29 @@ async fn perform_authentication(
     let mut verified_acl = ClientAcl::Unrestricted;
     let is_valid = match outcome {
         Ok(true) => {
+            // Which device this was, if it named one, recorded under the same
+            // lock that verified it. This is the stamp `client list` reads to
+            // say whether a device is still in use: without it every named
+            // device reports "never used" forever, and the one question the
+            // device table exists to answer — which of these can be revoked
+            // without disconnecting a live one — has nothing to go on.
+            let device_stamp_moved = match resp_device_id.as_deref() {
+                Some(name) => cfg
+                    .clients
+                    .get_mut(&client_id)
+                    .is_some_and(|client| client.record_device_success(name)),
+                None => false,
+            };
             // Clear the counters only when there is something to clear, so a
             // healthy client does not turn every connection into a disk write.
-            let dirty = cfg
-                .clients
-                .get(&client_id)
-                .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+            // A named device that moved its stamp is worth one: `unix_now` is
+            // whole seconds, so a device reconnecting inside the same second
+            // is not.
+            let dirty = device_stamp_moved
+                || cfg
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
             if dirty {
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
@@ -2085,7 +2145,7 @@ mod tests {
     fn an_outstanding_token_is_accepted() {
         let cfg = auth_with_pending(Some("0123456789abcdef"));
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", None),
             EnrollmentVerdict::Accept
         );
     }
@@ -2186,11 +2246,11 @@ mod tests {
     fn a_wrong_token_is_refused_and_counted() {
         let cfg = auth_with_pending(Some("0123456789abcdef"));
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", "0123456789abcde0"),
+            enrollment_verdict(&cfg, "alice", "0123456789abcde0", None),
             EnrollmentVerdict::Refuse { counted: true }
         );
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", ""),
+            enrollment_verdict(&cfg, "alice", "", None),
             EnrollmentVerdict::Refuse { counted: true }
         );
     }
@@ -2202,7 +2262,7 @@ mod tests {
     fn a_client_with_nothing_pending_is_refused_without_being_counted() {
         let cfg = auth_with_pending(None);
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", None),
             EnrollmentVerdict::Refuse { counted: false }
         );
     }
@@ -2211,7 +2271,7 @@ mod tests {
     fn an_unknown_client_is_refused_without_being_counted() {
         let cfg = auth_with_pending(Some("0123456789abcdef"));
         assert_eq!(
-            enrollment_verdict(&cfg, "bob", "0123456789abcdef"),
+            enrollment_verdict(&cfg, "bob", "0123456789abcdef", None),
             EnrollmentVerdict::Refuse { counted: false }
         );
     }
@@ -2224,7 +2284,7 @@ mod tests {
         let mut cfg = auth_with_pending(Some("0123456789abcdef"));
         cfg.clients.get_mut("alice").unwrap().locked_until = Some(u64::MAX);
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", "0123456789abcdef"),
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", None),
             EnrollmentVerdict::Refuse { counted: false }
         );
     }
@@ -2236,8 +2296,64 @@ mod tests {
     fn a_blank_pending_token_is_never_accepted() {
         let cfg = auth_with_pending(Some(""));
         assert_eq!(
-            enrollment_verdict(&cfg, "alice", ""),
+            enrollment_verdict(&cfg, "alice", "", None),
             EnrollmentVerdict::Refuse { counted: false }
         );
+    }
+
+    /// A device that is already in the table keeps its credential.
+    ///
+    /// The token proves the invite reached someone, not which device it
+    /// reached — the name is supplied by the client at enrollment time — so
+    /// overwriting the entry handed a device that is already enrolled to
+    /// whoever copied the link: the real device is locked out, while the access
+    /// log and the peer list go on attributing the connection to it.
+    #[test]
+    fn an_enrollment_may_not_take_over_a_device_that_is_already_there() {
+        let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("laptop")),
+            EnrollmentVerdict::Refuse { counted: false }
+        );
+    }
+
+    /// The same table, a name that is not in it: an enrollment is how a device
+    /// that is not there yet gets one, and refusing those would make the table
+    /// impossible to grow past the first device.
+    #[test]
+    fn an_enrollment_may_still_add_a_device_that_is_not_there() {
+        let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("phone")),
+            EnrollmentVerdict::Accept
+        );
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", None),
+            EnrollmentVerdict::Accept
+        );
+    }
+
+    /// Refused for the right reason: it is not a guess at the token, so it must
+    /// not move the lockout counter. Counting it would let whoever is holding a
+    /// copied link lock the client out with retries.
+    #[test]
+    fn taking_over_a_device_is_not_counted_as_a_wrong_token() {
+        let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
+        assert!(!enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("laptop")).counted());
+    }
+
+    /// A config holding one client, with `token` left outstanding for it and
+    /// `device` already enrolled under it.
+    fn auth_with_device(device: &str, token: Option<&str>) -> AuthConfig {
+        let mut cfg = auth_with_pending(token);
+        cfg.clients.get_mut("alice").unwrap().devices.insert(
+            device.to_string(),
+            DeviceAuth {
+                secret: "DEVICESECRET".to_string(),
+                created_at: "0".to_string(),
+                last_used: None,
+            },
+        );
+        cfg
     }
 }

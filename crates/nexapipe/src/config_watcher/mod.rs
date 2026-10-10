@@ -464,11 +464,13 @@ pub type SharedConfigWatcher = Arc<ConfigWatcher>;
 ///
 /// A lockout only means anything if it survives a restart, so
 /// `failed_attempts`, `locked_until` and `last_used` are written back whenever
-/// the connection layer changes them. Only those three keys of
-/// `[auth.clients.<id>]` are touched — and only for clients that already have
-/// a section on disk, so a stale in-memory entry cannot resurrect a client
-/// the operator removed. Everything else in the file, comments included,
-/// survives byte for byte, exactly like [`ProxyConfig::write_client_secret`].
+/// the connection layer changes them — and `last_used` under
+/// `[auth.clients.<id>.devices.<name>]` with them, which is the stamp that says
+/// whether a device is still in use. Only those keys are touched, and only for
+/// clients and devices that already have a section on disk, so a stale
+/// in-memory entry cannot resurrect one the operator removed. Everything else
+/// in the file, comments included, survives byte for byte, exactly like
+/// [`ProxyConfig::write_client_secret`].
 pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
     // The whole read-modify-write runs under the lock, not just the write: two
     // counter writebacks that both read first would each build their document
@@ -506,6 +508,29 @@ fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<(
         set_counter(table, "failed_attempts", client.failed_attempts as u64);
         set_counter(table, "locked_until", client.locked_until.unwrap_or(0));
         set_counter(table, "last_used", client.last_used.unwrap_or(0));
+
+        // The same stamp per device, which is the one a per-device credential
+        // is for: without it `client list` answers "never used" for every named
+        // device, and "which of these can I revoke" has nothing to go on. Only
+        // devices the file already carries are written — inventing a section
+        // with no secret would leave a device nobody can authenticate as.
+        if !client.devices.is_empty() {
+            let Some(devices) = table
+                .get_mut("devices")
+                .and_then(|item| item.as_table_like_mut())
+            else {
+                continue;
+            };
+            for (name, device) in &client.devices {
+                let Some(entry) = devices
+                    .get_mut(name)
+                    .and_then(|item| item.as_table_like_mut())
+                else {
+                    continue;
+                };
+                set_counter(entry, "last_used", device.last_used.unwrap_or(0));
+            }
+        }
     }
 
     crate::config::write_config_file(path, &doc.to_string())?;
@@ -969,6 +994,55 @@ mod tests {
         assert_eq!(
             ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None),
             None
+        );
+    }
+
+    /// Whether a device is still in use is answered from the stamp the server
+    /// writes back. A device whose `last_used` never reaches the file reports
+    /// "never used" forever, and "which of these can I revoke without
+    /// disconnecting someone" has nothing to go on — which is the whole of what
+    /// a per-device credential is for.
+    #[test]
+    fn a_device_stamp_is_written_back_without_touching_its_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+        std::fs::write(
+            &path,
+            "[auth]\n\
+             [auth.clients.alice]\n\
+             secret = \"ALICEALICEALICEA\"\n\
+             \n\
+             [auth.clients.alice.devices.laptop]\n\
+             secret = \"LAPTOPLAPTOPLAPT\"\n",
+        )
+        .expect("write the config");
+
+        let mut alice = client("ALICEALICEALICEA");
+        alice.devices = [(
+            "laptop".to_string(),
+            DeviceAuth {
+                secret: "LAPTOPLAPTOPLAPT".to_string(),
+                created_at: "0".to_string(),
+                last_used: Some(1700000000),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let config = config_with(&[("alice", alice)]);
+
+        // Written the way the connection layer writes it: from a snapshot, which
+        // is a copy that carries no credential.
+        save_auth_state(&path_str, &config.counter_snapshot()).expect("the writeback succeeds");
+
+        let on_disk = std::fs::read_to_string(&path).expect("read the config back");
+        assert!(
+            on_disk.contains("last_used = 1700000000"),
+            "the device stamp did not reach the file: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("LAPTOPLAPTOPLAPT"),
+            "the snapshot's blanked secret must not be written over the real one: {on_disk}"
         );
     }
 

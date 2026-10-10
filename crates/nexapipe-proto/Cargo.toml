@@ -2,6 +2,7 @@
 name = 'nexapipe-proto'
 version.workspace = true
 edition = '2024'
+rust-version.workspace = true
 description = 'Wire format of the nexapipe L4 (TCP/UDP) tunnel'
 license = 'MIT'
 

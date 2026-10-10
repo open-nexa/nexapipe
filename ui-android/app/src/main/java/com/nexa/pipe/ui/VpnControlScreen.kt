@@ -76,6 +76,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val relayUrl by viewModel.relayUrl.collectAsState()
     val relayAuthToken by viewModel.relayAuthToken.collectAsState()
     val credentialProtection by viewModel.credentialProtection.collectAsState()
+    val plaintextConsentPending by viewModel.plaintextConsentPending.collectAsState()
     val vpnTakeoverChoice by viewModel.vpnTakeoverChoice.collectAsState()
     // For the VPN-slot question asked before a connect: the check reads the
     // platform's VPN state off the main thread.
@@ -364,6 +365,33 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 }
             }
         }
+
+    // Asked before the credential is written, not reported after: once it is on
+    // disk in the clear, telling the user about it does not put it back.
+    // Dismissing is the refusal, so the only way to store one is to answer
+    // this.
+    //
+    // In front of the endpoint branch below, not inside the Scaffold: a 2FA
+    // edit on the detail screen can raise this, and a dialog rendered after
+    // that branch's early return is a question the user cannot reach — the
+    // write it is waiting on simply never happens.
+    if (plaintextConsentPending) {
+        AlertDialog(
+            onDismissRequest = { viewModel.declinePlaintextCredentials() },
+            title = { Text(stringResource(R.string.plaintext_consent_title)) },
+            text = { Text(stringResource(R.string.plaintext_consent_body)) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.acceptPlaintextCredentials() }) {
+                    Text(stringResource(R.string.plaintext_consent_accept))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.declinePlaintextCredentials() }) {
+                    Text(stringResource(R.string.plaintext_consent_decline))
+                }
+            }
+        )
+    }
 
     // While an endpoint is open, its page replaces the whole screen: the
     // domain management lives there, keeping the main page a directory. The

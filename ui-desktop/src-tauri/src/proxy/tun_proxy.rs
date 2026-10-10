@@ -458,15 +458,34 @@ impl TunProxy {
         //    successfully. Scoped to the proxied domains where the OS can say so:
         //    everything else on this machine — an internal zone, another tunnel's
         //    names — then keeps resolving wherever it was resolving before.
-        let hijack =
-            dns_config::set_system_dns(&interface, &dns_ip, &self.config.dns.proxy_domains)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
-                    // Best effort: the teardown below still has to undo whatever
-                    // the attempt left in place, and the global places are the
-                    // ones a failed scoped attempt falls through to.
-                    dns_config::DnsHijack::Global
-                });
+        // Pointing system DNS at the TUN is not something to fail soft on. The
+        // routes are already installed and the device is configured, so a
+        // tunnel that starts anyway looks like a working one: the UI reports
+        // running while the domains the proxy exists for resolve at their real
+        // addresses and leave in the clear. Wind down instead, and say why.
+        let hijack = match dns_config::set_system_dns(
+            &interface,
+            &dns_ip,
+            &self.config.dns.proxy_domains,
+        ) {
+            Ok(hijack) => hijack,
+            Err(e) => {
+                // The same wind-down as the one below, minus the stack: it has
+                // not been started, so there is nothing to shut down. The
+                // global places are the ones a failed scoped attempt falls
+                // through to, which is what the restore has to undo.
+                dns_stopped.store(true, std::sync::atomic::Ordering::Release);
+                let _ = dns_handle.await;
+                if let Some(handle) = dns_v6_handle {
+                    let _ = handle.await;
+                }
+                let _ = routing::remove_routes(&interface);
+                let _ = routing::remove_ipv6(&interface);
+                return Err(anyhow::anyhow!(
+                    "system DNS could not be pointed at {dns_ip} ({e:#}); the tunnel was not started"
+                ));
+            }
+        };
 
         // 5. Start the smoltcp stack over the device. Each AsyncRead/AsyncWrite call
         //    on the device carries exactly one IP packet; the stack demultiplexes TCP

@@ -1870,6 +1870,13 @@ impl Drop for ConfigLock {
 /// The replacement is created `0600`, because what it holds is TOTP secrets and
 /// enrollment tokens: a new file takes the umask, and the file it replaces was
 /// checked at startup for being private.
+///
+/// The mode is part of the call that creates the file, not a `chmod` after the
+/// write. Tightening it afterwards leaves the secrets on disk at `0644` for as
+/// long as the write takes, and `write_all` plus `sync_all` make sure they
+/// really are on disk in that window — the server refuses to *start* on a
+/// world-readable config, so handing one to every local account for the length
+/// of a write contradicts the check that exists to prevent it.
 pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     let target = Path::new(path);
     let directory = target
@@ -1880,25 +1887,31 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
-    let temp = directory.join(format!(".{name}.{}.tmp", std::process::id()));
+    // The pid alone was not enough to keep two writers apart: pids are reused,
+    // and a pid that comes back while an older temp file of the same name is
+    // still there would have the new write truncate a file it did not create.
+    // The random half makes the name this process's own regardless.
+    let temp = directory.join(format!(
+        ".{name}.{}.{:x}.tmp",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
 
     let write = || -> anyhow::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temp)
             .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", temp.display()))?;
         file.write_all(contents.as_bytes())
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", temp.display()))?;
         file.sync_all()
             .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", temp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("cannot set the mode of {}: {e}", temp.display()))?;
-        }
         Ok(())
     };
 
@@ -1907,10 +1920,25 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
         return Err(e);
     }
 
+    // Renaming over a symlink puts a regular file where the link was: the
+    // indirection an operator set up is gone, the file the link pointed at keeps
+    // its old contents, and every command involved still reports success. A
+    // config reached through a link is a normal way to keep one file in version
+    // control or out of a container image, so the rename is aimed at what the
+    // link resolves to instead — the real file is replaced and the link stays.
+    //
+    // `Path::join` with an absolute path yields that path, so a link pointing
+    // outside this directory needs no special case; a relative one resolves
+    // against the directory holding the link, which is what the shell does.
+    let destination = match fs::read_link(target) {
+        Ok(resolved) => directory.join(resolved),
+        Err(_) => target.to_path_buf(),
+    };
+
     // A rename cannot replace a file that is itself a mount point, which is
     // what a bind-mounted single config file is. Falling back to writing in
     // place is the lesser evil: it loses the atomicity, not the write.
-    if let Err(rename) = fs::rename(&temp, target) {
+    if let Err(rename) = fs::rename(&temp, &destination) {
         let _ = fs::remove_file(&temp);
 
         // Writing in place keeps whatever mode the target already has, so the
@@ -2770,6 +2798,62 @@ pending_enrollment = "TOKEN"
                 .expect("the config is still there")
                 .trim(),
             "counter = 2"
+        );
+    }
+
+    /// A config of TOTP secrets must not be readable by another account, and
+    /// not only once the write has finished: `write_config_file` used to create
+    /// the replacement under the umask and chmod it to 0600 *after* flushing the
+    /// secrets to disk, so a local user reading it in that window got every
+    /// TOTP seed in the file. The mode now goes into the call that creates it.
+    #[cfg(unix)]
+    #[test]
+    fn a_written_config_is_private_to_its_owner() {
+        let (_dir, path) = scratch_config("counter = 0\n");
+        write_config_file(&path, "counter = 1\n").expect("the write succeeds");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a config holding TOTP secrets must be private, got {mode:o}"
+        );
+    }
+
+    /// A config reached through a symlink is a normal way to keep one file in
+    /// version control or out of a container image. Renaming a temp file over
+    /// the link replaces the link with a regular file: the indirection is gone
+    /// and the file it pointed at keeps the old contents, while every command
+    /// involved still reports success.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_reached_through_a_symlink_is_the_one_that_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real.toml");
+        let link = dir.path().join("config.toml");
+        fs::write(&real, "counter = 0\n").expect("write the real file");
+        std::os::unix::fs::symlink(&real, &link).expect("create the link");
+
+        let path = link.to_str().expect("utf-8 path").to_string();
+        write_config_file(&path, "counter = 1\n").expect("the write succeeds");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("the path is still there")
+                .file_type()
+                .is_symlink(),
+            "the link must survive the write"
+        );
+        assert_eq!(
+            fs::read_to_string(&real)
+                .expect("read the real file")
+                .trim(),
+            "counter = 1",
+            "the edit has to land in the file the link points at"
         );
     }
 
