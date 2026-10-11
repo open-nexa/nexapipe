@@ -2004,7 +2004,7 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
 
 /// What [`ProxyConfig::ensure_iroh_secret_key`] resolved the endpoint's
 /// identity to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EndpointIdentity {
     /// `[iroh] secret_key` was already set and parses. Nothing was written.
     Configured(String),
@@ -2016,6 +2016,29 @@ pub enum EndpointIdentity {
     /// config owned by another user). The server runs on the returned key, and
     /// the Node ID will be different after the next restart.
     Ephemeral(String),
+}
+
+/// Handwritten, and never `derive(Debug)`, for the reason
+/// [`IrohConfig`]'s is: every variant here *is* the ed25519 private key.
+///
+/// The derive is a loaded gun. This enum reaches a `{:?}` on the failure path
+/// of a test, where CI collects the output and keeps it — and a real key
+/// printed there is the endpoint's identity in a log anyone with read access to
+/// the build can lift. A failure would hand over exactly the thing the caller
+/// was told is private. The variant is enough to debug with: which of the three
+/// paths produced this is the question a reader actually has.
+impl std::fmt::Debug for EndpointIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (variant, key) = match self {
+            Self::Configured(key) => ("Configured", key),
+            Self::Generated(key) => ("Generated", key),
+            Self::Ephemeral(key) => ("Ephemeral", key),
+        };
+        f.debug_struct("EndpointIdentity")
+            .field("variant", &variant)
+            .field("key", &redacted(&Some(key.clone())))
+            .finish()
+    }
 }
 
 impl EndpointIdentity {
@@ -4156,6 +4179,46 @@ secret = "CLIENTSECRET"
             "an ephemeral key is still a full ed25519 key"
         );
         public_key(identity.key());
+    }
+
+    /// `EndpointIdentity` must not print its key.
+    ///
+    /// Every variant of it *is* the ed25519 private key, and this enum reaches
+    /// a `{:?}` on the failure path of this very module, where the message goes
+    /// to CI and stays there. A derived `Debug` — the obvious way to write this
+    /// type — would put a live key on that line while the suite still reported
+    /// green.
+    ///
+    /// Pinned rather than left to review because the mistake is invisible in the
+    /// diff that adds the enum: nothing about `#[derive(Debug)]` looks wrong
+    /// until you know what the type holds.
+    #[test]
+    fn an_identity_never_prints_its_key() {
+        for identity in [
+            EndpointIdentity::Configured(generate_secret_key_hex()),
+            EndpointIdentity::Generated(generate_secret_key_hex()),
+            EndpointIdentity::Ephemeral(generate_secret_key_hex()),
+        ] {
+            let rendered = format!("{identity:?}");
+            assert!(
+                !rendered.contains(identity.key()),
+                "{rendered} leaked the private key"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "{rendered} should say the key was withheld"
+            );
+        }
+    }
+
+    /// The variant survives redaction: it is the one thing a reader of that log
+    /// line needs — which of the three paths produced this identity.
+    #[test]
+    fn an_identity_still_says_which_path_it_came_from() {
+        let rendered = |identity: EndpointIdentity| format!("{identity:?}");
+        assert!(rendered(EndpointIdentity::Configured(String::new())).contains("Configured"));
+        assert!(rendered(EndpointIdentity::Generated(String::new())).contains("Generated"));
+        assert!(rendered(EndpointIdentity::Ephemeral(String::new())).contains("Ephemeral"));
     }
 
     /// The generated key is a private key, so the file it lands in must be

@@ -149,10 +149,14 @@ fn a_first_start_writes_the_key_and_binds_the_node_id_to_it() {
     let _ = child.wait();
 
     let key = configured_secret_key(&path).expect("the first start wrote a key");
+    // The length, never the value: CI keeps a failed test's output, and this is
+    // the endpoint's real private key. `{key:?}` here would put it in the build
+    // log of every run that ever trips this assertion.
     assert_eq!(
         key.len(),
         64,
-        "an ed25519 key is 32 bytes of hex, got {key:?}"
+        "an ed25519 key is 32 bytes of hex, got {} characters",
+        key.len()
     );
 
     // The key the file now holds is the one the Node ID came from.
