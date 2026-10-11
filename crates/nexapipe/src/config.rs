@@ -886,10 +886,20 @@ const FIRST_RUN_CONFIG: &str = include_str!("../templates/first-run-config.toml"
 /// looks deliberate. So the read still happens in [`ProxyConfig::from_file`],
 /// and its error still reaches the operator.
 ///
-/// Under the config lock, because the check-then-write is two steps: two servers
-/// started at once would otherwise both see no file and both write, and the
-/// slower one's rename would drop the first one's config on the floor. The lock
-/// is the same one every other writer of this file takes.
+/// The create is atomic via `OpenOptions::create_new(true)` (the "create and
+/// must-not-exist" check is a single syscall). That matters because the check
+/// above and the write below are two steps: an external writer that does not
+/// take the config lock — an operator saving in their editor, a sibling tool
+/// — could otherwise slip a file in between, and `write_config_file` would
+/// rename its temp file over that destination, discarding the operator's
+/// routes and credentials. `create_new` makes the second step safe by failing
+/// rather than overwriting.
+///
+/// Under the config lock, on principle: the lock no longer *needs* to be
+/// taken, because `create_new` is already atomic. Kept for symmetry with the
+/// rest of the config writers — it serialises a `ensure_config_file` call
+/// with an in-progress 2FA writeback so the new template never lands between
+/// the 2FA reader and the 2FA writer.
 ///
 /// Not for every command. `status` reads the config of a process that is
 /// already running and `--generate-2fa` works without one, so neither should
@@ -900,13 +910,30 @@ pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
     }
 
     with_config_lock(path, || {
-        // Re-checked inside the lock: the check above is the fast path, and this
-        // is the one that decides whether anything is written.
-        if Path::new(path).exists() {
-            return Ok(false);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        write_config_file(path, FIRST_RUN_CONFIG)?;
-        Ok(true)
+
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(FIRST_RUN_CONFIG.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path))?;
+                file.sync_all()
+                    .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", path))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A non-locking writer (operator with an editor, a sibling
+                // tool) created the file between our existence check and
+                // our create. Preserve whatever they wrote.
+                Ok(false)
+            }
+            Err(e) => Err(anyhow::anyhow!("cannot create {}: {e}", path)),
+        }
     })
 }
 

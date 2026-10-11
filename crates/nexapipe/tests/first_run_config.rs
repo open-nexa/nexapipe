@@ -19,6 +19,10 @@ use nexapipe::config::ProxyConfig;
 /// How long a start gets to write the config and print its Node ID.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long a server started against a broken config gets to refuse to start
+/// before the test gives up and kills it.
+const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+
 /// An empty directory: the state of a host where nobody has run the server yet.
 fn empty_dir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -32,9 +36,13 @@ fn empty_dir() -> (tempfile::TempDir, PathBuf) {
 ///
 /// Reading stdout while the process runs is what makes this work at all: the
 /// server does not exit, so `wait_with_output` would block forever on a process
-/// behaving exactly as it should. The child is killed before this returns —
-/// including on the timeout path, where an assertion fires — so a failing test
-/// does not leave a server bound to a port.
+/// behaving exactly as it should. The deadline bounds the whole wait, not just
+/// the iterations — `read_line` blocks until data, EOF, or error, so a child
+/// that is alive but stops producing output would otherwise hang the test
+/// past `STARTUP_DEADLINE`, because the deadline check below the read never
+/// runs. Reading on a separate thread and `recv_timeout`-ing from here closes
+/// that gap; the child is killed on timeout, the test process exiting will
+/// reap anything else.
 fn start_until_node_id(config: &Path) -> (String, Child) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
         .args(["--config", config.to_str().expect("utf-8 path")])
@@ -44,20 +52,40 @@ fn start_until_node_id(config: &Path) -> (String, Child) {
         .spawn()
         .expect("spawn nexapipe");
     let stdout = child.stdout.take().expect("stdout is piped");
-    let mut stdout = std::io::BufReader::new(stdout);
+
+    // The reader thread owns the pipe and exits when stdout EOFs (the child
+    // closing it on exit, or a kill closing it for us). The main thread does
+    // not touch the pipe at all, so its `recv_timeout` is the only thing that
+    // can fire while the child is alive-but-quiet.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let is_node_id = line
+                        .trim()
+                        .starts_with("Node ID (stable, for server_node_id):");
+                    // Send even if the receiver has gone — the test moved on.
+                    let _ = tx.send(line.clone());
+                    if is_node_id {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 
     let deadline = Instant::now() + STARTUP_DEADLINE;
     let mut collected = String::new();
-    let mut line = String::new();
     let node_id = loop {
-        line.clear();
-        match std::io::BufRead::read_line(&mut stdout, &mut line) {
-            Ok(0) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("nexapipe exited before printing a Node ID:\n{collected}");
-            }
-            Ok(_) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
                 collected.push_str(&line);
                 if let Some(rest) = line
                     .trim()
@@ -66,24 +94,71 @@ fn start_until_node_id(config: &Path) -> (String, Child) {
                     break rest.trim().to_string();
                 }
             }
-            Err(e) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("reading nexapipe's stdout failed: {e}");
+                panic!(
+                    "nexapipe printed no Node ID within {}s.\nCaptured so far:\n{collected}",
+                    STARTUP_DEADLINE.as_secs()
+                );
             }
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "nexapipe printed no Node ID within {}s.\nCaptured so far:\n{collected}",
-                STARTUP_DEADLINE.as_secs()
-            );
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("nexapipe closed stdout before printing a Node ID:\n{collected}");
+            }
         }
     };
 
     (node_id, child)
+}
+
+/// Run `child` to completion, or kill it after `timeout`. Stdout and stderr are
+/// drained on background threads so the child cannot block on a full pipe
+/// before the deadline, and the captured bytes are returned alongside the
+/// exit status.
+///
+/// `wait_with_output` is what the broken-config test used, and it blocks until
+/// the child exits. A regression that turned a refused-to-start server into a
+/// persistent one would hang the test forever — the deadline is what turns
+/// that hang into a clear failure with the captured output.
+fn wait_with_output_and_deadline(
+    mut child: Child,
+    timeout: Duration,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break child.wait().expect("wait after kill");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    (status, stdout, stderr)
 }
 
 /// A missing config is written, and the server it describes actually starts.
@@ -218,24 +293,23 @@ fn a_broken_config_is_not_replaced_by_a_generated_one() {
     let broken = "[auth\nenabled = true\n";
     fs::write(&path, broken).expect("write config");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+    let child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
         .args(["--config", path.to_str().expect("utf-8 path")])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn nexapipe")
-        .wait_with_output()
-        .expect("nexapipe refuses to start, so it exits");
+        .expect("spawn nexapipe");
 
+    let (status, stdout, stderr) = wait_with_output_and_deadline(child, EXIT_DEADLINE);
     let text = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     );
 
     assert!(
-        !output.status.success(),
+        !status.success(),
         "a config that cannot be parsed must not start:\n{text}"
     );
     assert_eq!(
