@@ -9,6 +9,10 @@ use iroh::endpoint::presets;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
 use jni::{Env, EnvUnowned, Outcome};
+// Only `native_init` reads the Android context, and only on Android. Gated to
+// match: an ungated import is an unused-import warning on every other `jni`
+// build, which is what the release archives are.
+#[cfg(target_os = "android")]
 use ndk_context;
 use once_cell::sync::{Lazy, OnceCell};
 use std::collections::HashMap;
@@ -2596,6 +2600,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(
     }
 }
 
+/// The same gate as the entry point above, and it has to be repeated rather
+/// than inherited: `cfg` does not propagate into a function body, so a free
+/// function that reads `ProxyState::tun_proxy` needs its own. Without it this
+/// still compiles for every `jni` build that is not an Android one — which is
+/// exactly what the release archives build (`--features jni,local-proxy` on
+/// eight non-Android targets), and the combination no CI job compiles.
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
 fn stop_tun_proxy() -> jint {
     jni_log!("[DEBUG:jni] nativeStopTunProxy called");
 
