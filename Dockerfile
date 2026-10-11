@@ -29,6 +29,10 @@ RUN mkdir -p /app/logs
 # Where docker-compose mounts the config directory.
 RUN mkdir -p /app/config
 
+# Where docker-compose mounts the secrets directory holding the endpoint
+# identity (NEXAPIPE_IROH_SECRET_KEY_FILE points [iroh] at /app/secrets/iroh.key).
+RUN mkdir -p /app/secrets
+
 COPY --from=builder /app/target/release/nexapipe /usr/local/bin/nexapipe
 
 # iroh carries every authenticated client, so nothing has to be published for

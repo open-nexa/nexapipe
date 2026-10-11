@@ -29,6 +29,15 @@ services:
       # (`failed_attempts`, `locked_until`, `last_used`) back into this file, so
       # a `:ro` mount costs a lockout its persistence and an error per attempt.
       - ./config:/app/config
+      # The endpoint identity lives here, not in config.toml: the env var below
+      # points `secret_key_file` at `/app/secrets/iroh.key`, and the first start
+      # generates the key into it (mode 0600). That keeps the credential out of
+      # the file operators edit, copy and back up, and out of the config mount
+      # entirely. Create it first: `mkdir -p secrets`. Back the directory up
+      # with the config — losing it means a new Node ID on the next start, and
+      # clients that stored the old one stop finding the server. Do not commit
+      # it.
+      - ./secrets:/app/secrets
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
       - ./logs:/app/logs
@@ -36,6 +45,12 @@ services:
       # Directory inside the container that receives the log files. Overrides
       # [log] dir so the files always land in the mounted volume.
       - NEXAPIPE_LOG_DIR=/app/logs
+      # The endpoint identity as a file path, read by [iroh] alongside
+      # NEXAPIPE_IROH_SECRET_KEY and the config's own `secret_key` /
+      # `secret_key_file` keys — naming the key by more than one of them is
+      # refused, so leave those unset while this is set. A missing file is
+      # generated here on first start; see the ./secrets mount above.
+      - NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/iroh.key
       # Where the binary looks for the config by default. The bind mount above
       # puts `config.toml` at `/app/config/config.toml` inside the container;
       # setting this means `nexapipe` (no --config) picks it up. --config still

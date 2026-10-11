@@ -2376,6 +2376,17 @@ pub fn generate_secret_key_hex() -> String {
 /// how an endpoint ends up on a Node ID nobody expected.
 const IROH_SECRET_KEY_ENV: &str = "NEXAPIPE_IROH_SECRET_KEY";
 
+/// The environment variable carrying the *path* of the file holding
+/// `[iroh] secret_key`.
+///
+/// The file-pointing twin of [`IROH_SECRET_KEY_ENV`], for a deployment (the
+/// docker compose setup is one) that keeps the key in a file of its own
+/// choosing — a mounted secrets directory — rather than next to the config.
+/// Unlike a relative `secret_key_file` in the config, this path is taken
+/// literally (anchored on the working directory if relative), because
+/// environment wiring speaks in process paths, not config-relative ones.
+const IROH_SECRET_KEY_FILE_ENV: &str = "NEXAPIPE_IROH_SECRET_KEY_FILE";
+
 /// The environment variable carrying `[iroh] relay_auth_token` directly.
 const RELAY_AUTH_TOKEN_ENV: &str = "NEXAPIPE_RELAY_AUTH_TOKEN";
 
@@ -2396,11 +2407,8 @@ fn credential_env(name: &str) -> Option<String> {
 /// behaviour turning on which of the two the operator last touched — for the
 /// endpoint key that is a Node ID rotating underneath every client that stored
 /// it — so a config that says two things is refused instead of adjudicated.
-fn refuse_ambiguous_credential_sources(
-    what: &str,
-    sources: [Option<&str>; 3],
-) -> anyhow::Result<()> {
-    let named: Vec<&str> = sources.into_iter().flatten().collect();
+fn refuse_ambiguous_credential_sources(what: &str, sources: &[Option<&str>]) -> anyhow::Result<()> {
+    let named: Vec<&str> = sources.iter().flatten().copied().collect();
     if named.len() > 1 {
         anyhow::bail!(
             "[iroh] {what} is named by {} — one credential, one source; keep exactly one of them",
@@ -2408,6 +2416,22 @@ fn refuse_ambiguous_credential_sources(
         );
     }
     Ok(())
+}
+
+/// Turns an environment-named file path into an absolute one.
+///
+/// A config `secret_key_file` is read against the config's directory (see
+/// [`credential_file_path`]); an environment path is deployment wiring, so it
+/// is taken literally and only a relative one gets anchored, on the process's
+/// working directory.
+fn absolute_env_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 /// The path a `*_file` key names, relative paths against the config file's
@@ -2453,17 +2477,22 @@ fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String
     Ok(Some(content.to_string()))
 }
 
-/// Resolves `[iroh] secret_key` from its candidate sources: the environment,
-/// then the file `secret_key_file` names, then the literal.
+/// Resolves `[iroh] secret_key` from its candidate sources: the environment
+/// value, the environment-named file, the file `secret_key_file` names, then
+/// the literal.
 ///
-/// `env_raw` is passed in rather than read here so the ranking is testable
-/// without touching process state; the caller hands it over from
-/// [`credential_env`]. `Ok(None)` means nothing names a key — including a
-/// `secret_key_file` whose file does not exist yet, which is the first-start
-/// case [`ProxyConfig::ensure_iroh_secret_key`] generates into.
+/// `env_raw` and `env_file` are passed in rather than read here so the ranking
+/// is testable without touching process state; the caller hands them over from
+/// [`credential_env`], with `env_file` already made absolute by
+/// [`absolute_env_path`]. `Ok(None)` means nothing named a key — including a
+/// pointed-to file that does not exist yet, which is the first-start case
+/// [`ProxyConfig::ensure_iroh_secret_key`] generates into. The caller folds an
+/// environment-named missing path onto the `secret_key_file` field so the
+/// generation lands in the file the environment named, not back in the config.
 fn resolve_secret_key_source(
     config_dir: Option<&Path>,
     env_raw: Option<String>,
+    env_file: Option<&Path>,
     iroh: &IrohConfig,
 ) -> anyhow::Result<Option<(String, CredentialSource)>> {
     // A trailing newline from `printf`, or a compose file that lists the
@@ -2476,8 +2505,9 @@ fn resolve_secret_key_source(
 
     refuse_ambiguous_credential_sources(
         "secret_key",
-        [
+        &[
             env.map(|_| IROH_SECRET_KEY_ENV),
+            env_file.map(|_| IROH_SECRET_KEY_FILE_ENV),
             iroh.secret_key_file.as_deref().map(|_| "secret_key_file"),
             iroh.secret_key.as_deref().map(|_| "secret_key"),
         ],
@@ -2486,8 +2516,13 @@ fn resolve_secret_key_source(
     if let Some(key) = env {
         return Ok(Some((key.to_string(), CredentialSource::Env)));
     }
-    if let Some(file) = &iroh.secret_key_file {
-        let full = credential_file_path(config_dir, file);
+    // An environment-named file outranks the config's pointer: both are files,
+    // but deployment wiring wins over what the file on disk says.
+    if let Some(full) = env_file.map(Path::to_path_buf).or_else(|| {
+        iroh.secret_key_file
+            .as_ref()
+            .map(|file| credential_file_path(config_dir, file))
+    }) {
         return match read_credential_file(&full, "secret_key")? {
             Some(key) => Ok(Some((key, CredentialSource::File))),
             None => Ok(None),
@@ -2519,7 +2554,7 @@ fn resolve_relay_auth_token_source(
 
     refuse_ambiguous_credential_sources(
         "relay_auth_token",
-        [
+        &[
             env.map(|_| RELAY_AUTH_TOKEN_ENV),
             iroh.relay_auth_token_file
                 .as_deref()
@@ -2564,11 +2599,32 @@ impl ProxyConfig {
             return Ok(());
         };
 
-        if let Some((key, source)) =
-            resolve_secret_key_source(config_dir, credential_env(IROH_SECRET_KEY_ENV), iroh)?
-        {
-            iroh.secret_key = Some(key);
-            iroh.secret_key_source = source;
+        // Blank means unset, the same rule the value env vars get; made
+        // absolute here because environment paths are not config-relative.
+        let env_key_file = credential_env(IROH_SECRET_KEY_FILE_ENV)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| absolute_env_path(Path::new(&value)));
+
+        match resolve_secret_key_source(
+            config_dir,
+            credential_env(IROH_SECRET_KEY_ENV),
+            env_key_file.as_deref(),
+            iroh,
+        )? {
+            Some((key, source)) => {
+                iroh.secret_key = Some(key);
+                iroh.secret_key_source = source;
+            }
+            None => {
+                // Nothing resolved. If the environment named a file that does
+                // not exist yet, fold its path onto the pointer field: the
+                // first-start generation in ensure_iroh_secret_key then writes
+                // the key there rather than inline back into this config.
+                if let Some(env_file) = env_key_file {
+                    iroh.secret_key_file = Some(env_file.to_string_lossy().into_owned());
+                }
+            }
         }
         if let Some((token, source)) =
             resolve_relay_auth_token_source(config_dir, credential_env(RELAY_AUTH_TOKEN_ENV), iroh)?
@@ -3848,7 +3904,7 @@ pending_enrollment = "TOKEN"
         // parser silently drops.
         let iroh: IrohConfig = toml::from_str("secret_key = \"00\"\n").expect("parse");
 
-        let err = resolve_secret_key_source(None, Some("env-key".to_string()), &iroh)
+        let err = resolve_secret_key_source(None, Some("env-key".to_string()), None, &iroh)
             .expect_err("a credential named twice is refused");
         assert!(
             err.to_string().contains(IROH_SECRET_KEY_ENV),
@@ -3862,9 +3918,10 @@ pending_enrollment = "TOKEN"
     fn an_env_key_resolves_as_env() {
         let iroh: IrohConfig = toml::from_str("").expect("parse");
 
-        let (key, source) = resolve_secret_key_source(None, Some("  abc  ".to_string()), &iroh)
-            .expect("one source resolves")
-            .expect("the environment names a key");
+        let (key, source) =
+            resolve_secret_key_source(None, Some("  abc  ".to_string()), None, &iroh)
+                .expect("one source resolves")
+                .expect("the environment names a key");
         assert_eq!(key, "abc");
         assert_eq!(source, CredentialSource::Env);
     }
@@ -3876,11 +3933,81 @@ pending_enrollment = "TOKEN"
     fn an_empty_env_value_names_nothing() {
         let iroh: IrohConfig = toml::from_str("secret_key = \"00\"\n").expect("parse");
 
-        let (key, source) = resolve_secret_key_source(None, Some("   ".to_string()), &iroh)
+        let (key, source) = resolve_secret_key_source(None, Some("   ".to_string()), None, &iroh)
             .expect("a blank env value is not a source")
             .expect("the inline literal is the only source left");
         assert_eq!(key, "00");
         assert_eq!(source, CredentialSource::Inline);
+    }
+
+    /// An environment-named file path is a file source, taken literally even
+    /// when it is not next to the config.
+    #[test]
+    fn an_env_named_key_file_resolves_as_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_path = dir.path().join("elsewhere").join("iroh.key");
+        fs::create_dir_all(key_path.parent().expect("parent")).expect("mkdir");
+        let key = generate_secret_key_hex();
+        fs::write(&key_path, &key).expect("write the key file");
+        chmod_owner_only(&key_path);
+        let iroh: IrohConfig = toml::from_str("").expect("parse");
+
+        let (resolved, source) =
+            resolve_secret_key_source(Some(dir.path()), None, Some(&key_path), &iroh)
+                .expect("the env-named file resolves")
+                .expect("it names a key");
+        assert_eq!(resolved, key);
+        assert_eq!(source, CredentialSource::File);
+    }
+
+    /// The two environment variables naming the same key two ways are refused,
+    /// not ranked.
+    #[test]
+    fn an_env_value_and_an_env_file_refuse() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_path = dir.path().join("iroh.key");
+        fs::write(&key_path, generate_secret_key_hex()).expect("write the key file");
+        chmod_owner_only(&key_path);
+        let iroh: IrohConfig = toml::from_str("").expect("parse");
+
+        let err =
+            resolve_secret_key_source(None, Some("env-key".to_string()), Some(&key_path), &iroh)
+                .expect_err("two environment answers are refused");
+        let text = err.to_string();
+        assert!(text.contains(IROH_SECRET_KEY_ENV), "{text}");
+        assert!(text.contains(IROH_SECRET_KEY_FILE_ENV), "{text}");
+    }
+
+    /// The environment file outranks nothing when the config also points at a
+    /// file: refused, same one-source rule.
+    #[test]
+    fn an_env_file_and_a_config_pointer_refuse() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let env_path = dir.path().join("env.key");
+        fs::write(&env_path, generate_secret_key_hex()).expect("write env key");
+        chmod_owner_only(&env_path);
+        let cfg_path = dir.path().join("cfg.key");
+        fs::write(&cfg_path, generate_secret_key_hex()).expect("write config key");
+        chmod_owner_only(&cfg_path);
+        let iroh: IrohConfig = toml::from_str("secret_key_file = \"cfg.key\"\n").expect("parse");
+
+        let err = resolve_secret_key_source(Some(dir.path()), None, Some(&env_path), &iroh)
+            .expect_err("a pointer in the env and one in the config are refused");
+        assert!(err.to_string().contains("secret_key_file"), "{err}");
+    }
+
+    /// An environment-named file that does not exist yet defers to first-start
+    /// generation rather than failing — the caller folds the path onto the
+    /// pointer field so the key is generated where the env says.
+    #[test]
+    fn a_missing_env_named_file_defers_to_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_path = dir.path().join("secrets").join("iroh.key");
+        let iroh: IrohConfig = toml::from_str("").expect("parse");
+
+        let resolved = resolve_secret_key_source(None, None, Some(&key_path), &iroh)
+            .expect("a missing pointed-to file is not an error");
+        assert!(resolved.is_none(), "nothing is resolved until generation");
     }
 
     /// A relay token file resolves like a key file, trimmed.

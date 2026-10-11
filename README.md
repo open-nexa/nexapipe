@@ -208,6 +208,16 @@ Two things are worth knowing about that:
   `NEXAPIPE_NO_PERSIST_IDENTITY=1` to ask for that deliberately and leave the
   file alone.
 
+**The key can live outside config.toml entirely.** Point `[iroh]
+secret_key_file` at a file holding just the hex key — a missing file is
+generated into on first start (`0600` on Unix) — or keep it out of every file
+with the environment: `NEXAPIPE_IROH_SECRET_KEY` carries the key itself,
+`NEXAPIPE_IROH_SECRET_KEY_FILE` a path to a file that does (generated into the
+same way when missing). A config whose key comes from outside holds no
+credential, so it does not have to be private. Naming the key by more than one
+source — a value and a path, the environment and the config, either and
+`secret_key` — refuses the start rather than picking silently.
+
 ```bash
 cargo run -p nexapipe -- --generate-secret   # only to move an identity between hosts
 ```
@@ -215,13 +225,20 @@ cargo run -p nexapipe -- --generate-secret   # only to move an identity between 
 ### Docker
 
 ```bash
-mkdir -p config && cp config.toml.example config/config.toml   # config.toml is gitignored
+mkdir -p config secrets
+cp config.toml.example config/config.toml   # config.toml is gitignored
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
 `docker-compose.yaml` mounts a `config/` directory — the one holding your
-`config.toml` — and a `logs/` volume, and points `NEXAPIPE_LOG_DIR` at it.
+`config.toml` — a `secrets/` directory for the endpoint identity, and a `logs/`
+volume, and points `NEXAPIPE_LOG_DIR` at the logs volume. The `secrets/` mount
+goes with `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/iroh.key`: the endpoint
+key is generated into that file on the first start (`0600`), so `config.toml`
+itself holds no private key. Back `secrets/` up with `config/` — losing it
+means a new Node ID on the next start, and clients that stored the old one stop
+finding the server.
 It also sets `NEXAPIPE_CONFIG_DIR=/app/config`, so the binary inside the
 container picks up `/app/config/config.toml` by default — the same file the
 host sees at `config/config.toml`. `--config` still wins, so an operator can

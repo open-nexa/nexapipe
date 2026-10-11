@@ -61,6 +61,22 @@ differently without being configured to:
 
 ### Added
 
+- **The endpoint identity can come out of the config directory entirely.**
+  `NEXAPIPE_IROH_SECRET_KEY_FILE` names, by *path*, the file holding the
+  `[iroh]` secret key — the file-pointing sibling of
+  `NEXAPIPE_IROH_SECRET_KEY`, which carries the key value itself. A missing
+  env-named file is generated into on first start (`0600` on Unix), and the
+  key is never written back into `config.toml`, so the config holds no
+  credential and does not have to be private. The env path is deployment
+  wiring: it is taken literally rather than read against the config's
+  directory (that reading stays with the existing `secret_key_file` key).
+  Naming the key by more than one source — value and path, env and config,
+  either and `secret_key` — refuses the start, the same one-credential,
+  one-source rule every other pair follows. The docker compose setup wires
+  the variable at `/app/secrets/iroh.key` over a new `./secrets` mount, so
+  the identity lives next to the config instead of inside it; back the
+  directory up with `config/`.
+
 - **A first start with no `config.toml` writes one for you.** Server mode
   only, and only when the file is missing — an existing file is never
   regenerated, and one that exists but does not parse still fails the
