@@ -3998,9 +3998,14 @@ secret = "CLIENTSECRET"
     /// A key that is already configured is used as it stands. Writing a fresh
     /// one here would rotate the endpoint's identity on every restart, which is
     /// the exact failure this whole mechanism exists to remove.
+    ///
+    /// The key is generated rather than written out as a literal. A hardcoded
+    /// hex string sitting under a `secret_key` key is what a credential scanner
+    /// is built to catch, and it is right to: once such a line is in the history
+    /// nobody reviewing a diff can tell a fixture from a real key any more.
     #[test]
     fn a_configured_key_is_left_alone() {
-        let key = hex::encode([7u8; 32]);
+        let key = generate_secret_key_hex();
         let (_dir, path) = scratch_config(&format!("[iroh]\nsecret_key = \"{key}\"\n"));
 
         let identity =
