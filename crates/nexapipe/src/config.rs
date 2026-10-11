@@ -2027,8 +2027,12 @@ impl EndpointIdentity {
     }
 }
 
-/// Set to `1`, `true` or an empty value to keep `[iroh] secret_key` out of the
-/// config file.
+/// Set to any value other than empty, `0` or `false` (for example `1`) to keep
+/// `[iroh] secret_key` out of the config file.
+///
+/// Empty does **not** disable persistence: a compose file that lists a variable
+/// without a value (`- NEXAPIPE_NO_PERSIST_IDENTITY`) is asking for the default,
+/// not for the behaviour. `persistence_disabled` is where that rule lives.
 ///
 /// The one deployment this exists for: a throwaway container or a test harness
 /// that wants a clean identity on every run, and would rather not have the file
