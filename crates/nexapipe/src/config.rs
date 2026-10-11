@@ -76,7 +76,11 @@ pub struct MetricsConfig {
     pub enabled: bool,
 }
 
-#[derive(Deserialize, Clone)]
+/// `Default` because the startup path builds one from scratch when a config
+/// has no `[iroh]` section at all but still needs somewhere to put the secret
+/// key it just generated. Every field is optional, so "all of them absent" is
+/// exactly what an empty `[iroh]` means.
+#[derive(Deserialize, Clone, Default)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
@@ -100,8 +104,14 @@ pub struct IrohConfig {
     /// nothing to keep the two families on the same one.
     pub bind_ipv6: Option<bool>,
     /// Secret key for stable endpoint identity.
-    /// If provided, the endpoint will have the same Node ID across restarts.
-    /// Can be generated using `nexapipe --generate-secret` command.
+    ///
+    /// Optional in the config because the server generates one on first start
+    /// when this is absent, and writes it here — so a config that never
+    /// mentions it still ends up with a Node ID that survives a restart. Set it
+    /// by hand only to move an identity between hosts, or to keep one when the
+    /// file is not writable (see `NEXAPIPE_NO_PERSIST_IDENTITY`).
+    ///
+    /// A value that is present but does not parse refuses the start.
     pub secret_key: Option<String>,
 }
 
@@ -665,6 +675,15 @@ impl ProxyConfig {
         Timeouts::resolve(self.timeouts)
     }
 
+    /// Whether the config file this was read from holds a credential.
+    ///
+    /// Asked about the *file*, not about what the process is running with: the
+    /// permission check it feeds is "can another account on this host read the
+    /// secrets in that file". So a key generated at startup and never written —
+    /// because the config was read-only, or because
+    /// `NEXAPIPE_NO_PERSIST_IDENTITY` said not to — must not make this true.
+    /// Folding an ephemeral identity in here would make exactly the deployments
+    /// that need one refuse to start over a key that is not on disk.
     pub fn holds_credentials(&self) -> bool {
         self.iroh
             .as_ref()
@@ -1981,6 +2000,222 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// What [`ProxyConfig::ensure_iroh_secret_key`] resolved the endpoint's
+/// identity to.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EndpointIdentity {
+    /// `[iroh] secret_key` was already set and parses. Nothing was written.
+    Configured(String),
+    /// No `secret_key` was configured and one was generated and written to the
+    /// config file. The Node ID is stable from this restart on.
+    Generated(String),
+    /// No `secret_key` was configured, and persisting one was either turned off
+    /// by `NEXAPIPE_NO_PERSIST_IDENTITY` or not possible (a read-only mount, a
+    /// config owned by another user). The server runs on the returned key, and
+    /// the Node ID will be different after the next restart.
+    Ephemeral(String),
+}
+
+/// Handwritten, and never `derive(Debug)`, for the reason
+/// [`IrohConfig`]'s is: every variant here *is* the ed25519 private key.
+///
+/// The derive is a loaded gun. This enum reaches a `{:?}` on the failure path
+/// of a test, where CI collects the output and keeps it — and a real key
+/// printed there is the endpoint's identity in a log anyone with read access to
+/// the build can lift. A failure would hand over exactly the thing the caller
+/// was told is private. The variant is enough to debug with: which of the three
+/// paths produced this is the question a reader actually has.
+impl std::fmt::Debug for EndpointIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (variant, key) = match self {
+            Self::Configured(key) => ("Configured", key),
+            Self::Generated(key) => ("Generated", key),
+            Self::Ephemeral(key) => ("Ephemeral", key),
+        };
+        f.debug_struct("EndpointIdentity")
+            .field("variant", &variant)
+            .field("key", &redacted(&Some(key.clone())))
+            .finish()
+    }
+}
+
+impl EndpointIdentity {
+    /// The hex key the endpoint should run on, whichever way it was arrived at.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Configured(key) | Self::Generated(key) | Self::Ephemeral(key) => key,
+        }
+    }
+}
+
+/// Set to any value other than empty, `0` or `false` (for example `1`) to keep
+/// `[iroh] secret_key` out of the config file.
+///
+/// Empty does **not** disable persistence: a compose file that lists a variable
+/// without a value (`- NEXAPIPE_NO_PERSIST_IDENTITY`) is asking for the default,
+/// not for the behaviour. `persistence_disabled` is where that rule lives.
+///
+/// The one deployment this exists for: a throwaway container or a test harness
+/// that wants a clean identity on every run, and would rather not have the file
+/// silently gain a private key. Everywhere else it is the wrong setting — the
+/// Node ID changing on every restart is what makes clients lose track of the
+/// server.
+const NO_PERSIST_ENV: &str = "NEXAPIPE_NO_PERSIST_IDENTITY";
+
+/// Whether the operator asked for the identity *not* to be written to disk.
+///
+/// Read from the environment rather than from the config on purpose: the
+/// decision is about whether this process may touch that file, so it has to be
+/// answerable when the file cannot be read at all, and an env var is what a
+/// systemd unit or a compose file can set without editing a config the server
+/// may not even have permission to write.
+fn persist_identity_disabled() -> bool {
+    persistence_disabled(std::env::var(NO_PERSIST_ENV).ok().as_deref())
+}
+
+/// The rule [`persist_identity_disabled`] applies, as a function of the value.
+///
+/// `unset`, empty and `0` all mean "no": a compose file that lists a variable
+/// without a value (`- NEXAPIPE_NO_PERSIST_IDENTITY`) is asking for the default,
+/// not for the behaviour being switched on. Everything else means yes, so an
+/// operator who writes `NEXAPIPE_NO_PERSIST_IDENTITY=yes` gets what they meant.
+///
+/// Split out from the `env::var` call because `set_var` is `unsafe` in Rust
+/// 2024 and the parsing is the part worth testing.
+fn persistence_disabled(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// Resolves the endpoint's identity for this run, generating and persisting
+    /// one when the config has none.
+    ///
+    /// Refuses a `secret_key` that does not parse. The old behaviour was a
+    /// warning and a throwaway key, which left the endpoint on a different
+    /// Node ID after every restart while looking like a config problem rather
+    /// than one — a typo is a typo, and the fix is to delete the line (which
+    /// brings this function back) or paste a real `--generate-secret` output.
+    ///
+    /// A write that fails is *not* fatal. A config on a read-only mount, or one
+    /// the server's user cannot write, is a normal deployment: refusing to
+    /// start there would be strictly worse than the fresh-Node-ID behaviour
+    /// this replaced. The key is generated either way, the warning says the
+    /// Node ID will not survive a restart, and the server comes up.
+    ///
+    /// Takes the already-parsed `config` rather than re-reading `path`: the
+    /// caller is about to run on exactly that value, and a second read could
+    /// disagree with it if the file changed in between.
+    pub fn ensure_iroh_secret_key(
+        path: &str,
+        config: &ProxyConfig,
+    ) -> anyhow::Result<EndpointIdentity> {
+        let configured = config
+            .iroh
+            .as_ref()
+            .and_then(|iroh| iroh.secret_key.clone());
+
+        if let Some(configured) = configured {
+            configured.parse::<iroh::SecretKey>().map_err(|e| {
+                anyhow::anyhow!(
+                    "[iroh] secret_key in {path} is not a valid key ({e}): the Node ID would \
+                     change on every restart and every client would lose the server. Delete the \
+                     line to have a working one generated, or run --generate-secret and paste its \
+                     output"
+                )
+            })?;
+            return Ok(EndpointIdentity::Configured(configured));
+        }
+
+        if persist_identity_disabled() {
+            tracing::warn!(
+                "{NO_PERSIST_ENV} is set: [iroh] secret_key is not written to {path}, so the Node \
+                 ID will be different after every restart"
+            );
+            return Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()));
+        }
+
+        match ProxyConfig::write_iroh_secret_key(path) {
+            Ok(hex) => {
+                tracing::info!(
+                    "Generated an endpoint identity and saved it to {path} as [iroh] secret_key; \
+                     the Node ID is now stable across restarts"
+                );
+                Ok(EndpointIdentity::Generated(hex))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not write an endpoint identity to {path} ({e:#}); starting on a \
+                     throwaway one, so the Node ID will be different after the next restart"
+                );
+                Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()))
+            }
+        }
+    }
+}
+
+/// A fresh ed25519 key as the hex `config.toml` stores it in.
+///
+/// Shared by `--generate-secret` and the startup path so both spell a key the
+/// same way: a hex string that round-trips through `SecretKey::from_str` is the
+/// only thing either of them promises.
+pub fn generate_secret_key_hex() -> String {
+    hex::encode(iroh::SecretKey::generate().to_bytes())
+}
+
+impl ProxyConfig {
+    /// Writes a freshly generated `secret_key` into `[iroh]` of the config file
+    /// at `path`, and returns the hex key now in it.
+    ///
+    /// The whole point of this function is that a Node ID nobody had to write
+    /// down is still stable: an operator who skipped `--generate-secret` used
+    /// to get a fresh one on every restart, and every client that had stored it
+    /// lost the server. Generating the key here rather than in the endpoint
+    /// builder is what makes it survive, because the builder's key is never
+    /// written anywhere.
+    ///
+    /// Only ever called when `[iroh] secret_key` is *absent*. A key that is
+    /// present but does not parse is refused at startup rather than replaced
+    /// here: it is a typo the operator has to see, and silently replacing it
+    /// would swap the endpoint's identity underneath whatever the typo was
+    /// supposed to be — including a key that was merely truncated past the
+    /// end of the line.
+    ///
+    /// Comments, key order and every other section survive: the document is
+    /// edited as TOML rather than re-serialized from a `ProxyConfig`, which
+    /// would drop the operator's prose along with the config.
+    pub fn write_iroh_secret_key(path: &str) -> anyhow::Result<String> {
+        with_config_lock(path, || Self::write_iroh_secret_key_unlocked(path))
+    }
+
+    fn write_iroh_secret_key_unlocked(path: &str) -> anyhow::Result<String> {
+        let key = iroh::SecretKey::generate();
+        let hex = hex::encode(key.to_bytes());
+
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let mut doc: toml_edit::DocumentMut = content.parse().map_err(|e| {
+            anyhow::anyhow!("{path} is not valid TOML, secret_key not written ({e})")
+        })?;
+
+        // `sub_table` rather than `entry("iroh")`: a config with no `[iroh]` at
+        // all should gain the one key, not a header and a key.
+        let iroh_table = sub_table(doc.as_table_mut(), "iroh", path).map_err(|_| {
+            anyhow::anyhow!("{path}: [iroh] is not a table, secret_key not written")
+        })?;
+        iroh_table.insert("secret_key", toml_edit::value(hex.as_str()));
+
+        write_config_file(path, &doc.to_string())?;
+
+        Ok(hex)
+    }
 }
 
 /// What [`ProxyConfig::write_client_secret`] did to the config file.
@@ -3682,5 +3917,331 @@ secret = "CLIENTSECRET"
         ))
         .expect_err("a name that ends its own log line must not load");
         assert!(err.to_string().contains("printable ASCII"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The endpoint identity
+    //
+    // The property being pinned throughout: a config that never mentions
+    // `[iroh] secret_key` comes out of the first start with a Node ID that is
+    // still the same one after the next. Everything else here is about not
+    // breaking the operator's file on the way there.
+    // -----------------------------------------------------------------------
+
+    /// A config with no `[iroh]` section at all gains one holding the key, and
+    /// nothing else. This is the three-line config the README's quick start
+    /// tells people to write, so it is the case that has to work.
+    #[test]
+    fn a_config_without_iroh_gains_the_key() {
+        let (_dir, path) = scratch_config(
+            "[[routes]]\n\
+             host_pattern = \"*\"\n\
+             backends = [\"http://127.0.0.1:18080\"]\n",
+        );
+
+        let identity =
+            ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+                .expect("the identity is resolved");
+
+        let EndpointIdentity::Generated(key) = identity else {
+            panic!("a missing key has to be generated and written");
+        };
+        key.parse::<iroh::SecretKey>()
+            .expect("the written key parses as an ed25519 secret key");
+
+        let config = parse(&fs::read_to_string(&path).expect("the config is still there"));
+        assert_eq!(
+            config.iroh.and_then(|iroh| iroh.secret_key).as_deref(),
+            Some(key.as_str()),
+            "the key has to be on disk, not only in memory"
+        );
+        // And the rest of the file is untouched.
+        assert!(
+            config
+                .routes
+                .expect("the routes survived")
+                .iter()
+                .any(|route| route.host_pattern == "*"),
+            "the generated key must not cost the operator their routes"
+        );
+    }
+
+    /// An `[iroh]` section that exists for other reasons keeps them. Losing
+    /// `relay_mode = "pinned"` because a key was written would silently change
+    /// which relays the endpoint uses.
+    #[test]
+    fn an_existing_iroh_section_keeps_its_other_keys() {
+        let (_dir, path) = scratch_config(
+            "[iroh]\n\
+             relay_mode = \"pinned\"\n\
+             bind_port = 41641\n",
+        );
+
+        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+            .expect("the identity is resolved");
+
+        let written = fs::read_to_string(&path).expect("the config is still there");
+        let config = parse(&written);
+        let iroh = config.iroh.expect("[iroh] survived");
+        assert_eq!(iroh.relay_mode.as_deref(), Some("pinned"));
+        assert_eq!(iroh.bind_port, Some(41641));
+        assert!(
+            iroh.secret_key.is_some(),
+            "the key belongs in the section that was already there"
+        );
+    }
+
+    /// The comments an operator wrote around the spot are the reason the file is
+    /// edited as TOML instead of re-serialized. `config.toml.example` is 368
+    /// lines of prose, and a first start that flattened it to three keys would
+    /// be a nasty surprise.
+    #[test]
+    fn the_comments_around_the_key_survive() {
+        let (_dir, path) = scratch_config(
+            "# My edge box in the shed.\n\
+             [iroh]\n\
+             # Turned on after the relay migration.\n\
+             relay_mode = \"pinned\"\n",
+        );
+
+        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+            .expect("the identity is resolved");
+
+        let written = fs::read_to_string(&path).expect("the config is still there");
+        assert!(
+            written.contains("# My edge box in the shed."),
+            "the header comment was lost:\n{written}"
+        );
+        assert!(
+            written.contains("# Turned on after the relay migration."),
+            "the comment on the key above was lost:\n{written}"
+        );
+    }
+
+    /// A key that is already configured is used as it stands. Writing a fresh
+    /// one here would rotate the endpoint's identity on every restart, which is
+    /// the exact failure this whole mechanism exists to remove.
+    ///
+    /// The key is generated rather than written out as a literal. A hardcoded
+    /// hex string sitting under a `secret_key` key is what a credential scanner
+    /// is built to catch, and it is right to: once such a line is in the history
+    /// nobody reviewing a diff can tell a fixture from a real key any more.
+    #[test]
+    fn a_configured_key_is_left_alone() {
+        let key = generate_secret_key_hex();
+        let (_dir, path) = scratch_config(&format!("[iroh]\nsecret_key = \"{key}\"\n"));
+
+        let identity =
+            ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+                .expect("the identity is resolved");
+
+        assert_eq!(identity, EndpointIdentity::Configured(key.clone()));
+        assert_eq!(
+            fs::read_to_string(&path).expect("the config is still there"),
+            format!("[iroh]\nsecret_key = \"{key}\"\n"),
+            "a configured key must not be rewritten"
+        );
+    }
+
+    /// A key that does not parse refuses the start. It used to be a warning and
+    /// a random key, which left the endpoint on a different Node ID after every
+    /// restart — every stored Node ID stale, and the log saying it had been
+    /// handled.
+    #[test]
+    fn an_unparseable_key_refuses_rather_than_rotating() {
+        let broken = "[iroh]\nsecret_key = \"not-a-key\"\n";
+        let (_dir, path) = scratch_config(broken);
+
+        let err = ProxyConfig::ensure_iroh_secret_key(&path, &parse(broken))
+            .expect_err("a key that does not parse must not be papered over");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("not a valid key"),
+            "the refusal names the problem: {message}"
+        );
+        assert!(
+            message.contains("every restart"),
+            "the refusal says what it would have cost: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("the config is still there"),
+            broken,
+            "the operator's typo has to survive so they can see it"
+        );
+    }
+
+    /// Two starts in a row have to land on the same Node ID. Without this the
+    /// mechanism could write a key on the first run and still let a later one
+    /// replace it, which is the bug in a slower form.
+    /// Two starts in a row land on the same key.
+    ///
+    /// The variants differ between the two calls — the first start generates, the
+    /// second finds what the first wrote — so this compares the keys themselves.
+    /// Asserting the variants would pin the wrong thing: what has to be stable is
+    /// the identity, not which branch produced it.
+    #[test]
+    fn the_node_id_survives_a_restart() {
+        let (_dir, path) = scratch_config("debug = true\n");
+
+        let first =
+            ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+                .expect("the first start resolves an identity");
+        let second =
+            ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+                .expect("the second start resolves an identity");
+
+        assert_eq!(
+            first.key(),
+            second.key(),
+            "the second start has to find the key the first one wrote"
+        );
+        assert_eq!(
+            public_key(first.key()),
+            public_key(second.key()),
+            "and therefore the same Node ID"
+        );
+    }
+
+    /// The public key of a hex secret key.
+    fn public_key(hex_key: &str) -> String {
+        iroh::SecretKey::from_bytes(
+            &hex::decode(hex_key)
+                .expect("the key is hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .public()
+        .to_string()
+    }
+
+    /// The env var that turns persistence off is read as an operator would expect.
+    ///
+    /// A compose file that lists a variable with no value (`- NEXAPIPE_NO_PERSIST_IDENTITY`)
+    /// is asking for the default, not for the behaviour — so empty means "no", like
+    /// unset. The end-to-end half of this (the server really does leave the file
+    /// alone) is in `tests/first_run_identity.rs`, which can set the variable on a
+    /// child process without `unsafe`.
+    #[test]
+    fn the_no_persist_flag_reads_the_way_it_looks() {
+        for off in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+        ] {
+            assert!(
+                !persistence_disabled(off),
+                "{off:?} has to mean persistence stays on"
+            );
+        }
+        for on in [Some("1"), Some("true"), Some("yes"), Some("anything else")] {
+            assert!(
+                persistence_disabled(on),
+                "{on:?} has to turn persistence off"
+            );
+        }
+    }
+
+    /// An unwritable config is an ordinary deployment (a read-only bind mount, a
+    /// A config that reads fine but cannot be written is an ordinary deployment (a
+    /// read-only bind mount, a file owned by another user), and it has to keep
+    /// working. The old code path here was "no key configured, random identity,
+    /// carry on"; refusing to start would make this change a regression for exactly
+    /// that case.
+    ///
+    /// Reachable portably by pointing at a file that is not TOML: the caller already
+    /// parsed a config (that is what `config` is), and the writer re-reads the
+    /// path, so the two can disagree — an operator saving over the file mid-start is
+    /// the realistic version of it.
+    #[test]
+    fn an_unwritable_config_still_resolves_an_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "this is not TOML at all: \"\n").expect("write a file that is not TOML");
+        let path = path.to_string_lossy().into_owned();
+
+        let identity = ProxyConfig::ensure_iroh_secret_key(&path, &parse("debug = true\n")).expect(
+            "a file the server cannot write must not stop it: the key is generated either way",
+        );
+
+        assert!(
+            matches!(identity, EndpointIdentity::Ephemeral(_)),
+            "a failed write has to degrade to a throwaway identity, got {identity:?}"
+        );
+        // Still a usable key, or the server would be refusing connections for a
+        // reason that has nothing to do with why the write failed.
+        assert_eq!(
+            identity.key().len(),
+            64,
+            "an ephemeral key is still a full ed25519 key"
+        );
+        public_key(identity.key());
+    }
+
+    /// `EndpointIdentity` must not print its key.
+    ///
+    /// Every variant of it *is* the ed25519 private key, and this enum reaches
+    /// a `{:?}` on the failure path of this very module, where the message goes
+    /// to CI and stays there. A derived `Debug` — the obvious way to write this
+    /// type — would put a live key on that line while the suite still reported
+    /// green.
+    ///
+    /// Pinned rather than left to review because the mistake is invisible in the
+    /// diff that adds the enum: nothing about `#[derive(Debug)]` looks wrong
+    /// until you know what the type holds.
+    #[test]
+    fn an_identity_never_prints_its_key() {
+        for identity in [
+            EndpointIdentity::Configured(generate_secret_key_hex()),
+            EndpointIdentity::Generated(generate_secret_key_hex()),
+            EndpointIdentity::Ephemeral(generate_secret_key_hex()),
+        ] {
+            let rendered = format!("{identity:?}");
+            assert!(
+                !rendered.contains(identity.key()),
+                "{rendered} leaked the private key"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "{rendered} should say the key was withheld"
+            );
+        }
+    }
+
+    /// The variant survives redaction: it is the one thing a reader of that log
+    /// line needs — which of the three paths produced this identity.
+    #[test]
+    fn an_identity_still_says_which_path_it_came_from() {
+        let rendered = |identity: EndpointIdentity| format!("{identity:?}");
+        assert!(rendered(EndpointIdentity::Configured(String::new())).contains("Configured"));
+        assert!(rendered(EndpointIdentity::Generated(String::new())).contains("Generated"));
+        assert!(rendered(EndpointIdentity::Ephemeral(String::new())).contains("Ephemeral"));
+    }
+
+    /// The generated key is a private key, so the file it lands in must be
+    /// private. This is the same rule `check_config_permissions` refuses a start
+    /// over, so the write has to satisfy it rather than leave the next start to
+    /// find its own output and reject it.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_key_lands_in_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, path) = scratch_config("debug = true\n");
+        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+            .expect("the identity is resolved");
+
+        let mode = fs::metadata(&path)
+            .expect("the config is there")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a file holding the endpoint's private key must be private, got {mode:o}"
+        );
     }
 }

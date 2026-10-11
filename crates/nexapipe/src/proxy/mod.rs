@@ -307,20 +307,24 @@ pub async fn run_proxy(
     }
 
     if let Some(iroh_cfg) = iroh_config {
-        // Use configured secret key for stable endpoint identity
+        // Use configured secret key for stable endpoint identity.
+        //
+        // An unparseable key is refused rather than replaced by a fresh one.
+        // It used to be a warning and a random key, which put the endpoint on a
+        // different Node ID after every restart while looking like a solved
+        // problem — every client that had stored the Node ID lost the server,
+        // and nothing in the log said why. `ProxyConfig::ensure_iroh_secret_key`
+        // has already refused this at startup, so reaching the error here means
+        // the two checks disagree; failing keeps that from being silent.
         if let Some(secret_key_str) = &iroh_cfg.secret_key {
-            match secret_key_str.parse::<SecretKey>() {
-                Ok(secret_key) => {
-                    builder = builder.secret_key(secret_key);
-                    tracing::info!("Using configured secret key for stable endpoint identity");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse secret_key from config, generating new one: {}",
-                        e
-                    );
-                }
-            }
+            let secret_key = secret_key_str.parse::<SecretKey>().map_err(|e| {
+                anyhow::anyhow!(
+                    "[iroh] secret_key is not a valid key ({e}); refusing to start on a \
+                     throwaway identity, because the Node ID would change on every restart"
+                )
+            })?;
+            builder = builder.secret_key(secret_key);
+            tracing::info!("Using configured secret key for stable endpoint identity");
         }
 
         // IPv6 is opt-in because it is a second socket, not a change to the

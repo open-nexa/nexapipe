@@ -142,9 +142,34 @@ Ticket (for clients):                 endpoint:...
 ```
 
 把 **Node ID**（稳定，但需要发现机制）或 **Ticket**（包含地址，地址变化时它也会变）
-交给客户端。设置 `[iroh] secret_key` 可以让 Node ID —— 以及所有以 Node ID 为前提的
-东西 —— 在重启后保持不变。Ticket 不同：它固化的是打印时的那组地址，`secret_key`
-拦不住它过期，端点搬家后必须重新生成：
+交给客户端。
+
+**`[iroh] secret_key` 不需要你手动填。** 它缺失时，服务端会在首次启动时生成一个、
+写回 `config.toml` 的 `[iroh]` 段，并从那时起一直使用它 —— 于是 Node ID 从第一次
+运行起就是稳定的，无需任何复制粘贴：
+
+```toml
+[iroh]
+# 由 nexapipe 在首次启动时写入；删掉这一行就会重新生成
+secret_key = "8f2a…"
+```
+
+写回走的是和 2FA 命令同一条加锁 + 原子替换的路径，所以你的注释和其余配置都会保留。
+同时也意味着这个配置文件变成了**私有**（`0600`）—— 因为它现在存着一把私钥，而带凭据的
+配置文件本来就必须是这个权限，否则启动时会被权限检查拒绝。
+
+有两点值得知道：
+
+- **写坏了的 `secret_key` 会拒绝启动。** 以前只是一条告警加一把临时身份，结果是每次
+  重启 Node ID 都变，而日志看上去像是已经处理过了。删掉这一行让它重新生成，或者粘贴
+  `--generate-secret` 的输出。
+- **写不进去的配置文件仍然会启动**，只是用一把临时身份并给出告警 —— 只读挂载、或者文件
+  属于另一个用户，都是很常见的部署方式，在那里拒绝启动比"每次重启都是新 Node ID"更糟。
+  这时 Node ID 每次重启都会变。想主动要这个行为、并让服务端完全不碰你的文件，请设置
+  `NEXAPIPE_NO_PERSIST_IDENTITY=1`。
+
+Ticket 是另一回事：它固化的是打印时的那组地址，`secret_key` 拦不住它过期，端点搬家后
+必须重新生成。想手工生成一把密钥（例如把身份搬到另一台机器）才需要：
 
 ```bash
 cargo run -p nexapipe -- --generate-secret
@@ -201,14 +226,18 @@ docker compose exec nexapipe /usr/local/bin/nexapipe \
   就会丢掉其中一次。最坏的情况是 `pending_enrollment` 令牌：服务端从不把它写回，
   所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
 - **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
-  `[iroh] secret_key` 推导，宿主机上那份配置若缺这个键 —— 或者 `nexapipe`
-  是另一个提交编出来的 —— 生成的邀请码会指向一个没人在跑的端点。
+  `[iroh] secret_key` 推导，所以 `nexapipe` 若和正在跑的那个不是同一个提交编出来的，
+  生成的邀请码会指向一个没人在跑的端点。（"宿主机那份配置缺这个键"曾经也是触发方式之一；
+  现在服务端首次启动就会写一个进去，所以这个键总是有的。）
 - **权限与属主会被改掉。** 从宿主机重写后，文件可能变成 `0644` 或换了属主：
   持有凭据的配置随后会在启动时被拒绝，而且权限不恢复到 `0600`，reload 就无法
   把 2FA 打开。
 
-挂载刻意是**可写**的：服务端要把 2FA 计数写回这个文件，挂成 `:ro` 会让锁定期
-失去持久化，并且每次尝试都打一条错误日志。
+挂载刻意是**可写**的：服务端会在首次启动时把 `[iroh] secret_key` 写进
+`config.toml`，并在每次 2FA 尝试后把计数写回去 —— 挂成 `:ro` 会让锁定期失去持久化、
+每次尝试都打一条错误日志，还会让 Node ID 每次重启都变。配置确实只能只读时，请设
+`NEXAPIPE_NO_PERSIST_IDENTITY=1`，并在这种情况下手工写死 `[iroh] secret_key`，
+至少让身份能保持稳定。
 
 用编辑器改没问题，前提是**原地保存**（`vim` 的默认行为，以及 shell 的 `>`
 重定向）。改什么都别假设生效了，去日志里确认一次：
@@ -294,8 +323,11 @@ systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UI
 
 **配置目录必须保持可写。** 服务端会把 2FA 的 `failed_attempts` /
 `locked_until` 计数、已注册设备的密钥和它的 `last_used` 写回 `config.toml`，
-并在首次启动时在旁边写出 `config.toml.admin-token`。`ReadWritePaths` 只放开
-这一个目录。只有关掉 2FA 且不做注册的部署才用不上它。
+并在首次启动时在旁边写出 `config.toml.admin-token`。首次启动时它也会写这个
+文件 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
+也必须可写，否则 Node ID 每次重启都会变。`ReadWritePaths` 只放开这一个目录。
+想在不可写的配置下运行，请设 `NEXAPIPE_NO_PERSIST_IDENTITY=1`，代价是 Node ID
+无法跨重启保持。
 
 **每次改完都要是 `0600`、属主 `nexapipe`。** 配置里带 `[auth]` 密钥、
 `[iroh] secret_key` 或 `relay_auth_token`，且能被其他账号读到时，服务端
@@ -341,7 +373,7 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 | --- | --- |
 | `-c, --config <PATH>` | 配置文件（默认 `config.toml`）。 |
 | `--local-proxy` | 以客户端本地 HTTP 代理运行，而非服务端。 |
-| `--generate-secret` | 打印一个新的 iroh 密钥，用于稳定的端点身份。 |
+| `--generate-secret` | 打印一个新的 iroh 密钥。通常不需要 —— 服务端会在首次启动时自行写入 `[iroh] secret_key`；这条命令用于把身份搬到另一台机器。 |
 | `--generate-2fa <CLIENT_ID>` | 生成 TOTP 密钥，写入配置并打印注册用二维码。 |
 | `--force` | 配合 `--generate-2fa`：轮换已有客户端的密钥。 |
 | `--show-2fa <CLIENT_ID>` | 打印已存在于 `[auth.clients]` 中客户端的二维码。 |
@@ -443,7 +475,7 @@ domains = ["app.example.com"]
 | 省略的键 | 得到的行为 |
 | --- | --- |
 | `[server] listen_addr` | 不监听明文端口 —— 流量只能经由 iroh 进来 |
-| `[iroh] secret_key` | 每次重启都是新的 Node ID；不想让客户端每次都找不到服务端，就加上它（`--generate-secret`） |
+| `[iroh] secret_key` | 稳定的 Node ID；不填的话首次启动会自动生成并写进配置。想要旧行为（每次重启都是新 Node ID、且不碰配置文件）请设`NEXAPIPE_NO_PERSIST_IDENTITY=1` |
 | `[iroh] relay_mode` | `default`：使用 N0 中继，按延迟挑选 home relay |
 | `mode` | `http` |
 | `path_pattern` | `/`，前缀匹配 |
@@ -497,7 +529,7 @@ domains = ["app.example.com"]
 
 | 配置项 | 说明 |
 | --- | --- |
-| `secret_key` | 由 `--generate-secret` 生成的十六进制密钥；保持 Node ID 稳定。 |
+| `secret_key` | 可选。不填的话服务端会在首次启动时生成一个写进这里，Node ID 无需手动配置即可保持稳定。只有想把身份搬到另一台机器、或配置文件写不进去时才需要手动设置。无法解析的值会拒绝启动。 |
 | `bind_port` | 固定 UDP 端口，而非临时端口。 |
 | `bind_ipv6` | 同时在该端口上绑定 `[::]`，使端点也能通过 IPv6 应答。IPv4 套接字保留 —— 这是**增加一个**，不是替换；且 IPv6 绑定允许失败，没有 IPv6 的主机仍能启动。未设置 `bind_port` 时此项无效。 |
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`。缺省即 `default`。 |

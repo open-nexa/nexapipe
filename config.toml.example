@@ -67,9 +67,16 @@ expose = false
 # ============================================================
 
 [iroh]
-# A fixed endpoint identity: with it, the Node ID survives a restart. Generate
-# one with `nexapipe --generate-secret`. Clients that fill in `server_node_id`
-# need it, otherwise they lose track of the server every time it restarts.
+# The endpoint identity. Leave this out: nexapipe generates one on first start
+# and writes it here, so the Node ID survives a restart without a copy-paste.
+# Clients that fill in `server_node_id` need that.
+#
+# Set it by hand only to move an identity to another host, or to pin one when
+# the config cannot be written (a read-only mount): the key in the file is the
+# identity, and a server that cannot write it has a different Node ID after every
+# restart. NEXAPIPE_NO_PERSIST_IDENTITY=1 asks for exactly that and leaves the
+# file alone. A value that does not parse refuses the start rather than silently
+# becoming a new identity each time.
 # secret_key = "your-hex-encoded-secret-key"
 
 # Fixed UDP port; unset means an ephemeral one.
