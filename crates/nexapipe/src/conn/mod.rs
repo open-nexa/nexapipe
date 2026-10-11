@@ -1124,10 +1124,6 @@ async fn enroll_client(
     }
     drop(cfg);
 
-    // The write above recreated the file, so a mode that was private at startup
-    // can have been widened by an editor or a mount since — and the startup
-    // check is not going to run again until a restart.
-    crate::config::warn_world_readable_config(auth.path());
     match device {
         Some(name) => tracing::info!(
             "2FA: client '{client_id}' enrolled device '{name}'; its own secret was left \

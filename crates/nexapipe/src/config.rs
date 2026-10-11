@@ -1294,88 +1294,30 @@ pub struct DeviceAuthToml {
     pub last_used: Option<u64>,
 }
 
-/// Warns when the config file is reachable by accounts other than its owner.
+/// Checks a credential sidecar file's permissions before its secret becomes
+/// live.
 ///
-/// Refusing is not always an option — the caller may be rewriting the file long
-/// after startup, where failing would take a running proxy down — so this is the
-/// report-only half. [`check_config_permissions`] is the one that gates a start.
+/// These files hold one secret and nothing else — the endpoint key a
+/// `secret_key_file` / `NEXAPIPE_IROH_SECRET_KEY_FILE` points at, a relay
+/// token file, or the admin IPC token — so there is no "nothing live in it
+/// yet" half-way case, as the old config-file gate had: a file another
+/// account can read or write is refused outright. `config.toml` itself is deliberately no
+/// longer checked: operator-edited bind mounts are commonly 0644, and the
+/// credentials now belong in a sidecar like this one or in the environment.
+/// A file that cannot be stat'ed is not this function's problem: the caller
+/// has already read it to get here.
 #[cfg(unix)]
-pub fn warn_world_readable_config(path: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    let mode = metadata.permissions().mode();
-    if mode & 0o077 != 0 {
-        tracing::error!(
-            "{path} is readable or writable by other accounts (mode {mode:o}) and holds the 2FA \
-             secrets; run `chmod 600 {path}`"
-        );
-    }
-}
-
-/// No file modes to inspect outside Unix, so there is nothing to warn about.
-#[cfg(not(unix))]
-pub fn warn_world_readable_config(_path: &str) {}
-
-/// The refusal for a config file other accounts can reach, if there should be
-/// one.
-///
-/// `[auth.clients]` holds the TOTP secrets, and those secrets are the *only*
-/// credential gating the iroh listener: the HMAC in every AUTH_RESPONSE is keyed
-/// with one, so anybody who can read this file can authenticate as that client
-/// for as long as the secret lives — and `save_auth_state` rewrites the file on
-/// every failed attempt, so a permissive mode is not a one-off leak but a
-/// standing one. Where the secrets are the live credential that is worth
-/// refusing a start over; the IPC token check (`reject_world_readable`) already
-/// refuses for the same reason, and a warning that only turns up in a rotated
-/// log is how a permissive mode survives for years.
-///
-/// The same file also carries `[iroh] secret_key` and `relay_auth_token`, which
-/// are credentials whether or not `[auth]` is on, so a config holding any of the
-/// three is refused. One holding none — no 2FA, no key, no token — keeps only
-/// the warning, because a 0644 config is a fixture of Docker bind mounts.
-///
-/// `mode` is passed in rather than read from the file so the rule can be tested
-/// everywhere, including on the platforms with no file modes to inspect.
-pub(crate) fn world_readable_refusal(
-    path: &str,
-    mode: u32,
-    holds_credentials: bool,
-) -> Option<String> {
-    (mode & 0o077 != 0 && holds_credentials).then(|| {
-        format!(
-            "{path} is readable or writable by other accounts (mode {mode:o}) and holds \
-             credentials: every account on this host can read them, and the 2FA secrets are the \
-             only credential gating the iroh listener, so any of them can authenticate as every \
-             client. Run `chmod 600 {path}`, or move the credentials out of this file"
-        )
-    })
-}
-
-/// Checks the config file's permissions before its secrets become live.
-///
-/// Refuses when the file is not private and holds a credential — a TOTP seed,
-/// the endpoint's secret key or a relay token — and warns otherwise. A file that
-/// cannot be stat'ed is not this function's problem: the caller has already read
-/// it to get here.
-#[cfg(unix)]
-pub fn check_config_permissions(path: &str, holds_credentials: bool) -> anyhow::Result<()> {
+pub fn check_credential_file_permissions(path: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let Ok(metadata) = std::fs::metadata(path) else {
         return Ok(());
     };
     let mode = metadata.permissions().mode();
-    if let Some(refusal) = world_readable_refusal(path, mode, holds_credentials) {
-        anyhow::bail!(refusal);
-    }
     if mode & 0o077 != 0 {
-        tracing::error!(
-            "{path} is readable or writable by other accounts (mode {mode:o}); nothing in it \
-             authenticates anybody yet — run `chmod 600 {path}` before adding [auth], a \
-             [iroh] secret_key or a relay token"
+        anyhow::bail!(
+            "{path} is readable or writable by other accounts (mode {mode:o}) and holds a \
+             credential; run `chmod 600 {path}`"
         );
     }
     Ok(())
@@ -1383,7 +1325,7 @@ pub fn check_config_permissions(path: &str, holds_credentials: bool) -> anyhow::
 
 /// No file modes to inspect outside Unix, so there is nothing to refuse.
 #[cfg(not(unix))]
-pub fn check_config_permissions(_path: &str, _holds_credentials: bool) -> anyhow::Result<()> {
+pub fn check_credential_file_permissions(_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -2401,6 +2343,22 @@ fn credential_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// Whether any environment variable names an `[iroh]` credential.
+///
+/// Blank or whitespace-only values count as unset, the same rule the value
+/// variables follow in the resolver. Used to decide whether a config that has
+/// no `[iroh]` table at all needs one materialised in memory before the
+/// external sources can be resolved.
+fn environment_names_iroh_credential() -> bool {
+    let named = |name: &str| {
+        credential_env(name)
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
+    named(IROH_SECRET_KEY_ENV) || named(IROH_SECRET_KEY_FILE_ENV) || named(RELAY_AUTH_TOKEN_ENV)
+}
+
 /// Refuses a `[iroh]` credential that more than one source names.
 ///
 /// One credential, one answer. Any ranking would leave the deployment's
@@ -2457,9 +2415,9 @@ fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
 /// as "no credential": the pointer was spelled, and pointing it at a blank file
 /// is a typo to see, not a mode.
 ///
-/// Held to the same permission rule the config file is when it carries
-/// credentials (see `check_config_permissions`): this file *is* the credential
-/// now, so one another account can read or write refuses the load.
+/// Held to the credential-file permission rule
+/// (`check_credential_file_permissions`): this file *is* the credential now,
+/// so one another account can read or write refuses the load.
 fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String>> {
     let content = match fs::read_to_string(full) {
         Ok(content) => content,
@@ -2473,7 +2431,7 @@ fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String
             full.display()
         );
     }
-    check_config_permissions(&full.to_string_lossy(), true)?;
+    check_credential_file_permissions(&full.to_string_lossy())?;
     Ok(Some(content.to_string()))
 }
 
@@ -2595,6 +2553,19 @@ impl ProxyConfig {
     /// but "is the key in *this file*", which is what the permission gate is
     /// about.
     fn resolve_external_credentials(&mut self, config_dir: Option<&Path>) -> anyhow::Result<()> {
+        // A config with no `[iroh]` table at all still has to honour
+        // credentials wired through the environment: the docker compose setup
+        // points NEXAPIPE_IROH_SECRET_KEY_FILE at a secrets directory against
+        // exactly such a file — the generated first-run template has no
+        // `[iroh]` table. Skipping resolution here used to let the key fall
+        // through to the inline write-back into config.toml, and the watcher's
+        // next reload then refused it as two sources naming one key.
+        // Materialise an empty table in memory only — resolution never writes
+        // the config — and resolve as usual.
+        if self.iroh.is_none() && environment_names_iroh_credential() {
+            self.iroh = Some(IrohConfig::default());
+        }
+
         let Some(iroh) = self.iroh.as_mut() else {
             return Ok(());
         };
@@ -2677,7 +2648,7 @@ fn write_key_file(path: &Path) -> anyhow::Result<String> {
             // The winner of the race wrote the file, not us, so hold it to the
             // same permission rule a normal load applies: a 0644 key a sibling
             // account dropped in is refused the same way it would be on reload.
-            check_config_permissions(&path.to_string_lossy(), true)?;
+            check_credential_file_permissions(&path.to_string_lossy())?;
             Ok(existing.to_string())
         }
         Err(e) => Err(e).map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display())),
@@ -3796,27 +3767,9 @@ pending_enrollment = "TOKEN"
         );
     }
 
-    /// A mode only the owner can reach is never a reason to refuse; anything
-    /// group- or world-reachable is, even without the read bit — one write is
-    /// enough to swap a secret.
-    #[test]
-    fn only_a_private_config_passes_with_2fa_on() {
-        assert_eq!(world_readable_refusal("config.toml", 0o600, true), None);
-        assert!(world_readable_refusal("config.toml", 0o644, true).is_some());
-        assert!(world_readable_refusal("config.toml", 0o640, true).is_some());
-        assert!(world_readable_refusal("config.toml", 0o602, true).is_some());
-    }
-
-    /// A file holding no credential at all — no 2FA, no key, no relay token — is
-    /// how a Docker bind mount arrives: warn, do not refuse.
-    #[test]
-    fn a_permissive_config_with_no_credentials_is_only_warned_about() {
-        assert_eq!(world_readable_refusal("config.toml", 0o644, false), None);
-    }
-
     /// The endpoint key and the relay token are credentials whether or not
-    /// `[auth]` is on, so a config carrying either is worth refusing a
-    /// permissive mode over.
+    /// `[auth]` is on; this is what marks an inline value as a credential that
+    /// belongs in a sidecar file or the environment rather than the config.
     #[test]
     fn a_key_or_a_relay_token_makes_the_config_hold_credentials() {
         assert!(parse("[iroh]\nsecret_key = \"00\"\n").holds_credentials());
@@ -4150,47 +4103,34 @@ pending_enrollment = "TOKEN"
         assert!(err.to_string().contains("chmod 600"), "{err}");
     }
 
-    /// A refusal that does not say how to fix it is a support ticket.
-    #[test]
-    fn the_refusal_names_the_fix() {
-        let refusal = world_readable_refusal("/etc/nexapipe/config.toml", 0o644, true)
-            .expect("0644 with 2FA on is refused");
-        assert!(
-            refusal.contains("chmod 600 /etc/nexapipe/config.toml"),
-            "{refusal}"
-        );
-    }
-
+    /// A credential sidecar file is private or refused; there is no
+    /// "credentials not live yet" half-way case for these.
     #[cfg(unix)]
-    fn chmod(path: &str, mode: u32) {
+    #[test]
+    fn a_credential_file_is_private_or_refused() {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
-    }
+        let set_mode = |path: &str, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+        };
 
-    /// The check the startup path runs, against a real file: the same mode has
-    /// to be fatal once the secrets are live and survivable before they are.
-    #[cfg(unix)]
-    #[test]
-    fn startup_check_refuses_only_while_the_secrets_are_live() {
         let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
 
-        chmod(&path, 0o600);
-        check_config_permissions(&path, true).expect("0600 starts with credentials in the file");
+        set_mode(&path, 0o600);
+        check_credential_file_permissions(&path).expect("0600 is accepted");
 
-        chmod(&path, 0o644);
-        let err = check_config_permissions(&path, true)
-            .expect_err("0644 is fatal with credentials in it");
+        set_mode(&path, 0o644);
+        let err = check_credential_file_permissions(&path)
+            .expect_err("0644 is fatal for a credential file");
         assert!(err.to_string().contains("chmod 600"), "{err}");
-        check_config_permissions(&path, false).expect("0644 still starts with none in it");
     }
 
     /// A file the caller could not even stat has already failed to be read; the
     /// permission check is not the place to report that.
     #[cfg(unix)]
     #[test]
-    fn startup_check_passes_a_file_it_cannot_stat() {
-        check_config_permissions("/nonexistent/config.toml", true)
-            .expect("a missing config is reported by the loader, not here");
+    fn credential_file_check_passes_a_file_it_cannot_stat() {
+        check_credential_file_permissions("/nonexistent/iroh.key")
+            .expect("a missing file is reported by the loader, not here");
     }
 
     /// An enrollment is two writes to the same file: a token that an invitation
@@ -5095,9 +5035,9 @@ secret = "CLIENTSECRET"
     }
 
     /// The generated key is a private key, so the file it lands in must be
-    /// private. This is the same rule `check_config_permissions` refuses a start
-    /// over, so the write has to satisfy it rather than leave the next start to
-    /// find its own output and reject it.
+    /// private. This is the same rule `check_credential_file_permissions`
+    /// refuses a load over, so the write has to satisfy it rather than leave
+    /// the next start to find its own output and reject it.
     #[cfg(unix)]
     #[test]
     fn a_generated_key_lands_in_a_private_file() {

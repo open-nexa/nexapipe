@@ -12,7 +12,7 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-No configuration key is added, removed or renamed. Three things behave
+No configuration key is added, removed or renamed. Four things behave
 differently without being configured to:
 
 - A config with no `[iroh] secret_key` gets one generated on the first start
@@ -23,8 +23,26 @@ differently without being configured to:
   below.
 - The default `--config` path moves when `NEXAPIPE_CONFIG_DIR` is set —
   see `### Changed` below.
+- A `0644` `config.toml` no longer refuses a start or a 2FA-enabling
+  reload — config permissions are not checked anymore, see `### Changed`
+  below.
 
 ### Changed
+
+- **`config.toml` permissions are no longer checked at start or on reload.**
+  The server used to refuse a start (exit 1) when the file was group- or
+  world-reachable and held a credential — a TOTP seed, an `[iroh]
+  secret_key` or a `relay_auth_token` — and a reload could not turn 2FA on
+  against such a file. That gate is gone: a `0644` bind mount starts, which
+  is the ordinary Docker arrival mode. The trade-off is on the operator:
+  any account that can read the file can copy every credential in it. Keep
+  the file private (`chmod 600` remains recommended and the generated file
+  is still written `0600`), or move the credentials out, which the new
+  sidecar and environment sources exist for. The credential sidecar files
+  themselves — `secret_key_file`, `relay_auth_token_file`,
+  `NEXAPIPE_IROH_SECRET_KEY_FILE` and `config.toml.admin-token` — are still
+  enforced `0600` on Unix and refuse the load otherwise; nothing about
+  those checks changed.
 
 - **`NEXAPIPE_CONFIG_DIR` shifts the default `--config` path.** What used
   to be `./config.toml` is now `<dir>/config.toml` whenever the environment
@@ -67,9 +85,13 @@ differently without being configured to:
   `NEXAPIPE_IROH_SECRET_KEY`, which carries the key value itself. A missing
   env-named file is generated into on first start (`0600` on Unix), and the
   key is never written back into `config.toml`, so the config holds no
-  credential and does not have to be private. The env path is deployment
-  wiring: it is taken literally rather than read against the config's
-  directory (that reading stays with the existing `secret_key_file` key).
+  credential and does not have to be private. The environment credentials
+  apply even when the config has no `[iroh]` table at all — the generated
+  first-run template has none, which is exactly the docker first-run path:
+  an empty table is materialised in memory for the load, the file on disk is
+  not touched. The env path is deployment wiring: it is taken literally
+  rather than read against the config's directory (that reading stays with
+  the existing `secret_key_file` key).
   Naming the key by more than one source — value and path, env and config,
   either and `secret_key` — refuses the start, the same one-credential,
   one-source rule every other pair follows. The docker compose setup wires

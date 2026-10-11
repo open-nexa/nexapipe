@@ -260,12 +260,9 @@ impl ConfigWatcher {
         // itself. A refusal covers that value alone: the clients table below is
         // still merged, so a reload that could not move the gate does not also
         // drop the client the operator just added.
-        if let Some(refusal) = ConfigWatcher::auth_enabled_refusal(
-            &live,
-            &new_auth,
-            &self.config_path,
-            self.plaintext.get().copied(),
-        ) {
+        if let Some(refusal) =
+            ConfigWatcher::auth_enabled_refusal(&live, &new_auth, self.plaintext.get().copied())
+        {
             tracing::error!("{refusal}");
         } else if apply_auth_enabled(&mut live, &new_auth) == Some(true) {
             tracing::warn!(
@@ -357,7 +354,7 @@ impl ConfigWatcher {
     /// Why this reload must not move `enabled`, when it must not.
     ///
     /// Returns the message to log and otherwise does nothing; the caller keeps
-    /// the live state and applies the rest of the section. Three refusals, all
+    /// the live state and applies the rest of the section. Two refusals, both
     /// about the single direction that can go wrong — turning the gate on:
     ///
     /// - **The file wants 2FA off.** Nothing requires this direction, and it
@@ -369,19 +366,17 @@ impl ConfigWatcher {
     ///   on that listener, so enabling it mid-run would produce exactly the
     ///   state the startup check exists to prevent. A reload must not be the way
     ///   around a check the startup path enforces.
-    /// - **The config file is not private.** 2FA off is how a 0644 file is
-    ///   allowed to exist (a Docker bind mount arrives that way); enabling 2FA
-    ///   turns every secret in it into a live credential for every account that
-    ///   can read it, which `check_config_permissions` refuses at startup for
-    ///   the same reason.
+    ///
+    /// A permissive mode on `config.toml` itself is no longer a reason to
+    /// refuse: the file's permissions are not checked at start or on reload,
+    /// and credentials belong in a sidecar file or the environment.
     ///
     /// `live.enabled == true` short-circuits all of it: once 2FA is on, the file
     /// saying `true` again changes nothing, so a reload that only edits routes
-    /// cannot be blocked by any of the three.
+    /// cannot be blocked by either.
     fn auth_enabled_refusal(
         live: &AuthConfig,
         incoming: &AuthConfig,
-        config_path: &str,
         plaintext: Option<PlaintextListener>,
     ) -> Option<String> {
         if live.enabled == incoming.enabled {
@@ -397,8 +392,8 @@ impl ConfigWatcher {
             );
         }
 
-        // The file says true while the process is not gating: three conditions
-        // have to hold, and each has a message naming the way out.
+        // The file says true while the process is not gating: the plaintext
+        // listener has to be the local one, and that gets its own message.
         if let Some(plaintext) = plaintext
             && crate::proxy::plaintext_auth_conflict(plaintext.addr, plaintext.exposed, true)
                 .is_some()
@@ -411,34 +406,8 @@ impl ConfigWatcher {
             ));
         }
 
-        if let Some(refusal) = config_file_enabling_refusal(config_path) {
-            return Some(format!("[auth] enabled = true is ignored: {refusal}"));
-        }
-
         None
     }
-}
-
-/// The refusal for turning 2FA on against the config file as it is right now.
-///
-/// The rule itself is `config::world_readable_refusal` — the same "the secrets
-/// become live credentials, so the file has to be private" test the startup path
-/// applies — reused rather than restated so the two cannot drift. Only the mode
-/// is read here, because that is the one input the caller cannot supply.
-#[cfg(unix)]
-fn config_file_enabling_refusal(path: &str) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // The file has just been read, so a failed stat is its own problem and not a
-    // reason to refuse a change.
-    let mode = std::fs::metadata(path).ok()?.permissions().mode();
-    crate::config::world_readable_refusal(path, mode, true)
-}
-
-/// No file modes to inspect outside Unix, so there is nothing to refuse.
-#[cfg(not(unix))]
-fn config_file_enabling_refusal(_path: &str) -> Option<String> {
-    None
 }
 
 /// Moves `enabled` from the file onto the live state, and reports the transition.
@@ -534,12 +503,6 @@ fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<(
     }
 
     crate::config::write_config_file(path, &doc.to_string())?;
-
-    // The startup check only runs once, and this write recreates the file under
-    // some editors and bind mounts — so a mode that was private when the proxy
-    // started can be permissive by now. Refusing here would take a running
-    // proxy down over a file it has already rewritten, so this reports only.
-    crate::config::warn_world_readable_config(path);
     Ok(())
 }
 
@@ -899,7 +862,7 @@ mod tests {
         let mut incoming = config_with(&[("a", client("A"))]);
         incoming.enabled = false;
 
-        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None)
+        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, None)
             .expect("turning 2FA off must be refused");
 
         assert!(
@@ -923,41 +886,7 @@ mod tests {
         incoming.enabled = true;
 
         assert_eq!(
-            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "/nonexistent", None),
-            None
-        );
-    }
-
-    /// Enabling 2FA against a config file other accounts can read would turn
-    /// every secret in it into a live credential, which is what
-    /// `check_config_permissions` refuses a start over.
-    #[cfg(unix)]
-    #[test]
-    fn a_reload_may_not_enable_2fa_on_a_world_readable_config() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "[auth]\nenabled = true").unwrap();
-        drop(file);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let live = config_with(&[]);
-        let mut incoming = config_with(&[]);
-        incoming.enabled = true;
-
-        let refusal =
-            ConfigWatcher::auth_enabled_refusal(&live, &incoming, path.to_str().unwrap(), None)
-                .expect("a world-readable config must not be enabled on");
-
-        assert!(refusal.contains("chmod 600"), "{refusal}");
-
-        // And the check is about the mode alone: private is not refused.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            ConfigWatcher::auth_enabled_refusal(&live, &incoming, path.to_str().unwrap(), None),
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, None),
             None
         );
     }
@@ -976,7 +905,7 @@ mod tests {
             addr: "0.0.0.0:8080".parse().unwrap(),
             exposed: true,
         });
-        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", exposed)
+        let refusal = ConfigWatcher::auth_enabled_refusal(&live, &incoming, exposed)
             .expect("an exposed plaintext listener must block the flip");
         assert!(refusal.contains("plaintext listener"), "{refusal}");
 
@@ -987,13 +916,13 @@ mod tests {
             exposed: false,
         });
         assert_eq!(
-            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", loopback),
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, loopback),
             None
         );
 
         // And no plaintext listener at all is always fine.
         assert_eq!(
-            ConfigWatcher::auth_enabled_refusal(&live, &incoming, "", None),
+            ConfigWatcher::auth_enabled_refusal(&live, &incoming, None),
             None
         );
     }

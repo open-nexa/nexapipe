@@ -22,7 +22,7 @@
 //! working; `/v1/*` answers `503` rather than serving without a token, because
 //! serving without one is the thing the token exists to prevent.
 use crate::auth::totp::constant_time_eq;
-use crate::config::check_config_permissions;
+use crate::config::check_credential_file_permissions;
 use std::path::Path;
 
 /// What is appended to the config path to get the token file:
@@ -99,9 +99,9 @@ pub fn load_existing(config_path: &str) -> Option<String> {
 
 /// Reads an existing token file.
 fn load(path: &str) -> Result<String, String> {
-    // A credential, so the same check that gates a start gates this: a token
-    // any account can read is not a token.
-    check_config_permissions(path, true).map_err(|e| e.to_string())?;
+    // A credential, so the same check that gates a key file gates this: a
+    // token any account can read is not a token.
+    check_credential_file_permissions(path).map_err(|e| e.to_string())?;
 
     let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read it ({e})"))?;
     let token = raw.trim().to_string();
@@ -119,7 +119,7 @@ fn create(path: &str) -> Result<String, String> {
     // Checked after the write rather than before: the file this is about is
     // the one that now exists, and a mode the OS did not apply is a real
     // failure and not a hypothetical one.
-    check_config_permissions(path, true).map_err(|e| e.to_string())?;
+    check_credential_file_permissions(path).map_err(|e| e.to_string())?;
     Ok(token)
 }
 

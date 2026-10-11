@@ -172,8 +172,9 @@ secret_key = "8f2a…"
 ```
 
 写回走的是和 2FA 命令同一条加锁 + 原子替换的路径，所以你的注释和其余配置都会保留。
-同时也意味着这个配置文件变成了**私有**（`0600`）—— 因为它现在存着一把私钥，而带凭据的
-配置文件本来就必须是这个权限，否则启动时会被权限检查拒绝。
+这次写入在 Unix 上会把文件建成**私有**（`0600`），但权限不再被强制检查：
+`0644` 的配置（Docker bind mount 往往就是这样）也能正常启动。代价是文件里的
+凭据任何账号都能读到，所以要么保持文件私有，要么按下面的方式把密钥移出配置文件。
 
 有两点值得知道：
 
@@ -263,8 +264,8 @@ docker compose exec nexapipe /usr/local/bin/nexapipe \
   生成的邀请码会指向一个没人在跑的端点。（"宿主机那份配置缺这个键"曾经也是触发方式之一；
   现在服务端首次启动就会写一个进去，所以这个键总是有的。）
 - **权限与属主会被改掉。** 从宿主机重写后，文件可能变成 `0644` 或换了属主：
-  持有凭据的配置随后会在启动时被拒绝，而且权限不恢复到 `0600`，reload 就无法
-  把 2FA 打开。
+  这不再阻止服务启动（配置文件权限已不再检查），但任何能读这个文件的账号都能
+  拷走里面的凭据，所以应保持文件私有，或把凭据移到旁文件/环境变量。
 
 挂载刻意是**可写**的：服务端会在首次启动时把 `[iroh] secret_key` 写进
 `config.toml`，并在每次 2FA 尝试后把计数写回去 —— 挂成 `:ro` 会让锁定期失去持久化、
@@ -293,6 +294,7 @@ sudo mkdir -p /etc/nexapipe
 sudo cp config.toml.example /etc/nexapipe/config.toml
 sudo chown -R nexapipe:nexapipe /etc/nexapipe
 sudo chmod 700 /etc/nexapipe
+# 建议的加固，不再是启动的必要条件。
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
@@ -313,9 +315,9 @@ ExecStart=/usr/local/bin/nexapipe --config /etc/nexapipe/config.toml
 Restart=on-failure
 RestartSec=5s
 
-# 只在文件存在时读取：前面的 `-` 就是「可选」的意思。服务端从环境里读的只有
-# NEXAPIPE_LOG_DIR 和 NEXAPIPE_MAX_CONNS_PER_PEER 两项 —— 别的都挪不出
-# config.toml，所以密钥留在配置里，配置保持 0600。
+# 只在文件存在时读取：前面的 `-` 就是「可选」的意思。除
+# NEXAPIPE_LOG_DIR 和 NEXAPIPE_MAX_CONNS_PER_PEER 外，iroh 密钥和 relay
+# token 也可以从环境变量或旁文件提供，所以只读配置不必携带凭据。
 EnvironmentFile=-/etc/nexapipe/nexapipe.env
 
 # ProtectSystem=strict 之下，除这里列出的路径外全部只读。配置目录必须可写，
@@ -362,17 +364,16 @@ systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UI
 想在不可写的配置下运行，请设 `NEXAPIPE_NO_PERSIST_IDENTITY=1`，代价是 Node ID
 无法跨重启保持。
 
-**每次改完都要是 `0600`、属主 `nexapipe`。** 配置里带 `[auth]` 密钥、
-`[iroh] secret_key` 或 `relay_auth_token`，且能被其他账号读到时，服务端
-**拒绝启动**——进程以 1 退出，而不是带着一份谁都能复制的凭据继续服务；在权限
-修好之前，reload 也开不了 2FA。用 root 编辑是最常见的丢法：改成
-`sudo -u nexapipe $EDITOR /etc/nexapipe/config.toml`，或者事后 `chown` +
-`chmod`。
+**建议每次改完保持 `0600`、属主 `nexapipe`，但不再强制。** 配置文件权限已
+不再检查，所以 `0644` 也能启动；但配置里若带 `[auth]` 密钥、
+`[iroh] secret_key` 或 `relay_auth_token`，任何账号都能读走这些凭据。更好的
+做法是把它们放进旁文件（仍强制 `0600`）或环境变量。用 root 编辑是最常见的
+丢法：改成 `sudo -u nexapipe $EDITOR /etc/nexapipe/config.toml`，或者事后
+`chown` + `chmod`。
 
 **改配置不需要 reload。** 文件每 5 秒重读一次；对没有 `ExecReload` 的 unit
 执行 `systemctl reload` 只会得到一条警告，什么也不会发生。拒绝错误改动也是
-watcher 的职责：解析不了的改动，或者把文件权限改松的改动，会被记录下来，
-而已经在服务的路由继续服务。
+watcher 的职责：解析不了的改动会被记录下来，而已经在服务的路由继续服务。
 
 另有两件与 systemd 无关的事。**打开隧道的 UDP 端口**——设置 `[iroh] bind_port`，
 否则端点用的是临时端口，没有端口可写规则。以及 **用能读令牌文件的账号执行
@@ -856,7 +857,7 @@ allow = [
 | 键 | 重载时 |
 |---|---|
 | `[[routes]]` | 生效。后端会被重新探测；已建立的连接保留其授权时所用的路由。 |
-| `[auth]` | 生效，含 `enabled` —— 打开 2FA 会开始对重载之后新建的连接生效。含密钥的文件必须是 `0600`，否则重载被拒。 |
+| `[auth]` | 生效，含 `enabled` —— 打开 2FA 会开始对重载之后新建的连接生效。配置文件权限已不再检查；请保持文件私有或把密钥移出。 |
 | `[health_check]` | 生效。`enabled` 暂停/恢复探测；其余键对重载新增或改动的路由生效。 |
 | `[timeouts]` | 需重启：启动时读取一次，与 `[server] listen_addr` 同理。 |
 | `[peers] allow` | 目前需重启。 |
@@ -1054,10 +1055,12 @@ TOTP 握手。
 （`algorithm`、`time_step`、`digits`）在启动时只读取一次，需要重启。见
 `config.toml.2fa.example`。
 
-这些密钥是**唯一**把守 iroh 监听器的凭证，因此只要 `config.toml` 里存着凭证 ——
-TOTP 种子、`[iroh] secret_key` 或 `relay_auth_token` —— 而它又可被其属主之外的
-任何账号读取或写入，服务端就**拒绝启动**（`chmod 600 config.toml`）。三者都没有的
-配置只记录同样的警告后照常启动，Docker bind mount 拿到的正是这种文件。没有凭证的
+这些密钥是**唯一**把守 iroh 监听器的凭证。配置文件权限已不再强制——`0644`
+也能启动——所以保持 `config.toml` 私有（仍建议 `chmod 600 config.toml`）是
+运维自己的责任，或者把凭据移到旁文件（`secret_key_file`、
+`relay_auth_token_file`、`config.toml.admin-token`）或环境变量
+（`NEXAPIPE_IROH_SECRET_KEY`、`NEXAPIPE_IROH_SECRET_KEY_FILE`、
+`NEXAPIPE_RELAY_AUTH_TOKEN`）。旁文件本身仍强制 `0600`，否则拒绝加载。没有凭证的
 客户端面对要求凭证的服务端同样会被拒绝：QUIC 握手成功，而服务端在握手期限（5 秒）内
 没有收到 `AUTH_START` 时会关闭连接。
 

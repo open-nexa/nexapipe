@@ -227,12 +227,11 @@ fn the_generated_config_enables_2fa_with_no_clients() {
 
 /// The file is created private on Unix.
 ///
-/// With `[auth] enabled = true`, the startup permission check (`run_server_mode`,
-/// `auth_cfg.enabled || holds_credentials()`) refuses to start a world-readable
-/// config. `write_config_file` opens the temp file at mode 0600 up front, so the
-/// secrets are never on disk at the umask default — tightening the mode after
-/// the write would leave them at 0644 for the length of the write, and the
-/// server would then refuse to start on the file it wrote itself.
+/// `write_config_file` opens the temp file at mode 0600 up front, so a config
+/// carrying 2FA settings is never on disk at the umask default — tightening the
+/// mode after the write would leave it 0644 for the length of the write.
+/// Startup no longer refuses a permissive config, but the generated file stays
+/// private by default; the credential sidecar files are still enforced 0600.
 #[cfg(unix)]
 #[test]
 fn the_generated_config_is_private_on_unix() {
