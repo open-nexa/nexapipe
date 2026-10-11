@@ -291,6 +291,10 @@ async fn main() {
         println!("Add this to your config.toml under [iroh] section:");
         println!("secret_key = \"{}\"", secret_key_hex);
         println!();
+        println!("To keep the key out of config.toml instead (so the file holds no");
+        println!("credential and can stay world-readable), point [iroh] secret_key_file");
+        println!("at a file holding just the key, or set NEXAPIPE_IROH_SECRET_KEY.");
+        println!();
         println!("Or skip this entirely: nexapipe writes [iroh] secret_key on first start");
         println!("when the key is missing.");
         return;

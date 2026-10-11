@@ -92,6 +92,21 @@ expose = false
 # becoming a new identity each time.
 # secret_key = "your-hex-encoded-secret-key"
 
+# To keep the key out of this file entirely — so the config itself holds no
+# credential and can stay world-readable (a shared bind mount, a file an
+# operator edits without worrying) — point at a file holding the hex key and
+# nothing else:
+#
+#   secret_key_file = "/run/secrets/iroh-key"
+#
+# A relative path is read against this file's directory. A missing file is
+# created on first start (mode 0600 on Unix) with a generated key; an empty
+# one, an unreadable one, or one another account can read or write refuses
+# the start. Naming the key here *and* in `secret_key` is refused — one
+# credential, one source. NEXAPIPE_IROH_SECRET_KEY carries the key in the
+# environment instead, ranked the same way.
+# secret_key_file = ""
+
 # Fixed UDP port; unset means an ephemeral one.
 bind_port = 0
 
@@ -119,6 +134,14 @@ relay_mode = "default"
 # Bearer token for a self-hosted relay that requires one. Only meaningful for
 # custom, and both sides need it.
 # relay_auth_token = ""
+
+# The same token, read from a file instead of this one — same idea as
+# secret_key_file above, and the same refusal rules (empty, unreadable, or
+# world-readable refuses; naming it here *and* in relay_auth_token refuses;
+# NEXAPIPE_RELAY_AUTH_TOKEN carries it in the environment instead). A missing
+# file is refused here rather than generated: the server cannot invent a
+# token.
+# relay_auth_token_file = ""
 
 # ============================================================
 # [log] - logging and rotation

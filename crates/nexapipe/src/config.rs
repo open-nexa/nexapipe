@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
@@ -113,6 +113,44 @@ pub struct IrohConfig {
     ///
     /// A value that is present but does not parse refuses the start.
     pub secret_key: Option<String>,
+    /// Path to a file holding `secret_key`, for a config that must not carry
+    /// the key itself.
+    ///
+    /// The point is the permission gate: a config whose only credential is a
+    /// pointer holds nothing worth reading, so it can stay `0644` — a Docker
+    /// bind mount, a file an operator edits — while the key file it names is
+    /// held to the `0600` rule in its place. See [`CredentialSource`].
+    pub secret_key_file: Option<String>,
+    /// Path to a file holding `relay_auth_token`, same idea as
+    /// [`Self::secret_key_file`] for the relay bearer token.
+    pub relay_auth_token_file: Option<String>,
+    /// Where `secret_key` was resolved from. Filled by
+    /// [`ProxyConfig::resolve_external_credentials`] during the load; not
+    /// spelled in the file, so `serde` skips it.
+    #[serde(skip)]
+    pub secret_key_source: CredentialSource,
+    /// Where `relay_auth_token` was resolved from. See
+    /// [`Self::secret_key_source`].
+    #[serde(skip)]
+    pub relay_auth_token_source: CredentialSource,
+}
+
+/// Where a `[iroh]` credential was resolved from.
+///
+/// [`ProxyConfig::holds_credentials`] asks this: the permission gate is about
+/// what an account that reads *the config file* would obtain, and a credential
+/// that came from the environment or from a pointed-to file is not in the
+/// config for anyone to read. Only the inline literal makes the file itself a
+/// credential holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialSource {
+    /// The literal value written in config.toml.
+    #[default]
+    Inline,
+    /// `NEXAPIPE_IROH_SECRET_KEY` / `NEXAPIPE_RELAY_AUTH_TOKEN`.
+    Env,
+    /// The file `secret_key_file` / `relay_auth_token_file` names.
+    File,
 }
 
 /// `Some(_)` becomes `Some("<redacted>")` for a `Debug` view.
@@ -140,6 +178,10 @@ impl std::fmt::Debug for IrohConfig {
             .field("bind_port", &self.bind_port)
             .field("bind_ipv6", &self.bind_ipv6)
             .field("secret_key", &redacted(&self.secret_key))
+            .field("secret_key_file", &self.secret_key_file)
+            .field("secret_key_source", &self.secret_key_source)
+            .field("relay_auth_token_file", &self.relay_auth_token_file)
+            .field("relay_auth_token_source", &self.relay_auth_token_source)
             .finish()
     }
 }
@@ -684,10 +726,18 @@ impl ProxyConfig {
     /// `NEXAPIPE_NO_PERSIST_IDENTITY` said not to — must not make this true.
     /// Folding an ephemeral identity in here would make exactly the deployments
     /// that need one refuse to start over a key that is not on disk.
+    ///
+    /// The same logic covers a credential that lives outside the file: a key
+    /// resolved from the environment or from a `secret_key_file` pointer is
+    /// not in *this* file for anyone to read, so it does not make the config a
+    /// credential holder — the pointed-to file is held to the `0600` rule in
+    /// the config's place, where it is read (see `read_credential_file`).
     pub fn holds_credentials(&self) -> bool {
-        self.iroh
-            .as_ref()
-            .is_some_and(|iroh| iroh.secret_key.is_some() || iroh.relay_auth_token.is_some())
+        self.iroh.as_ref().is_some_and(|iroh| {
+            (iroh.secret_key.is_some() && iroh.secret_key_source == CredentialSource::Inline)
+                || (iroh.relay_auth_token.is_some()
+                    && iroh.relay_auth_token_source == CredentialSource::Inline)
+        })
     }
 
     /// Turns the `[[routes]]` table into the objects the proxy actually routes
@@ -847,8 +897,9 @@ impl ProxyConfig {
             .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
         tracing::debug!("Config content read successfully, parsing TOML");
-        let config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+        config.resolve_external_credentials(path.parent())?;
 
         tracing::debug!("Config parsed successfully: {:?}", config);
         Ok(config)
@@ -1342,7 +1393,8 @@ impl ProxyConfig {
         let content = std::fs::read_to_string(path)?;
 
         // Parse the base config
-        let base: Self = toml::from_str(&content)?;
+        let mut base: Self = toml::from_str(&content)?;
+        base.resolve_external_credentials(Path::new(path).parent())?;
 
         // Try to parse auth section separately
         // Note `toml::from_str`, not `str::parse`: `Value::from_str` reads a
@@ -2213,6 +2265,11 @@ impl ProxyConfig {
     /// this replaced. The key is generated either way, the warning says the
     /// Node ID will not survive a restart, and the server comes up.
     ///
+    /// A `secret_key_file` the load found missing is generated into, rather
+    /// than written around: the key belongs in the pointed-to file — writing it
+    /// back into the config would undo the deployment's whole reason for the
+    /// pointer. The same not-fatal rule covers it.
+    ///
     /// Takes the already-parsed `config` rather than re-reading `path`: the
     /// caller is about to run on exactly that value, and a second read could
     /// disagree with it if the file changed in between.
@@ -2235,6 +2292,43 @@ impl ProxyConfig {
                 )
             })?;
             return Ok(EndpointIdentity::Configured(configured));
+        }
+
+        // A pointed-to key file that does not exist yet. Reached only when the
+        // load resolved no key from it, which is exactly the first-start case:
+        // a file that exists but is broken was refused during the load.
+        if let Some(file) = config
+            .iroh
+            .as_ref()
+            .and_then(|iroh| iroh.secret_key_file.as_deref())
+        {
+            let full = credential_file_path(Path::new(path).parent(), file);
+            if persist_identity_disabled() {
+                tracing::warn!(
+                    "{NO_PERSIST_ENV} is set: no secret key is written to {}, so the Node ID \
+                     will be different after every restart",
+                    full.display()
+                );
+                return Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()));
+            }
+            return match write_key_file(&full) {
+                Ok(hex) => {
+                    tracing::info!(
+                        "Generated an endpoint identity and saved it to {}; the Node ID is now \
+                         stable across restarts",
+                        full.display()
+                    );
+                    Ok(EndpointIdentity::Generated(hex))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not write an endpoint identity to {} ({e:#}); starting on a \
+                         throwaway one, so the Node ID will be different after the next restart",
+                        full.display()
+                    );
+                    Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()))
+                }
+            };
         }
 
         if persist_identity_disabled() {
@@ -2271,6 +2365,283 @@ impl ProxyConfig {
 /// only thing either of them promises.
 pub fn generate_secret_key_hex() -> String {
     hex::encode(iroh::SecretKey::generate().to_bytes())
+}
+
+/// The environment variable carrying `[iroh] secret_key` directly.
+///
+/// For a deployment that keeps credentials out of the config file entirely. It
+/// outranks a pointed-to file and the inline literal — and a config that names
+/// more than one source is refused rather than ranked (see
+/// `refuse_ambiguous_credential_sources`), because a silently-picked winner is
+/// how an endpoint ends up on a Node ID nobody expected.
+const IROH_SECRET_KEY_ENV: &str = "NEXAPIPE_IROH_SECRET_KEY";
+
+/// The environment variable carrying `[iroh] relay_auth_token` directly.
+const RELAY_AUTH_TOKEN_ENV: &str = "NEXAPIPE_RELAY_AUTH_TOKEN";
+
+/// The raw value of an environment credential, when the variable is set.
+///
+/// Whether the value counts — a blank or whitespace-only one means "not
+/// named", the same rule `NEXAPIPE_NO_PERSIST_IDENTITY` follows — is decided
+/// where the sources are ranked, in [`resolve_secret_key_source`] and
+/// [`resolve_relay_auth_token_source`], so the ranking is testable without
+/// touching process state.
+fn credential_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Refuses a `[iroh]` credential that more than one source names.
+///
+/// One credential, one answer. Any ranking would leave the deployment's
+/// behaviour turning on which of the two the operator last touched — for the
+/// endpoint key that is a Node ID rotating underneath every client that stored
+/// it — so a config that says two things is refused instead of adjudicated.
+fn refuse_ambiguous_credential_sources(
+    what: &str,
+    sources: [Option<&str>; 3],
+) -> anyhow::Result<()> {
+    let named: Vec<&str> = sources.into_iter().flatten().collect();
+    if named.len() > 1 {
+        anyhow::bail!(
+            "[iroh] {what} is named by {} — one credential, one source; keep exactly one of them",
+            named.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The path a `*_file` key names, relative paths against the config file's
+/// directory.
+///
+/// Anchoring on the config rather than the working directory is what makes a
+/// sibling file (`secret_key_file = "iroh.key"`) mean the same thing no matter
+/// where the server is started from — the same reading
+/// `config.toml.admin-token` gets.
+fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    config_dir.unwrap_or(Path::new(".")).join(path)
+}
+
+/// Reads the file a `*_file` credential names.
+///
+/// `None` when the file does not exist — the caller decides whether that is a
+/// first start (a secret key is generated into the file) or a broken config (a
+/// relay token cannot be invented). An empty file is refused rather than read
+/// as "no credential": the pointer was spelled, and pointing it at a blank file
+/// is a typo to see, not a mode.
+///
+/// Held to the same permission rule the config file is when it carries
+/// credentials (see `check_config_permissions`): this file *is* the credential
+/// now, so one another account can read or write refuses the load.
+fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String>> {
+    let content = match fs::read_to_string(full) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => anyhow::bail!("cannot read the {what} file {}: {e}", full.display()),
+    };
+    let content = content.trim();
+    if content.is_empty() {
+        anyhow::bail!(
+            "{}: the {what} file holds nothing; write the credential into it and nothing else",
+            full.display()
+        );
+    }
+    check_config_permissions(&full.to_string_lossy(), true)?;
+    Ok(Some(content.to_string()))
+}
+
+/// Resolves `[iroh] secret_key` from its candidate sources: the environment,
+/// then the file `secret_key_file` names, then the literal.
+///
+/// `env_raw` is passed in rather than read here so the ranking is testable
+/// without touching process state; the caller hands it over from
+/// [`credential_env`]. `Ok(None)` means nothing names a key — including a
+/// `secret_key_file` whose file does not exist yet, which is the first-start
+/// case [`ProxyConfig::ensure_iroh_secret_key`] generates into.
+fn resolve_secret_key_source(
+    config_dir: Option<&Path>,
+    env_raw: Option<String>,
+    iroh: &IrohConfig,
+) -> anyhow::Result<Option<(String, CredentialSource)>> {
+    // A trailing newline from `printf`, or a compose file that lists the
+    // variable without a value, must neither become key bytes nor count as a
+    // source: trim, and a leftover blank means the environment named nothing.
+    let env = env_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    refuse_ambiguous_credential_sources(
+        "secret_key",
+        [
+            env.map(|_| IROH_SECRET_KEY_ENV),
+            iroh.secret_key_file.as_deref().map(|_| "secret_key_file"),
+            iroh.secret_key.as_deref().map(|_| "secret_key"),
+        ],
+    )?;
+
+    if let Some(key) = env {
+        return Ok(Some((key.to_string(), CredentialSource::Env)));
+    }
+    if let Some(file) = &iroh.secret_key_file {
+        let full = credential_file_path(config_dir, file);
+        return match read_credential_file(&full, "secret_key")? {
+            Some(key) => Ok(Some((key, CredentialSource::File))),
+            None => Ok(None),
+        };
+    }
+    Ok(iroh
+        .secret_key
+        .clone()
+        .map(|key| (key, CredentialSource::Inline)))
+}
+
+/// Resolves `[iroh] relay_auth_token` from its candidate sources, in the same
+/// order [`resolve_secret_key_source`] ranks them.
+///
+/// Unlike a secret key, a pointed-to token file that does not exist is refused
+/// rather than deferred: the server cannot invent a relay token, and a missing
+/// one would otherwise surface later as a vaguer relay-configuration error.
+fn resolve_relay_auth_token_source(
+    config_dir: Option<&Path>,
+    env_raw: Option<String>,
+    iroh: &IrohConfig,
+) -> anyhow::Result<Option<(String, CredentialSource)>> {
+    // The same blank-means-nothing reading the secret key gives the
+    // environment.
+    let env = env_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    refuse_ambiguous_credential_sources(
+        "relay_auth_token",
+        [
+            env.map(|_| RELAY_AUTH_TOKEN_ENV),
+            iroh.relay_auth_token_file
+                .as_deref()
+                .map(|_| "relay_auth_token_file"),
+            iroh.relay_auth_token.as_deref().map(|_| "relay_auth_token"),
+        ],
+    )?;
+
+    if let Some(token) = env {
+        return Ok(Some((token.to_string(), CredentialSource::Env)));
+    }
+    if let Some(file) = &iroh.relay_auth_token_file {
+        let full = credential_file_path(config_dir, file);
+        return match read_credential_file(&full, "relay_auth_token")? {
+            Some(token) => Ok(Some((token, CredentialSource::File))),
+            None => anyhow::bail!(
+                "[iroh] relay_auth_token_file {} does not exist; unlike a secret key, a relay \
+                 token cannot be generated, so write the token into the file first",
+                full.display()
+            ),
+        };
+    }
+    Ok(iroh
+        .relay_auth_token
+        .clone()
+        .map(|token| (token, CredentialSource::Inline)))
+}
+
+impl ProxyConfig {
+    /// Resolves the `[iroh]` credentials that name a source outside this file.
+    ///
+    /// Both parse paths come through here — `from_file` for the server and the
+    /// config watcher, `load_with_auth` for the 2FA-facing commands and the
+    /// auth reload — so a credential is resolved the same way however the
+    /// config was read. The resolved value replaces the field, and the
+    /// [`CredentialSource`] it came from is recorded next to it: what
+    /// [`ProxyConfig::holds_credentials`] then asks is not "is there a key"
+    /// but "is the key in *this file*", which is what the permission gate is
+    /// about.
+    fn resolve_external_credentials(&mut self, config_dir: Option<&Path>) -> anyhow::Result<()> {
+        let Some(iroh) = self.iroh.as_mut() else {
+            return Ok(());
+        };
+
+        if let Some((key, source)) =
+            resolve_secret_key_source(config_dir, credential_env(IROH_SECRET_KEY_ENV), iroh)?
+        {
+            iroh.secret_key = Some(key);
+            iroh.secret_key_source = source;
+        }
+        if let Some((token, source)) =
+            resolve_relay_auth_token_source(config_dir, credential_env(RELAY_AUTH_TOKEN_ENV), iroh)?
+        {
+            iroh.relay_auth_token = Some(token);
+            iroh.relay_auth_token_source = source;
+        }
+        Ok(())
+    }
+}
+
+/// Writes a freshly generated key to the file `secret_key_file` names, or
+/// reads back the one that is already there.
+///
+/// `create_new` first rather than checking then writing: the load saw no file,
+/// and one appearing in between holds the credential now — replacing it would
+/// rotate the identity underneath whoever read it in that window. The same
+/// read-back on a lost race `config.toml.admin-token` does.
+fn write_key_file(path: &Path) -> anyhow::Result<String> {
+    let key = iroh::SecretKey::generate();
+    let hex = hex::encode(key.to_bytes());
+    match create_private_file(path) {
+        Ok(mut file) => {
+            file.write_all(hex.as_bytes())
+                .and_then(|_| file.flush())
+                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+            Ok(hex)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} appeared while the key was being generated, and reading it back \
+                     failed: {e}",
+                    path.display()
+                )
+            })?;
+            let existing = existing.trim();
+            if existing.is_empty() {
+                anyhow::bail!("{} appeared and holds nothing", path.display());
+            }
+            Ok(existing.to_string())
+        }
+        Err(e) => Err(e).map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display())),
+    }
+}
+
+/// Creates a new file only this account can read.
+///
+/// The mode is set at creation rather than chmod'ed after: between the two the
+/// file exists with the default mode, and a credential is worth less than a
+/// second of that. `mode` is applied against the umask, so the bits are set
+/// again and confirmed — the same care `admin::token::create_private` takes.
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// No file modes to set outside Unix, so the file is created as it comes.
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 impl ProxyConfig {
@@ -3384,6 +3755,216 @@ pending_enrollment = "TOKEN"
         assert!(!parse("").holds_credentials());
     }
 
+    /// A key in a pointed-to file reaches the config resolved, and — the point
+    /// of the pointer — does not make the config a credential holder.
+    #[test]
+    fn a_key_file_resolves_and_leaves_the_config_credential_free() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = generate_secret_key_hex();
+        fs::write(dir.path().join("iroh.key"), &key).expect("write the key file");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
+
+        let (config, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect("a config whose key lives in a file loads");
+
+        let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
+        assert_eq!(
+            iroh.secret_key.as_deref(),
+            Some(key.as_str()),
+            "the key from the file is what the config runs on"
+        );
+        assert_eq!(iroh.secret_key_source, CredentialSource::File);
+        assert!(
+            !config.holds_credentials(),
+            "the config holds a pointer, not a key, so the permission gate keeps warning \
+             instead of refusing"
+        );
+    }
+
+    /// A config naming the key twice refuses to load rather than ranking the
+    /// candidates: which source wins must not turn on precedence rules the
+    /// operator has to look up.
+    #[test]
+    fn naming_the_key_twice_refuses_to_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("iroh.key"), generate_secret_key_hex())
+            .expect("write the key file");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[iroh]\nsecret_key = \"{}\"\nsecret_key_file = \"iroh.key\"\n",
+                generate_secret_key_hex()
+            ),
+        )
+        .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("two answers to one question are refused");
+        assert!(err.to_string().contains("named by"), "{err}");
+        assert!(err.to_string().contains("secret_key_file"), "{err}");
+    }
+
+    /// The environment outranks nothing when the config also names the key:
+    /// refused, not silently adjudicated.
+    ///
+    /// Driven through `resolve_secret_key_source`'s parameter rather than the
+    /// process environment — `set_var` is `unsafe` in Rust 2024, and the
+    /// end-to-end env coverage lives in `tests/first_run_identity.rs`, where a
+    /// child process takes the variable.
+    #[test]
+    fn an_env_key_alongside_an_inline_one_is_refused() {
+        // IrohConfig *is* the [iroh] table, so its TOML carries the fields
+        // without the header — a header here would be an unknown field the
+        // parser silently drops.
+        let iroh: IrohConfig = toml::from_str("secret_key = \"00\"\n").expect("parse");
+
+        let err = resolve_secret_key_source(None, Some("env-key".to_string()), &iroh)
+            .expect_err("a credential named twice is refused");
+        assert!(
+            err.to_string().contains(IROH_SECRET_KEY_ENV),
+            "the refusal names both sources: {err}"
+        );
+    }
+
+    /// An environment credential resolves with the env source, and the value
+    /// is trimmed: a trailing newline from `printf` must not become key bytes.
+    #[test]
+    fn an_env_key_resolves_as_env() {
+        let iroh: IrohConfig = toml::from_str("").expect("parse");
+
+        let (key, source) = resolve_secret_key_source(None, Some("  abc  ".to_string()), &iroh)
+            .expect("one source resolves")
+            .expect("the environment names a key");
+        assert_eq!(key, "abc");
+        assert_eq!(source, CredentialSource::Env);
+    }
+
+    /// An empty environment variable is "not named", not an empty key — the
+    /// same reading `NEXAPIPE_NO_PERSIST_IDENTITY` gets — so the literal the
+    /// config carries stays the one answer.
+    #[test]
+    fn an_empty_env_value_names_nothing() {
+        let iroh: IrohConfig = toml::from_str("secret_key = \"00\"\n").expect("parse");
+
+        let (key, source) = resolve_secret_key_source(None, Some("   ".to_string()), &iroh)
+            .expect("a blank env value is not a source")
+            .expect("the inline literal is the only source left");
+        assert_eq!(key, "00");
+        assert_eq!(source, CredentialSource::Inline);
+    }
+
+    /// A relay token file resolves like a key file, trimmed.
+    #[test]
+    fn a_relay_token_file_resolves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("relay.token"), "  bearer-token  \n")
+            .expect("write the token file");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nrelay_auth_token_file = \"relay.token\"\n")
+            .expect("write the config");
+
+        let (config, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect("a config whose token lives in a file loads");
+
+        let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
+        assert_eq!(iroh.relay_auth_token.as_deref(), Some("bearer-token"));
+        assert_eq!(iroh.relay_auth_token_source, CredentialSource::File);
+        assert!(!config.holds_credentials());
+    }
+
+    /// A token file that does not exist is refused rather than deferred: the
+    /// server cannot invent a relay token, and a missing one must not surface
+    /// later as a vaguer relay-configuration error.
+    #[test]
+    fn a_missing_relay_token_file_refuses_to_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nrelay_auth_token_file = \"relay.token\"\n")
+            .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("a token cannot be generated into a missing file");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    /// A key file that holds nothing is a typo to see, not a mode: the pointer
+    /// was spelled, so a blank file refuses the load.
+    #[test]
+    fn an_empty_key_file_refuses_to_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("iroh.key"), "  \n").expect("write a blank key file");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("a blank credential file is refused");
+        assert!(err.to_string().contains("holds nothing"), "{err}");
+    }
+
+    /// A first start with a `secret_key_file` writes the key into that file —
+    /// never back into the config — and a reload resolves from the file
+    /// without turning the config into a credential holder.
+    #[test]
+    fn a_missing_key_file_is_generated_into() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
+
+        let config =
+            ProxyConfig::from_file(path.to_str().expect("utf-8 path")).expect("the config loads");
+        let identity =
+            ProxyConfig::ensure_iroh_secret_key(path.to_str().expect("utf-8 path"), &config)
+                .expect("the identity resolves");
+        assert!(
+            matches!(identity, EndpointIdentity::Generated(_)),
+            "a first start generates into the pointed-to file, got {identity:?}"
+        );
+
+        let key =
+            fs::read_to_string(dir.path().join("iroh.key")).expect("the key file was written");
+        assert_eq!(key.trim().len(), 64, "a full ed25519 key, not {key:?}");
+        assert_eq!(
+            identity.key(),
+            key.trim(),
+            "the running identity is the key in the file"
+        );
+
+        let content = fs::read_to_string(&path).expect("read the config back");
+        assert!(
+            !content.contains("secret_key ="),
+            "the key must not be written back into the config: that would undo the whole \
+             point of the pointer"
+        );
+
+        let (reloaded, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect("the config reloads from the key file");
+        assert_eq!(
+            reloaded.iroh.as_ref().expect("[iroh]").secret_key_source,
+            CredentialSource::File,
+            "the reload resolves from the file the first start wrote"
+        );
+        assert!(!reloaded.holds_credentials());
+    }
+
+    /// A key file another account can read is the credential in the open: the
+    /// same refusal the config gets for holding one inline.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_key_file_refuses_to_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_path = dir.path().join("iroh.key");
+        fs::write(&key_path, generate_secret_key_hex()).expect("write the key file");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("a world-readable credential file is refused");
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+    }
+
     /// A refusal that does not say how to fix it is a support ticket.
     #[test]
     fn the_refusal_names_the_fix() {
@@ -3512,6 +4093,10 @@ pending_enrollment = "TOKEN"
             bind_port: Some(1234),
             bind_ipv6: Some(true),
             secret_key: Some("ed25519-private-key".to_string()),
+            secret_key_file: Some("iroh.key".to_string()),
+            secret_key_source: CredentialSource::Inline,
+            relay_auth_token_file: Some("relay.token".to_string()),
+            relay_auth_token_source: CredentialSource::Inline,
         };
 
         let rendered = format!("{iroh:?}");
