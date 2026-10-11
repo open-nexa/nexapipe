@@ -2,7 +2,7 @@
 #
 # Usage:
 #   cp config.toml.example config.toml     # config.toml is gitignored: it is the operator's live config
-#   cargo run -p nexapipe -- --config config.toml
+#   nexapipe                                # picks up ./config.toml by default
 #
 # This is the general example, with 2FA off. See config.toml.2fa.example for the
 # same file with TOTP authentication enabled.
@@ -14,6 +14,11 @@
 # itself is heavily commented at the top of the template, with the same
 # shape and the same next step: enroll the first client with
 # `nexapipe --generate-invite client-001 --create-client --config config.toml`.
+#
+# The docker setup uses a different default: docker-compose.yaml binds
+# `./config` to `/app/config` and sets `NEXAPIPE_CONFIG_DIR=/app/config`, so the
+# container picks up `/app/config/config.toml` by default. Locally this file
+# is what you want; in the container you want `config/config.toml`.
 #
 # Reloading: the file is re-read every 5 seconds. `[[routes]]` is applied live;
 # a config that fails to parse or validate is reported and ignored, so a

@@ -105,7 +105,7 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `third_party/smoltcp` | 内置的 smoltcp 0.12，附带序列号下溢 panic 的补丁。通过 `[patch.crates-io]` 接入。不要改动。 |
 | `ui-android/` | Android 应用（Kotlin + Compose）。 |
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
-| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端，2FA 关闭）。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。 |
+| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端，2FA 关闭）。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
 | `config.toml.2fa.example` | 同上，但启用 2FA 并带有 `[auth.clients]` 条目。 |
 | `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat）。 |
 
@@ -122,7 +122,7 @@ host_pattern = "*"
 backends = ["http://127.0.0.1:3000"]    # 你想暴露出去的服务
 EOF
 
-cargo run -p nexapipe -- --config config.toml
+nexapipe                                # 默认读取 ./config.toml
 ```
 
 三行就是一个能跑的服务端：一条全捕获路由、一个后端，其余配置全部取默认值。客户端
@@ -134,7 +134,7 @@ cargo run -p nexapipe -- --config config.toml
 2FA 开启、没有路由、没有 enrolled 客户端。它是一个供你编辑的起点，还不是能用的服务：
 
 ```bash
-cargo run -p nexapipe -- --config config.toml     # 生成 config.toml 并启动
+nexapipe                                # 生成 ./config.toml 并启动
 ```
 
 在你修改之前，这份文件有两件事成立，且都是偏安全的方向：**没有路由**，所以所有 host
@@ -142,7 +142,7 @@ cargo run -p nexapipe -- --config config.toml     # 生成 config.toml 并启动
 客户端这样创建：
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --create-client --config config.toml
+nexapipe --generate-invite client-001 --create-client --config config.toml
 ```
 
 已存在的配置永远不会被重新生成；已存在但解析失败的文件仍然会导致启动失败，而不是被替换掉。
@@ -201,7 +201,10 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
 `docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）
-和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向该挂载点。`host.docker.internal`
+和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向该挂载点；同时设置
+`NEXAPIPE_CONFIG_DIR=/app/config`，让容器里的二进制默认读取
+`/app/config/config.toml`，与宿主机看到的 `config/config.toml` 是同一个文件。
+`--config` 仍然优先生效，所以运维者随时可以指向任意路径。`host.docker.internal`
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
@@ -388,7 +391,7 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 
 | 参数 | 说明 |
 | --- | --- |
-| `-c, --config <PATH>` | 配置文件（默认 `config.toml`）。 |
+| `-c, --config <PATH>` | 配置文件（默认 `./config.toml`；`NEXAPIPE_CONFIG_DIR` 可调整）。 |
 | `--local-proxy` | 以客户端本地 HTTP 代理运行，而非服务端。 |
 | `--generate-secret` | 打印一个新的 iroh 密钥。通常不需要 —— 服务端会在首次启动时自行写入 `[iroh] secret_key`；这条命令用于把身份搬到另一台机器。 |
 | `--generate-2fa <CLIENT_ID>` | 生成 TOTP 密钥，写入配置并打印注册用二维码。 |
