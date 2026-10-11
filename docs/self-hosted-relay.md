@@ -311,10 +311,11 @@ And `[iroh]` is read once at startup. The endpoint is bound once, so changing
 any of the three takes a restart — unlike routes, which the watcher picks up
 within seconds.
 
-One consequence of writing a token here: `relay_auth_token` is a credential, and
-a `config.toml` holding one that is readable or writable by another account makes
-the server **refuse to start**. `chmod 600 config.toml`. This is the same check
-that covers a TOTP seed and `[iroh] secret_key`.
+One consequence of writing a token here: `relay_auth_token` is a credential.
+Config file permissions are no longer enforced, so a `0644` `config.toml`
+starts — but keep the file private (`chmod 600 config.toml`) or move the token
+to `relay_auth_token_file` / `NEXAPIPE_RELAY_AUTH_TOKEN`; a credential sidecar
+file is still enforced `0600` and refuses the load otherwise.
 
 ### Checking it took effect
 

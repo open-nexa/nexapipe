@@ -388,8 +388,9 @@ domains = ["app.example.com"]
 # ============================================================
 # With this on, every client connection must complete a TOTP handshake before
 # proxying is allowed. The secrets below are the only credential gating the iroh
-# listener, so keep the file private: with enabled = true the server refuses to
-# start when config.toml is readable or writable by another account - chmod 600.
+# listener. Config file permissions are no longer enforced, so keep this file
+# private (chmod 600 is recommended) or move credentials into sidecar files /
+# the environment.
 #
 # Generate a secret and its enrollment QR code (both write the result back into
 # config.toml, so do not point them at the example file itself):

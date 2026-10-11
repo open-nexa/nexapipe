@@ -489,28 +489,6 @@ async fn run_server_mode(
     // Load 2FA auth config
     let auth_config = match ProxyConfig::load_with_auth(config_path) {
         Ok((_, auth_cfg)) => {
-            // The secrets in here are the whole credential, so a permissive
-            // mode is fatal while they are live: every account on the host
-            // could authenticate as every client. So are the endpoint's
-            // secret key and a relay token, which is why a config carrying
-            // either is refused too even with `[auth]` off. One with none of
-            // them is a fixture of Docker deployments and only gets the
-            // warning.
-            //
-            // Outside the `[auth]` block below: the credentials that make a
-            // permissive mode fatal are not all in that section, so a file
-            // without one has to be checked as well — otherwise a config
-            // holding a secret key started unchallenged simply because 2FA
-            // was off.
-            let holds_credentials = auth_cfg.as_ref().is_some_and(|cfg| cfg.enabled)
-                || proxy_config.holds_credentials();
-            if let Err(e) =
-                nexapipe::config::check_config_permissions(config_path, holds_credentials)
-            {
-                tracing::error!("{}", e);
-                std::process::exit(1);
-            }
-
             if let Some(ref cfg) = auth_cfg {
                 if cfg.enabled {
                     tracing::info!(

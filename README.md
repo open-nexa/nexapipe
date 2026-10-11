@@ -190,10 +190,11 @@ secret_key = "8f2a…"
 ```
 
 The file is rewritten through the same locked, atomic write the 2FA commands
-use, so your comments and the rest of the config survive. That also means the
-config file is now **private** (`0600`), because it holds a private key — which
-is the mode the startup permission check requires of a config with a credential
-in it.
+use, so your comments and the rest of the config survive. That write creates
+the file **private** (`0600`) on Unix, but the mode is no longer enforced: a
+`0644` config — a Docker bind mount arrives that way — starts fine. The
+credentials inside are then readable by every account, so either keep the
+file private or move the key out of it (below).
 
 Two things are worth knowing about that:
 
@@ -296,8 +297,10 @@ goes wrong:
   running. (A config *without* the key used to be a way to hit this too; the
   server now writes one on first start, so the key is there.)
 - **Mode and ownership change under you.** A rewrite from the host can land the
-  file at `0644` or with a different owner. A config holding a credential is then
-  refused at startup, and a reload cannot turn 2FA on until it is `0600` again.
+  file at `0644` or with a different owner. That no longer stops the server —
+  config permissions are not checked — but any account that can read the file
+  can copy every credential in it, so keep it private or move the credentials
+  into a sidecar file or the environment.
 
 The mount is read-write on purpose: the server writes `[iroh] secret_key` into
 `config.toml` on the first start, and the 2FA counters back into it after every
@@ -329,6 +332,7 @@ sudo mkdir -p /etc/nexapipe
 sudo cp config.toml.example /etc/nexapipe/config.toml
 sudo chown -R nexapipe:nexapipe /etc/nexapipe
 sudo chmod 700 /etc/nexapipe
+# Recommended hardening; no longer required for the server to start.
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
@@ -349,10 +353,10 @@ ExecStart=/usr/local/bin/nexapipe --config /etc/nexapipe/config.toml
 Restart=on-failure
 RestartSec=5s
 
-# Read only if it exists: the leading `-` is what makes it optional. The only
-# two settings the server reads from its environment are NEXAPIPE_LOG_DIR and
-# NEXAPIPE_MAX_CONNS_PER_PEER — nothing else can be moved out of config.toml,
-# so a secret stays in the config and the config stays 0600.
+# Read only if it exists: the leading `-` is what makes it optional. Besides
+# NEXAPIPE_LOG_DIR and NEXAPIPE_MAX_CONNS_PER_PEER, the iroh key and relay
+# token can be supplied from the environment or a sidecar file, so a read-only
+# config does not have to carry credentials.
 EnvironmentFile=-/etc/nexapipe/nexapipe.env
 
 # ProtectSystem=strict makes every path read-only except the ones named here.
@@ -405,19 +409,19 @@ every restart. `ReadWritePaths` is that one directory and nothing wider.
 `NEXAPIPE_NO_PERSIST_IDENTITY=1` is the way to run without a writable config, at
 the cost of a Node ID that does not survive a restart.
 
-**`0600` and owned by `nexapipe`, after every edit.** A config holding `[auth]`
-secrets, an `[iroh] secret_key` or a `relay_auth_token` that any other account
-can read is **refused at startup** — the process exits 1 rather than serving with
-credentials every account can copy — and a reload cannot turn 2FA on until the
-mode is fixed. Editing as root is the ordinary way to lose this: `sudo -u
-nexapipe $EDITOR /etc/nexapipe/config.toml`, or `chown` and `chmod` when you did
-not.
+**Keep it `0600` and owned by `nexapipe`, after every edit — recommended, not
+enforced.** Config file permissions are no longer checked, so a `0644` config
+starts, but one holding `[auth]` secrets, an `[iroh] secret_key` or a
+`relay_auth_token` then hands every credential to any account that can read
+the file. Prefer moving those into a sidecar file (which is still enforced
+`0600`) or the environment. Editing as root is the ordinary way a private mode
+gets lost: `sudo -u nexapipe $EDITOR /etc/nexapipe/config.toml`, or `chown`
+and `chmod` when you did not.
 
 **A config edit needs no reload.** The file is re-read every 5 seconds, and
 `systemctl reload` against a unit with no `ExecReload` gets you a warning and
 nothing else. The watcher is also what refuses a bad edit: a change that does
-not parse, or one that left the file readable by others, is reported and the
-routes already serving stay up.
+not parse is reported and the routes already serving stay up.
 
 Two things that are not systemd's. **Open the tunnel's UDP port** — set `[iroh]
 bind_port`, because without it the endpoint takes an ephemeral one and there is
@@ -954,7 +958,7 @@ is one table:
 | Key | On reload |
 |---|---|
 | `[[routes]]` | Applied. Backends are re-probed; connections already open keep the route they were authorized against. |
-| `[auth]` | Applied, including `enabled` — turning 2FA on gates connections opened after the reload. A file holding secrets has to be `0600` or the reload is refused. |
+| `[auth]` | Applied, including `enabled` — turning 2FA on gates connections opened after the reload. Config file permissions are no longer checked; keep the file private or move its secrets out. |
 | `[health_check]` | Applied. `enabled` pauses and resumes probing; the rest takes effect for routes added or changed by a reload. |
 | `[timeouts]` | Restart-only: read once at startup, like `[server] listen_addr`. |
 | `[peers] allow` | Restart-only for now. |
@@ -1167,11 +1171,14 @@ was started with no `[auth]` section at all. The TOTP parameters
 (`algorithm`, `time_step`, `digits`) are read once at startup and need a restart;
 see `config.toml.2fa.example`.
 
-Those secrets are the *only* credential gating the iroh listener, so the server
-**refuses to start** when `config.toml` holds a credential — a TOTP seed, an
-`[iroh] secret_key`, or a `relay_auth_token` — and is readable or writable by
-another account (`chmod 600 config.toml`). A config holding none of them logs the
-same warning and starts, which is what a Docker bind mount arrives as. A client
+Those secrets are the *only* credential gating the iroh listener. Config file
+permissions are no longer enforced — a `0644` config starts — so it is on the
+operator to keep `config.toml` private (`chmod 600 config.toml` is still
+recommended), or to move credentials into a sidecar file (`secret_key_file`,
+`relay_auth_token_file`, the `config.toml.admin-token`) or the environment
+(`NEXAPIPE_IROH_SECRET_KEY`, `NEXAPIPE_IROH_SECRET_KEY_FILE`,
+`NEXAPIPE_RELAY_AUTH_TOKEN`). The sidecar files themselves are still enforced
+`0600` and refuse the load otherwise. A client
 with no credentials against a
 server that requires them is refused too: the QUIC handshake succeeds, and the
 server closes the connection once the handshake deadline (5 s) passes.
