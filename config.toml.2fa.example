@@ -28,7 +28,7 @@
 # catch-all route (see the `host_pattern = "*"` entry below), which is also
 # load-balanced and health-checked. `passthrough` and `tcp`/`udp` lookups never
 # had a fallback and still have none.
-debug = true
+#debug = false
 
 [server]
 # Left unset, i.e. the plaintext listener stays closed. It is the one entry
