@@ -44,13 +44,20 @@ fn empty_dir() -> (tempfile::TempDir, PathBuf) {
 /// that gap; the child is killed on timeout, the test process exiting will
 /// reap anything else.
 fn start_until_node_id(config: &Path) -> (String, Child) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
+    command
         .args(["--config", config.to_str().expect("utf-8 path")])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn nexapipe");
+        .stderr(Stdio::piped());
+    start_until_node_id_with(command)
+}
+
+/// Same as [`start_until_node_id`], but lets the caller configure the
+/// `Command` before it is spawned. Used by tests that need to set env vars
+/// (e.g. `NEXAPIPE_CONFIG_DIR`) rather than pass `--config` explicitly.
+fn start_until_node_id_with(mut command: Command) -> (String, Child) {
+    let mut child = command.spawn().expect("spawn nexapipe");
     let stdout = child.stdout.take().expect("stdout is piped");
 
     // The reader thread owns the pipe and exits when stdout EOFs (the child
@@ -439,5 +446,58 @@ fn local_proxy_does_not_create_a_config() {
         !path.exists(),
         "--local-proxy must not leave a server-style config behind: {}",
         path.display()
+    );
+}
+
+/// `NEXAPIPE_CONFIG_DIR` shifts the default config path the binary uses when
+/// `--config` is not given. The docker setup relies on this: with the env var
+/// unset the default is `./config.toml`, and with it set the default is
+/// `<dir>/config.toml` — the same path the docker-compose bind-mount resolves
+/// to inside the container.
+///
+/// The whole point of the env var is that a fresh start works without an
+/// operator having to mkdir anything. Regression: a previous version opened
+/// the lock file `<path>.lock` before the parent directory existed, and the
+/// start aborted with `cannot open ...lock: 系统找不到指定的路径` — leaving
+/// the operator with no config and a misleading "the file is still in cwd"
+/// impression. This test pins the happy path: with the env var set and no
+/// `--config`, the file lands at `<dir>/config.toml`, and the dir is created
+/// if it was missing.
+#[test]
+fn the_env_var_shifts_the_default_config_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A subdirectory inside the tempdir, the way docker-compose mounts a
+    // bind target — the parent dir does not exist when the binary starts.
+    let config_dir = dir.path().join("config");
+    assert!(!config_dir.exists(), "the parent must start missing");
+
+    // Run with the env var set and *no* `--config`, so the default path is
+    // what `compute_default_config()` returns. The server does not exit on
+    // its own — `start_until_node_id` waits for the Node ID line on stdout,
+    // which means the server has reached the "running" state and the auto
+    // write has already landed. We kill it before reading the file so the
+    // config lock is released.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_nexapipe"));
+    command
+        .env(
+            "NEXAPIPE_CONFIG_DIR",
+            config_dir.to_str().expect("utf-8 path"),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (_node_id, mut child) = start_until_node_id_with(command);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let config_path = config_dir.join("config.toml");
+    assert!(
+        config_path.exists(),
+        "the env var must shift the default to <dir>/config.toml: {}",
+        config_path.display(),
+    );
+    assert!(
+        !dir.path().join("config.toml").exists(),
+        "no file at the old default path (cwd) — the env var fully overrides it"
     );
 }

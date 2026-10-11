@@ -895,6 +895,14 @@ const FIRST_RUN_CONFIG: &str = include_str!("../templates/first-run-config.toml"
 /// routes and credentials. `create_new` makes the second step safe by failing
 /// rather than overwriting.
 ///
+/// `create_new` only succeeds when the parent directory already exists, so
+/// the parent is created with `fs::create_dir_all` first. That is what
+/// makes the docker default path (`<NEXAPIPE_CONFIG_DIR>/config.toml`)
+/// work for a fresh start: `docker-compose.yaml` binds the directory the
+/// env var names into the container, but a first start that runs before
+/// any config has been written would otherwise fail with "no such file or
+/// directory" on the lock file `with_config_lock` opens.
+///
 /// Under the config lock, on principle: the lock no longer *needs* to be
 /// taken, because `create_new` is already atomic. Kept for symmetry with the
 /// rest of the config writers — it serialises a `ensure_config_file` call
@@ -907,6 +915,19 @@ const FIRST_RUN_CONFIG: &str = include_str!("../templates/first-run-config.toml"
 pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
     if Path::new(path).exists() {
         return Ok(false);
+    }
+
+    // `with_config_lock` opens `<path>.lock` and that fails when the parent
+    // directory does not yet exist, so the directory is created before the
+    // lock is taken. The lock file is otherwise useless: every write of this
+    // path goes through this function and through the other writers in this
+    // crate, all of which take the same lock. Idempotent — running it on a
+    // directory that already exists is a no-op.
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
     }
 
     with_config_lock(path, || {
