@@ -10,6 +10,33 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+### Changed
+
+- **A stable Node ID no longer takes two manual steps.** A config with no
+  `[iroh] secret_key` gets one generated on the first start and written back
+  into `config.toml`, so the endpoint's identity survives a restart without
+  running `--generate-secret` and pasting the result. This is what a client that
+  stores `server_node_id` depends on, and skipping it used to leave the server
+  on a different Node ID after every restart — silently, since the server came up
+  fine and served traffic both times. The write goes through the same locked,
+  atomic path as the 2FA commands, so comments and the rest of the config
+  survive, and the file lands at `0600` because it now holds a private key.
+
+  Two behaviours come with it, both deliberate: a `secret_key` that does not
+  parse **refuses the start** (it used to be a warning and a throwaway
+  identity, which looked handled while the Node ID quietly changed every
+  restart), and a config that cannot be written **still starts**, on a throwaway
+  identity with a warning — a read-only mount or a file owned by another user is
+  an ordinary deployment, and refusing there would be worse than the behaviour
+  this replaces. `NEXAPIPE_NO_PERSIST_IDENTITY=1` asks for that ephemeral
+  identity deliberately and leaves the file untouched.
+
+  Deployments that relied on a fresh Node ID per restart should set that
+  variable; everything else needs no change, and `--generate-secret` remains
+  for moving an identity between hosts.
+
 ## [0.6.0] — 2026-10-11
 
 A readable version of this release, with downloads, is published at

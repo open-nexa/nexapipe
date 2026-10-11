@@ -157,14 +157,40 @@ Ticket (for clients):                 endpoint:...
 ```
 
 Give clients either the **Node ID** (stable, but it needs discovery) or the
-**Ticket** (carries addresses, so it changes when they do). Set
-`[iroh] secret_key` to keep the Node ID stable across restarts — and with it
-everything the Node ID is used for. A ticket is a different matter: it embeds
-the addresses it was printed with, so a `secret_key` does not stop it going
-stale, and it has to be regenerated when the endpoint moves.
+**Ticket** (carries addresses, so it changes when they do).
+
+**You do not have to set `[iroh] secret_key` yourself.** When it is missing, the
+server generates one on the first start, writes it back into `config.toml` under
+`[iroh]`, and uses it from then on — so the Node ID is stable from the very first
+run without a copy-paste:
+
+```toml
+[iroh]
+# written by nexapipe on first start; delete the line to have a new one made
+secret_key = "8f2a…"
+```
+
+The file is rewritten through the same locked, atomic write the 2FA commands
+use, so your comments and the rest of the config survive. That also means the
+config file is now **private** (`0600`), because it holds a private key — which
+is the mode the startup permission check requires of a config with a credential
+in it.
+
+Two things are worth knowing about that:
+
+- **A `secret_key` that does not parse refuses the start.** It used to be a
+  warning and a throwaway identity, which left the endpoint on a different Node
+  ID after every restart while looking handled. Delete the line to have a
+  working one generated, or paste the output of `--generate-secret`.
+- **A config that cannot be written still starts**, on a throwaway identity, with
+  a warning — a read-only mount or a file owned by another user is an ordinary
+  deployment, and refusing to start there would be worse than the fresh Node ID
+  this replaces. The Node ID then changes on every restart. Set
+  `NEXAPIPE_NO_PERSIST_IDENTITY=1` to ask for that deliberately and leave the
+  file alone.
 
 ```bash
-cargo run -p nexapipe -- --generate-secret
+cargo run -p nexapipe -- --generate-secret   # only to move an identity between hosts
 ```
 
 ### Docker
@@ -226,16 +252,21 @@ goes wrong:
   one of them. A `pending_enrollment` token is the worst case: the server never
   writes it back, so losing the race costs you the invite and prints nothing.
 - **The host binary is not the server's binary.** `--generate-invite` derives the
-  endpoint from `[iroh] secret_key`, so a host copy of the config without that
-  key — or a `nexapipe` built from another commit — issues an invite pointing at
-  an endpoint nobody is running.
+  endpoint from `[iroh] secret_key`, so a `nexapipe` built from another commit
+  than the running one can issue an invite pointing at an endpoint nobody is
+  running. (A config *without* the key used to be a way to hit this too; the
+  server now writes one on first start, so the key is there.)
 - **Mode and ownership change under you.** A rewrite from the host can land the
   file at `0644` or with a different owner. A config holding a credential is then
   refused at startup, and a reload cannot turn 2FA on until it is `0600` again.
 
-The mount is read-write on purpose: the server writes the 2FA counters back into
-the file, so a `:ro` mount would cost a lockout its persistence and log an error
-on every attempt.
+The mount is read-write on purpose: the server writes `[iroh] secret_key` into
+`config.toml` on the first start, and the 2FA counters back into it after every
+attempt, so a `:ro` mount would cost a lockout its persistence and log an error
+on every attempt — and leave the Node ID changing on every restart. Set
+`NEXAPIPE_NO_PERSIST_IDENTITY=1` if the config genuinely has to stay read-only,
+and pin `[iroh] secret_key` by hand in that case, so the identity at least
+survives.
 
 Editing with an editor is fine as long as it saves in place — the default for
 `vim` and for a shell `>` redirect. Whatever you changed, confirm the server
@@ -328,9 +359,12 @@ credential file in `/etc` is not one of them.
 **The config directory has to stay writable.** The server writes back into
 `config.toml` — the 2FA `failed_attempts` / `locked_until` counters, an enrolled
 device's secret and its `last_used` — and writes `config.toml.admin-token`
-beside it the first time it starts. `ReadWritePaths` is that one directory and
-nothing wider. A deployment that never needs it is one with 2FA off and no
-enrollment.
+beside it the first time it starts. On the very first start it writes there too,
+adding `[iroh] secret_key` when the config has none: a deployment that never
+enrolls a client still needs the directory writable, or the Node ID changes on
+every restart. `ReadWritePaths` is that one directory and nothing wider.
+`NEXAPIPE_NO_PERSIST_IDENTITY=1` is the way to run without a writable config, at
+the cost of a Node ID that does not survive a restart.
 
 **`0600` and owned by `nexapipe`, after every edit.** A config holding `[auth]`
 secrets, an `[iroh] secret_key` or a `relay_auth_token` that any other account
@@ -382,7 +416,7 @@ will name.
 | --- | --- |
 | `-c, --config <PATH>` | Config file (default `config.toml`). |
 | `--local-proxy` | Run as a client-side local HTTP proxy instead of a server. |
-| `--generate-secret` | Print a new iroh secret key for a stable endpoint identity. |
+| `--generate-secret` | Print a new iroh secret key. Usually unnecessary — the server writes `[iroh] secret_key` on first start; this is for moving an identity between hosts. |
 | `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print the enrollment QR code. |
 | `--force` | With `--generate-2fa`: rotate an existing client's secret. |
 | `--show-2fa <CLIENT_ID>` | Print the QR code of a client already in `[auth.clients]`. |
@@ -495,7 +529,7 @@ What the short forms leave out, and what you get instead:
 | Omitted | You get |
 | --- | --- |
 | `[server] listen_addr` | no plaintext listener — traffic comes in over iroh only |
-| `[iroh] secret_key` | a fresh Node ID on every restart; add one (`--generate-secret`) when clients should not lose track of the server |
+| `[iroh] secret_key` | a stable Node ID, written into the config on first start if you leave it out. Set `NEXAPIPE_NO_PERSIST_IDENTITY=1` for the old behaviour (a fresh Node ID every restart, config untouched) |
 | `[iroh] relay_mode` | `default`: N0 relays, home relay picked by latency |
 | `mode` | `http` |
 | `path_pattern` | `/`, prefix match |
@@ -555,7 +589,7 @@ startup — delete them and see [TLS](#tls).
 
 | Key | Notes |
 | --- | --- |
-| `secret_key` | Hex secret key from `--generate-secret`; keeps the Node ID stable. |
+| `secret_key` | Optional. The server generates one on first start and writes it here when absent, so the Node ID is stable without you setting it. Set it by hand only to move an identity between hosts, or to keep one when the file cannot be written. A value that does not parse refuses the start. |
 | `bind_port` | Fixed UDP port instead of an ephemeral one. |
 | `bind_ipv6` | Also bind `[::]` on that port, so the endpoint answers over IPv6. The IPv4 socket stays — this adds one, it does not replace one — and the IPv6 bind is allowed to fail, so a host without IPv6 still starts. Ignored without `bind_port`. |
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`. Absent means `default`. |

@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::{
-    AdminConfig, ClientSecretWrite, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
+    AdminConfig, ClientSecretWrite, EndpointIdentity, IrohConfig, LocalProxyConfig, ProxyConfig,
+    ServerConfig,
 };
 use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
@@ -246,14 +247,20 @@ async fn main() {
 
     // Handle --generate-secret flag
     if cli.generate_secret {
-        let secret_key = SecretKey::generate();
-        // Convert to hex string for storage
-        let secret_key_hex = hex::encode(secret_key.to_bytes());
+        // Printing a key is not the same thing as giving the endpoint one: this
+        // writes nothing, and a copy-paste is still the operator's job. The
+        // startup path generates and persists a key on its own
+        // (`ProxyConfig::ensure_iroh_secret_key`); this stays for generating one
+        // to move between hosts, or to seed a config before its first run.
+        let secret_key_hex = nexapipe::config::generate_secret_key_hex();
         println!("Generated secret key for stable endpoint identity:");
         println!("{}", secret_key_hex);
         println!();
         println!("Add this to your config.toml under [iroh] section:");
         println!("secret_key = \"{}\"", secret_key_hex);
+        println!();
+        println!("Or skip this entirely: nexapipe writes [iroh] secret_key on first start");
+        println!("when the key is missing.");
         return;
     }
 
@@ -314,6 +321,26 @@ async fn main() {
     // Last chance to notice configuration that TLS termination left behind.
     proxy_config.warn_removed_tls_keys();
 
+    // The endpoint's identity, generated and written back to `config.toml` if it
+    // has none. Before `log::init` would mean a warning nobody sees; after the
+    // permission check would mean writing a credential into a file that check
+    // is about to refuse. Here it sits in both gaps' place: logged, and before
+    // anything reads the file's mode.
+    //
+    // Local-proxy mode is skipped: it is the client half, and the endpoint it
+    // dials is somebody else's identity.
+    let identity = if cli.local_proxy {
+        None
+    } else {
+        match ProxyConfig::ensure_iroh_secret_key(&cli.config, &proxy_config) {
+            Ok(identity) => Some(identity),
+            Err(e) => {
+                tracing::error!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    };
+
     if debug_enabled {
         tracing::info!("Debug mode enabled");
     }
@@ -329,7 +356,13 @@ async fn main() {
     if cli.local_proxy {
         run_local_proxy_mode(&proxy_config, &shutdown_signal).await;
     } else {
-        run_server_mode(&proxy_config, &cli.config, &shutdown_signal).await;
+        run_server_mode(
+            &proxy_config,
+            &cli.config,
+            identity.as_ref(),
+            &shutdown_signal,
+        )
+        .await;
     }
 
     // The server mode has already drained its connections by the time it
@@ -340,12 +373,26 @@ async fn main() {
 async fn run_server_mode(
     proxy_config: &ProxyConfig,
     config_path: &str,
+    identity: Option<&EndpointIdentity>,
     shutdown_signal: &Arc<ShutdownSignal>,
 ) {
     let server_config: Option<ServerConfig> = proxy_config.server.clone();
-    let iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
+    let mut iroh_config: Option<IrohConfig> = proxy_config.iroh.clone();
     let admin_config: Option<AdminConfig> = proxy_config.admin.clone();
     let metrics_config = proxy_config.metrics;
+
+    // The resolved identity overrides whatever `[iroh] secret_key` the config
+    // holds, because it is that key or the one written in its place.
+    //
+    // On the *endpoint's* copy only. `proxy_config` stays as it was loaded,
+    // because `holds_credentials()` is asked about the file on disk further
+    // down and an ephemeral identity was never written there — folding it in
+    // would make a read-only deployment refuse to start over a key that is not
+    // in the file, which is the one case an ephemeral identity exists for.
+    if let Some(identity) = identity {
+        iroh_config.get_or_insert_with(Default::default).secret_key =
+            Some(identity.key().to_string());
+    }
 
     // Same builder the config watcher calls on a reload: a route that works
     // after a restart must work without one too. A bad config is fatal here,
