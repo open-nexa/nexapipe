@@ -2592,9 +2592,18 @@ fn write_key_file(path: &Path) -> anyhow::Result<String> {
     let hex = hex::encode(key.to_bytes());
     match create_private_file(path) {
         Ok(mut file) => {
-            file.write_all(hex.as_bytes())
-                .and_then(|_| file.flush())
-                .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+            // sync_all, not flush: for a regular file flush is nearly a no-op,
+            // and a crash between write and durability could leave a truncated
+            // key on disk that the next start refuses with "holds nothing".
+            // A failed write removes the file too — otherwise this one failure
+            // would leave an empty file behind that makes every later start
+            // refuse instead of regenerating. The handle must be dropped first
+            // so the remove works on Windows as well.
+            if let Err(e) = file.write_all(hex.as_bytes()).and_then(|_| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                anyhow::bail!("cannot write {}: {e}", path.display());
+            }
             Ok(hex)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2609,6 +2618,10 @@ fn write_key_file(path: &Path) -> anyhow::Result<String> {
             if existing.is_empty() {
                 anyhow::bail!("{} appeared and holds nothing", path.display());
             }
+            // The winner of the race wrote the file, not us, so hold it to the
+            // same permission rule a normal load applies: a 0644 key a sibling
+            // account dropped in is refused the same way it would be on reload.
+            check_config_permissions(&path.to_string_lossy(), true)?;
             Ok(existing.to_string())
         }
         Err(e) => Err(e).map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display())),
@@ -3938,12 +3951,19 @@ pending_enrollment = "TOKEN"
             "a first start generates into the pointed-to file, got {identity:?}"
         );
 
-        let key =
+        // Compare and measure without formatting the key: a failing
+        // assert_eq! would render both values, putting the private key in the
+        // CI log the same way EndpointIdentity's Debug refuses to.
+        let file_key =
             fs::read_to_string(dir.path().join("iroh.key")).expect("the key file was written");
-        assert_eq!(key.trim().len(), 64, "a full ed25519 key, not {key:?}");
+        let file_key = file_key.trim();
         assert_eq!(
-            identity.key(),
-            key.trim(),
+            file_key.len(),
+            64,
+            "the file holds a full ed25519 key (64 hex chars)"
+        );
+        assert!(
+            identity.key() == file_key,
             "the running identity is the key in the file"
         );
 
@@ -3980,6 +4000,26 @@ pending_enrollment = "TOKEN"
 
         let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
             .expect_err("a world-readable credential file is refused");
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+    }
+
+    /// A key file that appears between the load and the generation — the lost
+    /// race `write_key_file` reads back — is held to the same 0600 rule as a
+    /// file a normal load points at: a nonempty 0644 winner is refused rather
+    /// than adopted.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_race_winner_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_path = dir.path().join("iroh.key");
+        fs::write(&key_path, generate_secret_key_hex())
+            .expect("a sibling process drops a nonempty 0644 key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+        let err = write_key_file(&key_path)
+            .expect_err("the lost-race read-back applies the same permission refusal");
         assert!(err.to_string().contains("chmod 600"), "{err}");
     }
 
