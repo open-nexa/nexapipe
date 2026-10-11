@@ -10,10 +10,12 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## [Unreleased]
+## [0.6.1] — 2026-10-11
 
-No configuration key is added, removed or renamed. Four things behave
-differently without being configured to:
+Two configuration keys are added (`[iroh] secret_key_file` and
+`relay_auth_token_file`) and none is removed or renamed, so a `config.toml`
+that works on 0.6.0 still loads. Five things behave differently without being
+configured to:
 
 - A config with no `[iroh] secret_key` gets one generated on the first start
   and written back into `config.toml` — see `### Changed` below.
@@ -26,6 +28,8 @@ differently without being configured to:
 - A `0644` `config.toml` no longer refuses a start or a 2FA-enabling
   reload — config permissions are not checked anymore, see `### Changed`
   below.
+- The `[iroh]` identity and relay token can come from the environment or a
+  separate file instead of the inline literal — see `### Added` below.
 
 ### Changed
 
@@ -77,7 +81,25 @@ differently without being configured to:
   variable; everything else needs no change, and `--generate-secret` remains
   for moving an identity between hosts.
 
+- **Docs: the invite QR code renders with correct line spacing on macOS.**
+  The generated page used a line-height that collapsed the code block on
+  Safari; it now carries an explicit line-height so the QR image and the
+  surrounding text line up the same on every browser.
+
 ### Added
+
+- **`[iroh]` credentials can come from a file or the environment.** Two
+  keys point at a separate file holding the value instead of spelling it
+  inline: `secret_key_file` for the endpoint identity and
+  `relay_auth_token_file` for the relay bearer token; relative paths are
+  read against the config file's directory. Two environment variables carry
+  the value directly: `NEXAPIPE_IROH_SECRET_KEY` and
+  `NEXAPIPE_RELAY_AUTH_TOKEN`. Sources rank environment, then file, then
+  the inline literal, and naming more than one source for one credential
+  is refused at load rather than silently picked — a config that disagrees
+  with itself is a deployment mistake. The sidecar files are still enforced
+  `0600` on Unix and refuse the load otherwise, now that the config file's
+  own mode is no longer checked (see `### Changed`).
 
 - **The endpoint identity can come out of the config directory entirely.**
   `NEXAPIPE_IROH_SECRET_KEY_FILE` names, by *path*, the file holding the
@@ -113,6 +135,15 @@ differently without being configured to:
   `--generate-2fa`, `client list|add|revoke`) do not create the file,
   and `--local-proxy` skips the step too — the template describes a
   server, not a client.
+
+### Fixed
+
+- **Android: the `tun-proxy` feature's stop path is gated on Android.**
+  `nativeStopTunProxy` imported `ndk_context` unconditionally and called an
+  Android-only NDK function, so a host build with `--features tun-proxy`
+  failed to link. Both are now behind `#[cfg(target_os = "android")]`,
+  matching the rest of the JNI surface — the TUN proxy is an Android-only
+  feature, and the host build was never meant to exercise it.
 
 ## [0.6.0] — 2026-10-11
 

@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-10 (Phase 3's six deliverables have shipped; entries closed by v0.6.0 marked in §1, §4, §5 and §9; a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
+| Last updated | 2026-10-11 (v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured); the size-and-performance measurement work moved to [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); entries closed by v0.6.0 marked in §1, §4, §5 and §9; a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -715,7 +715,27 @@ tree says about itself today.
 Gate: validate the premise first. If "visitors must install a client" turns out
 not to be the main reason people walk away, this stays shelved.
 
-### Phase 3.5 — v0.6.1, "weighed"
+### Phase 3.5 — v0.6.1, "configured"
+
+No new routing, authentication or observability capability is opened for this
+release. What it does is lower the friction of bringing a server up for the
+first time, and let an operator keep the endpoint's credentials out of
+`config.toml` entirely. Five items, all around the config surface.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| — | **First-run writes a config and an identity** | A server start with no `config.toml` writes a minimal one (`[auth] enabled = true`, no plaintext listener, no routes), and a config with no `[iroh] secret_key` generates one and writes it back — so a fresh operator has something to edit and an identity that survives a restart, without running `--generate-secret` by hand. A key that does not parse refuses the start; a config that cannot be written still starts on a throwaway identity with a warning. |
+| — | **The default config path is Docker-friendly** | `--config` defaults to `./config/config.toml` (was `./config.toml`), and `NEXAPIPE_CONFIG_DIR` shifts that default to `<dir>/config.toml` — the docker bind-mount target, so the container picks up the operator's file by default. `--config` always wins; nothing else changes. |
+| — | **`[iroh]` credentials can live outside `config.toml`** | `secret_key_file` and `relay_auth_token_file` point at a separate `0600` file; `NEXAPIPE_IROH_SECRET_KEY` and `NEXAPIPE_RELAY_AUTH_TOKEN` carry the value from the environment. Sources rank env → file → inline, and naming more than one for a credential is refused at load. |
+| — | **The identity can live in the secrets directory, with no `[iroh]` table** | `NEXAPIPE_IROH_SECRET_KEY_FILE` names the key file by absolute path; a missing file is generated into on first start, and the key is never written back to `config.toml`. The docker compose setup mounts `./secrets` at `/app/secrets` and wires the variable there. Config-file permissions are no longer checked at start or reload — a `0644` bind mount starts; the sidecar files stay enforced `0600`. |
+| — | **Android: the TUN stop path is gated on Android** | `nativeStopTunProxy` imported `ndk_context` and called an Android-only NDK function unconditionally, so a host build with `--features tun-proxy` failed to link. Both are now `#[cfg(target_os = "android")]`, matching the rest of the JNI surface. |
+
+**Done when:** a newcomer runs `nexapipe` with no `--config`, gets a working
+minimal config and a stable Node ID, and can keep the `secret_key` and
+`relay_auth_token` out of `config.toml` — in a file, the environment, or a
+secrets mount — without a permission gate on the config itself.
+
+### Phase 3.6 — v0.6.2, "weighed"
 
 No new capability is opened for this release, and that is the point: it exists
 because the artifact-size work in [`size-perf-roadmap.md`](size-perf-roadmap.md)
@@ -760,10 +780,16 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── systemd unit ──────────────► v0.6.0
                                               ├── Windows runs the tests ────► v0.6.0
                                               │
+                                              ├── first-run config + identity ► v0.6.1
+                                              ├── config path + CONFIG_DIR ──► v0.6.1
+                                              ├── external [iroh] credentials ► v0.6.1
+                                              ├── secrets-file env + no gate ► v0.6.1
+                                              ├── Android tun-proxy gate ────► v0.6.1
+                                              │
                               R13 edge (after validation) ──► v1.0
 
-        S1 measure ──┬── S2 desktop profile ──┐          (size-perf-roadmap.md)
-                     └── S3 Android R8 ───────┴── S4 budget gate
+        S1 measure (v0.6.2) ──┬── S2 desktop profile ──┐   (size-perf-roadmap.md)
+                               └── S3 Android R8 ───────┴── S4 budget gate
         F1 benches ──────► F2 targeted work ───► F3 perf budget
 ```
 
@@ -778,9 +804,10 @@ not separate out because the two halves share a deliverable. R13 keeps its id
 and its gate; what moved is the phase number above it, because v0.6.0 was
 inserted beneath it. The size and performance chain at the bottom is not part of
 this document's numbering: it is `S*` and `F*` rather than `R*`, and its detail
-lives in [`size-perf-roadmap.md`](size-perf-roadmap.md). Only S1 lands in
-[v0.6.1](#phase-35--v061-weighed), because nothing else in that document can be
-verified until S1 says what the artifacts weigh today.
+lives in [`size-perf-roadmap.md`](size-perf-roadmap.md). S1 lands in
+[v0.6.2](#phase-36--v062-weighed), because nothing else in that document can be
+verified until S1 says what the artifacts weigh today; v0.6.1 carried the
+config-surface improvements above instead.
 
 ---
 
