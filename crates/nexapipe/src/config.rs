@@ -855,6 +855,58 @@ impl ProxyConfig {
     }
 }
 
+/// The config written when there is none: 2FA on, nothing else.
+///
+/// Deliberately small, and deliberately **not** a working proxy: it carries no
+/// `[[routes]]`, so every host is answered 404 until one is added. A generated
+/// backend address would be a guess — `127.0.0.1:3000` is only right by
+/// coincidence — and a wrong one fails every request while looking configured.
+/// The commented route below is the shape to uncomment.
+///
+/// `[auth] enabled = true` is the one setting that is not the operator's to
+/// infer: a config with no `[auth.clients]` refuses every connection, which is
+/// the correct state for a file nobody has written yet. It also means the file
+/// counts as holding a credential, so on Unix it has to be `0600` — which is why
+/// this goes out through [`write_config_file`] rather than `fs::write`.
+///
+/// No `[iroh] secret_key`: the endpoint identity is generated and written back
+/// on first start (see `ensure_iroh_secret_key`), so writing one here would be
+/// a second answer to the same question.
+const FIRST_RUN_CONFIG: &str = include_str!("../templates/first-run-config.toml");
+
+/// Writes a minimal config at `path` when there is none, and reports whether it
+/// did.
+///
+/// Only `NotFound` leads to a write. A file that exists but cannot be read or
+/// parsed is somebody's typo to fix, and generating over it would replace a
+/// config they wrote — or, worse, a half-written one — with a default that
+/// looks deliberate. So the read still happens in [`ProxyConfig::from_file`],
+/// and its error still reaches the operator.
+///
+/// Under the config lock, because the check-then-write is two steps: two servers
+/// started at once would otherwise both see no file and both write, and the
+/// slower one's rename would drop the first one's config on the floor. The lock
+/// is the same one every other writer of this file takes.
+///
+/// Not for every command. `status` reads the config of a process that is
+/// already running and `--generate-2fa` works without one, so neither should
+/// leave a file behind; this is called from the server start path only.
+pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
+    if Path::new(path).exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(path, || {
+        // Re-checked inside the lock: the check above is the fast path, and this
+        // is the one that decides whether anything is written.
+        if Path::new(path).exists() {
+            return Ok(false);
+        }
+        write_config_file(path, FIRST_RUN_CONFIG)?;
+        Ok(true)
+    })
+}
+
 pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrategy {
     match strategy.as_deref() {
         Some("random") | Some("Random") => crate::lb::LoadBalancingStrategy::Random,

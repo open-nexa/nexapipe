@@ -12,6 +12,16 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
+No configuration key is added, removed or renamed. Two things behave
+differently without being configured to:
+
+- A config with no `[iroh] secret_key` gets one generated on the first start
+  and written back into `config.toml` — see `### Changed` below.
+- A server start with `--config <path>` and no file at `<path>` no longer
+  exits with `Config file not found` — it writes a minimal `config.toml`
+  instead, so a fresh operator has something to edit — see `### Added`
+  below.
+
 ### Changed
 
 - **A stable Node ID no longer takes two manual steps.** A config with no
@@ -36,6 +46,23 @@ For what comes next, and for why some things are deliberately not planned, see
   Deployments that relied on a fresh Node ID per restart should set that
   variable; everything else needs no change, and `--generate-secret` remains
   for moving an identity between hosts.
+
+### Added
+
+- **A first start with no `config.toml` writes one for you.** Server mode
+  only, and only when the file is missing — an existing file is never
+  regenerated, and one that exists but does not parse still fails the
+  start rather than being replaced. The generated file has
+  `[auth] enabled = true`, no `[server] listen_addr` (the plaintext
+  listener stays closed), and no `[[routes]]` entry, so every host is
+  answered 404 and nothing can connect until a client is enrolled. The
+  outcome is announced through the log channel — server-mode startup
+  routes advisories through `tracing::info!`, reserving raw stdout for
+  output that carries data the operator needs to act on (Node ID,
+  ticket, invite, QR code). Read-only commands (`status`,
+  `--generate-2fa`, `client list|add|revoke`) do not create the file,
+  and `--local-proxy` skips the step too — the template describes a
+  server, not a client.
 
 ## [0.6.0] — 2026-10-11
 

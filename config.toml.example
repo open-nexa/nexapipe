@@ -7,6 +7,14 @@
 # This is the general example, with 2FA off. See config.toml.2fa.example for the
 # same file with TOTP authentication enabled.
 #
+# No file at the path? On a first server start, the binary writes a minimal
+# `config.toml` for you (2FA on, no routes, no clients) instead of refusing to
+# start. This file is the long version of that — every section written out —
+# for when you want to read it instead of running it. The auto-generated file
+# itself is heavily commented at the top of the template, with the same
+# shape and the same next step: enroll the first client with
+# `nexapipe --generate-invite client-001 --create-client --config config.toml`.
+#
 # Reloading: the file is re-read every 5 seconds. `[[routes]]` is applied live;
 # a config that fails to parse or validate is reported and ignored, so a
 # half-saved edit cannot take the proxy down. `[auth]` and `[auth.clients]` are

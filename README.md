@@ -145,6 +145,25 @@ left at its default. The client side is the same length — see
 defaults to. Start from `config.toml.example` instead when you want every
 section written out, or `config.toml.2fa.example` when you want 2FA on.
 
+Leave the file out entirely and the server writes a minimal `config.toml` for you
+instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is a
+starting point to edit, not a working proxy:
+
+```bash
+cargo run -p nexapipe -- --config config.toml     # writes config.toml, then starts
+```
+
+Two things are true of that file until you change them, and both are the safe
+direction: **no route**, so every host is answered 404; and **no client**, so with
+`[auth] enabled = true` nothing can connect at all. Enroll the first one with
+
+```bash
+cargo run -p nexapipe -- --generate-invite client-001 --create-client --config config.toml
+```
+
+A config that already exists is never regenerated, and one that exists but does
+not parse still fails the start rather than being replaced.
+
 On startup the server prints what clients need:
 
 ```
