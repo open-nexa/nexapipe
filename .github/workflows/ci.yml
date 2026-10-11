@@ -151,11 +151,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every entry here must be a subset of what release.yml passes to
+        # `cargo build -p nexapipe-client`, or the release is compiling a
+        # combination nothing here has ever type-checked.
+        #
+        # `jni,local-proxy` is that combination: the release cdylib is built
+        # with it on eight non-Android targets. `jni` on its own was missing
+        # from this matrix until v0.6.0, and the gap shipped a release whose
+        # every server archive failed to compile — `stop_tun_proxy` read a
+        # `tun_proxy` field gated behind `tun-proxy` + `android`, so it existed
+        # on every host build and had nothing to read. The `android-ndk` job
+        # below does compile `jni`, but its `target_os` makes the gate true, so
+        # it agreed with the working build and never saw the broken one.
         features:
           - "local-proxy"
           - "tun-proxy" # the shared smoltcp stack (host entry point)
           - "webpki-roots"
           - "uniffi"
+          - "jni,local-proxy" # the release cdylib's feature set, on a host target
     steps:
       - uses: actions/checkout@v7
       - name: Set up Rust
