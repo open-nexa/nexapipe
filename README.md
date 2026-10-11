@@ -1168,6 +1168,13 @@ code stays valid across restarts. Override any of it with `--invite-domains`,
   and `algorithm` — an unknown name is an error, never a silent fallback to SHA1.
 - Keep the code under ~400 characters so it stays easy to scan; the command warns
   when it is longer.
+- **The terminal can break a perfectly good code.** The `unicode` renderer packs
+  two module rows into one text line with half blocks (`▀▄█`), which only works
+  when the terminal's line height equals the glyph height. A terminal with
+  extra line spacing leaves a blank seam between every text line, cutting the
+  symbol into disconnected horizontal bands that no scanner can lock onto. The
+  link itself is fine — it is the same one printed below the code. See
+  [QR codes that will not scan](#qr-codes-that-will-not-scan).
 - An invite that carries `secret=` is a **password in the clear**, and so is its
   QR rendering — anyone who scans it holds that client's credentials.
 - **Revoking one used to mean rotating all.** Deleting the
@@ -1175,6 +1182,44 @@ code stays valid across restarts. Override any of it with `--invite-domains`,
   still takes every device enrolled under that client with it. A device that
   enrolled with a name can now be dropped on its own, and the rest left alone:
   see [`nexapipe client`](#nexapipe-client).
+
+### QR codes that will not scan
+
+A code that scans on one machine and not another is almost never a bad link —
+it is the terminal drawing it. The `unicode` renderer packs **two module rows
+into one text line** using half blocks (`▀`, `▄`, `█`), so the symbol only holds
+together when the terminal's line height is exactly the glyph height. A terminal
+with extra line spacing draws each text line shorter than its slot and leaves a
+blank seam in between. Those seams run the full width of the symbol, so what the
+scanner sees is a stack of disconnected horizontal bands: the data is intact, but
+row synchronisation is lost and detection fails.
+
+**The tell:** the printed code looks correct to you, and the same link scans
+elsewhere. Measuring a screenshot confirms it — pick a horizontal scan line
+across the middle of the symbol and you get alternating ink and white bands on a
+strict period, where a scannable code has no such period.
+
+This bites hardest on **macOS terminals**, where line spacing above 1.0 is
+common: Terminal.app (Settings → Profiles → Text) and iTerm2 (Settings →
+Profiles → Text → Line Spacing) both ship with padding that closes the gap.
+Windows Terminal sets line height to the glyph height, so the same code scans
+there — the usual report is "works over SSH on Windows, fails on my Mac".
+
+Fix it in whichever order suits you:
+
+1. **Set line spacing to 1.0.** Terminal.app: Settings → Profiles → Text → Line
+   spacing `1.0`. iTerm2: Settings → Profiles → Text → Line Spacing `1.0`. The
+   next `--generate-invite` prints seamlessly.
+2. **Write the code to a file.** `--qr-out invite.svg` produces a pixel-exact SVG
+   that no terminal setting can distort — open it in a browser or Preview and
+   scan that. Best option when you cannot change the terminal, e.g. a shared
+   session or a jump host.
+3. **Use `--qr-format ascii`.** Every module is two characters wide, so the
+   symbol does not depend on half-block metrics at all.
+
+If it still will not scan after all three, the link is the suspect: paste it into
+the client's "add endpoint" dialog instead of scanning, which bypasses the
+terminal entirely.
 
 ### Inviting a client that does not exist yet (`--create-client`)
 

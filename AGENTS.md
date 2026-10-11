@@ -65,7 +65,17 @@ No approval is needed for read-only work: answering questions, reading files, se
 - The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "commit it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
 - Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
-## Pre-Push Review (MANDATORY)
+## Push Review — Classify First (MANDATORY)
+
+How much ceremony a push needs depends on what is in it. **Classify the change first, then follow the matching rule.** Do not assume a file extension decides this: what matters is whether the change states an instruction someone will act on.
+
+| Class | Before the push |
+| --- | --- |
+| Code, CI, dependencies, build/release, security posture | **Review first** — subagent, blocking findings resolved before pushing |
+| Documentation that states an operator instruction (commands, flags, config, install steps, security guidance) | **Review first** — the same gate; wrong instructions cost an operator real time |
+| Documentation that is descriptive only (README/ROADMAP prose, internal notes, changelog) | **Assess the risk; if low, push** — see below |
+
+### Review first (classes 1 and 2)
 
 - **A subagent must review the change before any push.** Before `git push` — including a branch that opens or updates a PR — dispatch a review subagent (`Agent` with `subagent_type: "general-purpose"`) and hand it the base ref. It reviews correctness, not style.
 - **Hand it everything the push would carry: the committed range *and* whatever is still uncommitted.** The agent does not commit on its own, so the change usually sits in the working tree, and a three-dot `git diff <base>...HEAD` omits it entirely:
@@ -81,8 +91,33 @@ No approval is needed for read-only work: answering questions, reading files, se
 - **`APPROVED` may still carry non-blocking observations; `CHANGES REQUESTED` means at least one blocking finding is open.** Style, formatting, naming and refactors — anything `cargo fmt` and `cargo clippy` already cover — are reported as non-blocking and never turn the verdict into `CHANGES REQUESTED`.
 - **A blocking finding stops the push.** Fix it, re-run the affected build/test/lint, review again, then push. Repeat until the verdict is `APPROVED`. Never push while a blocking finding is open.
 - **Report the verdict.** State the verdict, the findings and the fixes in the reply that accompanies the push, so the owner sees what was checked.
-- **A green review is not permission to push.** This gate is a precondition for pushing, not an authorization: the commit and the push still need the explicit instruction described in Git Safety Rules.
-- **Documentation-only changes still get a skim** — a reviewer may pass them quickly, but a change is never pushed unreviewed.
+
+### Descriptive docs — assess the risk, then push (class 3)
+
+Prose cannot break the build, and a subagent reading a paragraph about terminal line spacing adds little that reading the paragraph does not. So **make the assessment yourself, state it in the reply, and skip the subagent when the risk is low.**
+
+Run this first:
+
+```bash
+git diff <base>...HEAD --stat
+```
+
+Then all three must hold:
+
+- **Only prose changed.** No code, CI, dependency manifest, build or release script, security boundary — and no real secret, endpoint or credential.
+- **No operator instruction is stated or changed.** Any new or altered command, flag, config key, file path, default value, or platform menu path puts the change in class 1 or 2. Prose that *explains* a mechanism, without telling anyone to run anything, stays in class 3.
+- **A wrong statement would mislead, not damage.** It may cost a reader understanding, but not their data, their machines or their deployments.
+
+All three low → **push, and say so in the reply: what changed, that it is prose only, and that no subagent review was run.** Any one fails → review first.
+
+**Skip the review, not the check.** A low-risk verdict still means reading your own diff end to end before pushing, and it never relaxes the worktree or commit rules.
+
+### Always applies
+
+- **A green review is not permission to push.** The gate is a precondition for pushing, not an authorization: the commit and the push still need the explicit instruction described in Git Safety Rules.
+- **The owner may ask for a review anyway**, for any class, and may override this section in the current task.
+- **When the class is unclear, review.** An unnecessary review costs minutes; a wrong install instruction costs a broken deployment.
+
 
 ## Git Workflow — Worktrees & Branch Base (MANDATORY)
 
