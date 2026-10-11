@@ -3755,13 +3755,28 @@ pending_enrollment = "TOKEN"
         assert!(!parse("").holds_credentials());
     }
 
+    /// Restricts a credential file the test creates to the owner, the way a
+    /// real deployment has to for the load to succeed — a `fs::write` file is
+    /// 0644 under the default umask, and `read_credential_file` rightly refuses
+    /// that on Unix. Outside Unix there are no modes to set.
+    #[cfg(unix)]
+    fn chmod_owner_only(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    }
+
+    #[cfg(not(unix))]
+    fn chmod_owner_only(_path: &std::path::Path) {}
+
     /// A key in a pointed-to file reaches the config resolved, and — the point
     /// of the pointer — does not make the config a credential holder.
     #[test]
     fn a_key_file_resolves_and_leaves_the_config_credential_free() {
         let dir = tempfile::tempdir().expect("temp dir");
         let key = generate_secret_key_hex();
-        fs::write(dir.path().join("iroh.key"), &key).expect("write the key file");
+        let key_path = dir.path().join("iroh.key");
+        fs::write(&key_path, &key).expect("write the key file");
+        chmod_owner_only(&key_path);
         let path = dir.path().join("config.toml");
         fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
 
@@ -3859,8 +3874,9 @@ pending_enrollment = "TOKEN"
     #[test]
     fn a_relay_token_file_resolves() {
         let dir = tempfile::tempdir().expect("temp dir");
-        fs::write(dir.path().join("relay.token"), "  bearer-token  \n")
-            .expect("write the token file");
+        let token_path = dir.path().join("relay.token");
+        fs::write(&token_path, "  bearer-token  \n").expect("write the token file");
+        chmod_owner_only(&token_path);
         let path = dir.path().join("config.toml");
         fs::write(&path, "[iroh]\nrelay_auth_token_file = \"relay.token\"\n")
             .expect("write the config");
