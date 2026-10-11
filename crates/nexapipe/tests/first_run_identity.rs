@@ -10,7 +10,11 @@
 //! So these drive the binary the way an operator does and pin three things: the
 //! key lands in the config file without anyone asking, the Node ID that comes
 //! out is the same one the next start produces, and the escape hatch
-//! (`NEXAPIPE_NO_PERSIST_IDENTITY`) really does keep the file untouched.
+//! (`NEXAPIPE_NO_PERSIST_IDENTITY`) really does keep the file untouched. The
+//! external sources (`NEXAPIPE_IROH_SECRET_KEY`, a pointed-to
+//! `secret_key_file`) are driven here too: they are the same identity
+//! machinery, and the environment can only be observed through a child
+//! process.
 //!
 //! Each server is started with the relay disabled, so a test needs no network
 //! and no discovery — the same reason `data_plane.rs` binds loopback
@@ -336,5 +340,111 @@ fn a_broken_key_refuses_to_start() {
     assert!(
         configured_secret_key(&path).as_deref() == Some("not-a-key"),
         "the operator's typo has to survive so they can see it:\n{text}"
+    );
+}
+
+/// `NEXAPIPE_IROH_SECRET_KEY` supplies the identity without the config ever
+/// holding it.
+///
+/// The end of the ladder that starts with the inline `secret_key` and steps
+/// down through `secret_key_file`: a deployment that keeps credentials out of
+/// the config file entirely. The endpoint has to run on the key the variable
+/// carries, and the file has to come back untouched — a server that wrote a
+/// key into the config anyway would undo the deployment's whole reason for the
+/// variable.
+#[test]
+fn the_env_var_supplies_the_identity_without_touching_the_config() {
+    let (_dir, path) = scratch_config();
+    let before = fs::read_to_string(&path).expect("read the config");
+    let key = nexapipe::config::generate_secret_key_hex();
+
+    let (node_id, mut child) = start_until_node_id(&path, &[("NEXAPIPE_IROH_SECRET_KEY", &key)]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // The Node ID the server printed is the public half of the key the
+    // variable carried — the same derivation the on-disk case asserts.
+    let derived = iroh::SecretKey::from_bytes(
+        &hex::decode(&key)
+            .expect("the generated key is hex")
+            .try_into()
+            .expect("32 bytes"),
+    )
+    .public();
+    assert_eq!(
+        node_id,
+        derived.to_string(),
+        "the endpoint has to run on the key from the environment"
+    );
+    assert_eq!(
+        configured_secret_key(&path),
+        None,
+        "nothing may be written when the key came from the environment"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("the config is still there"),
+        before,
+        "the file has to come back byte for byte"
+    );
+
+    // And the config, read back the way the permission check reads it, holds
+    // no credential: the key is not in the file for anyone to see.
+    let reloaded = nexapipe::config::ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+        .expect("the config still parses");
+    assert!(
+        !reloaded.holds_credentials(),
+        "a config whose key lives in the environment holds no credential, so the \
+         permission gate keeps warning instead of refusing"
+    );
+}
+
+/// The variable and the literal naming the same key refuses the start.
+///
+/// A silent winner would leave the endpoint on whichever Node ID the
+/// precedence rules picked — a config that says two things has to be fixed,
+/// not adjudicated. The inline value is deliberately unparseable, so the only
+/// error this start can produce is the ambiguity one.
+#[test]
+fn an_env_key_alongside_an_inline_one_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [iroh]\n\
+         relay_mode = \"disabled\"\n\
+         secret_key = \"not-a-key\"\n",
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args(["--config", path.to_str().expect("utf-8 path")])
+        .env(
+            "NEXAPIPE_IROH_SECRET_KEY",
+            nexapipe::config::generate_secret_key_hex(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe")
+        .wait_with_output()
+        .expect("nexapipe refuses to start, so it exits");
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a config naming the key twice must not start:\n{text}"
+    );
+    assert!(
+        text.contains("named by") && text.contains("NEXAPIPE_IROH_SECRET_KEY"),
+        "the refusal names both sources:\n{text}"
     );
 }
