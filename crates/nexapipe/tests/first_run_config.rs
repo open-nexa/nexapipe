@@ -145,10 +145,12 @@ fn the_generated_config_enables_2fa_with_no_clients() {
 
 /// The file is created private on Unix.
 ///
-/// The generated config turns 2FA on, which `holds_credentials` counts, so the
-/// startup permission check *refuses to start* a world-readable one. Creating
-/// it 0644 by umask and tightening it after the write would mean the server
-/// refuses to start on the file it wrote itself.
+/// With `[auth] enabled = true`, the startup permission check (`run_server_mode`,
+/// `auth_cfg.enabled || holds_credentials()`) refuses to start a world-readable
+/// config. `write_config_file` opens the temp file at mode 0600 up front, so the
+/// secrets are never on disk at the umask default — tightening the mode after
+/// the write would leave them at 0644 for the length of the write, and the
+/// server would then refuse to start on the file it wrote itself.
 #[cfg(unix)]
 #[test]
 fn the_generated_config_is_private_on_unix() {
@@ -266,6 +268,102 @@ fn status_does_not_create_a_config() {
     assert!(
         !path.exists(),
         "a read-only command must not leave a config behind: {}",
+        path.display()
+    );
+}
+
+/// `--generate-2fa` early-returns before `ensure_config_file` even runs, so a
+/// missing config on the path makes it error out — and crucially, without
+/// leaving one behind. The existing client-cli suite already exercises
+/// `--generate-2fa` against a config that *exists*; this pins the *missing*
+/// half of the same invariant.
+#[test]
+fn generate_2fa_does_not_create_a_config() {
+    let (_dir, path) = empty_dir();
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--generate-2fa",
+            "client-001",
+            "--qr-format",
+            "none",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe")
+        .wait_with_output()
+        .expect("--generate-2fa exits");
+
+    assert!(
+        !path.exists(),
+        "--generate-2fa must not leave a config behind: {}",
+        path.display()
+    );
+}
+
+/// `client list` reads the file via `ProxyConfig::load_with_auth`, which fails
+/// on a missing one. The subcommand is the write half of the management
+/// surface and shares the file lock with the server, but it should never be
+/// the *reason* a file appears on disk — the operator chose to run a query
+/// against nothing, and the answer is "no such file", not "I made you one".
+#[test]
+fn client_list_does_not_create_a_config() {
+    let (_dir, path) = empty_dir();
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "client",
+            "list",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe")
+        .wait_with_output()
+        .expect("client list exits");
+
+    assert!(
+        !path.exists(),
+        "`client list` must not leave a config behind: {}",
+        path.display()
+    );
+}
+
+/// `--local-proxy` does not early-return the way the read-only commands do,
+/// but it is still gated out of `ensure_config_file` by `!cli.local_proxy`:
+/// the template describes a *server*, and handing a server-shaped config to
+/// the client half would be worse than the "config not found" it replaces.
+/// Pinning the gate separately from the early-return paths catches a future
+/// flag landing below `ensure_config_file` without the `!cli.local_proxy`
+/// guard.
+#[test]
+fn local_proxy_does_not_create_a_config() {
+    let (_dir, path) = empty_dir();
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--local-proxy",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe")
+        .wait_with_output()
+        .expect("--local-proxy exits");
+
+    assert!(
+        !path.exists(),
+        "--local-proxy must not leave a server-style config behind: {}",
         path.display()
     );
 }

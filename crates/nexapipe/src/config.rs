@@ -865,9 +865,12 @@ impl ProxyConfig {
 ///
 /// `[auth] enabled = true` is the one setting that is not the operator's to
 /// infer: a config with no `[auth.clients]` refuses every connection, which is
-/// the correct state for a file nobody has written yet. It also means the file
-/// counts as holding a credential, so on Unix it has to be `0600` — which is why
-/// this goes out through [`write_config_file`] rather than `fs::write`.
+/// the correct state for a file nobody has written yet. With 2FA on, the
+/// startup permission check refuses to start over a world-readable config —
+/// `run_server_mode` keys the refusal off `auth_cfg.enabled ||
+/// proxy_config.holds_credentials()` — so the file has to be `0600` on Unix,
+/// which is why this goes out through [`write_config_file`] rather than
+/// `fs::write`.
 ///
 /// No `[iroh] secret_key`: the endpoint identity is generated and written back
 /// on first start (see `ensure_iroh_secret_key`), so writing one here would be
