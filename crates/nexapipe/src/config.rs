@@ -3953,6 +3953,8 @@ pending_enrollment = "TOKEN"
     #[cfg(unix)]
     #[test]
     fn a_world_readable_key_file_refuses_to_load() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().expect("temp dir");
         let key_path = dir.path().join("iroh.key");
         fs::write(&key_path, generate_secret_key_hex()).expect("write the key file");
