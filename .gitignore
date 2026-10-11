@@ -10,6 +10,10 @@ nexa_vpn_log.txt
 logs/*
 !logs/.gitkeep
 config.toml
+# The endpoint identity key the docker setup generates into ./secrets/iroh.key
+# (NEXAPIPE_IROH_SECRET_KEY_FILE). The directory itself stays untracked the
+# same way config/ is: a private key has no business in the repo.
+secrets/
 docs/*plan*
 docs/*fix*
 docs/*patch*

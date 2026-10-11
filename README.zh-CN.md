@@ -192,16 +192,29 @@ Ticket 是另一回事：它固化的是打印时的那组地址，`secret_key` 
 cargo run -p nexapipe -- --generate-secret
 ```
 
+**密钥也可以完全不放在 config.toml 里。** 把 `[iroh] secret_key_file` 指向一个只装
+十六进制密钥的文件 —— 文件缺失时首次启动会自动生成写入（Unix 上 `0600`）；或者用环境
+变量让它连文件都不沾：`NEXAPIPE_IROH_SECRET_KEY` 直接装密钥本身，
+`NEXAPIPE_IROH_SECRET_KEY_FILE` 装*指向密钥文件的路径*（缺失时同样自动生成）。
+密钥一旦来自配置之外，config.toml 就不再是凭据持有者，因此不必设为私有。但同一把
+密钥只能有一个来源 —— 值和路径、环境变量和配置、其中之一和 `secret_key` —— 同时
+命名多个会被拒绝启动，而不是静默挑一个。
+
 ### Docker
 
 ```bash
-mkdir -p config && cp config.toml.example config/config.toml   # config.toml 已被 gitignore
+mkdir -p config secrets
+cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-`docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）
-和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向该挂载点；同时设置
+`docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）、
+存放端点身份的 `secrets/` 目录和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向
+logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/iroh.key`
+使用：端点密钥在首次启动时生成进这个文件（`0600`），因此 `config.toml` 本身不再
+持有私钥。`secrets/` 请和 `config/` 一起备份 —— 丢了它意味着下次重启 Node ID 会变，
+存过旧 Node ID 的客户端将找不到服务器。同时 compose 还设置
 `NEXAPIPE_CONFIG_DIR=/app/config`，让容器里的二进制默认读取
 `/app/config/config.toml`，与宿主机看到的 `config/config.toml` 是同一个文件。
 `--config` 仍然优先生效，所以运维者随时可以指向任意路径。`host.docker.internal`

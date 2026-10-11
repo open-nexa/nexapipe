@@ -11,10 +11,10 @@
 //! key lands in the config file without anyone asking, the Node ID that comes
 //! out is the same one the next start produces, and the escape hatch
 //! (`NEXAPIPE_NO_PERSIST_IDENTITY`) really does keep the file untouched. The
-//! external sources (`NEXAPIPE_IROH_SECRET_KEY`, a pointed-to
-//! `secret_key_file`) are driven here too: they are the same identity
-//! machinery, and the environment can only be observed through a child
-//! process.
+//! external sources (`NEXAPIPE_IROH_SECRET_KEY`,
+//! `NEXAPIPE_IROH_SECRET_KEY_FILE`, a pointed-to `secret_key_file`) are driven
+//! here too: they are the same identity machinery, and the environment can
+//! only be observed through a child process.
 //!
 //! Each server is started with the relay disabled, so a test needs no network
 //! and no discovery — the same reason `data_plane.rs` binds loopback
@@ -446,5 +446,127 @@ fn an_env_key_alongside_an_inline_one_refuses_to_start() {
     assert!(
         text.contains("named by") && text.contains("NEXAPIPE_IROH_SECRET_KEY"),
         "the refusal names both sources:\n{text}"
+    );
+}
+
+/// `NEXAPIPE_IROH_SECRET_KEY_FILE` points the identity at a file of the
+/// deployment's choosing — the docker compose setup points it at a separate
+/// secrets directory, not next to the config. A missing file is generated
+/// there on first start (never inline into the config), the Node ID is stable
+/// on the next start, and the config itself stays credential-free.
+#[test]
+fn the_env_named_key_file_holds_the_identity_outside_the_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [iroh]\n\
+         relay_mode = \"disabled\"\n",
+    )
+    .expect("write config");
+    let secrets_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secrets_dir).expect("the secrets directory exists, empty");
+    let key_file = secrets_dir.join("iroh.key");
+    let env = [(
+        "NEXAPIPE_IROH_SECRET_KEY_FILE",
+        key_file.to_str().expect("utf-8 path"),
+    )];
+
+    let (first, mut child) = start_until_node_id(&path, &env);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Length and mode only, never the value: this is the endpoint's private
+    // key, and a failing assertion's output is what CI keeps.
+    let written = fs::read_to_string(&key_file).expect("the key was generated where the env said");
+    assert_eq!(
+        written.trim().len(),
+        64,
+        "the env-named file holds a full ed25519 key"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&key_file).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the generated key file is owner-only");
+    }
+
+    let config_content = fs::read_to_string(&path).expect("read the config back");
+    assert!(
+        !config_content.contains("secret_key"),
+        "the key must never be written back into the config:\n{config_content}"
+    );
+
+    let (second, mut child) = start_until_node_id(&path, &env);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        first, second,
+        "the key in the env-named file is the one the identity survives a restart on"
+    );
+
+    let reloaded = nexapipe::config::ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+        .expect("the config still parses");
+    assert!(
+        !reloaded.holds_credentials(),
+        "a config whose key lives in an env-named file holds no credential"
+    );
+}
+
+/// The two environment variables naming the same key two ways — a value and a
+/// path — refuse the start, the same one-source rule every other pair gets.
+#[test]
+fn an_env_value_and_an_env_named_file_refuse_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[[routes]]\n\
+         host_pattern = \"*\"\n\
+         backends = [\"http://127.0.0.1:18080\"]\n\
+         \n\
+         [iroh]\n\
+         relay_mode = \"disabled\"\n",
+    )
+    .expect("write config");
+    let key_file = dir.path().join("iroh.key");
+    fs::write(&key_file, nexapipe::config::generate_secret_key_hex()).expect("write the key file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+        .args(["--config", path.to_str().expect("utf-8 path")])
+        .env(
+            "NEXAPIPE_IROH_SECRET_KEY",
+            nexapipe::config::generate_secret_key_hex(),
+        )
+        .env(
+            "NEXAPIPE_IROH_SECRET_KEY_FILE",
+            key_file.to_str().expect("utf-8 path"),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nexapipe")
+        .wait_with_output()
+        .expect("nexapipe refuses to start, so it exits");
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "two env answers to one credential must not start:\n{text}"
+    );
+    assert!(
+        text.contains("named by")
+            && text.contains("NEXAPIPE_IROH_SECRET_KEY")
+            && text.contains("NEXAPIPE_IROH_SECRET_KEY_FILE"),
+        "the refusal names both env sources:\n{text}"
     );
 }
