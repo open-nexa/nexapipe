@@ -11,6 +11,30 @@ use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use nexapipe_client::relay::RelayModeSpec;
 use std::sync::Arc;
 
+/// The default config path the binary uses when `--config` is not given.
+///
+/// Two paths land at the same file: `./config.toml` is what local dev has
+/// always used, `./config/config.toml` is what `docker-compose.yaml`'s
+/// bind-mount target resolves to inside the container. Rather than pick
+/// one and break the other, this function lets the environment decide —
+/// the docker-compose sets `NEXAPIPE_CONFIG_DIR=/app/config`, and the
+/// binary prepends that to `config.toml`. Local dev that does not set the
+/// variable gets the original behaviour.
+fn compute_default_config() -> String {
+    match std::env::var("NEXAPIPE_CONFIG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => {
+            // Trim a trailing slash so the join reads as `<dir>/config.toml`,
+            // not `<dir>//config.toml`. A trailing slash is the most common
+            // case (compose file style: `- /app/config/`) but other shapes
+            // (`- /app/config`, `- /app/config///`) should all land at the
+            // same path.
+            let trimmed = dir.trim().trim_end_matches('/');
+            format!("{trimmed}/config.toml")
+        }
+        _ => "config.toml".to_string(),
+    }
+}
+
 /// How the 2FA enrollment QR code is drawn.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum QrFormat {
@@ -33,7 +57,15 @@ struct Cli {
     // needs the config for the listener address, and `nexapipe --config X
     // status` is the spelling an operator who already uses the flag will try
     // first.
-    #[arg(short, long, default_value = "config.toml", global = true)]
+    //
+    // The default is computed: `NEXAPIPE_CONFIG_DIR` shifts it to that
+    // directory's `config.toml` when set, otherwise it stays at `./config.toml`.
+    // The docker setup sets `NEXAPIPE_CONFIG_DIR=/app/config` (matching the
+    // bind-mount target), so the container picks up `/app/config/config.toml`
+    // by default and a local dev that omits `--config` keeps the old behaviour.
+    // `--config` always wins, so an operator can still point the binary at any
+    // path they like.
+    #[arg(short, long, default_value_t = compute_default_config(), global = true)]
     config: String,
 
     #[arg(long, help = "Run in client local proxy mode")]

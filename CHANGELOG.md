@@ -12,7 +12,7 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-No configuration key is added, removed or renamed. Two things behave
+No configuration key is added, removed or renamed. Three things behave
 differently without being configured to:
 
 - A config with no `[iroh] secret_key` gets one generated on the first start
@@ -21,8 +21,20 @@ differently without being configured to:
   exits with `Config file not found` — it writes a minimal `config.toml`
   instead, so a fresh operator has something to edit — see `### Added`
   below.
+- The default `--config` path moves when `NEXAPIPE_CONFIG_DIR` is set —
+  see `### Changed` below.
 
 ### Changed
+
+- **`NEXAPIPE_CONFIG_DIR` shifts the default `--config` path.** What used
+  to be `./config.toml` is now `<dir>/config.toml` whenever the environment
+  variable is set, with the variable unset falling back to `./config.toml`.
+  The docker setup sets `NEXAPIPE_CONFIG_DIR=/app/config` (matching the
+  bind-mount target), so the container picks up `/app/config/config.toml`
+  by default and a local dev that omits `--config` keeps the old behaviour.
+  `--config` always wins. Operators who want the docker path locally can
+  set the variable for one run with `NEXAPIPE_CONFIG_DIR=config nexapipe`;
+  operators on the previous default need no change at all.
 
 - **A stable Node ID no longer takes two manual steps.** A config with no
   `[iroh] secret_key` gets one generated on the first start and written back

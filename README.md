@@ -119,7 +119,7 @@ bindings for Swift/Kotlin/Python. See
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
-| `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. |
+| `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
 | `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
@@ -136,7 +136,7 @@ host_pattern = "*"
 backends = ["http://127.0.0.1:3000"]    # the service you want to expose
 EOF
 
-cargo run -p nexapipe -- --config config.toml
+nexapipe                                # picks up ./config.toml
 ```
 
 Three lines is a working server: one catch-all route, one backend, every other key
@@ -150,7 +150,7 @@ instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is
 starting point to edit, not a working proxy:
 
 ```bash
-cargo run -p nexapipe -- --config config.toml     # writes config.toml, then starts
+nexapipe                                # writes ./config.toml, then starts
 ```
 
 Two things are true of that file until you change them, and both are the safe
@@ -158,7 +158,7 @@ direction: **no route**, so every host is answered 404; and **no client**, so wi
 `[auth] enabled = true` nothing can connect at all. Enroll the first one with
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --create-client --config config.toml
+nexapipe --generate-invite client-001 --create-client
 ```
 
 A config that already exists is never regenerated, and one that exists but does
@@ -222,9 +222,12 @@ docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 
 `docker-compose.yaml` mounts a `config/` directory — the one holding your
 `config.toml` — and a `logs/` volume, and points `NEXAPIPE_LOG_DIR` at it.
-`host.docker.internal` is configured, so backends running on the Docker host are
-reachable. Moving an existing deployment over is one command:
-`mkdir -p config && mv config.toml config/config.toml`.
+It also sets `NEXAPIPE_CONFIG_DIR=/app/config`, so the binary inside the
+container picks up `/app/config/config.toml` by default — the same file the
+host sees at `config/config.toml`. `--config` still wins, so an operator can
+point at any path. `host.docker.internal` is configured, so backends running
+on the Docker host are reachable. Moving an existing deployment over is one
+command: `mkdir -p config && mv config.toml config/config.toml`.
 
 Published images are on GHCR (`linux/amd64` and `linux/arm64`), named the same
 as what `docker-compose.yaml` builds. To run one instead of building locally,
@@ -433,7 +436,7 @@ will name.
 
 | Flag | Meaning |
 | --- | --- |
-| `-c, --config <PATH>` | Config file (default `config.toml`). |
+| `-c, --config <PATH>` | Config file (default `./config.toml`; `NEXAPIPE_CONFIG_DIR` shifts it). |
 | `--local-proxy` | Run as a client-side local HTTP proxy instead of a server. |
 | `--generate-secret` | Print a new iroh secret key. Usually unnecessary — the server writes `[iroh] secret_key` on first start; this is for moving an identity between hosts. |
 | `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print the enrollment QR code. |
