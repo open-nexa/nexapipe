@@ -130,6 +130,23 @@ cargo run -p nexapipe -- --config config.toml
 想要每个配置段都写出来的版本请从 `config.toml.example` 开始，想开启 2FA 则从
 `config.toml.2fa.example` 开始。
 
+完全不写这个文件也可以：服务端会自己生成一份最简的 `config.toml`，而不是直接拒绝启动 ——
+2FA 开启、没有路由、没有 enrolled 客户端。它是一个供你编辑的起点，还不是能用的服务：
+
+```bash
+cargo run -p nexapipe -- --config config.toml     # 生成 config.toml 并启动
+```
+
+在你修改之前，这份文件有两件事成立，且都是偏安全的方向：**没有路由**，所以所有 host
+都会得到 404；**没有客户端**，所以在 `[auth] enabled = true` 的情况下谁都连不上。第一个
+客户端这样创建：
+
+```bash
+cargo run -p nexapipe -- --generate-invite client-001 --create-client --config config.toml
+```
+
+已存在的配置永远不会被重新生成；已存在但解析失败的文件仍然会导致启动失败，而不是被替换掉。
+
 启动时服务端会打印客户端需要的信息：
 
 ```

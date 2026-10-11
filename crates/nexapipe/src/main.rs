@@ -305,6 +305,29 @@ async fn main() {
         return;
     }
 
+    // A first start with no config file gets a minimal one written for it,
+    // rather than a refusal to start with nothing to act on. Server mode only:
+    // `--local-proxy` reads the same path as a *client* config, and the file
+    // written here describes a server, so handing it to the client half would
+    // be worse than the error it replaces.
+    //
+    // The "did we just write it?" flag is captured here and the advisory is
+    // emitted after `log::init` below — server-mode startup routes advisory
+    // output through the log channel rather than raw stdout, and the tracing
+    // subscriber is not installed yet at this point.
+    let config_just_generated = if !cli.local_proxy {
+        match nexapipe::config::ensure_config_file(&cli.config) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                eprintln!("Failed to create {}: {:#}", cli.config, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        false
+    };
+
     let proxy_config = match ProxyConfig::from_file(&cli.config) {
         Ok(config) => config,
         Err(e) => {
@@ -343,6 +366,21 @@ async fn main() {
 
     if debug_enabled {
         tracing::info!("Debug mode enabled");
+    }
+
+    if config_just_generated {
+        // Server-mode advisories go through the log channel, not raw stdout:
+        // a banner is reserved for output that carries data the operator needs
+        // to act on (Node ID / ticket / invite / QR). This is just "what I
+        // did and what you should do next", which is what the log is for.
+        tracing::info!(
+            "No config at {} — wrote a minimal one: [auth] enabled = true with 0 \
+             clients enrolled (nothing can connect), no [[routes]] entry (every \
+             host is answered 404). Enroll the first client with: \
+             nexapipe --generate-invite client-001 --create-client --config {}",
+            cli.config,
+            cli.config,
+        );
     }
 
     let shutdown_signal = Arc::new(ShutdownSignal::new());

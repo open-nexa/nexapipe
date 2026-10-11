@@ -1,0 +1,77 @@
+# Nexapipe configuration — generated on first start, because there was no
+# config file at this path.
+#
+# It is deliberately minimal, and it is deliberately not a working proxy yet:
+# nothing is routed, so every host is answered 404 until a [[routes]] entry says
+# where to send it. Edit this file; nothing here is regenerated.
+#
+# Two things are already decided, and both are the safe direction:
+#
+#   * [auth] is on. Every client connection has to complete a 2FA handshake,
+#     and with no [auth.clients] entry below, that means nothing can connect
+#     yet. Enroll the first client with:
+#
+#       nexapipe --generate-invite client-001 --create-client
+#
+#     (add `--registration` to hand out a one-time link instead of printing the
+#     secret, and `--qr-out invite.svg` to save the code as an image).
+#
+#   * The plaintext listener ([server] listen_addr) is closed. It is the one
+#     entry point 2FA does not cover — the handshake runs on the iroh listener —
+#     so a request arriving there reaches a route without ever authenticating.
+#     Uncomment listen_addr only for a client on this host.
+#
+# config.toml.example documents every section at length, and
+# config.toml.2fa.example is the same file with 2FA configured.
+
+[auth]
+enabled = true
+
+# ===== Routes =====
+# Where requests go. One catch-all entry is the smallest thing that forwards
+# anything:
+#
+# [[routes]]
+# host_pattern = "*"
+# backends = ["http://127.0.0.1:3000"]
+#
+# `host_pattern` is an exact name or a "*.suffix" wildcard, case-insensitively.
+# A host with no matching route is answered 404 — there is no fallback backend.
+#
+# `mode` picks how the route talks to it, decided by the first byte of the
+# stream, so the modes never see each other's traffic:
+#
+#   http (default)   re-issues a parsed request to an http:// backend
+#   passthrough      copies raw bytes; TLS stays with the backend (Caddy &co)
+#   tcp / udp        L4 tunnel, one QUIC bi-stream per flow; backends are then
+#                    host:port, e.g. "10.0.0.5:5432"
+
+# ===== Auxiliary listener (off by default) =====
+# Loopback only, and unauthenticated: it answers /healthz always, and /metrics
+# when [metrics] enabled = true. It names the routes and the clients, so it is
+# not something to expose.
+#
+# [admin]
+# listen_addr = "127.0.0.1:9090"
+#
+# [metrics]
+# enabled = true
+
+# ===== Client Local Proxy Configuration (client side) =====
+# [local_proxy]
+# enabled = true
+# listen_addr = "127.0.0.1:8080"
+# proxy_domains = ["example.com"]
+#
+# [[local_proxy.nodes]]
+# server_node_id = "<this server's Node ID, printed at startup>"
+# domains = ["example.com"]
+#
+# [local_proxy.two_factor]
+# enabled = true
+# client_id = "client-001"
+# secret = "<the secret --generate-invite printed>"
+# algorithm = "sha1"
+#
+# Rotating log files under ./logs next to the console output are on by default.
+# NEXAPIPE_LOG_DIR overrides the directory without touching this file.

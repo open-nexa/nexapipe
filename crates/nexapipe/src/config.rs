@@ -855,6 +855,88 @@ impl ProxyConfig {
     }
 }
 
+/// The config written when there is none: 2FA on, nothing else.
+///
+/// Deliberately small, and deliberately **not** a working proxy: it carries no
+/// `[[routes]]`, so every host is answered 404 until one is added. A generated
+/// backend address would be a guess — `127.0.0.1:3000` is only right by
+/// coincidence — and a wrong one fails every request while looking configured.
+/// The commented route below is the shape to uncomment.
+///
+/// `[auth] enabled = true` is the one setting that is not the operator's to
+/// infer: a config with no `[auth.clients]` refuses every connection, which is
+/// the correct state for a file nobody has written yet. With 2FA on, the
+/// startup permission check refuses to start over a world-readable config —
+/// `run_server_mode` keys the refusal off `auth_cfg.enabled ||
+/// proxy_config.holds_credentials()` — so the file has to be `0600` on Unix,
+/// which is why this goes out through [`write_config_file`] rather than
+/// `fs::write`.
+///
+/// No `[iroh] secret_key`: the endpoint identity is generated and written back
+/// on first start (see `ensure_iroh_secret_key`), so writing one here would be
+/// a second answer to the same question.
+const FIRST_RUN_CONFIG: &str = include_str!("../templates/first-run-config.toml");
+
+/// Writes a minimal config at `path` when there is none, and reports whether it
+/// did.
+///
+/// Only `NotFound` leads to a write. A file that exists but cannot be read or
+/// parsed is somebody's typo to fix, and generating over it would replace a
+/// config they wrote — or, worse, a half-written one — with a default that
+/// looks deliberate. So the read still happens in [`ProxyConfig::from_file`],
+/// and its error still reaches the operator.
+///
+/// The create is atomic via `OpenOptions::create_new(true)` (the "create and
+/// must-not-exist" check is a single syscall). That matters because the check
+/// above and the write below are two steps: an external writer that does not
+/// take the config lock — an operator saving in their editor, a sibling tool
+/// — could otherwise slip a file in between, and `write_config_file` would
+/// rename its temp file over that destination, discarding the operator's
+/// routes and credentials. `create_new` makes the second step safe by failing
+/// rather than overwriting.
+///
+/// Under the config lock, on principle: the lock no longer *needs* to be
+/// taken, because `create_new` is already atomic. Kept for symmetry with the
+/// rest of the config writers — it serialises a `ensure_config_file` call
+/// with an in-progress 2FA writeback so the new template never lands between
+/// the 2FA reader and the 2FA writer.
+///
+/// Not for every command. `status` reads the config of a process that is
+/// already running and `--generate-2fa` works without one, so neither should
+/// leave a file behind; this is called from the server start path only.
+pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
+    if Path::new(path).exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(path, || {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(FIRST_RUN_CONFIG.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path))?;
+                file.sync_all()
+                    .map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", path))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A non-locking writer (operator with an editor, a sibling
+                // tool) created the file between our existence check and
+                // our create. Preserve whatever they wrote.
+                Ok(false)
+            }
+            Err(e) => Err(anyhow::anyhow!("cannot create {}: {e}", path)),
+        }
+    })
+}
+
 pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrategy {
     match strategy.as_deref() {
         Some("random") | Some("Random") => crate::lb::LoadBalancingStrategy::Random,
