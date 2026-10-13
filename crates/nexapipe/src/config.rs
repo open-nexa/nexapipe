@@ -268,6 +268,14 @@ pub struct RouteConfig {
     /// `udp` routes: seconds of silence before a flow is closed. The server
     /// default (`l4::DEFAULT_UDP_IDLE_TIMEOUT`) applies when this is absent.
     pub idle_timeout_secs: Option<u64>,
+    /// `tcp` / `udp` routes: seconds one flow may run before it is closed. The
+    /// server default (`deadline::DEFAULT_L4_FLOW_SECS`) applies when absent.
+    ///
+    /// Distinct from `idle_timeout_secs` on purpose: that one bounds the gap
+    /// between packets and re-arms on each, while this bounds the flow. Raise it
+    /// for a long-lived session — an interactive SSH connection or a database
+    /// session over the tunnel is meant to outlive any default.
+    pub flow_timeout_secs: Option<u64>,
 
     // ---- Removed keys, see `ServerConfig` ----
     pub cert_path: Option<String>,
@@ -818,6 +826,15 @@ impl ProxyConfig {
                 );
             }
 
+            // Same reasoning for the whole-flow bound: zero would close every flow
+            // the instant it opened, which is never what a zero here means.
+            if route_config.flow_timeout_secs == Some(0) {
+                anyhow::bail!(
+                    "{label}: flow_timeout_secs is 0, which closes a flow the moment it is \
+                     opened; leave it out for the default"
+                );
+            }
+
             // Every declared mode has to be able to dial these backends, so each
             // one is checked: the `http` rules and the L4 rules disagree (a URL
             // to fetch versus an address to dial, and only the L4 one insists on
@@ -835,6 +852,9 @@ impl ProxyConfig {
                 client_ports: route_config.client_ports.clone(),
                 idle_timeout: route_config
                     .idle_timeout_secs
+                    .map(std::time::Duration::from_secs),
+                flow_timeout: route_config
+                    .flow_timeout_secs
                     .map(std::time::Duration::from_secs),
             };
             let client_ports = route_config.client_ports.clone();
@@ -2964,6 +2984,67 @@ idle_timeout_secs = 0
         assert!(
             error.contains("idle_timeout_secs"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// A zero flow timeout closes a flow as soon as it is opened, which is what
+    /// a zero here would actually do — so it is refused rather than accepted.
+    #[test]
+    fn build_routes_refuses_a_zero_flow_timeout() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.nekblab.top"
+mode = "tcp"
+backends = ["10.0.0.5:5432"]
+flow_timeout_secs = 0
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("flow_timeout_secs"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The two bounds are independent: naming one does not disturb the other,
+    /// and leaving both out is what a config written before either existed does.
+    #[test]
+    fn the_flow_and_idle_timeouts_are_carried_separately() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "db.nekblab.top"
+mode = "udp"
+backends = ["10.0.0.5:3478"]
+idle_timeout_secs = 120
+flow_timeout_secs = 7200
+"#,
+        );
+        let routes = config.build_routes().unwrap();
+        assert_eq!(
+            routes[0].idle_timeout(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            routes[0].flow_timeout(),
+            Some(std::time::Duration::from_secs(7200))
+        );
+
+        let bare = parse(
+            r#"
+[[routes]]
+host_pattern = "db.nekblab.top"
+mode = "udp"
+backends = ["10.0.0.5:3478"]
+"#,
+        );
+        let routes = bare.build_routes().unwrap();
+        assert!(routes[0].idle_timeout().is_none());
+        assert!(
+            routes[0].flow_timeout().is_none(),
+            "an absent key means the server default, not zero"
         );
     }
 

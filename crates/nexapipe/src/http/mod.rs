@@ -49,6 +49,10 @@ const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
 /// value lets a client choose how much this process allocates — one stream at a
 /// time, and a peer can open many. Well past any ordinary upload; a deployment
 /// that needs to push larger bodies should stream them instead of raising this.
+///
+/// This bounds one request. How many such bodies may be held at once is
+/// [`ByteBudget`](crate::conn::limits::ByteBudget)'s, which is why a body is
+/// only read once it has been given a reservation from it.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 /// Whether a request header may be forwarded to the backend.
@@ -181,7 +185,10 @@ pub async fn proxy_request(
     .parse::<http::Uri>()
     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
-    let body = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
+    // Held for as long as the buffered body is alive — see `read_body_limited`.
+    // Dropping it here rather than at the end of the function is deliberate and
+    // is what makes the budget mean what it says.
+    let (body, _body_reservation) = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
 
     let mut builder = Request::builder().method(method).uri(new_uri);
 
@@ -238,17 +245,58 @@ pub async fn proxy_request(
 
 /// Reads a request body into memory, refusing one larger than `limit`.
 ///
+/// Reads a body whole, refusing one past `limit` or past what the process can
+/// hold at once.
+///
+/// Returns the reservation as well as the bytes, and the caller has to keep it:
+/// dropping it gives the bytes back, so the total the budget reports is what is
+/// held *now* rather than what was ever read. A caller that answers the request
+/// and returns is exactly the lifetime a buffered body has.
+///
 /// The size is not known up front — a chunked request says nothing about how
 /// much is coming — so the limit has to be enforced while reading rather than
 /// by checking a `content-length` header the client is free to understate.
-async fn read_body_limited<B>(body: B, limit: usize) -> anyhow::Result<bytes::Bytes>
+/// The size is not known up front — a chunked request says nothing about how
+/// much is coming — so the limit has to be enforced while reading rather than
+/// by checking a `content-length` header the client is free to understate.
+///
+/// The deadline over the read is likewise total rather than per frame, so a
+/// client that trickles one byte before each expiry renews nothing.
+async fn read_body_limited<B>(
+    body: B,
+    limit: usize,
+) -> anyhow::Result<(bytes::Bytes, crate::conn::limits::ByteReservation)>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
     let mut body = body;
     let mut bytes: Vec<u8> = Vec::new();
-    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+    // Claimed as the frames arrive rather than up front: see `ByteReservation`.
+    let mut reservation = crate::conn::limits::ByteReservation::empty();
+    // A deadline over the whole read, not per frame: this is the path the
+    // plaintext listener takes, and it had no bound at all, so a client that
+    // opened a socket and then sent a byte of body every few seconds held the
+    // connection, the task and the buffer indefinitely. The iroh path has always
+    // bounded this read; this is the same bound, in one place.
+    let body_deadline = crate::deadline::Deadlines::default().body;
+    let deadline_at = tokio::time::Instant::now() + body_deadline;
+    loop {
+        // A `loop` rather than `while let`, so that the deadline's own expiry is
+        // told apart from the end of the body.
+        let frame =
+            match tokio::time::timeout_at(deadline_at, http_body_util::BodyExt::frame(&mut body))
+                .await
+            {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "request body did not finish within {}s",
+                        body_deadline.as_secs()
+                    ));
+                }
+            };
         let frame = frame.map_err(|e| anyhow::anyhow!("failed to read the request body: {}", e))?;
         // Anything that is not a data frame — trailers — carries no body bytes.
         let Ok(data) = frame.into_data() else {
@@ -259,9 +307,10 @@ where
                 "request body is over the {limit} byte limit"
             ));
         }
+        reservation.grow(data.len())?;
         bytes.extend_from_slice(&data);
     }
-    Ok(bytes.into())
+    Ok((bytes.into(), reservation))
 }
 
 fn should_compress(content_type: Option<&str>) -> bool {
@@ -643,7 +692,32 @@ pub async fn proxy_to_backend_streaming(
     // what is being coalesced and may still be lost: a body that died half way
     // is reported as the half that arrived, not as the whole that was intended.
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
-    while let Some(chunk) = body_stream.next().await {
+    // Idle, not a phase deadline: see `Deadlines::response_idle`. What is being
+    // bounded is the gap between chunks, so this re-arms on every chunk — which
+    // is what lets an SSE stream or a WebSocket stay open for as long as both
+    // ends want, while a backend that accepted the request and then went silent
+    // cannot hold this slot and its backend lease forever.
+    let response_idle = crate::deadline::Deadlines::default().response_idle;
+    loop {
+        // A `loop` rather than `while let`: the three outcomes — a chunk, the
+        // end of the body, and the backend going quiet — are told apart here,
+        // and only the first two are ordinary iteration.
+        let chunk = match tokio::time::timeout(response_idle, body_stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            // The body finished: this is the end, not a failure, and it must not
+            // be mistaken for one.
+            Ok(None) => break,
+            Err(_) => {
+                // The backend went quiet mid-body. Whatever was already flushed
+                // reached the client, so what is reported is what was delivered
+                // rather than zero.
+                tracing::debug!(
+                    "Backend sent nothing for {:?} mid-body, ending the stream",
+                    response_idle
+                );
+                break;
+            }
+        };
         match chunk {
             Ok(data) => {
                 if use_chunked {
@@ -974,8 +1048,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_within_the_limit_is_read_whole() {
-        let read = read_body_limited(body_of(10), 10).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(10), 10).await.unwrap();
         assert_eq!(read.len(), 10);
+        assert_eq!(reservation.bytes(), 10, "the body is held for its lifetime");
     }
 
     #[tokio::test]
@@ -988,8 +1063,25 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_body_is_within_any_limit() {
-        let read = read_body_limited(body_of(0), 0).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(0), 0).await.unwrap();
         assert!(read.is_empty());
+        assert_eq!(reservation.bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_body_hands_its_reservation_back() {
+        // The budget is process-wide and shared between tests, so this asserts
+        // the *shape* of the behaviour rather than a number: a body refused
+        // past the per-request limit must not leave its bytes counted against
+        // the process-wide one, or every later request would find the budget
+        // smaller than it should be.
+        let before = crate::conn::limits::body_budget().held();
+        let _ = read_body_limited(body_of(4096), 16).await;
+        assert_eq!(
+            crate::conn::limits::body_budget().held(),
+            before,
+            "a refused body releases what it had taken"
+        );
     }
 
     /// A chunked body of one or more `chunks`, terminated the usual way.

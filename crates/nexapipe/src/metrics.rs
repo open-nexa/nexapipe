@@ -93,6 +93,12 @@ pub fn uptime_seconds() -> u64 {
 pub struct Metrics {
     /// Connections accepted since startup, whatever happened to them.
     connections_total: AtomicU64,
+    /// The per-peer connection ceiling the limiter refuses against, published
+    /// so a dashboard can show headroom. Written once at startup.
+    max_connections_per_peer: AtomicU64,
+    /// The process-wide connection ceiling, likewise. `0` means "no global
+    /// ceiling", which is how [`ConnectionLimiter::new`] leaves it.
+    max_connections_global: AtomicU64,
     /// Connections by the kind of path they were last seen using. The sum of
     /// the three is the number of connections open right now, so there is no
     /// separate active counter that could disagree with it.
@@ -168,6 +174,8 @@ impl Metrics {
     pub const fn new() -> Self {
         Self {
             connections_total: AtomicU64::new(0),
+            max_connections_per_peer: AtomicU64::new(0),
+            max_connections_global: AtomicU64::new(0),
             direct: AtomicU64::new(0),
             relayed: AtomicU64::new(0),
             unknown: AtomicU64::new(0),
@@ -223,6 +231,25 @@ impl Metrics {
         // them, and a scrape that lands a millisecond early simply reports the
         // number as it was a millisecond ago.
         self.connections_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the ceilings the limiter refuses connections against.
+    ///
+    /// Written once, when the endpoint is built, because that is when the caps
+    /// are resolved from the environment. A `usize::MAX` global — the shape
+    /// [`ConnectionLimiter::new`] builds — is published as `0` rather than as
+    /// 18446744073709551615: a scrape cannot tell "unlimited" from "a number too
+    /// large to be a real limit", and `0` is what a dashboard should divide by
+    /// to mean *do not alarm on this one*.
+    pub fn record_connection_limits(&self, per_peer: usize, global: usize) {
+        let per_peer = u64::try_from(per_peer).unwrap_or(u64::MAX);
+        let global = match u64::try_from(global) {
+            Ok(n) if n < u64::MAX => n,
+            _ => 0,
+        };
+        self.max_connections_per_peer
+            .store(per_peer, Ordering::Relaxed);
+        self.max_connections_global.store(global, Ordering::Relaxed);
     }
 
     /// Records one answered request and how long it took.
@@ -377,6 +404,24 @@ impl Metrics {
             "nexapipe_connections_active",
             "Connections open right now.",
             self.connections_active(),
+        );
+
+        // The two ceilings the limiter refuses connections against, so a
+        // dashboard can show headroom rather than only the current count.
+        // Without them an operator sees "active: 4096" and cannot tell a
+        // server at its budget from a server at half of it.
+        gauge(
+            &mut out,
+            "nexapipe_connections_limit_per_peer",
+            "Concurrent connections one peer may hold; a connection past this is refused.",
+            self.max_connections_per_peer.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "nexapipe_connections_limit_global",
+            "Concurrent connections the whole process may hold; a connection past this is refused \
+             whatever the peer is at.",
+            self.max_connections_global.load(Ordering::Relaxed),
         );
 
         // One series per path kind under a single HELP and TYPE: that is what
