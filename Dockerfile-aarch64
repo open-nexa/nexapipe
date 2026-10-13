@@ -33,6 +33,12 @@ RUN mkdir -p /app/logs
 # Where docker-compose mounts the config directory.
 RUN mkdir -p /app/config
 
+# Where the endpoint identity lives, kept out of config.toml since v0.6.1:
+# [iroh] secret_key_file points at /app/secrets/iroh.key and the first start
+# generates the key into it. The amd64 image has created this since the same
+# release; without it an arm64 deployment has nowhere to put the key.
+RUN mkdir -p /app/secrets
+
 COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/nexapipe /usr/local/bin/nexapipe
 
 # The proxy listens for HTTP (and TLS passthrough) on [server] listen_addr and
