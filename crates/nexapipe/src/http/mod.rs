@@ -243,19 +243,14 @@ pub async fn proxy_request(
     Ok(response.map(http_body_util::BodyExt::boxed_unsync))
 }
 
-/// Reads a request body into memory, refusing one larger than `limit`.
-///
-/// Reads a body whole, refusing one past `limit` or past what the process can
-/// hold at once.
+/// Reads a request body whole, refusing one past `limit` or past what the
+/// process can hold at once.
 ///
 /// Returns the reservation as well as the bytes, and the caller has to keep it:
 /// dropping it gives the bytes back, so the total the budget reports is what is
 /// held *now* rather than what was ever read. A caller that answers the request
 /// and returns is exactly the lifetime a buffered body has.
 ///
-/// The size is not known up front — a chunked request says nothing about how
-/// much is coming — so the limit has to be enforced while reading rather than
-/// by checking a `content-length` header the client is free to understate.
 /// The size is not known up front — a chunked request says nothing about how
 /// much is coming — so the limit has to be enforced while reading rather than
 /// by checking a `content-length` header the client is free to understate.
