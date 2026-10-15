@@ -32,7 +32,7 @@ use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
 use crate::metrics;
 use crate::routes::{BackendLookup, RouteConfig};
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
+use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
     encode_frame,
@@ -417,16 +417,13 @@ where
         crate::metrics::METRICS.record_bytes_received(leftover.len() as u64);
     }
 
-    // Bounded as a whole, not only on silence: see `serve_tcp`. The copy ends
-    // early when the deadline passes, which closes the flow and frees the slot,
-    // the backend lease and the task together.
-    let copied = tokio::time::timeout(
-        flow_timeout,
-        copy_both_ways(stream, backend_stream, "L4 TCP"),
-    );
-    match copied.await {
-        Ok(result) => result?,
-        Err(_) => {
+    // Bounded as a whole, not only on silence: see `serve_tcp`. The deadline is
+    // handed to the copy rather than wrapped around it, so the helper's own
+    // half-close still runs when it fires and the client sees an EOF rather than
+    // a reset.
+    match copy_both_ways_until(stream, backend_stream, "L4 TCP", Some(flow_timeout)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             // `warn`, not `debug`: this fires on a session that was working and
             // is now being cut, which is the one event in this file an operator
             // has to be able to find. `flow_timeout_secs` on the route raises it
@@ -435,8 +432,9 @@ where
                 "L4 TCP: closing the flow to {host}:{port} after {flow_timeout:?}, which is the \
                  whole-flow bound; raise flow_timeout_secs on the route for longer sessions"
             );
-            return Ok(());
         }
+        // A real transport failure, which is what the other paths report too.
+        Err(e) => return Err(e.into()),
     }
     Ok(())
 }

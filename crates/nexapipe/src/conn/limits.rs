@@ -256,6 +256,14 @@ pub struct StreamLimiter {
 
 impl StreamLimiter {
     pub fn new(max_global: usize) -> Self {
+        // Clamped, not refused. `tokio::sync::Semaphore::new` panics above
+        // `MAX_PERMITS`, and an operator who writes a huge number here almost
+        // certainly means "unlimited" — so the ceiling becomes "as large as a
+        // semaphore can be", which is what was asked for, rather than a refusal
+        // that takes the listener offline. `cap_from_env` treats a bad value as
+        // a warning; this is the same rule one level down, where there is no
+        // sensible fallback to substitute.
+        let max_global = max_global.min(tokio::sync::Semaphore::MAX_PERMITS);
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(max_global)),
             max_global,
@@ -313,19 +321,24 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 /// there — each one bounds a resource that the per-connection and per-peer
 /// numbers cannot bound on their own.
 ///
-/// **Scope: the plaintext HTTP listener only.** The iroh path buffers a body
-/// through `read_remaining_request_body` / `read_chunked_request_body` instead,
-/// and neither reserves from here — so today this bounds one of the two paths a
-/// body can take, not the whole process. Closing that gap needs the two readers
-/// to reserve as they fill rather than after the fact, which is left for a
-/// change that can prove the per-flow slots stay right when a reservation is
-/// refused mid-body. Until then the connection and stream ceilings above are
-/// what bounds the iroh path.
+/// **Both body paths reserve here**, which took two changes to arrange. The
+/// plaintext listener buffers through `read_body_limited`, which grows a
+/// reservation per frame. The iroh path buffers through two readers of its own:
+/// the one with a `content-length` takes the whole declared size before its
+/// first read, because QUIC is a byte stream and a peer decides how much body
+/// rides along with the head, so the declared size is the only honest number;
+/// the chunked one grows per decoded frame, because a chunked body declares no
+/// length and there is no moment at which the total is knowable.
+///
+/// Every reader returns its reservation to its caller rather than dropping it:
+/// the bytes are still held after the read, right up to when the body goes to
+/// the backend, so a reservation released at the end of the read would report a
+/// figure that undercounts exactly while the memory is held.
 ///
 /// A process-wide static rather than something threaded through every call: the
 /// bodies are read deep inside the HTTP path, and the alternative is a parameter
-/// on every function between the accept loop and `read_body_limited`. The same
-/// trade [`config_write_gate`](crate::conn::config_write_gate) makes.
+/// on every function between the accept loop and the readers. The same trade
+/// [`config_write_gate`](crate::conn::config_write_gate) makes.
 #[derive(Debug)]
 pub struct ByteBudget {
     held: AtomicUsize,
@@ -641,6 +654,24 @@ mod tests {
         let limiter = Arc::new(StreamLimiter::new(0));
         assert!(limiter.try_acquire().is_none());
         assert_eq!(limiter.available(), 0);
+    }
+
+    /// An operator who writes a huge `NEXAPIPE_MAX_STREAMS` means "unlimited",
+    /// and `Semaphore::new` panics above `MAX_PERMITS` — so without a clamp the
+    /// server does not start at all, which is the one outcome a value this large
+    /// should never produce.
+    #[tokio::test]
+    async fn an_oversized_stream_ceiling_does_not_take_the_listener_down() {
+        let limiter = Arc::new(StreamLimiter::new(usize::MAX));
+        assert_eq!(
+            limiter.max_global(),
+            tokio::sync::Semaphore::MAX_PERMITS,
+            "the ceiling is clamped to what a semaphore can actually hold"
+        );
+        assert!(
+            limiter.try_acquire().is_some(),
+            "a clamped ceiling still admits streams"
+        );
     }
 
     #[test]

@@ -711,14 +711,25 @@ pub async fn proxy_to_backend_streaming(
             // be mistaken for one.
             Ok(None) => break,
             Err(_) => {
-                // The backend went quiet mid-body. Whatever was already flushed
-                // reached the client, so what is reported is what was delivered
-                // rather than zero.
-                tracing::debug!(
-                    "Backend sent nothing for {:?} mid-body, ending the stream",
-                    response_idle
+                // The backend went quiet mid-body, which is a failure and not an
+                // end: returning here rather than breaking out is what keeps the
+                // two apart. Breaking would fall through to the chunked
+                // terminator and `send.finish()` below, and the client would
+                // get a body that is syntactically complete and silently
+                // truncated — a truncated stream it has no way to tell from a
+                // whole one, and an access line recording a success.
+                //
+                // `bytes_sent` is what the client actually received, so it is
+                // still reported rather than zero.
+                tracing::warn!(
+                    "Backend sent nothing for {response_idle:?} mid-body, ending the stream \
+                     after {bytes_sent} bytes"
                 );
-                break;
+                return Err(ProxyFailure::after(
+                    status,
+                    bytes_sent,
+                    anyhow::anyhow!("backend sent nothing for {response_idle:?} mid-body"),
+                ));
             }
         };
         match chunk {
@@ -877,9 +888,9 @@ async fn read_chunked_request_body(
     let mut buf = [0u8; 8192];
     let mut reservation = crate::conn::limits::ByteReservation::empty();
 
-    // A phase deadline rather than the idle cap alone: a peer sending one chunk
-    // before each idle expiry renews that one forever, and this holds a stream
-    // slot for as long as it keeps doing so.
+    // A phase deadline, not a per-read one: a peer sending one chunk before
+    // each expiry renews a per-read bound forever, and this holds a stream slot
+    // for as long as it keeps doing so.
     let body_deadline = crate::deadline::Deadlines::default().body;
     let deadline_at = tokio::time::Instant::now() + body_deadline;
 
@@ -940,14 +951,19 @@ where
     let mut remaining = content_length.saturating_sub(body.len());
     let mut buf = [0u8; 8192];
 
-    // Claimed before the first read: `remaining` is what this is about to
-    // allocate, whatever actually arrives.
-    let reservation = crate::conn::limits::ByteReservation::take(remaining)?;
+    // `content_length`, not `remaining`. Whatever arrived with the head is
+    // already sitting in `body` and is already going to the backend, so it is
+    // held memory whether or not this function accounts for it — and QUIC is a
+    // byte stream, so a peer decides for itself how much body rides along with
+    // the head. Reserving `remaining` alone left that up to ~72 KiB per stream
+    // uncounted, which is the whole budget on a busy connection.
+    let reservation = crate::conn::limits::ByteReservation::take(content_length)?;
 
-    // A deadline over the whole read, not per read. The idle cap below is still
-    // wanted — a slow but progressing upload is legitimate — but on its own it
-    // re-arms on every byte, which is exactly what a peer dripping one byte
-    // before each expiry wants.
+    // A deadline over the whole read rather than per read. An idle cap is still
+    // wanted for a slow but progressing upload, but on its own it re-arms on
+    // every byte, which is exactly what a peer dripping one byte before each
+    // expiry wants — and it is not a cap this path can enforce any more, since
+    // `REQUEST_BODY_READ_TIMEOUT` is gone.
     let body_deadline = crate::deadline::Deadlines::default().body;
     let deadline_at = tokio::time::Instant::now() + body_deadline;
 
@@ -1412,6 +1428,37 @@ mod tests {
             .await
             .expect("the budget took the same size back");
         assert_eq!(complete_body.len(), DECLARED);
+    }
+
+    /// Bytes that arrived with the head are charged to the budget even though this
+    /// function never reads a byte for them.
+    ///
+    /// QUIC is a byte stream, so how much body rides along with the head is the
+    /// peer's choice — the head loop can hand this function a buffer already
+    /// holding the whole body. Those bytes are held and are going to the
+    /// backend, so a reservation of `remaining` alone (which is zero here)
+    /// would leave the entire body uncounted on every stream a peer chose to
+    /// send in one segment.
+    #[tokio::test(start_paused = true)]
+    async fn bytes_that_arrived_with_the_head_are_charged_too() {
+        const DECLARED: usize = 8192;
+
+        // The peer sent head and body in one segment: the buffer holds all
+        // `DECLARED` bytes, so `remaining` is zero and a reservation of
+        // `remaining` takes nothing at all. The body is still forwarded.
+        let mut reader = ScriptedReader::pieces(&[], true);
+        let mut body = vec![b'x'; DECLARED];
+
+        let reservation = read_remaining_request_body(&mut reader, &mut body, DECLARED)
+            .await
+            .expect("a declared size inside the budget is admitted");
+        assert_eq!(body.len(), DECLARED);
+        assert!(
+            reservation.bytes() >= DECLARED,
+            "the {} bytes already in the buffer were charged {}",
+            DECLARED,
+            reservation.bytes()
+        );
     }
 
     /// A body that declares more than the process budget allows is refused
