@@ -14,6 +14,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// acceptable, so an intercepted one cannot be replayed next week.
 const TIMESTAMP_WINDOW_SECS: i64 = 30;
 
+/// Which credential a response is to be proven with.
+///
+/// Decided by what the server holds for the device the response named — never
+/// by anything the response carries, so a peer cannot choose a weaker proof
+/// than the one its entry demands.
+enum Proof {
+    /// A TOTP seed: an HMAC over the challenge, then a code.
+    Secret(Vec<u8>),
+    /// An Ed25519 public key: a signature over the same bytes the HMAC covers.
+    Key(iroh::PublicKey),
+}
+
 /// TOTP validator for verifying client codes.
 ///
 /// Borrows the [`AuthConfig`] it validates against: the config is shared and
@@ -43,20 +55,27 @@ impl<'a> TotpValidator<'a> {
     /// issued.
     ///
     /// Everything a response must prove is checked here, in order: the client
-    /// is known and not locked out, its secret decodes, its timestamp is
-    /// fresh, its signature matches HMAC-SHA256(secret, nonce || timestamp),
-    /// and finally the TOTP code is current. Only the last step can return
-    /// `Ok(false)`: a wrong code is a user mistake and counts toward the
-    /// lockout, while every `Err` is a refusal the caller logs instead of
-    /// counting.
+    /// is known and not locked out, the device it named has a credential that
+    /// reads back, its timestamp is fresh, and then the proof itself — which
+    /// is one of two, decided by what that credential is. A device with a
+    /// secret proves itself the way it always has: the signature matches
+    /// HMAC-SHA256(secret, nonce || timestamp) and the TOTP code is current. A
+    /// device with a public key proves itself with an Ed25519 signature over
+    /// the same bytes, and has no code to offer: `totp_code` is empty.
+    ///
+    /// `Ok(false)` is the credential being wrong — a wrong code for a secret
+    /// device, a signature that is not this key's for a key device — and the
+    /// caller counts it toward the lockout, which for a key device is the only
+    /// wrong-credential signal there is. Every `Err` is a refusal the caller
+    /// logs instead of counting.
     ///
     /// `device_id` says which credential under that client is being proven:
     /// `None` is the device that has no name and answers with the client's own
     /// `secret`, which is what every device used before a client could carry a
-    /// table of them. A name selects that device's secret, and a name the
-    /// table does not carry is refused rather than falling back — dropping a
-    /// device from the table is how it is revoked, and a fallback would let it
-    /// back in under the name it no longer has.
+    /// table of them. A name selects that device's entry, and the entry decides
+    /// the proof. A name the table does not carry is refused rather than
+    /// falling back — dropping a device from the table is how it is revoked,
+    /// and a fallback would let it back in under the name it no longer has.
     ///
     /// Which device authenticated changes nothing about the lockout: the
     /// counter is the client's, so a device cannot escape it by naming itself
@@ -98,16 +117,21 @@ impl<'a> TotpValidator<'a> {
         // name. `unnamed_device_allowed = false` is how an operator says this
         // client has stopped handing that secret out, and makes revoking a
         // device mean what it reads as meaning.
-        let secret = match device_id {
+        //
+        // The unnamed device is always the secret path: its credential is the
+        // client's own `secret`, a string, and a key has no place in it.
+        let proof = match device_id {
             None if !client.unnamed_device_allowed => {
                 return Err(AuthError::UnnamedDeviceNotAllowed);
             }
-            None => client.decode_secret(),
-            Some(name) => client
-                .devices
-                .get(name)
-                .ok_or(AuthError::UnknownDevice)?
-                .decode_secret(),
+            None => client.decode_secret().map(Proof::Secret),
+            Some(name) => {
+                let device = client.devices.get(name).ok_or(AuthError::UnknownDevice)?;
+                match device.public_key.as_deref() {
+                    Some(key) => super::device_key::parse_public_key(key).map(Proof::Key),
+                    None => device.decode_secret().map(Proof::Secret),
+                }
+            }
         }
         .map_err(|_| AuthError::InvalidSecret)?;
 
@@ -120,11 +144,30 @@ impl<'a> TotpValidator<'a> {
             return Err(AuthError::StaleTimestamp);
         }
 
-        let expected = hmac_signature(&secret, nonce, timestamp)?;
-        if !constant_time_eq(signature, &expected) {
-            return Err(AuthError::ChallengeMismatch);
+        match proof {
+            Proof::Secret(secret) => {
+                let expected = hmac_signature(&secret, nonce, timestamp)?;
+                if !constant_time_eq(signature, &expected) {
+                    return Err(AuthError::ChallengeMismatch);
+                }
+                self.check_code(secret, code)
+            }
+            // The key path's whole verdict: a signature over the same message
+            // the HMAC above covers, so this is the same statement, proven the
+            // other way. `false` here is a wrong signature, which the caller
+            // counts the way it counts a wrong code — a key device has no
+            // code, so this is the only wrong-credential signal there is, and
+            // leaving it uncounted would let the device be hammered without
+            // limit.
+            Proof::Key(key) => Ok(super::device_key::ed25519_verify(
+                &key, nonce, timestamp, signature,
+            )),
         }
+    }
 
+    /// The code half of the secret path: whether `code` is current for
+    /// `secret` under this config's algorithm, digits, window and step.
+    fn check_code(&self, secret: Vec<u8>, code: &str) -> Result<bool, AuthError> {
         // `Builder` narrows two of these: 5.x took `digits` as a `usize` and
         // `skew` as a `u8`, 6.0 takes a `u8` and a `u16`. Converting rather
         // than casting keeps a config that does not fit from being truncated
@@ -158,6 +201,11 @@ impl<'a> TotpValidator<'a> {
 /// The signature a client attaches to AUTH_RESPONSE:
 /// HMAC-SHA256(secret, nonce || timestamp.to_le_bytes()).
 ///
+/// The message is built by [`super::device_key::sign_message`], the one
+/// definition both proof paths use — a key-based device signs these same bytes
+/// with Ed25519, so what a response proves does not depend on which credential
+/// answered it.
+///
 /// Keep in sync with `TwoFactorAuth::sign_challenge` in
 /// `crates/nexapipe-client/src/auth.rs`.
 pub(crate) fn hmac_signature(
@@ -170,8 +218,7 @@ pub(crate) fn hmac_signature(
     // returned rather than `expect`ed because it runs inside a handshake, where
     // a panic would drop the connection with nothing to report.
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::InvalidSecret)?;
-    mac.update(nonce);
-    mac.update(&timestamp.to_le_bytes());
+    mac.update(&super::device_key::sign_message(nonce, timestamp));
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
@@ -210,6 +257,12 @@ pub enum AuthError {
     /// Deliberately carries no name: it is answered to a name the peer chose,
     /// which is not a name this process has agreed to print.
     UnknownDevice,
+    /// The stored credential could not be read at all: a secret that does not
+    /// decode, or a public key that is not a point on the curve.
+    ///
+    /// Either way it is the server's own config that is broken, not a peer's
+    /// mistake — a peer could not have supplied these bytes — so a caller
+    /// reports it as such and never counts it as an attempt.
     InvalidSecret,
     TotpCreationFailed,
     LockedOut,
@@ -229,7 +282,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::ClientNotFound => write!(f, "Client not found"),
             AuthError::UnknownDevice => write!(f, "No device of that name under this client"),
-            AuthError::InvalidSecret => write!(f, "Invalid secret configuration"),
+            AuthError::InvalidSecret => write!(f, "Invalid credential configuration"),
             AuthError::TotpCreationFailed => write!(f, "Failed to create TOTP validator"),
             AuthError::LockedOut => {
                 write!(f, "Client is locked out due to too many failed attempts")
@@ -291,6 +344,7 @@ mod tests {
                 "laptop".to_string(),
                 crate::auth::DeviceAuth {
                     secret: "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP".to_string(),
+                    public_key: None,
                     created_at: String::new(),
                     last_used: None,
                 },
@@ -306,6 +360,25 @@ mod tests {
             clients: HashMap::from([("alice".to_string(), client)]),
             ..AuthConfig::default()
         }
+    }
+
+    /// The same client, plus a second device that proves itself with a key
+    /// instead — and the key that proves it, which only the test holds. The
+    /// two kinds side by side is what a migration looks like: one device still
+    /// answers with a code, the next one signs.
+    fn config_with_a_key_device() -> (AuthConfig, iroh::SecretKey) {
+        let key = iroh::SecretKey::generate();
+        let mut config = config_with_one_device();
+        config.clients.get_mut("alice").unwrap().devices.insert(
+            "phone".to_string(),
+            crate::auth::DeviceAuth {
+                secret: String::new(),
+                public_key: Some(crate::auth::public_key_hex(&key.public())),
+                created_at: String::new(),
+                last_used: None,
+            },
+        );
+        (config, key)
     }
 
     /// The nonce a test signs over, minted the way the connection layer mints
@@ -524,5 +597,105 @@ mod tests {
     fn an_unnamed_device_is_allowed_unless_the_config_says_otherwise() {
         let config = config_with_one_device();
         assert!(config.clients["alice"].unnamed_device_allowed);
+    }
+
+    /// A key device proves itself with a signature over the challenge, and it
+    /// does so without a code — which is the point, because the device this is
+    /// for has nobody to read one.
+    #[test]
+    fn a_key_device_proves_itself_with_a_signature() {
+        let (config, key) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let signature = key.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("phone"),
+            &nonce,
+            timestamp,
+            &signature.to_bytes(),
+            "",
+        );
+        assert!(matches!(outcome, Ok(true)), "{outcome:?}");
+    }
+
+    /// A signature that is not this device's is the key path's wrong
+    /// credential, so it is `Ok(false)` — the verdict the caller counts — and
+    /// not an `Err`. If it were an `Err`, the counter would never move and the
+    /// device could be tried without limit.
+    #[test]
+    fn a_wrong_signature_is_a_wrong_credential_not_an_error() {
+        let (config, _) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let stranger = iroh::SecretKey::generate();
+        let signature = stranger.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("phone"),
+            &nonce,
+            timestamp,
+            &signature.to_bytes(),
+            "",
+        );
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+    }
+
+    /// The freshness bound is the same for both proofs: a signature is proof
+    /// of seeing this challenge, and a stale timestamp is a refusal — `Err`,
+    /// which the caller does not count — whichever kind of device sent it.
+    #[test]
+    fn a_stale_timestamp_is_refused_on_the_key_path_too() {
+        let (config, key) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp() - 3600;
+
+        let signature = key.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("phone"),
+            &nonce,
+            timestamp,
+            &signature.to_bytes(),
+            "",
+        );
+        assert!(
+            matches!(outcome, Err(AuthError::StaleTimestamp)),
+            "{outcome:?}"
+        );
+    }
+
+    /// A key device is not also a secret device: a response that answers for
+    /// the key device with the *client's* own secret — what a peer falls back
+    /// to when it has nothing else — is refused at the signature check, and
+    /// the key device's entry cannot be reached by an unsuspecting client.
+    #[test]
+    fn a_key_device_is_not_reachable_with_the_clients_secret() {
+        let (config, _) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let clients_own = hmac_signature(
+            &config.clients["alice"].decode_secret().unwrap(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        // An HMAC is not a signature, and nothing on the key path reads it as
+        // one: the verdict is a wrong credential, not a fallback to the
+        // client's secret.
+        let outcome =
+            validator.verify_response("alice", Some("phone"), &nonce, timestamp, &clients_own, "");
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
     }
 }

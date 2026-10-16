@@ -83,11 +83,13 @@ bind_ipv6 = false
 # ]
 
 # ===== 2FA Authentication Configuration (server side) =====
-# When enabled, every client connection must complete a TOTP handshake before
-# proxying is allowed. `enabled` is picked up live by the config watcher, taking
-# effect for connections opened after the reload; turning it back *off* on a
-# running server is refused, so disabling 2FA needs a restart. The TOTP
-# parameters below are read once at startup - restart after changing any of them.
+# When enabled, every client connection must prove a credential before proxying
+# is allowed — a TOTP response, or, for a device registered with a key, a
+# signature over that connection's challenge. `enabled` is picked up live by the
+# config watcher, taking effect for connections opened after the reload; turning
+# it back *off* on a running server is refused, so disabling 2FA needs a
+# restart. The TOTP parameters below are read once at startup - restart after
+# changing any of them.
 [auth]
 enabled = true
 algorithm = "sha1"      # sha1, sha256, sha512
@@ -197,6 +199,26 @@ created_at = "1723756800"
 # `devices` table at all — which is every client written before this existed —
 # authenticates exactly as it always did.
 #
+# An entry below carries exactly one credential, and it is one of two kinds.
+# The `secret` on the laptop is a TOTP seed issued at enrollment, and that device
+# answers each handshake the way clients always have — an HMAC keyed by the seed
+# plus a code. A `public_key` is the other kind: the half of an Ed25519 pair
+# whose private half stays on the device, which proves itself by signing the
+# same challenge instead. What the server holds then cannot be replayed — a copy
+# of this file is no way in, where a copied `secret` is the credential itself —
+# and no code has to come from anywhere, which is what a device that runs
+# unattended wants. A wrong signature counts toward the lockout exactly like a
+# wrong code. Exactly one kind per entry: both, or neither, is refused at load
+# rather than one of two credentials being silently ignored.
+#
+# The shell has the same two forms — `client add client-001 --device <name>`
+# issues a seed; the key kind is one word more:
+#
+#   nexapipe client add client-001 --device phone --public-key <64 hex chars>
+#
+# The public half is what an operator registers; the device generates the pair,
+# and the private half never travels. `client list` marks such a device `key`.
+#
 # The `secret` above is still a credential of its own: it is what a device that
 # names none answers with. Revoking a device strikes one entry out of the table
 # below and leaves it standing, so a secret that has been handed out — in an
@@ -210,8 +232,13 @@ created_at = "1723756800"
 # Left out, or true, the client answers as it always has. Turning it off before
 # every device is enrolled locks out the ones that never named themselves.
 [auth.clients.client-001.devices.laptop]
-secret = "LAPTOPSECRET"     # Base32-encoded secret, issued at enrollment
+secret = "LAPTOPSECRET"     # Base32-encoded TOTP seed, issued at enrollment
 created_at = "1723756800"
+
+# The same table, one device later, carrying the other kind of credential:
+# [auth.clients.client-001.devices.phone]
+# public_key = "a1b2c3…"    # 64 hex characters, the public half of an Ed25519 key
+# created_at = "1723756800"
 
 [auth.clients.client-002]
 secret = "KBSWY3DPEHPK3PXQ"

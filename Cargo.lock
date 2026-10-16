@@ -2426,6 +2426,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "futures-util",
+ "hex",
  "hmac",
  "http",
  "http-body-util",

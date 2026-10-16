@@ -10,6 +10,49 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## [Unreleased]
+
+The device credential can now be a **key** instead of a shared secret. No
+configuration key is added, removed or renamed, and a `config.toml` that works
+on 0.6.1 still loads and behaves as it did: a device entry that carries a
+`secret` is checked exactly as before.
+
+### Added
+
+- **Per-device Ed25519 keys.** An entry under
+  `[auth.clients.<id>.devices.<name>]` can carry `public_key` — the public
+  half of an Ed25519 pair, 64 hex characters — instead of `secret`, and that
+  device then proves itself by signing each connection's challenge (the nonce
+  and the timestamp) instead of answering with a TOTP code. What the server
+  holds is no longer itself a credential: a leaked config yields no way in for
+  a key device, and the private half never leaves the device. A wrong
+  signature counts toward the lockout exactly like a wrong code. A device
+  entry carries exactly one of the two — both, or neither, is refused at
+  load.
+- **`nexapipe client add <id> --device <name> --public-key <hex>`** registers
+  the public half from the shell, with the same replace semantics as the
+  secret path (`--force` to rotate); `client list` marks a key device with
+  `key`.
+- **Enrollment can issue a key.** A client built on the client library can
+  offer a public key while it spends its one-shot enrollment token
+  (`Enrollment::with_key`); the server records it and answers with an empty
+  secret, and the client authenticates every later connection with
+  `TwoFactorAuth::with_key`. An older server ignores the offered key and
+  issues a secret as before, which the client then uses.
+
+### Changed
+
+- **The handshake proves a credential, not necessarily a TOTP secret.** Which
+  kind of credential a device has comes from the server's own record, not
+  from a wire discriminator, so no message variant or scheme field was added,
+  and the handshake of every device that keeps a secret is byte-for-byte
+  unchanged.
+- **TOTP is the enrollment-time factor.** For a key device no seed reaches
+  the device at all; the human moment stays with the invite and the one-shot
+  token, and no unattended path has a prompt to answer. Both apps still
+  enroll and answer with TOTP secrets — holding a key in the desktop and
+  Android UIs is planned for the next release.
+
 ## [0.6.1] — 2026-10-11
 
 Two configuration keys are added (`[iroh] secret_key_file` and

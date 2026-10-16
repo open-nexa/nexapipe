@@ -489,6 +489,7 @@ reload.
 | `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. |
 | `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of the device that names none. Refuses to replace one without `--force`. |
 | `client add <CLIENT_ID> --device <NAME>` | Issue a credential to one device, leaving the client's own `secret` alone — so the devices already using it keep working. The client has to exist first. |
+| `client add <CLIENT_ID> --device <NAME> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars) that the device signs every challenge with. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
 | `client revoke <CLIENT_ID>` | Drop a client and every device credential under it. |
 | `client revoke <CLIENT_ID> --device <NAME>` | Drop one device's credential, keeping the client and its other devices. |
 
@@ -518,7 +519,8 @@ The server checks a peer against whichever of the two it asked for: a device
 that named itself against its own entry, one that named none against the
 client's `secret`. Neither has to be written by hand — enrollment files a device
 on its own, and `client add --device` issues one from the shell — and a client
-carrying no `devices` table behaves exactly as it did before it existed.
+carrying no `devices` table behaves exactly as it did before it existed. A
+device can carry a key instead of a secret — see [Device keys](#device-keys).
 
 ---
 
@@ -1124,8 +1126,10 @@ with `modes = ["http", "tcp"]`.
 
 ## 2FA (TOTP)
 
-When `[auth] enabled = true`, every client connection must complete a TOTP
-handshake before any traffic is proxied.
+When `[auth] enabled = true`, every client connection must prove its credential
+before any traffic is proxied — a TOTP response, or, for a device registered
+with a key, a signature over that connection's challenge (see
+[Device keys](#device-keys) below). The TOTP half comes first.
 
 1. Generate a secret and a scannable QR code. The secret is written into
    `[auth.clients]` of your `config.toml` as it is printed, so step 2 is only
@@ -1210,6 +1214,49 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
   response signature (HMAC-SHA256 keyed by the secret) *before* it looks at the
   code. Any `nexapipe://` invite with `secret=` and any enrollment QR carry it
   **in the clear** — treat both as passwords (`--qr-out` writes `0600` on Unix).
+
+### Device keys
+
+A device does not have to hold a shared secret. Register the **public** half of
+an Ed25519 key pair for one named device, and the private half — generated on
+the device, never sent anywhere — is what it proves itself with:
+
+```bash
+nexapipe client add client-001 --device phone --public-key <64 hex chars> \
+  --config config.toml
+```
+
+From then on that device answers each connection by **signing** the challenge
+(the nonce and the timestamp) instead of returning a code, and the server
+verifies the signature against the key it holds. Three things follow:
+
+- **What the server holds cannot be replayed.** A copy of `config.toml` yields
+  no way in for a key device, where a copied `secret` *is* the credential
+  itself. The private half never leaves the device, not even at enrollment.
+- **Nothing has to come from anywhere at connection time** — no seed kept for
+  the handshake, no code produced — which is what a device that runs unattended
+  needs. There is no prompt for a human to miss.
+- **A wrong signature counts toward the lockout** exactly like a wrong code, so
+  a key device cannot be hammered without limit; a stale timestamp is still
+  refused without counting.
+
+A device entry carries **one** credential — `secret` or `public_key`, never
+both, and one of the two is required: a config with both, or with neither, is
+refused at load rather than one of two credentials being silently ignored.
+Whether a device is key-based comes from that entry and not from the wire, so
+the handshake of every device that keeps a secret stays byte-for-byte what it
+was, and a config written before any of this loads and behaves as it always
+did. `client list` marks a key device with `key`, and
+`client revoke <id> --device <name>` drops it like any other device.
+
+Enrollment can issue a key too: a client built on the library can offer a
+public key while it spends its one-shot token (the library exposes this as
+`Enrollment::with_key`), the server records it and answers with no secret, and
+every later handshake goes out signed (`TwoFactorAuth::with_key`). The human
+moment stays where it was — scanning the invite, spending the token, once —
+which is why TOTP is the enrollment-time factor rather than a prompt on every
+connection. Both apps still enroll and answer with TOTP secrets; holding a key
+is the next release's half in each.
 
 ---
 
@@ -1399,8 +1446,9 @@ question:
   handshake, before the connection is accepted. Optional: with no `[peers]`
   section every Node ID that can reach the endpoint gets as far as the next
   check.
-- 2FA — *who is this*. A TOTP handshake whose response needs an HMAC over that
-  connection's nonce, keyed by the client's secret.
+- 2FA — *who is this*. A handshake whose response needs an HMAC over that
+  connection's nonce, keyed by the client's secret — or an Ed25519 signature
+  over the same bytes, for a device registered with a public key.
 - `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
   at the handshake.
 
