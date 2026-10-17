@@ -1304,10 +1304,18 @@ pub struct ClientAuthToml {
 /// is no `allow_hosts` here on purpose: what a client may reach is answered by
 /// the client's entry alone, and a second place to say it is a second place for
 /// it to disagree.
+///
+/// One of `secret` and `public_key` has to be set and the other has to not be,
+/// which the loader enforces where the operator can see which entry it is
+/// about; both fields are `Option` so that either spelling parses far enough to
+/// be told what is wrong with it.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceAuthToml {
-    pub secret: String,
+    pub secret: Option<String>,
+    /// The device's Ed25519 public key, hex: the credential of a device that
+    /// signs its handshake instead of answering with a TOTP code.
+    pub public_key: Option<String>,
     pub created_at: Option<String>,
     /// Written back by the server, read here, so "when did this device last
     /// connect" survives a restart.
@@ -1402,9 +1410,16 @@ impl ProxyConfig {
                             // log line for every outcome carries, and what an
                             // operator names when revoking one. An empty one
                             // is not a name — the unnamed device is what the
-                            // client's own `secret` is for — and an empty
-                            // secret would key its HMAC with nothing, which is
-                            // a signature anybody can forge.
+                            // client's own `secret` is for.
+                            //
+                            // The two fields that follow are one credential
+                            // spelled two ways — a TOTP seed the device shares
+                            // with the server, or the public half of a key pair
+                            // it keeps the other half of — and a device answers
+                            // with exactly one of them. Both, or neither, is a
+                            // config that does not say how the device proves
+                            // itself, refused here where the operator can see
+                            // which entry it is.
                             let mut devices = HashMap::new();
                             for (device_id, device_toml) in client_toml.devices.unwrap_or_default()
                             {
@@ -1423,16 +1438,41 @@ impl ProxyConfig {
                                         crate::auth::MAX_DEVICE_ID_LEN
                                     );
                                 }
-                                if device_toml.secret.is_empty() {
-                                    anyhow::bail!(
-                                        "[auth.clients.{id}.devices.{device_id}]: secret is empty; \
-                                         an empty one keys this device's HMAC with nothing"
-                                    );
+                                // `secret = ""` is read as no secret at all:
+                                // an empty one is not a credential, and an
+                                // entry left holding only that is refused
+                                // below like one that has nothing.
+                                let secret = device_toml.secret.filter(|s| !s.is_empty());
+                                match (&secret, &device_toml.public_key) {
+                                    (None, None) => anyhow::bail!(
+                                        "[auth.clients.{id}.devices.{device_id}]: no `secret` and \
+                                         no `public_key`; a device answers with one of the two, \
+                                         and an empty secret is not one"
+                                    ),
+                                    (Some(_), Some(_)) => anyhow::bail!(
+                                        "[auth.clients.{id}.devices.{device_id}]: both a `secret` \
+                                         and a `public_key`; a device answers with one \
+                                         credential, and two are two answers to disagree about"
+                                    ),
+                                    (None, Some(public_key)) => {
+                                        // Checked where the key would otherwise
+                                        // first be used: at a handshake, where
+                                        // a bad key and a wrong one are the
+                                        // same refusal.
+                                        if let Err(why) = crate::auth::parse_public_key(public_key)
+                                        {
+                                            anyhow::bail!(
+                                                "[auth.clients.{id}.devices.{device_id}]: {why}"
+                                            );
+                                        }
+                                    }
+                                    (Some(_), None) => {}
                                 }
                                 devices.insert(
                                     device_id,
                                     crate::auth::DeviceAuth {
-                                        secret: device_toml.secret,
+                                        secret: secret.unwrap_or_default(),
+                                        public_key: device_toml.public_key,
                                         created_at: device_toml.created_at.unwrap_or_else(
                                             crate::auth::config::default_created_at,
                                         ),
@@ -1627,9 +1667,12 @@ impl ProxyConfig {
         write_config_file(path, &doc.to_string())
     }
 
-    /// Spends the token for one named device: writes that device's own secret
-    /// into `[auth.clients.<id>.devices.<name>]` and drops
+    /// Spends the token for one named device: writes that device's own
+    /// credential into `[auth.clients.<id>.devices.<name>]` and drops
     /// `pending_enrollment`, leaving the client's `secret` as it was.
+    ///
+    /// The material is whichever the enrollment turned on: a secret the server
+    /// generated, or the public key the device offered in ENROLL_START.
     ///
     /// The client's secret is deliberately untouched. It is the credential of
     /// the device that has no name — every device that enrolled before this
@@ -1642,7 +1685,7 @@ impl ProxyConfig {
     /// with the token still beside it would leave the window open for a second
     /// device to trade the same link for the same credential.
     ///
-    /// The entry lands where [`Self::write_device_secret`] puts one: both
+    /// The entry lands where [`Self::write_device_credential`] puts one: both
     /// writers go through [`device_table`] and [`device_entry`], so a device
     /// that spent a token and one an operator wrote by hand are the same shape
     /// on disk.
@@ -1650,10 +1693,10 @@ impl ProxyConfig {
         path: &str,
         client_id: &str,
         device: &str,
-        secret: &str,
+        material: crate::auth::DeviceMaterial<'_>,
     ) -> anyhow::Result<()> {
         with_config_lock(path, || {
-            Self::complete_device_enrollment_unlocked(path, client_id, device, secret)
+            Self::complete_device_enrollment_unlocked(path, client_id, device, material)
         })
     }
 
@@ -1661,7 +1704,7 @@ impl ProxyConfig {
         path: &str,
         client_id: &str,
         device: &str,
-        secret: &str,
+        material: crate::auth::DeviceMaterial<'_>,
     ) -> anyhow::Result<()> {
         let content =
             fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
@@ -1674,24 +1717,29 @@ impl ProxyConfig {
         let client = sub_table(clients, client_id, path)?;
 
         let devices = device_table(client, client_id, path)?;
-        devices.insert(device, device_entry(secret, path)?);
+        devices.insert(device, device_entry(material, path)?);
 
         client.remove("pending_enrollment");
 
         write_config_file(path, &doc.to_string())
     }
 
-    /// Writes `secret` under `[auth.clients.<client_id>.devices.<device>]`,
-    /// which is what gives one device of a client a credential of its own.
+    /// Writes one device's credential — a TOTP secret or a public key — under
+    /// `[auth.clients.<client_id>.devices.<device>]`, which is what gives one
+    /// device of a client a credential of its own.
     ///
     /// The client's own `secret` is deliberately left alone: it is the
     /// credential of the device that names none, so rotating it re-enrolls
-    /// every unnamed device at once, and issuing one device a secret of its own
-    /// is exactly the case where that is known not to be what was asked for.
+    /// every unnamed device at once, and issuing one device a credential of its
+    /// own is exactly the case where that is known not to be what was asked
+    /// for.
     ///
     /// `force` is what allows an existing device to be issued another one, for
     /// the reason [`Self::write_client_secret`] needs it: a device already
-    /// using the old secret stops authenticating the moment it changes.
+    /// using the old credential stops authenticating the moment it changes.
+    /// Replacing one kind with the other has to go through `force` the same
+    /// way — a device that answered with a code and now answers with a
+    /// signature is as enrolled-out as one whose secret changed.
     ///
     /// What it writes is the entry [`Self::complete_device_enrollment`] writes
     /// when a device spends a token — one shape on disk, reached the same way.
@@ -1701,23 +1749,23 @@ impl ProxyConfig {
     ///
     /// The client has to be there first — a device table under a client with no
     /// secret of its own is a config that will not load.
-    pub fn write_device_secret(
+    pub fn write_device_credential(
         path: &str,
         client_id: &str,
         device: &str,
-        secret: &str,
+        material: crate::auth::DeviceMaterial<'_>,
         force: bool,
     ) -> anyhow::Result<ClientSecretWrite> {
         with_config_lock(path, || {
-            Self::write_device_secret_unlocked(path, client_id, device, secret, force)
+            Self::write_device_credential_unlocked(path, client_id, device, material, force)
         })
     }
 
-    fn write_device_secret_unlocked(
+    fn write_device_credential_unlocked(
         path: &str,
         client_id: &str,
         device: &str,
-        secret: &str,
+        material: crate::auth::DeviceMaterial<'_>,
         force: bool,
     ) -> anyhow::Result<ClientSecretWrite> {
         // The name becomes a key in this file and the subject of every log line
@@ -1752,11 +1800,11 @@ impl ProxyConfig {
         let replaced = devices.contains_key(device);
         if replaced && !force {
             anyhow::bail!(
-                "device \"{device}\" of client \"{client_id}\" already has a secret in {path}"
+                "device \"{device}\" of client \"{client_id}\" already has a credential in {path}"
             );
         }
 
-        devices.insert(device, device_entry(secret, path)?);
+        devices.insert(device, device_entry(material, path)?);
 
         write_config_file(path, &doc.to_string())?;
 
@@ -1878,9 +1926,10 @@ fn device_names(devices: &dyn toml_edit::TableLike) -> String {
 ///
 /// Where a device's credential goes, for both of the writers that put one
 /// there: the enrollment that spends a token, and the operator CLI behind
-/// [`ProxyConfig::write_device_secret`]. One table either way, so a device that
-/// enrolled and one that was handed a secret by hand are the same shape on
-/// disk, and the handshake does not have to know which of the two it is.
+/// [`ProxyConfig::write_device_credential`]. One table either way, so a device
+/// that enrolled and one that was handed a credential by hand are the same
+/// shape on disk, and the handshake does not have to know which of the two it
+/// is.
 ///
 /// Not `sub_table`, which makes an implicit table: a device added under one
 /// would be written as `devices.laptop = { … }` on a line of the client's own
@@ -1905,26 +1954,43 @@ fn device_table<'a>(
     })
 }
 
-/// The entry a device's credential is stored as: its `secret` and when it was
-/// issued, which is the one thing the file says about a device besides its name.
+/// The entry a device's credential is stored as: whichever of the two it is —
+/// `secret` or `public_key` — and when it was issued, which is the one thing
+/// the file says about a device besides its name.
 ///
 /// Inline rather than a sub-table of its own, because the table it goes into
 /// may itself be an inline one an operator wrote, and a sub-table cannot be
 /// put inside one.
 ///
-/// An empty secret is refused rather than written: the loader rejects one — it
-/// would key this device's HMAC with nothing — so an entry holding `""` is not
-/// a device that cannot authenticate, it is a config that cannot be read again,
-/// and both writers would have reported success while doing it.
-fn device_entry(secret: &str, path: &str) -> anyhow::Result<toml_edit::Item> {
-    if secret.is_empty() {
-        anyhow::bail!(
-            "{path}: a device secret cannot be empty; an empty one keys this device's HMAC with \
-             nothing and leaves a config that cannot be loaded"
-        );
-    }
+/// The material is checked here rather than written as handed over: the loader
+/// refuses an empty secret (it would key this device's HMAC with nothing) and a
+/// public key that is not a key, so an unchecked write would hand back success
+/// while leaving a config that cannot be read again. A key is written in the
+/// canonical spelling — lowercase hex — whatever case it arrived in.
+fn device_entry(
+    material: crate::auth::DeviceMaterial<'_>,
+    path: &str,
+) -> anyhow::Result<toml_edit::Item> {
     let mut entry = toml_edit::InlineTable::new();
-    entry.insert("secret", toml_edit::Value::from(secret));
+    match material {
+        crate::auth::DeviceMaterial::Secret(secret) => {
+            if secret.is_empty() {
+                anyhow::bail!(
+                    "{path}: a device secret cannot be empty; an empty one keys this device's \
+                     HMAC with nothing and leaves a config that cannot be loaded"
+                );
+            }
+            entry.insert("secret", toml_edit::Value::from(secret));
+        }
+        crate::auth::DeviceMaterial::PublicKey(public_key) => {
+            let key = crate::auth::parse_public_key(public_key)
+                .map_err(|why| anyhow::anyhow!("{path}: {why}"))?;
+            entry.insert(
+                "public_key",
+                toml_edit::Value::from(crate::auth::public_key_hex(&key)),
+            );
+        }
+    }
     entry.insert(
         "created_at",
         toml_edit::Value::from(crate::auth::config::default_created_at()),
@@ -2786,6 +2852,7 @@ fn sub_table<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::DeviceMaterial;
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")
@@ -3518,8 +3585,13 @@ pending_enrollment = "TOKEN"
     fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
         let (_dir, path) = scratch_client_with_token();
 
-        ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "LAPTOPSECRET")
-            .expect("the device enrollment is saved");
+        ProxyConfig::complete_device_enrollment(
+            &path,
+            "alice",
+            "laptop",
+            DeviceMaterial::Secret("LAPTOPSECRET"),
+        )
+        .expect("the device enrollment is saved");
 
         let on_disk = fs::read_to_string(&path).expect("read the config back");
         assert!(
@@ -3583,10 +3655,20 @@ pending_enrollment = "TOKEN"
     fn a_second_device_enrolling_leaves_the_first_one_alone() {
         let (_dir, path) = scratch_client_with_token();
 
-        ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "LAPTOPSECRET")
-            .expect("the first device enrolls");
-        ProxyConfig::complete_device_enrollment(&path, "alice", "phone", "PHONESECRET")
-            .expect("the second device enrolls");
+        ProxyConfig::complete_device_enrollment(
+            &path,
+            "alice",
+            "laptop",
+            DeviceMaterial::Secret("LAPTOPSECRET"),
+        )
+        .expect("the first device enrolls");
+        ProxyConfig::complete_device_enrollment(
+            &path,
+            "alice",
+            "phone",
+            DeviceMaterial::Secret("PHONESECRET"),
+        )
+        .expect("the second device enrolls");
 
         let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
         let auth = auth.expect("auth is enabled");
@@ -3607,14 +3689,25 @@ pending_enrollment = "TOKEN"
         let (_dir, path) = scratch_client_with_token();
         let before = fs::read_to_string(&path).expect("read the config first");
 
-        let enrollment = ProxyConfig::complete_device_enrollment(&path, "alice", "laptop", "")
-            .expect_err(
-                "an empty secret is not a credential, it is a config that cannot be read again",
-            );
+        let enrollment = ProxyConfig::complete_device_enrollment(
+            &path,
+            "alice",
+            "laptop",
+            DeviceMaterial::Secret(""),
+        )
+        .expect_err(
+            "an empty secret is not a credential, it is a config that cannot be read again",
+        );
         assert!(enrollment.to_string().contains("empty"), "{enrollment:#}");
 
-        let operator = ProxyConfig::write_device_secret(&path, "alice", "laptop", "", true)
-            .expect_err("the same for the operator CLI");
+        let operator = ProxyConfig::write_device_credential(
+            &path,
+            "alice",
+            "laptop",
+            DeviceMaterial::Secret(""),
+            true,
+        )
+        .expect_err("the same for the operator CLI");
         assert!(operator.to_string().contains("empty"), "{operator:#}");
 
         assert_eq!(
@@ -4343,9 +4436,14 @@ pending_enrollment = "TOKEN"
              secret = \"JBSWY3DPEHPK3PXP\"\n",
         );
 
-        let outcome =
-            ProxyConfig::write_device_secret(&path, "acme", "laptop", "MFRGGZDFMZTWQ2LK", false)
-                .expect("the device secret should be written");
+        let outcome = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "laptop",
+            DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+            false,
+        )
+        .expect("the device secret should be written");
         assert_eq!(outcome, ClientSecretWrite::Added);
 
         let written = fs::read_to_string(&path).expect("read back");
@@ -4380,10 +4478,18 @@ pending_enrollment = "TOKEN"
              secret = \"OLDOLDOLDOLDOLD\"\n",
         );
 
-        let err =
-            ProxyConfig::write_device_secret(&path, "acme", "laptop", "NEWNEWNEWNEWNEW", false)
-                .expect_err("a device must not lose its credential by accident");
-        assert!(err.to_string().contains("already has a secret"), "{err}");
+        let err = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "laptop",
+            DeviceMaterial::Secret("NEWNEWNEWNEWNEW"),
+            false,
+        )
+        .expect_err("a device must not lose its credential by accident");
+        assert!(
+            err.to_string().contains("already has a credential"),
+            "{err}"
+        );
         assert_eq!(
             devices_of(&path, "acme")
                 .get("laptop")
@@ -4391,9 +4497,14 @@ pending_enrollment = "TOKEN"
             Some("OLDOLDOLDOLDOLD")
         );
 
-        let outcome =
-            ProxyConfig::write_device_secret(&path, "acme", "laptop", "NEWNEWNEWNEWNEW", true)
-                .expect("with force the secret is replaced");
+        let outcome = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "laptop",
+            DeviceMaterial::Secret("NEWNEWNEWNEWNEW"),
+            true,
+        )
+        .expect("with force the secret is replaced");
         assert_eq!(outcome, ClientSecretWrite::Replaced);
         assert_eq!(
             devices_of(&path, "acme")
@@ -4415,9 +4526,14 @@ pending_enrollment = "TOKEN"
              secret = \"JBSWY3DPEHPK3PXP\"\n",
         );
 
-        let err =
-            ProxyConfig::write_device_secret(&path, "ghost", "laptop", "MFRGGZDFMZTWQ2LK", false)
-                .expect_err("a device of a client that is not there must not be created");
+        let err = ProxyConfig::write_device_credential(
+            &path,
+            "ghost",
+            "laptop",
+            DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+            false,
+        )
+        .expect_err("a device of a client that is not there must not be created");
         assert!(err.to_string().contains("ghost"), "{err}");
         assert!(
             devices_of(&path, "ghost").is_empty(),
@@ -4439,12 +4555,144 @@ pending_enrollment = "TOKEN"
         );
 
         for name in ["", "lap top", "laptop\nsecret = \"x\""] {
-            let err =
-                ProxyConfig::write_device_secret(&path, "acme", name, "MFRGGZDFMZTWQ2LK", false)
-                    .expect_err("an unusable device name must not be written");
+            let err = ProxyConfig::write_device_credential(
+                &path,
+                "acme",
+                name,
+                DeviceMaterial::Secret("MFRGGZDFMZTWQ2LK"),
+                false,
+            )
+            .expect_err("an unusable device name must not be written");
             assert!(err.to_string().contains("printable ASCII"), "{err}");
         }
         assert!(devices_of(&path, "acme").is_empty());
+    }
+
+    /// The other half of the writer: a key an operator registers lands under
+    /// the same table as a secret, spelled canonically — lowercase hex, so the
+    /// file says one thing however the key was pasted — and reads back as a
+    /// key device.
+    #[test]
+    fn a_device_key_lands_under_the_clients_devices_table() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+        let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
+
+        let outcome = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "server",
+            DeviceMaterial::PublicKey(&key.to_uppercase()),
+            false,
+        )
+        .expect("the device key should be written");
+        assert_eq!(outcome, ClientSecretWrite::Added);
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains(&format!("public_key = \"{key}\"")),
+            "the key is spelled canonically whatever case it arrived in: {written}"
+        );
+        let devices = devices_of(&path, "acme");
+        let server = &devices["server"];
+        assert_eq!(server.public_key.as_deref(), Some(key.as_str()));
+        assert!(server.secret.is_empty(), "{server:?}");
+        assert_eq!(
+            secret_of(&path, "acme").as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "the unnamed device keeps the credential it had"
+        );
+    }
+
+    /// A key that is not a key is refused before the file is touched, the same
+    /// way an empty secret is: what the writer must never do is report success
+    /// while leaving a config the loader will refuse on the next start.
+    #[test]
+    fn a_public_key_that_is_not_a_key_is_refused_by_the_writer() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        );
+        let before = fs::read_to_string(&path).expect("read the config first");
+
+        let err = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "server",
+            DeviceMaterial::PublicKey("not a key"),
+            false,
+        )
+        .expect_err("a value that is not a key must not be written");
+        assert!(err.to_string().contains("not hex"), "{err}");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the config back"),
+            before,
+            "a refused write still changed the file"
+        );
+        assert!(
+            ProxyConfig::load_with_auth(&path).is_ok(),
+            "the config was left in a state that cannot be loaded"
+        );
+    }
+
+    /// Switching a device from one credential to the other is a replace like
+    /// any other: it takes `--force`, because a device answering with a code
+    /// stops the moment its entry says key. The secret is gone rather than
+    /// kept beside the key — one credential, which is the shape the loader
+    /// insists on.
+    #[test]
+    fn a_key_replaces_a_secret_only_with_force() {
+        let (_dir, path) = scratch_config(
+            "[auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.acme]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n\
+             \n\
+             [auth.clients.acme.devices.server]\n\
+             secret = \"OLDOLDOLDOLDOLD\"\n",
+        );
+        let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
+
+        let err = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "server",
+            DeviceMaterial::PublicKey(&key),
+            false,
+        )
+        .expect_err("a device must not lose its credential by accident");
+        assert!(
+            err.to_string().contains("already has a credential"),
+            "{err}"
+        );
+
+        let outcome = ProxyConfig::write_device_credential(
+            &path,
+            "acme",
+            "server",
+            DeviceMaterial::PublicKey(&key),
+            true,
+        )
+        .expect("with force the key is written");
+        assert_eq!(outcome, ClientSecretWrite::Replaced);
+
+        let devices = devices_of(&path, "acme");
+        let server = &devices["server"];
+        assert_eq!(server.public_key.as_deref(), Some(key.as_str()));
+        assert!(
+            server.secret.is_empty(),
+            "the old secret is gone, not kept beside the key: {server:?}"
+        );
     }
 
     /// Revoking one device leaves the client and every other device alone —
@@ -4753,7 +5001,8 @@ created_at = "1700000000"
 
     /// A device secret keys that device's HMAC, so an empty one is a signature
     /// anybody can forge — refused at load rather than read as "a device that
-    /// authenticates nobody".
+    /// authenticates nobody". An empty spelling is no secret at all, so this is
+    /// also the entry with no credential of any kind.
     #[test]
     fn an_empty_device_secret_is_refused() {
         let err = load_from(
@@ -4768,6 +5017,79 @@ secret = ""
         .expect_err("an empty secret must not load");
 
         assert!(err.to_string().contains("devices.laptop"), "{err}");
+        assert!(err.to_string().contains("empty secret"), "{err}");
+    }
+
+    /// A device answers with exactly one credential, and the loader is where
+    /// that is enforced. Neither field is a config that does not say how the
+    /// device proves itself; both is two answers to disagree about. Refused
+    /// here, where the operator can see which entry it is about, rather than at
+    /// a handshake whose only reportable outcome is "refused".
+    #[test]
+    fn a_device_entry_needs_exactly_one_credential() {
+        let client = r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+"#;
+
+        let neither = load_from(&format!(
+            "{client}\n[auth.clients.client-001.devices.laptop]\ncreated_at = \"1700000000\"\n"
+        ))
+        .expect_err("a device with no credential must not load");
+        assert!(neither.to_string().contains("devices.laptop"), "{neither}");
+        assert!(neither.to_string().contains("no `secret`"), "{neither}");
+        assert!(neither.to_string().contains("no `public_key`"), "{neither}");
+
+        let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
+        let both = load_from(&format!(
+            "{client}\n[auth.clients.client-001.devices.laptop]\nsecret = \"LAPTOPSECRET\"\n\
+             public_key = \"{key}\"\n"
+        ))
+        .expect_err("two credentials must not load");
+        assert!(both.to_string().contains("devices.laptop"), "{both}");
+        assert!(both.to_string().contains("both"), "{both}");
+    }
+
+    /// A device that proves itself with a key: `public_key` is read where a
+    /// `secret` would be, and the rest of the entry is what it always was.
+    #[test]
+    fn a_public_key_device_loads_where_a_secret_one_does() {
+        let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
+
+        let (_, auth) = load_from(&format!(
+            "[auth.clients.client-001]\nsecret = \"CLIENTSECRET\"\n\n\
+             [auth.clients.client-001.devices.server]\npublic_key = \"{key}\"\n"
+        ))
+        .expect("a key device loads");
+
+        let device = &auth.expect("auth section present").clients["client-001"].devices["server"];
+        assert_eq!(device.public_key.as_deref(), Some(key.as_str()));
+        assert!(device.secret.is_empty(), "{device:?}");
+        assert!(
+            !device.created_at.is_empty(),
+            "an undated device is dated the moment it is issued"
+        );
+    }
+
+    /// A key that is not a key is refused where it is written into the file.
+    /// The handshake could only refuse the device that holds it — a bad key and
+    /// a wrong one read the same from there — so the load is the last place
+    /// this can be caught with something to say about why.
+    #[test]
+    fn a_public_key_that_is_not_a_key_is_refused_at_load() {
+        let err = load_from(
+            r#"
+[auth.clients.client-001]
+secret = "CLIENTSECRET"
+
+[auth.clients.client-001.devices.server]
+public_key = "not a key"
+"#,
+        )
+        .expect_err("a public_key that is not a key must not load");
+
+        assert!(err.to_string().contains("devices.server"), "{err}");
+        assert!(err.to_string().contains("not hex"), "{err}");
     }
 
     /// Why a device entry refuses keys it does not know, which is the reason
