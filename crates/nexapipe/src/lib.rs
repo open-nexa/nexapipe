@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod config_watcher;
 pub mod conn;
+pub mod deadline;
 pub mod health;
 pub mod http;
 pub mod l4;

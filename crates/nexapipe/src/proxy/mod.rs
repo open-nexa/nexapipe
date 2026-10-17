@@ -535,12 +535,15 @@ pub async fn run_proxy(
         }));
     }
 
-    // One limiter for the whole endpoint: the per-peer cap only means anything
-    // if every accepted connection counts against the same map.
-    let conn_limiter = conn::limits::ConnectionLimiter::from_env();
-    tracing::info!(
-        "At most {} concurrent connections per peer",
-        conn_limiter.max()
+    // One set of limiters for the whole endpoint: every cap only means anything
+    // if every accepted connection and stream counts against the same state.
+    // Both ceilings are here rather than only the per-peer one because an
+    // `EndpointId` is a public key — see `conn::limits`.
+    let limiters = conn::limits::Limiters::from_env();
+    tracing::info!("Accepting at most {}", limiters.describe());
+    crate::metrics::METRICS.record_connection_limits(
+        limiters.connections.max(),
+        limiters.connections.max_global(),
     );
 
     // Kept, rather than spawned and forgotten: the drain below counts work that
@@ -577,7 +580,7 @@ pub async fn run_proxy(
                         let config_clone = config.clone();
                         let http_client_clone = http_client.clone();
                         let auth_state_clone = auth_state.clone();
-                        let limiter_clone = conn_limiter.clone();
+                        let limiters_clone = limiters.clone();
                         let peers_clone = peers.clone();
                         let in_flight_clone = in_flight.clone();
                         // Counted out here, not in the task's first line: a
@@ -595,7 +598,7 @@ pub async fn run_proxy(
                                 config_clone,
                                 http_client_clone,
                                 auth_state_clone,
-                                limiter_clone,
+                                limiters_clone,
                                 guard,
                                 peers_clone,
                             )

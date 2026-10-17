@@ -49,6 +49,10 @@ const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
 /// value lets a client choose how much this process allocates — one stream at a
 /// time, and a peer can open many. Well past any ordinary upload; a deployment
 /// that needs to push larger bodies should stream them instead of raising this.
+///
+/// This bounds one request. How many such bodies may be held at once is
+/// [`ByteBudget`](crate::conn::limits::ByteBudget)'s, which is why a body is
+/// only read once it has been given a reservation from it.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 /// Whether a request header may be forwarded to the backend.
@@ -181,7 +185,10 @@ pub async fn proxy_request(
     .parse::<http::Uri>()
     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
-    let body = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
+    // Held for as long as the buffered body is alive — see `read_body_limited`.
+    // Dropping it here rather than at the end of the function is deliberate and
+    // is what makes the budget mean what it says.
+    let (body, _body_reservation) = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
 
     let mut builder = Request::builder().method(method).uri(new_uri);
 
@@ -236,19 +243,55 @@ pub async fn proxy_request(
     Ok(response.map(http_body_util::BodyExt::boxed_unsync))
 }
 
-/// Reads a request body into memory, refusing one larger than `limit`.
+/// Reads a request body whole, refusing one past `limit` or past what the
+/// process can hold at once.
+///
+/// Returns the reservation as well as the bytes, and the caller has to keep it:
+/// dropping it gives the bytes back, so the total the budget reports is what is
+/// held *now* rather than what was ever read. A caller that answers the request
+/// and returns is exactly the lifetime a buffered body has.
 ///
 /// The size is not known up front — a chunked request says nothing about how
 /// much is coming — so the limit has to be enforced while reading rather than
 /// by checking a `content-length` header the client is free to understate.
-async fn read_body_limited<B>(body: B, limit: usize) -> anyhow::Result<bytes::Bytes>
+///
+/// The deadline over the read is likewise total rather than per frame, so a
+/// client that trickles one byte before each expiry renews nothing.
+async fn read_body_limited<B>(
+    body: B,
+    limit: usize,
+) -> anyhow::Result<(bytes::Bytes, crate::conn::limits::ByteReservation)>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
     let mut body = body;
     let mut bytes: Vec<u8> = Vec::new();
-    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+    // Claimed as the frames arrive rather than up front: see `ByteReservation`.
+    let mut reservation = crate::conn::limits::ByteReservation::empty();
+    // A deadline over the whole read, not per frame: this is the path the
+    // plaintext listener takes, and it had no bound at all, so a client that
+    // opened a socket and then sent a byte of body every few seconds held the
+    // connection, the task and the buffer indefinitely. The iroh path has always
+    // bounded this read; this is the same bound, in one place.
+    let body_deadline = crate::deadline::Deadlines::default().body;
+    let deadline_at = tokio::time::Instant::now() + body_deadline;
+    loop {
+        // A `loop` rather than `while let`, so that the deadline's own expiry is
+        // told apart from the end of the body.
+        let frame =
+            match tokio::time::timeout_at(deadline_at, http_body_util::BodyExt::frame(&mut body))
+                .await
+            {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "request body did not finish within {}s",
+                        body_deadline.as_secs()
+                    ));
+                }
+            };
         let frame = frame.map_err(|e| anyhow::anyhow!("failed to read the request body: {}", e))?;
         // Anything that is not a data frame — trailers — carries no body bytes.
         let Ok(data) = frame.into_data() else {
@@ -259,9 +302,10 @@ where
                 "request body is over the {limit} byte limit"
             ));
         }
+        reservation.grow(data.len())?;
         bytes.extend_from_slice(&data);
     }
-    Ok(bytes.into())
+    Ok((bytes.into(), reservation))
 }
 
 fn should_compress(content_type: Option<&str>) -> bool {
@@ -515,7 +559,12 @@ pub async fn proxy_to_backend_streaming(
     }
 
     let mut full_body = body_data;
-    if let Some(content_length) = declared_length {
+    // Held for as long as the body is alive, which is until this function
+    // returns: the buffer is handed to the backend below and dropped with the
+    // request. Same rule as `read_body_limited` on the plaintext path, and the
+    // reason the two are worth keeping in step — one without the other leaves
+    // the process budget counting a fraction of what it actually holds.
+    let _body_reservation = if let Some(content_length) = declared_length {
         // Checked before the body is read, not after: `content_length` is the
         // size of the buffer this is about to fill.
         if content_length > MAX_REQUEST_BODY {
@@ -523,16 +572,19 @@ pub async fn proxy_to_backend_streaming(
                 "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
             )));
         }
-        read_remaining_request_body(recv, &mut full_body, content_length).await?;
+        read_remaining_request_body(recv, &mut full_body, content_length).await?
     } else if chunked {
         // A chunked body declares no length, so without this branch the request
         // went out carrying only the bytes that happened to arrive with the
         // head — and `transfer-encoding` is not forwarded, so the backend was
         // handed a body with no framing at all and no way to know it was
         // truncated. Decode the chunks and send one buffer with a length.
-        read_chunked_request_body(recv, &mut full_body).await?;
+        let reservation = read_chunked_request_body(recv, &mut full_body).await?;
         builder = builder.header("content-length", full_body.len());
-    }
+        reservation
+    } else {
+        crate::conn::limits::ByteReservation::empty()
+    };
 
     // The body is complete at this point in every branch above, and this is the
     // only place it is whole: what goes out is a reconstructed request with its
@@ -643,7 +695,43 @@ pub async fn proxy_to_backend_streaming(
     // what is being coalesced and may still be lost: a body that died half way
     // is reported as the half that arrived, not as the whole that was intended.
     let mut body_stream = http_body_util::BodyExt::into_data_stream(body);
-    while let Some(chunk) = body_stream.next().await {
+    // Idle, not a phase deadline: see `Deadlines::response_idle`. What is being
+    // bounded is the gap between chunks, so this re-arms on every chunk — which
+    // is what lets an SSE stream or a WebSocket stay open for as long as both
+    // ends want, while a backend that accepted the request and then went silent
+    // cannot hold this slot and its backend lease forever.
+    let response_idle = crate::deadline::Deadlines::default().response_idle;
+    loop {
+        // A `loop` rather than `while let`: the three outcomes — a chunk, the
+        // end of the body, and the backend going quiet — are told apart here,
+        // and only the first two are ordinary iteration.
+        let chunk = match tokio::time::timeout(response_idle, body_stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            // The body finished: this is the end, not a failure, and it must not
+            // be mistaken for one.
+            Ok(None) => break,
+            Err(_) => {
+                // The backend went quiet mid-body, which is a failure and not an
+                // end: returning here rather than breaking out is what keeps the
+                // two apart. Breaking would fall through to the chunked
+                // terminator and `send.finish()` below, and the client would
+                // get a body that is syntactically complete and silently
+                // truncated — a truncated stream it has no way to tell from a
+                // whole one, and an access line recording a success.
+                //
+                // `bytes_sent` is what the client actually received, so it is
+                // still reported rather than zero.
+                tracing::warn!(
+                    "Backend sent nothing for {response_idle:?} mid-body, ending the stream \
+                     after {bytes_sent} bytes"
+                );
+                return Err(ProxyFailure::after(
+                    status,
+                    bytes_sent,
+                    anyhow::anyhow!("backend sent nothing for {response_idle:?} mid-body"),
+                ));
+            }
+        };
         match chunk {
             Ok(data) => {
                 if use_chunked {
@@ -694,13 +782,6 @@ pub async fn proxy_to_backend_streaming(
 /// few dozen bytes is malformed; the cap keeps a stream that never sends a
 /// CRLF from growing this buffer without bound.
 const MAX_CHUNK_HEADER: usize = 1024;
-
-/// How long the body may go without the peer sending anything.
-///
-/// An idle timeout, not a total one: it is rearmed on every read, so a large
-/// upload that trickles for minutes is fine while a stream that opens the
-/// request and then stops — holding a connection slot on the way — is not.
-const REQUEST_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many bytes of a chunked body `input` decodes on its own.
 ///
@@ -794,30 +875,44 @@ fn parse_chunk_size(header: &[u8]) -> Result<usize, anyhow::Error> {
 ///
 /// Whatever arrived with the head is already the start of the chunk stream, so
 /// it is handed to the decoder first and only then is more read.
+///
+/// A chunked body declares no length, so the reservation grows as the frames
+/// decode rather than being taken up front — there is no honest moment at which
+/// this knows how much it wants. Returns the reservation, which the caller keeps
+/// for the lifetime of the body.
 async fn read_chunked_request_body(
     recv: &mut iroh::endpoint::RecvStream,
     body: &mut Vec<u8>,
-) -> Result<(), anyhow::Error> {
+) -> Result<crate::conn::limits::ByteReservation, anyhow::Error> {
     let mut pending = std::mem::take(body);
     let mut buf = [0u8; 8192];
+    let mut reservation = crate::conn::limits::ByteReservation::empty();
+
+    // A phase deadline, not a per-read one: a peer sending one chunk before
+    // each expiry renews a per-read bound forever, and this holds a stream slot
+    // for as long as it keeps doing so.
+    let body_deadline = crate::deadline::Deadlines::default().body;
+    let deadline_at = tokio::time::Instant::now() + body_deadline;
 
     loop {
         let (decoded, used, complete) =
             decode_chunks(&pending, MAX_REQUEST_BODY.saturating_sub(body.len()))?;
+        // Before the bytes are appended, so a refused reservation leaves the
+        // buffer and the budget agreeing about what is held.
+        reservation.grow(decoded.len())?;
         body.extend_from_slice(&decoded);
         pending.drain(..used);
         if complete {
-            return Ok(());
+            return Ok(reservation);
         }
 
-        let read = match tokio::time::timeout(REQUEST_BODY_READ_TIMEOUT, recv.read(&mut buf)).await
-        {
+        let read = match tokio::time::timeout_at(deadline_at, recv.read(&mut buf)).await {
             Ok(result) => result
                 .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?,
             Err(_) => {
                 return Err(anyhow::anyhow!(
-                    "chunked request body went {}s without sending anything",
-                    REQUEST_BODY_READ_TIMEOUT.as_secs()
+                    "chunked request body did not finish within {}s",
+                    body_deadline.as_secs()
                 ));
             }
         };
@@ -836,31 +931,55 @@ fn request_is_chunked(req: &Request<()>) -> bool {
         .is_some_and(|v| v.to_lowercase().contains("chunked"))
 }
 
-/// Generic over the reader so the idle cap below can be tested without an
-/// endpoint; callers pass an iroh receive stream.
+/// Generic over the reader so the caps below can be tested without an endpoint;
+/// callers pass an iroh receive stream.
+///
+/// Returns the reservation for the bytes it read, and the caller has to keep it
+/// for as long as the body is alive — see `read_body_limited`, which does the
+/// same on the plaintext path.
+///
+/// The reservation tracks what is **buffered**, not what is declared. Those are
+/// different numbers and the gap between them is the whole design: a peer
+/// decides `content-length`, and this process decides how much memory it is
+/// willing to hold. Reserving the declared size up front reads well and is
+/// wrong — sixteen streams that declare 64 MiB and then send nothing hold the
+/// entire 1 GiB budget for five minutes, refusing every honest upload while none
+/// of them has a byte in memory. Growing per frame means the budget is always
+/// counting real bytes, whether they came with the head or off the wire.
 async fn read_remaining_request_body<R>(
     recv: &mut R,
     body: &mut Vec<u8>,
     content_length: usize,
-) -> Result<(), anyhow::Error>
+) -> Result<crate::conn::limits::ByteReservation, anyhow::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut remaining = content_length.saturating_sub(body.len());
     let mut buf = [0u8; 8192];
 
+    // What arrived with the head is buffered already — QUIC is a byte stream, so
+    // a peer decides how much body rides along with them — and it is charged
+    // before any read. `body.len()` and not `min(content_length)`: a peer may
+    // overstate or understate its own length, and this path does not discard the
+    // excess, so every byte here is memory the process is holding.
+    let mut reservation = crate::conn::limits::ByteReservation::take(body.len())?;
+
+    // A deadline over the whole read rather than per read. An idle cap is still
+    // wanted for a slow but progressing upload, but on its own it re-arms on
+    // every byte, which is exactly what a peer dripping one byte before each
+    // expiry wants — and it is not a cap this path can enforce any more, since
+    // `REQUEST_BODY_READ_TIMEOUT` is gone.
+    let body_deadline = crate::deadline::Deadlines::default().body;
+    let deadline_at = tokio::time::Instant::now() + body_deadline;
+
     while remaining > 0 {
-        // Idle-capped per read, like the chunked path: a peer that declares a
-        // large `content-length` and then drips it a byte at a time otherwise
-        // holds the buffer, and the stream slot, for as long as it likes.
-        let read = match tokio::time::timeout(REQUEST_BODY_READ_TIMEOUT, recv.read(&mut buf)).await
-        {
+        let read = match tokio::time::timeout_at(deadline_at, recv.read(&mut buf)).await {
             Ok(result) => result
                 .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?,
             Err(_) => {
                 return Err(anyhow::anyhow!(
-                    "request body went {}s without sending anything: {} of {} bytes arrived",
-                    REQUEST_BODY_READ_TIMEOUT.as_secs(),
+                    "request body did not finish within {}s: {} of {} bytes arrived",
+                    body_deadline.as_secs(),
                     body.len(),
                     content_length
                 ));
@@ -877,6 +996,10 @@ where
         }
 
         let take = read.min(remaining);
+        // Before the append, so a refused reservation leaves the buffer and the
+        // budget agreeing about what is held: `grow` does not accumulate when it
+        // refuses, and the `?` drops the reservation on the way out.
+        reservation.grow(take)?;
         body.extend_from_slice(&buf[..take]);
         remaining -= take;
     }
@@ -886,7 +1009,7 @@ where
         body.len(),
         content_length
     );
-    Ok(())
+    Ok(reservation)
 }
 
 pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, anyhow::Error> {
@@ -974,8 +1097,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_within_the_limit_is_read_whole() {
-        let read = read_body_limited(body_of(10), 10).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(10), 10).await.unwrap();
         assert_eq!(read.len(), 10);
+        assert_eq!(reservation.bytes(), 10, "the body is held for its lifetime");
     }
 
     #[tokio::test]
@@ -988,8 +1112,23 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_body_is_within_any_limit() {
-        let read = read_body_limited(body_of(0), 0).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(0), 0).await.unwrap();
         assert!(read.is_empty());
+        assert_eq!(reservation.bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_body_hands_its_reservation_back() {
+        // Asserted through the reservation this call returns rather than by
+        // reading the process-wide total: that total is shared with every other
+        // test in this binary, which run concurrently, so a "same as before"
+        // comparison here would mostly be measuring the other tests.
+        //
+        // What this pins is that the per-request limit refuses *before* anything
+        // is reserved, so there is nothing to leak. The direct statement about
+        // the budget's own arithmetic is `ByteBudget::bodies_are_bounded_across_the_process`.
+        let refused = read_body_limited(body_of(4096), 16).await;
+        assert!(refused.is_err(), "a body over the limit must be refused");
     }
 
     /// A chunked body of one or more `chunks`, terminated the usual way.
@@ -1229,6 +1368,22 @@ mod tests {
                 ends,
             }
         }
+
+        /// Queues `total` bytes as `piece`-sized chunks.
+        ///
+        /// For a body too large to hand over as one slice — the reader's own
+        /// buffer is 8 KiB, so a single larger chunk is a test bug rather than a
+        /// large body.
+        fn feed(&mut self, piece: usize, total: usize) -> &mut Self {
+            let piece = piece.max(1);
+            let mut left = total;
+            while left > 0 {
+                let n = piece.min(left);
+                self.chunks.push_back(vec![b'x'; n]);
+                left -= n;
+            }
+            self
+        }
     }
 
     impl tokio::io::AsyncRead for ScriptedReader {
@@ -1251,8 +1406,8 @@ mod tests {
         }
     }
 
-    /// The clock is paused, so the 30s cap is reached without the test waiting
-    /// for it: what is being checked is that there is a cap at all.
+    /// The clock is paused, so the deadline is reached without the test waiting
+    /// for it: what is being checked is that there is a bound at all.
     #[tokio::test(start_paused = true)]
     async fn a_declared_body_that_stops_arriving_is_given_up_on() {
         let mut reader = ScriptedReader::pieces(&[b"a-few-bytes"], false);
@@ -1262,11 +1417,145 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string().contains("without sending anything"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("did not finish within"), "{err}");
         assert_eq!(body, b"a-few-bytes");
+    }
+
+    /// The reservation a declared body takes is given back when the read fails,
+    /// so one stalled upload does not permanently shrink the process budget for
+    /// every other request behind it.
+    ///
+    /// Asserted by asking for a body twice and requiring both to be admitted,
+    /// rather than by watching the process-wide total: that total is shared with
+    /// every other test in this binary, which run concurrently, so a "same as
+    /// before" comparison here would mostly be measuring the other tests.
+    #[tokio::test(start_paused = true)]
+    async fn a_declared_body_that_never_arrives_returns_its_reservation() {
+        const DECLARED: usize = 4096;
+
+        // The first read holds a reservation and then fails on the deadline: it
+        // was told 4096 bytes and never got them.
+        let mut stalled = ScriptedReader::pieces(&[b"a-few-bytes"], false);
+        let mut stalled_body = Vec::new();
+        assert!(
+            read_remaining_request_body(&mut stalled, &mut stalled_body, DECLARED)
+                .await
+                .is_err(),
+            "the read must not succeed"
+        );
+
+        // The second is a body that actually arrives, and it is admitted at the
+        // same declared size. Had the first leaked its reservation, this would
+        // be competing with it for the same budget rather than starting clean.
+        let mut complete = ScriptedReader::pieces(&[&vec![b'x'; DECLARED]], true);
+        let mut complete_body = Vec::new();
+        read_remaining_request_body(&mut complete, &mut complete_body, DECLARED)
+            .await
+            .expect("the budget took the same size back");
+        assert_eq!(complete_body.len(), DECLARED);
+    }
+
+    /// Bytes that arrived with the head are charged to the budget even though this
+    /// function never reads a byte for them.
+    ///
+    /// QUIC is a byte stream, so how much body rides along with the head is the
+    /// peer's choice — the head loop can hand this function a buffer already
+    /// holding the whole body. Those bytes are held and are going to the
+    /// backend, so a reservation of `remaining` alone (which is zero here)
+    /// would leave the entire body uncounted on every stream a peer chose to
+    /// send in one segment.
+    #[tokio::test(start_paused = true)]
+    async fn bytes_that_arrived_with_the_head_are_charged_too() {
+        const DECLARED: usize = 8192;
+
+        // The peer sent head and body in one segment: the buffer holds all
+        // `DECLARED` bytes, so `remaining` is zero and a reservation of
+        // `remaining` takes nothing at all. The body is still forwarded.
+        let mut reader = ScriptedReader::pieces(&[], true);
+        let mut body = vec![b'x'; DECLARED];
+
+        let reservation = read_remaining_request_body(&mut reader, &mut body, DECLARED)
+            .await
+            .expect("a declared size inside the budget is admitted");
+        assert_eq!(body.len(), DECLARED);
+        assert!(
+            reservation.bytes() >= DECLARED,
+            "the {} bytes already in the buffer were charged {}",
+            DECLARED,
+            reservation.bytes()
+        );
+    }
+
+    /// The reservation is the bytes this reader is holding, which is not the
+    /// declared length and not the bytes still owed.
+    ///
+    /// Observable directly because the read succeeds: the head carried more body
+    /// than the header declared, so nothing is left to read and the reservation
+    /// is returned intact. A reservation of the declared length would report 4
+    /// here for 8 KiB of live buffer — the undercount this whole change is about.
+    #[tokio::test(start_paused = true)]
+    async fn the_reservation_counts_the_buffer_and_not_the_declared_length() {
+        const BUFFERED: usize = 8192;
+
+        // Declares less than the head already delivered. Legal on a byte stream:
+        // the extra bytes ride along either way and this path does not discard
+        // them, so they are memory the process is holding.
+        let mut reader = ScriptedReader::pieces(&[], true);
+        let mut body = vec![b'x'; BUFFERED];
+
+        let reservation = read_remaining_request_body(&mut reader, &mut body, 4)
+            .await
+            .expect("nothing is owed, so nothing fails");
+        assert_eq!(body.len(), BUFFERED);
+        assert_eq!(
+            reservation.bytes(),
+            BUFFERED,
+            "every buffered byte is charged, whatever the header claimed"
+        );
+    }
+
+    /// The reservation a declared body takes is what the caller holds, and it
+    /// covers the bytes actually buffered rather than the promise.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_arrives_is_charged_for_what_it_carried() {
+        const DECLARED: usize = 4096;
+
+        let mut reader = ScriptedReader::pieces(&[&vec![b'x'; DECLARED]], true);
+        let mut body = Vec::new();
+
+        let reservation = read_remaining_request_body(&mut reader, &mut body, DECLARED)
+            .await
+            .expect("a body inside the budget is admitted");
+        assert_eq!(body.len(), DECLARED);
+        assert_eq!(
+            reservation.bytes(),
+            DECLARED,
+            "every buffered byte is charged exactly once"
+        );
+    }
+
+    /// A body that outgrows the process budget is refused while it grows.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_larger_than_the_process_budget_is_refused() {
+        // A body that has outgrown the process budget is refused as it grows, not
+        // because of what it declared. `usize::MAX` only proves the counter does
+        // not overflow on the way there: the reader charges per frame, so the
+        // refusal arrives when a frame will not fit, however many bytes were
+        // promised.
+        let mut reader = ScriptedReader::pieces(&[], true);
+        // 8 KiB pieces, matching the reader's own buffer, totalling more than
+        // the 1 GiB process budget — so the refusal arrives on a frame rather
+        // than at the end of the stream.
+        reader.feed(8192, 1024 * 1024 * 1024 + 1024 * 1024);
+        let mut body: Vec<u8> = Vec::new();
+
+        let err = read_remaining_request_body(&mut reader, &mut body, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit"),
+            "expected a budget refusal, got: {err}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

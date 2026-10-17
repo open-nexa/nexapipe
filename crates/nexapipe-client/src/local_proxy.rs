@@ -95,6 +95,102 @@ fn header_over_limit(request: &[u8], header_end: Option<usize>) -> bool {
     header_end.unwrap_or(request.len()) > MAX_REQUEST_HEADER
 }
 
+/// What reading a request head produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderOutcome {
+    /// The head is complete, ending at this offset into the buffer.
+    Complete(usize),
+    /// The connection should be closed: the caller went away, the head went past
+    /// its size cap, or the deadline expired. One value rather than three
+    /// because every one of them is answered the same way, and a caller that had
+    /// to tell them apart would only be able to log the difference.
+    Closed,
+}
+
+/// Reads a request head up to its `\r\n\r\n`, bounded by one deadline.
+///
+/// The deadline is a parameter rather than something read from the environment
+/// here, for two reasons: the caller has already taken the instant for the first
+/// byte and the rest of the head shares it, and a test can then drive this over
+/// a `tokio::io::duplex` pair in milliseconds instead of waiting out the
+/// production thirty seconds.
+///
+/// Extracted from the connection handler so the anti-slowloris property is
+/// testable on its own. Under the per-read timeout this replaces, a caller
+/// sending one byte before each expiry renewed the deadline on every read and
+/// was never disconnected — which is precisely what the test below pins.
+async fn read_http_header<S>(
+    stream: &mut S,
+    request_buf: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> HeaderOutcome
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    // Already complete in what the first read carried, e.g. a header that
+    // arrived whole. Checked before any read so a request that needed none is
+    // not charged a deadline it did not need.
+    let mut header_end = request_buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4);
+
+    // The same cap as the loop, applied to what already arrived: a header that
+    // came in one read never enters the loop and would escape the limit.
+    if header_over_limit(request_buf, header_end) {
+        jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+        return HeaderOutcome::Closed;
+    }
+
+    let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
+    while header_end.is_none() {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut temp_buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                jni_log!("[DEBUG:local-proxy] Read error: {}", e);
+                return HeaderOutcome::Closed;
+            }
+            Err(_) => {
+                jni_log!(
+                    "[DEBUG:local-proxy] Request head did not arrive before its deadline, closing \
+                     connection"
+                );
+                return HeaderOutcome::Closed;
+            }
+        };
+
+        let prev_len = request_buf.len();
+        request_buf.extend_from_slice(&temp_buf[..n]);
+
+        // Search for \r\n\r\n, starting a few bytes before the new data: a
+        // terminator can straddle two reads.
+        let search_start = prev_len.saturating_sub(3);
+        if let Some(pos) = request_buf[search_start..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            header_end = Some(search_start + pos + 4);
+        }
+
+        // A peer that keeps sending without ever ending its headers grows this
+        // buffer without bound, and the deadline alone does not stop it: it is
+        // sending, just not finishing.
+        if header_over_limit(request_buf, header_end) {
+            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
+            return HeaderOutcome::Closed;
+        }
+    }
+
+    match header_end {
+        Some(pos) => HeaderOutcome::Complete(pos),
+        None => {
+            jni_log!("[DEBUG:local-proxy] HTTP header end not found, closing connection");
+            HeaderOutcome::Closed
+        }
+    }
+}
+
 /// How long the accept loop waits after an error before trying again, and how
 /// many it takes before it concludes the listener is not coming back.
 const ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(100);
@@ -610,15 +706,17 @@ where
     jni_log!("[DEBUG:local-proxy] New local connection received");
 
     // Step 1: Read the first chunk of data to determine protocol (HTTP vs TLS)
+    //
+    // Shares the header budget with the loop below rather than having its own
+    // thirty seconds: this is the first read *of* that header, so giving it a
+    // separate budget would let a client spend twice the intended time before
+    // the first byte of its request line was counted against anything.
+    let header_budget = crate::deadline::Deadlines::default().header;
+    let first_byte_deadline = tokio::time::Instant::now() + header_budget;
     let mut request_buf = Vec::new();
     let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
 
-    let n = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(30),
-        stream.read(&mut temp_buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout_at(first_byte_deadline, stream.read(&mut temp_buf)).await {
         Ok(Ok(0)) => {
             jni_log!("[DEBUG:local-proxy] Empty request, closing connection");
             return Ok(());
@@ -642,67 +740,23 @@ where
         return handle_tls_tunnel(stream, request_buf, endpoint_group, proxy_domains, peer).await;
     }
 
-    // Step 2: HTTP — read the complete request header (up to \r\n\r\n)
-    let mut header_end: Option<usize> = None;
-    if let Some(pos) = request_buf[..].windows(4).position(|w| w == b"\r\n\r\n") {
-        header_end = Some(pos + 4);
-    }
-
-    // The same cap as the loop below, applied to the first read: a header that
-    // arrives whole in one read never enters the loop, and would otherwise
-    // escape the limit entirely.
-    if header_over_limit(&request_buf, header_end) {
-        jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
-        return Ok(());
-    }
-
-    while header_end.is_none() {
-        let n = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            stream.read(&mut temp_buf),
-        )
-        .await
-        {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                jni_log!("[DEBUG:local-proxy] Read error: {}", e);
-                return Ok(());
-            }
-            Err(_) => {
-                jni_log!("[DEBUG:local-proxy] Read timeout, closing connection");
-                return Ok(());
-            }
+    // Step 2: HTTP — read the complete request head (up to \r\n\r\n).
+    //
+    // `first_byte_deadline`, not a fresh instant: the budget was taken once,
+    // before the first read above, and it covers the whole head. Taking it again
+    // here would hand the caller two budgets — thirty seconds to send a first
+    // byte and thirty more to finish the header — which is exactly the doubling
+    // the first read's comment says this avoids.
+    //
+    // The per-read timeouts this replaces re-armed on each read, so a client
+    // sending one byte of `Host:` before each expiry kept the connection, the
+    // task and the slot for as long as it liked — the read that arrived *was*
+    // the renewal.
+    let header_end =
+        match read_http_header(&mut stream, &mut request_buf, first_byte_deadline).await {
+            HeaderOutcome::Complete(header_end) => header_end,
+            HeaderOutcome::Closed => return Ok(()),
         };
-
-        let prev_len = request_buf.len();
-        request_buf.extend_from_slice(&temp_buf[..n]);
-
-        // Search for \r\n\r\n, starting a few bytes before the new data
-        let search_start = prev_len.saturating_sub(3);
-        if let Some(pos) = request_buf[search_start..]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-        {
-            header_end = Some(search_start + pos + 4);
-        }
-
-        // A peer that keeps sending without ever ending its headers grows this
-        // buffer without bound — one read every 30s is enough, because each
-        // read is what resets the timeout above.
-        if header_over_limit(&request_buf, header_end) {
-            jni_log!("[DEBUG:local-proxy] Request header over the limit, closing connection");
-            return Ok(());
-        }
-    }
-
-    let header_end = match header_end {
-        Some(pos) => pos,
-        None => {
-            jni_log!("[DEBUG:local-proxy] HTTP header end not found, closing connection");
-            return Ok(());
-        }
-    };
 
     let request = match parse_http_request_legacy(&request_buf[..header_end]) {
         Ok(req) => {
@@ -1271,16 +1325,31 @@ where
 
     // Ensure we have enough data for the full TLS record (ClientHello)
     // Record header is 5 bytes: content_type(1) + version(2) + length(2)
+    //
+    // Bounded as a whole rather than per read: the record length is known once
+    // the header is in, so this loop's job is to fetch a known number of bytes,
+    // and a client that sends the five header bytes and then one byte of record
+    // every few seconds would otherwise hold the connection open indefinitely —
+    // this read had no bound at all before.
     let mut data = initial_data;
     if data.len() >= 5 {
         let record_len = ((data[3] as usize) << 8) | (data[4] as usize);
         let total_needed = 5 + record_len;
+        let hello_deadline =
+            tokio::time::Instant::now() + crate::deadline::Deadlines::default().tls_hello;
         while data.len() < total_needed {
             let mut extra = [0u8; 4096];
-            match stream.read(&mut extra).await {
-                Ok(0) => break,
-                Ok(n) => data.extend_from_slice(&extra[..n]),
-                Err(_) => break,
+            match tokio::time::timeout_at(hello_deadline, stream.read(&mut extra)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => data.extend_from_slice(&extra[..n]),
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    jni_log!(
+                        "[DEBUG:local-proxy] TLS ClientHello took longer than its deadline, \
+                         closing connection"
+                    );
+                    return Ok(());
+                }
             }
         }
     }
@@ -1594,6 +1663,7 @@ mod tests {
     use crate::LoadBalancingStrategy;
     use iroh::Endpoint;
     use iroh::endpoint::presets;
+    use std::time::Duration;
 
     /// A proxy listening on an ephemeral port, with no backends behind it.
     ///
@@ -1704,6 +1774,93 @@ mod tests {
 
         proxy.stop();
         runner.abort();
+    }
+
+    /// A caller that trickles its request head forever is closed, rather than
+    /// holding its connection, its task and its slot open indefinitely.
+    ///
+    /// The shape of this test is the point: a byte goes out well inside the
+    /// deadline, over and over, for longer than the deadline itself. Under a
+    /// per-read timeout every one of those bytes reset the clock and the read
+    /// would still be running at the end; under a phase deadline the instant was
+    /// taken once and the trickle renews nothing.
+    ///
+    /// Drives `read_http_header` over a `duplex` pair rather than a real socket
+    /// so the budget can be milliseconds instead of the production thirty
+    /// seconds — which is why the deadline is a parameter of that function.
+    #[tokio::test]
+    async fn a_trickling_request_head_is_closed_rather_than_waited_on() {
+        use tokio::io::AsyncWriteExt;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        // A request line that never terminates, so the reader stays in the loop
+        // for the whole run.
+        let trickle = tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let mut sends = 0usize;
+            // Twice the deadline: comfortably past the point where a per-read
+            // timeout would have renewed forever, while each individual send
+            // stays inside the budget.
+            while started.elapsed() < Duration::from_millis(400) {
+                if client.write_all(b"G").await.is_err() {
+                    break;
+                }
+                sends += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            sends
+        });
+
+        let mut request_buf = Vec::new();
+        let started = std::time::Instant::now();
+        let outcome = read_http_header(&mut server, &mut request_buf, deadline).await;
+
+        assert_eq!(
+            outcome,
+            HeaderOutcome::Closed,
+            "a head that trickles past its deadline must be closed, not waited on"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "it expired on the deadline rather than when the peer stopped: {:?}",
+            started.elapsed()
+        );
+
+        let sends = trickle.await.unwrap_or(0);
+        assert!(
+            sends > 1,
+            "the test did not actually trickle: {sends} sends"
+        );
+    }
+
+    /// A head that arrives complete is read as one, and the deadline is not
+    /// charged to a request that needed no waiting.
+    #[tokio::test]
+    async fn a_head_that_arrives_whole_is_complete_at_once() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            let _ = client
+                .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                .await;
+            // Held open so the read cannot end at EOF and be mistaken for a
+            // complete head by accident.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut request_buf = Vec::new();
+        match read_http_header(&mut server, &mut request_buf, deadline).await {
+            HeaderOutcome::Complete(end) => {
+                assert_eq!(
+                    &request_buf[..end],
+                    b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                );
+            }
+            HeaderOutcome::Closed => panic!("a complete head must not be reported as closed"),
+        }
     }
 
     /// `stop()` has to reach a loop that is parked in `accept()`, not one that

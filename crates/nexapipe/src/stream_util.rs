@@ -70,11 +70,33 @@ impl AsyncWrite for DuplexIroh {
 /// The result is the one from the direction that finished first. A clean EOF on
 /// either side is `Ok`, so this only reports a transport failure — which is the
 /// difference between a tunnel that ended and one that broke, and the caller needs
-/// it to log the right thing.
+/// it to log the right thing. A deadline that expires comes back as `TimedOut`, so
+/// the caller can tell "this one was cut" from "this one broke"; either way the
+/// half-close below has already run.
 ///
 /// `label` only ever reaches a debug log — it exists so an operator can tell the TLS
 /// path from the L4 path when both are in play.
 pub async fn copy_both_ways<A, B>(client: A, backend: B, label: &str) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    copy_both_ways_until(client, backend, label, None).await
+}
+
+/// [`copy_both_ways`], with a whole-copy deadline.
+///
+/// The deadline is a third `select!` arm rather than a `timeout` wrapped around the
+/// call: wrapping drops this future at expiry, which skips the two `shutdown()` calls
+/// below — and those are the ones that turn a finished tunnel into a clean EOF instead
+/// of a reset. As an arm it loses the race like any other direction and falls through
+/// to the same shutdowns.
+pub async fn copy_both_ways_until<A, B>(
+    client: A,
+    backend: B,
+    label: &str,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -88,6 +110,21 @@ where
     let finished = tokio::select! {
         result = copy_one_way(&mut client_read, &mut backend_write, label, CopyLeg::Client) => result,
         result = copy_one_way(&mut backend_read, &mut client_write, label, CopyLeg::Backend) => result,
+        // `Some` when a deadline was given, and `pending` forever when it was not:
+        // a disabled arm that can still win the race is how this becomes a bug
+        // rather than a no-op.
+        _ = async {
+            match deadline {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending().await,
+            }
+        } => {
+            tracing::debug!("{}: copy ended on its deadline", label);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the copy ended on its deadline",
+            ))
+        }
     };
 
     let _ = backend_write.shutdown().await;
