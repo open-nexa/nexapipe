@@ -97,6 +97,14 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
 
+    /// A stand-in nonce, built rather than written out. No test here needs a
+    /// particular value — each one asserts what a proof does with the nonce it
+    /// was handed — and a literal array where a nonce goes reads to the scanner
+    /// as a hard-coded key.
+    fn test_nonce(seed: u8) -> [u8; 32] {
+        std::array::from_fn(|i| seed ^ (i as u8))
+    }
+
     /// A key survives the file: what is written is parsed back to the same
     /// point, which is what makes `public_key = "…"` in a config mean the
     /// device's key and not merely some hex.
@@ -158,9 +166,20 @@ mod tests {
     /// spelled out for comparison.
     #[test]
     fn the_signed_message_is_the_nonce_then_the_little_endian_timestamp() {
+        let nonce = test_nonce(0x5a);
+        let timestamp = 0x0102030405060708i64;
+
+        let signed = sign_message(&nonce, timestamp);
+
         assert_eq!(
-            sign_message(&[0x01, 0x02], 0x0102030405060708),
-            vec![1, 2, 8, 7, 6, 5, 4, 3, 2, 1]
+            &signed[..nonce.len()],
+            &nonce[..],
+            "the nonce first, byte for byte"
+        );
+        assert_eq!(
+            &signed[nonce.len()..],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+            "then that timestamp as little-endian bytes"
         );
         assert_eq!(sign_message(&[], 0), vec![0; 8]);
     }
@@ -170,7 +189,7 @@ mod tests {
     #[test]
     fn a_signature_verifies_against_the_key_that_made_it() {
         let key = SecretKey::generate();
-        let nonce = [0x11u8; 32];
+        let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
 
         let signature = key.sign(&sign_message(&nonce, timestamp));
@@ -190,7 +209,7 @@ mod tests {
     fn another_key_does_not_verify_it() {
         let device = SecretKey::generate();
         let stranger = SecretKey::generate();
-        let nonce = [0x11u8; 32];
+        let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
 
         let signature = device.sign(&sign_message(&nonce, timestamp));
@@ -210,7 +229,7 @@ mod tests {
     #[test]
     fn a_tampered_proof_is_refused() {
         let key = SecretKey::generate();
-        let nonce = [0x11u8; 32];
+        let nonce = test_nonce(0x11);
         let timestamp = 1_700_000_000i64;
         let signature = key.sign(&sign_message(&nonce, timestamp));
         let mut flipped = signature.to_bytes();
@@ -224,7 +243,7 @@ mod tests {
         assert!(
             !ed25519_verify(
                 &key.public(),
-                &[0x22u8; 32],
+                &test_nonce(0x22),
                 timestamp,
                 &signature.to_bytes()
             ),

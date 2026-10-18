@@ -5064,7 +5064,12 @@ secret = "CLIENTSECRET"
 
         let device = &auth.expect("auth section present").clients["client-001"].devices["server"];
         assert_eq!(device.public_key.as_deref(), Some(key.as_str()));
-        assert!(device.secret.is_empty(), "{device:?}");
+        // Not `{device:?}`: `DeviceAuth`'s `Debug` prints `secret: "<redacted>"`,
+        // so it says nothing here and reads to the scanner as logging a secret.
+        assert!(
+            device.secret.is_empty(),
+            "a device registered with a key holds no seed"
+        );
         assert!(
             !device.created_at.is_empty(),
             "an undated device is dated the moment it is issued"

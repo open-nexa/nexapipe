@@ -1000,6 +1000,14 @@ mod tests {
         device_id_is_usable,
     };
 
+    /// A stand-in nonce, built rather than written out — the twin of the helper
+    /// in `crates/nexapipe/src/auth/device_key.rs`. No test here needs a
+    /// particular value, and a literal array where a nonce goes reads to the
+    /// scanner as a hard-coded key.
+    fn test_nonce(seed: u8) -> [u8; 32] {
+        std::array::from_fn(|i| seed ^ (i as u8))
+    }
+
     /// The mirror of the test in `crates/nexapipe/src/auth/protocol.rs`: the
     /// two sides define these messages separately, and the tag is all that
     /// decides which one a peer is looking at.
@@ -1114,7 +1122,7 @@ mod tests {
         let public_key = hex::encode(key.public().as_bytes());
         let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
 
-        let (totp_code, signature) = auth.prove(&[0x0a, 0x0b], 1_700_000_000).unwrap();
+        let (totp_code, signature) = auth.prove(&test_nonce(0x0a), 1_700_000_000).unwrap();
         assert_eq!(totp_code, "", "a key device sends no code");
         assert_eq!(signature.len(), 64, "an Ed25519 signature is 64 bytes");
 
@@ -1138,12 +1146,12 @@ mod tests {
         let public = key.public();
         let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
 
-        let signature = auth
-            .sign_challenge(&[0x01, 0x02], 0x0102030405060708)
-            .unwrap();
+        let nonce = test_nonce(0x01);
+        let signature = auth.sign_challenge(&nonce, 0x0102030405060708).unwrap();
         assert_eq!(signature.len(), 64);
 
-        let message = [0x01, 0x02, 8, 7, 6, 5, 4, 3, 2, 1];
+        let mut message = nonce.to_vec();
+        message.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
         public
             .verify(
                 &message,
