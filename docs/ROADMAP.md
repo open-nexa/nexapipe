@@ -245,8 +245,9 @@ short-lived", and enrollment is where a device name comes from now.
 server and the client library.** A device can be registered with the public half
 of an Ed25519 key pair instead of a TOTP seed and then proves itself by signing
 each connection's challenge: what the server holds is not itself a credential, so
-a leaked config yields no way in, where a leaked `secret` *is* the credential
-itself.
+a leaked config yields no way in *as that device*, where a leaked `secret` *is*
+the credential itself. The client's own `secret` is still in the file, and still
+answers for a peer that names no device until `unnamed_device_allowed = false`.
 Which kind a device is comes from the server's own record and not from the wire —
 no scheme field, no new message — so the handshake is byte-for-byte what it
 always was for the devices that keep a secret, and the path for a device that

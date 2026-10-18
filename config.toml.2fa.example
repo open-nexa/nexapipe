@@ -204,9 +204,11 @@ created_at = "1723756800"
 # answers each handshake the way clients always have — an HMAC keyed by the seed
 # plus a code. A `public_key` is the other kind: the half of an Ed25519 pair
 # whose private half stays on the device, which proves itself by signing the
-# same challenge instead. What the server holds then cannot be replayed — a copy
-# of this file is no way in, where a copied `secret` is the credential itself —
-# and no code has to come from anywhere, which is what a device that runs
+# same challenge instead. What the server holds then cannot be replayed: a copy
+# of this file is no way in "as that device", where a copied `secret` is the
+# credential itself. That is not the same as no way in at all — this file still
+# holds the client's own `secret`, and the paragraph below says what that one is
+# worth. And no code has to come from anywhere, which is what a device that runs
 # unattended wants. A wrong signature counts toward the lockout exactly like a
 # wrong code. Exactly one kind per entry: both, or neither, is refused at load
 # rather than one of two credentials being silently ignored.

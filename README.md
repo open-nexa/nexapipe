@@ -489,7 +489,7 @@ reload.
 | `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. |
 | `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of the device that names none. Refuses to replace one without `--force`. |
 | `client add <CLIENT_ID> --device <NAME>` | Issue a credential to one device, leaving the client's own `secret` alone — so the devices already using it keep working. The client has to exist first. |
-| `client add <CLIENT_ID> --device <NAME> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars) that the device signs every challenge with. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
+| `client add <CLIENT_ID> --device <NAME> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars). The device signs every challenge with the private half it keeps; this is what the server verifies that signature against. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
 | `client revoke <CLIENT_ID>` | Drop a client and every device credential under it. |
 | `client revoke <CLIENT_ID> --device <NAME>` | Drop one device's credential, keeping the client and its other devices. |
 
@@ -1211,7 +1211,8 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - `algorithm`, `time_step` and `digits` are read when the QR code is generated,
   not when it is scanned — leave them stable after devices are enrolled.
 - **The secret is the credential, not the six digits.** The server checks the
-  response signature (HMAC-SHA256 keyed by the secret) *before* it looks at the
+  response signature (HMAC-SHA256 keyed by the secret; an Ed25519 signature over
+  the same bytes, for a device registered with a key) *before* it looks at the
   code. Any `nexapipe://` invite with `secret=` and any enrollment QR carry it
   **in the clear** — treat both as passwords (`--qr-out` writes `0600` on Unix).
 
@@ -1231,8 +1232,11 @@ From then on that device answers each connection by **signing** the challenge
 verifies the signature against the key it holds. Three things follow:
 
 - **What the server holds cannot be replayed.** A copy of `config.toml` yields
-  no way in for a key device, where a copied `secret` *is* the credential
-  itself. The private half never leaves the device, not even at enrollment.
+  no way in *as that device*, where a copied `secret` *is* the credential
+  itself. It is not "no way in" outright: the file still holds the client's own
+  `secret`, which answers for any peer that names no device until
+  `unnamed_device_allowed = false`. The private half never leaves the device,
+  not even at enrollment.
 - **Nothing has to come from anywhere at connection time** — no seed kept for
   the handshake, no code produced — which is what a device that runs unattended
   needs. There is no prompt for a human to miss.
@@ -1447,8 +1451,9 @@ question:
   section every Node ID that can reach the endpoint gets as far as the next
   check.
 - 2FA — *who is this*. A handshake whose response needs an HMAC over that
-  connection's nonce, keyed by the client's secret — or an Ed25519 signature
-  over the same bytes, for a device registered with a public key.
+  connection's nonce followed by its timestamp in little-endian bytes, keyed by
+  the client's secret — or an Ed25519 signature over those same bytes, for a
+  device registered with a public key.
 - `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
   at the handshake.
 

@@ -24,11 +24,12 @@ on 0.6.1 still loads and behaves as it did: a device entry that carries a
   half of an Ed25519 pair, 64 hex characters — instead of `secret`, and that
   device then proves itself by signing each connection's challenge (the nonce
   and the timestamp) instead of answering with a TOTP code. What the server
-  holds is no longer itself a credential: a leaked config yields no way in for
-  a key device, and the private half never leaves the device. A wrong
-  signature counts toward the lockout exactly like a wrong code. A device
-  entry carries exactly one of the two — both, or neither, is refused at
-  load.
+  holds is no longer itself a credential: a leaked config yields no way in *as
+  that device*, and the private half never leaves the device. It still holds
+  the client's own `secret`, though, which answers for any peer that names no
+  device until `unnamed_device_allowed = false`. A wrong signature counts
+  toward the lockout exactly like a wrong code. A device entry carries exactly
+  one of the two — both, or neither, is refused at load.
 - **`nexapipe client add <id> --device <name> --public-key <hex>`** registers
   the public half from the shell, with the same replace semantics as the
   secret path (`--force` to rotate); `client list` marks a key device with
