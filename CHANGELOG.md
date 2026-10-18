@@ -13,9 +13,10 @@ For what comes next, and for why some things are deliberately not planned, see
 ## [Unreleased]
 
 The device credential can now be a **key** instead of a shared secret. No
-configuration key is added, removed or renamed, and a `config.toml` that works
-on 0.6.1 still loads and behaves as it did: a device entry that carries a
-`secret` is checked exactly as before.
+existing configuration key is removed or renamed, and the one this adds —
+`public_key` — is optional, so a `config.toml` that works on 0.6.1 still loads
+and behaves as it did: a device entry that carries a `secret` is checked exactly
+as before.
 
 ### Added
 

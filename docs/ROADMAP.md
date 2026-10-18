@@ -224,9 +224,10 @@ exporter, and client-side latency, are not planned for this release.
 ### 4.3 Identity and authorization (P1)
 
 Authentication is a per-device credential — a TOTP seed or a key. **The
-shared-secret half closed in v0.6.0:** what a `client_id` carries now is its own
-`secret` plus a table of devices, each with a secret of its own issued at
-enrollment, and each revocable without touching the others. The README stopped
+shared-secret half closed in v0.6.0:** what a `client_id` carries is its own
+`secret` plus a table of devices, each holding a credential of its own issued at
+enrollment and each revocable without touching the others — a TOTP seed then,
+either that or an Ed25519 public key now. The README stopped
 saying that too, and both halves that
 [Phase 3](#phase-3--v060-one-device-at-a-time) still owed the model have landed
 since: a revoked device no longer keeps the connections it already holds, and
