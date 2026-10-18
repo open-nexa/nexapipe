@@ -117,16 +117,20 @@ impl ConnectionLimiter {
     }
 
     /// Connections `peer` is holding right now, for tests and diagnostics.
+    ///
+    /// A poisoned lock is recovered rather than reported as zero: the counters
+    /// themselves are still sound, and answering "0" here would have a caller
+    /// log a full process as empty — the one place that must not guess.
     pub fn count(&self, peer: &EndpointId) -> usize {
-        self.counts
-            .lock()
-            .map(|counts| counts.per_peer.get(peer).copied().unwrap_or(0))
-            .unwrap_or(0)
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.per_peer.get(peer).copied().unwrap_or(0)
     }
 
     /// Connections the whole process is holding right now.
+    ///
+    /// Recovers a poisoned lock for the reason [`Self::count`] gives.
     pub fn total(&self) -> usize {
-        self.counts.lock().map(|counts| counts.total).unwrap_or(0)
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).total
     }
 
     pub fn max(&self) -> usize {
@@ -547,6 +551,43 @@ mod tests {
         let limiter = Arc::new(ConnectionLimiter::new(0));
         assert!(limiter.try_acquire(peer(1)).is_none());
         assert_eq!(limiter.count(&peer(1)), 0);
+    }
+
+    #[test]
+    fn diagnostics_report_the_real_counts_through_a_poisoned_lock() {
+        let limiter = Arc::new(ConnectionLimiter::new(4));
+        let a = peer(1);
+
+        let guards: Vec<_> = (0..3).filter_map(|_| limiter.try_acquire(a)).collect();
+        assert_eq!(
+            guards.len(),
+            3,
+            "the connections this test poisons over are held"
+        );
+
+        // Poison it the only way a Mutex gets poisoned: a panic while held.
+        let poisoner = limiter.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.counts.lock().unwrap();
+            panic!("a connection handler died holding the counter");
+        })
+        .join();
+
+        assert_eq!(
+            limiter.count(&a),
+            3,
+            "a poisoned lock still reports what is held"
+        );
+        assert_eq!(
+            limiter.total(),
+            3,
+            "the process total is not an empty process"
+        );
+
+        // And the accounting itself is untouched by the poison.
+        drop(guards);
+        assert_eq!(limiter.count(&a), 0);
+        assert_eq!(limiter.total(), 0);
     }
 
     #[test]
