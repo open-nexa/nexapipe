@@ -1507,6 +1507,24 @@ Both are regular directories of this repository (their git history was preserved
 when they were imported from their former standalone repos), and they ship from
 the same tags as the server.
 
+### First launch on macOS
+
+The desktop builds attached to GitHub releases are not code-signed or notarized.
+Safari marks the downloaded DMG, and the app copied from it, as quarantined, so
+the first launch is refused with:
+
+> "nexa" is damaged and can't be opened. You should move it to the Trash.
+
+The app is intact. Remove the quarantine attribute once after installing:
+
+```bash
+xattr -cr /Applications/nexa.app
+```
+
+Right-click → Open does not bypass this dialog, and the command has to be run
+again after every reinstall. A local build (`build_dmg.sh`) carries no
+quarantine flag in the first place.
+
 ---
 
 ## Development
