@@ -1330,6 +1330,22 @@ Cargo feature：
 两者都是本仓库中的普通目录（从先前的独立仓库导入时保留了 git 历史），并与服务端从
 同一个 tag 发布。
 
+### macOS 首次启动
+
+GitHub Releases 中的桌面端安装包尚未做代码签名与公证。Safari 会给下载的 DMG 以及
+从中拷贝出来的应用打上 quarantine 标记，导致首次打开时 macOS 提示：
+
+> “nexa” is damaged and can't be opened. You should move it to the Trash.
+
+应用本身没有损坏。安装后执行一次即可：
+
+```bash
+xattr -cr /Applications/nexa.app
+```
+
+右键 →“打开”无法绕过这条提示；每次重新安装后都需要再执行一次。从源码本地构建
+（`build_dmg.sh`）不会带上 quarantine 标记。
+
 ---
 
 ## 开发
