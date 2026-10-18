@@ -24,7 +24,7 @@ pub mod allow_list;
 pub mod limits;
 pub mod peers;
 
-use limits::ConnectionLimiter;
+use limits::Limiters;
 
 type HttpClient =
     legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
@@ -1849,6 +1849,7 @@ pub async fn handle_connection(
     client: Arc<HttpClient>,
     auth_state: Option<AuthState>,
     peers: Arc<PeerRegistry>,
+    limiters: Limiters,
 ) {
     let peer_id = conn.remote_id();
     let peer = peer_id.to_string();
@@ -2038,7 +2039,29 @@ pub async fn handle_connection(
                 // Refused rather than queued: waiting for a slot would only move
                 // the unbounded growth into a backlog this loop cannot see, and
                 // the peer has to learn that its stream was not served.
+                //
+                // Two ceilings, checked together and for different reasons: the
+                // per-connection one keeps one connection from asking for the
+                // whole process's allowance, and the process-wide one keeps a
+                // crowd of connections from doing it between them. The process
+                // slot is taken first and given back if the connection's own is
+                // full, because the reverse order would leave a permit held for
+                // a stream that is never served.
+                let global_permit = match limiters.streams.try_acquire() {
+                    Some(permit) => permit,
+                    None => {
+                        tracing::warn!(
+                            "Refusing a stream from {peer_id}, the server already has {} streams \
+                             in flight",
+                            limiters.streams.max_global()
+                        );
+                        let mut send = send;
+                        let _ = send.finish();
+                        continue;
+                    }
+                };
                 let Ok(permit) = stream_slots.clone().try_acquire_owned() else {
+                    drop(global_permit);
                     tracing::warn!(
                         "Connection {} already has {} streams in flight, closing this one",
                         peer_id,
@@ -2073,8 +2096,10 @@ pub async fn handle_connection(
                 );
                 tokio::spawn(async move {
                     // Held for the life of the task and released by its Drop, so
-                    // a slot frees however the stream ends.
+                    // a slot frees however the stream ends. Both permits, for the
+                    // same reason and in the same way.
                     let _permit = permit;
+                    let _global_permit = global_permit;
                     if let Err(e) = handle_bidi_stream(
                         send,
                         recv,
@@ -2118,7 +2143,7 @@ pub async fn handle_incoming(
     config: Arc<RouteConfig>,
     client: Arc<HttpClient>,
     auth_state: Option<AuthState>,
-    limiter: Arc<ConnectionLimiter>,
+    limiters: Limiters,
     in_flight: InFlightGuard,
     peers: Arc<PeerRegistry>,
 ) {
@@ -2130,12 +2155,26 @@ pub async fn handle_incoming(
                 // spent its allowance gets a close frame and nothing else, so
                 // opening connections is not a way to make the server work.
                 let peer_id = conn.remote_id();
-                let Some(guard) = limiter.try_acquire(peer_id) else {
-                    tracing::warn!(
-                        "Refusing connection from {peer_id}, it already holds {} of {}",
-                        limiter.count(&peer_id),
-                        limiter.max()
-                    );
+                let Some(guard) = limiters.connections.try_acquire(peer_id) else {
+                    // Both ceilings refuse here and the two mean different
+                    // things to whoever has to answer the alert: one peer is
+                    // over its own allowance, or the process is full. Say
+                    // which, or the second reads as the first.
+                    let limiter = &limiters.connections;
+                    let per_peer = limiter.count(&peer_id);
+                    let total = limiter.total();
+                    if per_peer >= limiter.max() {
+                        tracing::warn!(
+                            "Refusing connection from {peer_id}, it already holds {per_peer} of {}",
+                            limiter.max()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Refusing connection from {peer_id}, the server is at {total} of {} \
+                             concurrent connections",
+                            limiter.max_global()
+                        );
+                    }
                     conn.close(auth_close_code::TOO_MANY.into(), b"too many connections");
                     return;
                 };
@@ -2146,7 +2185,7 @@ pub async fn handle_incoming(
                     // shutdown knows this connection is still here.
                     let _guard = guard;
                     let _in_flight = in_flight;
-                    handle_connection(conn, config, client, auth_state, peers).await;
+                    handle_connection(conn, config, client, auth_state, peers, limiters).await;
                 });
             }
             Err(e) => {

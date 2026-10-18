@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod client;
 pub mod connection_pool;
+pub mod deadline;
 pub mod endpoint_group;
 pub mod error;
 pub mod flow;

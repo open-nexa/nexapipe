@@ -210,11 +210,16 @@ backends = ["127.0.0.1:443"]
 #    preface. client_ports is only a selector (it decides whether this route can
 #    match); it never decides where the connection goes. Absent = every port
 #    matches. Backends must spell out the port.
+#    flow_timeout_secs = close the flow after this many seconds in total;
+#    unset falls back to the server default. Raise it for a session that is
+#    meant to last — an interactive SSH connection or a database session — since
+#    the default bounds the whole flow, not the silence in it.
 [[routes]]
 host_pattern = "db.example.com"
 mode = "tcp"
 backends = ["127.0.0.1:5432"]
 client_ports = [5432, 6432]
+flow_timeout_secs = 3600
 
 # 4) udp: UDP flows, one QUIC bi-stream per flow.
 #    idle_timeout_secs = close the flow after this many silent seconds; unset

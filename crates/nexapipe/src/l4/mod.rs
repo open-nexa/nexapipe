@@ -32,7 +32,7 @@ use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
 use crate::metrics;
 use crate::routes::{BackendLookup, RouteConfig};
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
+use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
     encode_frame,
@@ -316,11 +316,26 @@ where
     );
 
     let connect_timeout = config.timeouts().connect;
+    // Both bounds are per route, and both have a server default: the idle one is
+    // the gap between packets, the flow one is how long the flow may last. See
+    // `L4Options::flow_timeout` for why they are not the same number.
+    let deadlines = crate::deadline::Deadlines::default();
     let result = match preface.proto {
-        L4Proto::Tcp => serve_tcp(stream, &route.backend, leftover, connect_timeout).await,
+        L4Proto::Tcp => {
+            let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
+            serve_tcp(
+                stream,
+                &route.backend,
+                leftover,
+                connect_timeout,
+                flow_timeout,
+            )
+            .await
+        }
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT);
-            serve_udp(stream, &route.backend, leftover, idle).await
+            let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
+            serve_udp(stream, &route.backend, leftover, idle, flow_timeout).await
         }
     };
 
@@ -360,11 +375,19 @@ where
 }
 
 /// TCP: dial the backend, hand the client its status byte, then copy raw bytes.
+///
+/// `flow_timeout` bounds the whole flow rather than the gap between packets: a
+/// TCP connection that is being used and one that is being held open by a peer
+/// that keeps it technically alive look identical from here, so bounding only the
+/// silence would let the second renew itself forever. It is configurable per
+/// route because a legitimate long-lived session — an interactive SSH connection,
+/// a database session — is meant to outlive any default.
 async fn serve_tcp<S>(
     mut stream: S,
     backend: &str,
     leftover: Vec<u8>,
     connect_timeout: Duration,
+    flow_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -394,7 +417,25 @@ where
         crate::metrics::METRICS.record_bytes_received(leftover.len() as u64);
     }
 
-    copy_both_ways(stream, backend_stream, "L4 TCP").await?;
+    // Bounded as a whole, not only on silence: see `serve_tcp`. The deadline is
+    // handed to the copy rather than wrapped around it, so the helper's own
+    // half-close still runs when it fires and the client sees an EOF rather than
+    // a reset.
+    match copy_both_ways_until(stream, backend_stream, "L4 TCP", Some(flow_timeout)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // `warn`, not `debug`: this fires on a session that was working and
+            // is now being cut, which is the one event in this file an operator
+            // has to be able to find. `flow_timeout_secs` on the route raises it
+            // — the default is meant to be generous, not invisible.
+            tracing::warn!(
+                "L4 TCP: closing the flow to {host}:{port} after {flow_timeout:?}, which is the \
+                 whole-flow bound; raise flow_timeout_secs on the route for longer sessions"
+            );
+        }
+        // A real transport failure, which is what the other paths report too.
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
@@ -402,12 +443,14 @@ where
 ///
 /// `backend` only picks the peer address: a UDP socket has no handshake, so there is
 /// nothing to connect to and no way to learn the backend is down. The flow ends when
-/// either side goes quiet for `idle`, or when the client closes the stream.
+/// either side goes quiet for `idle`, when it has run for `flow_timeout`, or when
+/// the client closes the stream.
 async fn serve_udp<S>(
     mut stream: S,
     backend: &str,
     leftover: Vec<u8>,
     idle: Duration,
+    flow_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -547,9 +590,27 @@ where
 
     // The first direction to finish ends the flow: a UDP tunnel has no half-close to
     // negotiate, and keeping the other pump alive would only hold a dead socket open.
-    tokio::select! {
-        _ = client_to_backend => (),
-        _ = backend_to_client => (),
+    //
+    // The `idle` inside each pump above bounds the *gap* between datagrams and
+    // re-arms on every one, which is right for a UDP flow — it has no protocol
+    // end. It is not enough on its own: a peer that sends one datagram every
+    // `idle - 1s` keeps both pumps alive indefinitely, so the flow is also
+    // bounded as a whole. That is the deadline a slowloris-style peer cannot
+    // renew, and without it a flow slot and a task stay pinned for as long as
+    // the far side cares to send.
+    let flows = async {
+        tokio::select! {
+            _ = client_to_backend => (),
+            _ = backend_to_client => (),
+        }
+    };
+    if tokio::time::timeout(flow_timeout, flows).await.is_err() {
+        // `warn` for the same reason as the TCP path: a working session being
+        // cut is an event an operator has to be able to find.
+        tracing::warn!(
+            "L4 UDP: closing the flow to {target} after {flow_timeout:?}, which is the \
+             whole-flow bound; raise flow_timeout_secs on the route for longer sessions"
+        );
     }
 
     // Finish the send side so the client sees a clean end of stream instead of a reset.
@@ -706,6 +767,7 @@ mod tests {
         .with_l4_options(L4Options {
             client_ports: None,
             idle_timeout: idle,
+            flow_timeout: None,
         })
     }
 
@@ -1100,6 +1162,84 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the idle timeout should end the flow")
+            .unwrap();
+        assert!(outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_udp_flow_ends_when_it_has_run_for_its_flow_timeout() {
+        // The gap the idle bound cannot close: a peer that keeps a datagram
+        // moving faster than `idle` never trips it, so without a bound on the
+        // whole flow this datagram loop would hold the slot and the task forever.
+        // The idle here is generous and the flow timeout is short, which is the
+        // only arrangement in which the flow bound is what ends it.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let idle = Duration::from_secs(30);
+        let flow = Duration::from_millis(300);
+        let config = RouteConfig::new(vec![
+            Route::new(
+                "turn.test",
+                "/",
+                true,
+                vec![backend_addr.to_string()],
+                LoadBalancingStrategy::RoundRobin,
+                RouteMode::Udp,
+                None,
+            )
+            .with_l4_options(L4Options {
+                client_ports: None,
+                idle_timeout: Some(idle),
+                flow_timeout: Some(flow),
+            }),
+        ]);
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        client
+            .write_all(&preface(L4Proto::Udp, "turn.test", 3478))
+            .await
+            .unwrap();
+        assert_eq!(read_status(&mut client).await, Status::Ok);
+
+        // Keep sending well inside the idle window for longer than the flow
+        // budget, so only the flow deadline can end this.
+        let started = std::time::Instant::now();
+        let mut kept_alive = 0;
+        while started.elapsed() < Duration::from_millis(250) {
+            client
+                .write_all(&encode_frame_to_vec(b"tick").unwrap())
+                .await
+                .unwrap();
+            kept_alive += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(kept_alive > 1, "the flow really was still being renewed");
+
+        // And it does end, on the flow budget rather than on anything else.
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("the flow timeout should end the flow");
+        assert!(read.is_ok());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the flow should have ended on its own")
             .unwrap();
         assert!(outcome.is_ok());
     }

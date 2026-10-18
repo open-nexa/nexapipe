@@ -117,6 +117,18 @@ pub struct L4Options {
     pub client_ports: Option<Vec<u16>>,
     /// Silence after which a UDP flow is closed. `None` means the server default.
     pub idle_timeout: Option<Duration>,
+    /// How long one flow may run before it is closed. `None` means the server
+    /// default.
+    ///
+    /// Separate from `idle_timeout` because the two bound different things: the
+    /// idle one is the *gap* between packets and re-arms on each one, which is
+    /// what a UDP flow needs, while this one is the whole flow. A peer that
+    /// sends one packet just before each idle expiry keeps a flow alive with the
+    /// idle bound alone, so the flow is also bounded as a whole.
+    ///
+    /// Raise it for a long-lived session over the tunnel — an interactive SSH
+    /// connection or a database session is meant to outlive any default here.
+    pub flow_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +226,11 @@ impl Route {
     /// `udp` routes only: how long a flow may sit idle.
     pub fn idle_timeout(&self) -> Option<Duration> {
         self.l4.idle_timeout
+    }
+
+    /// How long one flow on this route may run, if the route says.
+    pub fn flow_timeout(&self) -> Option<Duration> {
+        self.l4.flow_timeout
     }
 
     pub fn matches(&self, host: &str, path: &str) -> bool {
@@ -425,6 +442,12 @@ pub struct L4RouteInfo {
     pub backend: String,
     /// `udp` routes only; `None` means the caller's own default.
     pub idle_timeout: Option<Duration>,
+    /// `tcp` and `udp` routes; `None` means the caller's own default.
+    ///
+    /// How long the whole flow may run, as against the gap between packets that
+    /// `idle_timeout` bounds. Separate because a peer can keep a flow alive
+    /// forever by sending one packet before each idle expiry.
+    pub flow_timeout: Option<Duration>,
     /// Held until this flow finishes, so the balancer knows the slot is still
     /// taken. Nothing reads it; see [`BackendInfo::_lease`].
     _lease: BackendLease,
@@ -438,6 +461,7 @@ impl std::fmt::Debug for L4RouteInfo {
         f.debug_struct("L4RouteInfo")
             .field("backend", &self.backend)
             .field("idle_timeout", &self.idle_timeout)
+            .field("flow_timeout", &self.flow_timeout)
             .finish()
     }
 }
@@ -647,6 +671,7 @@ impl RouteConfig {
         BackendLookup::Found(L4RouteInfo {
             backend: lease.url().to_string(),
             idle_timeout: route.idle_timeout(),
+            flow_timeout: route.flow_timeout(),
             _lease: lease,
         })
     }
@@ -1057,6 +1082,7 @@ mod tests {
         .with_l4_options(L4Options {
             client_ports: ports.map(|p| p.to_vec()),
             idle_timeout: None,
+            flow_timeout: None,
         })
     }
 
@@ -1231,6 +1257,7 @@ mod tests {
         .with_l4_options(L4Options {
             client_ports: None,
             idle_timeout: Some(std::time::Duration::from_secs(120)),
+            flow_timeout: None,
         });
         assert_eq!(
             route.idle_timeout(),
@@ -1717,6 +1744,7 @@ mod tests {
         .with_l4_options(L4Options {
             client_ports: Some(vec![443]),
             idle_timeout: None,
+            flow_timeout: None,
         });
 
         let config = RouteConfig::new(vec![every_port, only_443]);
