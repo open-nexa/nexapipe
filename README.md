@@ -247,6 +247,22 @@ point at any path. `host.docker.internal` is configured, so backends running
 on the Docker host are reachable. Moving an existing deployment over is one
 command: `mkdir -p config && mv config.toml config/config.toml`.
 
+The image runs as **uid 1000, not root** — the proxy needs no privileges, and a
+server reachable from the internet holding the 2FA seeds and the endpoint
+identity should not be root. The three mounted directories therefore have to be
+writable by that uid; on a fresh setup the `mkdir` above already does it.
+**Upgrading a deployment that ran the root image** needs one command first,
+because the files it wrote are root-owned:
+
+```bash
+chown -R 1000:1000 config secrets logs
+```
+
+Skipping it does not always fail loudly. A `config.toml` the new user cannot
+write costs every 2FA counter update, and an `iroh.key` it cannot open is
+*regenerated* — which is a new Node ID, and every client that stored the old one
+stops finding the server.
+
 Published images are on GHCR (`linux/amd64` and `linux/arm64`), named the same
 as what `docker-compose.yaml` builds. To run one instead of building locally,
 pull it and start the stack **without** `--build` — `--build` rebuilds from the

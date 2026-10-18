@@ -222,6 +222,19 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
+镜像以 **uid 1000 运行，不是 root** —— 这个代理不需要特权，而一个从公网可达、
+手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个目录因此必须对该
+uid 可写；全新部署时上面的 `mkdir` 已经满足。**从旧的 root 镜像升级**需要先执行一条
+命令，因为它写下的文件仍属 root：
+
+```bash
+chown -R 1000:1000 config secrets logs
+```
+
+跳过这一步不一定立刻报错：新用户写不了 `config.toml` 会让每次 2FA 计数都更新失败，
+而读不了 `iroh.key` 会被**重新生成** —— 那意味着新的 Node ID，存过旧 Node ID 的
+客户端将找不到服务器。
+
 镜像也已发布到 GHCR（`linux/amd64` 与 `linux/arm64`），名字与 `docker-compose.yaml`
 本地构建的产物相同。想直接运行官方镜像而不是本地构建，先拉取，然后**不要**加 `--build`
 启动 —— `--build` 会无视已有镜像，按 `Dockerfile` 重新构建：

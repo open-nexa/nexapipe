@@ -20,10 +20,10 @@ services:
       # `cp config.toml.example config/config.toml`
       # (`config.toml` is gitignored: it is the operator's live config), or
       # `mv config.toml config/config.toml` for a deployment that already has
-      # one. Start from `config.toml.2fa.example` instead for 2FA — and mind
-      # its file mode, a config holding secrets is refused when it is not
-      # `0600`. A missing directory makes Docker create an empty one and the
-      # server then fails to read the file.
+      # one. Start from `config.toml.2fa.example` instead for 2FA — its file mode
+      # is no longer checked, so a `0644` config starts. A missing directory
+      # makes Docker create an empty one and the server then fails to read the
+      # file.
       #
       # Mounted read-write on purpose: the server writes the 2FA counters
       # (`failed_attempts`, `locked_until`, `last_used`) back into this file, so
@@ -41,6 +41,18 @@ services:
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
       - ./logs:/app/logs
+    # The image runs as uid 1000, not root, so all three mounts above must be
+    # writable by it. On a fresh setup `mkdir -p` then `docker compose up` is
+    # enough — the directories land owned by whoever ran mkdir, which is uid 1000
+    # on an ordinary Linux box.
+    #
+    # **Upgrading a deployment that ran the root image**: the files it wrote are
+    # root-owned, and the new user cannot write them — the symptom is a start
+    # that fails on `/app/config/config.toml`, or a *new* iroh key generated
+    # because `/app/secrets/iroh.key` could not be opened, which changes the Node
+    # ID every client has stored. Chown before the first start:
+    #
+    #     chown -R 1000:1000 config secrets logs
     environment:
       # Directory inside the container that receives the log files. Overrides
       # [log] dir so the files always land in the mounted volume.

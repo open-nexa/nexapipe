@@ -73,11 +73,36 @@ impl TotpAlgorithm {
 }
 
 /// Client-side 2FA credentials loaded from config file / app settings.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is written out rather than derived, and `secret` is the reason: a
+/// derived one prints the TOTP seed in full, so every `{:?}` that reaches a log
+/// line, a panic message or a bug report pastes a working credential into it.
+/// An empty `secret` prints as `""` for the same reason — an absent secret and a
+/// masked one should not be told apart by a reader.
+#[derive(Clone, PartialEq)]
 pub struct TwoFactorConfig {
     pub client_id: String,
     pub secret: String,
     pub algorithm: TotpAlgorithm,
+}
+
+impl std::fmt::Debug for TwoFactorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorConfig")
+            .field("client_id", &self.client_id)
+            .field("secret", &masked(&self.secret))
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
+}
+
+/// What a secret prints as: present, and how long — never the value itself.
+fn masked(secret: &str) -> String {
+    if secret.is_empty() {
+        String::new()
+    } else {
+        format!("<{} chars>", secret.chars().count())
+    }
 }
 
 impl TwoFactorConfig {
@@ -121,7 +146,11 @@ fn decode_base32(secret_base32: &str) -> Result<Vec<u8>, ClientError> {
 }
 
 /// Client-side 2FA authenticator
-#[derive(Debug, Clone)]
+///
+/// The `Debug` is written out for the same reason [`TwoFactorConfig`]'s is: the
+/// decoded `secret` is the credential itself, in a form a derived `Debug` would
+/// print as a byte array.
+#[derive(Clone)]
 pub struct TwoFactorAuth {
     client_id: String,
     secret: Vec<u8>,
@@ -134,6 +163,19 @@ pub struct TwoFactorAuth {
     /// secret, and it is the only thing a server that predates per-device
     /// credentials understands.
     device_id: Option<String>,
+}
+
+impl std::fmt::Debug for TwoFactorAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorAuth")
+            .field("client_id", &self.client_id)
+            .field("secret", &format_args!("<{} bytes>", self.secret.len()))
+            .field("algorithm", &self.algorithm)
+            .field("time_step", &self.time_step)
+            .field("digits", &self.digits)
+            .field("device_id", &self.device_id)
+            .finish()
+    }
 }
 
 impl TwoFactorAuth {
@@ -464,7 +506,9 @@ impl TwoFactorAuth {
 /// right after a token has been spent. An app that keeps its settings somewhere
 /// durable has to write these three fields down: the token is gone, so a
 /// restart that still holds the invite cannot enroll a second time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` masks `secret`, for the reason [`TwoFactorConfig`]'s does.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IssuedCredential {
     pub client_id: String,
     /// Base32, exactly as it goes into [`TwoFactorAuth::new`] next time.
@@ -479,6 +523,17 @@ pub struct IssuedCredential {
     pub device: Option<String>,
 }
 
+impl std::fmt::Debug for IssuedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCredential")
+            .field("client_id", &self.client_id)
+            .field("secret", &masked(&self.secret))
+            .field("algorithm", &self.algorithm)
+            .field("device", &self.device)
+            .finish()
+    }
+}
+
 /// A credential that has not been issued yet.
 ///
 /// A `v=2` invitation carries one of these instead of the client's secret: the
@@ -486,7 +541,11 @@ pub struct IssuedCredential {
 /// holds is a token the server exchanges for a freshly generated secret and
 /// then discards. The trade is that the app has to keep what comes back — see
 /// [`Enrollment::exchange`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` masks `token`, for the reason [`TwoFactorConfig`]'s does: an
+/// unspent invitation link *is* the credential, and this is the struct an app
+/// is most likely to log while working out why an enrollment did not go through.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Enrollment {
     client_id: String,
     token: String,
@@ -495,6 +554,16 @@ pub struct Enrollment {
     /// to answer with it or to refuse it, and what it answers with is what the
     /// credential is filed under.
     device_id: Option<String>,
+}
+
+impl std::fmt::Debug for Enrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrollment")
+            .field("client_id", &self.client_id)
+            .field("token", &masked(&self.token))
+            .field("device_id", &self.device_id)
+            .finish()
+    }
 }
 
 impl Enrollment {
@@ -798,9 +867,79 @@ pub mod auth_protocol {
 #[cfg(test)]
 mod tests {
     use super::{
-        Enrollment, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth, auth_protocol::AuthMessage,
-        device_id_is_usable,
+        Enrollment, IssuedCredential, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth,
+        TwoFactorConfig, auth_protocol::AuthMessage, device_id_is_usable,
     };
+
+    /// A `Debug` that prints a secret turns every log line, panic message and
+    /// bug report that touches one into a credential disclosure — and these are
+    /// exactly the values an app logs while working out why authentication
+    /// stopped working. Every holder of a secret gets a hand-written `Debug` for
+    /// that reason; this is the test that keeps the hand-written ones honest.
+    #[test]
+    fn no_debug_output_carries_a_secret() {
+        let secret = "JBSWY3DPEHPK3PXP";
+        let config = TwoFactorConfig {
+            client_id: "node-1".to_string(),
+            secret: secret.to_string(),
+            algorithm: TotpAlgorithm::SHA1,
+        };
+        let auth = TwoFactorAuth::new("node-1", secret, TotpAlgorithm::SHA1).expect("a credential");
+        let issued = IssuedCredential {
+            client_id: "node-1".to_string(),
+            secret: secret.to_string(),
+            algorithm: "sha1".to_string(),
+            device: Some("laptop".to_string()),
+        };
+        let enrollment = Enrollment::new("node-1", "an-invitation-token");
+
+        for rendered in [
+            format!("{config:?}"),
+            format!("{auth:?}"),
+            format!("{issued:?}"),
+            format!("{enrollment:?}"),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a TOTP seed reached a Debug output: {rendered}"
+            );
+            assert!(
+                !rendered.contains("an-invitation-token"),
+                "an enrollment token reached a Debug output: {rendered}"
+            );
+        }
+    }
+
+    /// Masking must not turn into silence: a reader debugging a login needs to
+    /// tell "no secret configured" from "a secret is there and I cannot see it",
+    /// and needs to know the value is not the wrong length.
+    #[test]
+    fn a_masked_secret_still_says_whether_there_is_one() {
+        let with_secret = TwoFactorConfig {
+            client_id: "node-1".to_string(),
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            algorithm: TotpAlgorithm::SHA1,
+        };
+        let without = TwoFactorConfig {
+            client_id: "node-1".to_string(),
+            secret: String::new(),
+            algorithm: TotpAlgorithm::SHA1,
+        };
+
+        let present = format!("{with_secret:?}");
+        let absent = format!("{without:?}");
+
+        assert_ne!(
+            present, absent,
+            "a masked secret and an absent one are indistinguishable"
+        );
+        assert!(
+            present.contains("16 chars"),
+            "the length is not reported: {present}"
+        );
+        // The whole point of masking, stated as a test: the length is not the value.
+        assert!(!present.contains("JBSWY3DPEHPK3PXP"));
+    }
 
     /// The mirror of the test in `crates/nexapipe/src/auth/protocol.rs`: the
     /// two sides define these messages separately, and the tag is all that
