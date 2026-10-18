@@ -252,15 +252,56 @@ pub fn report_result(result_file: Option<&str>, outcome: &Result<(), AppError>) 
     };
 
     match result_file {
-        Some(path) => match std::fs::write(Path::new(path), line) {
-            Ok(()) => {}
-            Err(e) => eprintln!("Failed to write result file {}: {}", path, e),
-        },
+        Some(path) => {
+            let path = Path::new(path);
+            match write_result_file(path, &line) {
+                Ok(()) => {}
+                Err(e) => eprintln!("Failed to write result file {}: {}", path.display(), e),
+            }
+        }
         None => match outcome {
             Ok(()) => println!("OK"),
             Err(e) => eprintln!("{}", e),
         },
     }
+}
+
+/// Writes the one line the parent reads back, refusing to follow a symlink.
+///
+/// The elevated child runs as an administrator and writes into a temporary
+/// directory, which on a multi-user machine is one account's to plant and
+/// another's to read. `fs::write` follows a symlink, so a link planted at the
+/// path the parent polls would have the outcome — which carries the failure
+/// detail — written into a file the planting account can read, by a process
+/// holding administrator rights. `create_new` fails on an existing path rather
+/// than opening it, and `O_NOFOLLOW` closes the window between the two calls on
+/// Unix.
+///
+/// Best-effort about the outcome: a child that cannot write its result loses the
+/// detail, not the operation, and says so on stderr where the launcher's log
+/// has it.
+fn write_result_file(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    file.write_all(line.as_bytes())
 }
 
 /// Serializes a failure for the result file, falling back to `Display` so a report is never lost.
@@ -274,8 +315,19 @@ fn decode_failure(payload: &str) -> AppError {
         .unwrap_or_else(|_| AppError::with_detail(codes::SERVICE_LEGACY_FAILURE, payload))
 }
 
+/// Reads the outcome the elevated child left, if it left one that can be read.
+///
+/// The open is `O_NOFOLLOW` and the result has to be a regular file: the parent
+/// polls this path for as long as the elevation takes, and on a shared machine
+/// another account can create the path first. Without both checks a planted
+/// symlink turns a failed elevation into a reported success — the one thing this
+/// whole exchange exists to make impossible — or into a failure detail of
+/// somebody else's choosing.
+///
+/// Anything unreadable is `None`, which the callers already read as "no result
+/// yet"; they go on to time out or fall back to the child's exit code.
 fn read_result_file(path: &Path) -> Option<Result<(), AppError>> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_regular_file(path)?;
     let raw = raw.trim();
     let (prefix, payload) = raw.split_once(SEPARATOR)?;
 
@@ -284,6 +336,47 @@ fn read_result_file(path: &Path) -> Option<Result<(), AppError>> {
         ERR_PREFIX => Some(Err(decode_failure(payload))),
         _ => None,
     }
+}
+
+/// The file's contents, when `path` is a regular file that is not a symlink.
+#[cfg(unix)]
+fn read_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+
+    // Checked after the open, which is what makes it worth anything: the metadata
+    // a path lookup returns describes whatever is at the path *now*, not the file
+    // this handle is already on.
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    Some(contents)
+}
+
+/// No symlink to refuse on this platform, so the regular-file check stands alone.
+///
+/// Still worth having: a directory at the path would otherwise fail the read
+/// with a message that reads like a permissions problem.
+#[cfg(not(unix))]
+fn read_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    Some(contents)
 }
 
 fn wait_for_result_file(path: &Path, timeout: Duration) -> Option<Result<(), AppError>> {
@@ -563,5 +656,94 @@ mod tests {
 
         assert_eq!(take_result_file_arg(&mut args), None);
         assert_eq!(args, vec!["nexa"]);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexapipe-elevate-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        dir
+    }
+
+    /// The round trip the whole file exists for: a child writes `OK:`, the
+    /// parent reads it back as a success.
+    #[test]
+    fn a_written_result_is_read_back() {
+        let dir = scratch("roundtrip");
+        let path = dir.join("result");
+
+        write_result_file(&path, "OK:").expect("written");
+
+        assert_eq!(read_result_file(&path), Some(Ok(())));
+    }
+
+    /// A symlink planted where the result file is expected must not be followed.
+    ///
+    /// The elevated child writes as an administrator into a temporary directory
+    /// that another account may have written first, and the parent polls the same
+    /// path for as long as the prompt is up. A link to a file the planting
+    /// account can read turns that into either a fabricated success or a failure
+    /// detail of its choosing — which is the one thing this exchange exists to
+    /// prevent.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_is_neither_written_through_nor_read() {
+        let dir = scratch("symlink");
+        let path = dir.join("result");
+        let target = dir.join("planted");
+        std::fs::write(&target, "OK:").expect("the planted file is there");
+
+        std::os::unix::fs::symlink(&target, &path).expect("the link is planted");
+
+        // Written: the outcome goes nowhere near the planted file.
+        assert!(
+            write_result_file(&path, "ERR:something").is_err(),
+            "a symlink was written through"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("still readable"),
+            "OK:",
+            "the planted file was overwritten by the elevated child"
+        );
+
+        // Read: the parent does not believe it either.
+        assert_eq!(
+            read_result_file(&path),
+            None,
+            "a planted symlink was read as the child's outcome"
+        );
+    }
+
+    /// An existing regular file is not overwritten. The parent deletes the path
+    /// before spawning, so a file already there means something else got there
+    /// first, and clobbering it is how a second elevation's result replaces the
+    /// first's.
+    #[test]
+    fn an_existing_result_file_is_not_overwritten() {
+        let dir = scratch("existing");
+        let path = dir.join("result");
+        std::fs::write(&path, "OK:").expect("something else got there first");
+
+        assert!(write_result_file(&path, "ERR:later").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still readable"),
+            "OK:",
+            "an existing result file was clobbered"
+        );
+    }
+
+    /// A directory at the result path is not read as an outcome. Without the
+    /// regular-file check the read fails with something that reads like a
+    /// permissions problem rather than "that is not what I asked for".
+    #[test]
+    fn a_directory_at_the_result_path_is_not_an_outcome() {
+        let dir = scratch("directory");
+        let path = dir.join("result");
+        std::fs::create_dir(&path).expect("a directory is there");
+
+        assert_eq!(read_result_file(&path), None);
     }
 }
