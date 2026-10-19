@@ -1,0 +1,19 @@
+# cargo-audit configuration for the desktop app.
+# CI runs `cargo audit` with this directory as the working directory; cargo-audit
+# picks the config up from `.cargo/audit.toml`. Vulnerabilities fail the job,
+# informational advisories (unmaintained/unsound/yanked) stay warnings.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0367/0368/0369: symlink and SUID/SGID handling flaws in
+    # `zip::ZipArchive::extract`, fixed only in zip >= 9.0.0. zip enters this
+    # dependency tree solely through tauri-plugin-updater, which pins `zip ^4`
+    # (2.14.0 and even 3.0.0-alpha.3 still do), so the lockfile cannot move to
+    # the patched line yet. Exposure is narrow in practice: the updater only
+    # extracts archives served by our own release backend after minisign
+    # signature verification. Remove these entries and bump the lockfile as
+    # soon as a tauri-plugin-updater release allows zip >= 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]
