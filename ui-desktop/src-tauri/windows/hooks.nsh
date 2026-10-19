@@ -38,9 +38,54 @@
 ; in the app says the same thing about the same service; the two have to stay in sync.
 !define NEXAPIPE_SERVICE_ARGUMENT "--service"
 ; Scratch files for the elevated steps. Nothing of this survives the run.
-!define NEXAPIPE_STOP_SCRIPT "$TEMP\nexapipe-stop-service.cmd"
-!define NEXAPIPE_RESTORE_SCRIPT "$TEMP\nexapipe-restore-service.cmd"
-!define NEXAPIPE_RESTORE_LOG "$TEMP\nexapipe-restore-service.log"
+;
+; Their names are drawn at run time rather than fixed. A batch file written to a predictable
+; path in a per-user temporary directory is a file another account on the same machine can
+; create first, and this installer then runs whatever is there with administrator rights:
+; `FileOpen ... w` truncates it and overwrites it, so planting the file is enough to have the
+; installer's own UAC prompt execute commands the planting account chose. `GetTempFileName`
+; asks the OS for a name it has already reserved for this process, so nothing can be sitting
+; there first.
+;
+; `Var` rather than `!define`: these are per-run values, and a name picked when the installer
+; was built is no better than one written down here.
+Var /GLOBAL NEXAPIPE_STOP_SCRIPT
+Var /GLOBAL NEXAPIPE_RESTORE_SCRIPT
+Var /GLOBAL NEXAPIPE_RESTORE_LOG
+
+; Puts a fresh OS-chosen path ending in `ext` in `name`. `GetTempFileName` creates an empty
+; `.tmp` file, which is what reserves the name, and the file is then renamed to `ext`: `cmd /c`
+; runs a file as a batch script only for `.cmd` / `.bat`, and a `.tmp` goes to whatever the file
+; association says, usually nothing. `Rename` refuses an existing destination, so a file planted
+; at the renamed path makes the reservation fail rather than get reused. The caller overwrites
+; the reserved file with `FileOpen`. A reservation that could not be made leaves an empty string,
+; and every use below reads one of these only after checking it is not empty — so the elevated
+; step is skipped rather than run against a path nobody reserved.
+;
+; No labels, for the reason the wait macro below gives: this is inserted more than once.
+!macro NEXAPIPE_TEMP_FILE name ext
+  Push $0
+  ClearErrors
+  GetTempFileName $0 "$TEMP"
+  ${If} ${Errors}
+  ${OrIf} $0 == ""
+    StrCpy $0 ""
+  ${Else}
+    ClearErrors
+    Rename $0 "$0${ext}"
+    ${If} ${Errors}
+      Delete $0
+      StrCpy $0 ""
+    ${Else}
+      StrCpy $0 "$0${ext}"
+    ${EndIf}
+  ${EndIf}
+  ${If} $0 == ""
+    DetailPrint "Could not reserve a temporary file name; skipping the elevated step."
+  ${EndIf}
+  StrCpy ${name} $0
+  Pop $0
+!macroend
 
 ; Where the uninstaller leaves its note about the service it is about to drop, for the install
 ; that follows to pick up. The two product names are spelled out rather than read from
@@ -176,17 +221,24 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
     DetailPrint "Stopping ${NEXAPIPE_SERVICE_NAME} so ${NEXAPIPE_SERVICE_EXE} can be replaced..."
 
-    FileOpen $0 "${NEXAPIPE_STOP_SCRIPT}" w
-    FileWrite $0 "@echo off$\r$\n"
-    ; Stopping is enough to free the file. The entry stays registered on purpose: deleting it here
-    ; would silently uninstall the service the user had set up, and replacing the binary later in
-    ; this very run is all that needs it to be down.
-    !insertmacro NEXAPIPE_WRITE_STOP_WAIT
-    FileClose $0
+    ; Reserved now, opened below: the name has to exist before the script is written into it,
+    ; or there is a window in which another account creates the file first.
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_STOP_SCRIPT ".cmd"
+    ${If} $NEXAPIPE_STOP_SCRIPT != ""
+      FileOpen $0 $NEXAPIPE_STOP_SCRIPT w
+      FileWrite $0 "@echo off$\r$\n"
+      ; Stopping is enough to free the file. The entry stays registered on purpose: deleting it here
+      ; would silently uninstall the service the user had set up, and replacing the binary later in
+      ; this very run is all that needs it to be down.
+      !insertmacro NEXAPIPE_WRITE_STOP_WAIT
+      FileClose $0
 
-    !insertmacro NEXAPIPE_RUN_ELEVATED "${NEXAPIPE_STOP_SCRIPT}"
+      !insertmacro NEXAPIPE_RUN_ELEVATED $NEXAPIPE_STOP_SCRIPT
+    ${EndIf}
 
-    ; Only the wait below still has anything to add.
+    ; Only the wait below still has anything to add. It runs even when the script could not be
+    ; written, because an upgrade that cannot stop the service still has to wait for the file to
+    ; be released before it can replace it.
     !insertmacro NEXAPIPE_AWAIT_UNLOCKED
   ${EndIf}
 
@@ -205,44 +257,65 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
     DetailPrint "Restoring ${NEXAPIPE_SERVICE_NAME}..."
 
-    FileOpen $0 "${NEXAPIPE_RESTORE_SCRIPT}" w
-    FileWrite $0 "@echo off$\r$\n"
-    ; `create` fails with 1073 when an entry is already registered and `config` with 1060 when it
-    ; is not, so asking first is what keeps both paths working rather than just the one expected.
-    ; The binary reached with `binPath=` is quoted the way `sc` wants it: an unescaped quote in a
-    ; path containing spaces is rejected with 1639. The description is cosmetic and only the app
-    ; sets it, so it is not mirrored here to avoid drifting out of step with the Rust side.
-    FileWrite $0 "sc.exe query ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
-    FileWrite $0 "if not errorlevel 1 goto reconfigure$\r$\n"
-    FileWrite $0 'sc.exe create ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto DisplayName= "${NEXAPIPE_SERVICE_DISPLAY_NAME}" > "${NEXAPIPE_RESTORE_LOG}" 2>&1$\r$\n'
-    FileWrite $0 "goto registered$\r$\n"
-    FileWrite $0 ":reconfigure$\r$\n"
-    ; The install directory can move between versions, and the entry then still points at a path
-    ; that no longer exists.
-    FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto > "${NEXAPIPE_RESTORE_LOG}" 2>&1$\r$\n'
-    FileWrite $0 ":registered$\r$\n"
-    ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
-      ; Only ever started again when it was running before the upgrade: a service the user had
-      ; stopped deliberately has to stay stopped.
-      FileWrite $0 "sc.exe start ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
-    ${EndIf}
-    FileWrite $0 "exit /b 0$\r$\n"
-    FileClose $0
+    ; Both names reserved before either is written: the log path is baked into the script text
+    ; below, so it has to exist before that text is written, and both are handed out by the OS
+    ; rather than named here. Both are required, too: a script redirecting into `""` fails the
+    ; redirection, and `cmd` then never runs the `sc.exe` line it was attached to.
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_RESTORE_SCRIPT ".cmd"
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_RESTORE_LOG ".log"
 
-    !insertmacro NEXAPIPE_RUN_ELEVATED "${NEXAPIPE_RESTORE_SCRIPT}"
-
-    ; `cmd.exe` wrote `sc.exe`'s answer into the log, which is the only way to learn anything from
-    ; an elevated child: nothing comes back through "runas", and DetailPrint is where whoever has
-    ; to debug this will look.
-    ClearErrors
-    FileOpen $0 "${NEXAPIPE_RESTORE_LOG}" r
-    ${IfNot} ${Errors}
-      FileRead $0 $1
-      ${If} $1 != ""
-        DetailPrint "${NEXAPIPE_SERVICE_NAME}: $1"
+    ${If} $NEXAPIPE_RESTORE_SCRIPT != ""
+    ${AndIf} $NEXAPIPE_RESTORE_LOG != ""
+      FileOpen $0 $NEXAPIPE_RESTORE_SCRIPT w
+      FileWrite $0 "@echo off$\r$\n"
+      ; `create` fails with 1073 when an entry is already registered and `config` with 1060 when it
+      ; is not, so asking first is what keeps both paths working rather than just the one expected.
+      ; The binary reached with `binPath=` is quoted the way `sc` wants it: an unescaped quote in a
+      ; path containing spaces is rejected with 1639. The description is cosmetic and only the app
+      ; sets it, so it is not mirrored here to avoid drifting out of step with the Rust side.
+      ;
+      ; Single-quoted so `"` is literal: NSIS has no `\"` escape, and these lines must come out the
+      ; way `bin_path_value` in platform.rs writes them (`"\"<exe>\" --service"`).
+      FileWrite $0 "sc.exe query ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
+      FileWrite $0 "if not errorlevel 1 goto reconfigure$\r$\n"
+      FileWrite $0 'sc.exe create ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto DisplayName= "${NEXAPIPE_SERVICE_DISPLAY_NAME}" > "$NEXAPIPE_RESTORE_LOG" 2>&1$\r$\n'
+      FileWrite $0 "goto registered$\r$\n"
+      FileWrite $0 ":reconfigure$\r$\n"
+      ; The install directory can move between versions, and the entry then still points at a path
+      ; that no longer exists.
+      FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto > "$NEXAPIPE_RESTORE_LOG" 2>&1$\r$\n'
+      FileWrite $0 ":registered$\r$\n"
+      ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
+        ; Only ever started again when it was running before the upgrade: a service the user had
+        ; stopped deliberately has to stay stopped.
+        FileWrite $0 "sc.exe start ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
       ${EndIf}
+      FileWrite $0 "exit /b 0$\r$\n"
       FileClose $0
-      Delete "${NEXAPIPE_RESTORE_LOG}"
+
+      !insertmacro NEXAPIPE_RUN_ELEVATED $NEXAPIPE_RESTORE_SCRIPT
+
+      ; `cmd.exe` wrote `sc.exe`'s answer into the log, which is the only way to learn anything
+      ; from an elevated child: nothing comes back through "runas", and DetailPrint is where
+      ; whoever has to debug this will look.
+      ClearErrors
+      FileOpen $0 "$NEXAPIPE_RESTORE_LOG" r
+      ${IfNot} ${Errors}
+        FileRead $0 $1
+        ${If} $1 != ""
+          DetailPrint "${NEXAPIPE_SERVICE_NAME}: $1"
+        ${EndIf}
+        FileClose $0
+        Delete "$NEXAPIPE_RESTORE_LOG"
+      ${EndIf}
+    ${Else}
+      ; Whichever of the two did get reserved is not going to be used.
+      ${If} $NEXAPIPE_RESTORE_SCRIPT != ""
+        Delete $NEXAPIPE_RESTORE_SCRIPT
+      ${EndIf}
+      ${If} $NEXAPIPE_RESTORE_LOG != ""
+        Delete $NEXAPIPE_RESTORE_LOG
+      ${EndIf}
     ${EndIf}
 
     ; Forget the note only once the entry is really back. A declined UAC prompt keeps it for the
@@ -289,17 +362,21 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
   ${OrIf} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
     DetailPrint "Stopping ${NEXAPIPE_SERVICE_NAME} so it can be unregistered..."
 
-    FileOpen $0 "${NEXAPIPE_STOP_SCRIPT}" w
-    FileWrite $0 "@echo off$\r$\n"
-    ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
-      !insertmacro NEXAPIPE_WRITE_STOP_WAIT
-    ${EndIf}
-    ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
-      FileWrite $0 "sc delete ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
-    ${EndIf}
-    FileClose $0
+    ; Reserved before it is written into, for the reason the macro gives.
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_STOP_SCRIPT ".cmd"
+    ${If} $NEXAPIPE_STOP_SCRIPT != ""
+      FileOpen $0 $NEXAPIPE_STOP_SCRIPT w
+      FileWrite $0 "@echo off$\r$\n"
+      ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
+        !insertmacro NEXAPIPE_WRITE_STOP_WAIT
+      ${EndIf}
+      ${If} $NEXAPIPE_SERVICE_WAS_INSTALLED = 1
+        FileWrite $0 "sc delete ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
+      ${EndIf}
+      FileClose $0
 
-    !insertmacro NEXAPIPE_RUN_ELEVATED "${NEXAPIPE_STOP_SCRIPT}"
+      !insertmacro NEXAPIPE_RUN_ELEVATED $NEXAPIPE_STOP_SCRIPT
+    ${EndIf}
 
     !insertmacro NEXAPIPE_AWAIT_UNLOCKED
   ${EndIf}

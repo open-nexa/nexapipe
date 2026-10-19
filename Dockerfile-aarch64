@@ -25,6 +25,13 @@ FROM registry.it.iakl.top/alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata
 
+# The proxy needs no privileges, and running it as root bought nothing: the
+# plaintext listener is off by default, the TLS port belongs to the backend
+# (Caddy), and the iroh port is an ephemeral UDP one. uid 1000 matches what the
+# bind mounts are usually owned by; see the amd64 Dockerfile for the upgrade
+# note, which applies here unchanged.
+RUN adduser -D -u 1000 -h /app nexapipe
+
 WORKDIR /app
 
 # Default location of the log files; docker-compose mounts a volume on top.
@@ -41,6 +48,11 @@ RUN mkdir -p /app/secrets
 
 COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/nexapipe /usr/local/bin/nexapipe
 
+# Owned by the runtime user, because all three are bind-mounted on top at run
+# time and what matters is the host directory's ownership — this only makes an
+# un-mounted `docker run` work.
+RUN chown -R nexapipe:nexapipe /app/logs /app/config /app/secrets
+
 # The proxy listens for HTTP (and TLS passthrough) on [server] listen_addr and
 # for iroh on a UDP port. The TLS port belongs to the backend (Caddy), which this
 # container only connects out to.
@@ -50,6 +62,8 @@ EXPOSE 8080
 # [auth.clients]. It is mounted at run time (see docker-compose.yaml), as the
 # directory /app/config — a single-file bind mount is pinned to one inode and
 # stops following the file as soon as anything replaces it.
+
+USER nexapipe
 
 ENTRYPOINT ["nexapipe"]
 CMD ["--config", "/app/config/config.toml"]

@@ -477,6 +477,9 @@ mod windows_impl {
     /// Every command inherits the redirection [`with_logging`] appends, so `sc.exe`'s own output
     /// ends up in a log file: `Start-Process -Verb RunAs` cannot hand a child's stdout back to
     /// us, and without the log a failure would surface as an unexplained non-zero exit code.
+    ///
+    /// The batch file's handle is held open across the whole exchange — see
+    /// [`write_script`] — so `script` is what has to be dropped before the file can be removed.
     fn run(
         build: impl FnOnce(&Path) -> Vec<String>,
         description: &str,
@@ -486,7 +489,7 @@ mod windows_impl {
         let bat = temp_path("bat");
         let log = bat.with_extension("log");
         let lines = build(&log);
-        write_script(&bat, &with_logging(&lines, &log))?;
+        let script = write_script(&bat, &with_logging(&lines, &log))?;
 
         let mut elevated = matches!(escalation, Escalation::Always);
         let output = if elevated {
@@ -504,7 +507,11 @@ mod windows_impl {
             }
         };
 
+        // Read before the handle is released: the log is written by the child, and the point of
+        // holding the batch file was never to stop the child reading it — only to stop anyone
+        // else changing what it says.
         let text = read_log(&log).unwrap_or_default();
+        drop(script);
         let _ = std::fs::remove_file(&bat);
         let _ = std::fs::remove_file(&log);
 
@@ -557,11 +564,76 @@ mod windows_impl {
         script
     }
 
-    fn write_script(path: &Path, content: &str) -> Result<(), AppError> {
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
+    /// Writes the batch file and returns the handle that keeps it unchangeable.
+    ///
+    /// The returned handle is the whole point, and callers must hold it for as long as the script
+    /// can still be run. `create_new` refuses an existing path — `File::create` truncates whatever
+    /// is there, and on a shared machine the temporary directory is another account's to write
+    /// first — and the share mode then keeps the file from being changed at all while it is held:
+    ///
+    /// * `FILE_SHARE_READ` and nothing else. The elevated child has to *read* the batch file, so
+    ///   sharing reads is required; omitting write and delete is what stops anyone else from
+    ///   rewriting it, replacing it, or swapping a link in its place for the whole window between
+    ///   writing it and the user answering the UAC prompt.
+    /// * `O_NOFOLLOW` closes the same gap on the open itself, so a symlink planted between the
+    ///   existence check and the create is refused rather than followed.
+    ///
+    /// Without this the window is real and long: the prompt stays up until a human answers it, and
+    /// anything that rewrites the batch file in that time gets its commands run with administrator
+    /// rights. That is local privilege escalation from a temporary directory.
+    fn write_script(path: &Path, content: &str) -> Result<ScriptLock, AppError> {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // `sys::c` constants: `FILE_SHARE_READ` is 1, and `O_NOFOLLOW` is not exposed by
+        // `std::os::windows`, so it is spelled the same way on the Windows side as on Unix —
+        // as a no-op this platform cannot honour, which the regular-file check below covers.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+            .map_err(|e| {
+                AppError::cause(
+                    codes::SERVICE_COMMAND_FAILED,
+                    format!("cannot create {}: {e}", path.display()),
+                )
+            })?;
+
+        // Asked before anything is written: a symlink or a reparse point that reached this far
+        // would have the batch text land wherever it points, and this file's text is what runs as
+        // an administrator.
+        let metadata = file.metadata().map_err(|e| {
+            AppError::cause(
+                codes::SERVICE_COMMAND_FAILED,
+                format!("cannot inspect {}: {e}", path.display()),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(AppError::with_detail(
+                codes::SERVICE_COMMAND_FAILED,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+
+        let mut file = file;
         file.write_all(content.as_bytes())
-            .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))
+            .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
+        // Flushed to disk while it is still ours: the elevated child is a different process, and a
+        // batch file the kernel has not yet written out is a batch file it may read short.
+        let _ = file.flush();
+        let _ = file.sync_all();
+
+        Ok(ScriptLock { _file: file })
+    }
+
+    /// Keeps a batch file from being changed while a script that runs as an administrator can
+    /// still read it. Dropping it releases the file; see [`write_script`].
+    struct ScriptLock {
+        /// Named with a leading underscore so it reads as "held, not used" at the drop site.
+        _file: std::fs::File,
     }
 
     fn run_plain(bat: &Path, description: &str) -> Result<Output, AppError> {

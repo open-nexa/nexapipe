@@ -115,6 +115,11 @@ windows = { version = "0.62", features = [
     "Security_Credentials_UI",
     "Win32_Foundation",
     "Win32_Security",
+    # `SetNamedSecurityInfoW` / `ConvertStringSecurityDescriptorToSecurityDescriptorW`,
+    # which is how a token file is given an ACL on Windows: a file there inherits
+    # whatever its directory grants and has no mode of its own, so `write_private`
+    # had nothing at all to make it private with. See `ipc_token::write_private`.
+    "Win32_Security_Authorization",
     "Win32_System_Com",
     # `OpenProcessToken` / `GetCurrentProcess`, which is how the account to
     # authenticate is read off the process token instead of the environment.

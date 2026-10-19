@@ -99,8 +99,22 @@ impl HttpResponse {
     }
 
     pub fn parse(response: &[u8]) -> Result<Self, crate::error::ClientError> {
-        let response_str = String::from_utf8_lossy(response);
-        let mut lines = response_str.split("\r\n");
+        // The head is split off by *bytes*, not by counting characters of a
+        // lossy decode: `from_utf8_lossy` replaces every invalid byte with one
+        // U+FFFD, which is three bytes where the response had one, so a head
+        // carrying any non-UTF-8 byte produced an offset past the real body and
+        // sliced the wrong bytes out of it. Locating the terminator in the raw
+        // bytes removes the whole class — the decode below is only ever used to
+        // read header text, never to measure it.
+        let Some(head_len) = find_head_end(response) else {
+            // No terminator: everything received is headers, so there is no body.
+            return Err(crate::error::ClientError::ParseError(
+                "No header terminator in response".to_string(),
+            ));
+        };
+
+        let head = String::from_utf8_lossy(&response[..head_len]);
+        let mut lines = head.split("\r\n");
 
         let status_line = lines.next().ok_or_else(|| {
             crate::error::ClientError::ParseError("Missing status line".to_string())
@@ -124,32 +138,35 @@ impl HttpResponse {
         };
 
         let mut headers = HashMap::new();
-        let mut body_start = status_line.len() + 2;
-
         for line in lines {
+            // The final split element is empty: the terminator ends the head.
             if line.is_empty() {
-                body_start += 2;
                 break;
             }
-            body_start += line.len() + 2;
             if let Some((name, value)) = line.split_once(':') {
                 headers.insert(name.trim().to_lowercase(), value.trim().to_string());
             }
         }
 
-        let body = if body_start < response.len() {
-            response[body_start..].to_vec()
-        } else {
-            Vec::new()
-        };
-
         Ok(HttpResponse {
             status_code,
             status_text,
             headers,
-            body,
+            body: response[head_len..].to_vec(),
         })
     }
+}
+
+/// Length of the head, terminator included, or `None` when the head never ends.
+///
+/// Searches for `\r\n\r\n` in the raw bytes. A lone `\n\n` is deliberately not
+/// accepted: this parses what the server crate itself writes, and that writes
+/// CRLF.
+fn find_head_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
 }
 
 pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, crate::error::ClientError> {
@@ -224,4 +241,91 @@ pub fn is_websocket_request_static(req: &Request<()>) -> bool {
     }
     jni_log!("[DEBUG:http] WebSocket detection - returning false");
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HttpResponse;
+
+    /// A header value is bytes, not text, and a Latin-1 one is what a broken
+    /// or binary backend actually sends.
+    ///
+    /// The head used to be measured off `from_utf8_lossy`, which turns each
+    /// invalid byte into one U+FFFD — three bytes in UTF-8 — so every offset
+    /// after it drifted by two and the body was sliced out of the middle of the
+    /// headers. One such byte in a header is enough.
+    #[test]
+    fn a_non_utf8_byte_in_a_header_does_not_move_the_body_start() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        // 0xFF is not valid UTF-8 anywhere.
+        raw.extend_from_slice(b"X-Note: caf\xe9\r\n");
+        raw.extend_from_slice(b"Content-Length: 5\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"hello");
+
+        let response = HttpResponse::parse(&raw).expect("a Latin-1 header still parses");
+
+        assert_eq!(
+            response.body(),
+            b"hello",
+            "the body is what followed the head"
+        );
+        assert_eq!(
+            response.headers().get("content-length").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(response.status_code(), 200);
+    }
+
+    #[test]
+    fn a_plain_response_still_parses() {
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-A: 1\r\n\r\n{\"ok\":true}";
+
+        let response = HttpResponse::parse(raw).expect("a well-formed response parses");
+
+        assert_eq!(response.status_code(), 201);
+        assert_eq!(response.status_text(), "Created");
+        assert_eq!(
+            response.headers().get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(response.headers().get("x-a").map(String::as_str), Some("1"));
+        assert_eq!(response.body(), b"{\"ok\":true}");
+    }
+
+    /// A response with no body still ends its head with the terminator, and an
+    /// empty body must not be mistaken for a missing one.
+    #[test]
+    fn an_empty_body_parses_as_empty() {
+        let raw = b"HTTP/1.1 204 No Content\r\n\r\n";
+
+        let response = HttpResponse::parse(raw).expect("a bodiless response parses");
+
+        assert_eq!(response.status_code(), 204);
+        assert!(response.body().is_empty());
+    }
+
+    /// A head that never terminates is a truncated response, not one whose body
+    /// happens to be empty — reporting it as the latter would hand the caller a
+    /// success it cannot act on.
+    #[test]
+    fn an_unterminated_head_is_an_error() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
+
+        assert!(HttpResponse::parse(raw).is_err());
+    }
+
+    /// The header terminator is the first one, so a body containing the same
+    /// bytes must not be mistaken for the end of the head.
+    #[test]
+    fn a_terminator_inside_the_body_does_not_end_the_head() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
+        raw.extend_from_slice(b"part1\r\n\r\npart2");
+
+        let response = HttpResponse::parse(&raw).expect("the head ends at the first terminator");
+
+        assert_eq!(response.body(), b"part1\r\n\r\npart2");
+    }
 }

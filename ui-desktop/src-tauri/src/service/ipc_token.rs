@@ -473,9 +473,105 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
         file.write_all(content.as_bytes())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // A Windows file has no mode of its own: it inherits whatever its
+        // directory grants, and the token directory here is under LOCALAPPDATA,
+        // which is per-user but still readable by anything running as that user —
+        // including the elevated service this token exists to authenticate. So
+        // the file is written and then given an explicit DACL.
+        //
+        // `OW` (owner rights) rather than a fixed account: the token is written
+        // by whichever account first runs the app, and `SYSTEM` (`SY`) and the
+        // administrators group (`BA`) need to read it too — the service runs as
+        // LocalSystem and reads every session's candidate. Everyone else is
+        // refused. `FA` is "all rights", which for these three is the whole point.
+        //
+        // Not `CO` (creator owner): Windows swaps that placeholder for the
+        // creator's SID only in ACEs a child *inherits*. Set directly, as here, it
+        // stays `S-1-3-0`, matches no token, and leaves the user who wrote the
+        // file unable to read it back.
+        const SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
+
+        std::fs::write(path, content.as_bytes())?;
+        restrict_to_owner_system_and_admins(path, SDDL)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::write(path, content.as_bytes())
+    }
+}
+
+/// Replaces `path`'s DACL with `sddl`.
+///
+/// Best-effort by design: a token that cannot be given an ACL is still a token,
+/// and refusing to write one at all would leave the app unable to reach its own
+/// service over a permission problem the user cannot act on. What is refused is
+/// the *silent* part — the caller is told, and the read path checks what it can
+/// (`reject_world_readable` is a no-op here, so this log line is the only trace).
+#[cfg(windows)]
+fn restrict_to_owner_system_and_admins(path: &Path, sddl: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        SetFileSecurityW,
+    };
+
+    unsafe {
+        // The out-parameter is a raw pointer, not a reference: the API fills it
+        // in and the descriptor is then owned by this function, not by Rust.
+        let mut descriptor: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "cannot parse the token ACL ({e:?}, os error {})",
+                GetLastError().0
+            ))
+        })?;
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        // `SetFileSecurityW` takes the descriptor directly, so the file is never
+        // opened with `WRITE_DAC` — one less thing that can fail first.
+        //
+        // `PROTECTED_DACL_SECURITY_INFORMATION` is what makes the SDDL's `D:P`
+        // mean anything: without it the DACL set here is merged with whatever the
+        // directory would have inherited, which is the state this whole function
+        // exists to remove.
+        let result = SetFileSecurityW(
+            PCWSTR(wide.as_ptr()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+        .ok();
+
+        // The descriptor is not owned by the file, and this runs on both the
+        // success and the failure path.
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "{} keeps the ACL its directory gave it: {e:?} (os error {})",
+                path.display(),
+                GetLastError().0
+            );
+        }
+        Ok(())
     }
 }
 

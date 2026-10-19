@@ -258,7 +258,7 @@ impl MasterKey {
         }
 
         #[cfg(not(target_os = "macos"))]
-        if let Some(key) = Self::from_keychain(dir) {
+        if let Some(key) = Self::from_keychain(dir)? {
             return Ok(Self {
                 key,
                 source: KeySource::Keychain,
@@ -358,33 +358,38 @@ impl MasterKey {
     ///
     /// `dir` is where a key that predates a working keychain would be: see
     /// [`Self::adopt_file_key`].
+    ///
+    /// The `Result` carries the one failure that must not be read as "no
+    /// keychain": a fallback file another account can read. Everything else
+    /// still answers `None`, because falling back is the right answer to a
+    /// keychain that cannot be reached — see [`Self::adopt_file_key`].
     #[cfg(not(target_os = "macos"))]
-    fn from_keychain(dir: &Path) -> Option<[u8; KEY_LEN]> {
+    fn from_keychain(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, AppError> {
         use keyring::Entry;
 
         let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) else {
-            return None;
+            return Ok(None);
         };
 
         match entry.get_password() {
             Ok(hex) => {
                 if let Some(key) = parse_key(&hex) {
-                    return Some(key);
+                    return Ok(Some(key));
                 }
                 // Present but unreadable: carrying on would overwrite a key that
                 // existing credentials are encrypted under, so this is left alone
                 // and the caller falls back — with a key that cannot decrypt them
                 // either.
                 tracing::warn!("the keychain master key is not 32 bytes; not replacing it");
-                return None;
+                return Ok(None);
             }
             // The ordinary first run, and the one case in which minting a key is
             // right: there is nothing there for it to overwrite. A key left in
             // the fallback file by a build with no keychain backend is not a
             // first run, so it is moved across first.
             Err(keyring::Error::NoEntry) => {
-                if let Some(key) = Self::adopt_file_key(&entry, dir) {
-                    return Some(key);
+                if let Some(key) = Self::adopt_file_key(&entry, dir)? {
+                    return Ok(Some(key));
                 }
             }
             // Anything else — a locked keychain, access denied, a backend that
@@ -393,17 +398,17 @@ impl MasterKey {
             // which is unrecoverable; a call that cannot read loses nothing.
             Err(e) => {
                 tracing::warn!("the keychain could not be read, master key left alone: {e}");
-                return None;
+                return Ok(None);
             }
         }
 
         let Ok(fresh) = random_bytes::<KEY_LEN>() else {
-            return None;
+            return Ok(None);
         };
         if entry.set_password(&hex(&fresh)).is_err() {
-            return None;
+            return Ok(None);
         }
-        Some(fresh)
+        Ok(Some(fresh))
     }
 
     /// Moves a master key out of the fallback file and into the keychain.
@@ -419,16 +424,23 @@ impl MasterKey {
     /// `None` when there is no file key to move, or when the keychain would not
     /// take it — either way the caller falls back to the file, which is exactly
     /// where the key already is.
+    ///
+    /// A file key that is there but readable by other accounts is an `Err`
+    /// rather than a `None`: falling back would reach
+    /// [`Self::from_file`], which reads the same file and refuses it there, so
+    /// the load fails either way — only this way says which file and why.
     #[cfg(not(target_os = "macos"))]
-    fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Option<[u8; KEY_LEN]> {
-        let key = Self::file_key(dir)?;
+    fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Result<Option<[u8; KEY_LEN]>, AppError> {
+        let Some(key) = Self::file_key(dir)? else {
+            return Ok(None);
+        };
 
         if entry.set_password(&hex(&key)).is_err() {
             tracing::warn!(
                 "the keychain would not take the existing master key; it stays in {}",
                 dir.join(FALLBACK_KEY_FILE).display()
             );
-            return None;
+            return Ok(None);
         }
 
         // Removed only once the keychain holds it, so there is no moment in which
@@ -443,35 +455,45 @@ impl MasterKey {
                 path.display()
             );
         }
-        Some(key)
+        Ok(Some(key))
     }
 
     /// The fallback file's key, when the file holds one.
     ///
-    /// `None` on a first run, which is every platform but a Linux install
+    /// `Ok(None)` on a first run, which is every platform but a Linux install
     /// upgraded from a build with no keychain backend. A file that is there and
     /// does not parse is reported rather than ignored: something wrote it, and
     /// moving on silently mints a key that cannot read what that one sealed.
-    fn file_key(dir: &Path) -> Option<[u8; KEY_LEN]> {
+    ///
+    /// A file another account can read is an `Err` rather than a `None`, because
+    /// `None` here means "there is no key file" and the caller acts on that by
+    /// minting a fresh key — which would leave every credential sealed under the
+    /// readable one permanently undecryptable. See [`reject_readable_by_others`].
+    fn file_key(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, AppError> {
         let path = dir.join(FALLBACK_KEY_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        reject_readable_by_others(&path)?;
+
         let Ok(contents) = std::fs::read_to_string(&path) else {
-            return None;
+            return Ok(None);
         };
 
-        match parse_key(contents.trim()) {
+        Ok(match parse_key(contents.trim()) {
             Some(key) => Some(key),
             None => {
                 tracing::warn!("{} is not a 32-byte key; not replacing it", path.display());
                 None
             }
-        }
+        })
     }
 
     /// The fallback file's copy, generating one when there is none.
     fn from_file(dir: &Path) -> Result<[u8; KEY_LEN], AppError> {
         let path = dir.join(FALLBACK_KEY_FILE);
 
-        if let Some(key) = Self::file_key(dir) {
+        if let Some(key) = Self::file_key(dir)? {
             return Ok(key);
         }
         if path.exists() {
@@ -562,6 +584,10 @@ impl Store {
     }
 
     fn load(&self) -> Result<Entries, AppError> {
+        // Checked before the bytes are read, not after: the point is not to
+        // decrypt a store another account could have read while it was there.
+        reject_readable_by_others(&self.path)?;
+
         match std::fs::read_to_string(&self.path) {
             Ok(contents) => serde_json::from_str(&contents).map_err(|e| {
                 AppError::cause(
@@ -801,6 +827,55 @@ fn sync_file(_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Refuses to go on reading a file another account could have read.
+///
+/// The store and the fallback master key are written `0600`, but writing a file
+/// privately and *reading* one privately are separate decisions, and only the
+/// first was ever made here: the read paths had no check at all, so a store
+/// copied off a backup, restored from an archive that does not keep modes, or
+/// left behind by an older build was decrypted like any other. On the platforms
+/// where the master key lives in this file rather than the keychain, reading it
+/// at all hands over every credential in the store — the file *is* the key.
+///
+/// So the check is on the read, and it refuses rather than warns: a store
+/// another account can read is not a store worth decrypting, and the fix is one
+/// `chmod`, which the error says.
+///
+/// Unix only. Windows has no mode bits, and the equivalent there is an ACL —
+/// see the service token, which is where the ACL is set.
+#[cfg(unix)]
+fn reject_readable_by_others(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // `metadata` and not `symlink_metadata`: a symlink is followed by the read
+    // that follows, so it is the file it points at whose mode decides whether
+    // this passes — `lstat` would report a link's own `0777` and refuse every
+    // symlinked store. Unreadable metadata is treated as a pass, because the read
+    // itself is about to fail with a better message than this one would give.
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = metadata.permissions().mode();
+
+    if mode & 0o077 != 0 {
+        return Err(AppError::with_detail(
+            codes::CREDENTIALS_STORE_FAILED,
+            format!(
+                "{} is readable by other accounts (mode {mode:o}); chmod 600 it, or delete it \
+                 so a private one is written",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// No mode bits to check. See the Unix half.
+#[cfg(not(unix))]
+fn reject_readable_by_others(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
 fn random_bytes<const N: usize>() -> Result<[u8; N], AppError> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).map_err(|e| {
@@ -869,7 +944,7 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{hex, parse_key, random_bytes, CredentialKind, Store, ENTRY_PREFIX, KEY_LEN};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -884,6 +959,13 @@ mod tests {
         let key = random_bytes::<KEY_LEN>().expect("a key");
         let store = Store::with_key(&dir, key);
         (dir, store)
+    }
+
+    /// Writes the fallback key file the way the app does — private — so the tests
+    /// that then loosen it are loosening a known-good file rather than whatever
+    /// the ambient umask happened to produce.
+    fn write_file_key(dir: &Path, key: &[u8; KEY_LEN]) {
+        super::write_private(&dir.join(super::FALLBACK_KEY_FILE), &hex(key)).expect("written");
     }
 
     #[test]
@@ -1041,9 +1123,12 @@ mod tests {
     fn a_master_key_left_in_a_file_is_read_back() {
         let dir = scratch("file-key");
         let key = random_bytes::<KEY_LEN>().expect("a key");
-        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), hex(&key)).expect("written");
+        write_file_key(&dir, &key);
 
-        assert_eq!(super::MasterKey::file_key(&dir), Some(key));
+        assert_eq!(
+            super::MasterKey::file_key(&dir).expect("readable"),
+            Some(key)
+        );
     }
 
     /// The ordinary case on every platform with a keychain: nothing was ever
@@ -1052,17 +1137,82 @@ mod tests {
     fn a_first_run_has_no_file_key() {
         let dir = scratch("no-file-key");
 
-        assert_eq!(super::MasterKey::file_key(&dir), None);
+        assert_eq!(super::MasterKey::file_key(&dir).expect("readable"), None);
     }
 
     /// A file that is there but is not a key must not be read as one: a key made
     /// of zeroes, or a truncated one, would silently orphan the whole store.
+    ///
+    /// Written privately, because the check that runs before the parse is about
+    /// permissions — a `0644` file would be refused for that instead, and the
+    /// parse never reached.
     #[test]
     fn a_file_that_is_not_a_key_is_absent_rather_than_a_short_key() {
         let dir = scratch("bad-file-key");
-        std::fs::write(dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
+        super::write_private(&dir.join(super::FALLBACK_KEY_FILE), "not-a-key").expect("written");
 
-        assert_eq!(super::MasterKey::file_key(&dir), None);
+        assert_eq!(super::MasterKey::file_key(&dir).expect("readable"), None);
+    }
+
+    /// The master key file *is* every credential in the store, on the platforms
+    /// where it lives in a file. One that other accounts can read is therefore
+    /// refused outright rather than warned about — and refused as an error, not
+    /// as "absent", because "absent" is what makes the caller mint a fresh key
+    /// and orphan the store sealed under the readable one.
+    #[cfg(unix)]
+    #[test]
+    fn a_master_key_other_accounts_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("loose-key-file");
+        let key = random_bytes::<KEY_LEN>().expect("a key");
+        let path = dir.join(super::FALLBACK_KEY_FILE);
+        write_file_key(&dir, &key);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosened");
+
+        let error = super::MasterKey::file_key(&dir)
+            .expect_err("a world-readable master key is not read");
+
+        assert!(
+            error.to_string().contains("chmod 600"),
+            "the error does not say how to fix it: {error}"
+        );
+    }
+
+    /// The store file gets the same refusal, and it is checked *before* the read
+    /// rather than after: the point is not to decrypt a store another account
+    /// could read while it was sitting there.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_other_accounts_can_read_is_not_decrypted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = store("loose-store");
+        store.put("totp:node-1", "secret").expect("written");
+        let path = dir.join(super::STORE_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosened");
+
+        assert!(
+            store.load().is_err(),
+            "a world-readable store was decrypted anyway"
+        );
+    }
+
+    /// A group-readable file is refused too. "Other accounts" is not only the
+    /// `o` bits: a shared machine puts the user's own group on the path.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_master_key_is_refused_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("group-key-file");
+        let path = dir.join(super::FALLBACK_KEY_FILE);
+        write_file_key(&dir, &random_bytes::<KEY_LEN>().expect("a key"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("loosened");
+
+        assert!(super::MasterKey::file_key(&dir).is_err());
     }
 
     /// A minted key reaches the file whole, or the file is not written at all.
@@ -1079,7 +1229,10 @@ mod tests {
 
         let key = super::MasterKey::from_file(&dir).expect("a key is minted");
 
-        assert_eq!(super::MasterKey::file_key(&dir), Some(key));
+        assert_eq!(
+            super::MasterKey::file_key(&dir).expect("readable"),
+            Some(key)
+        );
         let temporary = dir.join(format!("{}.tmp", super::FALLBACK_KEY_FILE));
         assert!(
             !temporary.exists(),
