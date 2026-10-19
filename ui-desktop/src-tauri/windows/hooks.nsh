@@ -53,19 +53,34 @@ Var /GLOBAL NEXAPIPE_STOP_SCRIPT
 Var /GLOBAL NEXAPIPE_RESTORE_SCRIPT
 Var /GLOBAL NEXAPIPE_RESTORE_LOG
 
-; Puts a fresh OS-chosen path in `name`. `GetTempFileName` creates the file empty, which is
-; what reserves the name; the caller overwrites it with `FileOpen`. A reservation that could
-; not be made leaves an empty string, and every use below reads one of these only after
-; checking it is not empty — so the elevated step is skipped rather than run against a path
-; nobody reserved.
-!
+; Puts a fresh OS-chosen path ending in `ext` in `name`. `GetTempFileName` creates an empty
+; `.tmp` file, which is what reserves the name, and the file is then renamed to `ext`: `cmd /c`
+; runs a file as a batch script only for `.cmd` / `.bat`, and a `.tmp` goes to whatever the file
+; association says, usually nothing. `Rename` refuses an existing destination, so a file planted
+; at the renamed path makes the reservation fail rather than get reused. The caller overwrites
+; the reserved file with `FileOpen`. A reservation that could not be made leaves an empty string,
+; and every use below reads one of these only after checking it is not empty — so the elevated
+; step is skipped rather than run against a path nobody reserved.
+;
 ; No labels, for the reason the wait macro below gives: this is inserted more than once.
-!macro NEXAPIPE_TEMP_FILE name
+!macro NEXAPIPE_TEMP_FILE name ext
   Push $0
   ClearErrors
-  GetTempFileName "$TEMP" "nexa" cmd $0
+  GetTempFileName $0 "$TEMP"
   ${If} ${Errors}
+  ${OrIf} $0 == ""
     StrCpy $0 ""
+  ${Else}
+    ClearErrors
+    Rename $0 "$0${ext}"
+    ${If} ${Errors}
+      Delete $0
+      StrCpy $0 ""
+    ${Else}
+      StrCpy $0 "$0${ext}"
+    ${EndIf}
+  ${EndIf}
+  ${If} $0 == ""
     DetailPrint "Could not reserve a temporary file name; skipping the elevated step."
   ${EndIf}
   StrCpy ${name} $0
@@ -208,7 +223,7 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
 
     ; Reserved now, opened below: the name has to exist before the script is written into it,
     ; or there is a window in which another account creates the file first.
-    !insertmacro NEXAPIPE_TEMP_FILE NEXAPIPE_STOP_SCRIPT
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_STOP_SCRIPT ".cmd"
     ${If} $NEXAPIPE_STOP_SCRIPT != ""
       FileOpen $0 $NEXAPIPE_STOP_SCRIPT w
       FileWrite $0 "@echo off$\r$\n"
@@ -244,11 +259,13 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
 
     ; Both names reserved before either is written: the log path is baked into the script text
     ; below, so it has to exist before that text is written, and both are handed out by the OS
-    ; rather than named here.
-    !insertmacro NEXAPIPE_TEMP_FILE NEXAPIPE_RESTORE_SCRIPT
-    !insertmacro NEXAPIPE_TEMP_FILE NEXAPIPE_RESTORE_LOG
+    ; rather than named here. Both are required, too: a script redirecting into `""` fails the
+    ; redirection, and `cmd` then never runs the `sc.exe` line it was attached to.
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_RESTORE_SCRIPT ".cmd"
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_RESTORE_LOG ".log"
 
     ${If} $NEXAPIPE_RESTORE_SCRIPT != ""
+    ${AndIf} $NEXAPIPE_RESTORE_LOG != ""
       FileOpen $0 $NEXAPIPE_RESTORE_SCRIPT w
       FileWrite $0 "@echo off$\r$\n"
       ; `create` fails with 1073 when an entry is already registered and `config` with 1060 when it
@@ -256,14 +273,17 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
       ; The binary reached with `binPath=` is quoted the way `sc` wants it: an unescaped quote in a
       ; path containing spaces is rejected with 1639. The description is cosmetic and only the app
       ; sets it, so it is not mirrored here to avoid drifting out of step with the Rust side.
+      ;
+      ; Single-quoted so `"` is literal: NSIS has no `\"` escape, and these lines must come out the
+      ; way `bin_path_value` in platform.rs writes them (`"\"<exe>\" --service"`).
       FileWrite $0 "sc.exe query ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n"
       FileWrite $0 "if not errorlevel 1 goto reconfigure$\r$\n"
-      FileWrite $0 "sc.exe create ${NEXAPIPE_SERVICE_NAME} binPath= \"\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\"\" ${NEXAPIPE_SERVICE_ARGUMENT}\" start= auto DisplayName= \"\"${NEXAPIPE_SERVICE_DISPLAY_NAME}\"\" > \"$NEXAPIPE_RESTORE_LOG\" 2>&1$\r$\n"
+      FileWrite $0 'sc.exe create ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto DisplayName= "${NEXAPIPE_SERVICE_DISPLAY_NAME}" > "$NEXAPIPE_RESTORE_LOG" 2>&1$\r$\n'
       FileWrite $0 "goto registered$\r$\n"
       FileWrite $0 ":reconfigure$\r$\n"
       ; The install directory can move between versions, and the entry then still points at a path
       ; that no longer exists.
-      FileWrite $0 "sc.exe config ${NEXAPIPE_SERVICE_NAME} binPath= \"\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\"\" ${NEXAPIPE_SERVICE_ARGUMENT}\" start= auto > \"$NEXAPIPE_RESTORE_LOG\" 2>&1$\r$\n"
+      FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} binPath= "\"$INSTDIR\${NEXAPIPE_SERVICE_EXE}\" ${NEXAPIPE_SERVICE_ARGUMENT}" start= auto > "$NEXAPIPE_RESTORE_LOG" 2>&1$\r$\n'
       FileWrite $0 ":registered$\r$\n"
       ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
         ; Only ever started again when it was running before the upgrade: a service the user had
@@ -287,6 +307,14 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
         ${EndIf}
         FileClose $0
         Delete "$NEXAPIPE_RESTORE_LOG"
+      ${EndIf}
+    ${Else}
+      ; Whichever of the two did get reserved is not going to be used.
+      ${If} $NEXAPIPE_RESTORE_SCRIPT != ""
+        Delete $NEXAPIPE_RESTORE_SCRIPT
+      ${EndIf}
+      ${If} $NEXAPIPE_RESTORE_LOG != ""
+        Delete $NEXAPIPE_RESTORE_LOG
       ${EndIf}
     ${EndIf}
 
@@ -335,7 +363,7 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
     DetailPrint "Stopping ${NEXAPIPE_SERVICE_NAME} so it can be unregistered..."
 
     ; Reserved before it is written into, for the reason the macro gives.
-    !insertmacro NEXAPIPE_TEMP_FILE NEXAPIPE_STOP_SCRIPT
+    !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_STOP_SCRIPT ".cmd"
     ${If} $NEXAPIPE_STOP_SCRIPT != ""
       FileOpen $0 $NEXAPIPE_STOP_SCRIPT w
       FileWrite $0 "@echo off$\r$\n"

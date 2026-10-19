@@ -29,10 +29,12 @@ RUN apk add --no-cache ca-certificates tzdata
 #
 # uid 1000 rather than a named account, because the bind mounts below are owned
 # by whoever ran `mkdir` on the host and that is very often uid 1000 already; a
-# different uid is the case where the write fails. **Upgrading an existing
-# deployment**: `chown -R 1000:1000 config secrets logs` on the host first —
-# files created by the previous root-running image stay root-owned, and a 0600
-# key the new user cannot open is a start that fails on a first-run identity.
+# different uid is the case where the write fails, so the README has every setup
+# run `sudo chown -R 1000:1000 config secrets logs` on the host. **Upgrading an
+# existing deployment** needs that before the first start — files created by the
+# previous root-running image stay root-owned, which is also why it takes
+# `sudo`, and a 0600 key the new user cannot open is a start that fails on a
+# first-run identity.
 RUN adduser -D -u 1000 -h /app nexapipe
 
 WORKDIR /app

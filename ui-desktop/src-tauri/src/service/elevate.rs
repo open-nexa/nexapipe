@@ -159,7 +159,8 @@ pub fn run_self_elevated(args: &[&str]) -> Result<(), AppError> {
     let requested: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
     let result_path = result_file_path();
-    let _ = std::fs::remove_file(&result_path);
+    create_result_file(&result_path)
+        .map_err(|e| AppError::cause(codes::SERVICE_ELEVATION_FAILED, e))?;
 
     let mut elevated_args = requested;
     elevated_args.push(ELEVATED_ARG.to_string());
@@ -266,16 +267,49 @@ pub fn report_result(result_file: Option<&str>, outcome: &Result<(), AppError>) 
     }
 }
 
-/// Writes the one line the parent reads back, refusing to follow a symlink.
+/// Creates the empty result file the elevated child will write into, owned by this process.
+///
+/// The parent creates it, not the child, because the child usually runs as root (`pkexec`,
+/// `sudo`, `osascript ... with administrator privileges`): a `0600` file the child created would
+/// be root's, and this process could neither read the outcome back nor delete the file. Root can
+/// write into a file this account owns, so ownership has to start on this side.
+///
+/// `create_new` refuses a path that already exists and `O_NOFOLLOW` refuses a link, so nothing
+/// another account planted in the temporary directory is adopted as the result file; in a sticky
+/// `/tmp` that account cannot replace it afterwards either.
+fn create_result_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+    }
+
+    #[cfg(not(unix))]
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    Ok(())
+}
+
+/// Writes the one line the parent reads back into the file the parent created.
 ///
 /// The elevated child runs as an administrator and writes into a temporary
 /// directory, which on a multi-user machine is one account's to plant and
 /// another's to read. `fs::write` follows a symlink, so a link planted at the
 /// path the parent polls would have the outcome — which carries the failure
 /// detail — written into a file the planting account can read, by a process
-/// holding administrator rights. `create_new` fails on an existing path rather
-/// than opening it, and `O_NOFOLLOW` closes the window between the two calls on
-/// Unix.
+/// holding administrator rights. So the file is never created here: it is opened
+/// only if it already exists, with `O_NOFOLLOW` on Unix, and must be a regular
+/// file once open. The truncation comes after that check, so it can only ever
+/// empty the file this handle is on.
 ///
 /// Best-effort about the outcome: a child that cannot write its result loses the
 /// detail, not the operation, and says so on stderr where the launcher's log
@@ -289,18 +323,17 @@ fn write_result_file(path: &Path, line: &str) -> std::io::Result<()> {
 
         std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?
     };
 
     #[cfg(not(unix))]
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
 
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("the result path is not a regular file"));
+    }
+    file.set_len(0)?;
     file.write_all(line.as_bytes())
 }
 
@@ -668,16 +701,37 @@ mod tests {
         dir
     }
 
-    /// The round trip the whole file exists for: a child writes `OK:`, the
-    /// parent reads it back as a success.
+    /// The round trip the whole file exists for: the parent creates the file, a
+    /// child writes `OK:`, the parent reads it back as a success.
     #[test]
     fn a_written_result_is_read_back() {
         let dir = scratch("roundtrip");
         let path = dir.join("result");
 
+        create_result_file(&path).expect("created");
+        // An empty file is "no result yet", which is what the parent polls through.
+        assert_eq!(read_result_file(&path), None);
+
         write_result_file(&path, "OK:").expect("written");
 
         assert_eq!(read_result_file(&path), Some(Ok(())));
+    }
+
+    /// The parent's file is private to it. The elevated child writes into it as
+    /// root, which a `0600` mode does not stop, while another account cannot read
+    /// the outcome out of it.
+    #[cfg(unix)]
+    #[test]
+    fn the_result_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("private");
+        let path = dir.join("result");
+
+        create_result_file(&path).expect("created");
+
+        let mode = std::fs::metadata(&path).expect("there").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     }
 
     /// A symlink planted where the result file is expected must not be followed.
@@ -690,13 +744,19 @@ mod tests {
     /// prevent.
     #[cfg(unix)]
     #[test]
-    fn a_planted_symlink_is_neither_written_through_nor_read() {
+    fn a_planted_symlink_is_neither_adopted_written_through_nor_read() {
         let dir = scratch("symlink");
         let path = dir.join("result");
         let target = dir.join("planted");
         std::fs::write(&target, "OK:").expect("the planted file is there");
 
         std::os::unix::fs::symlink(&target, &path).expect("the link is planted");
+
+        // Created: the parent does not take the link as its result file.
+        assert!(
+            create_result_file(&path).is_err(),
+            "a planted symlink was adopted as the result file"
+        );
 
         // Written: the outcome goes nowhere near the planted file.
         assert!(
@@ -717,22 +777,33 @@ mod tests {
         );
     }
 
-    /// An existing regular file is not overwritten. The parent deletes the path
-    /// before spawning, so a file already there means something else got there
-    /// first, and clobbering it is how a second elevation's result replaces the
-    /// first's.
+    /// The parent never reuses a path that already exists. Its name is unique to
+    /// this process and moment, so a file already there means something else got
+    /// there first.
     #[test]
-    fn an_existing_result_file_is_not_overwritten() {
+    fn an_existing_path_is_not_adopted_as_the_result_file() {
         let dir = scratch("existing");
         let path = dir.join("result");
         std::fs::write(&path, "OK:").expect("something else got there first");
 
-        assert!(write_result_file(&path, "ERR:later").is_err());
+        assert!(create_result_file(&path).is_err());
         assert_eq!(
             std::fs::read_to_string(&path).expect("still readable"),
             "OK:",
-            "an existing result file was clobbered"
+            "an existing file was truncated by the parent"
         );
+    }
+
+    /// The child only ever writes into the file the parent created. Creating one
+    /// itself would hand the outcome to whoever owns the directory entry — and,
+    /// running as root, leave a file the parent can neither read nor remove.
+    #[test]
+    fn a_missing_result_file_is_not_created_by_the_child() {
+        let dir = scratch("missing");
+        let path = dir.join("result");
+
+        assert!(write_result_file(&path, "OK:").is_err());
+        assert!(!path.exists(), "the child created the result file");
     }
 
     /// A directory at the result path is not read as an outcome. Without the

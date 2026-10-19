@@ -204,8 +204,9 @@ cargo run -p nexapipe -- --generate-secret
 ### Docker
 
 ```bash
-mkdir -p config secrets
+mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml 已被 gitignore
+sudo chown -R 1000:1000 config secrets logs # 镜像以 uid 1000 运行
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
@@ -224,11 +225,12 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 
 镜像以 **uid 1000 运行，不是 root** —— 这个代理不需要特权，而一个从公网可达、
 手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个目录因此必须对该
-uid 可写；全新部署时上面的 `mkdir` 已经满足。**从旧的 root 镜像升级**需要先执行一条
-命令，因为它写下的文件仍属 root：
+uid 可写，这正是上面那条 `chown` 的作用：`mkdir` 建出的目录属于执行它的用户，恰好是
+uid 1000 只是巧合。**从旧的 root 镜像升级**也要在首次启动前执行同一条命令，而且必须
+加 `sudo` —— 旧镜像写下的文件属于 root：
 
 ```bash
-chown -R 1000:1000 config secrets logs
+sudo chown -R 1000:1000 config secrets logs
 ```
 
 跳过这一步不一定立刻报错：新用户写不了 `config.toml` 会让每次 2FA 计数都更新失败，

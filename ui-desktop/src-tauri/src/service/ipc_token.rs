@@ -481,12 +481,17 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
         // including the elevated service this token exists to authenticate. So
         // the file is written and then given an explicit DACL.
         //
-        // `CO` (creator owner) rather than the current user: the token is written
+        // `OW` (owner rights) rather than a fixed account: the token is written
         // by whichever account first runs the app, and `SYSTEM` (`SY`) and the
         // administrators group (`BA`) need to read it too — the service runs as
         // LocalSystem and reads every session's candidate. Everyone else is
         // refused. `FA` is "all rights", which for these three is the whole point.
-        const SDDL: &str = "D:P(A;;FA;;;CO)(A;;FA;;;SY)(A;;FA;;;BA)";
+        //
+        // Not `CO` (creator owner): Windows swaps that placeholder for the
+        // creator's SID only in ACEs a child *inherits*. Set directly, as here, it
+        // stays `S-1-3-0`, matches no token, and leaves the user who wrote the
+        // file unable to read it back.
+        const SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
 
         std::fs::write(path, content.as_bytes())?;
         restrict_to_owner_system_and_admins(path, SDDL)

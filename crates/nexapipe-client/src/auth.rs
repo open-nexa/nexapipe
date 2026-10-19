@@ -929,14 +929,13 @@ mod tests {
         let present = format!("{with_secret:?}");
         let absent = format!("{without:?}");
 
-        assert_ne!(
-            present, absent,
+        // Neither message interpolates the rendering: a failure here would print
+        // whatever the `Debug` let through, which is the leak under test.
+        assert!(
+            present != absent,
             "a masked secret and an absent one are indistinguishable"
         );
-        assert!(
-            present.contains("16 chars"),
-            "the length is not reported: {present}"
-        );
+        assert!(present.contains("16 chars"), "the length is not reported");
         // The whole point of masking, stated as a test: the length is not the value.
         assert!(!present.contains("JBSWY3DPEHPK3PXP"));
     }

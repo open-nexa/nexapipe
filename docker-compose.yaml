@@ -16,7 +16,8 @@ services:
       # swapped out, silently and forever. A directory mount is resolved by
       # name on every lookup, so it always sees the current file.
       #
-      # Create it first: `mkdir -p config`, then
+      # Create it first (with the other two mounts — see the ownership note
+      # below): `mkdir -p config secrets logs`, then
       # `cp config.toml.example config/config.toml`
       # (`config.toml` is gitignored: it is the operator's live config), or
       # `mv config.toml config/config.toml` for a deployment that already has
@@ -33,7 +34,7 @@ services:
       # points `secret_key_file` at `/app/secrets/iroh.key`, and the first start
       # generates the key into it (mode 0600). That keeps the credential out of
       # the file operators edit, copy and back up, and out of the config mount
-      # entirely. Create it first: `mkdir -p secrets`. Back the directory up
+      # entirely. Create it with the config directory above. Back the directory up
       # with the config — losing it means a new Node ID on the next start, and
       # clients that stored the old one stop finding the server. Do not commit
       # it.
@@ -41,18 +42,22 @@ services:
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
       - ./logs:/app/logs
-    # The image runs as uid 1000, not root, so all three mounts above must be
-    # writable by it. On a fresh setup `mkdir -p` then `docker compose up` is
-    # enough — the directories land owned by whoever ran mkdir, which is uid 1000
-    # on an ordinary Linux box.
+    # The image runs as uid 1000, not root, so all three mounts above must exist
+    # and be writable by it. `mkdir` alone is not enough: the directories land
+    # owned by whoever ran it, and on a host where that is not uid 1000 the
+    # failures are quiet — an iroh key that cannot be written is replaced by an
+    # ephemeral one (a new Node ID on every restart), and a config that cannot be
+    # written loses the 2FA counters. On a fresh setup, after copying the config:
+    #
+    #     mkdir -p config secrets logs
+    #     sudo chown -R 1000:1000 config secrets logs
     #
     # **Upgrading a deployment that ran the root image**: the files it wrote are
     # root-owned, and the new user cannot write them — the symptom is a start
     # that fails on `/app/config/config.toml`, or a *new* iroh key generated
     # because `/app/secrets/iroh.key` could not be opened, which changes the Node
-    # ID every client has stored. Chown before the first start:
-    #
-    #     chown -R 1000:1000 config secrets logs
+    # ID every client has stored. Run the same `sudo chown` before the first
+    # start; without `sudo` it cannot change files root owns.
     environment:
       # Directory inside the container that receives the log files. Overrides
       # [log] dir so the files always land in the mounted volume.

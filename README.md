@@ -226,8 +226,9 @@ cargo run -p nexapipe -- --generate-secret   # only to move an identity between 
 ### Docker
 
 ```bash
-mkdir -p config secrets
+mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml is gitignored
+sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
@@ -250,12 +251,14 @@ command: `mkdir -p config && mv config.toml config/config.toml`.
 The image runs as **uid 1000, not root** — the proxy needs no privileges, and a
 server reachable from the internet holding the 2FA seeds and the endpoint
 identity should not be root. The three mounted directories therefore have to be
-writable by that uid; on a fresh setup the `mkdir` above already does it.
-**Upgrading a deployment that ran the root image** needs one command first,
-because the files it wrote are root-owned:
+writable by that uid, which is what the `chown` above is for: `mkdir` leaves
+them owned by whoever ran it, and that is uid 1000 only by coincidence.
+**Upgrading a deployment that ran the root image** needs the same command
+before the first start, and it needs `sudo` — the files the old image wrote
+are root-owned:
 
 ```bash
-chown -R 1000:1000 config secrets logs
+sudo chown -R 1000:1000 config secrets logs
 ```
 
 Skipping it does not always fail loudly. A `config.toml` the new user cannot

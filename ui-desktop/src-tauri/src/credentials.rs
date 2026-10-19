@@ -847,9 +847,10 @@ fn sync_file(_path: &Path) -> Result<(), AppError> {
 fn reject_readable_by_others(path: &Path) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
 
-    // `symlink_metadata` and not `metadata`: a symlink is followed by the read
+    // `metadata` and not `symlink_metadata`: a symlink is followed by the read
     // that follows, so it is the file it points at whose mode decides whether
-    // this passes. Unreadable metadata is treated as a pass, because the read
+    // this passes — `lstat` would report a link's own `0777` and refuse every
+    // symlinked store. Unreadable metadata is treated as a pass, because the read
     // itself is about to fail with a better message than this one would give.
     let Ok(metadata) = std::fs::metadata(path) else {
         return Ok(());
