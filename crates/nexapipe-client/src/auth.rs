@@ -1,6 +1,10 @@
 // 2FA authentication module for Nexapipe client.
 //
-// Provides TOTP code generation and authentication handshake.
+// Provides TOTP code generation and the authentication handshake, in the two
+// shapes the server accepts: a secret-based device answers with an HMAC over
+// the challenge plus a code, a key-based one signs the same bytes with an
+// Ed25519 key it generated and never hands over. Which shape a credential has
+// is whatever its enrollment produced.
 
 use crate::ClientError;
 use hmac::{Hmac, KeyInit, Mac};
@@ -120,14 +124,34 @@ fn decode_base32(secret_base32: &str) -> Result<Vec<u8>, ClientError> {
         .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))
 }
 
+/// What a client-side credential proves itself with.
+///
+/// Which variant is in play is decided by the server's record, never here: a
+/// device is key-based iff the server holds a `public_key` for it, and a
+/// response offering the other kind of proof is simply refused. The client
+/// learns its own variant at the one moment both sides agreed — enrollment —
+/// and keeps it: [`TwoFactorAuth::with_key`] for a key, [`TwoFactorAuth::new`]
+/// for a secret.
+#[derive(Debug, Clone)]
+enum Proof {
+    /// A TOTP seed: an HMAC over the challenge, then a code.
+    Totp {
+        secret: Vec<u8>,
+        algorithm: TotpAlgorithm,
+        time_step: u32,
+        digits: u32,
+    },
+    /// The device's own Ed25519 key: a signature over the same bytes the HMAC
+    /// covers. The private half never leaves this process; the server holds
+    /// the public half under the device's name.
+    Key(iroh::SecretKey),
+}
+
 /// Client-side 2FA authenticator
 #[derive(Debug, Clone)]
 pub struct TwoFactorAuth {
     client_id: String,
-    secret: Vec<u8>,
-    algorithm: TotpAlgorithm,
-    time_step: u32,
-    digits: u32,
+    proof: Proof,
     /// Which of this client's devices this credential belongs to. `None` is the
     /// device that was never given a name, which is what every client was
     /// before a client could have several — it answers with the client's own
@@ -147,10 +171,12 @@ impl TwoFactorAuth {
 
         Ok(Self {
             client_id: client_id.to_string(),
-            secret,
-            algorithm,
-            time_step: 30,
-            digits: 6,
+            proof: Proof::Totp {
+                secret,
+                algorithm,
+                time_step: 30,
+                digits: 6,
+            },
             device_id: None,
         })
     }
@@ -167,12 +193,32 @@ impl TwoFactorAuth {
 
         Ok(Self {
             client_id: client_id.to_string(),
-            secret,
-            algorithm,
-            time_step,
-            digits,
+            proof: Proof::Totp {
+                secret,
+                algorithm,
+                time_step,
+                digits,
+            },
             device_id: None,
         })
+    }
+
+    /// A credential that proves itself with a device key instead of a secret.
+    ///
+    /// The key is this device's own — the server holds its public half under
+    /// `device_id`, and every handshake is proven by a signature only this
+    /// credential can produce. There is no code to read, which is the point:
+    /// an unattended device has nobody to read one.
+    ///
+    /// The name is required rather than optional, and not for convenience: a
+    /// key cannot be the credential of the unnamed slot, which is the client's
+    /// own shared secret — the server refuses a key that names no device.
+    pub fn with_key(client_id: &str, key: iroh::SecretKey, device_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            proof: Proof::Key(key),
+            device_id: Some(device_id.to_string()),
+        }
     }
 
     /// The same credential, answering as one named device of its client.
@@ -200,21 +246,32 @@ impl TwoFactorAuth {
 
     /// Generate current TOTP code
     pub fn generate_code(&self) -> Result<String, ClientError> {
+        let Proof::Totp {
+            secret,
+            algorithm,
+            time_step,
+            digits,
+        } = &self.proof
+        else {
+            return Err(ClientError::InvalidConfig(
+                "this credential proves itself with a key; there is no TOTP code".to_string(),
+            ));
+        };
         // Same narrowing as the server's validator: `digits` is a `u8` here
         // where 5.x gave it a `usize`, so an out-of-range config is refused
         // rather than truncated into a digit count nobody asked for.
-        let digits = u8::try_from(self.digits).map_err(|_| {
-            ClientError::InvalidConfig(format!("{} is not a TOTP digit count", self.digits))
+        let digits = u8::try_from(*digits).map_err(|_| {
+            ClientError::InvalidConfig(format!("{} is not a TOTP digit count", digits))
         })?;
 
         let totp = Builder::new()
-            .with_algorithm(self.algorithm.to_totp_rs())
+            .with_algorithm(algorithm.to_totp_rs())
             .with_digits(digits)
             // No skew: this side only ever generates, and a code is either the
             // current one or not. The server's window is what grants tolerance.
             .with_skew(0)
-            .with_step_duration(self.time_step as u64)
-            .with_secret(self.secret.clone())
+            .with_step_duration(*time_step as u64)
+            .with_secret(secret.clone())
             .build()
             .map_err(|e| ClientError::Other(format!("Failed to create TOTP: {e}")))?;
 
@@ -229,20 +286,50 @@ impl TwoFactorAuth {
         &self.client_id
     }
 
-    /// Sign a server challenge: HMAC-SHA256(secret, nonce || timestamp_le).
+    /// Sign a server challenge: HMAC-SHA256(secret, nonce || timestamp_le) for
+    /// a secret-based credential, an Ed25519 signature over those same bytes
+    /// for a key-based one.
     ///
-    /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`.
+    /// Keep in sync with `hmac_signature` in `crates/nexapipe/src/auth/totp.rs`
+    /// and `sign_message` in `crates/nexapipe/src/auth/device_key.rs`: whichever
+    /// proof is in play, what is signed is the nonce, byte for byte, then the
+    /// timestamp as little-endian bytes.
     ///
     /// Fallible in the type only: HMAC takes a key of any length — a long one is
     /// hashed, a short one is zero-padded — so this has never failed. It is
     /// returned rather than `expect`ed because it runs inside a handshake, where
     /// a panic would kill the connection with nothing to report.
     pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Result<Vec<u8>, ClientError> {
-        let mut mac = HmacSha256::new_from_slice(&self.secret)
-            .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
-        mac.update(nonce);
-        mac.update(&timestamp.to_le_bytes());
-        Ok(mac.finalize().into_bytes().to_vec())
+        match &self.proof {
+            Proof::Totp { secret, .. } => {
+                let mut mac = HmacSha256::new_from_slice(secret)
+                    .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
+                mac.update(nonce);
+                mac.update(&timestamp.to_le_bytes());
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            Proof::Key(key) => {
+                let mut message = Vec::with_capacity(nonce.len() + 8);
+                message.extend_from_slice(nonce);
+                message.extend_from_slice(&timestamp.to_le_bytes());
+                Ok(key.sign(&message).to_bytes().to_vec())
+            }
+        }
+    }
+
+    /// The two fields an AUTH_RESPONSE is proven with, produced together.
+    ///
+    /// Together because they have to agree: the server knows from its own
+    /// record which proof it will demand, and it reads the code only on the
+    /// secret path — a key device signs, and an empty `totp_code` is what its
+    /// response carries. Building the two apart is how they could end up
+    /// disagreeing.
+    fn prove(&self, nonce: &[u8], timestamp: i64) -> Result<(String, Vec<u8>), ClientError> {
+        let signature = self.sign_challenge(nonce, timestamp)?;
+        match &self.proof {
+            Proof::Totp { .. } => Ok((self.generate_code()?, signature)),
+            Proof::Key(_) => Ok((String::new(), signature)),
+        }
     }
 
     /// Turn a failed handshake read into an error that says what happened.
@@ -391,16 +478,16 @@ impl TwoFactorAuth {
         };
 
         // Step 3: Generate and send AUTH_RESPONSE. The signature proves
-        // possession of the secret and binds the response to this connection's
-        // challenge; the timestamp is taken now, not reused from AUTH_START, so
-        // the server's freshness window is measured from the actual response.
-        let totp_code = self.generate_code()?;
-
+        // possession of the credential and binds the response to this
+        // connection's challenge; the timestamp is taken now, not reused from
+        // AUTH_START, so the server's freshness window is measured from the
+        // actual response. The code travels beside it for a secret-based
+        // credential and is empty for a key-based one — see `prove`.
         let response_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let signature = self.sign_challenge(&nonce, response_timestamp)?;
+        let (totp_code, signature) = self.prove(&nonce, response_timestamp)?;
 
         // The same name AUTH_START carried, and not for politeness: this is the
         // message the server reads the device from when it picks which secret
@@ -446,13 +533,42 @@ impl TwoFactorAuth {
     /// An enrollment hands out a credential the app has never seen, and an app
     /// that cannot read it back cannot persist it — which would leave every
     /// restart trying to spend a token that has already been burned.
+    ///
+    /// Empty for a key-based credential, which has no secret: what such an app
+    /// has to persist is the key — the private half is its own to keep, and
+    /// [`Self::public_key_hex`] is the half the server knows it by.
     pub fn secret_base32(&self) -> String {
-        base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret)
+        match &self.proof {
+            Proof::Totp { secret, .. } => {
+                base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret)
+            }
+            Proof::Key(_) => String::new(),
+        }
     }
 
     /// The algorithm name, for the same reason as [`Self::secret_base32`].
+    ///
+    /// Empty for a key-based credential: there is no TOTP at all on that path,
+    /// so there is no algorithm to name.
     pub fn algorithm_name(&self) -> &'static str {
-        self.algorithm.name()
+        match &self.proof {
+            Proof::Totp { algorithm, .. } => algorithm.name(),
+            Proof::Key(_) => "",
+        }
+    }
+
+    /// The public half of the key this credential proves itself with, lowercase
+    /// hex — the spelling the server stores and an app has to persist.
+    ///
+    /// `None` for a secret-based credential, which has no key; a caller uses
+    /// that to tell the two kinds apart. The private half is deliberately not
+    /// readable from here: it was the caller's own before it was handed over,
+    /// and the caller is the one that has to keep it.
+    pub fn public_key_hex(&self) -> Option<String> {
+        match &self.proof {
+            Proof::Totp { .. } => None,
+            Proof::Key(key) => Some(hex::encode(key.public().as_bytes())),
+        }
     }
 }
 
@@ -462,14 +578,24 @@ impl TwoFactorAuth {
 /// Handed out once by
 /// [`crate::connection_pool::IrohConnectionPool::take_issued_credential`],
 /// right after a token has been spent. An app that keeps its settings somewhere
-/// durable has to write these three fields down: the token is gone, so a
-/// restart that still holds the invite cannot enroll a second time.
+/// durable has to write these fields down: the token is gone, so a restart that
+/// still holds the invite cannot enroll a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedCredential {
     pub client_id: String,
     /// Base32, exactly as it goes into [`TwoFactorAuth::new`] next time.
+    /// Empty when the device was issued a key instead — see [`Self::public_key`].
     pub secret: String,
     pub algorithm: String,
+    /// The public half of the key the device was issued, lowercase hex — the
+    /// spelling the server stores — with `None` for a credential that is a
+    /// secret.
+    ///
+    /// A `Some` here is also what says the credential proves itself with a
+    /// signature: an app persisting it has to keep the private half it
+    /// generated, because the server knows this device by its key and would
+    /// refuse a secret it never issued.
+    pub public_key: Option<String>,
     /// The device this credential was issued for, which has to be persisted
     /// with it: the server filed the secret under that name, so an app that
     /// writes down the secret and not the name has a credential it can no
@@ -483,10 +609,14 @@ pub struct IssuedCredential {
 ///
 /// A `v=2` invitation carries one of these instead of the client's secret: the
 /// link stops being a credential the moment it has been used, because what it
-/// holds is a token the server exchanges for a freshly generated secret and
-/// then discards. The trade is that the app has to keep what comes back — see
+/// holds is a token the server exchanges for a freshly generated secret — or,
+/// when the enrollment offers one, records as a device key — and then
+/// discards. The trade is that the app has to keep what comes back — see
 /// [`Enrollment::exchange`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `PartialEq`: an offered key is secret material with no equality of its
+/// own, and comparing enrollments is not a question this type is asked.
+#[derive(Debug, Clone)]
 pub struct Enrollment {
     client_id: String,
     token: String,
@@ -495,6 +625,10 @@ pub struct Enrollment {
     /// to answer with it or to refuse it, and what it answers with is what the
     /// credential is filed under.
     device_id: Option<String>,
+    /// The device key to offer, if any. What travels is the public half, and
+    /// what comes back tells this side whether the offer was taken: an empty
+    /// `secret` in ENROLL_ISSUE is the server saying the key was recorded.
+    key: Option<iroh::SecretKey>,
 }
 
 impl Enrollment {
@@ -503,12 +637,26 @@ impl Enrollment {
             client_id: client_id.to_string(),
             token: token.to_string(),
             device_id: None,
+            key: None,
         }
     }
 
     /// The same enrollment, asking to be issued under one device name.
     pub fn with_device(mut self, device_id: &str) -> Self {
         self.device_id = Some(device_id.to_string());
+        self
+    }
+
+    /// The same enrollment, offering this device's key.
+    ///
+    /// What the server makes of the offer decides the credential: one that
+    /// knows keys files the public half under the device name and answers with
+    /// an empty secret — from then on nothing but a signature is sent — while
+    /// one that predates them ignores the field and issues a secret, which
+    /// then has to work as it always did. The public half travels in the
+    /// clear, being public; the private half stays here.
+    pub fn with_key(mut self, key: iroh::SecretKey) -> Self {
+        self.key = Some(key);
         self
     }
 
@@ -557,6 +705,10 @@ impl Enrollment {
                 client_id: self.client_id.clone(),
                 token: self.token.clone(),
                 device_id: self.device_id.clone(),
+                public_key: self
+                    .key
+                    .as_ref()
+                    .map(|key| hex::encode(key.public().as_bytes())),
             },
         )
         .await?;
@@ -575,34 +727,66 @@ impl Enrollment {
                         "the server issued a credential for a different client id".to_string(),
                     ));
                 }
-                // The name the server filed this secret under is the only
-                // name this credential has, and it is whatever came back
-                // here — asked for in ENROLL_START, answered in this one.
-                //
-                // An answer that names no device is a server that filed it
-                // under no device: it predates the table, or it was asked
-                // for none. Either way it has nothing to match a name
-                // against, and putting the one that was asked for back
-                // sends it on every handshake from here on — which the
-                // server answers by refusing a device it does not know.
-                // Narrowed the way `digits` is narrowed in `generate_code`, and
-                // for the same reason: a cast truncates a period that does not
-                // fit into one that looks deliberate — a 90-second step read as
-                // some other number — where a refusal names the value the
-                // server actually sent.
-                let period = u32::try_from(period).map_err(|_| {
-                    ClientError::InvalidConfig(format!("{period} is not a TOTP period"))
-                })?;
-                let issued = TwoFactorAuth::with_params(
-                    &client_id,
-                    &secret,
-                    TotpAlgorithm::from_name(&algorithm),
-                    period,
-                    digits,
-                )?;
-                match device_id {
-                    Some(name) => issued.with_device(&name),
-                    None => issued,
+                if secret.is_empty() {
+                    // No secret in the answer means the server recorded the
+                    // key this enrollment offered — it only ever does that
+                    // when the request carried one, so this is that key,
+                    // whose private half never left this process.
+                    let Some(key) = self.key.clone() else {
+                        return Err(ClientError::Other(
+                            "the server issued an empty secret, but this enrollment offered \
+                             no key"
+                                .to_string(),
+                        ));
+                    };
+                    // A key is one device's credential; the unnamed slot is
+                    // the client's shared secret and the server refuses to
+                    // file a key there, so a key answer always names the
+                    // device it was filed under.
+                    let Some(name) = device_id else {
+                        return Err(ClientError::Other(
+                            "the server issued a key credential without naming the device \
+                             it was filed under"
+                                .to_string(),
+                        ));
+                    };
+                    TwoFactorAuth::with_key(&client_id, key, &name)
+                } else {
+                    // A secret came back, so a secret is the credential:
+                    // either that is what was asked for, or a key was offered
+                    // and the server predates keys — it ignores the field and
+                    // issues a secret as it always has, which then has to
+                    // work.
+                    //
+                    // The name the server filed this secret under is the only
+                    // name this credential has, and it is whatever came back
+                    // here — asked for in ENROLL_START, answered in this one.
+                    //
+                    // An answer that names no device is a server that filed it
+                    // under no device: it predates the table, or it was asked
+                    // for none. Either way it has nothing to match a name
+                    // against, and putting the one that was asked for back
+                    // sends it on every handshake from here on — which the
+                    // server answers by refusing a device it does not know.
+                    // Narrowed the way `digits` is narrowed in `generate_code`, and
+                    // for the same reason: a cast truncates a period that does not
+                    // fit into one that looks deliberate — a 90-second step read as
+                    // some other number — where a refusal names the value the
+                    // server actually sent.
+                    let period = u32::try_from(period).map_err(|_| {
+                        ClientError::InvalidConfig(format!("{period} is not a TOTP period"))
+                    })?;
+                    let issued = TwoFactorAuth::with_params(
+                        &client_id,
+                        &secret,
+                        TotpAlgorithm::from_name(&algorithm),
+                        period,
+                        digits,
+                    )?;
+                    match device_id {
+                        Some(name) => issued.with_device(&name),
+                        None => issued,
+                    }
                 }
             }
             // One reply for every way this can fail: an enrollment token is
@@ -740,11 +924,15 @@ pub mod auth_protocol {
         Response {
             client_id: String,
             timestamp: i64,
+            /// The current TOTP code; empty when the device is known by a key,
+            /// whose proof is the signature alone.
             totp_code: String,
-            /// HMAC-SHA256(secret, nonce || timestamp_le) over the challenge.
+            /// HMAC-SHA256(secret, nonce || timestamp_le) over the challenge for
+            /// a secret-based credential, an Ed25519 signature over those same
+            /// bytes for a key-based one.
             signature: Vec<u8>,
             /// The device [`AuthMessage::Start`] named. The server picks the
-            /// secret to check this against from here, not from AUTH_START.
+            /// credential to check this against from here, not from AUTH_START.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             device_id: Option<String>,
         },
@@ -764,11 +952,21 @@ pub mod auth_protocol {
             /// Absent keeps the old behaviour: one secret for the client.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             device_id: Option<String>,
+            /// The device key this client is asking to be issued under, as the
+            /// public half of an Ed25519 key pair in lowercase hex.
+            ///
+            /// Absent for a client that has no key to offer. A server that
+            /// predates this field ignores it and issues a secret, so a client
+            /// offering one has to keep working with what it is given.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            public_key: Option<String>,
         },
         /// The credential the token stood in for, issued and the token burned.
         #[serde(rename = "ENROLL_ISSUE")]
         EnrollIssue {
             client_id: String,
+            /// Base32 when a secret was issued; empty when the device was
+            /// issued a key instead, which is what the offered key bought.
             secret: String,
             algorithm: String,
             digits: u32,
@@ -802,6 +1000,14 @@ mod tests {
         device_id_is_usable,
     };
 
+    /// A stand-in nonce, built rather than written out — the twin of the helper
+    /// in `crates/nexapipe/src/auth/device_key.rs`. No test here needs a
+    /// particular value, and a literal array where a nonce goes reads to the
+    /// scanner as a hard-coded key.
+    fn test_nonce(seed: u8) -> [u8; 32] {
+        std::array::from_fn(|i| seed ^ (i as u8))
+    }
+
     /// The mirror of the test in `crates/nexapipe/src/auth/protocol.rs`: the
     /// two sides define these messages separately, and the tag is all that
     /// decides which one a peer is looking at.
@@ -811,6 +1017,7 @@ mod tests {
             client_id: "client-001".to_string(),
             token: "tok".to_string(),
             device_id: None,
+            public_key: None,
         };
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
@@ -831,6 +1038,126 @@ mod tests {
         };
         let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
+    }
+
+    /// The mirror of the server's test: the two sides define these messages
+    /// separately, and the field may not appear at all — a client that predates
+    /// keys sends none — so one without it has to still parse, and stay the
+    /// same message on the way back out.
+    #[test]
+    fn an_enrollment_without_a_key_still_parses_on_the_wire() {
+        let wire =
+            br#"{"type":"ENROLL_START","client_id":"client-001","token":"tok","device_id":"laptop"}"#;
+        let start = AuthMessage::from_bytes(wire).unwrap();
+        match &start {
+            AuthMessage::EnrollStart { public_key, .. } => assert_eq!(public_key, &None),
+            other => panic!("expected ENROLL_START, got {other:?}"),
+        }
+        assert_eq!(
+            start.to_bytes().unwrap(),
+            wire.to_vec(),
+            "no public_key goes out as no public_key"
+        );
+    }
+
+    /// And one that offers a key round-trips, exactly: the field is carried
+    /// whole, not normalized in flight.
+    #[test]
+    fn an_enrollment_offering_a_key_round_trips_byte_exactly() {
+        let wire = br#"{"type":"ENROLL_START","client_id":"client-001","token":"tok","device_id":"laptop","public_key":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"}"#;
+        let start = AuthMessage::from_bytes(wire).unwrap();
+        match &start {
+            AuthMessage::EnrollStart { public_key, .. } => assert_eq!(
+                public_key.as_deref(),
+                Some("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+            ),
+            other => panic!("expected ENROLL_START, got {other:?}"),
+        }
+        assert_eq!(start.to_bytes().unwrap(), wire.to_vec());
+    }
+
+    /// The offer is made of the public half, lowercase hex — the spelling the
+    /// server's config stores — and the builder keeps the private half, which
+    /// is what will sign every challenge once the offer is taken.
+    #[test]
+    fn an_enrollment_can_offer_a_key_beside_its_device_name() {
+        let key = iroh::SecretKey::generate();
+        let public_key = hex::encode(key.public().as_bytes());
+
+        let enrollment = Enrollment::new("client-001", "tok")
+            .with_device("phone-1a2b3c4d")
+            .with_key(key.clone());
+        assert!(
+            enrollment.key.is_some(),
+            "the offered key is kept to sign with"
+        );
+
+        // What those two produce on the wire, as `exchange_inner` sends it.
+        let start = AuthMessage::EnrollStart {
+            client_id: enrollment.client_id().to_string(),
+            token: "tok".to_string(),
+            device_id: enrollment.device_id().map(str::to_string),
+            public_key: enrollment
+                .key
+                .as_ref()
+                .map(|key| hex::encode(key.public().as_bytes())),
+        };
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(
+            json.contains(&format!(r#""public_key":"{public_key}""#)),
+            "{json}"
+        );
+        assert!(
+            !json.contains(&hex::encode(key.to_bytes())),
+            "the private half never goes on the wire: {json}"
+        );
+    }
+
+    /// A key-based credential puts a signature where a secret-based one puts an
+    /// HMAC and carries no code at all: the server reads the code only on the
+    /// secret path, and an empty one is what a key response looks like.
+    #[test]
+    fn a_key_credential_responds_with_a_signature_and_no_code() {
+        let key = iroh::SecretKey::generate();
+        let public_key = hex::encode(key.public().as_bytes());
+        let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
+
+        let (totp_code, signature) = auth.prove(&test_nonce(0x0a), 1_700_000_000).unwrap();
+        assert_eq!(totp_code, "", "a key device sends no code");
+        assert_eq!(signature.len(), 64, "an Ed25519 signature is 64 bytes");
+
+        assert_eq!(auth.public_key_hex(), Some(public_key));
+        assert_eq!(auth.secret_base32(), "", "a key credential has no secret");
+        assert_eq!(auth.algorithm_name(), "", "and no algorithm to name");
+        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert!(
+            auth.generate_code().is_err(),
+            "there is no code to generate"
+        );
+    }
+
+    /// What a key device signs is the same byte string the secret path HMACs —
+    /// the nonce, byte for byte, then the timestamp little-endian — because the
+    /// server verifies against exactly those bytes. This is the client half of
+    /// the pin the server's `device_key` tests keep.
+    #[test]
+    fn a_key_credential_signs_the_nonce_then_the_little_endian_timestamp() {
+        let key = iroh::SecretKey::generate();
+        let public = key.public();
+        let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
+
+        let nonce = test_nonce(0x01);
+        let signature = auth.sign_challenge(&nonce, 0x0102030405060708).unwrap();
+        assert_eq!(signature.len(), 64);
+
+        let mut message = nonce.to_vec();
+        message.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        public
+            .verify(
+                &message,
+                &iroh::Signature::try_from(signature.as_slice()).expect("64 bytes of signature"),
+            )
+            .expect("the signature verifies against the public half");
     }
 
     /// An enrollment that succeeds has to hand back something the app can

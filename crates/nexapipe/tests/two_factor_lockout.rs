@@ -87,6 +87,7 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                     "laptop".to_string(),
                     DeviceAuth {
                         secret: LAPTOP_SECRET.to_string(),
+                        public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
                     },
@@ -95,6 +96,7 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                     "phone".to_string(),
                     DeviceAuth {
                         secret: PHONE_SECRET.to_string(),
+                        public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
                     },

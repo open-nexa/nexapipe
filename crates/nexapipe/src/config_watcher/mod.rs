@@ -579,6 +579,7 @@ mod tests {
     fn device(secret: &str) -> DeviceAuth {
         DeviceAuth {
             secret: secret.to_string(),
+            public_key: None,
             created_at: "0".to_string(),
             last_used: None,
         }
@@ -953,6 +954,7 @@ mod tests {
             "laptop".to_string(),
             DeviceAuth {
                 secret: "LAPTOPLAPTOPLAPT".to_string(),
+                public_key: None,
                 created_at: "0".to_string(),
                 last_used: Some(1700000000),
             },
