@@ -150,12 +150,14 @@ pub async fn serve_admin(
                     // `serve_connection`. The timer is on for the same reason it
                     // is on the plaintext listener: without a header read
                     // timeout a client that opens a socket and sends nothing
-                    // holds the connection for as long as it likes.
+                    // holds the connection for as long as it likes. The admin
+                    // listener takes the same `[timeouts] header_secs` bound as
+                    // the client-facing one — its routes carry the deadlines.
                     let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
                     builder
                         .http1()
                         .timer(TokioTimer::new())
-                        .header_read_timeout(Some(crate::conn::HEAD_READ_TIMEOUT));
+                        .header_read_timeout(Some(state.routes.timeouts().deadlines.header));
 
                     let service =
                         service_fn(move |req: Request<Incoming>| handle(req, state.clone()));

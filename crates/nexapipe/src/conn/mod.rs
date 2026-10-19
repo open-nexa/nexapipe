@@ -65,20 +65,6 @@ const AUTH_RESULT_GRACE: tokio::time::Duration = tokio::time::Duration::from_mil
 /// 4 GiB before reading anything.
 const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 
-/// How long the whole request head may take to arrive.
-///
-/// The head arrives before anything is known about the peer: no route has been
-/// matched, no credential checked, no backend involved. The 64 KiB limit below
-/// bounds how many bytes a peer may send, not how long it may take to send
-/// them, so without this a peer that dribbles a byte at a time holds a stream —
-/// and the task serving it — indefinitely.
-///
-/// One deadline rather than a per-read idle timeout: an idle timeout resets on
-/// every byte, so a peer that sends just often enough to stay busy defeats it,
-/// which is exactly the shape of a slow read. A real client sends its head in
-/// the first read or two.
-pub(crate) const HEAD_READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-
 /// Streams one connection may have in flight at once.
 ///
 /// Every accepted bi-stream spawns a task, and `accept_bi` accepts them as fast
@@ -183,7 +169,11 @@ pub async fn handle_bidi_stream(
     // How much of `buf` has already been scanned for the end of the headers.
     let mut searched = 0usize;
 
-    let head_deadline = tokio::time::Instant::now() + HEAD_READ_TIMEOUT;
+    // A phase deadline over the whole head, taken once and never renewed: a
+    // peer that drips one byte before each expiry renews nothing. The bound is
+    // `[timeouts] header_secs` through the routes.
+    let header_secs = config.timeouts().deadlines.header.as_secs();
+    let head_deadline = tokio::time::Instant::now() + config.timeouts().deadlines.header;
     loop {
         let read = tokio::time::timeout_at(head_deadline, recv.read(&mut read_buf)).await;
         match read {
@@ -255,12 +245,9 @@ pub async fn handle_bidi_stream(
                 tracing::warn!(
                     "No complete request head from {} within {}s",
                     peer,
-                    HEAD_READ_TIMEOUT.as_secs()
+                    header_secs
                 );
-                return Err(anyhow::anyhow!(
-                    "no request head within {}s",
-                    HEAD_READ_TIMEOUT.as_secs()
-                ));
+                return Err(anyhow::anyhow!("no request head within {}s", header_secs));
             }
         }
     }

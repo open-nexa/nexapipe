@@ -266,7 +266,8 @@ pub struct RouteConfig {
     /// when the backend port is the same one the client asked for.
     pub client_ports: Option<Vec<u16>>,
     /// `udp` routes: seconds of silence before a flow is closed. The server
-    /// default (`l4::DEFAULT_UDP_IDLE_TIMEOUT`) applies when this is absent.
+    /// default (`[timeouts] l4_idle_secs`, itself 60) applies when this is
+    /// absent.
     pub idle_timeout_secs: Option<u64>,
     /// `tcp` / `udp` routes: seconds one flow may run before it is closed. The
     /// server default (`deadline::DEFAULT_L4_FLOW_SECS`) applies when absent.

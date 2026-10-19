@@ -721,12 +721,13 @@ async fn start_http_server(
                     // The timer is not on by default, and without it hyper has no
                     // header read timeout: a client that opens a socket and
                     // sends nothing holds the connection open for as long as it
-                    // likes. This is the listener an operator may expose.
+                    // likes. This is the listener an operator may expose. The
+                    // bound is `[timeouts] header_secs` through the routes.
                     let mut http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
                     http_builder
                         .http1()
                         .timer(TokioTimer::new())
-                        .header_read_timeout(Some(crate::conn::HEAD_READ_TIMEOUT));
+                        .header_read_timeout(Some(config_clone.timeouts().deadlines.header));
 
                     // One id and one span per request. `service_fn` is called
                     // once per request rather than once per connection, which
