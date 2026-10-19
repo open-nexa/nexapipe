@@ -59,11 +59,9 @@ No approval is needed for read-only work: answering questions, reading files, se
 
 ## Git Safety Rules (MANDATORY)
 
-- **Never push or write to a remote.** No `git push`, force-push, remote-add-then-push, remote branch deletion, or `gh release ...`. Local commits only; the owner pushes themselves.
-- **Never `git commit` automatically.** Committing belongs to the owner. When the work is verified, stop, summarize the change and hand over a suggested commit message — do not run `git commit`, `git commit -a`, or an implicit "stage then commit".
+- **Committing and pushing working branches is allowed.** Once the work is verified, the agent may `git commit` it on its working branch and `git push` that branch to the fork (`origin`), including the head branch of an open PR. Stage files by name, review `git status` before committing, and never commit secrets.
+- **Still ask first** before anything that rewrites or removes shared history or publishes a release: force-push (`--force`, `--force-with-lease`), pushing to `main`, deleting a remote branch or tag, pushing tags, and `gh release ...`.
 - Do not run history/discard commands (`git reset --hard`, `git checkout --`, `git clean -fd`, `git stash` without being asked, branch switches that drop work) unless explicitly requested.
-- The only exception is an explicit instruction in the current task, e.g. the user says "push it" / "commit it" / "please push". "Tests pass, so push it" style inference is NOT authorization.
-- Before any action with remote/public side effects (releases, tag deletion, etc.), ask first, act later.
 
 ## Git Workflow — Worktrees & Branch Base (MANDATORY)
 
@@ -92,7 +90,7 @@ No approval is needed for read-only work: answering questions, reading files, se
 
 ## Commit & Pull Request Guidelines
 
-- The agent does **not** create commits on its own initiative (see Git Safety Rules). The one exception is an explicit instruction in the current task — "commit it" means commit; a passing verification run does not. Otherwise, hand the owner a ready-to-use commit message and let them commit.
+- The agent commits and pushes its own verified work on its working branch (see Git Safety Rules); opening or merging the PR stays with the owner unless they ask for it.
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
 - Keep one logical change per commit.
 - Pull requests: describe what and why, link related issues, and add screenshots/videos for UI or VPN behavior changes.
