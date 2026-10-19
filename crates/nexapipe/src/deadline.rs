@@ -18,13 +18,15 @@
 //!   stream from a backend that is working. Those are named as idle on purpose,
 //!   so that a reader can tell at the call site which kind of bound it has.
 //!
-//! Every constant here is a default that a deployment can raise — **except the
-//! ones that cannot yet.** [`Overrides`] is the shape reading them from
-//! configuration takes, and it is deliberately not wired to anything yet: the
-//! call sites use [`Deadlines::default`], so `header`, `body`, `response_idle`,
-//! `l4_flow` and `tls_hello` are fixed and neither `config.toml` nor an
-//! environment variable reaches them. The one bound that *is* configurable is the
-//! per-route `flow_timeout_secs`, which resolves `l4_flow` for that route alone.
+//! Every constant here is a default that a deployment can raise: the six keys of
+//! [`Overrides`] are read from the server's `[timeouts]` section (`header_secs`,
+//! `body_secs`, `response_idle_secs`, `l4_flow_secs`, `l4_idle_secs`,
+//! `tls_hello_secs`) and [`crate::config::Timeouts`] carries the resolved
+//! [`Deadlines`] to every call site. A key left out means the default, and the
+//! per-route `flow_timeout_secs` still overrides `l4_flow` for one route alone.
+//! The client library's counterpart module restates the constants and does not
+//! read configuration; raising one of these on the server does not move the
+//! client's own copies.
 //!
 //! Said plainly here because a module that documents tunables it does not honour
 //! is worse than one that documents none. None of them is a quota either way:

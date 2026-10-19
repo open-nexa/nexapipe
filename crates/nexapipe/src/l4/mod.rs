@@ -318,8 +318,10 @@ where
     let connect_timeout = config.timeouts().connect;
     // Both bounds are per route, and both have a server default: the idle one is
     // the gap between packets, the flow one is how long the flow may last. See
-    // `L4Options::flow_timeout` for why they are not the same number.
-    let deadlines = crate::deadline::Deadlines::default();
+    // `L4Options::flow_timeout` for why they are not the same number. The
+    // defaults come from `[timeouts]` (`l4_flow_secs`, `l4_idle_secs`) through
+    // the config the connection arrived under, not from here.
+    let deadlines = config.timeouts().deadlines;
     let result = match preface.proto {
         L4Proto::Tcp => {
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);

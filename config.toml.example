@@ -285,14 +285,50 @@ path = "/health"
 # deadline no backend can meet, and the second is not a slow backend but one
 # that has stopped answering - and then nothing is holding the request slot.
 #
-# Waits on the *client's* bytes are deliberately not here - the L4 preface, the
-# TLS ClientHello, a first byte on the plaintext listener - because those are
-# protocol mechanics, not "how patient should I be with this backend".
+# The six keys below bound the phases of the exchange itself rather than the
+# backend's patience: how long a *client* may take to send its head and body,
+# how long a streamed response may go silent between chunks, how long an L4
+# tunnel may run, how idle a UDP flow may go, and how long a TLS ClientHello
+# may take. Each is optional, and leaving a key out keeps its default; the
+# distinction that decides each default is phase deadline (taken once, never
+# renewed - what a one-byte trickle cannot outwait) versus idle (re-armed on
+# every chunk or datagram, correct only where the phase is meant to stay open):
 #
-# NOT hot-reloadable: read once at startup, so editing either takes a restart.
+#   header_secs        a phase deadline over the whole request head.
+#                      Default: 30
+#   body_secs          a phase deadline over the whole request body, separate
+#                      from the head because a large upload legitimately takes
+#                      longer. Default: 300
+#   response_idle_secs idle between response chunks, so an SSE stream or a
+#                      long transfer stays open while a silent backend does
+#                      not hold the slot. Default: 120
+#   l4_flow_secs       a phase deadline over the whole life of an L4 tunnel,
+#                      TCP and UDP alike: a flow has no protocol-level end, so
+#                      this is the one stop against a peer renewing it
+#                      forever. Raise it for a long-lived SSH or database
+#                      session over the tunnel; a route's own
+#                      `flow_timeout_secs` overrides it per route.
+#                      Default: 3600
+#   l4_idle_secs       idle between UDP datagrams in either direction.
+#                      Default: 60
+#   tls_hello_secs     a phase deadline over the TLS ClientHello read.
+#                      Default: 10
+#
+# `0` is refused at startup for every key, and so is anything past 86400 (a
+# day): the first closes the phase the moment it opens, and the second is a
+# bound that never fires.
+#
+# NOT hot-reloadable: read once at startup, so editing any of these takes a
+# restart.
 # [timeouts]
 # connect_secs = 10
 # response_secs = 30
+# header_secs = 30
+# body_secs = 300
+# response_idle_secs = 120
+# l4_flow_secs = 3600
+# l4_idle_secs = 60
+# tls_hello_secs = 10
 
 # ============================================================
 # [admin] - the auxiliary listener (off by default)
