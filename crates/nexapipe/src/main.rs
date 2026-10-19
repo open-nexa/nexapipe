@@ -237,6 +237,14 @@ enum ClientAction {
         #[arg(long, value_name = "NAME")]
         device: Option<String>,
 
+        /// Issue this device a key instead of a secret: the public half of an
+        /// Ed25519 key pair, 64 hex characters. The device proves itself by
+        /// signing each challenge — no code for anyone to read — which is what
+        /// a device that runs unattended needs; the private half never leaves
+        /// the device.
+        #[arg(long, value_name = "HEX", requires = "device")]
+        public_key: Option<String>,
+
         /// Replace the credential that is already there, enrolling out whatever
         /// is using it now
         #[arg(long)]
@@ -328,8 +336,15 @@ async fn main() {
             ClientAction::Add {
                 client_id,
                 device,
+                public_key,
                 force,
-            } => add_client(&cli, client_id, device.as_deref(), *force),
+            } => add_client(
+                &cli,
+                client_id,
+                device.as_deref(),
+                public_key.as_deref(),
+                *force,
+            ),
             ClientAction::Revoke { client_id, device } => {
                 revoke_client(&cli, client_id, device.as_deref())
             }
@@ -810,6 +825,7 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                             "name": name,
                             "created_at": seconds_of(&device.created_at),
                             "last_used": device.last_used,
+                            "key": device.public_key.is_some(),
                         })
                     })
                     .collect();
@@ -897,6 +913,9 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                 if let Some(used) = device.last_used {
                     line.push_str(&format!(", last used {}", stamp(Some(used as i64))));
                 }
+                if device.public_key.is_some() {
+                    line.push_str(", key");
+                }
                 println!("      {name:width$}  {line}");
             }
         }
@@ -916,9 +935,21 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
 /// table exists: `client add <id>` rewrites the client's own `secret`, which is
 /// the credential of the device that names none — every device that enrolled
 /// before the table existed — while `client add <id> --device <name>` writes a
-/// secret of its own under that device and leaves the client's alone, so the
+/// credential of its own under that device and leaves the client's alone, so the
 /// other devices keep working.
-fn add_client(cli: &Cli, client_id: &str, device: Option<&str>, force: bool) -> anyhow::Result<()> {
+///
+/// `--device <name> --public-key <hex>` is the third case: the device is issued
+/// a key instead of a secret, so the ordinary path — generate a secret, draw it
+/// as a QR code — is skipped whole. Nothing is generated, because the private
+/// half is already on the device; what is written is the public half the
+/// operator pasted.
+fn add_client(
+    cli: &Cli,
+    client_id: &str,
+    device: Option<&str>,
+    public_key: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
     use nexapipe::auth::OtpAuthUri;
     use nexapipe::auth::otpauth::DEFAULT_ISSUER;
 
@@ -981,6 +1012,44 @@ fn add_client(cli: &Cli, client_id: &str, device: Option<&str>, force: bool) -> 
         }
     }
 
+    // The key path ends here: there is no secret to draw and nothing to scan,
+    // because the private half is already where it belongs. What the QR code
+    // normally does — getting the credential onto the device — has been done
+    // by whoever generated the pair; all that is missing is the public half
+    // recorded on this side.
+    if let Some(offered) = public_key {
+        // `requires = "device"` on the flag already refuses this spelling;
+        // the check stays because this function is where the invariant lives,
+        // and a key belongs to one named device — the unnamed slot is the
+        // client's shared secret, which has no key to be half of.
+        let Some(name) = device else {
+            anyhow::bail!("--public-key needs --device: a key is issued to one named device");
+        };
+        let key = nexapipe::auth::parse_public_key(offered)
+            .map_err(|why| anyhow::anyhow!("--public-key: {why}"))?;
+        let key = nexapipe::auth::public_key_hex(&key);
+
+        println!();
+        println!("Key for device \"{name}\" of client \"{client_id}\"");
+        println!("  Public key {key}");
+        println!();
+        println!(
+            "The device proves itself by signing each challenge with the private half of this \
+             key: no code for anyone to read and nothing to scan, which is what lets it run \
+             unattended. The private half stays on the device; this command never sees it."
+        );
+        println!();
+
+        return write_issued_credential(
+            cli,
+            client_id,
+            Some(name),
+            nexapipe::auth::DeviceMaterial::PublicKey(&key),
+            auth_config.enabled,
+            force,
+        );
+    }
+
     let issuer = match &cli.issuer {
         Some(issuer) => issuer.trim().to_string(),
         None => auth_config.issuer.clone(),
@@ -1034,27 +1103,28 @@ fn add_client(cli: &Cli, client_id: &str, device: Option<&str>, force: bool) -> 
     )?;
     println!();
 
-    write_issued_secret(
+    write_issued_credential(
         cli,
         client_id,
         device,
-        &uri.secret,
+        nexapipe::auth::DeviceMaterial::Secret(&uri.secret),
         auth_config.enabled,
         force,
     )
 }
 
-/// Puts the secret that was just printed into the config, so the server ends up
-/// holding the same credential the QR code carries.
+/// Puts the credential that was just printed into the config, so the server
+/// ends up holding the same thing the device carries: the secret the QR code
+/// spelled out, or the public half the operator pasted.
 ///
 /// `force` is passed through rather than assumed: whether the credential is
 /// already there is decided under the config lock by the writer, which is the
 /// only place that can answer it without racing a second writer.
-fn write_issued_secret(
+fn write_issued_credential(
     cli: &Cli,
     client_id: &str,
     device: Option<&str>,
-    secret: &str,
+    material: nexapipe::auth::DeviceMaterial<'_>,
     auth_enabled: bool,
     force: bool,
 ) -> anyhow::Result<()> {
@@ -1062,36 +1132,52 @@ fn write_issued_secret(
     // Spelled the way the file is written: a device goes under the client's
     // `devices` table as an inline entry rather than as a section of its own,
     // because that table may be one an operator wrote inline.
-    let (section, entry) = match device {
-        None => (
-            format!("[auth.clients.{}]", toml_key(client_id)),
-            format!("secret = \"{secret}\""),
-        ),
-        Some(name) => (
+    let (section, entry, noun, outcome) = match (device, material) {
+        (None, nexapipe::auth::DeviceMaterial::Secret(secret)) => {
+            let section = format!("[auth.clients.{}]", toml_key(client_id));
+            (
+                section.clone(),
+                format!("secret = \"{secret}\""),
+                "secret",
+                ProxyConfig::write_client_secret(&cli.config, client_id, secret, force),
+            )
+        }
+        (Some(name), nexapipe::auth::DeviceMaterial::Secret(secret)) => (
             format!("[auth.clients.{}.devices]", toml_key(client_id)),
             format!("{} = {{ secret = \"{secret}\" }}", toml_key(name)),
+            "secret",
+            ProxyConfig::write_device_credential(&cli.config, client_id, name, material, force),
         ),
+        (Some(name), nexapipe::auth::DeviceMaterial::PublicKey(key)) => (
+            format!("[auth.clients.{}.devices]", toml_key(client_id)),
+            format!("{} = {{ public_key = \"{key}\" }}", toml_key(name)),
+            "public key",
+            ProxyConfig::write_device_credential(&cli.config, client_id, name, material, force),
+        ),
+        // A key is one device's, and the unnamed slot — the client's own
+        // `secret` — is a string a key cannot live in. The CLI refuses this
+        // spelling twice before it gets here; the arm keeps the writer from
+        // being the one place that would write such a key nowhere.
+        (None, nexapipe::auth::DeviceMaterial::PublicKey(_)) => {
+            anyhow::bail!("a public key is issued to a named device; pass --device with it")
+        }
     };
     let what = match device {
         None => section.clone(),
         Some(name) => format!("\"{name}\" under {section}"),
     };
-    let outcome = match device {
-        None => ProxyConfig::write_client_secret(&cli.config, client_id, secret, force),
-        Some(name) => ProxyConfig::write_device_secret(&cli.config, client_id, name, secret, force),
-    };
 
     let written = match outcome {
         Ok(ClientSecretWrite::Added) => {
-            println!("Wrote the secret to {} as {}.", cli.config, what);
+            println!("Wrote the {noun} to {} as {}.", cli.config, what);
             false
         }
         Ok(ClientSecretWrite::Replaced) => {
-            println!("Replaced the secret of {} in {}.", what, cli.config);
+            println!("Replaced the {noun} of {} in {}.", what, cli.config);
             true
         }
-        // Fatal rather than a warning. The secret is on screen either way, so
-        // nothing is lost by stopping — but a command that exits 0 after
+        // Fatal rather than a warning. The credential is on screen either way,
+        // so nothing is lost by stopping — but a command that exits 0 after
         // writing nothing lets `client add acme && deploy` go ahead with no
         // credential on disk, and the next thing that fails is a handshake
         // somewhere else, pointing at the client rather than at this write.
@@ -1099,7 +1185,7 @@ fn write_issued_secret(
         // on its own: the operator can still put it in the file by hand.
         Err(e) => {
             return Err(e).context(format!(
-                "the secret was not written to {}; add it by hand:\n\
+                "the {noun} was not written to {}; add it by hand:\n\
                  {section}\n\
                  {entry}",
                 cli.config
@@ -1111,7 +1197,7 @@ fn write_issued_secret(
     if !auth_enabled {
         eprintln!(
             "warning: [auth] enabled is not true in {}, so the server will not ask for this \
-             secret; add enabled = true under [auth]",
+             credential; add enabled = true under [auth]",
             cli.config
         );
     }

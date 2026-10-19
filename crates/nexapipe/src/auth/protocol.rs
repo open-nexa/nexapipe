@@ -14,16 +14,29 @@
 //! Enrollment is how an invitation that is safe to hand out stays safe after it
 //! has been handed out: the link carries a one-time token instead of the
 //! client's long-lived secret, the server exchanges it for a freshly generated
-//! secret and burns the token in the same write, so a link that was copied in
-//! transit stops being a credential the moment it has been used once. The
-//! exchange runs on the same stream, ahead of AUTH_START.
+//! secret — or records the device key a key-based device offered — and burns
+//! the token in the same write, so a link that was copied in transit stops
+//! being a credential the moment it has been used once. The exchange runs on
+//! the same stream, ahead of AUTH_START.
 //!
-//! The response is signed: `signature` is
+//! The response is proven in one of two ways, and which one depends on what
+//! the server holds for the device that answered — never on anything the
+//! response itself says.
+//!
+//! The first is a secret: `signature` is
 //! HMAC-SHA256(secret, nonce || timestamp.to_le_bytes()) over the client's
-//! Base32-decoded TOTP secret, so a response only validates against the
-//! challenge that was issued for this very connection — an intercepted
-//! response cannot be replayed over a new one, and the timestamp bounds how
-//! long even the right response stays acceptable.
+//! Base32-decoded TOTP secret, and `totp_code` carries a current code. So a
+//! response only validates against the challenge that was issued for this very
+//! connection — an intercepted response cannot be replayed over a new one —
+//! and the timestamp bounds how long even the right response stays acceptable.
+//!
+//! The second is a device key: the same bytes signed with the Ed25519 private
+//! half of the key registered under the device, with `totp_code` empty. A
+//! device that runs unattended has nobody to read a code to it, so at
+//! enrollment — the one moment a human is certainly present — such a device is
+//! issued a credential that proves itself without one. Both proofs cover the
+//! same message, so a response says the same thing either way: this client saw
+//! this connection's nonce at this time.
 //!
 //! A `device_id` may ride along on the messages a client sends, and on the one
 //! the server answers an enrollment with. It names which of a client's devices
@@ -58,14 +71,19 @@ pub enum AuthMessage {
     Response {
         client_id: String,
         timestamp: i64,
+        /// The current TOTP code. Empty when the device is known by a key:
+        /// there is no code for it, and the signature is the whole proof.
         totp_code: String,
-        /// HMAC-SHA256 over `nonce || timestamp.to_le_bytes()` keyed with the
-        /// client's TOTP secret, proving the response was built for this
-        /// connection's challenge by someone holding the secret.
+        /// Over `nonce || timestamp.to_le_bytes()`: HMAC-SHA256 keyed with the
+        /// client's TOTP secret, or an Ed25519 signature by the device's key
+        /// when the server holds one for it. Both prove the same thing — this
+        /// client saw this connection's challenge at this time — so which one
+        /// this is depends on the receiving end's credential, not on anything
+        /// said here.
         signature: Vec<u8>,
         /// The same device [`AuthMessage::Start`] named. It is signed over
         /// nowhere, so it is not proof of anything on its own — what it does is
-        /// say which device's secret the response is to be checked against.
+        /// say which device's credential the response is to be checked against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
     },
@@ -87,12 +105,27 @@ pub enum AuthMessage {
         /// what authorizes the exchange, not this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
+        /// The device key this client is asking to be issued under, as the
+        /// public half of an Ed25519 key pair in lowercase hex.
+        ///
+        /// Absent for a client that has no key to offer, which is every client
+        /// built before keys existed; a server that predates this field ignores
+        /// it and issues a secret as before, so a client offering one has to
+        /// keep working with what it is given. Present, it must arrive with a
+        /// device name — a key belongs to one device, and the device that names
+        /// none answers with the client's shared secret, which has no key to
+        /// check against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_key: Option<String>,
     },
     /// Server issues the credential the token was standing in for
     #[serde(rename = "ENROLL_ISSUE")]
     EnrollIssue {
         client_id: String,
-        /// Base32-encoded secret, generated fresh for this enrollment.
+        /// Base32-encoded secret, generated fresh for this enrollment. Empty
+        /// when the device was issued a key instead: the server recorded the
+        /// public key the client offered, and this device will prove itself
+        /// with a signature rather than a code.
         secret: String,
         algorithm: String,
         digits: u32,
@@ -173,6 +206,7 @@ mod tests {
             client_id: "client-001".to_string(),
             token: "tok".to_string(),
             device_id: None,
+            public_key: None,
         };
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
@@ -284,6 +318,7 @@ mod tests {
                 client_id: "client-001".to_string(),
                 token: "tok".to_string(),
                 device_id: Some("laptop".to_string()),
+                public_key: None,
             },
             AuthMessage::EnrollIssue {
                 client_id: "client-001".to_string(),
@@ -328,5 +363,55 @@ mod tests {
         for id in ["", "laptop\r\nINFO: connected", &"x".repeat(256)] {
             assert_eq!(is_presentable_device_id(id), is_presentable_client_id(id));
         }
+    }
+
+    /// A key offered at enrollment is what the server records and what the
+    /// device will sign with, so it has to reach the other side exactly as it
+    /// was said: a field that changes shape on the way through is a device
+    /// that can never authenticate.
+    #[test]
+    fn an_enrollment_that_offers_a_key_carries_it_whole() {
+        let key = "a1".repeat(32);
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: "tok".to_string(),
+            device_id: Some("phone".to_string()),
+            public_key: Some(key.clone()),
+        };
+
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(&format!(r#""public_key":"{key}""#)), "{json}");
+
+        let back = AuthMessage::from_bytes(json.as_bytes()).expect("parses");
+        assert_eq!(back.to_bytes().unwrap(), start.to_bytes().unwrap());
+    }
+
+    /// The other half of the absence-means-old-client rule, for enrollment: a
+    /// client that has no key — every client built before this field existed —
+    /// sends no such key, and what it sends goes back out byte for byte.
+    #[test]
+    fn an_enrollment_from_a_client_with_no_key_still_parses() {
+        let wire = r#"{"type":"ENROLL_START","client_id":"client-001","token":"tok","device_id":"laptop"}"#;
+
+        let parsed = AuthMessage::from_bytes(wire.as_bytes()).expect("an old client still parses");
+        let AuthMessage::EnrollStart { public_key, .. } = parsed else {
+            panic!("expected ENROLL_START");
+        };
+        assert_eq!(public_key, None, "no key sent is a secret-based device");
+
+        assert_eq!(
+            String::from_utf8(
+                AuthMessage::EnrollStart {
+                    client_id: "client-001".to_string(),
+                    token: "tok".to_string(),
+                    device_id: Some("laptop".to_string()),
+                    public_key: None,
+                }
+                .to_bytes()
+                .unwrap()
+            )
+            .unwrap(),
+            wire,
+        );
     }
 }

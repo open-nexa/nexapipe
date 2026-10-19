@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-11 (v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured); the size-and-performance measurement work moved to [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); entries closed by v0.6.0 marked in §1, §4, §5 and §9; a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
+| Last updated | 2026-10-17 ([§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -61,8 +61,8 @@ The gap is not architectural, it is maturity:
   that is struck out loses the connections it already holds instead of keeping
   them until it hangs up. Both were the halves
   [Phase 3](#phase-3--v060-one-device-at-a-time) still owed, and both shipped in
-  v0.6.0; the kind of credential stays a TOTP secret for now, which is what
-  §4.3 is about.
+  v0.6.0; the kind of credential followed — a device can hold an Ed25519 key
+  instead of a TOTP seed now — which is what §4.3 is about.
 - Platform coverage has closed both of its holes: IPv6 inside the TUN and a
   second Android ABI shipped in v0.4.0, and the desktop TUN does UDP. (This
   list used to claim it did not. See [4.5](#45-protocols-and-transport-p1p2).)
@@ -223,10 +223,12 @@ exporter, and client-side latency, are not planned for this release.
 
 ### 4.3 Identity and authorization (P1)
 
-Authentication is a TOTP secret. **The shared-secret half closed in v0.6.0:**
-what a `client_id` carries now is its own `secret` plus a table of devices, each
-with a secret of its own issued at enrollment, and each revocable without
-touching the others. The README stopped saying that too, and both halves that
+Authentication is a per-device credential — a TOTP seed or a key. **The
+shared-secret half closed in v0.6.0:** what a `client_id` carries is its own
+`secret` plus a table of devices, each holding a credential of its own issued at
+enrollment and each revocable without touching the others — a TOTP seed then,
+either that or an Ed25519 public key now. The README stopped
+saying that too, and both halves that
 [Phase 3](#phase-3--v060-one-device-at-a-time) still owed the model have landed
 since: a revoked device no longer keeps the connections it already holds, and
 every client answers as one named device of itself. There is still no mTLS, no
@@ -238,21 +240,28 @@ before because a `client_id` did not survive the handshake.
 
 The `v=2` invite, with its one-shot enrollment token, is what downgraded "leaked
 URL means leaked credential forever" to "leaked URL is revocable and
-short-lived", and enrollment is where a device name comes from now. The direction
-it points at is unchanged: per-device keys signed by the server, with TOTP as a
-human second factor rather than the device identity itself.
+short-lived", and enrollment is where a device name comes from now.
 
-**Phase 3 took the first half of that step, and it has landed: one credential per
-device**, issued at enrollment and revocable on its own, with the credential
-still a TOTP secret and the handshake still the HMAC it is today. The second half
-is the *kind* of credential — per-device key pairs, and TOTP demoted to a second
-factor a human supplies — and it stays out of this release because it also means
-new material in both credential stores and a factor an unattended service cannot
-answer. Of the other half of making revocation true, closing the connections a
-revoked device already holds has landed. So has putting a name on the wire from
-the clients rather than from `--device` alone: each install answers as one named
-device of itself, which is what makes per-device revocation reachable from
-somewhere other than an operator's shell.
+**The second half of that step — the kind of credential — has landed in the
+server and the client library.** A device can be registered with the public half
+of an Ed25519 key pair instead of a TOTP seed and then proves itself by signing
+each connection's challenge: what the server holds is not itself a credential, so
+a leaked config yields no way in *as that device*, where a leaked `secret` *is*
+the credential itself. The client's own `secret` is still in the file, and still
+answers for a peer that names no device until `unnamed_device_allowed = false`.
+Which kind a device is comes from the server's own record and not from the wire —
+no scheme field, no new message — so the handshake is byte-for-byte what it
+always was for the devices that keep a secret, and the path for a device that
+never names itself (the client's own `secret`, `unnamed_device_allowed`) is
+untouched. A wrong signature counts toward the lockout exactly like a wrong code.
+TOTP's remaining role is the enrollment moment — the scan, the one-shot token —
+where a human is actually present and where none of the unattended paths
+(`--local-proxy`, the elevated service, the probe's reconnect loop, Android JNI)
+has to answer a prompt. What remains is the UI half, and it is the next
+release's: both apps still enroll and answer with TOTP secrets, and holding a
+key is v0.8.0 work in each. The library API (`Enrollment::with_key`,
+`TwoFactorAuth::with_key`) and `nexapipe client add <id> --device <name>
+--public-key <hex>` are what the feature ships with today.
 
 ### 4.4 Operations and distribution (P1)
 
