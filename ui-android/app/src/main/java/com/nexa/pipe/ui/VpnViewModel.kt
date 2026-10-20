@@ -396,7 +396,6 @@ class VpnViewModel : ViewModel() {
         withContext(Dispatchers.Main) { traffic.value = totals }
     }
 
-    /** Decodes `id=direct;id2=relay` — the format the native side writes. */
     /**
      * Starts re-reading what the tunnel reports per backend — the link type and what each one
      * has carried; no-op when a poll is already running.
