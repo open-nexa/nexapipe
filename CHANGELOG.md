@@ -174,21 +174,24 @@ its defaults — which are on.
   key, and the client's credentials — including the process-wide tables the
   Android app fills through JNI. The buffers those files are read into are
   wiped with them, so the plaintext of a credential file does not sit in the
-  heap after the parse that needed it. The same goes for the copies the TOML
-  parsers make on the way: a config file can hold the seeds in the clear, and
-  the tree it is parsed into — and the text that tree is written back out as —
-  are zeroed as soon as they have served their purpose, rather than left in
-  the heap for whatever reads it next. Until
-  now they were masked in `Debug` but stayed in the heap as plain `String`s,
-  so a core dump, a swap file or a read of `/proc/<pid>/mem` handed over
-  every credential the process had ever held, long after the handshake that
-  needed it. The TOTP validator the library builds is wiped with them, so the
-  second copy of the seed inside it is gone as well. The masking that was
-  already there is now the default rather than something each field has to
-  remember: a struct that derives `Debug` and holds a secret cannot leak it.
-  Nothing about the configuration or the wire format changes — a `config.toml`
-  written by this build is the one the previous build wrote, and a client
-  built against the old one still talks to a server built against the new one.
+  heap after the parse that needed it. Until now the credentials themselves
+  were masked in `Debug` but stayed in the heap as plain `String`s, so a core
+  dump, a swap file or a read of `/proc/<pid>/mem` handed over every
+  credential the process had ever held, long after the handshake that needed
+  it. The TOTP validator the library builds is wiped with them, so the second
+  copy of the seed inside it is gone as well. The masking that was already
+  there is now the default rather than something each field has to remember: a
+  struct that derives `Debug` and holds a secret cannot leak it. The copies
+  the TOML parsers make of the file are zeroed too: a config file can hold the
+  seeds in the clear, and the tree it is parsed into — and the text that tree
+  is written back out as — are zeroed as soon as they have served their
+  purpose, rather than left in the heap for whatever reads it next. One copy
+  of each string on the write path does stay behind: the raw text `toml_edit`
+  keeps for the values it parsed, which its private internals do not let a
+  caller reach. Nothing about the configuration or the wire format changes —
+  a `config.toml` written by this build is the one the previous build wrote,
+  and a client built against the old one still talks to a server built against
+  the new one.
 
 ## [0.6.1] — 2026-10-11
 

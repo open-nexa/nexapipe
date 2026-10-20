@@ -15,10 +15,24 @@
 //!   [`zeroize_document`] takes the strings out of such a document and zeroes
 //!   them.
 //!
-//! What neither of them can reach is the raw text `toml_edit` keeps for every
-//! value it parsed: that lives in a `RawString` whose fields are private, and
-//! the only way at the bytes is `unsafe` or a fork of the crate. The copies
-//! this crate makes are zeroed; the ones the library makes are not.
+//! What none of them can reach is the raw text `toml_edit` keeps for every
+//! value it parsed. For `secret = "ABC123"` that text is `"ABC123"`, the
+//! source with its quotes, so the heap holds the secret twice: the decoded
+//! value and the text it was decoded from. It lives in a private `RawString`
+//! behind `Formatted::repr`, which exposes only `&str` and has no `&mut` path
+//! to the bytes, so the only way at it is `unsafe` or a fork of the crate.
+//! One copy of every string on the write path is therefore left behind, and
+//! saying so plainly beats describing the write path as clean.
+//!
+//! Two things are left alone on purpose:
+//!
+//! - The keys of a table. A key names a thing — a client, a device, a route
+//!   — and the credentials in a config are values, not names.
+//! - The two `toml::Value`s that [`ProxyConfig`](crate::config::ProxyConfig)
+//!   holds outside the tree: `default_backend` and `acme`. They come from the
+//!   same document, but they hold no credentials — `build_routes` refuses a
+//!   `default_backend` outright and `acme` is ignored and reported — and they
+//!   live as long as the config does, which is the life of the process.
 
 use toml_edit::{DocumentMut, Formatted, Item, Table, Value};
 use zeroize::Zeroize;
@@ -69,10 +83,14 @@ impl Drop for ZeroizedValue {
 ///
 /// `toml_edit` keeps each value in a `Formatted<String>` whose fields are
 /// private, so the only way at the bytes is to take the value out of the item
-/// and zero it there. The raw text it keeps for the value it parsed is not a
-/// second copy of the value but the text the value was written as, and it
-/// lives in a private `RawString` this crate cannot reach — so what is zeroed
-/// here is the decoded value, not the file's own bytes.
+/// and zero it there.
+///
+/// That is one of the two copies a string on the write path has. The other is
+/// the raw text the value was parsed from, which lives in a private
+/// `RawString` behind `Formatted::repr` — `&str` is all that is exposed of it,
+/// and there is no `&mut` path to the bytes. The raw text is a copy of the
+/// secret as well, and it is left behind: reaching it would take `unsafe` or
+/// a fork of the library.
 pub fn zeroize_document(document: &mut DocumentMut) {
     zeroize_table(document.as_table_mut());
 }
@@ -171,13 +189,19 @@ mod tests {
         );
     }
 
-    /// The guard wipes the tree when it is dropped, which is the only moment
-    /// that matters: a tree that is dropped on an error path is dropped
-    /// without anyone asking.
+    /// A section taken out of the tree is not in the tree any more.
+    ///
+    /// It leaves by value, so the tree holds no second copy of it: a clone
+    /// would be one more copy of the seeds in the heap. The section the caller
+    /// gets is its own to zero.
+    ///
+    /// The wipe of the tree itself is a property of the guard rather than
+    /// something this test can watch: `Drop` runs when the tree goes out of
+    /// scope, and there is no way to look at a value after that.
     #[test]
-    fn the_guard_wipes_the_tree_it_holds() {
+    fn a_section_taken_out_of_the_tree_is_not_in_the_tree() {
         let mut tree = ZeroizedValue::new(toml::from_str("secret = \"ABC123\"").expect("parses"));
-        let section = tree
+        let mut section = tree
             .table_mut()
             .and_then(|table| table.remove("secret"))
             .expect("the secret is there");
@@ -188,8 +212,9 @@ mod tests {
         );
         assert_eq!(section.as_str(), Some("ABC123"));
 
-        // And the tree that is left is wiped when it goes.
-        drop(tree);
+        // The caller owns what it took out, and wipes it like the tree does.
+        zeroize_value(&mut section);
+        assert_eq!(section.as_str(), Some(""));
     }
 
     /// A document's strings are wiped in place: the values are taken out of

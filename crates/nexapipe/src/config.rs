@@ -2607,9 +2607,10 @@ pub(crate) fn read_config_document(
 /// long the allocator keeps the buffer. The document is zeroed too, so the
 /// tree it was parsed into does not keep them either.
 ///
-/// What is left is the raw text `toml_edit` keeps for every value it parsed:
-/// that lives in a private `RawString` this crate cannot reach, and closing
-/// that would take `unsafe` or a fork of the library. See
+/// What is left is one copy of every string on the write path: the raw text
+/// `toml_edit` keeps for each value it parsed, next to the decoded value
+/// above. It lives in a private `RawString` this crate cannot reach, and
+/// closing that would take `unsafe` or a fork of the library. See
 /// [`crate::toml_zeroize`].
 pub(crate) fn write_config_document(
     path: &str,
