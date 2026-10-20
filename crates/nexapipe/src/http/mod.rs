@@ -7,8 +7,9 @@ use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 /// Client used to reach backends.
 ///
@@ -45,6 +46,21 @@ pub fn create_http_client(
     connect_timeout: std::time::Duration,
     ca_file: Option<&std::path::Path>,
 ) -> anyhow::Result<HttpClient> {
+    Ok(create_http_client_with_tls(
+        tls_client_config(ca_file)?,
+        connect_timeout,
+    ))
+}
+
+/// The HTTP/1.1 client around a TLS configuration that is already built.
+///
+/// Split out so [`BackendClients`] can build the trust store once and hand a
+/// clone to each client, rather than reading the machine's roots (and the
+/// operator's CA file) twice for the same process.
+fn create_http_client_with_tls(
+    tls: rustls::ClientConfig,
+    connect_timeout: std::time::Duration,
+) -> HttpClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
@@ -64,30 +80,28 @@ pub fn create_http_client(
     // backend that speaks h2 gets it and a backend that does not falls back to
     // HTTP/1.1 without anybody having to say which it is.
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_client_config(ca_file)?)
+        .with_tls_config(tls)
         .https_or_http()
         .enable_all_versions()
         .wrap_connector(http_connector);
 
-    Ok(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_max_idle_per_host(100)
-            .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
-            .http1_title_case_headers(true)
-            .http1_ignore_invalid_headers_in_responses(true)
-            // The HTTP/2 settings are the same idea as the HTTP/1 ones above: a
-            // pooled connection is kept while it answers and dropped when it stops
-            // answering. Without them an h2 connection to a backend that went away
-            // stays in the pool until something else notices.
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            // The h2 half needs a clock of its own: an HTTP/2 connection
-            // carries its own timeouts — a ping that has to be answered, a
-            // stream that has to be reset — and without a timer the client
-            // panics the first time it negotiates h2 with a backend.
-            .timer(hyper_util::rt::TokioTimer::new())
-            .build(connector),
-    )
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+        .http1_title_case_headers(true)
+        .http1_ignore_invalid_headers_in_responses(true)
+        // The HTTP/2 settings are the same idea as the HTTP/1 ones above: a
+        // pooled connection is kept while it answers and dropped when it stops
+        // answering. Without them an h2 connection to a backend that went away
+        // stays in the pool until something else notices.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The h2 half needs a clock of its own: an HTTP/2 connection
+        // carries its own timeouts — a ping that has to be answered, a
+        // stream that has to be reset — and without a timer the client
+        // panics the first time it negotiates h2 with a backend.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .build(connector)
 }
 
 /// The clients the proxy reaches backends through.
@@ -109,6 +123,10 @@ pub struct BackendClients {
     http: Arc<HttpClient>,
     /// HTTP/2 in the clear, with prior knowledge.
     h2c: Arc<HttpClient>,
+    /// TLS for a connection that is not the pooled client's: a WebSocket holds
+    /// one connection for the whole session, and its handshake is HTTP/1.1.
+    /// The ALPN list this carries is `http/1.1` alone.
+    tls: Arc<rustls::ClientConfig>,
 }
 
 impl BackendClients {
@@ -118,9 +136,16 @@ impl BackendClients {
         connect_timeout: std::time::Duration,
         ca_file: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
+        let tls = tls_client_config(ca_file)?;
+        let mut websocket_tls = tls.clone();
+        // A WebSocket upgrade is HTTP/1.1. Offering h2 here would let a
+        // backend agree to a protocol this path cannot speak, so the raw
+        // connection asks for the one version it can carry.
+        websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(BackendClients {
-            http: Arc::new(create_http_client(connect_timeout, ca_file)?),
-            h2c: Arc::new(create_h2c_client(connect_timeout, ca_file)?),
+            http: Arc::new(create_http_client_with_tls(tls.clone(), connect_timeout)),
+            h2c: Arc::new(create_h2c_client_with_tls(tls, connect_timeout)),
+            tls: Arc::new(websocket_tls),
         })
     }
 
@@ -129,6 +154,116 @@ impl BackendClients {
         match protocol {
             BackendProtocol::Http1 => &self.http,
             BackendProtocol::H2c => &self.h2c,
+        }
+    }
+
+    /// Opens one connection to a backend, for a WebSocket session.
+    ///
+    /// This is not the pooled client: a WebSocket holds its connection for the
+    /// whole conversation, so it needs the socket itself rather than a request
+    /// the pool may reuse. An `https://` backend is still reached over a TLS
+    /// session this process originates and verifies, with the same trust store
+    /// as the pooled clients; a cleartext one is handed back as it is.
+    pub(crate) async fn connect_stream(
+        &self,
+        backend_url: &str,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<BackendStream> {
+        let url = url::Url::parse(backend_url)
+            .map_err(|e| anyhow::anyhow!("invalid backend URL: {e}"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
+            .to_string();
+        let port = url.port_or_known_default().unwrap_or(80);
+        let scheme = url.scheme().to_string();
+
+        let connect = async {
+            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to backend: {e}"))?;
+            // A WebSocket carries its own message framing; Nagle would only add
+            // latency to every frame.
+            let _ = tcp.set_nodelay(true);
+
+            match scheme.as_str() {
+                "http" => Ok(BackendStream::Plain(tcp)),
+                "https" => {
+                    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                        .map_err(|e| {
+                            anyhow::anyhow!("cannot verify the backend certificate for {host}: {e}")
+                        })?;
+                    let connector = tokio_rustls::TlsConnector::from(self.tls.clone());
+                    let tls = connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("TLS handshake with backend failed: {e}"))?;
+                    Ok(BackendStream::Tls(Box::new(tls)))
+                }
+                other => anyhow::bail!(
+                    "backend {backend_url} uses {other}://, which cannot carry a WebSocket"
+                ),
+            }
+        };
+
+        tokio::time::timeout(connect_timeout, connect)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
+    }
+}
+
+/// A dedicated backend connection, for a flow that owns it for its lifetime.
+///
+/// Plain or TLS, so the WebSocket path does not have to know which one it got
+/// after the dial: it writes the upgrade request and pipes the session either
+/// way.
+pub(crate) enum BackendStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl AsyncRead for BackendStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -144,6 +279,17 @@ pub fn create_h2c_client(
     connect_timeout: std::time::Duration,
     ca_file: Option<&std::path::Path>,
 ) -> anyhow::Result<HttpClient> {
+    Ok(create_h2c_client_with_tls(
+        tls_client_config(ca_file)?,
+        connect_timeout,
+    ))
+}
+
+/// The h2c client around a TLS configuration that is already built.
+fn create_h2c_client_with_tls(
+    tls: rustls::ClientConfig,
+    connect_timeout: std::time::Duration,
+) -> HttpClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
@@ -153,25 +299,23 @@ pub fn create_h2c_client(
     http_connector.enforce_http(false);
 
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_client_config(ca_file)?)
+        .with_tls_config(tls)
         .https_or_http()
         .enable_all_versions()
         .wrap_connector(http_connector);
 
-    Ok(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            // The one setting that makes this client h2: every connection it
-            // opens is an h2 connection, whatever the peer says or does not say.
-            .http2_only(true)
-            .pool_max_idle_per_host(100)
-            .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            // The clock the h2 half needs, for the same reason the other client
-            // has one: an h2 connection times things on its own.
-            .timer(hyper_util::rt::TokioTimer::new())
-            .build(connector),
-    )
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        // The one setting that makes this client h2: every connection it
+        // opens is an h2 connection, whatever the peer says or does not say.
+        .http2_only(true)
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The clock the h2 half needs, for the same reason the other client
+        // has one: an h2 connection times things on its own.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .build(connector)
 }
 
 /// The TLS configuration a backend handshake is made with.
@@ -1027,6 +1171,20 @@ impl From<::http::Error> for ProxyFailure {
 }
 
 impl ProxyFailure {
+    /// A failure before any of the answer reached the client.
+    ///
+    /// `retry` is what the failure says about trying again: a request that was
+    /// never carried may be, and one that was carried and lost may only be
+    /// when the method is idempotent. This is the same distinction
+    /// [`proxy_request`] makes, for the tunnel path.
+    pub(crate) fn unanswered(error: anyhow::Error, retry: Retryability) -> Self {
+        ProxyFailure {
+            error,
+            partial: None,
+            retry,
+        }
+    }
+
     /// A failure that happened `written` bytes into a `status` response.
     ///
     /// Used on the paths where the count is of bytes the client actually
@@ -1223,15 +1381,32 @@ pub async fn proxy_to_backend_streaming(
     let response_deadline = timeouts.response;
     let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
     {
-        Ok(result) => result.map_err(|e| {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
             tracing::error!("Failed to send request: {:?}", e);
-            anyhow::anyhow!("failed to send request: {:?}", e)
-        })?,
+            // A connect error means the request was never carried: the
+            // connection was refused, the name did not resolve, the handshake
+            // failed. Anything else means the request went out and the answer
+            // did not come, which only an idempotent request may be asked
+            // twice. The tunnel path needs this exactly as the plaintext one
+            // does, or `[retry]` would only work on one of them.
+            let retry = if e.is_connect() {
+                Retryability::Always
+            } else {
+                Retryability::IfIdempotent
+            };
+            return Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("failed to send request: {e:?}"),
+                retry,
+            ));
+        }
         Err(_) => {
-            return Err(ProxyFailure::from(anyhow::anyhow!(
-                "backend did not respond within {:?}",
-                response_deadline
-            )));
+            return Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("backend did not respond within {:?}", response_deadline),
+                // The request was carried: the deadline expired after it went
+                // out.
+                Retryability::IfIdempotent,
+            ));
         }
     };
 
@@ -2364,6 +2539,7 @@ mod transport {
     use super::*;
     use rcgen::{CertificateParams, IsCa, KeyPair};
     use std::convert::Infallible;
+    use tokio::io::AsyncWriteExt;
 
     /// The CA that signs the backend's certificate, and the backend's own
     /// certificate and key.
@@ -2477,6 +2653,45 @@ mod transport {
             .expect("the body")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// A WebSocket owns a raw connection rather than a pooled one, so it cannot
+    /// use the HTTP client. It still reaches an `https://` backend over TLS,
+    /// with the same CA file the pooled clients use.
+    #[tokio::test]
+    async fn an_https_backend_can_be_reached_as_a_raw_stream() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+                .expect("the clients");
+        let mut stream = clients
+            .connect_stream(
+                &format!("https://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the TLS connection is up");
+
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut reply = Vec::new();
+        stream
+            .read_to_end(&mut reply)
+            .await
+            .expect("the answer is read");
+
+        assert!(
+            String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 200"),
+            "the raw TLS stream should carry the backend's answer: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
     }
 
     /// A certificate nobody vouches for is refused, which is the whole point of

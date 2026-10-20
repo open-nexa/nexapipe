@@ -2,7 +2,7 @@ use crate::auth::{
     AuthConfig, AuthError, AuthMessage, ClientAcl, DeviceAuth, TotpValidator,
     is_presentable_client_id, is_presentable_device_id,
 };
-use crate::config::Timeouts;
+use crate::config::{BackendProtocol, Timeouts};
 use crate::config_watcher::save_auth_state;
 use crate::http;
 use crate::http::BackendClients;
@@ -438,9 +438,33 @@ pub async fn handle_bidi_stream(
     let outcome: Result<http::ProxySummary, http::ProxyFailure> =
         if http::is_websocket_request_static(&request) {
             tracing::debug!("WebSocket request detected");
-            handle_websocket_stream(send, recv, &request, &backend_info.url, config.timeouts())
-                .await
-                .map_err(http::ProxyFailure::from)
+            match handle_websocket_stream(
+                send,
+                recv,
+                &request,
+                clients,
+                &backend_info.url,
+                backend_info.protocol,
+                config.timeouts(),
+            )
+            .await
+            {
+                Ok(summary) => {
+                    // The backend answered the upgrade, so it is up.
+                    backend_info.report_success();
+                    Ok(summary)
+                }
+                Err(failure) => {
+                    // A failed dial or handshake says the backend is
+                    // unreachable; a session that dies after the upgrade says
+                    // nothing about that. This path is never retried, but the
+                    // circuit still learns from the first case.
+                    if failure.backend_is_down() {
+                        backend_info.report_failure();
+                    }
+                    Err(failure)
+                }
+            }
         } else {
             let body = body
                 .as_ref()
@@ -588,11 +612,23 @@ async fn handle_websocket_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     req: &Request<()>,
+    clients: &BackendClients,
     backend_url: &str,
+    protocol: BackendProtocol,
     timeouts: Timeouts,
-) -> anyhow::Result<http::ProxySummary> {
+) -> Result<http::ProxySummary, http::ProxyFailure> {
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+
+    if protocol == BackendProtocol::H2c {
+        // A WebSocket upgrade is HTTP/1.1. A route that speaks h2c has told
+        // the server its backend starts with HTTP/2's connection preface, and
+        // there is no way to carry an HTTP/1.1 upgrade on that connection.
+        return Err(http::ProxyFailure::from(anyhow::anyhow!(
+            "backend {backend_url} is reached with backend_protocol = \"h2c\", which cannot \
+             carry a WebSocket upgrade; use an http:// or https:// backend that speaks HTTP/1.1"
+        )));
+    }
 
     let host = url
         .host_str()
@@ -607,13 +643,13 @@ async fn handle_websocket_stream(
 
     // Not the pooled HTTP client: a WebSocket holds one dedicated connection
     // for the whole session, so this dial is its own, with the same deadline.
-    let mut backend_stream = tokio::time::timeout(
-        timeouts.connect,
-        tokio::net::TcpStream::connect((host, port)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
-    .map_err(|e| anyhow::anyhow!("failed to connect to backend: {e}"))?;
+    // It is still the same trust store: an https:// backend is reached over a
+    // TLS session this process originates and verifies, exactly as the pooled
+    // clients do.
+    let mut backend_stream = clients
+        .connect_stream(backend_url, timeouts.connect)
+        .await
+        .map_err(|e| http::ProxyFailure::unanswered(e, http::Retryability::Always))?;
 
     let path = req
         .uri()
@@ -640,7 +676,12 @@ async fn handle_websocket_stream(
     }
     request_buf.extend_from_slice(b"\r\n");
 
-    backend_stream.write_all(&request_buf).await?;
+    backend_stream.write_all(&request_buf).await.map_err(|e| {
+        http::ProxyFailure::unanswered(
+            anyhow::anyhow!("failed to write the WebSocket upgrade: {e}"),
+            http::Retryability::Always,
+        )
+    })?;
 
     let mut response_buf = Vec::with_capacity(8192);
     let mut trailing_ws_data = Vec::new();
@@ -684,28 +725,46 @@ async fn handle_websocket_stream(
         Ok(())
     };
 
-    tokio::time::timeout(timeouts.response, read_handshake)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "backend {}:{} did not answer the WebSocket handshake within {:?}",
-                host,
-                port,
-                timeouts.response
-            )
-        })??;
+    match tokio::time::timeout(timeouts.response, read_handshake).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(http::ProxyFailure::unanswered(
+                e,
+                http::Retryability::Always,
+            ));
+        }
+        Err(_) => {
+            return Err(http::ProxyFailure::unanswered(
+                anyhow::anyhow!(
+                    "backend {}:{} did not answer the WebSocket handshake within {:?}",
+                    host,
+                    port,
+                    timeouts.response
+                ),
+                http::Retryability::Always,
+            ));
+        }
+    }
 
     let response = http::parse_http_response_legacy(&response_buf)?;
     let handshake_bytes = response_buf.len() + trailing_ws_data.len();
     if response.status().as_u16() == 101 {
         tracing::debug!("WebSocket handshake successful with backend");
-        send.write_all(&response_buf).await?;
+        send.write_all(&response_buf).await.map_err(|e| {
+            http::ProxyFailure::from(anyhow::anyhow!(
+                "failed to write the WebSocket handshake: {e}"
+            ))
+        })?;
         if !trailing_ws_data.is_empty() {
             tracing::debug!(
                 "WebSocket handshake response contained {} trailing bytes",
                 trailing_ws_data.len()
             );
-            send.write_all(&trailing_ws_data).await?;
+            send.write_all(&trailing_ws_data).await.map_err(|e| {
+                http::ProxyFailure::from(anyhow::anyhow!(
+                    "failed to write the WebSocket handshake: {e}"
+                ))
+            })?;
         }
 
         let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
@@ -759,8 +818,16 @@ async fn handle_websocket_stream(
             "WebSocket handshake failed with backend, status: {}",
             response.status()
         );
-        send.write_all(&response_buf).await?;
-        send.finish()?;
+        send.write_all(&response_buf).await.map_err(|e| {
+            http::ProxyFailure::from(anyhow::anyhow!(
+                "failed to write the WebSocket handshake: {e}"
+            ))
+        })?;
+        send.finish().map_err(|e| {
+            http::ProxyFailure::from(anyhow::anyhow!(
+                "failed to finish the WebSocket stream: {e}"
+            ))
+        })?;
 
         return Ok(http::ProxySummary {
             status: response.status().as_u16(),

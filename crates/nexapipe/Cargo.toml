@@ -46,6 +46,10 @@ webpki-roots = "1.0.9"
 # Reading the CA file an operator names: the PEM parser that goes with the
 # `rustls` above.
 rustls-pemfile = "0.3"
+# A WebSocket is a raw connection for the whole session, so it cannot go
+# through the pooled HTTP client: this is the client-side TLS handshake for an
+# `https://` backend on that path.
+tokio-rustls = "0.26"
 tokio-stream.workspace = true
 flate2 = '1.0'
 bytes.workspace = true
@@ -70,5 +74,3 @@ tempfile = '3.8'
 # A certificate authority and a server certificate of our own, so the tests
 # can run a backend that speaks TLS without shipping a key in the repository.
 rcgen = "0.13"
-# The server side of that handshake.
-tokio-rustls = "0.26"

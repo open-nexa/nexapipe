@@ -13,7 +13,7 @@
 //! shows up as a backend that saw nothing.
 
 use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::presets};
-use nexapipe::config::{RouteMode, Timeouts};
+use nexapipe::config::{Retry, RouteMode, Timeouts};
 use nexapipe::conn;
 use nexapipe::http;
 use nexapipe::l4::FlowLimiter;
@@ -166,6 +166,19 @@ async fn read_request(sock: &mut TcpStream) -> Option<Seen> {
     Some(Seen { request_line, body })
 }
 
+/// An address nothing is listening on.
+///
+/// The port is held by a UDP socket, so a TCP connection to it is refused
+/// rather than timing out. The socket is returned so the caller keeps the
+/// address dead for as long as the test runs.
+async fn dead_backend() -> (String, tokio::net::UdpSocket) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a dead backend");
+    let port = socket.local_addr().expect("dead backend address").port();
+    (format!("http://127.0.0.1:{port}"), socket)
+}
+
 /// A backend that speaks nothing: it keeps the bytes it was sent and answers
 /// with one byte. This is what a passthrough route's TLS backend looks like
 /// from the proxy's side.
@@ -199,6 +212,97 @@ async fn spawn_raw_backend() -> (String, Arc<Mutex<Vec<u8>>>) {
     (addr, got)
 }
 
+/// A WebSocket backend on the loopback address that speaks TLS.
+///
+/// The certificate is made here rather than kept in the repository, and the CA
+/// that signed it is handed to the proxy through `[backends] ca_file`'s
+/// equivalent. A backend that accepts the TLS session and answers the upgrade
+/// is all this path needs.
+struct TlsWebSocketBackend {
+    url: String,
+    ca_file: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_tls_websocket_backend() -> TlsWebSocketBackend {
+    use rcgen::{CertificateParams, IsCa, KeyPair};
+
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("a CA with no names is a CA");
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().expect("a key pair");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("a self-signed CA");
+
+    let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .expect("a certificate for the loopback address");
+    server_params.is_ca = IsCa::NoCa;
+    let server_key = KeyPair::generate().expect("a key pair");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .expect("a certificate signed by the CA");
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let ca_file = dir.path().join("ca.pem");
+    std::fs::write(&ca_file, ca_cert.pem()).expect("the CA file");
+
+    let certs = vec![rustls::pki_types::CertificateDer::from(
+        server_cert.der().to_vec(),
+    )];
+    let key = rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der())
+        .expect("a DER private key");
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the ring provider supports the default protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("a server configuration");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the TLS backend");
+    let port = listener.local_addr().expect("backend address").port();
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        Err(_) => return,
+                    }
+                }
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Upgrade: websocket\r\n\
+                          Connection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                let _ = tls.flush().await;
+                // Keep the connection alive while the test reads the upgrade,
+                // so the proxy's pipes do not race it into an early close.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+        }
+    });
+
+    TlsWebSocketBackend {
+        url: format!("https://127.0.0.1:{port}"),
+        ca_file,
+        _dir: dir,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The proxy under test
 // ---------------------------------------------------------------------------
@@ -211,13 +315,36 @@ struct Proxy {
 /// connection, then hand every bidirectional stream to
 /// `conn::handle_bidi_stream`.
 async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
+    spawn_proxy_with(routes, Retry::default(), None).await
+}
+
+/// The same proxy, with the retry policy the binary would read from
+/// `[retry]`.
+async fn spawn_proxy_with_settings(routes: Vec<Route>, retry: Retry) -> Proxy {
+    spawn_proxy_with(routes, retry, None).await
+}
+
+/// The same proxy, trusting the CA in `ca_file` for `https://` backends.
+async fn spawn_proxy_with_ca(routes: Vec<Route>, ca_file: &std::path::Path) -> Proxy {
+    spawn_proxy_with(routes, Retry::default(), Some(ca_file)).await
+}
+
+async fn spawn_proxy_with(
+    routes: Vec<Route>,
+    retry: Retry,
+    ca_file: Option<&std::path::Path>,
+) -> Proxy {
     let ep = bind().await;
     let addr = dial_address(&ep);
 
-    let config = Arc::new(RouteConfig::new(routes));
+    let config = Arc::new(RouteConfig::with_settings(
+        routes,
+        Timeouts::default(),
+        retry,
+    ));
     let clients = Arc::new(
-        http::BackendClients::new(Timeouts::default().connect, None)
-            .expect("the default trust store is always usable"),
+        http::BackendClients::new(Timeouts::default().connect, ca_file)
+            .expect("the trust store is always usable"),
     );
     let limiter = Arc::new(FlowLimiter::new(64));
 
@@ -360,6 +487,34 @@ impl Tunnel {
         // a legitimate answer for the tests that provoke one.
         recv.read_to_end(REPLY_LIMIT).await.unwrap_or_default()
     }
+
+    /// Sends a WebSocket upgrade and reads only its response head.
+    ///
+    /// An upgrade is not a request with an end: once the `101` arrives the
+    /// stream is a conversation, and waiting for EOF would hang on a backend
+    /// that is doing exactly the right thing.
+    async fn upgrade(&self, payload: &[u8]) -> Vec<u8> {
+        let (mut send, mut recv) = self.conn.open_bi().await.expect("open_bi");
+        send.write_all(payload).await.expect("write request");
+        send.finish().expect("finish request");
+
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await;
+            let Ok(Ok(Some(n))) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..n]);
+            if reply.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        reply
+    }
 }
 
 /// Polls `probe` until it yields, so a test can assert on what another task
@@ -419,6 +574,75 @@ async fn a_get_reaches_the_backend_and_the_reply_comes_back() {
     let seen = backend.seen();
     assert_eq!(seen.len(), 1, "the backend should have seen one request");
     assert_eq!(seen[0].request_line, "GET /hello HTTP/1.1");
+}
+
+/// The same retry rule on the tunnel path: a request that never reached a
+/// backend is asked of another one.
+#[tokio::test]
+async fn a_tunneled_request_that_failed_is_tried_on_another_backend() {
+    let (dead, _hold) = dead_backend().await;
+    let backend = spawn_backend("second").await;
+    let route = Route::new(
+        "retry.test",
+        "/",
+        true,
+        vec![dead, backend.url.clone()],
+        LoadBalancingStrategy::RoundRobin,
+        RouteMode::Http,
+        None,
+    );
+    let proxy = spawn_proxy_with_settings(
+        vec![route],
+        Retry {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /retry HTTP/1.1\r\nHost: retry.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "expected the second backend's 200, got {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(reply_body(&reply), "second");
+    assert_eq!(
+        backend.seen().len(),
+        1,
+        "the surviving backend should have seen the retried request once"
+    );
+}
+
+/// A WebSocket owns its connection, but an `https://` backend is still reached
+/// over a TLS session the proxy originates and verifies.
+#[tokio::test]
+async fn a_websocket_reaches_an_https_backend_over_tls() {
+    let backend = spawn_tls_websocket_backend().await;
+    let proxy =
+        spawn_proxy_with_ca(vec![http_route("ws.test", &backend.url)], &backend.ca_file).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .upgrade(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: ws.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 101"),
+        "expected the backend's upgrade, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
 }
 
 /// The id on the reply is the one the access log records, so a client that
