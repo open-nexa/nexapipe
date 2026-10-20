@@ -1365,8 +1365,16 @@ class VpnViewModel : ViewModel() {
             // the app to grant it — so without this the warning outlives the
             // thing it is about, and the app tells the user to fix something
             // that is already fixed.
-            settingsManager?.saveVpnConsentMissing(false)
-            vpnConsentMissing.value = false
+            //
+            // The stored flag and the one on screen are written together or
+            // not at all: a screen that says there is no warning while the
+            // stored flag says there is one is a screen that contradicts
+            // itself the next time the settings are read back.
+            val manager = settingsManager
+            if (manager != null) {
+                manager.saveVpnConsentMissing(false)
+                vpnConsentMissing.value = false
+            }
         }
         return granted
     }
