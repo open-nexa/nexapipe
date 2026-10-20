@@ -70,7 +70,10 @@ pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
 /// True when the entry started the app: the window stays hidden and the app
 /// waits in the tray.
 pub fn is_background_launch() -> bool {
-    std::env::args().any(|arg| arg == BACKGROUND_FLAG)
+    // `args_os` rather than `args`: the latter panics on a non-UTF-8 argument, and the launcher
+    // that starts the app at login is not ours to control. A panic here would take the whole
+    // start-up down — this runs inside the `setup` hook — over an argument nobody chose.
+    std::env::args_os().any(|arg| arg == std::ffi::OsStr::new(BACKGROUND_FLAG))
 }
 
 /// The path of the running executable, which is what an entry has to point at.
@@ -264,9 +267,29 @@ mod platform {
 </dict>
 </plist>
 "#,
-            exe.display(),
+            xml_escape(&exe.display().to_string()),
             super::BACKGROUND_FLAG,
         )
+    }
+
+    /// The path as XML text.
+    ///
+    /// The path is interpolated into a `<string>`, and XML gives `&`, `<` and
+    /// `>` a meaning of their own. A path carrying one of them — `&` is the
+    /// common one, in a directory name — makes the plist malformed, and
+    /// `launchd` then refuses the agent: the entry is written, the switch says
+    /// "on", and nothing starts at the next login.
+    fn xml_escape(text: &str) -> String {
+        let mut escaped = String::with_capacity(text.len());
+        for c in text.chars() {
+            match c {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                _ => escaped.push(c),
+            }
+        }
+        escaped
     }
 
     /// Narrows the mode of a file to 0644, where the platform has one.
@@ -300,6 +323,24 @@ mod platform {
             // entry would be a job that never starts.
             assert!(plist_content(Path::new("/Applications/nexa.app/nexa"))
                 .contains("<key>RunAtLoad</key>"));
+        }
+
+        #[test]
+        fn a_path_with_xml_in_it_is_escaped() {
+            // An unescaped `&` makes the plist malformed, and `launchd` refuses
+            // an agent it cannot parse — so the entry is written and nothing
+            // ever starts.
+            let plist = plist_content(Path::new("/Users/A&B/nexa.app/nexa"));
+            assert!(
+                plist.contains("<string>/Users/A&amp;B/nexa.app/nexa</string>"),
+                "{plist}"
+            );
+            // And the `<` and `>` of a path are escaped the same way.
+            let plist = plist_content(Path::new("/Users/<a>/nexa"));
+            assert!(
+                plist.contains("<string>/Users/&lt;a&gt;/nexa</string>"),
+                "{plist}"
+            );
         }
     }
 }
@@ -382,18 +423,33 @@ mod platform {
 
     /// The program's path, as the `Exec` line has to carry it.
     ///
-    /// That line is a command line, and a space in it would end the program
-    /// name early — so a path with a space in it is quoted. The specification
-    /// allows either quoting or backslash escapes; quoting is used here
-    /// because a path that contains a quote of its own is a path that cannot be
-    /// expressed in an `Exec` line at all.
+    /// That line is a command line, and the specification reserves a whole set
+    /// of characters in it: space, tab, newline, `"`, `'`, `\`, `>`, `<`, `&`,
+    /// `;`, `$`, `*`, `?`, `#`, `(` and `)`, plus the backtick. A reserved
+    /// character that is not quoted ends the program name early — a path with
+    /// an `&` in it, say, is read as a path and a background job — so a path
+    /// carrying one is quoted.
+    ///
+    /// Inside the quotes, four characters still need an escape of their own:
+    /// the quote, the backslash, the backtick and the dollar sign.
     fn quote_argument(exe: &std::path::Path) -> String {
         let exe = exe.display().to_string();
-        if exe.contains(' ') {
-            format!("\"{exe}\"")
-        } else {
-            exe
+        const RESERVED: &[char] = &[
+            ' ', '\t', '\n', '"', '\'', '\\', '>', '<', '&', ';', '$', '*', '?', '#', '(', ')', '`',
+        ];
+        if !exe.chars().any(|c| RESERVED.contains(&c)) {
+            return exe;
         }
+        let mut quoted = String::with_capacity(exe.len() + 2);
+        quoted.push('"');
+        for c in exe.chars() {
+            if matches!(c, '"' | '\\' | '`' | '$') {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        quoted.push('"');
+        quoted
     }
 
     #[cfg(test)]
@@ -416,6 +472,35 @@ mod platform {
             // Quoting is only needed where it changes the meaning; adding it
             // everywhere would make every entry look like a special case.
             assert_eq!(quote_argument(Path::new("/home/ab/nexa")), "/home/ab/nexa");
+        }
+
+        #[test]
+        fn a_path_with_a_reserved_character_in_it_is_quoted() {
+            // The `Exec` line is read as a command, so an unquoted `&` ends the
+            // program name early — the entry then starts `/home/a` and nothing
+            // else. The specification reserves a whole set of characters, not
+            // the space alone.
+            assert_eq!(
+                quote_argument(Path::new("/home/a&b/nexa")),
+                "\"/home/a&b/nexa\""
+            );
+            assert_eq!(
+                quote_argument(Path::new("/home/a;b/nexa")),
+                "\"/home/a;b/nexa\""
+            );
+        }
+
+        #[test]
+        fn a_quote_in_a_quoted_path_is_escaped() {
+            // Inside the quotes, four characters need an escape of their own.
+            assert_eq!(
+                quote_argument(Path::new("/home/a\"b/nexa")),
+                "\"/home/a\\\"b/nexa\""
+            );
+            assert_eq!(
+                quote_argument(Path::new("/home/a$b/nexa")),
+                "\"/home/a\\$b/nexa\""
+            );
         }
     }
 }
@@ -460,6 +545,8 @@ mod tests {
     /// else's.
     #[test]
     fn the_flag_is_matched_exactly() {
-        assert!(std::env::args().any(|arg| arg == BACKGROUND_FLAG) == is_background_launch());
+        let flag = std::ffi::OsStr::new(BACKGROUND_FLAG);
+        let present = std::env::args_os().any(|arg| arg == flag);
+        assert!(present == is_background_launch());
     }
 }
