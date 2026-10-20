@@ -651,6 +651,11 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
 
     println!();
     println!("2FA enrollment for client \"{}\"", uri.client_id);
+    // The secret belongs on this terminal: the command exists to hand the
+    // operator a credential, and the two lines after it are the `otpauth://`
+    // URI and the QR code, which carry the same secret by design. Nothing else
+    // prints it, and this is the one place it is meant to be seen.
+    // codeql[rust/cleartext-logging]
     println!(
         "  Secret     {}{}",
         uri.secret.expose_secret(),
@@ -1088,6 +1093,10 @@ fn add_client(
         ),
         None => println!("Credential for client \"{}\"", uri.client_id),
     }
+    // The secret belongs on this terminal, for the same reason as in the
+    // `--generate-2fa` path above: the operator asked for this credential and
+    // the next step is typing it into an authenticator app.
+    // codeql[rust/cleartext-logging]
     println!("  Secret     {}", uri.secret.expose_secret());
     println!("  Algorithm  {}", uri.algorithm);
     println!(
