@@ -823,6 +823,21 @@ class VpnViewModel : ViewModel() {
         )
         updateNodeTwoFactor(node.nodeId, twoFactor)
         updateNodeEnrollment(node.nodeId, null)
+        // A server that predates keys ignores the offer and issues a secret.
+        // The key was never recorded there, so this endpoint does not answer
+        // with it, and keeping it would leave a credential the server does not
+        // hold — and one that a later enrollment would offer as if it had never
+        // been used. Dropped here, which is the one moment that knows the offer
+        // was ignored; enrolling again mints a key of its own.
+        if (publicKey == null) {
+            val leftover = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
+            if (leftover.isNotBlank()) {
+                settingsManager?.clearDeviceKey(node.nodeId)
+                addLog(
+                    "Dropped the device key of ${node.nodeId.take(8)}: this server issued a secret"
+                )
+            }
+        }
         // Says what happened, not what will happen: the write behind this is
         // still queued, and on a device that cannot protect the credential it
         // will stop and ask rather than store anything. Reporting it as saved

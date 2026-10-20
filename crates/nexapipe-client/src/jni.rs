@@ -829,14 +829,39 @@ fn device_id() -> Option<String> {
 /// presented as that device, which is exactly when Kotlin knows the name.
 ///
 /// `key` is the device's own Ed25519 key, when it has one. A key is the
-/// credential then, and it wins over the secret: a key node stores no secret at
-/// all, so the TOTP path would find nothing to build from. The name is not
-/// optional here — a key always names the device it was issued to, and the
-/// server refuses a key that names none.
+/// credential only where the record carries no secret: the server holds either
+/// a secret or a public key for a device, never both — `DeviceAuth` in
+/// `crates/nexapipe/src/auth/config.rs` refuses an entry with both — so a record
+/// that has a secret is one the server issued as a secret, and the key beside it
+/// is one it ignored. That matters because the key table is not pruned while the
+/// process lives: a key left over from an enrollment that fell back to a secret
+/// would otherwise sign for a device the server only knows by secret, and every
+/// handshake would be refused while that secret was still valid.
+///
+/// The name is not optional for a key: a key always names the device it was
+/// issued to, and the server refuses a key that names none.
 fn two_factor_auth(cfg: &NodeCredential, key: Option<&iroh::SecretKey>) -> Option<TwoFactorAuth> {
     let (client_id, secret, algorithm, device) = cfg;
     let device = device.as_deref().map(str::trim).filter(|d| !d.is_empty());
 
+    if !secret.trim().is_empty() {
+        if key.is_some() {
+            jni_log!("2FA: a secret is registered beside a device key; answering with the secret");
+        }
+        return match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
+            Ok(auth) => Some(match device {
+                Some(name) => auth.with_device(name),
+                None => auth,
+            }),
+            Err(e) => {
+                jni_log!("2FA auth config invalid: {}", e);
+                None
+            }
+        };
+    }
+
+    // No secret at all, so the key is the credential — the TOTP path would
+    // find nothing to build from and the node would answer with nothing.
     if let Some(key) = key {
         let Some(device) = device else {
             // A key with no device name is one that has not enrolled yet: the
@@ -849,19 +874,7 @@ fn two_factor_auth(cfg: &NodeCredential, key: Option<&iroh::SecretKey>) -> Optio
         return Some(TwoFactorAuth::with_key(client_id, key.clone(), device));
     }
 
-    if secret.trim().is_empty() {
-        return None;
-    }
-    match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
-        Ok(auth) => Some(match device {
-            Some(name) => auth.with_device(name),
-            None => auth,
-        }),
-        Err(e) => {
-            jni_log!("2FA auth config invalid: {}", e);
-            None
-        }
-    }
+    None
 }
 
 /// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
@@ -1702,9 +1715,11 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 endpoint_group.set_two_factor(Some(auth)).await;
             }
             for (node_id, cfg) in node_two_factor_snapshot() {
-                // A key is the credential where there is one: the node stores no
-                // secret at all, so the TOTP path would find nothing to build
-                // from and the node would answer with nothing.
+                // Passed along, not preferred: the key is the credential only
+                // where the record has no secret, and `two_factor_auth` is what
+                // decides that. A key the server never recorded (an older
+                // server ignored the offer) must not shadow the secret it
+                // issued instead.
                 let key = node_device_key_for(&node_id);
                 endpoint_group
                     .set_two_factor_for(&node_id, two_factor_auth(&cfg, key.as_ref()))
@@ -2897,5 +2912,70 @@ mod tests {
             None,
         );
         assert!(two_factor_auth(&cfg, None).is_none());
+    }
+
+    /// A secret wins over a key left beside it. The server holds one kind of
+    /// credential per device, so a record that carries a secret is one it
+    /// issued as a secret: the key was offered, ignored, and never pruned from
+    /// the table this side keeps. Signing with it would be refused while the
+    /// secret was still valid.
+    #[test]
+    fn a_stored_secret_wins_over_a_leftover_key() {
+        let key = DeviceKey::generate();
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            "JBSWY3DPEHPK3PXP".to_string(),
+            "sha1".to_string(),
+            Some("phone-1a2b3c4d".to_string()),
+        );
+
+        let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a secret is a credential");
+        assert_eq!(auth.client_id(), "client-001");
+        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(
+            auth.public_key_hex(),
+            None,
+            "the handshake answers the secret rather than signing with a key the server never recorded"
+        );
+    }
+
+    /// The key's "no device name yet" answer must not swallow a secret: the
+    /// precedence is decided by the secret alone, and the name only matters to
+    /// the key that is not the credential here.
+    #[test]
+    fn a_secret_answers_even_when_the_key_beside_it_names_no_device() {
+        let key = DeviceKey::generate();
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            "JBSWY3DPEHPK3PXP".to_string(),
+            "sha1".to_string(),
+            None,
+        );
+
+        let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a secret is a credential");
+        assert_eq!(
+            auth.device_id(),
+            None,
+            "a secret with no device stays unnamed"
+        );
+        assert_eq!(auth.public_key_hex(), None);
+    }
+
+    /// A blank secret is not a secret, so the key is the credential again: the
+    /// precedence is "is there a secret", not "does the record have one".
+    #[test]
+    fn a_key_answers_when_the_secret_beside_it_is_blank() {
+        let key = DeviceKey::generate();
+        let public = key.public_hex();
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            "   ".to_string(),
+            String::new(),
+            Some("phone-1a2b3c4d".to_string()),
+        );
+
+        let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a key is a credential");
+        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(auth.public_key_hex(), Some(public));
     }
 }
