@@ -68,7 +68,9 @@ as before.
   with `--locked` against the lockfile in this repository, and their base
   images are pinned by digest rather than by a name that can be moved. A
   compromised upstream action or a re-pushed base image no longer changes
-  what a release builds.
+  what a release builds. The tag a hand-triggered release run builds with
+  reaches the script as a value rather than as text, so it cannot become
+  shell on the way in.
 - **`cargo deny` runs over both cargo workspaces.** The licences the
   dependency tree may carry, the registries it may fetch from and the
   duplicate versions it may hold are now a written policy (`deny.toml`) and a
