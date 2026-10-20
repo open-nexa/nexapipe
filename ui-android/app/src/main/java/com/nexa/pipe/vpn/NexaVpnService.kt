@@ -21,6 +21,7 @@ import com.nexa.pipe.R
 import com.nexa.pipe.formatByteRate
 import com.nexa.pipe.locale.AppLocale
 import com.nexa.pipe.parseNodeTraffic
+import com.nexa.pipe.ui.BootConnector
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -96,6 +97,9 @@ class NexaVpnService : VpnService() {
     // native stop, which has to finish whether or not the service is still
     // alive to hear about it.
     private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // The boot connection, while it runs. Kept so it can be cancelled with
+    // the service rather than left behind holding a native call.
+    private var bootConnectJob: Job? = null
     @Volatile private var isUserStarted = false
 
     // Reconnect on network switch: keeps the reconnect job. The mutex serializes the rebuilds
@@ -234,9 +238,82 @@ class NexaVpnService : VpnService() {
                 ACTION_STOP -> {
                     stopVPN()
                 }
+                ACTION_BOOT_CONNECT -> {
+                    // The machine asked for the tunnel to come back.
+                    //
+                    // Android gives a service started with
+                    // startForegroundService() five seconds to call
+                    // startForeground(), and the wait for a network below can
+                    // take longer than that, so the obligation is met here —
+                    // with the text that says what is happening rather than
+                    // the one that says the tunnel is up, because it is not
+                    // yet.
+                    runCatching {
+                        createNotificationChannel()
+                        startForeground(
+                            NOTIFICATION_ID,
+                            createNotification(getString(R.string.notification_text_connecting))
+                        )
+                    }
+                    bootConnectJob = serviceScope.launch {
+                        bootConnect()
+                    }
+                }
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * Brings the tunnel back after a restart.
+     *
+     * The work is the same as a connection the user asked for — see
+     * [com.nexa.pipe.ui.BootConnector] — and it runs here rather than in the
+     * broadcast receiver because this service outlives the broadcast and can
+     * wait for a network.
+     */
+    private suspend fun bootConnect() {
+        if (!awaitNetwork(BOOT_NETWORK_TIMEOUT_MS)) {
+            Log.w(TAG, "boot: no network came up in time, so the tunnel stays down")
+            shutdownService()
+            return
+        }
+
+        val up = try {
+            BootConnector.connectIfWanted(this@NexaVpnService) { Log.i(TAG, it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "boot connect failed: ${e.message}")
+            false
+        }
+        if (!up) {
+            // Nothing came up. A foreground service with no tunnel behind it is
+            // a notification that says the tunnel is up over a tunnel that is
+            // not there, so it goes away.
+            shutdownService()
+        }
+    }
+
+    /**
+     * Waits for a network to come up.
+     *
+     * A boot broadcast arrives while the phone is still finding its way onto
+     * a network, and a tunnel built on no network reaches no backend. Polling
+     * is enough here: what is being waited for is a fact about the radio, and
+     * the radio does not offer a better signal than "there is a network now".
+     *
+     * Bounded, because waiting forever is the same as not trying: the phone
+     * may never get a network, and a foreground service waiting for one it
+     * will never have is a notification nobody asked for.
+     */
+    private suspend fun awaitNetwork(timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (connectivityManager?.activeNetwork != null) {
+                return true
+            }
+            delay(BOOT_NETWORK_POLL_MS)
+        }
+        return false
     }
 
     /**
@@ -994,6 +1071,14 @@ class NexaVpnService : VpnService() {
         private const val TRAFFIC_POLL_INTERVAL_MS = 1_000L
         const val ACTION_START = "com.nexa.pipe.vpn.ACTION_START"
         const val ACTION_STOP = "com.nexa.pipe.vpn.ACTION_STOP"
+        /**
+         * Bring the tunnel back after a restart.
+         *
+         * Sent by [BootReceiver] rather than by the screen: the user asked
+         * for the tunnel to come back when the machine starts, and there is no
+         * screen to ask at that point.
+         */
+        const val ACTION_BOOT_CONNECT = "com.nexa.pipe.vpn.ACTION_BOOT_CONNECT"
         const val EXTRA_DOMAINS = "com.nexa.pipe.vpn.EXTRA_DOMAINS"
         // Whether the user agreed that Nexa may take the slot from another VPN
         // app. Carried by ACTION_START; absent (or false) means the service
@@ -1006,6 +1091,15 @@ class NexaVpnService : VpnService() {
         // starting.
         private const val OWN_NETWORK_POLL_ATTEMPTS = 5
         private const val OWN_NETWORK_POLL_MS = 100L
+
+        // How long the boot path waits for a network, and how often it looks.
+        //
+        // Generous, because a phone that has just been switched on has to find
+        // a network first, and a tunnel built on no network reaches no
+        // backend — but bounded, because a phone that never finds one must not
+        // leave a foreground service waiting for it.
+        private const val BOOT_NETWORK_TIMEOUT_MS = 60_000L
+        private const val BOOT_NETWORK_POLL_MS = 1_000L
 
         // Network-switch reconnect parameters
         private const val RECONNECT_DEBOUNCE_MS = 1_500L

@@ -199,6 +199,36 @@ class VpnViewModel : ViewModel() {
         kotlinx.coroutines.flow.MutableStateFlow(VpnTakeoverChoice.Ask)
 
     /**
+     * Whether the tunnel should come back on its own after a restart.
+     *
+     * Off until the user says otherwise: a proxy that reconnects without being
+     * asked forwards traffic without being asked.
+     */
+    val autoConnectOnBoot = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * Whether the VPN permission was missing when the boot path last looked.
+     *
+     * Android does not promise that the permission survives a restart, so the
+     * boot path checks rather than assumes. When it finds the permission gone
+     * this says so, because a switch that is on and a tunnel that never comes
+     * back is the kind of thing a user cannot act on without being told why.
+     */
+    val vpnConsentMissing = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * Records whether the tunnel should come back after a restart.
+     *
+     * Written straight away rather than through the settings queue: there is
+     * no credential in it, and the queue exists to order keystore writes.
+     */
+    fun setAutoConnectOnBoot(enabled: Boolean) {
+        autoConnectOnBoot.value = enabled
+        settingsManager?.saveAutoConnectOnBoot(enabled)
+        addLog("Reconnect after a restart: $enabled")
+    }
+
+    /**
      * Runtime link type per backend (endpoint ID -> direct/relay), reported by iroh and
      * refreshed while the tunnel is up. Empty whenever nothing is connected, which is what
      * keeps the UI from drawing a stale icon after a disconnect.
@@ -469,6 +499,8 @@ class VpnViewModel : ViewModel() {
             relayUrl.value = manager.loadRelayUrl()
             relayAuthToken.value = manager.loadRelayAuthToken()
             vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
+            autoConnectOnBoot.value = manager.autoConnectOnBoot()
+            vpnConsentMissing.value = manager.vpnConsentMissing()
             deviceId.value = manager.deviceId()
             // Read after the load, because building a SettingsManager runs the
             // migration that re-seals whatever older versions left in plaintext —
