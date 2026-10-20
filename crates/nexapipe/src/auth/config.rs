@@ -573,7 +573,22 @@ impl ClientAcl {
             hosts: hosts.map(|hosts| {
                 hosts
                     .iter()
-                    .map(|h| crate::routes::normalize_host(h))
+                    // Folded as a pattern, not as a host. `normalize_host` takes
+                    // the trailing dots and the brackets off, which is right for
+                    // a host and wrong for a pattern: `*.`, `*..` and `[*]` all
+                    // fold into the catch-all, so an allow-list written as one
+                    // of them would authorize every host. A spelling that would
+                    // fold into the catch-all keeps its own shape here, and
+                    // matches nothing.
+                    .map(|h| {
+                        let folded = crate::routes::normalize_host(h);
+                        if folded == "*" && h != "*" {
+                            // The fold would have widened it into the catch-all.
+                            h.to_ascii_lowercase()
+                        } else {
+                            folded
+                        }
+                    })
                     .collect()
             }),
             ports: ports.map(|ports| ports.to_vec()),
@@ -814,6 +829,37 @@ mod tests {
         let acl = ClientAcl::from_hosts(Some(&[]));
         assert!(!acl.allows("api.example.com"));
         assert!(!acl.allows("anything.test"));
+    }
+
+    /// An entry that is the catch-all in another spelling is not the
+    /// catch-all: `*.`, `*..` and `[*]` all fold into `*`, and an allow-list
+    /// written as one of them would otherwise authorize every host.
+    ///
+    /// The safe direction is the one that denies: an entry nobody meant as
+    /// "every host" must not be read as "every host".
+    #[test]
+    fn an_allow_list_entry_that_folds_into_the_catch_all_authorizes_nothing() {
+        for spelling in ["*.", "*..", "[*]"] {
+            let acl = ClientAcl::from_hosts_and_ports(Some(&[spelling.to_string()]), None);
+
+            assert!(
+                !acl.allows("api.example.com"),
+                "{spelling} must not authorize a host"
+            );
+            assert!(
+                !acl.allows("anything.test"),
+                "{spelling} must not authorize a host"
+            );
+        }
+    }
+
+    /// The catch-all is the catch-all, and it is spelled one way.
+    #[test]
+    fn the_catch_all_still_authorizes_every_host() {
+        let acl = ClientAcl::from_hosts_and_ports(Some(&["*".to_string()]), None);
+
+        assert!(acl.allows("api.example.com"));
+        assert!(acl.allows("anything.test"));
     }
 
     /// A client with no `allow_ports` keeps the historical reach: every port.
