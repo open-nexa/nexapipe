@@ -1,3 +1,4 @@
+use crate::config::BackendProtocol;
 use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use ::http::{Request, Response, StatusCode};
 use flate2::Compression;
@@ -11,11 +12,20 @@ use tokio::io::AsyncReadExt;
 
 /// Client used to reach backends.
 ///
-/// Plaintext HTTP only: TLS is terminated by the backend (Caddy &co), so this
-/// process never speaks TLS to anything but the iroh endpoint. An `https://`
-/// backend is rejected when the config is loaded rather than silently attempted.
+/// Speaks HTTP/1.1 to every backend and HTTP/2 to the ones that offer it: an
+/// `https://` backend negotiates h2 through ALPN, and a cleartext one is
+/// spoken to over HTTP/1.1 unless its route asks for h2c.
+///
+/// One client serves both schemes. The connector reads the scheme off the
+/// request URI, and the pool keeps one set of connections per scheme and
+/// authority — so an `http://` and an `https://` backend on the same host are
+/// two sets, and neither is handed a connection the other opened.
+///
+/// TLS here is a client-side thing: this process never holds a certificate and
+/// never terminates a session. It *originates* one towards a backend the route
+/// names as `https://`, and checks the certificate it gets back.
 pub type HttpClient = hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<bytes::Bytes>,
 >;
 
@@ -26,18 +36,237 @@ pub type HttpClient = hyper_util::client::legacy::Client<
 /// made after the response head arrives, for a pooled connection that was closed
 /// meanwhile. It is a builder setting, not something a caller passes per request,
 /// because that is the only place the transport enforces it.
-pub fn create_http_client(connect_timeout: std::time::Duration) -> HttpClient {
+///
+/// `ca_file` names a PEM file of extra CA certificates to trust when verifying
+/// an `https://` backend. It is the machine's own roots *plus* that file: a
+/// backend signed by an internal authority needs the internal authority, and
+/// everything else keeps working.
+pub fn create_http_client(
+    connect_timeout: std::time::Duration,
+    ca_file: Option<&std::path::Path>,
+) -> anyhow::Result<HttpClient> {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
     http_connector.set_connect_timeout(Some(connect_timeout));
+    // The connector is handed the URI of the backend, `https://` included, and
+    // it is the one that decides to put TLS on top of the socket. A connector
+    // that insists on `http://` would refuse the address before the TLS layer
+    // ever saw it.
+    http_connector.enforce_http(false);
 
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
-        .http1_title_case_headers(true)
-        .http1_ignore_invalid_headers_in_responses(true)
-        .build(http_connector)
+    // The connector is what decides between plaintext and TLS, and it decides
+    // by the scheme of the URI it is handed — so the same client reaches an
+    // `http://` backend and an `https://` one.
+    //
+    // `enable_all_versions` is also what puts the protocols on the table: the
+    // ALPN list the handshake offers is `h2` first and `http/1.1` second, so a
+    // backend that speaks h2 gets it and a backend that does not falls back to
+    // HTTP/1.1 without anybody having to say which it is.
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_client_config(ca_file)?)
+        .https_or_http()
+        .enable_all_versions()
+        .wrap_connector(http_connector);
+
+    Ok(
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .pool_max_idle_per_host(100)
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+            .http1_title_case_headers(true)
+            .http1_ignore_invalid_headers_in_responses(true)
+            // The HTTP/2 settings are the same idea as the HTTP/1 ones above: a
+            // pooled connection is kept while it answers and dropped when it stops
+            // answering. Without them an h2 connection to a backend that went away
+            // stays in the pool until something else notices.
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            // The h2 half needs a clock of its own: an HTTP/2 connection
+            // carries its own timeouts — a ping that has to be answered, a
+            // stream that has to be reset — and without a timer the client
+            // panics the first time it negotiates h2 with a backend.
+            .timer(hyper_util::rt::TokioTimer::new())
+            .build(connector),
+    )
+}
+
+/// The clients the proxy reaches backends through.
+///
+/// Two of them, because the protocol to the backend is a property of the route
+/// and not of the process: a backend that speaks HTTP/2 in the clear is reached
+/// with a client that starts speaking h2, and everything else is reached with
+/// the client that speaks HTTP/1.1 and negotiates h2 over TLS when a backend
+/// offers it.
+///
+/// The two are separate objects rather than one client that decides per
+/// request, because the protocol is decided when the connection is made and
+/// not when the request is sent: a pooled connection is a connection to one
+/// backend in one protocol, and a client that mixed the two would hand an h1
+/// connection to a backend that only speaks h2.
+#[derive(Clone)]
+pub struct BackendClients {
+    /// HTTP/1.1, and HTTP/2 where a backend negotiates it over TLS.
+    http: Arc<HttpClient>,
+    /// HTTP/2 in the clear, with prior knowledge.
+    h2c: Arc<HttpClient>,
+}
+
+impl BackendClients {
+    /// Builds both clients, with the same connect deadline and the same trust
+    /// store.
+    pub fn new(
+        connect_timeout: std::time::Duration,
+        ca_file: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        Ok(BackendClients {
+            http: Arc::new(create_http_client(connect_timeout, ca_file)?),
+            h2c: Arc::new(create_h2c_client(connect_timeout, ca_file)?),
+        })
+    }
+
+    /// The client that speaks this protocol.
+    pub fn for_protocol(&self, protocol: BackendProtocol) -> &HttpClient {
+        match protocol {
+            BackendProtocol::Http1 => &self.http,
+            BackendProtocol::H2c => &self.h2c,
+        }
+    }
+}
+
+/// Builds the client that speaks HTTP/2 in the clear, with prior knowledge.
+///
+/// The other name for this is h2c, and the "prior knowledge" is the whole
+/// point: a cleartext connection has no handshake to negotiate a protocol in,
+/// so the client has to know that the backend speaks h2 and start speaking it.
+/// A backend that does not answer h2 gets a connection reset, which is a
+/// failure the route's own configuration is responsible for avoiding.
+pub fn create_h2c_client(
+    connect_timeout: std::time::Duration,
+    ca_file: Option<&std::path::Path>,
+) -> anyhow::Result<HttpClient> {
+    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    http_connector.set_nodelay(true);
+    http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
+    http_connector.set_connect_timeout(Some(connect_timeout));
+    // As in `create_http_client`: the connector is handed the URI and does not
+    // get to refuse the scheme.
+    http_connector.enforce_http(false);
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_client_config(ca_file)?)
+        .https_or_http()
+        .enable_all_versions()
+        .wrap_connector(http_connector);
+
+    Ok(
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            // The one setting that makes this client h2: every connection it
+            // opens is an h2 connection, whatever the peer says or does not say.
+            .http2_only(true)
+            .pool_max_idle_per_host(100)
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            // The clock the h2 half needs, for the same reason the other client
+            // has one: an h2 connection times things on its own.
+            .timer(hyper_util::rt::TokioTimer::new())
+            .build(connector),
+    )
+}
+
+/// The TLS configuration a backend handshake is made with.
+///
+/// The certificate is verified against the machine's own trust store, and there
+/// is no way to turn that off: a proxy that connects to a backend without
+/// checking who it is talking to is a proxy that can be redirected by whoever
+/// answers the name. A backend whose certificate this process cannot verify is
+/// a backend this proxy does not reach.
+///
+/// The provider is named rather than left to the process-wide default, so the
+/// client does not depend on the order things happen to be installed in — the
+/// iroh handshake installs a provider of its own, and the two must not race.
+fn tls_client_config(ca_file: Option<&std::path::Path>) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the ring provider supports the default protocol versions")
+        .with_root_certificates(root_store(ca_file)?)
+        .with_no_client_auth())
+}
+
+/// The certificates a backend's certificate is checked against.
+///
+/// The machine's own roots rather than a list this project ships: a
+/// certificate the browser on the same machine trusts is a certificate this
+/// proxy trusts, and a bundled list goes stale without anybody noticing.
+///
+/// A host with no roots of its own — a minimal container image without
+/// `ca-certificates`, say — falls back to Mozilla's bundled ones, because a
+/// proxy that cannot verify anything is a proxy that cannot reach an
+/// `https://` backend at all. The fallback is a weaker guarantee and says so
+/// in the log, rather than turning every handshake into a message about a
+/// missing issuer.
+fn root_store(ca_file: Option<&std::path::Path>) -> anyhow::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+
+    // The platform loader reports what it could not read alongside what it
+    // read, rather than failing as a whole: one unreadable store on a machine
+    // with several is still a store.
+    let native = rustls_native_certs::load_native_certs();
+    if !native.certs.is_empty() {
+        let mut rejected = 0usize;
+        for cert in native.certs {
+            if roots.add(cert).is_err() {
+                rejected += 1;
+            }
+        }
+        tracing::info!(
+            "Loaded {} CA certificates from the system trust store ({rejected} rejected)",
+            roots.len()
+        );
+    } else {
+        tracing::warn!(
+            "The system trust store holds no usable certificates ({} errors); falling back to \
+             Mozilla's bundled roots for backend TLS",
+            native.errors.len()
+        );
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    // The file the operator named is read here rather than at the first
+    // handshake: a CA file that cannot be read is a config that cannot work,
+    // and the operator should read about it at startup rather than in the log
+    // of a request that failed to verify.
+    if let Some(path) = ca_file {
+        let pem = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("cannot read the CA file {}: {e}", path.display()))?;
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut reader)
+            .map_err(|e| anyhow::anyhow!("cannot parse the CA file {}: {e}", path.display()))?;
+        if certs.is_empty() {
+            anyhow::bail!(
+                "the CA file {} holds no certificates; it should hold one or more PEM-encoded \
+                 certificates",
+                path.display()
+            );
+        }
+        let mut rejected = 0usize;
+        for cert in certs {
+            if roots
+                .add(rustls::pki_types::CertificateDer::from(cert))
+                .is_err()
+            {
+                rejected += 1;
+            }
+        }
+        tracing::info!(
+            "Loaded the CA file {} ({} certificates, {rejected} rejected)",
+            path.display(),
+            roots.len()
+        );
+    }
+
+    Ok(roots)
 }
 
 const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
@@ -169,7 +398,7 @@ fn forwards_request_header(name: &str) -> bool {
 }
 
 pub async fn proxy_request(
-    client: &HttpClient,
+    clients: &BackendClients,
     req: Request<Incoming>,
     config: Arc<RouteConfig>,
 ) -> Result<Response<ProxyBody>, anyhow::Error> {
@@ -223,6 +452,12 @@ pub async fn proxy_request(
             ));
         }
     };
+
+    // The client is picked by the protocol the route speaks to its backends,
+    // which is decided by the route rather than by the request: a backend that
+    // speaks h2 in the clear is reached with the h2c client, everything else
+    // with the one that speaks HTTP/1.1 and negotiates h2 over TLS.
+    let client = clients.for_protocol(backend_info.protocol);
 
     // `backend_info` carries the lease (see `BackendInfo::_lease`), so the
     // backend is counted as busy until this function returns — which is until
@@ -599,18 +834,23 @@ impl ProxyFailure {
 // pass the same two things — see the note on `conn::handle_bidi_stream`.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_to_backend_streaming(
-    client: &HttpClient,
+    clients: &BackendClients,
     // How long the backend may take to answer. Not read off the client, because
     // it is not the client's: the client owns the deadline for every dial, this
     // is the one for a single answer. See `crate::config::Timeouts`.
     timeouts: crate::config::Timeouts,
     req: &Request<()>,
     backend_url: &str,
+    // The protocol this backend is spoken to, which decides the client. It
+    // comes from the route rather than from the URL, because the same URL is
+    // reached differently depending on what the route says.
+    protocol: BackendProtocol,
     body_data: Vec<u8>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
     request_id: &str,
 ) -> Result<ProxySummary, ProxyFailure> {
+    let client = clients.for_protocol(protocol);
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -734,11 +974,15 @@ pub async fn proxy_to_backend_streaming(
     response_buf
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
 
-    let original_was_chunked = parts
+    // Whether the backend framed the body with a transfer coding of its own
+    // that is not `chunked`. Such a body is still encoded when it arrives, and
+    // the header that says so is dropped below, so it is not framed again
+    // either.
+    let other_transfer_coding = parts
         .headers
         .get("transfer-encoding")
         .and_then(|h| h.to_str().ok())
-        .map(|v| v.to_lowercase().contains("chunked"))
+        .map(|v| !v.to_lowercase().split(',').any(|c| c.trim() == "chunked"))
         .unwrap_or(false);
     let has_content_length = parts.headers.get("content-length").is_some();
 
@@ -759,7 +1003,17 @@ pub async fn proxy_to_backend_streaming(
         response_buf.extend_from_slice(b"\r\n");
     }
 
-    let use_chunked = !has_content_length && original_was_chunked;
+    // Whether the body is framed for the client, which is a question about
+    // what the *client* can be told rather than about what the backend said.
+    //
+    // The client on the other end of the tunnel speaks HTTP/1.1, and HTTP/1.1
+    // has no way to say "the body ends when this stream ends": a body with no
+    // length has to be chunked, or the client waits for a connection close
+    // that never comes. A backend that speaks HTTP/2 never sends a length at
+    // all — the stream carries the end — so a response from an h2 backend is
+    // exactly the case that has to be framed here. A backend that sent no
+    // length over HTTP/1.1 means the same thing, and is framed the same way.
+    let use_chunked = !has_content_length && !other_transfer_coding;
     if use_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
@@ -1827,5 +2081,297 @@ mod tests {
                 "a frame within the idle deadline must pass through: {frame:?}"
             );
         }
+    }
+}
+
+/// A backend that speaks TLS, and the client that reaches it.
+///
+/// The certificate is made here rather than kept in the repository: a key in
+/// the tree is a key somebody has to trust not to be used, and a test that
+/// needs one can make one in a millisecond.
+#[cfg(test)]
+mod tls {
+    use super::*;
+    use rcgen::{CertificateParams, IsCa, KeyPair};
+    use std::convert::Infallible;
+
+    /// The CA that signs the backend's certificate, and the backend's own
+    /// certificate and key.
+    struct Pki {
+        /// The CA certificate, PEM-encoded, which is what `[backends] ca_file`
+        /// points at.
+        ca_pem: String,
+        server_cert: Vec<u8>,
+        server_key: Vec<u8>,
+    }
+
+    /// A CA of our own, and a certificate for `127.0.0.1` signed by it.
+    fn pki() -> Pki {
+        let mut ca_params =
+            CertificateParams::new(Vec::<String>::new()).expect("a CA with no names is a CA");
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().expect("a key pair");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("a self-signed CA");
+
+        let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .expect("a certificate for the loopback address");
+        server_params.is_ca = IsCa::NoCa;
+        let server_key = KeyPair::generate().expect("a key pair");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .expect("a certificate signed by the CA");
+
+        Pki {
+            ca_pem: ca_cert.pem(),
+            server_cert: server_cert.der().to_vec(),
+            server_key: server_key.serialize_der(),
+        }
+    }
+
+    /// A backend on the loopback address that answers every request with
+    /// `hello`, over TLS.
+    ///
+    /// `alpn` is what the backend offers the handshake: `["http/1.1"]` for a
+    /// backend that speaks one version, `["h2"]` for one that speaks the
+    /// other and only the other. A client that cannot offer one of them fails
+    /// the handshake, which is what makes the h2 test a test.
+    async fn tls_backend(pki: &Pki, alpn: &[&[u8]]) -> u16 {
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            pki.server_cert.clone(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(pki.server_key.clone())
+            .expect("a DER private key");
+        // The provider is named rather than left to the process-wide default:
+        // more than one is compiled in, and rustls refuses to guess which one
+        // a process should use.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("a server configuration");
+        server_config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(|_req| async {
+                                Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                    bytes::Bytes::from_static(b"hello"),
+                                )))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// The backend is reached over TLS, and the answer comes back.
+    #[tokio::test]
+    async fn an_https_backend_is_reached_over_tls() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        let client = create_http_client(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+            .expect("a client");
+
+        let response = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers");
+        assert_eq!(response.status(), 200);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// A certificate nobody vouches for is refused, which is the whole point of
+    /// checking one.
+    #[tokio::test]
+    async fn a_certificate_that_is_not_vouched_for_is_refused() {
+        let pki = pki();
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        // No CA file: the machine's own roots, which know nothing about the
+        // certificate this backend just presented.
+        let client = create_http_client(std::time::Duration::from_secs(5), None).expect("a client");
+
+        let result = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await;
+        assert!(
+            result.is_err(),
+            "a certificate signed by an authority this process does not trust must not be \
+             accepted: {:?}",
+            result.map(|r| r.status())
+        );
+    }
+
+    /// A backend that speaks HTTP/2 and nothing else, over TLS.
+    ///
+    /// The backend offers `h2` and only `h2`, so a client that did not speak
+    /// it would fail the handshake rather than fall back: the answer coming
+    /// back is the proof that the connection was HTTP/2.
+    async fn h2_tls_backend(pki: &Pki) -> u16 {
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            pki.server_cert.clone(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(pki.server_key.clone())
+            .expect("a DER private key");
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("a server configuration");
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls);
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req| async {
+                            Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                bytes::Bytes::from_static(b"hello"),
+                            )))
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A backend that speaks HTTP/2 in the clear, and nothing else.
+    async fn h2c_backend() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req| async {
+                            Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                bytes::Bytes::from_static(b"hello"),
+                            )))
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A backend that speaks HTTP/2 over TLS is reached over HTTP/2, without
+    /// anybody having to say so: the handshake agrees on it.
+    #[tokio::test]
+    async fn an_https_backend_is_reached_over_http2() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = h2_tls_backend(&pki).await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+                .expect("the clients");
+        let client = clients.for_protocol(BackendProtocol::Http1);
+
+        let response = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers over h2");
+        assert_eq!(response.status(), 200);
+    }
+
+    /// A backend that speaks HTTP/2 in the clear is reached over HTTP/2, by
+    /// the client that starts speaking it — there is no handshake on a
+    /// cleartext connection to agree on anything.
+    #[tokio::test]
+    async fn a_cleartext_backend_is_reached_over_http2() {
+        let port = h2c_backend().await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+        let client = clients.for_protocol(BackendProtocol::H2c);
+
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers over h2");
+        assert_eq!(response.status(), 200);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// The CA file is read at startup, so a file that cannot be read is an
+    /// error the operator sees rather than a handshake that fails later.
+    #[test]
+    fn a_ca_file_that_cannot_be_read_is_refused() {
+        let error = create_http_client(
+            std::time::Duration::from_secs(1),
+            Some(std::path::Path::new("/nonexistent/nexapipe-ca.pem")),
+        )
+        .expect_err("a CA file that does not exist cannot be used");
+        assert!(
+            error.to_string().contains("cannot read the CA file"),
+            "the message has to name the file: {error}"
+        );
     }
 }

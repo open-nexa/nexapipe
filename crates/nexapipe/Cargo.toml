@@ -29,6 +29,23 @@ futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+# TLS towards the backends: a route may name an `https://` backend, and this
+# is the client side of that handshake. `ring` rather than the default
+# `aws-lc-rs`, because the workspace's `rustls` already asks for `ring` and the
+# process installs that one provider for the iroh handshake as well.
+hyper-rustls = { version = "0.27.10", default-features = false, features = [
+    "ring",
+    "http1",
+    "http2",
+    "tls12",
+] }
+# The trust store a backend's certificate is checked against: the machine's own
+# roots, with Mozilla's bundled ones as the fallback for a host that has none.
+rustls-native-certs = "0.8.4"
+webpki-roots = "1.0.9"
+# Reading the CA file an operator names: the PEM parser that goes with the
+# `rustls` above.
+rustls-pemfile = "0.3"
 tokio-stream.workspace = true
 flate2 = '1.0'
 bytes.workspace = true
@@ -50,3 +67,8 @@ duct = '1.1.1'
 tokio = { workspace = true, features = ['test-util'] }
 rqrr = { version = "0.11", default-features = false }
 tempfile = '3.8'
+# A certificate authority and a server certificate of our own, so the tests
+# can run a backend that speaks TLS without shipping a key in the repository.
+rcgen = "0.13"
+# The server side of that handshake.
+tokio-rustls = "0.26"

@@ -5,6 +5,7 @@ use crate::auth::{
 use crate::config::Timeouts;
 use crate::config_watcher::save_auth_state;
 use crate::http;
+use crate::http::BackendClients;
 use crate::l4;
 use crate::metrics;
 use crate::passthrough;
@@ -12,7 +13,6 @@ use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
 use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
-use hyper_util::client::legacy;
 use iroh::endpoint::{Connection, Incoming};
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
@@ -25,9 +25,6 @@ pub mod limits;
 pub mod peers;
 
 use limits::Limiters;
-
-type HttpClient =
-    legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
 
 /// How long the server waits for the client to open the 2FA handshake stream.
 ///
@@ -187,7 +184,7 @@ pub async fn handle_bidi_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     config: &RouteConfig,
-    client: &HttpClient,
+    clients: &BackendClients,
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
     acl: Option<Arc<ClientAcl>>,
@@ -423,10 +420,11 @@ pub async fn handle_bidi_stream(
         } else {
             let mut send = send;
             http::proxy_to_backend_streaming(
-                client,
+                clients,
                 config.timeouts(),
                 &request,
                 &backend_info.url,
+                backend_info.protocol,
                 body_data,
                 &mut send,
                 &mut recv,
@@ -1881,7 +1879,7 @@ async fn read_bytes(recv: &mut iroh::endpoint::RecvStream, len: usize) -> Result
 pub async fn handle_connection(
     conn: Connection,
     config: Arc<RouteConfig>,
-    client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     auth_state: Option<AuthState>,
     peers: Arc<PeerRegistry>,
     limiters: Limiters,
@@ -2107,7 +2105,7 @@ pub async fn handle_connection(
                     continue;
                 };
                 let config_clone = config.clone();
-                let client_clone = client.clone();
+                let clients_clone = clients.clone();
                 let limiter_clone = limiter.clone();
                 let peer_clone = peer.clone();
                 let acl_clone = client_acl.clone();
@@ -2139,7 +2137,7 @@ pub async fn handle_connection(
                         send,
                         recv,
                         &config_clone,
-                        &client_clone,
+                        &clients_clone,
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,
@@ -2176,7 +2174,7 @@ pub async fn handle_connection(
 pub async fn handle_incoming(
     incoming: Incoming,
     config: Arc<RouteConfig>,
-    client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     auth_state: Option<AuthState>,
     limiters: Limiters,
     in_flight: InFlightGuard,
@@ -2220,7 +2218,7 @@ pub async fn handle_incoming(
                     // shutdown knows this connection is still here.
                     let _guard = guard;
                     let _in_flight = in_flight;
-                    handle_connection(conn, config, client, auth_state, peers, limiters).await;
+                    handle_connection(conn, config, clients, auth_state, peers, limiters).await;
                 });
             }
             Err(e) => {

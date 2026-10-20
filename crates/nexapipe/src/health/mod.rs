@@ -1,4 +1,5 @@
-use crate::http::HttpClient;
+use crate::config::BackendProtocol;
+use crate::http::BackendClients;
 use crate::lb::BackendPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +42,13 @@ pub enum ProbeKind {
     ///
     /// The path belongs to this variant and not to the checker, because the TCP
     /// probe has no use for one — carrying it alongside would be a field that
-    /// only means something half the time.
-    Http { path: String },
+    /// only means something half the time. The protocol is here for the same
+    /// reason: it is how the HTTP question is asked, and a TCP probe does not
+    /// ask it.
+    Http {
+        path: String,
+        protocol: BackendProtocol,
+    },
     /// Connect, then close. Liveness, not health.
     Tcp,
 }
@@ -62,7 +68,7 @@ pub struct ProbeTarget {
 
 pub struct HealthChecker {
     backend_pool: Arc<BackendPool>,
-    client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     interval: Duration,
     timeout: Duration,
     failure_threshold: usize,
@@ -80,7 +86,7 @@ pub struct HealthChecker {
 impl HealthChecker {
     pub fn new(
         backend_pool: Arc<BackendPool>,
-        client: Arc<HttpClient>,
+        clients: Arc<BackendClients>,
         interval: Duration,
         timeout: Duration,
         failure_threshold: usize,
@@ -89,7 +95,7 @@ impl HealthChecker {
     ) -> Self {
         HealthChecker {
             backend_pool,
-            client,
+            clients,
             interval,
             timeout,
             failure_threshold: failure_threshold.max(1),
@@ -192,7 +198,7 @@ impl HealthChecker {
 
     async fn check_backend(&self, url: &str) -> bool {
         match &self.kind {
-            ProbeKind::Http { path } => self.check_http(url, path).await,
+            ProbeKind::Http { path, protocol } => self.check_http(url, path, *protocol).await,
             ProbeKind::Tcp => self.check_tcp(url).await,
         }
     }
@@ -236,7 +242,7 @@ impl HealthChecker {
         }
     }
 
-    async fn check_http(&self, url: &str, health_path: &str) -> bool {
+    async fn check_http(&self, url: &str, health_path: &str, protocol: BackendProtocol) -> bool {
         let health_url = format!("{}{}", url, health_path);
 
         // `health_path` comes from the config, and a character the URI parser
@@ -262,7 +268,8 @@ impl HealthChecker {
             }
         };
 
-        match tokio::time::timeout(self.timeout, self.client.request(request)).await {
+        let client = self.clients.for_protocol(protocol);
+        match tokio::time::timeout(self.timeout, client.request(request)).await {
             Ok(Ok(response)) => {
                 let status = response.status();
                 // Treat 2xx and 404 as healthy: some backends don't implement
@@ -370,14 +377,16 @@ mod tests {
     ) -> HealthChecker {
         HealthChecker::new(
             pool,
-            Arc::new(http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Duration::from_millis(10),
             Duration::from_millis(200),
             threshold,
             ProbeKind::Http {
                 path: "/health".to_string(),
+                protocol: BackendProtocol::Http1,
             },
             enabled,
         )
@@ -388,9 +397,10 @@ mod tests {
     fn tcp_checker(pool: Arc<BackendPool>) -> HealthChecker {
         HealthChecker::new(
             pool,
-            Arc::new(http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Duration::from_millis(10),
             Duration::from_millis(500),
             1,
@@ -413,6 +423,7 @@ mod tests {
     fn http_probe() -> ProbeKind {
         ProbeKind::Http {
             path: "/health".to_string(),
+            protocol: BackendProtocol::Http1,
         }
     }
 
@@ -628,14 +639,16 @@ mod tests {
         // for the rest of the run.
         let checker = HealthChecker::new(
             pool(),
-            Arc::new(http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Duration::from_millis(10),
             Duration::from_millis(200),
             1,
             ProbeKind::Http {
                 path: "/health check".to_string(),
+                protocol: BackendProtocol::Http1,
             },
             Arc::new(AtomicBool::new(true)),
         );

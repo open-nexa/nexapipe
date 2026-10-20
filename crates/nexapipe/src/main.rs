@@ -558,6 +558,7 @@ async fn run_server_mode(
             health_check: proxy_config.health_check.clone(),
             admin: admin_config,
             metrics: metrics_config,
+            backends: proxy_config.backends.clone(),
         },
     )
     .await

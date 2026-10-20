@@ -215,7 +215,10 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
     let addr = dial_address(&ep);
 
     let config = Arc::new(RouteConfig::new(routes));
-    let client = Arc::new(http::create_http_client(Timeouts::default().connect));
+    let clients = Arc::new(
+        http::BackendClients::new(Timeouts::default().connect, None)
+            .expect("the default trust store is always usable"),
+    );
     let limiter = Arc::new(FlowLimiter::new(64));
 
     tokio::spawn(async move {
@@ -228,7 +231,7 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
             };
 
             let config = config.clone();
-            let client = client.clone();
+            let clients = clients.clone();
             let limiter = limiter.clone();
             tokio::spawn(async move {
                 // Keep accepting on this connection: a task that returns after
@@ -245,7 +248,7 @@ async fn spawn_proxy(routes: Vec<Route>) -> Proxy {
                         send,
                         recv,
                         &config,
-                        &client,
+                        &clients,
                         &limiter,
                         "data-plane-test",
                         None,

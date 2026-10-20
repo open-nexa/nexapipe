@@ -1,5 +1,5 @@
 use crate::auth::ClientAcl;
-use crate::config::{RouteMode, Timeouts};
+use crate::config::{BackendProtocol, RouteMode, Timeouts};
 use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,6 +144,12 @@ pub struct Route {
     /// decided before matching, by its first byte.
     modes: Vec<RouteMode>,
     backend_pool: Arc<BackendPool>,
+    /// The wire protocol the backends of this route are spoken to.
+    ///
+    /// Part of the route rather than of the pool, because it is a property of
+    /// the hop to the backend and every backend of a route is reached the same
+    /// way. See [`crate::config::BackendProtocol`].
+    backend_protocol: BackendProtocol,
     path_rewrite: Option<String>,
     l4: L4Options,
 }
@@ -168,9 +174,20 @@ impl Route {
             path_is_prefix,
             modes: vec![mode],
             backend_pool: Arc::new(BackendPool::new(backends, strategy)),
+            backend_protocol: BackendProtocol::default(),
             path_rewrite,
             l4: L4Options::default(),
         }
+    }
+
+    /// Speak to this route's backends with this protocol.
+    ///
+    /// A builder rather than another constructor argument: the protocol is
+    /// about the hop to the backend, and a route that does not name one speaks
+    /// HTTP/1.1 — which is what the default says.
+    pub fn with_backend_protocol(mut self, protocol: BackendProtocol) -> Self {
+        self.backend_protocol = protocol;
+        self
     }
 
     /// Serve several modes from one route instead of one.
@@ -306,6 +323,11 @@ impl Route {
         &self.backend_pool
     }
 
+    /// The wire protocol this route's backends are spoken to.
+    pub fn backend_protocol(&self) -> BackendProtocol {
+        self.backend_protocol
+    }
+
     /// What makes this the same route across a reload, for the two things that
     /// hang off it: its backend pool and the health probe watching that pool.
     ///
@@ -425,6 +447,13 @@ impl<T> BackendLookup<T> {
 
 pub struct BackendInfo {
     pub url: String,
+    /// The wire protocol this backend is to be spoken to.
+    ///
+    /// Carried with the address because it is the other half of "where this
+    /// request goes": the same address is reached differently depending on
+    /// what the route says, and a caller that picked the backend has to pick
+    /// the client with it.
+    pub protocol: BackendProtocol,
     pub path_rewrite: Option<String>,
     pub path_pattern: String,
     pub path_is_prefix: bool,
@@ -565,6 +594,7 @@ impl RouteConfig {
         );
         BackendLookup::Found(BackendInfo {
             url: lease.url().to_string(),
+            protocol: route.backend_protocol(),
             path_rewrite: route.path_rewrite().clone(),
             path_pattern: route.path_pattern().to_string(),
             path_is_prefix: route.path_is_prefix(),
