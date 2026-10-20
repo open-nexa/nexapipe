@@ -115,6 +115,22 @@ a behaviour change, and a test that was not run is not a test that passed.
 the latter rewrites files nobody asked about and buries the change under
 formatting noise.
 
+Not every command in the table is available on every machine. `cargo ndk` is a
+separate install (`cargo install cargo-ndk`) and needs an Android NDK that CI
+installs for itself; where it is missing the NDK row cannot be run locally, and
+the report has to say so instead of leaving the box ticked. Run clippy the way
+CI runs it — `cargo clippy --workspace --all-targets --locked -- -D warnings` —
+because `--locked` is what stops a `Cargo.lock` edit from slipping in unnoticed.
+
+A lint that fires in a file you did not touch is not yours to fix. The local
+toolchain is usually ahead of the one CI pins, so the two disagree about what a
+warning even is. `cargo clippy` on a clean `upstream/main` fails today on
+`crates/nexapipe-client/src/traffic.rs`: Rust 1.99 deprecated
+`Atomic::fetch_update`, CI still runs 1.98.1 and cannot see it. Taking the
+compiler's own suggestion there — `try_update` — needs 1.95, which is above the
+workspace's declared `rust-version = "1.89"`, and no CI job checks that floor.
+Report the failure, leave the file alone, and let the owner decide.
+
 The job names are the ones `.github/workflows/ci.yml` reports on a pull request.
 Rename a job there and this table is stale.
 
@@ -142,6 +158,14 @@ is. The PR description follows `.github/PULL_REQUEST_TEMPLATE.md`: what changed,
 why, how it was verified — the commands that were actually run, and an honest
 list of what was not run and why. Screenshots or a recording are required for UI
 and VPN behaviour.
+
+The template is a file to read, not one `gh` applies. `gh pr create --body`
+takes the body verbatim: nothing fills the sections in, and a body that misses
+them reads as a body that skipped the template. Read
+`.github/PULL_REQUEST_TEMPLATE.md`, mirror its headings, and delete the
+checklist rows that do not apply — a ticked box for a command nobody ran is
+worse than no box at all. `gh pr create --body-file <path>` takes the body from
+a file, which is the easier way to write a long one.
 
 Opening or editing the pull request itself, in `upstream`, stays with the owner
 unless they asked for it.
