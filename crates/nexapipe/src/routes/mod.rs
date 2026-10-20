@@ -461,7 +461,25 @@ pub struct BackendInfo {
     /// backend: dropping it is what releases the backend's slot in the balancer,
     /// so nothing reads this field — moving it along with the requests is the
     /// whole point. See [`crate::lb::BackendLease`].
-    _lease: BackendLease,
+    ///
+    /// Taken rather than borrowed, because the work against a backend is not
+    /// over when the response head arrives: a body that is still streaming is
+    /// a backend that is still busy, and the caller that owns the body is the
+    /// one that has to keep the lease until it is dropped.
+    _lease: Option<BackendLease>,
+}
+
+impl BackendInfo {
+    /// Takes the lease out, so the caller can hold it for as long as the work
+    /// lasts.
+    ///
+    /// The lease counts the backend as busy until it is dropped, and the work
+    /// is not over when the response head is in: the body may still be
+    /// streaming. A caller that keeps the lease with the body is what makes
+    /// `least_conn` count what is really in flight.
+    pub fn take_lease(&mut self) -> Option<BackendLease> {
+        self._lease.take()
+    }
 }
 
 /// What the L4 tunnel needs in order to serve one flow.
@@ -598,7 +616,7 @@ impl RouteConfig {
             path_rewrite: route.path_rewrite().clone(),
             path_pattern: route.path_pattern().to_string(),
             path_is_prefix: route.path_is_prefix(),
-            _lease: lease,
+            _lease: Some(lease),
         })
     }
 

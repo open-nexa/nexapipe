@@ -313,6 +313,22 @@ impl BackendPool {
         result
     }
 
+    /// How many requests are outstanding against one backend right now.
+    ///
+    /// The number `least_conn` balances on, exposed so that what it counts
+    /// can be checked rather than taken on trust: a backend that is streaming
+    /// a response is busy, and one that answered and is waiting for the next
+    /// request is not.
+    pub async fn outstanding(&self, url: &str) -> usize {
+        let mut count = 0;
+        for backend in &self.backends {
+            if backend.status.read().await.url == url {
+                count += backend.in_flight.load(Ordering::Relaxed);
+            }
+        }
+        count
+    }
+
     /// How many backends are healthy right now.
     ///
     /// Reported rather than deduced from [`BackendPool::select_backend`], which

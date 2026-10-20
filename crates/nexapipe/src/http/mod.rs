@@ -397,11 +397,20 @@ fn forwards_request_header(name: &str) -> bool {
     .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
-pub async fn proxy_request(
+///
+/// The request body is a parameter rather than `Incoming` so that the path can
+/// be driven by something other than a live connection — a test, mostly. The
+/// body is read whole either way, and what comes back does not depend on where
+/// the request came from.
+pub async fn proxy_request<B>(
     clients: &BackendClients,
-    req: Request<Incoming>,
+    req: Request<B>,
     config: Arc<RouteConfig>,
-) -> Result<Response<ProxyBody>, anyhow::Error> {
+) -> Result<Response<ProxyBody>, anyhow::Error>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     // Answered, not raised: no `Host` means no route can match, which is the
     // same answer as a host no route matches — and the caller maps an `Err`
     // from here to a 502, which would blame a backend for a request that never
@@ -432,7 +441,7 @@ pub async fn proxy_request(
     let headers_clone = req.headers().clone();
     let method = req.method().clone();
 
-    let backend_info: BackendInfo = match config.get_backend(host, path).await {
+    let mut backend_info: BackendInfo = match config.get_backend(host, path).await {
         BackendLookup::Found(info) => info,
         // No route serves this host: saying 404 beats guessing at one.
         BackendLookup::NoRoute => {
@@ -556,16 +565,60 @@ pub async fn proxy_request(
     // request — and the connection — for as long as it liked.
     let idle = config.timeouts().deadlines.response_idle;
 
+    // The lease moves out of the backend info and into the body, because the
+    // work against that backend is not over when the response head arrives: a
+    // body that is still streaming is a backend that is still busy. See
+    // `LeasedBody`.
+    let lease = backend_info.take_lease();
+
     if content_encoding.is_none()
         && should_compress(content_type)
         && let Some(encodings) = accept_encoding
         && encodings.contains("gzip")
     {
+        // The whole body is read and compressed here, so the backend is done
+        // with it before the answer goes out: the lease goes back with the
+        // `backend_info` that is dropped at the end of this function.
         return compress_response(response, "gzip", idle).await;
     }
 
-    Ok(response
-        .map(|body| http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync()))
+    Ok(response.map(|body| {
+        let body = http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync();
+        http_body_util::BodyExt::boxed_unsync(LeasedBody {
+            inner: body,
+            _lease: lease,
+        })
+    }))
+}
+
+/// A response body that keeps its backend busy until the body is done.
+///
+/// The lease is what the balancer counts, and a backend that is still
+/// streaming a response is still busy with it. A balancer that cannot see
+/// that hands the next request to a backend that is already working, which
+/// is the whole failure `least_conn` exists to avoid.
+///
+/// Holding the lease in the body is what makes the count true: the body is
+/// dropped when the client has read it — or when the connection goes away
+/// instead — and the backend is free again then. The streaming path has
+/// always held its lease for the whole flow; this is the same rule on the
+/// path that did not.
+struct LeasedBody {
+    inner: ProxyBody,
+    /// Kept, never read: dropping it is what releases the backend.
+    _lease: Option<crate::lb::BackendLease>,
+}
+
+impl hyper::body::Body for LeasedBody {
+    type Data = bytes::Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
 }
 
 /// Reads a request body whole, refusing one past `limit` or past what the
@@ -2090,7 +2143,7 @@ mod tests {
 /// the tree is a key somebody has to trust not to be used, and a test that
 /// needs one can make one in a millisecond.
 #[cfg(test)]
-mod tls {
+mod transport {
     use super::*;
     use rcgen::{CertificateParams, IsCa, KeyPair};
     use std::convert::Infallible;
@@ -2358,6 +2411,84 @@ mod tls {
             .expect("the body")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// A backend on the loopback address that answers every request with
+    /// `hello`, in the clear.
+    async fn hello_backend() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(|_req| async {
+                                Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                    bytes::Bytes::from_static(b"hello"),
+                                )))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A backend stays busy for as long as its response is out there.
+    ///
+    /// The count is what `least_conn` balances on, and a response whose body
+    /// has not been read yet is a request the backend is still working on. A
+    /// balancer that cannot see that hands the next request to a backend that
+    /// is already busy.
+    #[tokio::test]
+    async fn a_backend_stays_busy_until_its_response_is_dropped() {
+        let port = hello_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let route = crate::routes::Route::new(
+            "busy.test",
+            "/",
+            true,
+            vec![backend.clone()],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        );
+        let config = Arc::new(crate::routes::RouteConfig::new(vec![route]));
+        let pool = config.routes().await[0].backend_pool().clone();
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://busy.test/")
+            .header("host", "busy.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request");
+        let response = proxy_request(&clients, request, config.clone())
+            .await
+            .expect("the backend answers");
+
+        assert_eq!(
+            pool.outstanding(&backend).await,
+            1,
+            "the response is still out there, so the backend is still busy with it"
+        );
+
+        drop(response);
+
+        assert_eq!(
+            pool.outstanding(&backend).await,
+            0,
+            "the body is gone, so the backend is free again"
+        );
     }
 
     /// The CA file is read at startup, so a file that cannot be read is an
