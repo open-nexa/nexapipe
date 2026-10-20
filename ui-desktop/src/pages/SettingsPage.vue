@@ -75,7 +75,14 @@ const useServiceModel = computed({
   },
 });
 
-const autoStart = ref(false);
+/**
+ * Whether the app is set to start when the machine does.
+ *
+ * `null` means "not known": the read failed, and a failed read is not "off" —
+ * the entry may well be there. The switch says so by staying disabled rather
+ * than by claiming a state nobody read.
+ */
+const autoStart = ref<boolean | null>(null);
 const logLevel = ref("info");
 const isLoading = ref(false);
 
@@ -92,10 +99,11 @@ async function loadSettings() {
     autoStart.value = await invoke<boolean>("is_auto_start_enabled");
   } catch (e) {
     // A read that fails is not "off": the entry may well be there. The switch
-    // is left showing what is known, and the failure is reported rather than
-    // swallowed — a silent `false` is the lie this used to tell.
+    // is left showing what is known — which is nothing, and which it says by
+    // staying disabled — and the failure is reported rather than swallowed. A
+    // silent `false` is the lie this used to tell: it claimed the entry was
+    // gone, and clicking the switch then wrote it back.
     console.error("Failed to read the start-at-login setting:", e);
-    autoStart.value = false;
     toast.fromKey("error.autostart.read_failed");
   }
   isLoading.value = false;
@@ -103,6 +111,10 @@ async function loadSettings() {
 
 async function saveAutoStart() {
   const wanted = autoStart.value;
+  if (wanted === null) {
+    // Nothing was read, so there is no state to change.
+    return;
+  }
   try {
     await invoke("set_auto_start", { enabled: wanted });
   } catch (e) {
@@ -112,6 +124,20 @@ async function saveAutoStart() {
     autoStart.value = !wanted;
     toast.fromKey("error.autostart.write_failed");
   }
+}
+
+/**
+ * Flips the start-at-login switch and writes the new state.
+ *
+ * A separate method rather than an inline expression, because the state has
+ * three values and the inline one could only assume two.
+ */
+function toggleAutoStart(): void {
+  if (autoStart.value === null) {
+    return;
+  }
+  autoStart.value = !autoStart.value;
+  void saveAutoStart();
 }
 
 /**
@@ -312,10 +338,11 @@ loadAppVersion();
             </div>
           </div>
           <div class="setting-right">
-            <button 
-              class="toggle" 
-              :class="{ active: autoStart }"
-              @click="autoStart = !autoStart; saveAutoStart()"
+            <button
+              class="toggle"
+              :class="{ active: autoStart === true }"
+              :disabled="autoStart === null"
+              @click="toggleAutoStart()"
             >
               <div class="toggle-thumb"></div>
             </button>
