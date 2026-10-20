@@ -449,11 +449,7 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
 }
 
 fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, auth state not written ({e})"))?;
+    let mut doc = crate::config::read_config_document(path, "auth state not written")?;
 
     let clients = doc
         .as_table_mut()
@@ -502,7 +498,7 @@ fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<(
         }
     }
 
-    crate::config::write_config_file(path, &doc.to_string())?;
+    crate::config::write_config_document(path, doc)?;
     Ok(())
 }
 
