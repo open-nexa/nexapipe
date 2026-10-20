@@ -5,6 +5,7 @@ certs/
 .gitignore
 .dockerignore
 .workbuddy/
+.worktrees/
 examples/
 ui-android/
 ui-desktop/

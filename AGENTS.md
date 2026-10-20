@@ -79,18 +79,21 @@ A PR therefore spans two repositories: its head branch is in `origin`, the PR it
 
 ## Git Workflow — Worktrees & Branch Base (MANDATORY)
 
-- **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `~/rust/nexapipe` and stays on `main`. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
+- **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `~/rust/nexapipe` and stays on `main`; the worktrees under `.worktrees/` are separate checkouts that happen to live inside it, and the main checkout's own working tree is not one of them. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
 - **Every new branch is based on the newest `main`.** Do not start from the local `main` ref alone: the fork's `main` regularly lags upstream. Fetch the upstream head and branch off that commit:
 
   ```bash
   git fetch --no-tags upstream main
-  git worktree add ~/WorkBuddy/Worktrees/nexapipe/<branch> -b <branch> upstream/main
-  cd ~/WorkBuddy/Worktrees/nexapipe/<branch>
+  git worktree add .worktrees/<branch> -b <branch> upstream/main
+  cd .worktrees/<branch>
   git merge-base --is-ancestor upstream/main HEAD   # verify the branch really sits on newest main
   ```
 
+  The directory name is the branch name with its slashes flattened to dashes (`v070/audit-fixes` → `.worktrees/v070-audit-fixes`).
+
   If the `upstream` remote is missing, add it once with `git remote add upstream git@github.com:open-nexa/nexapipe.git`. If the upstream lookup is unreachable, degrade to a fast-forward update of the local `main` (`git fetch --no-tags origin main`, fast-forward only — never `reset --hard`) and state explicitly in the reply which commit was used as the base.
-- **Worktree location:** `~/WorkBuddy/Worktrees/nexapipe/<branch-name>` for every working branch. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+- **Worktree location:** `<repo>/.worktrees/<branch-name>` for every working branch — inside the repository rather than beside it, so that reading and writing a worktree's files goes through the same file-access path as the rest of the project instead of prompting for a separate permission on every call. `.worktrees/` is listed in `.gitignore` and `.dockerignore`. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+- **Point searches and reads at the worktree you are working in.** A search rooted at the repository root does not descend into `.worktrees/`: each worktree is a separate git repository and a hidden directory, and the search tools skip both. The same holds for `.workbuddy/`.
 - **Exception — a fix to an open PR reuses that PR's branch and worktree.** When the task is fixing a bug in an existing open PR, work on that PR's own head branch, in that branch's existing worktree. Do not open a fresh branch and do not create a second worktree for it: the fix belongs in the PR that carries the defect, not in a parallel branch that has to be cherry-picked afterwards. Locate the worktree with `git worktree list` before starting, and check `git status` in it — if it holds unrelated uncommitted work, stop and ask instead of mixing the fix into it. The "newest `main`" rule above governs new branches only; a PR branch keeps its own base and history.
 - Set the worktree up only after the plan is approved; until then stay read-only.
 - **Never delete a worktree on your own initiative**, least of all one holding unpushed commits — ask first. After a reboot, `/private/tmp` is gone, so run `git worktree prune` before rebuilding anything that referenced it.
