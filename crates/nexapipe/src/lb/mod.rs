@@ -191,6 +191,19 @@ impl BackendPool {
     /// into their own "no route" answer. See each caller in
     /// `crate::routes::RouteConfig`.
     pub async fn select_backend(&self) -> Option<BackendLease> {
+        self.select_backend_excluding(&[]).await
+    }
+
+    /// A backend to send this flow to, preferring one that has not been tried
+    /// yet.
+    ///
+    /// The exclusion list is what a retry is built on: a backend that just
+    /// failed is the one most likely to fail again, so the next attempt asks
+    /// somebody else — where the route has somebody else. A route with a
+    /// single backend has nobody else to ask, and that backend is handed out
+    /// again: there is no other answer to give, and a second attempt at the
+    /// same backend is still better than none.
+    pub async fn select_backend_excluding(&self, exclude: &[String]) -> Option<BackendLease> {
         let mut healthy_backends = Vec::new();
         for (i, b) in self.backends.iter().enumerate() {
             if b.status.read().await.is_healthy() {
@@ -220,6 +233,28 @@ impl BackendPool {
             );
             return None;
         }
+
+        // The ones that have not been tried yet, when there are any. A pool
+        // whose every healthy backend is on the list falls back to the whole
+        // set, because the alternative is not to try at all.
+        let mut untried: Vec<usize> = Vec::new();
+        for i in &healthy_backends {
+            let url = &self.backends[*i].status.read().await.url;
+            if !exclude.iter().any(|e| e == url) {
+                untried.push(*i);
+            }
+        }
+        let healthy_backends = if untried.is_empty() {
+            if !exclude.is_empty() {
+                tracing::debug!(
+                    "Every healthy backend behind this route has been tried; trying one of them \
+                     again, because there is nobody else to ask"
+                );
+            }
+            healthy_backends
+        } else {
+            untried
+        };
 
         let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {

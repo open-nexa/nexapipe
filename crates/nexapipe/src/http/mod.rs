@@ -1,6 +1,6 @@
 use crate::config::BackendProtocol;
 use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
-use ::http::{Request, Response, StatusCode};
+use ::http::{Method, Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::{StreamExt, TryStreamExt};
@@ -420,6 +420,9 @@ where
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(crate::routes::host_without_port)
+        // Owned, because the request is moved into the body read below and
+        // the host is needed after that.
+        .map(str::to_string)
     else {
         return Ok(create_error_response(
             StatusCode::NOT_FOUND,
@@ -431,7 +434,10 @@ where
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(req.uri().path());
+        .unwrap_or(req.uri().path())
+        // Owned, for the same reason the host is: the request is moved into
+        // the body read below, and the path is needed after that.
+        .to_string();
 
     let accept_encoding = req
         .headers()
@@ -441,7 +447,9 @@ where
     let headers_clone = req.headers().clone();
     let method = req.method().clone();
 
-    let mut backend_info: BackendInfo = match config.get_backend(host, path).await {
+    // The first backend is chosen before the body is read, so a request for a
+    // host nobody serves is answered without reading what it carries.
+    let mut backend_info: BackendInfo = match config.get_backend(&host, &path).await {
         BackendLookup::Found(info) => info,
         // No route serves this host: saying 404 beats guessing at one.
         BackendLookup::NoRoute => {
@@ -462,19 +470,133 @@ where
         }
     };
 
+    // Read once, for every attempt: the body cannot be read twice, and what
+    // goes out is the same bytes whichever backend receives it.
+    //
+    // Held for as long as the buffered body is alive — see `read_body_limited`.
+    // Dropping it here rather than at the end of the function is deliberate and
+    // is what makes the budget mean what it says.
+    let (body, _body_reservation) = read_body_limited(
+        req.into_body(),
+        MAX_REQUEST_BODY,
+        config.timeouts().deadlines.body,
+    )
+    .await?;
+
+    let attempts = config.retry().attempts;
+    let backoff = config.retry().backoff;
+    // The backends that already failed this request. A retry asks somebody
+    // else, because the one that just failed is the one most likely to fail
+    // again.
+    let mut tried: Vec<String> = Vec::new();
+    let mut attempt = 0u32;
+
+    loop {
+        let outcome = attempt_backend(
+            clients,
+            &config,
+            &backend_info,
+            &method,
+            &headers_clone,
+            &path,
+            &body,
+        )
+        .await;
+
+        let response = match outcome {
+            Ok(response) => response,
+            Err(failure) => {
+                // Two questions, and the failure answers both: may this be
+                // tried again at all, and is there another backend to try it
+                // on.
+                if attempt >= attempts || !failure.retry.may_retry(&method) {
+                    return Err(failure.error);
+                }
+                attempt += 1;
+
+                tracing::warn!(
+                    "Request to {} failed ({}); trying another backend ({attempt}/{attempts})",
+                    backend_info.url,
+                    failure.error,
+                );
+
+                tried.push(backend_info.url.clone());
+                match config.get_backend_excluding(&host, &path, &tried).await {
+                    BackendLookup::Found(info) => backend_info = info,
+                    // Nobody else to ask. The failure is the answer: the pool
+                    // being empty is a consequence of it, not a new fact.
+                    BackendLookup::NoRoute | BackendLookup::Unavailable => {
+                        return Err(failure.error);
+                    }
+                }
+
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+                continue;
+            }
+        };
+
+        let content_encoding = response.headers().get("content-encoding");
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+
+        // The idle deadline covers the body as well as the head: a backend that
+        // answers and then goes silent must not hold this request open. The
+        // streaming path has always bounded this; the plaintext listener had no
+        // bound at all, so a backend that sent the head and stalled kept the
+        // request — and the connection — for as long as it liked.
+        let idle = config.timeouts().deadlines.response_idle;
+
+        // The lease moves out of the backend info and into the body, because
+        // the work against that backend is not over when the response head
+        // arrives: a body that is still streaming is a backend that is still
+        // busy. See `LeasedBody`.
+        let lease = backend_info.take_lease();
+
+        if content_encoding.is_none()
+            && should_compress(content_type)
+            && let Some(encodings) = accept_encoding
+            && encodings.contains("gzip")
+        {
+            // The whole body is read and compressed here, so the backend is
+            // done with it before the answer goes out: the lease goes back
+            // with the `backend_info` that is dropped at the end of this
+            // function.
+            return compress_response(response, "gzip", idle).await;
+        }
+
+        return Ok(response.map(|body| {
+            let body = http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync();
+            http_body_util::BodyExt::boxed_unsync(LeasedBody {
+                inner: body,
+                _lease: lease,
+            })
+        }));
+    }
+}
+
+/// One attempt at one backend: the answer, or the reason there was none.
+///
+/// Split out of [`proxy_request`] so that the retry loop above it is about
+/// retrying and this is about asking. The request is rebuilt for every
+/// attempt, because the backend it goes to may be a different one.
+async fn attempt_backend(
+    clients: &BackendClients,
+    config: &RouteConfig,
+    backend_info: &BackendInfo,
+    method: &Method,
+    headers: &::http::HeaderMap,
+    path: &str,
+    body: &bytes::Bytes,
+) -> Result<Response<hyper::body::Incoming>, ProxyFailure> {
     // The client is picked by the protocol the route speaks to its backends,
     // which is decided by the route rather than by the request: a backend that
     // speaks h2 in the clear is reached with the h2c client, everything else
     // with the one that speaks HTTP/1.1 and negotiates h2 over TLS.
     let client = clients.for_protocol(backend_info.protocol);
-
-    // `backend_info` carries the lease (see `BackendInfo::_lease`), so the
-    // backend is counted as busy until this function returns — which is until
-    // the response head is in hand, and exactly what the deadline below bounds.
-    // A response whose body *then* streams is not counted for the whole stream,
-    // so `least_conn` sees a long-running transfer as finished; that skews a
-    // balance decision at worst, and it is the one path the lease cannot follow
-    // without owning the response body.
     let response_deadline = config.timeouts().response;
 
     let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
@@ -506,19 +628,9 @@ where
     .parse::<http::Uri>()
     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
-    // Held for as long as the buffered body is alive — see `read_body_limited`.
-    // Dropping it here rather than at the end of the function is deliberate and
-    // is what makes the budget mean what it says.
-    let (body, _body_reservation) = read_body_limited(
-        req.into_body(),
-        MAX_REQUEST_BODY,
-        config.timeouts().deadlines.body,
-    )
-    .await?;
+    let mut builder = Request::builder().method(method.clone()).uri(new_uri);
 
-    let mut builder = Request::builder().method(method).uri(new_uri);
-
-    for (name, value) in headers_clone.iter() {
+    for (name, value) in headers.iter() {
         // Preserve the client's original Host header so backend virtual-host
         // routing works; drop the rest that only meant something for the hop
         // from the client to here.
@@ -528,7 +640,7 @@ where
         builder = builder.header(name, value);
     }
 
-    let proxied_req = builder.body(Full::new(body))?;
+    let proxied_req = builder.body(Full::new(body.clone()))?;
 
     tracing::debug!(
         "Proxying request: {} {} -> {}://{}:{}",
@@ -539,56 +651,32 @@ where
         backend_port
     );
 
-    let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
-    {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("backend request failed: {}", e))?,
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "backend {}:{} did not respond within {:?}",
-                backend_host,
-                backend_port,
-                response_deadline
-            ));
-        }
-    };
-
-    let content_encoding = response.headers().get("content-encoding");
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|h| h.to_str().ok());
-
-    // The idle deadline covers the body as well as the head: a backend that
-    // answers and then goes silent must not hold this request open. The
-    // streaming path has always bounded this; the plaintext listener had no
-    // bound at all, so a backend that sent the head and stalled kept the
-    // request — and the connection — for as long as it liked.
-    let idle = config.timeouts().deadlines.response_idle;
-
-    // The lease moves out of the backend info and into the body, because the
-    // work against that backend is not over when the response head arrives: a
-    // body that is still streaming is a backend that is still busy. See
-    // `LeasedBody`.
-    let lease = backend_info.take_lease();
-
-    if content_encoding.is_none()
-        && should_compress(content_type)
-        && let Some(encodings) = accept_encoding
-        && encodings.contains("gzip")
-    {
-        // The whole body is read and compressed here, so the backend is done
-        // with it before the answer goes out: the lease goes back with the
-        // `backend_info` that is dropped at the end of this function.
-        return compress_response(response, "gzip", idle).await;
+    match tokio::time::timeout(response_deadline, client.request(proxied_req)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(ProxyFailure {
+            error: anyhow::anyhow!("backend request failed: {e}"),
+            partial: None,
+            // A connect error means the request was never carried: the
+            // connection was refused, the name did not resolve, the handshake
+            // failed. Nothing reached the backend, so asking again is free of
+            // consequence whatever the request was. Anything else means the
+            // request was sent and the answer did not come, which only an
+            // idempotent request may be asked twice.
+            retry: if e.is_connect() {
+                Retryability::Always
+            } else {
+                Retryability::IfIdempotent
+            },
+        }),
+        Err(_) => Err(ProxyFailure {
+            error: anyhow::anyhow!(
+                "backend {backend_host}:{backend_port} did not respond within {response_deadline:?}"
+            ),
+            partial: None,
+            // The request was carried: the deadline expired after it went out.
+            retry: Retryability::IfIdempotent,
+        }),
     }
-
-    Ok(response.map(|body| {
-        let body = http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync();
-        http_body_util::BodyExt::boxed_unsync(LeasedBody {
-            inner: body,
-            _lease: lease,
-        })
-    }))
 }
 
 /// A response body that keeps its backend busy until the body is done.
@@ -848,6 +936,55 @@ pub struct ProxySummary {
 pub struct ProxyFailure {
     pub error: anyhow::Error,
     pub partial: Option<ProxySummary>,
+    /// What may be done about this failure.
+    pub retry: Retryability,
+}
+
+/// What may be done about a failed attempt.
+///
+/// The question is never "did it fail" but "may it be tried again", and the
+/// answer depends on two things that are easy to confuse:
+///
+/// - **Did the request reach the backend?** A connection that was refused
+///   never carried it, so the backend did not act on it and asking again is
+///   free of consequence — whatever the request was.
+/// - **Is the request safe to send twice?** A `GET` is. A `POST` that
+///   charges a card is not, and the only way to know is what the method says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryability {
+    /// The request was never carried to the backend. It may be tried again
+    /// whatever it is.
+    Always,
+    /// The request was carried and no answer came. It may be tried again only
+    /// if sending it twice is safe, which is what an idempotent method is.
+    IfIdempotent,
+    /// Nothing may be tried again: the client already has part of the answer,
+    /// or the failure says nothing about the backend.
+    Never,
+}
+
+impl Retryability {
+    /// Whether this failure may be tried again for this method.
+    pub fn may_retry(self, method: &Method) -> bool {
+        match self {
+            Retryability::Always => true,
+            Retryability::IfIdempotent => is_idempotent(method),
+            Retryability::Never => false,
+        }
+    }
+}
+
+/// Whether sending this request twice is safe.
+///
+/// The idempotent methods of RFC 9110: the same request may be sent again
+/// without the server doing the work twice. Everything else — `POST` above
+/// all — may not, which is why a request that was carried and lost is only
+/// retried when its method says it is safe.
+pub fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
 }
 
 impl From<anyhow::Error> for ProxyFailure {
@@ -855,6 +992,7 @@ impl From<anyhow::Error> for ProxyFailure {
         ProxyFailure {
             error,
             partial: None,
+            retry: Retryability::Never,
         }
     }
 }
@@ -878,8 +1016,103 @@ impl ProxyFailure {
                 status: status.as_u16(),
                 bytes_sent: written,
             }),
+            // The client has part of the answer, so there is nothing to try
+            // again: it would be a second answer to a request that was already
+            // answered.
+            retry: Retryability::Never,
         }
     }
+}
+
+// One more argument than clippy allows: the alternative is a struct bundling the
+// client with its deadlines, which every caller would have to build in order to
+// pass the same two things — see the note on `conn::handle_bidi_stream`.
+#[allow(clippy::too_many_arguments)]
+/// The body of a request, read once and ready to be sent to a backend.
+///
+/// Read outside the attempt, because the bytes come off the client's stream
+/// and that stream has them only once: a retry that had to read them again
+/// would wait for bytes that are never coming.
+pub struct RequestBody {
+    /// The bytes, whole.
+    pub bytes: Vec<u8>,
+    /// The length to declare to the backend, when the client declared none.
+    ///
+    /// A chunked request has no length of its own; the proxy reads the chunks
+    /// and sends one buffer with a length of its own.
+    pub content_length: Option<usize>,
+    /// Held for as long as the body is alive, so the process budget counts
+    /// what it holds now rather than what it ever read. See
+    /// [`crate::conn::limits::ByteReservation`].
+    pub reservation: crate::conn::limits::ByteReservation,
+}
+
+/// Reads the body of a request off the client's stream.
+///
+/// The bytes that arrived with the head are `body_data`; the rest is read
+/// here. What comes back is whole: either every byte the client promised, or
+/// an error — a body that stops halfway is a request that was never sent.
+pub async fn read_request_body(
+    req: &Request<()>,
+    recv: &mut iroh::endpoint::RecvStream,
+    body_data: Vec<u8>,
+    timeouts: crate::config::Timeouts,
+) -> Result<RequestBody, ProxyFailure> {
+    // A chunked body is sent as one buffer with a length of our own, so only a
+    // request whose `content-length` we could not read takes that path. One we
+    // could read is forwarded with the header it arrived with.
+    let declared_length = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let chunked = declared_length.is_none() && request_is_chunked(req);
+
+    let mut full_body = body_data;
+    // Held for as long as the body is alive, which is until the request is
+    // done: the buffer is handed to the backend and dropped with the request.
+    // Same rule as `read_body_limited` on the plaintext path, and the reason
+    // the two are worth keeping in step — one without the other leaves the
+    // process budget counting a fraction of what it actually holds.
+    let (reservation, content_length) = if let Some(content_length) = declared_length {
+        // Checked before the body is read, not after: `content_length` is the
+        // size of the buffer this is about to fill.
+        if content_length > MAX_REQUEST_BODY {
+            return Err(ProxyFailure::from(anyhow::anyhow!(
+                "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
+            )));
+        }
+        let reservation = read_remaining_request_body(
+            recv,
+            &mut full_body,
+            content_length,
+            timeouts.deadlines.body,
+        )
+        .await?;
+        (reservation, None)
+    } else if chunked {
+        // A chunked body declares no length, so without this branch the request
+        // went out carrying only the bytes that happened to arrive with the
+        // head — and `transfer-encoding` is not forwarded, so the backend was
+        // handed a body with no framing at all and no way to know it was
+        // truncated. Decode the chunks and send one buffer with a length.
+        let reservation =
+            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
+        (reservation, Some(full_body.len()))
+    } else {
+        (crate::conn::limits::ByteReservation::empty(), None)
+    };
+
+    // The body is complete at this point in every branch above, and this is the
+    // only place it is whole: what goes out is a reconstructed request with its
+    // own framing, so its size on the way out is not what arrived.
+    crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
+
+    Ok(RequestBody {
+        bytes: full_body,
+        content_length,
+        reservation,
+    })
 }
 
 // One more argument than clippy allows: the alternative is a struct bundling the
@@ -898,9 +1131,8 @@ pub async fn proxy_to_backend_streaming(
     // comes from the route rather than from the URL, because the same URL is
     // reached differently depending on what the route says.
     protocol: BackendProtocol,
-    body_data: Vec<u8>,
+    body: &RequestBody,
     send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
     request_id: &str,
 ) -> Result<ProxySummary, ProxyFailure> {
     let client = clients.for_protocol(protocol);
@@ -928,12 +1160,7 @@ pub async fn proxy_to_backend_streaming(
     // A chunked body is sent as one buffer with a length of our own, so only a
     // request whose `content-length` we could not read takes that path. One we
     // could read is forwarded with the header it arrived with.
-    let declared_length = req
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    let chunked = declared_length.is_none() && request_is_chunked(req);
+    let chunked = body.content_length.is_some();
 
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
@@ -952,47 +1179,14 @@ pub async fn proxy_to_backend_streaming(
         builder = builder.header(name, value);
     }
 
-    let mut full_body = body_data;
-    // Held for as long as the body is alive, which is until this function
-    // returns: the buffer is handed to the backend below and dropped with the
-    // request. Same rule as `read_body_limited` on the plaintext path, and the
-    // reason the two are worth keeping in step — one without the other leaves
-    // the process budget counting a fraction of what it actually holds.
-    let _body_reservation = if let Some(content_length) = declared_length {
-        // Checked before the body is read, not after: `content_length` is the
-        // size of the buffer this is about to fill.
-        if content_length > MAX_REQUEST_BODY {
-            return Err(ProxyFailure::from(anyhow::anyhow!(
-                "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
-            )));
-        }
-        read_remaining_request_body(
-            recv,
-            &mut full_body,
-            content_length,
-            timeouts.deadlines.body,
-        )
-        .await?
-    } else if chunked {
-        // A chunked body declares no length, so without this branch the request
-        // went out carrying only the bytes that happened to arrive with the
-        // head — and `transfer-encoding` is not forwarded, so the backend was
-        // handed a body with no framing at all and no way to know it was
-        // truncated. Decode the chunks and send one buffer with a length.
-        let reservation =
-            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
-        builder = builder.header("content-length", full_body.len());
-        reservation
-    } else {
-        crate::conn::limits::ByteReservation::empty()
-    };
+    // The length the proxy declares for a body the client did not give one
+    // for. The client's own `content-length` is dropped above, because this
+    // one is the truth.
+    if let Some(content_length) = body.content_length {
+        builder = builder.header("content-length", content_length);
+    }
 
-    // The body is complete at this point in every branch above, and this is the
-    // only place it is whole: what goes out is a reconstructed request with its
-    // own framing, so its size on the way out is not what arrived.
-    crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
-
-    let proxied_req = builder.body(Full::new(full_body.into()))?;
+    let proxied_req = builder.body(Full::new(body.bytes.clone().into()))?;
 
     tracing::debug!(
         "Proxying request via client (streaming): {} {}",
@@ -2440,6 +2634,145 @@ mod transport {
         });
 
         port
+    }
+
+    /// An address nothing is listening on.
+    ///
+    /// The port is taken and given back, so the connection to it is refused
+    /// rather than timing out — which is what a backend that is down looks
+    /// like.
+    async fn dead_backend() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A backend that accepts the connection and then says nothing, and how
+    /// many connections it accepted.
+    async fn silent_backend() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    // Held open, saying nothing: the request was carried and
+                    // the answer never came.
+                    let _stream = stream;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        (port, accepted)
+    }
+
+    /// A route table with the given backends, and a retry that tries again.
+    fn route_table(backends: Vec<String>, attempts: u32) -> Arc<crate::routes::RouteConfig> {
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "retry.test",
+            "/",
+            true,
+            backends,
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        );
+        Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry {
+                attempts,
+                backoff: std::time::Duration::ZERO,
+            },
+        ))
+    }
+
+    fn get_request() -> Request<Full<bytes::Bytes>> {
+        Request::builder()
+            .method("GET")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request")
+    }
+
+    /// A request that failed against one backend is tried against the next.
+    #[tokio::test]
+    async fn a_failed_request_is_tried_on_another_backend() {
+        let dead = dead_backend().await;
+        let port = hello_backend().await;
+        let alive = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![dead, alive], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let response = proxy_request(&clients, get_request(), config)
+            .await
+            .expect("the second backend answers");
+
+        assert_eq!(response.status(), 200);
+    }
+
+    /// A request that was carried and lost is not tried again, unless it is
+    /// safe to send twice.
+    #[tokio::test]
+    async fn a_post_that_reached_a_backend_is_not_tried_again() {
+        let (port, accepted) = silent_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![backend], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request");
+        let result = proxy_request(&clients, request, config).await;
+
+        assert!(
+            result.is_err(),
+            "the backend never answered, so the request failed"
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a POST may not be sent twice, so it was tried once"
+        );
+    }
+
+    /// The same request, but one that is safe to send twice.
+    #[tokio::test]
+    async fn a_get_that_reached_a_backend_is_tried_again() {
+        let (port, accepted) = silent_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![backend], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let result = proxy_request(&clients, get_request(), config).await;
+
+        assert!(result.is_err(), "the backend never answered");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a GET may be sent twice, so it was"
+        );
     }
 
     /// A backend stays busy for as long as its response is out there.

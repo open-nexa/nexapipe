@@ -181,7 +181,7 @@ impl StreamBudgets {
 // id is last because it is the newest thing this stream carries.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_bidi_stream(
-    send: iroh::endpoint::SendStream,
+    mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     config: &RouteConfig,
     clients: &BackendClients,
@@ -330,6 +330,28 @@ pub async fn handle_bidi_stream(
         None => BackendLookup::NoRoute,
     };
 
+    // The body is read once, before the first attempt: the bytes come off the
+    // client's stream, and that stream has them only once. A retry sends the
+    // same bytes again, which is only possible because they were kept.
+    //
+    // A WebSocket upgrade has no body to read: the session starts where the
+    // head ends, and the bytes after it are frames.
+    let body = if http::is_websocket_request_static(&request) {
+        None
+    } else {
+        match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
+            Ok(body) => Some(body),
+            Err(failure) => {
+                // The request never went anywhere: there is no backend to
+                // blame and no answer to give but the refusal.
+                tracing::error!("Could not read the request body: {}", failure.error);
+                let mut send = send;
+                let _ = send.finish();
+                return Err(failure.error);
+            }
+        }
+    };
+
     // Which refusal it is decides the status, and nothing else — the writing
     // and the logging below are the same either way. 404: nothing serves this
     // name. 503: the route is there and every backend behind it is down, which
@@ -411,6 +433,8 @@ pub async fn handle_bidi_stream(
     span.record("method", method.as_str());
     span.record("uri", request_target.as_str());
 
+    // A WebSocket upgrade is a conversation, and half of it cannot be taken
+    // back: it is never retried, and it does not go through the loop below.
     let outcome: Result<http::ProxySummary, http::ProxyFailure> =
         if http::is_websocket_request_static(&request) {
             tracing::debug!("WebSocket request detected");
@@ -418,19 +442,70 @@ pub async fn handle_bidi_stream(
                 .await
                 .map_err(http::ProxyFailure::from)
         } else {
-            let mut send = send;
-            http::proxy_to_backend_streaming(
-                clients,
-                config.timeouts(),
-                &request,
-                &backend_info.url,
-                backend_info.protocol,
-                body_data,
-                &mut send,
-                &mut recv,
-                request_id,
-            )
-            .await
+            let body = body
+                .as_ref()
+                .expect("the body of a request that is not a WebSocket is read above");
+            let attempts = config.retry().attempts;
+            let backoff = config.retry().backoff;
+            // The backends that already failed this request. A retry asks
+            // somebody else, because the one that just failed is the one most
+            // likely to fail again.
+            let mut tried: Vec<String> = Vec::new();
+            let mut attempt = 0u32;
+            let mut backend = backend_info;
+
+            loop {
+                let result = http::proxy_to_backend_streaming(
+                    clients,
+                    config.timeouts(),
+                    &request,
+                    &backend.url,
+                    backend.protocol,
+                    body,
+                    &mut send,
+                    request_id,
+                )
+                .await;
+
+                let failure = match result {
+                    Ok(summary) => break Ok(summary),
+                    Err(failure) => failure,
+                };
+
+                // Two questions, and the failure answers both: may this be
+                // tried again at all, and is there another backend to try it
+                // on.
+                if attempt >= attempts || !failure.retry.may_retry(request.method()) {
+                    break Err(failure);
+                }
+                attempt += 1;
+
+                tracing::warn!(
+                    "Request to {} failed ({}); trying another backend ({attempt}/{attempts})",
+                    backend.url,
+                    failure.error,
+                );
+
+                tried.push(backend.url.clone());
+                let next = match host {
+                    Some(h) => {
+                        config
+                            .get_backend_with_acl_excluding(h, path, acl.as_deref(), &tried)
+                            .await
+                    }
+                    None => BackendLookup::NoRoute,
+                };
+                match next.backend() {
+                    Some(info) => backend = info,
+                    // Nobody else to ask. The failure is the answer: the pool
+                    // being empty is a consequence of it, not a new fact.
+                    None => break Err(failure),
+                }
+
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
         };
 
     let elapsed_ms = started.elapsed().as_millis() as u64;

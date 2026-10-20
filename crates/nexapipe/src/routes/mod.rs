@@ -1,5 +1,5 @@
 use crate::auth::ClientAcl;
-use crate::config::{BackendProtocol, RouteMode, Timeouts};
+use crate::config::{BackendProtocol, Retry, RouteMode, Timeouts};
 use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -525,6 +525,14 @@ pub struct RouteConfig {
     /// not part of the routing table and a reload leaves it alone: changing a
     /// timeout takes a restart, like every key outside `[[routes]]`.
     timeouts: Timeouts,
+    /// How often a failed request is tried again, and on which backend.
+    ///
+    /// Held here rather than threaded down to each handler because this object
+    /// is what every one of them already receives, for the same reason the
+    /// deadlines are: routing and the rules its choices are carried out under
+    /// arrive together. A reload leaves it alone, like every key outside
+    /// `[[routes]]`.
+    retry: Retry,
 }
 
 impl RouteConfig {
@@ -532,6 +540,7 @@ impl RouteConfig {
         Self {
             routes: Arc::new(RwLock::new(routes)),
             timeouts: Timeouts::default(),
+            retry: Retry::default(),
         }
     }
 
@@ -544,6 +553,20 @@ impl RouteConfig {
         Self {
             routes: Arc::new(RwLock::new(routes)),
             timeouts,
+            retry: Retry::default(),
+        }
+    }
+
+    /// A table whose flows wait on these deadlines and retry like this.
+    ///
+    /// The only construction that matters outside a test: defaults exist so a
+    /// table built anywhere else — the local proxy, the tests — behaves exactly
+    /// as it did before this field existed.
+    pub fn with_settings(routes: Vec<Route>, timeouts: Timeouts, retry: Retry) -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(routes)),
+            timeouts,
+            retry,
         }
     }
 
@@ -552,11 +575,31 @@ impl RouteConfig {
         self.timeouts
     }
 
+    /// How often a request that failed is tried again.
+    pub fn retry(&self) -> Retry {
+        self.retry
+    }
+
     /// Backend for an HTTP request. Callers answer
     /// [`BackendLookup::NoRoute`] with `404` and [`BackendLookup::Unavailable`]
     /// with `503` — see the enum for why the two are not one answer.
     pub async fn get_backend(&self, host: &str, path: &str) -> BackendLookup<BackendInfo> {
         self.get_backend_with_acl(host, path, None).await
+    }
+
+    /// [`Self::get_backend`], preferring a backend that is not on the list.
+    ///
+    /// The list is the backends an earlier attempt already failed against, and
+    /// it is what a retry is built on: the backend that just failed is the one
+    /// most likely to fail again.
+    pub async fn get_backend_excluding(
+        &self,
+        host: &str,
+        path: &str,
+        exclude: &[String],
+    ) -> BackendLookup<BackendInfo> {
+        self.get_backend_with_acl_excluding(host, path, None, exclude)
+            .await
     }
 
     /// [`Self::get_backend`] under a client's host authorization.
@@ -570,6 +613,19 @@ impl RouteConfig {
         host: &str,
         path: &str,
         acl: Option<&ClientAcl>,
+    ) -> BackendLookup<BackendInfo> {
+        self.get_backend_with_acl_excluding(host, path, acl, &[])
+            .await
+    }
+
+    /// [`Self::get_backend_with_acl`], preferring a backend that is not on the
+    /// list.
+    pub async fn get_backend_with_acl_excluding(
+        &self,
+        host: &str,
+        path: &str,
+        acl: Option<&ClientAcl>,
+        exclude: &[String],
     ) -> BackendLookup<BackendInfo> {
         if acl.is_some_and(|acl| !acl.allows(host)) {
             tracing::debug!("Host {host} is not allowed for this client, answering 404");
@@ -595,7 +651,7 @@ impl RouteConfig {
         // A route matched, so this stopped being a routing question: every
         // backend behind it is down, and dialling one anyway spends a whole
         // connect timeout delivering the refusal the caller can write now.
-        let Some(lease) = route.backend_pool().select_backend().await else {
+        let Some(lease) = route.backend_pool().select_backend_excluding(exclude).await else {
             tracing::warn!(
                 "Route {}:{} matched host={host} path={path} but no backend is healthy -> 503",
                 route.host_pattern(),

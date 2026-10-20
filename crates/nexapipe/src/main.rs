@@ -497,7 +497,11 @@ async fn run_server_mode(
     // The `[timeouts]` values ride along here rather than being read where they
     // are used: they were validated above, and being handed to the table is what
     // keeps every handler agreeing on one value for "too long to wait".
-    let route_config = Arc::new(RouteConfig::with_timeouts(routes, proxy_config.timeouts()));
+    let route_config = Arc::new(RouteConfig::with_settings(
+        routes,
+        proxy_config.timeouts(),
+        proxy_config.retry(),
+    ));
 
     tracing::info!("Starting proxy with domain-based and path-based routing");
 

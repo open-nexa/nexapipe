@@ -686,6 +686,9 @@ pub struct ProxyConfig {
     /// machine's own trust store and nothing else.
     #[serde(default)]
     pub backends: BackendsConfig,
+    /// How often a failed request is tried again. Absent means it is not.
+    #[serde(default)]
+    pub retry: RetryConfig,
 }
 
 /// The `[backends]` section: how the proxy reaches the backends themselves.
@@ -707,6 +710,68 @@ pub struct BackendsConfig {
     /// without knowing who it is talking to can be redirected by whoever
     /// answers the name.
     pub ca_file: Option<String>,
+}
+
+/// The `[retry]` section: how often a request that failed is tried again.
+///
+/// Off by default, because a retry is a second attempt at something the
+/// backend may already have done: a request that failed on the way *to* the
+/// backend is safe to try again, and one that failed after the backend had it
+/// is not, unless the request was idempotent to begin with. What may be
+/// retried, and what may not, is spelled out in `crate::http`.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RetryConfig {
+    /// How many times a request may be tried again after it failed. Default: 0,
+    /// which is no retry at all.
+    ///
+    /// A retry asks the route for a *different* backend where the route has
+    /// one, because the backend that just failed is the one most likely to
+    /// fail again.
+    pub attempts: Option<u64>,
+    /// Milliseconds to wait before the next attempt. Default: 100.
+    ///
+    /// Not zero by default: a backend that refused the connection because it
+    /// is restarting refuses the next one too, and asking again immediately
+    /// turns one outage into as many attempts as the section allows.
+    pub backoff_ms: Option<u64>,
+}
+
+/// The `[retry]` section with every default filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    /// How many *extra* attempts a failed request may have. Zero means one
+    /// try and no more.
+    pub attempts: u32,
+    /// How long to wait between two attempts.
+    pub backoff: std::time::Duration,
+}
+
+impl Retry {
+    const DEFAULT_BACKOFF_MS: u64 = 100;
+    /// The most attempts a section may ask for. A hundred is already a
+    /// request that has been failing for a minute; more than that is a
+    /// request that should have been given up on.
+    const MAX_ATTEMPTS: u64 = 16;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+
+    pub fn resolve(config: RetryConfig) -> Self {
+        Retry {
+            attempts: config.attempts.unwrap_or(0).min(Self::MAX_ATTEMPTS) as u32,
+            backoff: std::time::Duration::from_millis(
+                config
+                    .backoff_ms
+                    .unwrap_or(Self::DEFAULT_BACKOFF_MS)
+                    .min(Self::MAX_BACKOFF_MS),
+            ),
+        }
+    }
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self::resolve(RetryConfig::default())
+    }
 }
 
 /// The `[peers]` section: a server-side allow-list of client public keys.
@@ -929,6 +994,11 @@ impl ProxyConfig {
     /// The `[timeouts]` deadlines this config resolves to.
     pub fn timeouts(&self) -> Timeouts {
         Timeouts::resolve(self.timeouts)
+    }
+
+    /// The `[retry]` settings this config resolves to.
+    pub fn retry(&self) -> Retry {
+        Retry::resolve(self.retry)
     }
 
     /// Whether the config file this was read from holds a credential.
@@ -3174,6 +3244,35 @@ backends = ["http://10.0.0.5:8080"]
             message.contains("host_pattern = \"*\""),
             "the error must say what to write instead: {message}"
         );
+    }
+
+    /// The `[retry]` section, and what it does when it is not there.
+    #[test]
+    fn the_retry_section_is_read_and_bounded() {
+        // Absent means no retry at all: a second attempt at something the
+        // backend may already have done is not a decision to make by default.
+        assert_eq!(Retry::resolve(RetryConfig::default()).attempts, 0);
+
+        let config = parse(
+            r#"
+[retry]
+attempts = 3
+backoff_ms = 250
+"#,
+        );
+        let retry = config.retry();
+        assert_eq!(retry.attempts, 3);
+        assert_eq!(retry.backoff, std::time::Duration::from_millis(250));
+
+        // A section that asks for a hundred attempts gets a number that is
+        // still a number of attempts and not a denial of service.
+        let config = parse(
+            r#"
+[retry]
+attempts = 1000
+"#,
+        );
+        assert_eq!(config.retry().attempts, 16);
     }
 
     /// The protocol a route speaks to its backends, and what happens when the
