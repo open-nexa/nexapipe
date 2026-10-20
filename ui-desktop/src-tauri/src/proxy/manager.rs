@@ -312,6 +312,24 @@ impl ProxyManager {
             .flat_map(|node| node.domains.iter().cloned())
             .collect();
 
+        // What the list is worth saying, once, before anything is started.
+        //
+        // A pattern that matches nothing is a warning: the domain is not
+        // proxied, and the name resolves for real instead — so a spelling the
+        // rule refuses has to be said out loud, because the scope the
+        // operating system is given still covers it. The client library has
+        // the notes; the desktop never asked for them.
+        let notes = nexapipe_client::domain_notes(&all_domains);
+        for (pattern, why) in &notes.unusable {
+            tracing::warn!("The proxy-domain pattern \"{pattern}\" matches nothing: {why}");
+        }
+        for pattern in &notes.narrowed {
+            tracing::info!(
+                "The proxy-domain pattern \"{pattern}\" names that host only; \"*.{pattern}\" \
+                 covers its subdomains"
+            );
+        }
+
         let nodes: Vec<NodeConfig> = self
             .config
             .nodes
