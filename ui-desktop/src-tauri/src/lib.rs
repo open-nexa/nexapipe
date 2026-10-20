@@ -1957,13 +1957,8 @@ pub fn run() {
         if event.id() != quit::QUIT_ITEM_ID {
             return;
         }
-        match tauri::Emitter::emit(app, quit::QUIT_REQUESTED_EVENT, ()) {
-            Ok(()) => tracing::info!("Quit chosen from the menu; waiting for the answer"),
-            Err(error) => {
-                tracing::warn!("Could not ask about quitting ({error}); exiting as asked");
-                app.exit(0);
-            }
-        }
+        tracing::info!("Quit chosen from the menu; waiting for the answer");
+        quit::ask(app);
     });
 
     let app = builder

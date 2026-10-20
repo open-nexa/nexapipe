@@ -34,9 +34,7 @@
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, Wry};
-
-use crate::quit::QUIT_REQUESTED_EVENT;
+use tauri::{AppHandle, Manager, Wry};
 
 /// The id the tray icon is filed under.
 ///
@@ -80,6 +78,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         // The menu opens on a right-click, which is the platform's own
         // convention; a left-click is the app's front door.
+        //
+        // Linux is the exception: the icon there is an appindicator, and that
+        // backend delivers no click event at all and ignores the
+        // menu-on-left-click setting. So the menu is the way back into the app
+        // on Linux, and the click below is what the other platforms get.
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             SHOW_ITEM_ID => show_window(app),
@@ -130,7 +133,7 @@ fn build_menu(app: &AppHandle, show_label: &str, quit_label: &str) -> tauri::Res
 ///
 /// Focused as well as shown: a window that appears behind whatever the user
 /// was looking at is a window they will not notice.
-fn show_window(app: &AppHandle) {
+pub(crate) fn show_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         tracing::warn!("the tray was asked to show the window, and there is none");
         return;
@@ -153,11 +156,5 @@ fn show_window(app: &AppHandle) {
 /// state is known — see [`crate::quit`]. This side only carries the question
 /// over, exactly as the macOS menu item does.
 fn ask_to_quit(app: &AppHandle) {
-    if let Err(e) = app.emit(QUIT_REQUESTED_EVENT, ()) {
-        // The renderer is gone, so there is nobody left to answer. Exiting is
-        // what was asked for, and asking again would hang on an answer that
-        // cannot come.
-        tracing::warn!("could not ask about quitting ({e}); exiting as asked");
-        app.exit(0);
-    }
+    crate::quit::ask(app);
 }

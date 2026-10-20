@@ -89,6 +89,25 @@ pub fn menu_bar(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .build()
 }
 
+/// Asks the renderer whether the app may quit.
+///
+/// The question is asked in the window, so the window comes back first: a
+/// hidden window has no dialog in it, and a question the user cannot see is a
+/// question that was never asked. Every path that asks asks this way — the
+/// tray's Quit item and the macOS menu bar's alike.
+///
+/// The answer comes back as [`finish_quit`], which is what ends the process.
+pub fn ask(app: &AppHandle) {
+    crate::tray::show_window(app);
+    if let Err(error) = tauri::Emitter::emit(app, QUIT_REQUESTED_EVENT, ()) {
+        // The renderer is gone, so there is nobody left to answer. Exiting is
+        // what was asked for, and asking again would hang on an answer that
+        // cannot come.
+        tracing::warn!("could not ask about quitting ({error}); exiting as asked");
+        app.exit(0);
+    }
+}
+
 /// Ends the process once the question has been answered.
 ///
 /// Called by the renderer rather than from the menu handler, because stopping the proxy first is
