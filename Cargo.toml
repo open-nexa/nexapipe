@@ -11,13 +11,20 @@ resolver = "3"
 version = "0.6.1"
 edition = "2024"
 license = "MIT"
-# 1.89 is where `File::lock` / `File::unlock` were stabilised, which the config
-# lock uses for `flock(2)` and `LockFileEx`. Declared rather than left implicit:
-# without it an older toolchain fails somewhere inside the dependency graph, on
-# an error that names neither this crate nor the standard-library call that
-# raised it — and every crate in the workspace is built by the same toolchain,
-# so this is one number for all of them.
-rust-version = "1.89"
+# The floor is the higher of two things this workspace needs:
+#
+# - 1.89, where `File::lock` / `File::unlock` were stabilised, which the config
+#   lock uses for `flock(2)` and `LockFileEx`.
+# - 1.95, where `Atomic::try_update` was stabilised, which the traffic and byte
+#   budget counters use to read a counter and write it back in one step.
+#
+# Declared rather than left implicit: without it an older toolchain fails
+# somewhere inside the dependency graph, on an error that names neither this
+# crate nor the standard-library call that raised it — and every crate in the
+# workspace is built by the same toolchain, so this is one number for all of
+# them. The `msrv` job in .github/workflows/ci.yml builds the workspace on
+# exactly this version, so the number is checked rather than only stated.
+rust-version = "1.95"
 
 # Vendor smoltcp 0.12.0 with a minimal patch guarding the unguarded
 # `remote_last_seq - local_seq_no` subtraction in the TCP transmit path.

@@ -123,7 +123,7 @@ impl NodeTraffic {
         // counter that can underflow into nonsense is a counter worth distrusting.
         let _ = self
             .active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
                 Some(active.saturating_sub(1))
             });
     }

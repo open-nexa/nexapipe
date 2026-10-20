@@ -146,7 +146,7 @@ a behaviour change, and a test that was not run is not a test that passed.
 | `ui-android/` | `cd ui-android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin` | `android app (unit tests + debug build)`, `android lint` |
 | `ui-desktop/` frontend | `cd ui-desktop && npm ci && npm run build && npm run lint:i18n && npm run lint:tokens` | `desktop frontend (typecheck + build + linters)` |
 | `ui-desktop/src-tauri/` | `cd ui-desktop/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib` | `desktop rust (clippy + tests)`, `desktop cargo check (macos-15 / ubuntu-22.04 / windows-latest)` |
-| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high` | `dependency audit`, `desktop dependency audit`, `dependency review` |
+| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high`; `cargo +<declared MSRV> check --workspace --all-targets --locked` when `rust-version` moves | `dependency audit`, `desktop dependency audit`, `dependency review`, `msrv` |
 | Docs only | No build. Every relative link resolves, the text is English, and the claims match the code | `rustfmt` and `clippy` still run; nothing else changes |
 
 `rustfmt --edition 2024 <path>` on the files you touched, not `cargo fmt --all`:
@@ -162,12 +162,13 @@ because `--locked` is what stops a `Cargo.lock` edit from slipping in unnoticed.
 
 A lint that fires in a file you did not touch is not yours to fix. The local
 toolchain is usually ahead of the one CI pins, so the two disagree about what a
-warning even is. `cargo clippy` on a clean `upstream/main` fails today on
+warning even is. `cargo clippy` on a clean `upstream/main` used to fail on
 `crates/nexapipe-client/src/traffic.rs`: Rust 1.99 deprecated
-`Atomic::fetch_update`, CI still runs 1.98.1 and cannot see it. Taking the
-compiler's own suggestion there — `try_update` — needs 1.95, which is above the
-workspace's declared `rust-version = "1.89"`, and no CI job checks that floor.
-Report the failure, leave the file alone, and let the owner decide.
+`Atomic::fetch_update`, CI still runs 1.98.1 and cannot see it. Report such a
+failure, leave the file alone, and let the owner decide — the fix for that one
+was to take the compiler's own suggestion, `try_update`, which needs 1.95, so
+the declared floor moved to 1.95 and the `msrv` job now builds the workspace on
+exactly that version.
 
 The job names are the ones `.github/workflows/ci.yml` reports on a pull request.
 Rename a job there and this table is stale.
