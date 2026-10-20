@@ -66,7 +66,22 @@ data class NodeTwoFactor(
      * field stays until the endpoint is enrolled under a name. The server
      * cannot revoke one device of a client through a credential nobody owns.
      */
-    val device: String? = null
+    val device: String? = null,
+    /**
+     * The public half of this device's own key, when the credential is a key.
+     *
+     * Null for a credential that is a secret, and that is how the two are told
+     * apart. The public half is not a secret — the server holds it too — so it
+     * lives here, next to the credential it belongs to, and is shown so an
+     * operator can tell which key a server has on file.
+     *
+     * The private half is the credential and never appears in this model: it is
+     * sealed in the file backup excludes, and it is read from there when a
+     * connection needs it. A model that is serialized into the backed-up
+     * endpoint list is the wrong place for a half that must never leave the
+     * device.
+     */
+    val publicKey: String? = null
 )
 
 /**
@@ -682,10 +697,59 @@ class VpnViewModel : ViewModel() {
     fun updateNodeEnrollment(nodeId: String, enrollment: NodeEnrollment?) {
         val index = nodes.value.indexOfFirst { it.nodeId == nodeId }
         if (index < 0) return
+        // A pending enrollment is the one moment a device key can be offered:
+        // the token in it is the human moment, and the key is what the device
+        // proves itself with from then on. Prepared here rather than at the
+        // connect, so the key is on file before the token is spent — a token
+        // cannot be spent twice, and an endpoint whose key was lost after the
+        // fact cannot enroll again from the same code.
+        if (enrollment != null) {
+            prepareDeviceKeyForEnrollment(nodeId)
+        }
         val updated = nodes.value.toMutableList()
         updated[index] = updated[index].copy(enrollment = enrollment)
         publishNodes(updated)
         addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
+    }
+
+    /**
+     * Mints a device key for an endpoint that is about to enroll, and keeps it.
+     *
+     * A key is the credential an unattended device proves itself with: the
+     * private half never leaves the phone and the server keeps only the public
+     * one, so what it holds is no longer a way in as this device. It is offered
+     * by the enrollment that spends the token, and signs every handshake after
+     * it.
+     *
+     * A server that predates keys ignores the offer and issues a secret as it
+     * always has, and the endpoint uses that instead. The user is asked about
+     * neither.
+     *
+     * A key that cannot be sealed is not kept: the endpoint then enrolls with
+     * a TOTP secret, which the server can revoke and this app can show the
+     * operator. A copy of the private half in the clear on a device that has
+     * just said it cannot protect one is worse than no key at all.
+     */
+    private fun prepareDeviceKeyForEnrollment(nodeId: String) {
+        val manager = settingsManager ?: return
+        // A key belongs to the device, not to the credential it proves: the
+        // server holds the public half under this device's name, so replacing
+        // the key would leave the server holding one key and this phone
+        // signing with another. It is kept, then, and a new one is minted
+        // only for a node that has none.
+        if (manager.deviceKeyFor(nodeId).isNotBlank()) {
+            addLog("Kept the device key of ${nodeId.take(8)}")
+            return
+        }
+        val privateKey = IrohProxy.nativeGenerateDeviceKey() ?: run {
+            addLog("No device key for ${nodeId.take(8)}: this endpoint will enroll with a secret")
+            return
+        }
+        if (!manager.saveDeviceKey(nodeId, privateKey)) {
+            addLog("Device key not kept for ${nodeId.take(8)}: this device cannot store one")
+            return
+        }
+        addLog("Prepared a device key for ${nodeId.take(8)}")
     }
 
     /**
@@ -733,6 +797,11 @@ class VpnViewModel : ViewModel() {
         // that leaves this pair indistinguishable from the client's shared
         // secret, and the one the page offers to re-enroll out of.
         val device = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
+        // A fifth line carries the public half of a device key. It is what
+        // tells a key credential from a secret one: a key answers with an
+        // empty secret and an empty algorithm, and the half the server holds
+        // is the only thing that says which key it is.
+        val publicKey = parts.getOrNull(4)?.takeIf { it.isNotBlank() }
         val node = nodes.value.firstOrNull { it.enrollment?.clientId == clientId }
             ?: nodes.value.firstOrNull { it.enrollment != null }
         if (node == null) {
@@ -745,8 +814,12 @@ class VpnViewModel : ViewModel() {
             enabled = true,
             clientId = clientId,
             secret = secret,
-            algorithm = algorithm,
-            device = device
+            // A key credential has no TOTP at all, so the server names no
+            // algorithm; the default keeps the record well-formed, and the
+            // public key is what says which kind of credential this is.
+            algorithm = algorithm.ifBlank { "sha1" },
+            device = device,
+            publicKey = publicKey
         )
         updateNodeTwoFactor(node.nodeId, twoFactor)
         updateNodeEnrollment(node.nodeId, null)
@@ -755,7 +828,13 @@ class VpnViewModel : ViewModel() {
         // will stop and ask rather than store anything. Reporting it as saved
         // here would be a claim about a write that has not run yet — and on the
         // decline path the token is gone and this secret with it.
-        addLog("Enrolled: the token is spent and the issued secret is being stored")
+        addLog(
+            if (publicKey != null) {
+                "Enrolled: the token is spent and this device's key is being stored"
+            } else {
+                "Enrolled: the token is spent and the issued secret is being stored"
+            }
+        )
     }
 
     /**
@@ -765,12 +844,27 @@ class VpnViewModel : ViewModel() {
      * saved secret rather than leaving it behind for whatever endpoint next
      * reuses the ID.
      *
+     * A credential that is no longer a key takes the key with it: the private
+     * half belongs to the credential that proved itself with it, and leaving it
+     * on disk would keep a credential this endpoint no longer answers with —
+     * and hand it to whatever endpoint reuses this ID next.
+     *
      * No client id in the log: debug builds expose Log.d, and the ID is half
      * of the 2FA credential pair.
      */
     fun updateNodeTwoFactor(nodeId: String, twoFactor: NodeTwoFactor?) {
         val index = nodes.value.indexOfFirst { it.nodeId == nodeId }
         if (index == -1) return
+        val previous = nodes.value[index].twoFactor
+        // The key goes with the credential that proved itself with it — unless
+        // this endpoint is about to enroll again, in which case the key is
+        // what the enrollment will offer and dropping it now would leave the
+        // device with nothing to prove itself with.
+        val enrolling = nodes.value[index].enrollment != null
+        if (previous?.publicKey != null && twoFactor?.publicKey == null && !enrolling) {
+            settingsManager?.clearDeviceKey(nodeId)
+            addLog("Dropped the device key of ${nodeId.take(8)}")
+        }
         val updated = nodes.value.toMutableList().apply {
             set(index, this[index].copy(twoFactor = twoFactor))
         }
@@ -1315,6 +1409,17 @@ class VpnViewModel : ViewModel() {
                                     enrollment.clientId,
                                     enrollment.token
                                 )
+                            }
+                            // The device key of an endpoint that has one, for the
+                            // two things it is used for: the enrollment above
+                            // offers it, and every handshake after it signs with
+                            // it. Registered before the group starts, like every
+                            // other credential — what is in the native tables at
+                            // nativeStartProxy is what goes on the wire.
+                            for (node in nodes.value) {
+                                val key = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
+                                if (key.isBlank()) continue
+                                IrohProxy.nativeSetDeviceKeyForNode(node.nodeId, key)
                             }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()

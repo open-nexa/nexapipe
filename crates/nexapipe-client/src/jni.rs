@@ -1,4 +1,4 @@
-use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::relay::RelayModeSpec;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
@@ -52,6 +52,18 @@ static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, NodeCredential>>> =
 // back with the secret Kotlin then persists. Kept apart from NODE_TWO_FACTOR because a node
 // holding a token must not present it as its TOTP secret.
 static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, String)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+// One device key per backend, keyed by endpoint ID.
+//
+// A key is the device's own credential rather than a copy of the server's: the
+// private half never leaves the device and the server holds only the public
+// one, so what Kotlin registers here is what an enrollment offers and what
+// every later handshake signs with. Kept apart from `NODE_TWO_FACTOR` because
+// the two travel together and mean different things — the credential record
+// says *which* client and *which* device this is, the key says *how* it proves
+// itself, and a node can have one without the other: a key with no device name
+// yet is one that is about to enroll.
+static NODE_DEVICE_KEYS: Lazy<Mutex<HashMap<String, iroh::SecretKey>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 /// The name this install answers as, injected once by Kotlin
 /// (`nativeSetDeviceId`) rather than per credential.
@@ -815,15 +827,35 @@ fn device_id() -> Option<String> {
 /// `UnknownDevice` — a connected pair that worked yesterday, broken by a name
 /// neither side asked for. Only a credential a server issued *to* a device is
 /// presented as that device, which is exactly when Kotlin knows the name.
-fn two_factor_auth(cfg: &NodeCredential) -> Option<TwoFactorAuth> {
+///
+/// `key` is the device's own Ed25519 key, when it has one. A key is the
+/// credential then, and it wins over the secret: a key node stores no secret at
+/// all, so the TOTP path would find nothing to build from. The name is not
+/// optional here — a key always names the device it was issued to, and the
+/// server refuses a key that names none.
+fn two_factor_auth(cfg: &NodeCredential, key: Option<&iroh::SecretKey>) -> Option<TwoFactorAuth> {
     let (client_id, secret, algorithm, device) = cfg;
+    let device = device.as_deref().map(str::trim).filter(|d| !d.is_empty());
+
+    if let Some(key) = key {
+        let Some(device) = device else {
+            // A key with no device name is one that has not enrolled yet: the
+            // name is what the server answers with, so before that there is
+            // nothing to present — and the enrollment is what is about to
+            // happen.
+            jni_log!("2FA: a device key is registered without a device name; it enrolls first");
+            return None;
+        };
+        return Some(TwoFactorAuth::with_key(client_id, key.clone(), device));
+    }
+
     if secret.trim().is_empty() {
         return None;
     }
     match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
-        Ok(auth) => Some(match device.as_deref().map(str::trim) {
-            Some(name) if !name.is_empty() => auth.with_device(name),
-            _ => auth,
+        Ok(auth) => Some(match device {
+            Some(name) => auth.with_device(name),
+            None => auth,
         }),
         Err(e) => {
             jni_log!("2FA auth config invalid: {}", e);
@@ -835,7 +867,7 @@ fn two_factor_auth(cfg: &NodeCredential) -> Option<TwoFactorAuth> {
 /// Read the 2FA credentials injected by Kotlin and build a TwoFactorAuth; returns None when unset or secret is empty.
 fn current_two_factor_auth() -> Option<TwoFactorAuth> {
     let cfg = TWO_FACTOR.lock().map(|g| g.clone()).unwrap_or_default()?;
-    two_factor_auth(&(cfg.0, cfg.1, cfg.2, None))
+    two_factor_auth(&(cfg.0, cfg.1, cfg.2, None), None)
 }
 
 /// A snapshot of the per-endpoint credentials, so the mutex is not held across
@@ -858,16 +890,37 @@ fn node_two_factor_for(node_id: &str) -> Option<NodeCredential> {
         .and_then(|map| map.get(node_id).cloned())
 }
 
+/// The device key registered for one endpoint, if any.
+fn node_device_key_for(node_id: &str) -> Option<iroh::SecretKey> {
+    NODE_DEVICE_KEYS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(node_id).cloned())
+}
+
 /// Whether this node has credentials, i.e. whether it must not enroll.
 ///
 /// Not `node_two_factor_for(..).is_some()`: an entry whose secret is blank is
 /// an entry that produces no `TwoFactorAuth`, so it authenticates with nothing
 /// and — read as "has credentials" — never enrolls either. The node then
 /// connects with no credential at all against a server that is asking for one.
+///
+/// A device key counts, but only once the node also names the device it was
+/// issued to: the name comes back from the enrollment, so before that the key
+/// is an offer rather than a credential, and the node still has to enroll.
 fn node_has_two_factor(node_id: &str) -> bool {
-    node_two_factor_for(node_id)
-        .map(|cfg| !cfg.1.trim().is_empty())
-        .unwrap_or(false)
+    let Some(cfg) = node_two_factor_for(node_id) else {
+        return false;
+    };
+    if !cfg.1.trim().is_empty() {
+        return true;
+    }
+    let names_a_device = cfg
+        .3
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|name| !name.is_empty());
+    names_a_device && node_device_key_for(node_id).is_some()
 }
 
 /// A snapshot of the per-endpoint enrollment tokens, so the mutex is not held across the
@@ -1063,6 +1116,95 @@ fn set_two_factor_for_node(
     0
 }
 
+/// Mints a device key and hands back its private half, as 64 hex characters.
+///
+/// The key is generated here rather than in Kotlin because Android's
+/// cryptography API has no Ed25519 below API 33, and the app supports API 26.
+///
+/// The private half is the credential: it is what proves this device to the
+/// server, and it never leaves the device. Kotlin seals it at rest and reads
+/// it back on every start, and it is what `nativeSetDeviceKeyForNode` takes.
+///
+/// Returns null when the key could not be handed over, which is a failure
+/// rather than a key that proves nothing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeGenerateDeviceKey(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        let key = DeviceKey::generate();
+        let private = key.private_hex();
+        jni_log!(
+            "[DEBUG:jni] nativeGenerateDeviceKey: public={}",
+            key.public_hex()
+        );
+        match env.new_string(private) {
+            Ok(s) => s.into_raw(),
+            Err(e) => {
+                jni_log!("nativeGenerateDeviceKey: {}", e);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Registers the device key of a single endpoint.
+///
+/// node_id:  endpoint ID this key belongs to.
+/// key:      the private half, as 64 hex characters — what
+///           `nativeGenerateDeviceKey` handed out.
+///
+/// A key is offered by the enrollment that spends the node's token, and signs
+/// every handshake after it. A node whose enrollment has not happened yet has
+/// a key but no device name, and the name is what the server answers with —
+/// so the key is an offer until then, not a credential.
+///
+/// Must be called before nativeStartProxy.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceKeyForNode(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    node_id: JString,
+    key: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        if env.exception_check() {
+            jni_log!("JNI exception pending before nativeSetDeviceKeyForNode");
+            env.exception_clear();
+            return -1;
+        }
+        let node_id = match read_jstring(env, &node_id) {
+            Some(v) => v.trim().to_string(),
+            None => {
+                jni_log!("Failed to read node_id in nativeSetDeviceKeyForNode");
+                return -1;
+            }
+        };
+        if node_id.is_empty() {
+            jni_log!("nativeSetDeviceKeyForNode: empty node_id");
+            return -1;
+        }
+        let spelled = read_jstring(env, &key).unwrap_or_default();
+        let key = match DeviceKey::from_hex(&spelled) {
+            Ok(key) => key,
+            Err(e) => {
+                jni_log!("nativeSetDeviceKeyForNode: {}", e);
+                return -1;
+            }
+        };
+        jni_log!(
+            "[DEBUG:jni] nativeSetDeviceKeyForNode: node='{}', public={}",
+            node_id,
+            key.public_hex()
+        );
+        if let Ok(mut map) = NODE_DEVICE_KEYS.lock() {
+            map.insert(node_id, key.secret_key().clone());
+        }
+        0
+    })
+}
+
 /// Drops every credential registered with `nativeSetTwoFactorForNode`.
 ///
 /// Read the configuration back through this pair on every connect: without the
@@ -1140,11 +1282,13 @@ fn set_enrollment_for_node(
     0
 }
 
-/// Drops every credential — and every enrollment token — registered per endpoint.
+/// Drops every credential — every enrollment token and every device key —
+/// registered per endpoint.
 ///
-/// The token table rides along on purpose: the two are the same question ("how does this
-/// endpoint authenticate?"), and reading the configuration back through one call is what
-/// keeps a stale entry from applying to a node that no longer has one.
+/// The token and key tables ride along on purpose: they are the same question
+/// ("how does this endpoint authenticate?"), and reading the configuration back
+/// through one call is what keeps a stale entry from applying to a node that
+/// no longer has one.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
     _env: EnvUnowned,
@@ -1156,15 +1300,23 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
     if let Ok(mut map) = NODE_ENROLLMENT.lock() {
         map.clear();
     }
+    if let Ok(mut map) = NODE_DEVICE_KEYS.lock() {
+        map.clear();
+    }
     0
 }
 
 /// The credential the server issued for an enrollment token, cleared on read.
 ///
-/// `client_id`, `secret` and `algorithm`, newline separated, or null when this run enrolled
-/// nothing. Spending a token rotates that client's secret server-side, so this is the only
-/// chance to read what it bought: without it the device holds an invite the server has
+/// `client_id`, `secret`, `algorithm`, the device name and the public key,
+/// newline separated, or null when this run enrolled nothing. Spending a token
+/// rotates that client's secret server-side, so this is the only chance to read
+/// what it bought: without it the device holds an invite the server has
 /// already forgotten and cannot enroll again.
+///
+/// A credential that is a key has an empty secret and an empty algorithm, and
+/// carries its public half in the last line instead — that is how the caller
+/// tells the two kinds apart.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTakeIssuedCredential(
     mut unowned_env: EnvUnowned,
@@ -1222,17 +1374,19 @@ fn take_issued_credential(env: &mut Env<'_>) -> jstring {
     let Some(issued) = issued else {
         return std::ptr::null_mut();
     };
-    // Four lines, the last one only since devices existed: the name the server
-    // filed this secret under, which Kotlin has to write down beside it — a
-    // secret kept without its name is one that no longer answers. Empty when
-    // the server answered an enrollment that named no device, and a caller
-    // that reads three lines still reads an unnamed credential.
+    // Five lines, each of them only since it became a thing: the name the
+    // server filed this credential under, which Kotlin has to write down beside
+    // it — a secret kept without its name is one that no longer answers — and
+    // the public half of the key, which is how Kotlin tells a key credential
+    // from a secret one. Both are empty when they do not apply, and a caller
+    // that reads three or four lines still reads what it read before.
     let encoded = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         issued.client_id,
         issued.secret,
         issued.algorithm,
-        issued.device.unwrap_or_default()
+        issued.device.unwrap_or_default(),
+        issued.public_key.unwrap_or_default()
     );
     match env.new_string(encoded) {
         Ok(value) => value.into_raw(),
@@ -1548,8 +1702,12 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 endpoint_group.set_two_factor(Some(auth)).await;
             }
             for (node_id, cfg) in node_two_factor_snapshot() {
+                // A key is the credential where there is one: the node stores no
+                // secret at all, so the TOTP path would find nothing to build
+                // from and the node would answer with nothing.
+                let key = node_device_key_for(&node_id);
                 endpoint_group
-                    .set_two_factor_for(&node_id, two_factor_auth(&cfg))
+                    .set_two_factor_for(&node_id, two_factor_auth(&cfg, key.as_ref()))
                     .await;
             }
             // Enrollment last, and only where no credentials were registered: enrolling
@@ -1565,10 +1723,25 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 // comes back this phone's alone, and enrolling without one is
                 // how a device ends up sharing the client's secret — the thing
                 // that makes revoking one rotate every other one.
+                let name = device_id();
                 let enrollment = Enrollment::new(&client_id, &token);
-                let enrollment = match device_id() {
-                    Some(name) => enrollment.with_device(&name),
+                let enrollment = match &name {
+                    Some(name) => enrollment.with_device(name),
                     None => enrollment,
+                };
+                // A device key is offered here rather than asked for: the server
+                // records the public half under the device's name and issues no
+                // secret at all, so the private half never has to be anywhere
+                // but this device. A server that predates keys ignores the offer
+                // and issues a secret as it always has, which is what the
+                // credential then is.
+                //
+                // Only with a name, because the server refuses a key that names
+                // no device — and a refusal that reads as a bad token would be a
+                // lie: the token was fine and the device had no name.
+                let enrollment = match (&name, node_device_key_for(&node_id)) {
+                    (Some(_), Some(key)) => enrollment.with_key(key),
+                    _ => enrollment,
                 };
                 endpoint_group
                     .set_enrollment_for(&node_id, Some(enrollment))
@@ -2647,4 +2820,82 @@ fn stop_tun_proxy() -> jint {
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key is the credential for a node that has one: the node stores no
+    /// secret at all, so the TOTP path would find nothing to build from and
+    /// the node would answer with nothing.
+    #[test]
+    fn a_node_with_a_key_authenticates_with_the_key() {
+        let key = DeviceKey::generate();
+        let public = key.public_hex();
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            String::new(),
+            String::new(),
+            Some("phone-1a2b3c4d".to_string()),
+        );
+
+        let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a key is a credential");
+        assert_eq!(auth.client_id(), "client-001");
+        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(
+            auth.public_key_hex(),
+            Some(public),
+            "the credential proves itself with the key that was registered"
+        );
+    }
+
+    /// A key with no device name is one that has not enrolled yet: the name
+    /// is what the server answers with, so before that there is nothing to
+    /// present — and the enrollment is what is about to happen.
+    #[test]
+    fn a_key_without_a_device_name_is_not_a_credential_yet() {
+        let key = DeviceKey::generate();
+        let cfg: NodeCredential = ("client-001".to_string(), String::new(), String::new(), None);
+
+        assert!(
+            two_factor_auth(&cfg, Some(key.secret_key())).is_none(),
+            "a key that names no device cannot answer a handshake"
+        );
+    }
+
+    /// The secret path is unchanged: a node with a secret still authenticates
+    /// with it, and still answers as the device it was issued to.
+    #[test]
+    fn a_node_with_a_secret_still_authenticates_with_the_secret() {
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            "JBSWY3DPEHPK3PXP".to_string(),
+            "sha1".to_string(),
+            Some("laptop".to_string()),
+        );
+
+        let auth = two_factor_auth(&cfg, None).expect("a secret is a credential");
+        assert_eq!(auth.client_id(), "client-001");
+        assert_eq!(auth.device_id(), Some("laptop"));
+        assert_eq!(
+            auth.public_key_hex(),
+            None,
+            "a secret has no key, and that is how the two kinds are told apart"
+        );
+    }
+
+    /// An empty secret is not a credential: it is how a node that was never
+    /// given one is represented, and read as "has credentials" it would
+    /// authenticate with nothing.
+    #[test]
+    fn an_empty_secret_is_no_credential() {
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            "  ".to_string(),
+            "sha1".to_string(),
+            None,
+        );
+        assert!(two_factor_auth(&cfg, None).is_none());
+    }
 }

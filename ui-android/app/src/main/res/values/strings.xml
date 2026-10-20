@@ -144,6 +144,11 @@
     <string name="two_factor_secret">TOTP Secret</string>
     <string name="two_factor_secret_placeholder">JBSWY3DPEHPK3PXP</string>
     <string name="two_factor_algorithm">Algorithm</string>
+    <string name="two_factor_credential_type">Credential</string>
+    <string name="two_factor_type_key">Device key</string>
+    <string name="two_factor_public_key">Public key</string>
+    <string name="two_factor_public_key_copy">Copy</string>
+    <string name="two_factor_key_hint">This endpoint proves itself with a key of its own. The private half never leaves this device, and the server holds only the public half above — so this endpoint can be revoked on its own, and a leaked configuration is no longer a way in as it.</string>
     <string name="two_factor_sha1">SHA1 (default)</string>
     <string name="two_factor_sha256">SHA256</string>
     <string name="two_factor_sha512">SHA512</string>
