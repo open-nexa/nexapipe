@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-20 (**the v0.7.0 release is cancelled; the next release is v1.0.0** — see [§0](#0-the-v100-decision-2026-10-20) for what that cycle contains and what it does not; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease — in v1.0.0; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed)) |
+| Last updated | 2026-10-20 (**the v0.7.0 release is cancelled; the next release is v1.0.0** — see [§0](#0-the-v100-decision-2026-10-20) for what that cycle contains and what it does not; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease — in v1.0.0; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v1.0.0](#phase-36--v100-weighed)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -810,7 +810,7 @@ competes with R13 for the same attention. What puts it ahead is that R13 is stil
 behind its own gate — the premise has not been validated — while this is what the
 tree says about itself today.
 
-### Phase 4 — v1.0, "reachable without our client" (exploratory)
+### Phase 4 — v1.1, "reachable without our client" (exploratory)
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -839,7 +839,7 @@ minimal config and a stable Node ID, and can keep the `secret_key` and
 `relay_auth_token` out of `config.toml` — in a file, the environment, or a
 secrets mount — without a permission gate on the config itself.
 
-### Phase 3.6 — v0.6.2, "weighed"
+### Phase 3.6 — v1.0.0, "weighed"
 
 No new capability is opened for this release, and that is the point: it exists
 because the artifact-size work in [`size-perf-roadmap.md`](size-perf-roadmap.md)
@@ -890,9 +890,9 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── secrets-file env + no gate ► v0.6.1
                                               ├── Android tun-proxy gate ────► v0.6.1
                                               │
-                              R13 edge (after validation) ──► v1.0
+                              R13 edge (after validation) ──► v1.1
 
-        S1 measure (v0.6.2) ──┬── S2 desktop profile ──┐   (size-perf-roadmap.md)
+        S1 measure (v1.0.0) ──┬── S2 desktop profile ──┐   (size-perf-roadmap.md)
                                └── S3 Android R8 ───────┴── S4 budget gate
         F1 benches ──────► F2 targeted work ───► F3 perf budget
 ```
@@ -909,7 +909,7 @@ and its gate; what moved is the phase number above it, because v0.6.0 was
 inserted beneath it. The size and performance chain at the bottom is not part of
 this document's numbering: it is `S*` and `F*` rather than `R*`, and its detail
 lives in [`size-perf-roadmap.md`](size-perf-roadmap.md). S1 lands in
-[v0.6.2](#phase-36--v062-weighed), because nothing else in that document can be
+[v1.0.0](#phase-36--v100-weighed), because nothing else in that document can be
 verified until S1 says what the artifacts weigh today; v0.6.1 carried the
 config-surface improvements above instead.
 
