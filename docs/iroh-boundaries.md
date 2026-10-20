@@ -77,17 +77,22 @@ Four modes, and what each one bounds:
 
 **What `custom` buys.** iroh's `relay_mode` only bounds the relay *this*
 endpoint registers with and probes through: a peer that hands over an address
-naming somebody else's relay would still be dialled through it, and a peer
-named only by a Node ID would be looked up through n0 and dialled through
-whatever n0 answered with. A `custom` client now refuses both:
+naming somebody else's relay would still be dialled through it. A `custom`
+client now refuses that:
 
-- a peer whose address names a relay other than yours is not dialled;
-- a peer named only by a Node ID is not dialled at all, because finding its
-  address means asking n0.
+- a peer whose address names a relay other than yours is not dialled.
 
-So a `custom` client reaches its peer through your relay and nothing else — and
-it reaches it by ticket, because that is what carries an address. Both ends of
-a self-hosted deployment point at the same relay, and the ticket names it.
+A peer named only by a Node ID is a different question, and the answer depends
+on the lookup: finding its address means asking n0, whose answer may be an n0
+relay. Such a peer is therefore dialled while the endpoint may still ask n0
+where it is — the operator's own trade to make. With the lookup off
+(`discovery = "none"`) it cannot be reached at all, and it is refused rather
+than pretended for.
+
+So a `custom` client reaches its peer through your relay and nothing else —
+as long as the peer carries an address. That is what a ticket is: a deployment
+that wants the peer reached through one relay only needs a ticket, and both
+ends on the same relay.
 
 **What `custom` still does not buy.** It says nothing about what the *server*
 publishes. A server in `custom` mode still publishes its address — its relay

@@ -345,9 +345,9 @@ pub async fn run_proxy(
     // its own; `none` takes the lookup services off the endpoint, and a peer
     // then has to bring an address of its own (a ticket) to be reachable.
     //
-    // A value that is present but unknown refuses the start, the same rule the
-    // relay modes follow: a config that says one thing and does another is
-    // worse than a config that does not start.
+    // A value that is present but unknown refuses the start, the rule the
+    // relay modes follow for a mode they cannot read. An empty one is
+    // refused as well: it is present, and it names no mode.
     let discovery = match iroh_config.as_ref().and_then(|c| c.discovery.as_deref()) {
         Some(value) => DiscoveryMode::parse(value)
             .with_context(|| format!("invalid [iroh] discovery: {value:?}"))?,

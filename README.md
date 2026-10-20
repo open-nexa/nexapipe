@@ -716,8 +716,10 @@ unrecognised spelling — stops startup instead of quietly falling back. A
 discovery — the lookup that turns a Node ID into "where do I send QUIC
 packets" — is a separate switch, `discovery = "none"`, and it is what keeps a
 lookup from going to `dns.iroh.link`. A `custom` client also refuses to dial a
-peer through anybody else's relay, and a peer named only by a Node ID, so it
-reaches its peer through your relay and nothing else.
+peer through anybody else's relay, so a peer that carries an address is
+reached through your relay and nothing else. A peer named only by a Node ID
+still needs the lookup to be found at all, so it is dialled while the endpoint
+may ask n0 where it is — and refused outright once the lookup is off.
 [What still depends on third-party infrastructure](docs/iroh-boundaries.md)
 states the boundary in full, including what each of these does and does not
 buy.
