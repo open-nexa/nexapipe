@@ -13,7 +13,7 @@
 //!
 //! With no address lookup at all, a Node ID on its own is no longer enough to
 //! reach a peer. The peer has to be named by something that carries its
-//! address: a ticket (`--generate-invite` produces one) or an explicit
+//! address: a ticket (the server prints one at start-up) or an explicit
 //! `EndpointAddr`. That is the trade — no third party learns which Node ID is
 //! being asked about, and nothing this endpoint sends leaves it — in exchange
 //! for having to hand the address over instead of looking it up.
@@ -61,6 +61,26 @@ impl DiscoveryMode {
                 VALID_DISCOVERY_MODES.join(", ")
             ),
         }
+    }
+
+    /// Resolves a configured value into a mode, treating an empty value as
+    /// "nothing was configured".
+    ///
+    /// An empty value is not a misspelled mode — it is the state a client is in
+    /// before anything has been injected into it. The Android app fills the
+    /// setting in when it connects, and the endpoint may be built before that
+    /// happens, so an empty value has to mean the default the way an unset
+    /// setting means it everywhere else. Refusing it would turn a missing
+    /// setting into a client that cannot start at all.
+    ///
+    /// An unknown *spelling* is still refused, by [`DiscoveryMode::parse`]: a
+    /// config that says `"off"` and gets `n0` anyway is a config that says one
+    /// thing and does another.
+    pub fn parse_or_default(value: &str) -> anyhow::Result<Self> {
+        if value.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        Self::parse(value)
     }
 
     /// One line for the startup log: what actually took effect.
@@ -112,6 +132,27 @@ mod tests {
         assert!(err.to_string().contains("unknown discovery mode"), "{err}");
         assert!(DiscoveryMode::parse("disabled").is_err());
         assert!(DiscoveryMode::parse("").is_err());
+    }
+
+    /// An empty value is "nothing was configured", not a misspelling: the
+    /// client that has not been told yet must still be able to start.
+    #[test]
+    fn an_empty_value_is_the_default_rather_than_an_error() {
+        assert_eq!(
+            DiscoveryMode::parse_or_default("").unwrap(),
+            DiscoveryMode::N0
+        );
+        assert_eq!(
+            DiscoveryMode::parse_or_default("   ").unwrap(),
+            DiscoveryMode::N0
+        );
+        // A value that names a mode wrongly is still refused.
+        assert!(DiscoveryMode::parse_or_default("off").is_err());
+        // And an empty value still means the default when it is spelled out.
+        assert_eq!(
+            DiscoveryMode::parse_or_default("none").unwrap(),
+            DiscoveryMode::None
+        );
     }
 
     #[test]

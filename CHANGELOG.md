@@ -141,14 +141,18 @@ its defaults — which are on.
 
 - **`relay_mode = "custom"` now means it for the peer as well.** A custom
   client dials its peer through the relay you run and nothing else: a peer
-  whose address names a different relay is refused, and so is a peer named only
-  by a Node ID — finding that peer's address means asking n0, whose answer may
-  be an n0 relay. Before, iroh's `relay_mode` bounded only the relay the
-  endpoint itself registered with, so a peer advertising an N0 relay was still
-  dialled through it. The refusal says which relay the peer named and which one
-  this endpoint uses. A deployment that relies on the old behaviour — a custom
-  client reaching an N0-relayed server — now needs a ticket, and both ends on
-  the same relay.
+  whose address names a different relay is refused, and the refusal says which
+  relay the peer named and which one this endpoint uses. Before, iroh's
+  `relay_mode` bounded only the relay the endpoint itself registered with, so
+  a peer advertising an N0 relay was still dialled through it.
+
+  A peer named only by a Node ID is dialled while the endpoint may still ask
+  n0 where that peer is — finding it means asking n0, whose answer may be an
+  n0 relay, and that is the operator's own trade to make. With the lookup off
+  (`discovery = "none"`) such a peer cannot be reached at all, and it is
+  refused rather than pretended for. A deployment that wants the peer reached
+  through one relay only needs a ticket, which carries the address, and both
+  ends on the same relay.
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which
   kind of credential a device has comes from the server's own record, not
   from a wire discriminator, so no message variant or scheme field was added,

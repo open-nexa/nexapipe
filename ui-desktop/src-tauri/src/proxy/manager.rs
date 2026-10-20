@@ -364,24 +364,22 @@ impl ProxyManager {
             );
         }
         tracing::info!("Relay: {}", relay.describe());
-        // Which relay a *peer* may be dialled through. `custom` says this
-        // endpoint uses one relay and no other, and that has to hold for the
-        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
-        // registers with, so a peer naming somebody else's relay would
-        // otherwise be dialled through it.
-        let restriction = relay.dial_restriction();
-        if let Some(restriction) = &restriction {
-            tracing::info!(
-                "Peers are dialled through {} and nothing else",
-                restriction.relay()
-            );
-        }
         // Whether this endpoint may ask n0 where a peer is. It is the one piece
         // of n0's infrastructure a relay setting does not reach, so it gets a
         // setting of its own.
         let discovery =
             DiscoveryMode::parse(&self.config.discovery_mode).map_err(StartError::Other)?;
         tracing::info!("Discovery: {}", discovery.describe());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it. A peer named only by a Node ID is
+        // dialled while the lookup above is on, and refused once it is off.
+        let restriction = relay.dial_restriction(discovery);
+        if let Some(restriction) = &restriction {
+            tracing::info!("Peers are dialled through {}", restriction.describe());
+        }
         // Bind IPv4 only. On hosts where IPv6 exists but cannot carry full-size QUIC
         // datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big" filtered), iroh's net
         // report calls v6 usable, relay dials and path migration move traffic onto v6 —

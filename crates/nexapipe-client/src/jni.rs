@@ -1554,23 +1554,14 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             );
         }
         jni_log!("[iroh] relay: {}", relay.describe());
-        // Which relay a *peer* may be dialled through. `custom` says this
-        // endpoint uses one relay and no other, and that has to hold for the
-        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
-        // registers with, so a peer naming somebody else's relay would
-        // otherwise be dialled through it.
-        let restriction = relay.dial_restriction();
-        if let Some(restriction) = &restriction {
-            jni_log!(
-                "[iroh] peers are dialled through {} and nothing else",
-                restriction.relay()
-            );
-        }
         // Whether this endpoint may ask n0 where a peer is. It is the one piece
         // of n0's infrastructure a relay setting does not reach, so it gets a
         // setting of its own.
         let cfg_discovery = DISCOVERY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
-        let discovery = match DiscoveryMode::parse(&cfg_discovery) {
+        // An empty value means nothing has been injected yet, which falls back to "n0" —
+        // the same reading an unset setting gets everywhere else. Only a value that
+        // names a mode wrongly is an error.
+        let discovery = match DiscoveryMode::parse_or_default(&cfg_discovery) {
             Ok(mode) => mode,
             Err(e) => {
                 jni_log!("[iroh] invalid discovery configuration: {e}");
@@ -1578,6 +1569,18 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             }
         };
         jni_log!("[iroh] discovery: {}", discovery.describe());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it. A peer named only by a Node ID is
+        // dialled while the lookup above is on — the Android app names every
+        // peer that way — and refused once the lookup is off.
+        let restriction = relay.dial_restriction(discovery);
+        if let Some(restriction) = &restriction {
+            let covered = restriction.describe();
+            jni_log!("[iroh] peers are dialled through {covered}");
+        }
         let mut builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
         builder = discovery.apply(builder);
         if let Some(restriction) = restriction {
