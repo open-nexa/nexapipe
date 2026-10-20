@@ -86,6 +86,65 @@ fn current_exe() -> Result<PathBuf, AppError> {
     })
 }
 
+/// The characters the specification reserves in a command line.
+///
+/// Space, tab, newline, `"`, `'`, `\`, `>`, `<`, `~`, `|`, `&`, `;`, `$`, `*`,
+/// `?`, `#`, `(` and `)`, plus the backtick. A reserved character that is not
+/// quoted ends the program name early — a path with an `&` in it, say, is read
+/// as a path and a background job — so a path carrying one is quoted.
+///
+/// One string rather than a list of characters, because a list of them is laid
+/// out by the formatter and the set belongs to the specification rather than
+/// to this file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const RESERVED: &str = " \t\n\"'\\><~| &;$*?#()`";
+
+/// The program's path, as the `Exec` line has to carry it.
+///
+/// That line is a command line, and the reserved characters above are the
+/// ones that need quoting there.
+///
+/// Inside the quotes, four characters still need an escape of their own:
+/// the quote, the backtick, the dollar sign and the backslash. The
+/// backslash needs two of them: the escape rule for a string value is
+/// applied before the quoting rule, so a literal backslash is four
+/// backslashes in the file.
+///
+/// A `%` is a field code otherwise — the specification expands those
+/// before the program ever sees the path — so a literal one is written
+/// `%%`.
+///
+/// At the top level rather than in the Linux module, because it is a pure
+/// function of the path and the rules of the specification: its tests are
+/// then the same on every platform, and a platform that never writes a
+/// `.desktop` file still gets them checked.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn quote_argument(exe: &std::path::Path) -> String {
+    let exe = exe.display().to_string();
+    if !exe.chars().any(|c| RESERVED.contains(c)) {
+        // Quoting is only needed where it changes the meaning, but a field
+        // code is expanded either way.
+        return exe.replace('%', "%%");
+    }
+    let mut quoted = String::with_capacity(exe.len() + 2);
+    quoted.push('"');
+    for c in exe.chars() {
+        match c {
+            '"' | '`' | '$' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            // The escape rule runs before the quoting rule, so a literal
+            // backslash is two escapes of its own.
+            '\\' => quoted.push_str("\\\\\\\\"),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 // -- Windows ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -442,44 +501,49 @@ mod platform {
              Exec={} {}\n\
              Terminal=false\n\
              X-GNOME-Autostart-enabled=true\n",
-            quote_argument(exe),
+            super::quote_argument(exe),
             super::BACKGROUND_FLAG,
         )
     }
+}
 
-    /// The program's path, as the `Exec` line has to carry it.
-    ///
-    /// That line is a command line, and the specification reserves a whole set
-    /// of characters in it: space, tab, newline, `"`, `'`, `\`, `>`, `<`, `&`,
-    /// `;`, `$`, `*`, `?`, `#`, `(` and `)`, plus the backtick. A reserved
-    /// character that is not quoted ends the program name early — a path with
-    /// an `&` in it, say, is read as a path and a background job — so a path
-    /// carrying one is quoted.
-    ///
-    /// Inside the quotes, four characters still need an escape of their own:
-    /// the quote, the backslash, the backtick and the dollar sign.
-    fn quote_argument(exe: &std::path::Path) -> String {
-        let exe = exe.display().to_string();
-        const RESERVED: &[char] = &[
-            ' ', '\t', '\n', '"', '\'', '\\', '>', '<', '&', ';', '$', '*', '?', '#', '(', ')', '`',
-        ];
-        if !exe.chars().any(|c| RESERVED.contains(&c)) {
-            return exe;
-        }
-        let mut quoted = String::with_capacity(exe.len() + 2);
-        quoted.push('"');
-        for c in exe.chars() {
-            if matches!(c, '"' | '\\' | '`' | '$') {
-                quoted.push('\\');
-            }
-            quoted.push(c);
-        }
-        quoted.push('"');
-        quoted
+// -- anything else ---------------------------------------------------------------------
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+mod platform {
+    use crate::error::{codes, AppError};
+
+    pub fn is_enabled() -> Result<bool, AppError> {
+        Err(AppError::new(codes::AUTOSTART_UNSUPPORTED_PLATFORM))
     }
 
-    #[cfg(test)]
-    mod tests {
+    pub fn set_enabled(_enabled: bool) -> Result<(), AppError> {
+        Err(AppError::new(codes::AUTOSTART_UNSUPPORTED_PLATFORM))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_background_flag_is_a_word_the_launcher_can_pass() {
+        // It travels through a registry value, a plist array and a desktop
+        // entry's `Exec` line, so it has to be a single argument with no
+        // spaces in it.
+        assert!(!BACKGROUND_FLAG.contains(' '));
+        assert!(BACKGROUND_FLAG.starts_with("--"));
+    }
+
+    #[test]
+    fn the_entry_name_is_one_word() {
+        // The same name appears in a registry value, a file name and a plist
+        // label; a space in it would need quoting in two of the three.
+        assert!(!ENTRY_NAME.contains(' '));
+    }
+
+    /// How the `Exec` line of a desktop entry carries a path.
+    mod quoting {
         use super::quote_argument;
         use std::path::Path;
 
@@ -528,42 +592,46 @@ mod platform {
                 "\"/home/a\\$b/nexa\""
             );
         }
-    }
-}
 
-// -- anything else ---------------------------------------------------------------------
+        #[test]
+        fn a_backslash_in_a_quoted_path_is_escaped_twice_over() {
+            // The escape rule for a string value runs before the quoting rule,
+            // so a literal backslash is two escapes of its own: four
+            // backslashes in the file.
+            assert_eq!(
+                quote_argument(Path::new("/home/a\\b/nexa")),
+                "\"/home/a\\\\\\\\b/nexa\""
+            );
+        }
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-mod platform {
-    use crate::error::{codes, AppError};
+        #[test]
+        fn a_tilde_or_a_pipe_in_a_path_is_quoted() {
+            // The specification reserves both, so a path carrying one is
+            // quoted like any other.
+            assert_eq!(
+                quote_argument(Path::new("/home/a~b/nexa")),
+                "\"/home/a~b/nexa\""
+            );
+            assert_eq!(
+                quote_argument(Path::new("/home/a|b/nexa")),
+                "\"/home/a|b/nexa\""
+            );
+        }
 
-    pub fn is_enabled() -> Result<bool, AppError> {
-        Err(AppError::new(codes::AUTOSTART_UNSUPPORTED_PLATFORM))
-    }
-
-    pub fn set_enabled(_enabled: bool) -> Result<(), AppError> {
-        Err(AppError::new(codes::AUTOSTART_UNSUPPORTED_PLATFORM))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_background_flag_is_a_word_the_launcher_can_pass() {
-        // It travels through a registry value, a plist array and a desktop
-        // entry's `Exec` line, so it has to be a single argument with no
-        // spaces in it.
-        assert!(!BACKGROUND_FLAG.contains(' '));
-        assert!(BACKGROUND_FLAG.starts_with("--"));
-    }
-
-    #[test]
-    fn the_entry_name_is_one_word() {
-        // The same name appears in a registry value, a file name and a plist
-        // label; a space in it would need quoting in two of the three.
-        assert!(!ENTRY_NAME.contains(' '));
+        #[test]
+        fn a_percentage_in_a_path_is_escaped() {
+            // A `%` is a field code otherwise, and the specification expands
+            // those before the program sees the path — so a literal one is
+            // written `%%`, quoted or not.
+            assert_eq!(
+                quote_argument(Path::new("/home/a%b/nexa")),
+                "/home/a%%b/nexa"
+            );
+            assert_eq!(
+                quote_argument(Path::new("/home/a b%c/nexa")),
+                "\"/home/a b%%c/nexa\""
+            );
+        }
     }
 
     /// The launch flag is read off the process's own arguments, and it has to
