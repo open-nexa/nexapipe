@@ -1210,7 +1210,7 @@ jobs:
           # The digest of the list that was just published. This is the handle
           # a user pulls, and the one the signature and the provenance
           # attestation below are bound to: the per-architecture digests are
-          # not what `docker pull ghcr.io/open-nexa/nexapipe:0.7.0` resolves to.
+          # not what `docker pull ghcr.io/open-nexa/nexapipe:1.0.0` resolves to.
           digest="$(docker buildx imagetools inspect "ghcr.io/open-nexa/nexapipe:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
             echo "::error::could not read the published digest"
