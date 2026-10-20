@@ -656,6 +656,9 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     // URI and the QR code, which carry the same secret by design. Nothing else
     // prints it, and this is the one place it is meant to be seen.
     // codeql[rust/cleartext-logging]
+    // CodeQL does not honour inline suppressions in Rust yet (github/codeql#21637),
+    // so this marker records the intent and starts suppressing on its own once
+    // that support lands. Until then the alert is dismissed by hand.
     println!(
         "  Secret     {}{}",
         uri.secret.expose_secret(),
@@ -1097,6 +1100,8 @@ fn add_client(
     // `--generate-2fa` path above: the operator asked for this credential and
     // the next step is typing it into an authenticator app.
     // codeql[rust/cleartext-logging]
+    // Rust does not honour inline suppressions yet (github/codeql#21637); see
+    // the `--generate-2fa` path above for the full explanation.
     println!("  Secret     {}", uri.secret.expose_secret());
     println!("  Algorithm  {}", uri.algorithm);
     println!(
