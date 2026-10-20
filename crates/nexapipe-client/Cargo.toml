@@ -40,13 +40,19 @@ nexapipe-proto.workspace = true
 netstack-smoltcp = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support
-totp-rs = { version = "6.0", features = ["gen_secret"] }
+# `zeroize` so the TOTP validator wipes its own copy of the seed when it is
+# dropped: the validator is built from the secret, and without this it kept a
+# second copy of the credential in the heap for as long as the process lived.
+totp-rs = { version = "6.0", features = ["gen_secret", "zeroize"] }
 base32 = "0.5"
 hex = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+# Wiping credentials from memory when they go out of scope; see
+# `src/secret.rs`, which is the only place this crate uses it.
+zeroize.workspace = true
 
 [features]
 default = ["native-certs", "tracing"]

@@ -300,9 +300,11 @@ pub async fn run_proxy(
     let relay = RelayModeSpec::parse(
         iroh_config.as_ref().and_then(|c| c.relay_mode.as_deref()),
         iroh_config.as_ref().and_then(|c| c.relay_url.as_deref()),
-        iroh_config
-            .as_ref()
-            .and_then(|c| c.relay_auth_token.as_deref()),
+        iroh_config.as_ref().and_then(|c| {
+            c.relay_auth_token
+                .as_ref()
+                .map(|token| token.expose_secret().as_str())
+        }),
     )
     .context("invalid [iroh] relay configuration")?;
     if let Some(relay) = &relay {
@@ -328,12 +330,15 @@ pub async fn run_proxy(
         // has already refused this at startup, so reaching the error here means
         // the two checks disagree; failing keeps that from being silent.
         if let Some(secret_key_str) = &iroh_cfg.secret_key {
-            let secret_key = secret_key_str.parse::<SecretKey>().map_err(|e| {
-                anyhow::anyhow!(
-                    "[iroh] secret_key is not a valid key ({e}); refusing to start on a \
+            let secret_key = secret_key_str
+                .expose_secret()
+                .parse::<SecretKey>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "[iroh] secret_key is not a valid key ({e}); refusing to start on a \
                      throwaway identity, because the Node ID would change on every restart"
-                )
-            })?;
+                    )
+                })?;
             builder = builder.secret_key(secret_key);
             tracing::info!("Using configured secret key for stable endpoint identity");
         }

@@ -167,6 +167,24 @@ its defaults — which are on.
   gate, beside the two `cargo audit` jobs — which watch advisories and
   nothing else. The check found two crates of this repository carrying no
   licence at all; both say MIT now.
+- **The credentials are wiped when they go out of scope.** A TOTP seed, an
+  enrollment token, a relay bearer, the admin token and the endpoint's own
+  private key are now held in a type that zeroes its buffer when it is dropped,
+  on both sides: the server's `[auth]` seeds, the admin token and the endpoint
+  key, and the client's credentials — including the process-wide tables the
+  Android app fills through JNI. The buffers those files are read into are
+  wiped with them, so the plaintext of a credential file does not sit in the
+  heap after the parse that needed it. Until
+  now they were masked in `Debug` but stayed in the heap as plain `String`s,
+  so a core dump, a swap file or a read of `/proc/<pid>/mem` handed over
+  every credential the process had ever held, long after the handshake that
+  needed it. The TOTP validator the library builds is wiped with them, so the
+  second copy of the seed inside it is gone as well. The masking that was
+  already there is now the default rather than something each field has to
+  remember: a struct that derives `Debug` and holds a secret cannot leak it.
+  Nothing about the configuration or the wire format changes — a `config.toml`
+  written by this build is the one the previous build wrote, and a client
+  built against the old one still talks to a server built against the new one.
 
 ## [0.6.1] — 2026-10-11
 

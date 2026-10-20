@@ -176,8 +176,11 @@ fn a_device_gets_a_credential_of_its_own() {
         nexapipe::config::ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
             .expect("config still parses");
     let auth = auth.expect("[auth] exists");
-    assert_eq!(auth.clients["acme"].devices["laptop"].secret, device_secret);
-    assert_eq!(auth.clients["acme"].secret, client_secret);
+    assert_eq!(
+        auth.clients["acme"].devices["laptop"].secret.as_str(),
+        device_secret
+    );
+    assert_eq!(auth.clients["acme"].secret.as_str(), client_secret);
 }
 
 #[test]

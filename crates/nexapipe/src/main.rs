@@ -9,6 +9,7 @@ use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use nexapipe_client::relay::RelayModeSpec;
+use nexapipe_client::secret::SecretString;
 use std::sync::Arc;
 
 /// The default config path the binary uses when `--config` is not given.
@@ -480,7 +481,7 @@ async fn run_server_mode(
     // in the file, which is the one case an ephemeral identity exists for.
     if let Some(identity) = identity {
         iroh_config.get_or_insert_with(Default::default).secret_key =
-            Some(identity.key().to_string());
+            Some(SecretString::new(identity.key().to_string()));
     }
 
     // Same builder the config watcher calls on a reload: a route that works
@@ -614,7 +615,7 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
             Some(client) if !cli.force => (client_id, client.secret.clone(), false),
             _ => (
                 client_id,
-                nexapipe::auth::TotpValidator::generate_secret(),
+                SecretString::new(nexapipe::auth::TotpValidator::generate_secret()),
                 true,
             ),
         }
@@ -644,14 +645,23 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
         issuer
     };
 
-    let uri = OtpAuthUri::from_auth_config(&issuer, &client_id, &secret, &auth_config)?;
+    let uri =
+        OtpAuthUri::from_auth_config(&issuer, &client_id, secret.expose_secret(), &auth_config)?;
     let link = uri.to_uri();
 
     println!();
     println!("2FA enrollment for client \"{}\"", uri.client_id);
+    // The secret belongs on this terminal: the command exists to hand the
+    // operator a credential, and the two lines after it are the `otpauth://`
+    // URI and the QR code, which carry the same secret by design. Nothing else
+    // prints it, and this is the one place it is meant to be seen.
+    // codeql[rust/cleartext-logging]
+    // CodeQL does not honour inline suppressions in Rust yet (github/codeql#21637),
+    // so this marker records the intent and starts suppressing on its own once
+    // that support lands. Until then the alert is dismissed by hand.
     println!(
         "  Secret     {}{}",
-        uri.secret,
+        uri.secret.expose_secret(),
         if generated {
             "   (newly generated)"
         } else if cli.generate_2fa.is_some() {
@@ -688,7 +698,12 @@ fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     )?;
 
     if generated {
-        save_generated_secret(cli, &client_id, &uri.secret, auth_config.enabled);
+        save_generated_secret(
+            cli,
+            &client_id,
+            uri.secret.expose_secret(),
+            auth_config.enabled,
+        );
     } else if cli.generate_2fa.is_some() {
         println!(
             "Client \"{}\" already has a secret in {}, so that is the one above:",
@@ -837,7 +852,7 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                 devices.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
                 serde_json::json!({
                     "id": id,
-                    "has_secret": !client.secret.is_empty(),
+                    "has_secret": !client.secret.expose_secret().is_empty(),
                     "created_at": seconds_of(&client.created_at),
                     "last_used": client.last_used,
                     "allow_hosts": client.allow_hosts,
@@ -869,7 +884,7 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
         println!("  {id}");
         println!(
             "    secret      {}",
-            if client.secret.is_empty() {
+            if client.secret.expose_secret().is_empty() {
                 "missing"
             } else {
                 "set"
@@ -1081,7 +1096,13 @@ fn add_client(
         ),
         None => println!("Credential for client \"{}\"", uri.client_id),
     }
-    println!("  Secret     {}", uri.secret);
+    // The secret belongs on this terminal, for the same reason as in the
+    // `--generate-2fa` path above: the operator asked for this credential and
+    // the next step is typing it into an authenticator app.
+    // codeql[rust/cleartext-logging]
+    // Rust does not honour inline suppressions yet (github/codeql#21637); see
+    // the `--generate-2fa` path above for the full explanation.
+    println!("  Secret     {}", uri.secret.expose_secret());
     println!("  Algorithm  {}", uri.algorithm);
     println!(
         "  Code       {} digits, {} second step",
@@ -1112,7 +1133,7 @@ fn add_client(
         cli,
         client_id,
         device,
-        nexapipe::auth::DeviceMaterial::Secret(&uri.secret),
+        nexapipe::auth::DeviceMaterial::Secret(uri.secret.expose_secret()),
         auth_config.enabled,
         force,
     )
@@ -1363,7 +1384,11 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             let secret_key = proxy_config
                 .as_ref()
                 .and_then(|config| config.iroh.as_ref())
-                .and_then(|iroh| iroh.secret_key.as_deref())
+                .and_then(|iroh| {
+                    iroh.secret_key
+                        .as_ref()
+                        .map(|key| key.expose_secret().as_str())
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "no endpoint identity in {}: set [iroh] secret_key \
@@ -1393,7 +1418,9 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         let spec = RelayModeSpec::parse(
             iroh.relay_mode.as_deref(),
             iroh.relay_url.as_deref(),
-            iroh.relay_auth_token.as_deref(),
+            iroh.relay_auth_token
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
         )
         .ok()
         .flatten()?;
@@ -1426,7 +1453,9 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         // below has no client to borrow from yet.
         let secret = match auth_config.clients.get(client_id) {
             Some(client) => client.secret.clone(),
-            None if cli.create_client => create_client_for_invite(cli, client_id, &auth_config)?,
+            None if cli.create_client => {
+                SecretString::new(create_client_for_invite(cli, client_id, &auth_config)?)
+            }
             None => {
                 let known = if auth_config.clients.is_empty() {
                     " (no client is configured yet)".to_string()
@@ -1473,7 +1502,7 @@ fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             let totp = InviteTotp::with_params(
                 issuer,
                 client_id,
-                &secret,
+                secret.expose_secret(),
                 TotpAlgorithm::from_name(auth_config.algorithm.name()),
                 auth_config.digits,
                 auth_config.time_step,

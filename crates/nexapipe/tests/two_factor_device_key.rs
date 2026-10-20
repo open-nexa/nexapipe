@@ -45,14 +45,14 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
     config.clients.insert(
         "client-001".to_string(),
         ClientAuth {
-            secret: SECRET.to_string(),
+            secret: nexapipe_client::secret::SecretString::new(SECRET.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "phone".to_string(),
                 DeviceAuth {
-                    secret: String::new(),
+                    secret: nexapipe_client::secret::SecretString::default(),
                     public_key: Some(nexapipe::auth::public_key_hex(&key.public())),
                     created_at: "0".to_string(),
                     last_used: None,
@@ -253,7 +253,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
         client.devices.insert(
             "broken".to_string(),
             DeviceAuth {
-                secret: String::new(),
+                secret: nexapipe_client::secret::SecretString::default(),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
@@ -262,7 +262,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
         client.devices.insert(
             "garbled".to_string(),
             DeviceAuth {
-                secret: String::new(),
+                secret: nexapipe_client::secret::SecretString::default(),
                 public_key: Some("not a key".to_string()),
                 created_at: "0".to_string(),
                 last_used: None,
@@ -322,7 +322,10 @@ fn keeps_a_key_device_when_it_writes_counters() {
     let mut auth = auth.expect("the config declares [auth]");
     let phone = &auth.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));
-    assert!(phone.secret.is_empty(), "a key device has no secret");
+    assert!(
+        phone.secret.expose_secret().is_empty(),
+        "a key device has no secret"
+    );
 
     auth.clients
         .get_mut("client-001")
@@ -348,5 +351,5 @@ fn keeps_a_key_device_when_it_writes_counters() {
     let reloaded = reloaded.unwrap();
     let phone = &reloaded.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));
-    assert!(phone.secret.is_empty());
+    assert!(phone.secret.expose_secret().is_empty());
 }

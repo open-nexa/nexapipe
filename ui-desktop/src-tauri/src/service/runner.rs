@@ -671,7 +671,10 @@ impl ServiceRunner {
         };
         IpcResponse::IssuedCredential(issued.map(|credential| IssuedCredentialPayload {
             client_id: credential.client_id,
-            secret: credential.secret,
+            // On its way to the app, and out of this process: the copy handed
+            // over is a plain string, and the one that stays behind is wiped
+            // with the credential.
+            secret: credential.secret.expose_secret().to_string(),
             algorithm: credential.algorithm,
             public_key: credential.public_key,
             device: credential.device,

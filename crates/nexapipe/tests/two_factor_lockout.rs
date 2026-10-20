@@ -51,7 +51,7 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
     config.clients.insert(
         "client-001".to_string(),
         ClientAuth {
-            secret: SECRET.to_string(),
+            secret: nexapipe_client::secret::SecretString::new(SECRET.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -78,7 +78,7 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
     config.clients.insert(
         "client-001".to_string(),
         ClientAuth {
-            secret: SECRET.to_string(),
+            secret: nexapipe_client::secret::SecretString::new(SECRET.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -86,7 +86,9 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                 (
                     "laptop".to_string(),
                     DeviceAuth {
-                        secret: LAPTOP_SECRET.to_string(),
+                        secret: nexapipe_client::secret::SecretString::new(
+                            LAPTOP_SECRET.to_string(),
+                        ),
                         public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
@@ -95,7 +97,9 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                 (
                     "phone".to_string(),
                     DeviceAuth {
-                        secret: PHONE_SECRET.to_string(),
+                        secret: nexapipe_client::secret::SecretString::new(
+                            PHONE_SECRET.to_string(),
+                        ),
                         public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
@@ -375,7 +379,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
     auth.clients.insert(
         "client-002".to_string(),
         ClientAuth {
-            secret: "KBSWY3DPEHPK3PXQ".to_string(),
+            secret: nexapipe_client::secret::SecretString::new("KBSWY3DPEHPK3PXQ".to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -642,11 +646,11 @@ fn keeps_the_device_table_when_it_writes_counters() {
     let client = &reloaded.clients["client-001"];
     assert_eq!(client.devices.len(), 2, "{client:?}");
     assert_eq!(
-        client.devices["laptop"].secret,
+        client.devices["laptop"].secret.as_str(),
         "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"
     );
     assert_eq!(
-        client.devices["phone"].secret,
+        client.devices["phone"].secret.as_str(),
         "MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA"
     );
     assert_eq!(client.failed_attempts, 1);

@@ -7,11 +7,12 @@
 // is whatever its enrollment produced.
 
 use crate::ClientError;
+use crate::secret::{SecretBytes, SecretString};
 use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
 use sha2::Sha256;
 use std::fmt;
-use totp_rs::{Algorithm, Builder, Secret};
+use totp_rs::{Algorithm, Builder, Secret as TotpSecret};
 
 /// Application error codes the server closes a connection with during the 2FA
 /// handshake. Must match `auth_close_code` in `crates/nexapipe/src/conn/mod.rs`
@@ -83,10 +84,14 @@ impl TotpAlgorithm {
 /// line, a panic message or a bug report pastes a working credential into it.
 /// An empty `secret` prints as `""` for the same reason — an absent secret and a
 /// masked one should not be told apart by a reader.
+///
+/// The seed itself is a [`SecretString`], so it is wiped when this config is
+/// dropped rather than left in the heap for the allocator to hand out again.
 #[derive(Clone, PartialEq)]
 pub struct TwoFactorConfig {
     pub client_id: String,
-    pub secret: String,
+    /// The TOTP seed, in the Base32 spelling it was configured with.
+    pub secret: SecretString,
     pub algorithm: TotpAlgorithm,
 }
 
@@ -94,7 +99,7 @@ impl std::fmt::Debug for TwoFactorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TwoFactorConfig")
             .field("client_id", &self.client_id)
-            .field("secret", &masked(&self.secret))
+            .field("secret", &masked(self.secret.as_str()))
             .field("algorithm", &self.algorithm)
             .finish()
     }
@@ -113,10 +118,15 @@ impl TwoFactorConfig {
     /// Build a [`TwoFactorAuth`] if a secret is configured; returns `Ok(None)`
     /// when the secret is empty (2FA effectively disabled).
     pub fn to_auth(&self) -> Result<Option<TwoFactorAuth>, ClientError> {
-        if self.secret.trim().is_empty() {
+        if self.secret.as_str().trim().is_empty() {
             return Ok(None);
         }
-        TwoFactorAuth::new(&self.client_id, &self.secret, self.algorithm.clone()).map(Some)
+        TwoFactorAuth::new(
+            &self.client_id,
+            self.secret.as_str(),
+            self.algorithm.clone(),
+        )
+        .map(Some)
     }
 }
 
@@ -129,24 +139,35 @@ impl TwoFactorConfig {
 /// case. Whitespace and `=` padding are dropped too; both are presentation
 /// rather than part of the secret, and grouping it is common enough that
 /// refusing it would only look pedantic.
-fn decode_base32(secret_base32: &str) -> Result<Vec<u8>, ClientError> {
-    let normalized: String = secret_base32
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+///
+/// The normalised spelling is a copy of the seed in the clear, so it is held
+/// in a [`SecretString`] rather than a `String`: it is wiped when this
+/// function returns, instead of being left in the heap for the allocator to
+/// hand out again.
+fn decode_base32(secret_base32: &str) -> Result<SecretBytes, ClientError> {
+    let normalized = SecretString::new(
+        secret_base32
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '=')
+            .map(|c| c.to_ascii_uppercase())
+            .collect(),
+    );
 
     // An empty string decodes to an empty key, which would then generate codes
     // from nothing and fail every handshake with no hint as to why. It is a
     // missing secret, not a short one.
-    if normalized.is_empty() {
+    if normalized.as_str().is_empty() {
         return Err(ClientError::InvalidConfig(
             "Invalid Base32 secret".to_string(),
         ));
     }
 
-    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &normalized)
-        .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))
+    base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        normalized.as_str(),
+    )
+    .map(SecretBytes::new)
+    .ok_or_else(|| ClientError::InvalidConfig("Invalid Base32 secret".to_string()))
 }
 
 /// What a client-side credential proves itself with.
@@ -160,8 +181,12 @@ fn decode_base32(secret_base32: &str) -> Result<Vec<u8>, ClientError> {
 #[derive(Debug, Clone)]
 enum Proof {
     /// A TOTP seed: an HMAC over the challenge, then a code.
+    ///
+    /// The seed is a [`SecretBytes`], so it is wiped when the credential is
+    /// dropped — and its `Debug` says nothing about its value, which is what
+    /// lets this enum keep a derived one.
     Totp {
-        secret: Vec<u8>,
+        secret: SecretBytes,
         algorithm: TotpAlgorithm,
         time_step: u32,
         digits: u32,
@@ -200,7 +225,10 @@ impl std::fmt::Debug for TwoFactorAuth {
                 time_step,
                 digits,
             } => rendered
-                .field("secret", &format_args!("<{} bytes>", secret.len()))
+                .field(
+                    "secret",
+                    &format_args!("<{} bytes>", secret.as_slice().len()),
+                )
                 .field("algorithm", algorithm)
                 .field("time_step", time_step)
                 .field("digits", digits),
@@ -323,7 +351,11 @@ impl TwoFactorAuth {
             // current one or not. The server's window is what grants tolerance.
             .with_skew(0)
             .with_step_duration(*time_step as u64)
-            .with_secret(secret.clone())
+            // The validator is built from a copy of the seed, and it keeps
+            // that copy: `totp-rs` is built with its `zeroize` feature, so the
+            // copy is wiped when the validator is dropped at the end of this
+            // function rather than left in the heap.
+            .with_secret(secret.expose_secret_cloned())
             .build()
             .map_err(|e| ClientError::Other(format!("Failed to create TOTP: {e}")))?;
 
@@ -354,7 +386,7 @@ impl TwoFactorAuth {
     pub fn sign_challenge(&self, nonce: &[u8], timestamp: i64) -> Result<Vec<u8>, ClientError> {
         match &self.proof {
             Proof::Totp { secret, .. } => {
-                let mut mac = HmacSha256::new_from_slice(secret)
+                let mut mac = HmacSha256::new_from_slice(secret.as_slice())
                     .map_err(|e| ClientError::Other(format!("HMAC rejected the secret: {e}")))?;
                 mac.update(nonce);
                 mac.update(&timestamp.to_le_bytes());
@@ -589,11 +621,17 @@ impl TwoFactorAuth {
     /// Empty for a key-based credential, which has no secret: what such an app
     /// has to persist is the key — the private half is its own to keep, and
     /// [`Self::public_key_hex`] is the half the server knows it by.
+    ///
+    /// The string this returns is a plain one: it is on its way to durable
+    /// storage, which is outside anything this process could wipe. That is the
+    /// point of the method, not an oversight — the copy that stays here is
+    /// still a [`SecretBytes`], and it is wiped with the credential.
     pub fn secret_base32(&self) -> String {
         match &self.proof {
-            Proof::Totp { secret, .. } => {
-                base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret)
-            }
+            Proof::Totp { secret, .. } => base32::encode(
+                base32::Alphabet::Rfc4648 { padding: false },
+                secret.as_slice(),
+            ),
             Proof::Key(_) => String::new(),
         }
     }
@@ -722,7 +760,10 @@ pub struct IssuedCredential {
     pub client_id: String,
     /// Base32, exactly as it goes into [`TwoFactorAuth::new`] next time.
     /// Empty when the device was issued a key instead — see [`Self::public_key`].
-    pub secret: String,
+    ///
+    /// A [`SecretString`]: the credential is wiped when this is dropped, and
+    /// the value is read through [`Secret::expose_secret`] where it has to be.
+    pub secret: SecretString,
     pub algorithm: String,
     /// The public half of the key the device was issued, lowercase hex — the
     /// spelling the server stores — with `None` for a credential that is a
@@ -746,7 +787,7 @@ impl std::fmt::Debug for IssuedCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IssuedCredential")
             .field("client_id", &self.client_id)
-            .field("secret", &masked(&self.secret))
+            .field("secret", &masked(self.secret.as_str()))
             .field("algorithm", &self.algorithm)
             .field("device", &self.device)
             .finish()
@@ -771,7 +812,12 @@ impl std::fmt::Debug for IssuedCredential {
 #[derive(Clone)]
 pub struct Enrollment {
     client_id: String,
-    token: String,
+    /// The one-time token an invitation carried.
+    ///
+    /// A [`SecretString`]: an unspent invitation link *is* the credential, so
+    /// the token is wiped when the enrollment is dropped — which is what
+    /// happens the moment it has been spent.
+    token: SecretString,
     /// The name to be enrolled under. The token is what authorizes the
     /// exchange, so this is a request rather than a claim: the server is free
     /// to answer with it or to refuse it, and what it answers with is what the
@@ -780,6 +826,10 @@ pub struct Enrollment {
     /// The device key to offer, if any. What travels is the public half, and
     /// what comes back tells this side whether the offer was taken: an empty
     /// `secret` in ENROLL_ISSUE is the server saying the key was recorded.
+    ///
+    /// The private half is wiped when the enrollment is dropped, the way the
+    /// rest of the credentials here are: `iroh::SecretKey` is built on
+    /// ed25519-dalek, whose signing key zeroes itself on the way out.
     key: Option<iroh::SecretKey>,
 }
 
@@ -787,7 +837,7 @@ impl std::fmt::Debug for Enrollment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Enrollment")
             .field("client_id", &self.client_id)
-            .field("token", &masked(&self.token))
+            .field("token", &masked(self.token.as_str()))
             .field("device_id", &self.device_id)
             .finish()
     }
@@ -797,7 +847,7 @@ impl Enrollment {
     pub fn new(client_id: &str, token: &str) -> Self {
         Self {
             client_id: client_id.to_string(),
-            token: token.to_string(),
+            token: SecretString::new(token.to_string()),
             device_id: None,
             key: None,
         }
@@ -865,6 +915,10 @@ impl Enrollment {
             &mut send,
             &AuthMessage::EnrollStart {
                 client_id: self.client_id.clone(),
+                // Onto the wire, and out of this process: the copy that
+                // travels is a plain string on the other side, because the
+                // receiver has to compare it — but the one here is still a
+                // `Secret`, and is wiped with the message.
                 token: self.token.clone(),
                 device_id: self.device_id.clone(),
                 public_key: self
@@ -889,7 +943,7 @@ impl Enrollment {
                         "the server issued a credential for a different client id".to_string(),
                     ));
                 }
-                if secret.is_empty() {
+                if secret.as_str().is_empty() {
                     // No secret in the answer means the server recorded the
                     // key this enrollment offered — it only ever does that
                     // when the request carried one, so this is that key,
@@ -940,7 +994,7 @@ impl Enrollment {
                     })?;
                     let issued = TwoFactorAuth::with_params(
                         &client_id,
-                        &secret,
+                        secret.as_str(),
                         TotpAlgorithm::from_name(&algorithm),
                         period,
                         digits,
@@ -1040,8 +1094,11 @@ const MAX_AUTH_MESSAGE: usize = 64 * 1024;
 const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Generate a new secret for client setup
+///
+/// A plain string, because it is on its way to a config file or an
+/// authenticator app: the copy that leaves this process is not ours to wipe.
 pub fn generate_secret() -> String {
-    Secret::generate().to_base32()
+    TotpSecret::generate().to_base32()
 }
 
 /// Whether a device name the server will accept.
@@ -1067,6 +1124,8 @@ pub const MAX_DEVICE_ID_LEN: usize = 255;
 /// Protocol messages for authentication handshake
 pub mod auth_protocol {
     use serde::{Deserialize, Serialize};
+
+    use crate::secret::SecretString;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type")]
@@ -1109,7 +1168,12 @@ pub mod auth_protocol {
         #[serde(rename = "ENROLL_START")]
         EnrollStart {
             client_id: String,
-            token: String,
+            /// The one-time token, on its way to the server.
+            ///
+            /// A [`SecretString`], so the copy that arrived in this process is
+            /// wiped when the message is dropped; the one that travels is a
+            /// plain string, because the receiver has to compare it.
+            token: SecretString,
             /// The name the device asking to enroll wants to be issued under.
             /// Absent keeps the old behaviour: one secret for the client.
             #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1129,7 +1193,11 @@ pub mod auth_protocol {
             client_id: String,
             /// Base32 when a secret was issued; empty when the device was
             /// issued a key instead, which is what the offered key bought.
-            secret: String,
+            ///
+            /// A [`SecretString`]: a credential that has just been issued is
+            /// the most valuable thing this process holds, and it is wiped
+            /// when the message is dropped.
+            secret: SecretString,
             algorithm: String,
             digits: u32,
             period: u64,
@@ -1161,6 +1229,7 @@ mod tests {
         DeviceKey, Enrollment, IssuedCredential, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth,
         TwoFactorConfig, auth_protocol::AuthMessage, device_id_is_usable,
     };
+    use crate::secret::SecretString;
 
     /// A `Debug` that prints a secret turns every log line, panic message and
     /// bug report that touches one into a credential disclosure — and these are
@@ -1172,13 +1241,13 @@ mod tests {
         let secret = "JBSWY3DPEHPK3PXP";
         let config = TwoFactorConfig {
             client_id: "node-1".to_string(),
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
             algorithm: TotpAlgorithm::SHA1,
         };
         let auth = TwoFactorAuth::new("node-1", secret, TotpAlgorithm::SHA1).expect("a credential");
         let issued = IssuedCredential {
             client_id: "node-1".to_string(),
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
             algorithm: "sha1".to_string(),
             public_key: None,
             device: Some("laptop".to_string()),
@@ -1209,12 +1278,12 @@ mod tests {
     fn a_masked_secret_still_says_whether_there_is_one() {
         let with_secret = TwoFactorConfig {
             client_id: "node-1".to_string(),
-            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             algorithm: TotpAlgorithm::SHA1,
         };
         let without = TwoFactorConfig {
             client_id: "node-1".to_string(),
-            secret: String::new(),
+            secret: SecretString::new(String::new()),
             algorithm: TotpAlgorithm::SHA1,
         };
 
@@ -1247,7 +1316,7 @@ mod tests {
     fn enrollment_messages_keep_their_wire_names() {
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
-            token: "tok".to_string(),
+            token: SecretString::new("tok".to_string()),
             device_id: None,
             public_key: None,
         };
@@ -1256,7 +1325,7 @@ mod tests {
 
         let issue = AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
-            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             algorithm: "SHA1".to_string(),
             digits: 6,
             period: 30,
@@ -1327,7 +1396,7 @@ mod tests {
         // What those two produce on the wire, as `exchange_inner` sends it.
         let start = AuthMessage::EnrollStart {
             client_id: enrollment.client_id().to_string(),
-            token: "tok".to_string(),
+            token: SecretString::new("tok".to_string()),
             device_id: enrollment.device_id().map(str::to_string),
             public_key: enrollment
                 .key

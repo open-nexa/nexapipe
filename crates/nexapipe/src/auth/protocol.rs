@@ -46,6 +46,7 @@
 //! field ignores it rather than failing, so a client and a server built either
 //! side of the change still complete a handshake.
 
+use nexapipe_client::secret::SecretString;
 use serde::{Deserialize, Serialize};
 
 /// Messages exchanged during authentication
@@ -99,7 +100,10 @@ pub enum AuthMessage {
         client_id: String,
         /// The token out of a `v=2` invite; valid until it has been exchanged
         /// once.
-        token: String,
+        ///
+        /// A [`SecretString`]: an unspent token is a credential, and this one is
+        /// wiped when the message is dropped.
+        token: SecretString,
         /// The name the device asking to enroll wants to be issued under. The
         /// server is free to answer with the same name or refuse; the token is
         /// what authorizes the exchange, not this field.
@@ -126,7 +130,10 @@ pub enum AuthMessage {
         /// when the device was issued a key instead: the server recorded the
         /// public key the client offered, and this device will prove itself
         /// with a signature rather than a code.
-        secret: String,
+        ///
+        /// A [`SecretString`]: a credential that has just been issued is the
+        /// most valuable thing this process holds.
+        secret: SecretString,
         algorithm: String,
         digits: u32,
         period: u64,
@@ -204,7 +211,7 @@ mod tests {
     fn enrollment_messages_keep_their_wire_names() {
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
-            token: "tok".to_string(),
+            token: SecretString::new("tok".to_string()),
             device_id: None,
             public_key: None,
         };
@@ -220,7 +227,7 @@ mod tests {
 
         let issue = AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
-            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             algorithm: "SHA1".to_string(),
             digits: 6,
             period: 30,
@@ -234,6 +241,35 @@ mod tests {
         };
         let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
+    }
+
+    /// The credential travels as the plain string it always was.
+    ///
+    /// The token and the secret are `Secret`s now, and a `Secret` that
+    /// serialized differently would break every peer built before it: the
+    /// field names and the spelling of the value are the contract, and the
+    /// wrapper changes neither.
+    #[test]
+    fn a_credential_travels_as_the_plain_string_it_always_was() {
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new("tok".to_string()),
+            device_id: None,
+            public_key: None,
+        };
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""token":"tok""#), "{json}");
+
+        let issue = AuthMessage::EnrollIssue {
+            client_id: "client-001".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            algorithm: "SHA1".to_string(),
+            digits: 6,
+            period: 30,
+            device_id: None,
+        };
+        let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""secret":"JBSWY3DPEHPK3PXP""#), "{json}");
     }
 
     /// A peer on either side of this change has to be able to talk to one on
@@ -316,13 +352,13 @@ mod tests {
             },
             AuthMessage::EnrollStart {
                 client_id: "client-001".to_string(),
-                token: "tok".to_string(),
+                token: SecretString::new("tok".to_string()),
                 device_id: Some("laptop".to_string()),
                 public_key: None,
             },
             AuthMessage::EnrollIssue {
                 client_id: "client-001".to_string(),
-                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
                 algorithm: "SHA1".to_string(),
                 digits: 6,
                 period: 30,
@@ -374,7 +410,7 @@ mod tests {
         let key = "a1".repeat(32);
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
-            token: "tok".to_string(),
+            token: SecretString::new("tok".to_string()),
             device_id: Some("phone".to_string()),
             public_key: Some(key.clone()),
         };
@@ -403,7 +439,7 @@ mod tests {
             String::from_utf8(
                 AuthMessage::EnrollStart {
                     client_id: "client-001".to_string(),
-                    token: "tok".to_string(),
+                    token: SecretString::new("tok".to_string()),
                     device_id: Some("laptop".to_string()),
                     public_key: None,
                 }

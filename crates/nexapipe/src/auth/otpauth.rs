@@ -20,6 +20,7 @@
 
 use super::config::AuthConfig;
 use anyhow::{Result, bail};
+use nexapipe_client::secret::SecretString;
 
 /// Scheme of the key URI format.
 pub const SCHEME: &str = "otpauth";
@@ -46,7 +47,10 @@ pub struct OtpAuthUri {
     /// Client ID as configured in `[auth.clients]`.
     pub client_id: String,
     /// Base32 secret, normalized to the form the clients expect.
-    pub secret: String,
+    ///
+    /// A [`SecretString`]: this is the credential an authenticator app is
+    /// about to be told about, and it is wiped with the entry.
+    pub secret: SecretString,
     /// Uppercase algorithm name, as the key URI format requires.
     pub algorithm: String,
     /// Number of digits in a code.
@@ -77,7 +81,12 @@ impl OtpAuthUri {
 
         let secret = normalize_secret(secret)
             .ok_or_else(|| anyhow::anyhow!("the secret is not a Base32 string"))?;
-        if base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret).is_none() {
+        if base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            secret.as_str(),
+        )
+        .is_none()
+        {
             bail!("the secret is not a Base32 string");
         }
 
@@ -135,7 +144,12 @@ impl OtpAuthUri {
         let issuer = percent_encode(&self.issuer, "");
         format!(
             "{SCHEME}://totp/{label}?secret={}&issuer={issuer}&algorithm={}&digits={}&period={}",
-            self.secret, self.algorithm, self.digits, self.period
+            // The URI *is* the credential — it is what the authenticator app
+            // scans — so it carries the secret in the clear by definition.
+            self.secret.expose_secret(),
+            self.algorithm,
+            self.digits,
+            self.period
         )
     }
 
@@ -164,13 +178,23 @@ impl OtpAuthUri {
 /// Normalizes a Base32 secret to the form the clients expect: uppercase, with
 /// whitespace and padding removed. Returns `None` when characters outside the
 /// Base32 alphabet are present.
-pub fn normalize_secret(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    if cleaned.is_empty() || !cleaned.chars().all(|c| BASE32_ALPHABET.contains(c)) {
+///
+/// The result is a [`SecretString`]: it is a copy of the seed in the clear,
+/// and it is wiped when it goes out of scope rather than being left in the
+/// heap for the allocator to hand out again.
+pub fn normalize_secret(raw: &str) -> Option<SecretString> {
+    let cleaned = SecretString::new(
+        raw.chars()
+            .filter(|c| !c.is_whitespace() && *c != '=')
+            .map(|c| c.to_ascii_uppercase())
+            .collect::<String>(),
+    );
+    if cleaned.as_str().is_empty()
+        || !cleaned
+            .as_str()
+            .chars()
+            .all(|c| BASE32_ALPHABET.contains(c))
+    {
         return None;
     }
     Some(cleaned)
@@ -271,8 +295,8 @@ mod tests {
     #[test]
     fn normalizes_secrets_like_the_clients_do() {
         assert_eq!(
-            normalize_secret(" jbswy3dp ehpk3pxp==\n").as_deref(),
-            Some("JBSWY3DPEHPK3PXP")
+            normalize_secret(" jbswy3dp ehpk3pxp==\n").map(|secret| secret.as_str().to_string()),
+            Some("JBSWY3DPEHPK3PXP".to_string())
         );
         assert_eq!(normalize_secret("JBSWY3DPEHPK3PX1"), None);
         assert_eq!(normalize_secret("  "), None);
