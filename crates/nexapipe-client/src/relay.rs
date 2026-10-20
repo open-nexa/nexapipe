@@ -284,7 +284,7 @@ impl RelayRestriction {
             // ours: this endpoint uses one relay and nothing else, and a peer
             // that names another one is not dialled through it — whichever one
             // iroh happens to pick.
-            if named.iter().all(|other| *other == &self.relay) {
+            if named.iter().all(|other| same_relay(other, &self.relay)) {
                 return Ok(());
             }
             return Err(format!(
@@ -299,7 +299,10 @@ impl RelayRestriction {
         }
 
         if addr.ip_addrs().next().is_some() {
-            // A direct address: no relay is involved, so nothing to refuse.
+            // A direct address: the peer names no relay, so there is no relay
+            // to refuse here. The lookup still runs while it is on, and its
+            // answer may add a relay to the path set — so this is a peer that
+            // has a direct address, not a promise that the dial stays direct.
             return Ok(());
         }
 
@@ -373,6 +376,23 @@ fn is_n0_relay(url: &RelayUrl) -> bool {
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host == N0_RELAY_SUFFIX.trim_start_matches('.') || host.ends_with(N0_RELAY_SUFFIX)
+}
+
+/// Whether two relay URLs name the same relay.
+///
+/// The comparison is on the host and the port rather than on the URL: a
+/// fully-qualified name ends in a dot, and the specification encourages that
+/// spelling, so two ends of the same relay can spell it differently and still
+/// be on it. A trailing dot is the same host, and the port a URL leaves out
+/// is the one it defaults to.
+fn same_relay(a: &RelayUrl, b: &RelayUrl) -> bool {
+    let host = |url: &RelayUrl| {
+        url.host_str()
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    };
+    a.scheme() == b.scheme()
+        && host(a) == host(b)
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 #[cfg(test)]
@@ -624,5 +644,54 @@ mod tests {
         let addr = EndpointAddr::new(node_id()).with_ip_addr("192.0.2.1:443".parse().unwrap());
 
         assert!(restriction.permits(&addr).is_ok());
+    }
+
+    /// The same relay spelled two ways is the same relay: a fully-qualified
+    /// name ends in a dot, and the specification recommends that spelling, so
+    /// two ends of one relay can differ on it and still be on it.
+    #[test]
+    fn a_peer_naming_our_relay_with_a_trailing_dot_is_dialled() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let addr = EndpointAddr::new(node_id())
+            .with_relay_url("https://relay.example.com.".parse().unwrap());
+
+        assert!(
+            restriction.permits(&addr).is_ok(),
+            "the same relay spelled with a trailing dot is still the same relay"
+        );
+    }
+
+    /// A port the URL leaves out is the one it defaults to, so the two
+    /// spellings of the same relay are the same relay.
+    #[test]
+    fn the_default_port_and_the_written_port_are_the_same_relay() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let addr = EndpointAddr::new(node_id())
+            .with_relay_url("https://relay.example.com:443".parse().unwrap());
+
+        assert!(
+            restriction.permits(&addr).is_ok(),
+            "443 is what the URL without a port means"
+        );
+    }
+
+    /// A different relay is still a different relay, whatever else about it
+    /// matches.
+    #[test]
+    fn a_peer_naming_another_host_is_refused() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let addr = EndpointAddr::new(node_id())
+            .with_relay_url("https://other.example.com".parse().unwrap());
+
+        assert!(restriction.permits(&addr).is_err());
     }
 }
