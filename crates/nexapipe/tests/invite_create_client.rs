@@ -92,7 +92,11 @@ fn invite_secret(output: &str) -> Option<String> {
 fn configured_secret(config: &Path, client_id: &str) -> Option<String> {
     let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(config.to_str().unwrap())
         .expect("config still parses");
-    auth.and_then(|auth| auth.clients.get(client_id).map(|c| c.secret.clone()))
+    auth.and_then(|auth| {
+        auth.clients
+            .get(client_id)
+            .map(|c| c.secret.expose_secret().to_string())
+    })
 }
 
 /// The whole point: one command creates the client *and* hands out its
@@ -166,7 +170,10 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
     let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
         .expect("config still parses");
     let client = &auth.expect("[auth] exists").clients["client-007"];
-    assert!(!client.secret.is_empty(), "a secret was written first");
+    assert!(
+        !client.secret.expose_secret().is_empty(),
+        "a secret was written first"
+    );
     assert!(
         client.pending_enrollment.is_some(),
         "the token joined the secret in one pass"

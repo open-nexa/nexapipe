@@ -561,10 +561,11 @@ mod tests {
     use super::*;
     use crate::auth::{ClientAuth, DeviceAuth};
     use crate::conn::peers::PeerIdentity;
+    use nexapipe_client::secret::SecretString;
 
     fn client(secret: &str) -> ClientAuth {
         ClientAuth {
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -578,7 +579,7 @@ mod tests {
 
     fn device(secret: &str) -> DeviceAuth {
         DeviceAuth {
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,
@@ -708,7 +709,7 @@ mod tests {
         assert_eq!(added, vec!["new".to_string()]);
         assert!(removed.is_empty());
         assert_eq!(live.clients.len(), 2);
-        assert_eq!(live.clients["new"].secret, "NEWNEWNEWNEWNEW");
+        assert_eq!(live.clients["new"].secret.as_str(), "NEWNEWNEWNEWNEW");
 
         let (added, removed) = merge_auth_clients(&mut live, &config_with(&[]));
 
@@ -731,15 +732,21 @@ mod tests {
         existing.locked_until = Some(12345);
 
         let mut incoming_client = client("NEWSECRETVALUE");
-        incoming_client.pending_enrollment = Some("token".to_string());
+        incoming_client.pending_enrollment = Some(SecretString::new("token".to_string()));
         let incoming = config_with(&[("client-001", incoming_client)]);
 
         let (added, removed) = merge_auth_clients(&mut live, &incoming);
 
         assert!(added.is_empty() && removed.is_empty());
         let client = &live.clients["client-001"];
-        assert_eq!(client.secret, "NEWSECRETVALUE");
-        assert_eq!(client.pending_enrollment.as_deref(), Some("token"));
+        assert_eq!(client.secret.as_str(), "NEWSECRETVALUE");
+        assert_eq!(
+            client
+                .pending_enrollment
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
+            Some("token")
+        );
         assert_eq!(client.failed_attempts, 2, "the file's stale counter loses");
         assert_eq!(client.locked_until, Some(12345));
     }
@@ -817,7 +824,7 @@ mod tests {
 
         assert_eq!(live.issuer, "Startup Issuer");
         assert_eq!(live.max_attempts, 9);
-        assert_eq!(live.clients["a"].secret, "A2");
+        assert_eq!(live.clients["a"].secret.as_str(), "A2");
     }
 
     /// Turning 2FA on mid-run is the half of the old startup-only rule that had
@@ -954,7 +961,7 @@ mod tests {
         alice.devices = [(
             "laptop".to_string(),
             DeviceAuth {
-                secret: "LAPTOPLAPTOPLAPT".to_string(),
+                secret: SecretString::new("LAPTOPLAPTOPLAPT".to_string()),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: Some(1700000000),

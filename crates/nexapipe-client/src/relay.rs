@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail};
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
 
+use crate::secret::SecretString;
+
 /// The relay we pin to by default: aps1-1, Singapore.
 ///
 /// iroh otherwise picks a home relay from the four N0 relays by latency and can
@@ -55,7 +57,12 @@ pub enum RelayModeSpec {
     /// A relay the operator runs. Exclusive — no N0 relay is used.
     Custom {
         url: RelayUrl,
-        auth_token: Option<String>,
+        /// The bearer token this relay asks for, if it asks for one.
+        ///
+        /// A [`SecretString`]: a relay bearer is a credential, and this one is
+        /// wiped when the spec is dropped. It also means the derived `Debug`
+        /// cannot leak it — the token prints as `<redacted>`, not as the value.
+        auth_token: Option<SecretString>,
     },
 }
 
@@ -120,7 +127,7 @@ impl RelayModeSpec {
         let auth_token = auth_token
             .map(str::trim)
             .filter(|t| !t.is_empty())
-            .map(str::to_string);
+            .map(|t| SecretString::new(t.to_string()));
         Ok(Self::Custom { url, auth_token })
     }
 
@@ -139,7 +146,10 @@ impl RelayModeSpec {
             Self::Custom { url, auth_token } => {
                 let config = RelayConfig::from(url.clone());
                 let config = match auth_token {
-                    Some(token) => config.with_auth_token(token.clone()),
+                    // Onto iroh, which keeps it for as long as the relay
+                    // configuration lives: the copy here is handed over, and
+                    // the one that stays is iroh's to wipe.
+                    Some(token) => config.with_auth_token(token.expose_secret_cloned()),
                     None => config,
                 };
                 RelayMode::Custom(RelayMap::from_iter([config]))
@@ -299,9 +309,23 @@ mod tests {
             spec,
             RelayModeSpec::Custom {
                 url: OWN_RELAY.parse().unwrap(),
-                auth_token: Some("secret".into()),
+                auth_token: Some(SecretString::new("secret".to_string())),
             }
         );
+    }
+
+    /// A relay bearer is a credential, and this type's `Debug` is derived —
+    /// so what makes it safe is the token's own type, not a hand-written
+    /// `Debug` here. A `{:?}` of a spec must not carry the bearer.
+    #[test]
+    fn a_relay_spec_never_prints_its_bearer() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), Some("s3cret-bearer"))
+            .unwrap()
+            .unwrap();
+        let rendered = format!("{spec:?}");
+
+        assert!(!rendered.contains("s3cret-bearer"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]

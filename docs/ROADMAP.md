@@ -455,7 +455,7 @@ fixed what it works around.
 The second is that **most of what it did find is defects, and defects are not
 scheduled.** They are listed below so the audit stays reproducible; each one is
 fixed rather than sequenced, and none of them appears in
-[section 6](#6-roadmap). Nine of them were fixed over the days that followed,
+[section 6](#6-roadmap). Twelve of them were fixed over the days that followed,
 on branches cut from `c1db94b` and later, and the table marks them; the rest
 are open and unscheduled. Three items from the same audit are capability work,
 and those are in [§6](#hardening-sweep--after-v060).
@@ -476,7 +476,7 @@ and those are in [§6](#hardening-sweep--after-v060).
 | P1 | **Blocking the main thread.** `stopVPN` calls `nativeStopTunProxy` directly, and both `onDestroy` and `ACTION_STOP` reach it on the main thread — the two paths `onRevoke` was deliberately moved off it for. | `ui-android/.../vpn/NexaVpnService.kt:159-161`, `:225-227`, `:293-297` — fixed on `fix/android-stop-vpn-off-main-thread` |
 | P1 | **Containers run as root with the configuration writable.** Neither Dockerfile sets `USER`, and `docker-compose.yaml` bind-mounts the host `./config` — the file holding the 2FA secrets — read-write into the container. | `Dockerfile:47`, `Dockerfile-aarch64:48`, `docker-compose.yaml:31` |
 | P1 | **A QR file carrying a secret is written world-readable, and over whatever is already there.** `--qr-out` wrote with `fs::write`, which truncates and follows a symlink, and made the file private only afterwards — so in between it was readable by anyone watching, and a name put there first could aim the write at another file. It now creates with `create_new` and the mode in the same call, and refuses a path that exists. | `crates/nexapipe/src/main.rs:1540-1549` — fixed on `fix/qr-out-create-private` |
-| P2 | **Secrets that outlive their use.** TOTP secrets, enrollment tokens and the relay bearer sit in process-wide `String`s on the client and are never zeroized; `auth.rs` derives `Debug` over them where `provisioning.rs` deliberately does not; a response parser computes its body offset from a lossy UTF-8 conversion and then slices the original bytes. | `crates/nexapipe-client/src/jni.rs:29`, `:44-51`; `auth.rs:76`, `:124`, `:489`; `http.rs:127-144` |
+| P2 | **Secrets that outlive their use.** TOTP secrets, enrollment tokens and the relay bearer sit in process-wide `String`s on the client and are never zeroized; `auth.rs` derives `Debug` over them where `provisioning.rs` deliberately does not; a response parser computes its body offset from a lossy UTF-8 conversion and then slices the original bytes. — the `Debug` half and the parser half were fixed in `#164`; the credentials themselves are now wiped when they go out of scope, on `v070/zeroize-secrets` | `crates/nexapipe-client/src/jni.rs:29`, `:44-51`; `auth.rs:76`, `:124`, `:489`; `http.rs:127-144` |
 | P2 | **Supply chain hygiene.** Actions pinned by tag rather than SHA; base images by floating tag, one from a self-hosted registry; `cargo build` in the Dockerfiles without `--locked`, though CI has it everywhere; images published with no signature and no provenance; `workflow_dispatch` input interpolated into a `run:` block. | `.github/workflows/*.yml`; `deny.toml`; `Dockerfile:8`, `:33`; `Dockerfile-aarch64:3`, `:34`; `release.yml` (the five dispatch inputs now reach the scripts through `env`) — fixed on `v070/supply-chain` (see [R18](#hardening-sweep--after-v060)) |
 
 ---

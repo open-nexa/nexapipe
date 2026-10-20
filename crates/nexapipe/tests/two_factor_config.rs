@@ -36,7 +36,7 @@ fn loads_the_auth_section_of_the_example_config() {
         .clients
         .get("client-001")
         .expect("client-001 is configured");
-    assert_eq!(client.secret, "JBSWY3DPEHPK3PXP");
+    assert_eq!(client.secret.as_str(), "JBSWY3DPEHPK3PXP");
     assert_eq!(
         auth.clients.get("client-002").map(|c| c.secret.as_str()),
         Some("KBSWY3DPEHPK3PXQ")
@@ -151,8 +151,13 @@ fn builds_the_enrollment_uri_from_the_loaded_settings() {
     let auth = auth.unwrap();
     let client = auth.clients.get("client-001").unwrap();
 
-    let uri = OtpAuthUri::from_auth_config(&auth.issuer, "client-001", &client.secret, &auth)
-        .expect("the example credentials are valid");
+    let uri = OtpAuthUri::from_auth_config(
+        &auth.issuer,
+        "client-001",
+        client.secret.expose_secret(),
+        &auth,
+    )
+    .expect("the example credentials are valid");
 
     assert_eq!(
         uri.to_uri(),

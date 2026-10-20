@@ -862,13 +862,13 @@ fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
     if let Some(totp) = &invite.totp {
         credentials::put(
             &credentials::secret_key(credentials::CredentialKind::TotpSecret, &node_id),
-            &totp.secret,
+            totp.secret.expose_secret(),
         )?;
     }
     if let Some(enrollment) = &invite.enrollment {
         credentials::put(
             &credentials::secret_key(credentials::CredentialKind::EnrollmentToken, &node_id),
-            &enrollment.token,
+            enrollment.token.expose_secret(),
         )?;
     }
 
@@ -1011,7 +1011,11 @@ async fn take_issued_credential(
                 .await
                 .map(|credential| IssuedCredentialPayload {
                     client_id: credential.client_id,
-                    secret: credential.secret,
+                    // The credential is on its way to the keychain, which is
+                    // outside this process: the copy handed over is a plain
+                    // string, and the one that stays behind is wiped with the
+                    // credential.
+                    secret: credential.secret.expose_secret().to_string(),
                     algorithm: credential.algorithm,
                     public_key: credential.public_key,
                     device: credential.device,

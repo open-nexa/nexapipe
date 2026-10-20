@@ -1,4 +1,5 @@
 use crate::routes::{L4Options, Route};
+use nexapipe_client::secret::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -87,7 +88,9 @@ pub struct IrohConfig {
     /// Bearer token sent to the relay. Only meaningful with `relay_mode = "custom"`;
     /// a relay that requires one has to be configured on both sides, because the
     /// client's relay map is the only place its token is read from.
-    pub relay_auth_token: Option<String>,
+    ///
+    /// A [`SecretString`], for the same reason the key above is one.
+    pub relay_auth_token: Option<SecretString>,
     pub bind_port: Option<u16>,
     /// Also bind the IPv6 wildcard (`[::]`) on the same port.
     ///
@@ -112,7 +115,10 @@ pub struct IrohConfig {
     /// file is not writable (see `NEXAPIPE_NO_PERSIST_IDENTITY`).
     ///
     /// A value that is present but does not parse refuses the start.
-    pub secret_key: Option<String>,
+    ///
+    /// A [`SecretString`]: this is the endpoint's private key — the thing that
+    /// makes the Node ID yours — and it is wiped when the config is dropped.
+    pub secret_key: Option<SecretString>,
     /// Path to a file holding `secret_key`, for a config that must not carry
     /// the key itself.
     ///
@@ -158,7 +164,7 @@ pub enum CredentialSource {
 /// Keeping the `Option` shape is the point: whether a credential is configured
 /// at all is something an operator needs to see in a log, and it is not the
 /// credential.
-pub(crate) fn redacted(value: &Option<String>) -> Option<&'static str> {
+pub(crate) fn redacted(value: &Option<SecretString>) -> Option<&'static str> {
     value.as_ref().map(|_| "<redacted>")
 }
 
@@ -1652,7 +1658,9 @@ pub struct AuthTomlConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuthToml {
-    pub secret: String,
+    /// A [`SecretString`]: the seed is a credential from the moment the file
+    /// is read, and the file format is unchanged by the wrapper.
+    pub secret: SecretString,
     pub created_at: Option<String>,
     /// Host patterns this client may reach; `None` means every route. Folded
     /// into the client's [`crate::auth::ClientAcl`] when a connection
@@ -1662,7 +1670,7 @@ pub struct ClientAuthToml {
     /// `--generate-invite --registration` and cleared by whoever spends it. Not
     /// written back by `save_auth_state`: it belongs to the operator, not to
     /// the runtime.
-    pub pending_enrollment: Option<String>,
+    pub pending_enrollment: Option<SecretString>,
     /// `[auth.clients.<id>.devices.<name>]` — credentials issued to individual
     /// devices, each with a secret of its own so one can be dropped without
     /// rotating the others. Absent means this client has never issued one, and
@@ -1694,7 +1702,7 @@ pub struct ClientAuthToml {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceAuthToml {
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     /// The device's Ed25519 public key, hex: the credential of a device that
     /// signs its handshake instead of answering with a TOTP code.
     pub public_key: Option<String>,
@@ -1771,7 +1779,12 @@ impl ProxyConfig {
                             // the way to close an enrollment is to delete the
                             // key, and a blank one is a typo with a wide door
                             // behind it.
-                            if client_toml.pending_enrollment.as_deref() == Some("") {
+                            if client_toml
+                                .pending_enrollment
+                                .as_ref()
+                                .map(|token| token.expose_secret().as_str())
+                                == Some("")
+                            {
                                 anyhow::bail!(
                                     "[auth.clients.{id}]: pending_enrollment is empty; delete the \
                                      key instead of setting it to \"\""
@@ -1824,7 +1837,8 @@ impl ProxyConfig {
                                 // an empty one is not a credential, and an
                                 // entry left holding only that is refused
                                 // below like one that has nothing.
-                                let secret = device_toml.secret.filter(|s| !s.is_empty());
+                                let secret =
+                                    device_toml.secret.filter(|s| !s.expose_secret().is_empty());
                                 match (&secret, &device_toml.public_key) {
                                     (None, None) => anyhow::bail!(
                                         "[auth.clients.{id}.devices.{device_id}]: no `secret` and \
@@ -2572,15 +2586,15 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
 #[derive(Clone, PartialEq, Eq)]
 pub enum EndpointIdentity {
     /// `[iroh] secret_key` was already set and parses. Nothing was written.
-    Configured(String),
+    Configured(SecretString),
     /// No `secret_key` was configured and one was generated and written to the
     /// config file. The Node ID is stable from this restart on.
-    Generated(String),
+    Generated(SecretString),
     /// No `secret_key` was configured, and persisting one was either turned off
     /// by `NEXAPIPE_NO_PERSIST_IDENTITY` or not possible (a read-only mount, a
     /// config owned by another user). The server runs on the returned key, and
     /// the Node ID will be different after the next restart.
-    Ephemeral(String),
+    Ephemeral(SecretString),
 }
 
 /// Handwritten, and never `derive(Debug)`, for the reason
@@ -2610,7 +2624,9 @@ impl EndpointIdentity {
     /// The hex key the endpoint should run on, whichever way it was arrived at.
     pub fn key(&self) -> &str {
         match self {
-            Self::Configured(key) | Self::Generated(key) | Self::Ephemeral(key) => key,
+            Self::Configured(key) | Self::Generated(key) | Self::Ephemeral(key) => {
+                key.expose_secret()
+            }
         }
     }
 }
@@ -2693,14 +2709,17 @@ impl ProxyConfig {
             .and_then(|iroh| iroh.secret_key.clone());
 
         if let Some(configured) = configured {
-            configured.parse::<iroh::SecretKey>().map_err(|e| {
-                anyhow::anyhow!(
-                    "[iroh] secret_key in {path} is not a valid key ({e}): the Node ID would \
+            configured
+                .expose_secret()
+                .parse::<iroh::SecretKey>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "[iroh] secret_key in {path} is not a valid key ({e}): the Node ID would \
                      change on every restart and every client would lose the server. Delete the \
                      line to have a working one generated, or run --generate-secret and paste its \
                      output"
-                )
-            })?;
+                    )
+                })?;
             return Ok(EndpointIdentity::Configured(configured));
         }
 
@@ -2719,7 +2738,9 @@ impl ProxyConfig {
                      will be different after every restart",
                     full.display()
                 );
-                return Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()));
+                return Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                    generate_secret_key_hex(),
+                )));
             }
             return match write_key_file(&full) {
                 Ok(hex) => {
@@ -2728,7 +2749,7 @@ impl ProxyConfig {
                          stable across restarts",
                         full.display()
                     );
-                    Ok(EndpointIdentity::Generated(hex))
+                    Ok(EndpointIdentity::Generated(SecretString::new(hex)))
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2736,7 +2757,9 @@ impl ProxyConfig {
                          throwaway one, so the Node ID will be different after the next restart",
                         full.display()
                     );
-                    Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()))
+                    Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                        generate_secret_key_hex(),
+                    )))
                 }
             };
         }
@@ -2746,7 +2769,9 @@ impl ProxyConfig {
                 "{NO_PERSIST_ENV} is set: [iroh] secret_key is not written to {path}, so the Node \
                  ID will be different after every restart"
             );
-            return Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()));
+            return Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                generate_secret_key_hex(),
+            )));
         }
 
         match ProxyConfig::write_iroh_secret_key(path) {
@@ -2755,14 +2780,16 @@ impl ProxyConfig {
                     "Generated an endpoint identity and saved it to {path} as [iroh] secret_key; \
                      the Node ID is now stable across restarts"
                 );
-                Ok(EndpointIdentity::Generated(hex))
+                Ok(EndpointIdentity::Generated(SecretString::new(hex)))
             }
             Err(e) => {
                 tracing::warn!(
                     "Could not write an endpoint identity to {path} ({e:#}); starting on a \
                      throwaway one, so the Node ID will be different after the next restart"
                 );
-                Ok(EndpointIdentity::Ephemeral(generate_secret_key_hex()))
+                Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                    generate_secret_key_hex(),
+                )))
             }
         }
     }
@@ -2886,7 +2913,7 @@ fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
 /// Held to the credential-file permission rule
 /// (`check_credential_file_permissions`): this file *is* the credential now,
 /// so one another account can read or write refuses the load.
-fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String>> {
+fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<SecretString>> {
     let content = match fs::read_to_string(full) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2900,7 +2927,7 @@ fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<String
         );
     }
     check_credential_file_permissions(&full.to_string_lossy())?;
-    Ok(Some(content.to_string()))
+    Ok(Some(SecretString::new(content.to_string())))
 }
 
 /// Resolves `[iroh] secret_key` from its candidate sources: the environment
@@ -2920,7 +2947,7 @@ fn resolve_secret_key_source(
     env_raw: Option<String>,
     env_file: Option<&Path>,
     iroh: &IrohConfig,
-) -> anyhow::Result<Option<(String, CredentialSource)>> {
+) -> anyhow::Result<Option<(SecretString, CredentialSource)>> {
     // A trailing newline from `printf`, or a compose file that lists the
     // variable without a value, must neither become key bytes nor count as a
     // source: trim, and a leftover blank means the environment named nothing.
@@ -2935,12 +2962,15 @@ fn resolve_secret_key_source(
             env.map(|_| IROH_SECRET_KEY_ENV),
             env_file.map(|_| IROH_SECRET_KEY_FILE_ENV),
             iroh.secret_key_file.as_deref().map(|_| "secret_key_file"),
-            iroh.secret_key.as_deref().map(|_| "secret_key"),
+            iroh.secret_key.as_ref().map(|_| "secret_key"),
         ],
     )?;
 
     if let Some(key) = env {
-        return Ok(Some((key.to_string(), CredentialSource::Env)));
+        return Ok(Some((
+            SecretString::new(key.to_string()),
+            CredentialSource::Env,
+        )));
     }
     // An environment-named file outranks the config's pointer: both are files,
     // but deployment wiring wins over what the file on disk says.
@@ -2970,7 +3000,7 @@ fn resolve_relay_auth_token_source(
     config_dir: Option<&Path>,
     env_raw: Option<String>,
     iroh: &IrohConfig,
-) -> anyhow::Result<Option<(String, CredentialSource)>> {
+) -> anyhow::Result<Option<(SecretString, CredentialSource)>> {
     // The same blank-means-nothing reading the secret key gives the
     // environment.
     let env = env_raw
@@ -2985,12 +3015,15 @@ fn resolve_relay_auth_token_source(
             iroh.relay_auth_token_file
                 .as_deref()
                 .map(|_| "relay_auth_token_file"),
-            iroh.relay_auth_token.as_deref().map(|_| "relay_auth_token"),
+            iroh.relay_auth_token.as_ref().map(|_| "relay_auth_token"),
         ],
     )?;
 
     if let Some(token) = env {
-        return Ok(Some((token.to_string(), CredentialSource::Env)));
+        return Ok(Some((
+            SecretString::new(token.to_string()),
+            CredentialSource::Env,
+        )));
     }
     if let Some(file) = &iroh.relay_auth_token_file {
         let full = credential_file_path(config_dir, file);
@@ -4218,8 +4251,12 @@ pending_enrollment = "TOKEN"
         let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
         let auth = auth.expect("auth is enabled");
         let alice = &auth.clients["alice"];
-        assert_eq!(alice.secret, "CLIENTSECRET", "the shared secret rotated");
-        assert_eq!(alice.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(
+            alice.secret.as_str(),
+            "CLIENTSECRET",
+            "the shared secret rotated"
+        );
+        assert_eq!(alice.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
         assert!(
             !alice.devices["laptop"].created_at.is_empty(),
             "a device with no issued-at looks never issued"
@@ -4290,8 +4327,8 @@ pending_enrollment = "TOKEN"
         let auth = auth.expect("auth is enabled");
         let devices = &auth.clients["alice"].devices;
         assert_eq!(devices.len(), 2, "{devices:?}");
-        assert_eq!(devices["laptop"].secret, "LAPTOPSECRET");
-        assert_eq!(devices["phone"].secret, "PHONESECRET");
+        assert_eq!(devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+        assert_eq!(devices["phone"].secret.as_str(), "PHONESECRET");
     }
 
     /// Neither writer may hand a device an empty secret.
@@ -4446,7 +4483,11 @@ pending_enrollment = "TOKEN"
     /// very loader `--generate-2fa` and the server share.
     fn secret_of(path: &str, client_id: &str) -> Option<String> {
         let (_, auth) = ProxyConfig::load_with_auth(path).expect("config still parses");
-        auth.and_then(|auth| auth.clients.get(client_id).map(|c| c.secret.clone()))
+        auth.and_then(|auth| {
+            auth.clients
+                .get(client_id)
+                .map(|c| c.secret.expose_secret().to_string())
+        })
     }
 
     #[test]
@@ -4597,7 +4638,9 @@ pending_enrollment = "TOKEN"
 
         let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
         assert_eq!(
-            iroh.secret_key.as_deref(),
+            iroh.secret_key
+                .as_ref()
+                .map(|key| key.expose_secret().as_str()),
             Some(key.as_str()),
             "the key from the file is what the config runs on"
         );
@@ -4665,7 +4708,7 @@ pending_enrollment = "TOKEN"
             resolve_secret_key_source(None, Some("  abc  ".to_string()), None, &iroh)
                 .expect("one source resolves")
                 .expect("the environment names a key");
-        assert_eq!(key, "abc");
+        assert_eq!(key.expose_secret(), "abc");
         assert_eq!(source, CredentialSource::Env);
     }
 
@@ -4679,7 +4722,7 @@ pending_enrollment = "TOKEN"
         let (key, source) = resolve_secret_key_source(None, Some("   ".to_string()), None, &iroh)
             .expect("a blank env value is not a source")
             .expect("the inline literal is the only source left");
-        assert_eq!(key, "00");
+        assert_eq!(key.expose_secret(), "00");
         assert_eq!(source, CredentialSource::Inline);
     }
 
@@ -4699,7 +4742,7 @@ pending_enrollment = "TOKEN"
             resolve_secret_key_source(Some(dir.path()), None, Some(&key_path), &iroh)
                 .expect("the env-named file resolves")
                 .expect("it names a key");
-        assert_eq!(resolved, key);
+        assert_eq!(resolved.expose_secret(), key.as_str());
         assert_eq!(source, CredentialSource::File);
     }
 
@@ -4768,7 +4811,12 @@ pending_enrollment = "TOKEN"
             .expect("a config whose token lives in a file loads");
 
         let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
-        assert_eq!(iroh.relay_auth_token.as_deref(), Some("bearer-token"));
+        assert_eq!(
+            iroh.relay_auth_token
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
+            Some("bearer-token")
+        );
         assert_eq!(iroh.relay_auth_token_source, CredentialSource::File);
         assert!(!config.holds_credentials());
     }
@@ -4945,10 +4993,16 @@ pending_enrollment = "TOKEN"
         let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
         let auth = auth.expect("auth section");
         assert_eq!(
-            auth.clients["client-001"].pending_enrollment.as_deref(),
+            auth.clients["client-001"]
+                .pending_enrollment
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
             Some("deadbeef")
         );
-        assert_eq!(auth.clients["client-001"].secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(
+            auth.clients["client-001"].secret.as_str(),
+            "JBSWY3DPEHPK3PXP"
+        );
 
         // Issuing a second token replaces the first: that is how a link that
         // never arrived gets revoked.
@@ -4958,7 +5012,8 @@ pending_enrollment = "TOKEN"
         assert_eq!(
             auth.unwrap().clients["client-001"]
                 .pending_enrollment
-                .as_deref(),
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
             Some("cafebabe")
         );
 
@@ -4966,7 +5021,7 @@ pending_enrollment = "TOKEN"
             .expect("enrollment should be saved");
         let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
         let client = &auth.unwrap().clients["client-001"];
-        assert_eq!(client.secret, "NEWSECRETVALUE");
+        assert_eq!(client.secret.as_str(), "NEWSECRETVALUE");
         // The token has to go with it, or the same link enrolls a second device.
         assert_eq!(client.pending_enrollment, None);
     }
@@ -5004,10 +5059,10 @@ pending_enrollment = "TOKEN"
         let iroh = IrohConfig {
             relay_url: Some("https://relay.example".to_string()),
             relay_mode: Some("custom".to_string()),
-            relay_auth_token: Some("bearer-secret".to_string()),
+            relay_auth_token: Some(SecretString::new("bearer-secret".to_string())),
             bind_port: Some(1234),
             bind_ipv6: Some(true),
-            secret_key: Some("ed25519-private-key".to_string()),
+            secret_key: Some(SecretString::new("ed25519-private-key".to_string())),
             secret_key_file: Some("iroh.key".to_string()),
             secret_key_source: CredentialSource::Inline,
             relay_auth_token_file: Some("relay.token".to_string()),
@@ -5217,7 +5272,7 @@ pending_enrollment = "TOKEN"
         let devices = devices_of(&path, "acme");
         let server = &devices["server"];
         assert_eq!(server.public_key.as_deref(), Some(key.as_str()));
-        assert!(server.secret.is_empty(), "{server:?}");
+        assert!(server.secret.expose_secret().is_empty(), "{server:?}");
         assert_eq!(
             secret_of(&path, "acme").as_deref(),
             Some("JBSWY3DPEHPK3PXP"),
@@ -5306,7 +5361,7 @@ pending_enrollment = "TOKEN"
         let server = &devices["server"];
         assert_eq!(server.public_key.as_deref(), Some(key.as_str()));
         assert!(
-            server.secret.is_empty(),
+            server.secret.expose_secret().is_empty(),
             "the old secret is gone, not kept beside the key: {server:?}"
         );
     }
@@ -5605,9 +5660,9 @@ created_at = "1700000000"
         .expect("a device table loads");
 
         let client = &auth.expect("auth section present").clients["client-001"];
-        assert_eq!(client.secret, "CLIENTSECRET");
+        assert_eq!(client.secret.as_str(), "CLIENTSECRET");
         assert_eq!(client.devices.len(), 2);
-        assert_eq!(client.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(client.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
         assert_eq!(client.devices["phone"].created_at, "1700000000");
         assert!(
             !client.devices["laptop"].created_at.is_empty(),
@@ -5683,7 +5738,7 @@ secret = "CLIENTSECRET"
         // Not `{device:?}`: `DeviceAuth`'s `Debug` prints `secret: "<redacted>"`,
         // so it says nothing here and reads to the scanner as logging a secret.
         assert!(
-            device.secret.is_empty(),
+            device.secret.expose_secret().is_empty(),
             "a device registered with a key holds no seed"
         );
         assert!(
@@ -5783,13 +5838,17 @@ secret = "CLIENTSECRET"
         let EndpointIdentity::Generated(key) = identity else {
             panic!("a missing key has to be generated and written");
         };
-        key.parse::<iroh::SecretKey>()
+        key.expose_secret()
+            .parse::<iroh::SecretKey>()
             .expect("the written key parses as an ed25519 secret key");
 
         let config = parse(&fs::read_to_string(&path).expect("the config is still there"));
         assert_eq!(
-            config.iroh.and_then(|iroh| iroh.secret_key).as_deref(),
-            Some(key.as_str()),
+            config
+                .iroh
+                .and_then(|iroh| iroh.secret_key)
+                .map(|key| key.expose_secret().to_string()),
+            Some(key.expose_secret().to_string()),
             "the key has to be on disk, not only in memory"
         );
         // And the rest of the file is untouched.
@@ -5872,7 +5931,10 @@ secret = "CLIENTSECRET"
             ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
                 .expect("the identity is resolved");
 
-        assert_eq!(identity, EndpointIdentity::Configured(key.clone()));
+        assert_eq!(
+            identity,
+            EndpointIdentity::Configured(SecretString::new(key.clone()))
+        );
         assert_eq!(
             fs::read_to_string(&path).expect("the config is still there"),
             format!("[iroh]\nsecret_key = \"{key}\"\n"),
@@ -6032,9 +6094,9 @@ secret = "CLIENTSECRET"
     #[test]
     fn an_identity_never_prints_its_key() {
         for identity in [
-            EndpointIdentity::Configured(generate_secret_key_hex()),
-            EndpointIdentity::Generated(generate_secret_key_hex()),
-            EndpointIdentity::Ephemeral(generate_secret_key_hex()),
+            EndpointIdentity::Configured(SecretString::new(generate_secret_key_hex())),
+            EndpointIdentity::Generated(SecretString::new(generate_secret_key_hex())),
+            EndpointIdentity::Ephemeral(SecretString::new(generate_secret_key_hex())),
         ] {
             let rendered = format!("{identity:?}");
             assert!(
@@ -6053,9 +6115,15 @@ secret = "CLIENTSECRET"
     #[test]
     fn an_identity_still_says_which_path_it_came_from() {
         let rendered = |identity: EndpointIdentity| format!("{identity:?}");
-        assert!(rendered(EndpointIdentity::Configured(String::new())).contains("Configured"));
-        assert!(rendered(EndpointIdentity::Generated(String::new())).contains("Generated"));
-        assert!(rendered(EndpointIdentity::Ephemeral(String::new())).contains("Ephemeral"));
+        assert!(
+            rendered(EndpointIdentity::Configured(SecretString::default())).contains("Configured")
+        );
+        assert!(
+            rendered(EndpointIdentity::Generated(SecretString::default())).contains("Generated")
+        );
+        assert!(
+            rendered(EndpointIdentity::Ephemeral(SecretString::default())).contains("Ephemeral")
+        );
     }
 
     /// The generated key is a private key, so the file it lands in must be

@@ -12,6 +12,7 @@ pub mod http;
 pub mod lb;
 pub mod provisioning;
 pub mod relay;
+pub mod secret;
 pub mod traffic;
 pub mod transport;
 
@@ -55,6 +56,7 @@ pub use http::{HttpRequest, HttpResponse};
 pub use lb::LoadBalancingStrategy;
 pub use provisioning::{EndpointInvite, EndpointTarget, InviteTotp};
 pub use relay::{PINNED_RELAY_URL, RelayModeSpec};
+pub use secret::{Secret, SecretBytes, SecretString};
 pub use transport::{TransportTuning, transport_config, transport_config_with_tuning};
 
 #[cfg(feature = "local-proxy")]

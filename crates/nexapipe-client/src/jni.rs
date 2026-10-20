@@ -1,5 +1,6 @@
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::relay::RelayModeSpec;
+use crate::secret::SecretString;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
 use crate::{DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, NodeConfig};
@@ -30,7 +31,12 @@ static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
 static STATE: OnceCell<Arc<Mutex<ProxyState>>> = OnceCell::new();
 // 2FA config: Kotlin injects (client_id, secret, algorithm) via nativeSetTwoFactor before startup.
-static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+//
+// The secret is a `SecretString`: this table lives for as long as the process
+// does, and the seed in it is a working credential — it is wiped when the
+// entry is replaced or cleared, rather than being left in the heap for the
+// allocator to hand out again.
+static TWO_FACTOR: Mutex<Option<(String, SecretString, String)>> = Mutex::new(None);
 
 /// One endpoint's TOTP credentials, as Kotlin filed them: client id, secret,
 /// algorithm, and the device the secret was issued to.
@@ -38,7 +44,9 @@ static TWO_FACTOR: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 /// The last field is what decides whether a handshake claims a device name, so
 /// it travels with the triple rather than being read from `DEVICE_ID` at apply
 /// time: a pair issued to the client has to keep answering as the client.
-type NodeCredential = (String, String, String, Option<String>);
+///
+/// The secret is a [`SecretString`], for the reason the table above gives.
+type NodeCredential = (String, SecretString, String, Option<String>);
 
 // 2FA credentials per backend, keyed by endpoint ID. Kotlin registers one entry
 // per endpoint that carries 2FA (nativeSetTwoFactorForNode); a backend without
@@ -51,7 +59,10 @@ static NODE_TWO_FACTOR: Lazy<Mutex<HashMap<String, NodeCredential>>> =
 // endpoint has no credentials yet: the token is spent by the first connection, which comes
 // back with the secret Kotlin then persists. Kept apart from NODE_TWO_FACTOR because a node
 // holding a token must not present it as its TOTP secret.
-static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, String)>>> =
+//
+// The token is a `SecretString`: an unspent invitation is a credential, and
+// this table holds it for as long as the process lives.
+static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, SecretString)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 // One device key per backend, keyed by endpoint ID.
 //
@@ -137,7 +148,12 @@ static RELAY_MODE: Mutex<String> = Mutex::new(String::new());
 static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
 // Bearer token for a `custom` relay that asks for one. Only ever read together with the two
 // above; never logged.
-static RELAY_AUTH_TOKEN: Mutex<String> = Mutex::new(String::new());
+//
+// A `SecretString`, and a `Lazy` because a `Secret` cannot be built in a
+// `static` initializer: the token is a credential, and it is wiped when the
+// entry is replaced or the process ends.
+static RELAY_AUTH_TOKEN: Lazy<Mutex<SecretString>> =
+    Lazy::new(|| Mutex::new(SecretString::default()));
 
 // Reason behind the last failed native call, so Kotlin can read it back.
 //
@@ -790,7 +806,7 @@ fn set_relay_config(
         *url = url_str;
     }
     if let Ok(mut token) = RELAY_AUTH_TOKEN.lock() {
-        *token = token_str;
+        *token = SecretString::new(token_str);
     }
     0
 }
@@ -844,11 +860,15 @@ fn two_factor_auth(cfg: &NodeCredential, key: Option<&iroh::SecretKey>) -> Optio
     let (client_id, secret, algorithm, device) = cfg;
     let device = device.as_deref().map(str::trim).filter(|d| !d.is_empty());
 
-    if !secret.trim().is_empty() {
+    if !secret.as_str().trim().is_empty() {
         if key.is_some() {
             jni_log!("2FA: a secret is registered beside a device key; answering with the secret");
         }
-        return match TwoFactorAuth::new(client_id, secret, TotpAlgorithm::from_name(algorithm)) {
+        return match TwoFactorAuth::new(
+            client_id,
+            secret.as_str(),
+            TotpAlgorithm::from_name(algorithm),
+        ) {
             Ok(auth) => Some(match device {
                 Some(name) => auth.with_device(name),
                 None => auth,
@@ -925,7 +945,7 @@ fn node_has_two_factor(node_id: &str) -> bool {
     let Some(cfg) = node_two_factor_for(node_id) else {
         return false;
     };
-    if !cfg.1.trim().is_empty() {
+    if !cfg.1.as_str().trim().is_empty() {
         return true;
     }
     let names_a_device = cfg
@@ -938,7 +958,7 @@ fn node_has_two_factor(node_id: &str) -> bool {
 
 /// A snapshot of the per-endpoint enrollment tokens, so the mutex is not held across the
 /// async calls that apply them.
-fn node_enrollment_snapshot() -> Vec<(String, (String, String))> {
+fn node_enrollment_snapshot() -> Vec<(String, (String, SecretString))> {
     match NODE_ENROLLMENT.lock() {
         Ok(map) => map
             .iter()
@@ -1037,7 +1057,7 @@ fn set_two_factor(
     );
 
     if let Ok(mut tf) = TWO_FACTOR.lock() {
-        *tf = Some((client_id, secret, algorithm));
+        *tf = Some((client_id, SecretString::new(secret), algorithm));
     }
     0
 }
@@ -1124,7 +1144,10 @@ fn set_two_factor_for_node(
     );
 
     if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
-        map.insert(node_id, (client_id, secret, algorithm, device));
+        map.insert(
+            node_id,
+            (client_id, SecretString::new(secret), algorithm, device),
+        );
     }
     0
 }
@@ -1290,7 +1313,7 @@ fn set_enrollment_for_node(
     );
 
     if let Ok(mut map) = NODE_ENROLLMENT.lock() {
-        map.insert(node_id, (client_id, token));
+        map.insert(node_id, (client_id, SecretString::new(token)));
     }
     0
 }
@@ -1396,7 +1419,10 @@ fn take_issued_credential(env: &mut Env<'_>) -> jstring {
     let encoded = format!(
         "{}\n{}\n{}\n{}\n{}",
         issued.client_id,
-        issued.secret,
+        // The credential leaves the process here — it is on its way to the
+        // app's own storage — so this copy is a plain string, and the one
+        // that stays behind is wiped with the credential.
+        issued.secret.expose_secret(),
         issued.algorithm,
         issued.device.unwrap_or_default(),
         issued.public_key.unwrap_or_default()
@@ -1468,13 +1494,14 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let relay = match RelayModeSpec::parse(Some(&cfg_mode), Some(&cfg_url), Some(&cfg_token)) {
-            Ok(spec) => spec.unwrap_or(RelayModeSpec::Pinned),
-            Err(e) => {
-                jni_log!("[iroh] invalid relay configuration: {e}");
-                return Err(());
-            }
-        };
+        let relay =
+            match RelayModeSpec::parse(Some(&cfg_mode), Some(&cfg_url), Some(cfg_token.as_str())) {
+                Ok(spec) => spec.unwrap_or(RelayModeSpec::Pinned),
+                Err(e) => {
+                    jni_log!("[iroh] invalid relay configuration: {e}");
+                    return Err(());
+                }
+            };
         if !relay.uses_url() && !cfg_url.is_empty() {
             jni_log!(
                 "[iroh] ignoring relay_url {:?}: mode {} does not use one",
@@ -1739,7 +1766,7 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 // how a device ends up sharing the client's secret — the thing
                 // that makes revoking one rotate every other one.
                 let name = device_id();
-                let enrollment = Enrollment::new(&client_id, &token);
+                let enrollment = Enrollment::new(&client_id, token.as_str());
                 let enrollment = match &name {
                     Some(name) => enrollment.with_device(name),
                     None => enrollment,
@@ -2850,7 +2877,7 @@ mod tests {
         let public = key.public_hex();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            String::new(),
+            SecretString::default(),
             String::new(),
             Some("phone-1a2b3c4d".to_string()),
         );
@@ -2871,7 +2898,12 @@ mod tests {
     #[test]
     fn a_key_without_a_device_name_is_not_a_credential_yet() {
         let key = DeviceKey::generate();
-        let cfg: NodeCredential = ("client-001".to_string(), String::new(), String::new(), None);
+        let cfg: NodeCredential = (
+            "client-001".to_string(),
+            SecretString::default(),
+            String::new(),
+            None,
+        );
 
         assert!(
             two_factor_auth(&cfg, Some(key.secret_key())).is_none(),
@@ -2885,7 +2917,7 @@ mod tests {
     fn a_node_with_a_secret_still_authenticates_with_the_secret() {
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            "JBSWY3DPEHPK3PXP".to_string(),
+            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             Some("laptop".to_string()),
         );
@@ -2907,7 +2939,7 @@ mod tests {
     fn an_empty_secret_is_no_credential() {
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            "  ".to_string(),
+            SecretString::new("  ".to_string()),
             "sha1".to_string(),
             None,
         );
@@ -2924,7 +2956,7 @@ mod tests {
         let key = DeviceKey::generate();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            "JBSWY3DPEHPK3PXP".to_string(),
+            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             Some("phone-1a2b3c4d".to_string()),
         );
@@ -2947,7 +2979,7 @@ mod tests {
         let key = DeviceKey::generate();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            "JBSWY3DPEHPK3PXP".to_string(),
+            SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             "sha1".to_string(),
             None,
         );
@@ -2969,7 +3001,7 @@ mod tests {
         let public = key.public_hex();
         let cfg: NodeCredential = (
             "client-001".to_string(),
-            "   ".to_string(),
+            SecretString::new("   ".to_string()),
             String::new(),
             Some("phone-1a2b3c4d".to_string()),
         );

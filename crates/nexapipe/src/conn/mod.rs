@@ -14,6 +14,7 @@ use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, Incoming};
+use nexapipe_client::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -974,7 +975,8 @@ fn enrollment_verdict(
     // of the same rule, so a reload path that skips validation cannot revive it.
     let Some(expected) = client
         .pending_enrollment
-        .as_deref()
+        .as_ref()
+        .map(|expected| expected.expose_secret())
         .filter(|expected| !expected.is_empty())
     else {
         return EnrollmentVerdict::Refuse { counted: false };
@@ -1084,7 +1086,7 @@ enum EnrollmentSlot {
     /// what every peer that predates the device table answers with.
     Shared {
         /// The secret this enrollment rotated away.
-        previous: String,
+        previous: SecretString,
     },
 }
 
@@ -1099,12 +1101,15 @@ enum EnrollmentSlot {
 #[derive(Clone)]
 enum IssuedCredential {
     /// A named device with a secret of its own.
-    DeviceSecret { name: String, secret: String },
+    DeviceSecret { name: String, secret: SecretString },
     /// A named device with a key: it signs each challenge, and `secret` is
     /// empty on the wire because there is no code for it to send.
+    ///
+    /// The key is the *public* half, so it is a plain string: there is nothing
+    /// secret about it.
     DeviceKey { name: String, key: String },
     /// The client's own `secret`, rotated.
-    SharedSecret(String),
+    SharedSecret(SecretString),
 }
 
 /// Writes the issued credential into the slot this enrollment named, in memory.
@@ -1123,7 +1128,7 @@ fn issue_enrolled_secret(
         // is unreachable; a shared slot with nothing to restore keeps the
         // caller's rollback simple rather than making it handle a third case.
         return EnrollmentSlot::Shared {
-            previous: String::new(),
+            previous: SecretString::default(),
         };
     };
 
@@ -1144,7 +1149,7 @@ fn issue_enrolled_secret(
             previous: client.devices.insert(
                 name.clone(),
                 DeviceAuth {
-                    secret: String::new(),
+                    secret: SecretString::default(),
                     public_key: Some(key.clone()),
                     created_at: crate::auth::config::default_created_at(),
                     last_used: None,
@@ -1181,7 +1186,7 @@ fn undo_enrolled_secret(cfg: &mut AuthConfig, client_id: &str, slot: EnrollmentS
         },
         EnrollmentSlot::Shared { previous } => client.secret = previous,
     }
-    client.pending_enrollment = Some(token.to_string());
+    client.pending_enrollment = Some(SecretString::new(token.to_string()));
 }
 
 /// Issues a credential against an enrollment token: a freshly generated secret,
@@ -1293,7 +1298,10 @@ async fn enroll_client(
     // this server knows and does not say.
     let issued = match public_key {
         None => {
-            let secret = crate::auth::TotpValidator::generate_secret();
+            // Minted as a `Secret`: the credential that is about to be issued
+            // is the most valuable thing this process holds, and it is wiped
+            // when the enrollment is over.
+            let secret = SecretString::new(crate::auth::TotpValidator::generate_secret());
             match device {
                 Some(name) => IssuedCredential::DeviceSecret {
                     name: name.to_string(),
@@ -1342,7 +1350,7 @@ async fn enroll_client(
                 path,
                 &enrolled_client,
                 name,
-                crate::auth::DeviceMaterial::Secret(secret),
+                crate::auth::DeviceMaterial::Secret(secret.expose_secret()),
             )
         }
         IssuedCredential::DeviceKey { name, key } => {
@@ -1353,9 +1361,11 @@ async fn enroll_client(
                 crate::auth::DeviceMaterial::PublicKey(key),
             )
         }
-        IssuedCredential::SharedSecret(secret) => {
-            crate::config::ProxyConfig::complete_enrollment(path, &enrolled_client, secret)
-        }
+        IssuedCredential::SharedSecret(secret) => crate::config::ProxyConfig::complete_enrollment(
+            path,
+            &enrolled_client,
+            secret.expose_secret(),
+        ),
     })
     .await
     {
@@ -1423,7 +1433,7 @@ async fn enroll_client(
         // An empty secret is how the client is told its key was recorded:
         // there is no seed for it to keep, and from here on every response it
         // sends is a signature.
-        IssuedCredential::DeviceKey { name, .. } => (String::new(), Some(name.clone())),
+        IssuedCredential::DeviceKey { name, .. } => (SecretString::default(), Some(name.clone())),
         IssuedCredential::SharedSecret(secret) => (secret.clone(), None),
     };
 
@@ -1663,7 +1673,7 @@ async fn perform_authentication(
             enroll_client(
                 auth,
                 &client_id,
-                &token,
+                token.expose_secret(),
                 device_id.as_deref(),
                 public_key.as_deref(),
                 &mut send,
@@ -2394,6 +2404,7 @@ mod tests {
         undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
+    use nexapipe_client::secret::SecretString;
     use std::collections::HashMap;
 
     #[test]
@@ -2442,7 +2453,7 @@ mod tests {
     fn device_secret(name: &str, secret: &str) -> IssuedCredential {
         IssuedCredential::DeviceSecret {
             name: name.to_string(),
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
         }
     }
 
@@ -2527,10 +2538,10 @@ mod tests {
         cfg.clients.insert(
             "alice".to_string(),
             ClientAuth {
-                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
                 created_at: "0".to_string(),
                 allow_hosts: None,
-                pending_enrollment: token.map(|t| t.to_string()),
+                pending_enrollment: token.map(|t| SecretString::new(t.to_string())),
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,
                 last_used: None,
@@ -2587,8 +2598,12 @@ mod tests {
             issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "LAPTOPSECRET"));
 
         let alice = &cfg.clients["alice"];
-        assert_eq!(alice.secret, shared, "the shared secret was rotated too");
-        assert_eq!(alice.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(
+            alice.secret.expose_secret(),
+            shared.expose_secret(),
+            "the shared secret was rotated too"
+        );
+        assert_eq!(alice.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
         assert!(
             alice.pending_enrollment.is_none(),
             "the token was left spendable"
@@ -2617,7 +2632,10 @@ mod tests {
 
         let device = &cfg.clients["alice"].devices["phone"];
         assert_eq!(device.public_key.as_deref(), Some(spelled.as_str()));
-        assert!(device.secret.is_empty(), "a key device has no TOTP seed");
+        assert!(
+            device.secret.expose_secret().is_empty(),
+            "a key device has no TOTP seed"
+        );
         assert!(matches!(slot, EnrollmentSlot::Device { .. }));
     }
 
@@ -2630,10 +2648,10 @@ mod tests {
         let slot = issue_enrolled_secret(
             &mut cfg,
             "alice",
-            &IssuedCredential::SharedSecret("NEWSECRET".to_string()),
+            &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
         );
 
-        assert_eq!(cfg.clients["alice"].secret, "NEWSECRET");
+        assert_eq!(cfg.clients["alice"].secret.as_str(), "NEWSECRET");
         assert!(cfg.clients["alice"].devices.is_empty());
         assert!(matches!(slot, EnrollmentSlot::Shared { .. }));
     }
@@ -2647,7 +2665,7 @@ mod tests {
         cfg.clients.get_mut("alice").unwrap().devices.insert(
             "laptop".to_string(),
             DeviceAuth {
-                secret: "OLDSECRET".to_string(),
+                secret: SecretString::new("OLDSECRET".to_string()),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
@@ -2655,14 +2673,20 @@ mod tests {
         );
 
         let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "NEWSECRET"));
-        assert_eq!(cfg.clients["alice"].devices["laptop"].secret, "NEWSECRET");
+        assert_eq!(
+            cfg.clients["alice"].devices["laptop"].secret.as_str(),
+            "NEWSECRET"
+        );
 
         undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
         let alice = &cfg.clients["alice"];
-        assert_eq!(alice.devices["laptop"].secret, "OLDSECRET");
+        assert_eq!(alice.devices["laptop"].secret.as_str(), "OLDSECRET");
         assert_eq!(
-            alice.pending_enrollment.as_deref(),
+            alice
+                .pending_enrollment
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
             Some("0123456789abcdef"),
             "the token is still the client's only way to enroll"
         );
@@ -2692,7 +2716,7 @@ mod tests {
         let slot = issue_enrolled_secret(
             &mut cfg,
             "alice",
-            &IssuedCredential::SharedSecret("NEWSECRET".to_string()),
+            &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
         );
         undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
@@ -2809,7 +2833,7 @@ mod tests {
         cfg.clients.get_mut("alice").unwrap().devices.insert(
             device.to_string(),
             DeviceAuth {
-                secret: "DEVICESECRET".to_string(),
+                secret: SecretString::new("DEVICESECRET".to_string()),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,

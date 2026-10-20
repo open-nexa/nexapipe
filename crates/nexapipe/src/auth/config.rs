@@ -1,5 +1,6 @@
 //! Configuration structures for 2FA authentication.
 
+use nexapipe_client::secret::{SecretBytes, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,7 +110,12 @@ impl Default for AuthConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientAuth {
     /// Base32-encoded secret key
-    pub secret: String,
+    ///
+    /// A [`SecretString`]: this is a working credential for as long as the
+    /// server runs, and it is wiped when the entry is replaced or the config
+    /// is dropped. The file it came from is written back unchanged — the
+    /// wrapper changes where the bytes live, not what they say.
+    pub secret: SecretString,
     /// When this client was created
     #[serde(default = "default_created_at")]
     pub created_at: String,
@@ -127,8 +133,11 @@ pub struct ClientAuth {
     /// `None` means no enrollment is outstanding, so a client with no token
     /// cannot talk the server into issuing one: enrollment is only ever opened
     /// by `--generate-invite --registration`, which writes it here.
+    ///
+    /// A [`SecretString`]: an unspent token is a credential, and it is wiped
+    /// when it is spent or when the config is dropped.
     #[serde(default)]
-    pub pending_enrollment: Option<String>,
+    pub pending_enrollment: Option<SecretString>,
     /// Credentials issued to individual devices under this client.
     ///
     /// A device here has a secret of its own, and the `secret` above is the
@@ -215,8 +224,10 @@ pub struct DeviceAuth {
     ///
     /// Empty when the device answers with a signature instead — see
     /// [`Self::public_key`].
+    ///
+    /// A [`SecretString`], for the reason the client's own secret is one.
     #[serde(default)]
-    pub secret: String,
+    pub secret: SecretString,
     /// The device's Ed25519 public key, hex, when it proves itself with a
     /// signature instead of a TOTP code.
     ///
@@ -298,7 +309,7 @@ impl AuthConfig {
                     (
                         id.clone(),
                         ClientAuth {
-                            secret: String::new(),
+                            secret: SecretString::default(),
                             created_at: String::new(),
                             allow_hosts: None,
                             pending_enrollment: None,
@@ -318,7 +329,7 @@ impl AuthConfig {
                                     (
                                         name.clone(),
                                         DeviceAuth {
-                                            secret: String::new(),
+                                            secret: SecretString::default(),
                                             public_key: None,
                                             created_at: String::new(),
                                             last_used: device.last_used,
@@ -353,8 +364,8 @@ impl DeviceAuth {
     ///
     /// A key-based device has no secret, and the handshake asks it for a
     /// signature instead of calling this.
-    pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        decode_base32_secret(&self.secret)
+    pub fn decode_secret(&self) -> Result<SecretBytes, anyhow::Error> {
+        decode_base32_secret(self.secret.as_str())
     }
 }
 
@@ -366,11 +377,18 @@ impl DeviceAuth {
 /// a secret written either of those ways in the config has to work as well —
 /// otherwise it fails to decode here and the client is stuck at "Invalid
 /// Base32 secret" with nothing saying the spelling is why.
-fn decode_base32_secret(stored: &str) -> Result<Vec<u8>, anyhow::Error> {
+fn decode_base32_secret(stored: &str) -> Result<SecretBytes, anyhow::Error> {
+    // The normalised spelling is a copy of the seed in the clear, so it is
+    // held in a `Secret`: it is wiped when this function returns rather than
+    // being left in the heap for the allocator to hand out again.
     let secret = crate::auth::otpauth::normalize_secret(stored)
         .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))?;
-    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret)
-        .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
+    base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        secret.as_str(),
+    )
+    .map(SecretBytes::new)
+    .ok_or_else(|| anyhow::anyhow!("Invalid Base32 secret"))
 }
 
 /// Seconds since the Unix epoch.
@@ -451,8 +469,8 @@ impl ClientAuth {
     /// padding, so a secret written either of those ways in the config has to
     /// work as well — otherwise it fails to decode here and the client is stuck
     /// at "Invalid Base32 secret" with nothing saying the spelling is why.
-    pub fn decode_secret(&self) -> Result<Vec<u8>, anyhow::Error> {
-        decode_base32_secret(&self.secret)
+    pub fn decode_secret(&self) -> Result<SecretBytes, anyhow::Error> {
+        decode_base32_secret(self.secret.as_str())
     }
 
     /// The host authorization for a connection authenticated as this client.
@@ -535,7 +553,7 @@ mod tests {
 
     fn client() -> ClientAuth {
         ClientAuth {
-            secret: String::new(),
+            secret: SecretString::default(),
             created_at: "0".to_string(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -549,7 +567,7 @@ mod tests {
 
     fn device(secret: &str) -> DeviceAuth {
         DeviceAuth {
-            secret: secret.to_string(),
+            secret: SecretString::new(secret.to_string()),
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,
@@ -606,17 +624,17 @@ mod tests {
         // has to decode too, or the client is stuck at "Invalid Base32 secret"
         // with nothing pointing at the spelling.
         let mut lower = client();
-        lower.secret = "jbswy3dpehpk3pxp".to_string();
+        lower.secret = SecretString::new("jbswy3dpehpk3pxp".to_string());
         let mut padded = client();
-        padded.secret = "my======".to_string();
+        padded.secret = SecretString::new("my======".to_string());
         let mut plain = client();
-        plain.secret = "JBSWY3DPEHPK3PXP".to_string();
+        plain.secret = SecretString::new("JBSWY3DPEHPK3PXP".to_string());
 
         assert_eq!(
             lower.decode_secret().unwrap(),
             plain.decode_secret().unwrap()
         );
-        assert_eq!(padded.decode_secret().unwrap(), b"f");
+        assert_eq!(padded.decode_secret().unwrap().as_slice(), b"f");
     }
 
     /// `Debug` is what a log line uses, and the whole config — this struct
@@ -626,8 +644,8 @@ mod tests {
     #[test]
     fn a_client_prints_no_credentials() {
         let mut c = client();
-        c.secret = "JBSWY3DPEHPK3PXP".to_string();
-        c.pending_enrollment = Some("deadbeef".to_string());
+        c.secret = SecretString::new("JBSWY3DPEHPK3PXP".to_string());
+        c.pending_enrollment = Some(SecretString::new("deadbeef".to_string()));
 
         let rendered = format!("{c:?}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
@@ -730,7 +748,10 @@ mod tests {
     #[test]
     fn a_device_secret_decodes_the_way_a_clients_does() {
         assert_eq!(
-            device("JBSWY3DPEHPK3PXP").decode_secret().unwrap(),
+            device("JBSWY3DPEHPK3PXP")
+                .decode_secret()
+                .unwrap()
+                .as_slice(),
             b"Hello!\xde\xad\xbe\xef"
         );
         assert_eq!(
@@ -753,7 +774,7 @@ mod tests {
             toml::from_str(r#"secret = "JBSWY3DPEHPK3PXP""#).expect("a plain client still parses");
 
         assert!(parsed.devices.is_empty(), "{parsed:?}");
-        assert_eq!(parsed.secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(parsed.secret.as_str(), "JBSWY3DPEHPK3PXP");
     }
 
     /// The table is spelled the way a `[auth.clients.<id>]` entry nests it, so
@@ -775,7 +796,7 @@ mod tests {
         .expect("a device table parses");
 
         assert_eq!(parsed.devices.len(), 2);
-        assert_eq!(parsed.devices["laptop"].secret, "LAPTOPSECRET");
+        assert_eq!(parsed.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
         assert_eq!(parsed.devices["phone"].created_at, "1700000000");
         // Issued-at is filled in when the config does not say, the way a
         // client's is: a device with an empty one looks never-issued.
@@ -785,13 +806,54 @@ mod tests {
         );
     }
 
+    /// The file the server writes is the file the operator wrote.
+    ///
+    /// The seeds are `Secret`s now, and a `Secret` that serialized differently
+    /// would rewrite every `[auth]` section in every config on the next write —
+    /// the seed is the credential, and its spelling in the file is what an
+    /// operator's tooling reads. The wrapper changes where the bytes live in
+    /// memory, not what the file says.
+    #[test]
+    fn a_client_survives_a_toml_round_trip_unchanged() {
+        let written = r#"
+            secret = "CLIENTSECRET"
+            created_at = "1700000000"
+            pending_enrollment = "deadbeef"
+
+            [devices.laptop]
+            secret = "LAPTOPSECRET"
+            created_at = "1700000000"
+            "#;
+
+        let parsed: ClientAuth = toml::from_str(written).expect("a client parses");
+        let written_back = toml::to_string(&parsed).expect("a client serializes");
+
+        assert!(
+            written_back.contains(r#"secret = "CLIENTSECRET""#),
+            "{written_back}"
+        );
+        assert!(
+            written_back.contains(r#"pending_enrollment = "deadbeef""#),
+            "{written_back}"
+        );
+        assert!(
+            written_back.contains(r#"secret = "LAPTOPSECRET""#),
+            "{written_back}"
+        );
+        // And it reads back as the same thing, which is the part that matters
+        // for a file the server rewrites on every counter change.
+        let reparsed: ClientAuth = toml::from_str(&written_back).expect("it parses back");
+        assert_eq!(reparsed.secret.as_str(), "CLIENTSECRET");
+        assert_eq!(reparsed.devices["laptop"].secret.as_str(), "LAPTOPSECRET");
+    }
+
     /// `Debug` is what a log line uses, and the whole config is logged when it
     /// is parsed. A device secret is as live a credential as a client's — it
     /// authenticates on its own — so it is redacted for the same reason.
     #[test]
     fn a_device_secret_is_no_more_printable_than_a_clients() {
         let mut c = client();
-        c.secret = "CLIENTSECRET".to_string();
+        c.secret = SecretString::new("CLIENTSECRET".to_string());
         c.devices
             .insert("laptop".to_string(), device("LAPTOPSECRET"));
 
@@ -820,9 +882,9 @@ mod tests {
         let snapshot = config.counter_snapshot();
         let snapshot = &snapshot.clients["alice"];
 
-        assert!(snapshot.secret.is_empty());
+        assert!(snapshot.secret.expose_secret().is_empty());
         let laptop = &snapshot.devices["laptop"];
-        assert!(laptop.secret.is_empty(), "{snapshot:?}");
+        assert!(laptop.secret.expose_secret().is_empty(), "{snapshot:?}");
         assert!(laptop.public_key.is_none(), "{snapshot:?}");
         assert!(laptop.created_at.is_empty(), "{snapshot:?}");
     }

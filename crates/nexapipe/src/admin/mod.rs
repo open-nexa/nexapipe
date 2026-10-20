@@ -354,7 +354,7 @@ async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
         .map(|(id, client)| {
             serde_json::json!({
                 "id": id,
-                "has_secret": !client.secret.is_empty(),
+                "has_secret": !client.secret.expose_secret().is_empty(),
                 "created_at": client.created_at,
                 "allow_hosts": client.allow_hosts,
                 "last_used": client.last_used,

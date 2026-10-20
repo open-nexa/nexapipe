@@ -2,6 +2,7 @@
 
 use super::config::{AuthConfig, TotpAlgorithm};
 use hmac::{Hmac, KeyInit, Mac};
+use nexapipe_client::secret::SecretBytes;
 use sha2::Sha256;
 use totp_rs::{Algorithm, Builder, Secret};
 
@@ -21,7 +22,11 @@ const TIMESTAMP_WINDOW_SECS: i64 = 30;
 /// than the one its entry demands.
 enum Proof {
     /// A TOTP seed: an HMAC over the challenge, then a code.
-    Secret(Vec<u8>),
+    ///
+    /// A [`SecretBytes`]: the seed is a working credential, and it is wiped
+    /// when the proof is dropped — which is as soon as the handshake that
+    /// needed it is over.
+    Secret(SecretBytes),
     /// An Ed25519 public key: a signature over the same bytes the HMAC covers.
     Key(iroh::PublicKey),
 }
@@ -146,7 +151,7 @@ impl<'a> TotpValidator<'a> {
 
         match proof {
             Proof::Secret(secret) => {
-                let expected = hmac_signature(&secret, nonce, timestamp)?;
+                let expected = hmac_signature(secret.as_slice(), nonce, timestamp)?;
                 if !constant_time_eq(signature, &expected) {
                     return Err(AuthError::ChallengeMismatch);
                 }
@@ -167,7 +172,7 @@ impl<'a> TotpValidator<'a> {
 
     /// The code half of the secret path: whether `code` is current for
     /// `secret` under this config's algorithm, digits, window and step.
-    fn check_code(&self, secret: Vec<u8>, code: &str) -> Result<bool, AuthError> {
+    fn check_code(&self, secret: SecretBytes, code: &str) -> Result<bool, AuthError> {
         // `Builder` narrows two of these: 5.x took `digits` as a `usize` and
         // `skew` as a `u8`, 6.0 takes a `u8` and a `u16`. Converting rather
         // than casting keeps a config that does not fit from being truncated
@@ -181,7 +186,10 @@ impl<'a> TotpValidator<'a> {
             .with_digits(digits)
             .with_skew(skew)
             .with_step_duration(self.config.time_step as u64)
-            .with_secret(secret)
+            // The validator keeps its own copy of the seed, and `totp-rs` is
+            // built with its `zeroize` feature: the copy is wiped when the
+            // validator is dropped here rather than left in the heap.
+            .with_secret(secret.expose_secret_cloned())
             .build()
             .map_err(|_| AuthError::TotpCreationFailed)?;
 
@@ -309,11 +317,12 @@ impl std::error::Error for AuthError {}
 mod tests {
     use super::*;
     use crate::auth::config::ClientAuth;
+    use nexapipe_client::secret::SecretString;
     use std::collections::HashMap;
 
     fn config_with_one_client() -> AuthConfig {
         let client = ClientAuth {
-            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             created_at: String::new(),
             allow_hosts: None,
             pending_enrollment: None,
@@ -336,14 +345,14 @@ mod tests {
     /// shorter than 128 bits — and the tests below reach the TOTP check.
     fn config_with_one_device() -> AuthConfig {
         let client = ClientAuth {
-            secret: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             created_at: String::new(),
             allow_hosts: None,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "laptop".to_string(),
                 crate::auth::DeviceAuth {
-                    secret: "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP".to_string(),
+                    secret: SecretString::new("KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP".to_string()),
                     public_key: None,
                     created_at: String::new(),
                     last_used: None,
@@ -372,7 +381,7 @@ mod tests {
         config.clients.get_mut("alice").unwrap().devices.insert(
             "phone".to_string(),
             crate::auth::DeviceAuth {
-                secret: String::new(),
+                secret: SecretString::default(),
                 public_key: Some(crate::auth::public_key_hex(&key.public())),
                 created_at: String::new(),
                 last_used: None,
@@ -432,15 +441,16 @@ mod tests {
         let timestamp = current_timestamp();
 
         let laptop = hmac_signature(
-            &config.clients["alice"].devices["laptop"]
+            config.clients["alice"].devices["laptop"]
                 .decode_secret()
-                .unwrap(),
+                .unwrap()
+                .as_slice(),
             &nonce,
             timestamp,
         )
         .unwrap();
         let clients_own = hmac_signature(
-            &config.clients["alice"].decode_secret().unwrap(),
+            config.clients["alice"].decode_secret().unwrap().as_slice(),
             &nonce,
             timestamp,
         )
@@ -514,7 +524,7 @@ mod tests {
         let timestamp = current_timestamp();
 
         let clients_own = hmac_signature(
-            &config.clients["alice"].decode_secret().unwrap(),
+            config.clients["alice"].decode_secret().unwrap().as_slice(),
             &nonce,
             timestamp,
         )
@@ -543,7 +553,7 @@ mod tests {
         let nonce = fresh_nonce();
         let timestamp = current_timestamp();
         let clients_own = hmac_signature(
-            &config.clients["alice"].decode_secret().unwrap(),
+            config.clients["alice"].decode_secret().unwrap().as_slice(),
             &nonce,
             timestamp,
         )
@@ -571,9 +581,10 @@ mod tests {
         let nonce = fresh_nonce();
         let timestamp = current_timestamp();
         let laptop = hmac_signature(
-            &config.clients["alice"].devices["laptop"]
+            config.clients["alice"].devices["laptop"]
                 .decode_secret()
-                .unwrap(),
+                .unwrap()
+                .as_slice(),
             &nonce,
             timestamp,
         )
@@ -685,7 +696,7 @@ mod tests {
         let timestamp = current_timestamp();
 
         let clients_own = hmac_signature(
-            &config.clients["alice"].decode_secret().unwrap(),
+            config.clients["alice"].decode_secret().unwrap().as_slice(),
             &nonce,
             timestamp,
         )

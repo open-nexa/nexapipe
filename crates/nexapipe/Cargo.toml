@@ -59,7 +59,10 @@ hex = '0.4'
 nexapipe-client = { path = '../nexapipe-client', features = ['local-proxy'] }
 nexapipe-proto.workspace = true
 # 2FA support
-totp-rs = { version = '6.0', features = ['gen_secret'] }
+# `zeroize` so the TOTP validator wipes its own copy of the seed when it is
+# dropped: the validator is built from the secret, and without this it kept a
+# second copy of the credential in the heap for as long as the process lived.
+totp-rs = { version = '6.0', features = ['gen_secret', 'zeroize'] }
 base32 = '0.5'
 # Challenge binding: AUTH_RESPONSE is signed HMAC-SHA256(secret, nonce||timestamp).
 hmac = '0.13'

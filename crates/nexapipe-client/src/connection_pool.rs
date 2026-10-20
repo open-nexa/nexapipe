@@ -12,6 +12,7 @@ use tracing;
 
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
+use crate::secret::SecretString;
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_CONNECTIONS: usize = 10;
@@ -342,7 +343,7 @@ impl IrohConnectionPool {
             .take()
             .map(|auth| IssuedCredential {
                 client_id: auth.client_id().to_string(),
-                secret: auth.secret_base32(),
+                secret: SecretString::new(auth.secret_base32()),
                 algorithm: auth.algorithm_name().to_string(),
                 public_key: auth.public_key_hex(),
                 device: auth.device_id().map(str::to_string),
