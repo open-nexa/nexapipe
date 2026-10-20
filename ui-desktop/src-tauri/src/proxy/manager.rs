@@ -367,8 +367,11 @@ impl ProxyManager {
         // Whether this endpoint may ask n0 where a peer is. It is the one piece
         // of n0's infrastructure a relay setting does not reach, so it gets a
         // setting of its own.
+        // An empty value means nothing was configured, which falls back to the
+        // default — the same reading the JNI gives it. Only a value that
+        // names a mode wrongly is an error.
         let discovery =
-            DiscoveryMode::parse(&self.config.discovery_mode).map_err(StartError::Other)?;
+            DiscoveryMode::parse_or_default(&self.config.discovery_mode).map_err(StartError::Other)?;
         tracing::info!("Discovery: {}", discovery.describe());
         // Which relay a *peer* may be dialled through. `custom` says this
         // endpoint uses one relay and no other, and that has to hold for the
