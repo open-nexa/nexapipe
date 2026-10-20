@@ -1251,7 +1251,11 @@ jobs:
 
   release:
     name: publish release
-    needs: [build, build-desktop, build-apk]
+    # publish-image is a need as well: the image is pushed by digest and then
+    # signed, so a failed signature or attestation has to keep the GitHub
+    # Release from being created over an unsigned image. A signing_only run
+    # skips both jobs anyway.
+    needs: [build, build-desktop, build-apk, publish-image]
     # A signing_only dispatch run uploads nothing to publish.
     if: ${{ inputs.signing_only != true && needs.build-apk.outputs.skip_rust != 'true' }}
     runs-on: ubuntu-latest
