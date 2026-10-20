@@ -1658,33 +1658,49 @@ pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool 
 pub(crate) fn report_domain_patterns(patterns: &[String]) {
     let notes = crate::domains::domain_notes(patterns);
     for (pattern, why) in &notes.unusable {
-        jni_log!(
-            "[domains] the proxy-domain pattern \"{}\" matches nothing: {}",
-            pattern,
-            why
-        );
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
-            "The proxy-domain pattern \"{}\" matches nothing: {}",
-            pattern,
-            why
-        );
+        warn(&format!(
+            "the proxy-domain pattern \"{pattern}\" matches nothing: {why}"
+        ));
     }
     for pattern in &notes.narrowed {
-        jni_log!(
-            "[domains] the proxy-domain pattern \"{}\" names that host only; \"*.{}\" covers its \
-             subdomains",
-            pattern,
-            pattern
-        );
-        #[cfg(feature = "tracing")]
-        tracing::info!(
-            "The proxy-domain pattern \"{}\" names that host only; \"*.{}\" covers its subdomains",
-            pattern,
-            pattern
-        );
+        info(&format!(
+            "the proxy-domain pattern \"{pattern}\" names that host only; \"*.{pattern}\" covers \
+             its subdomains"
+        ));
     }
 }
+
+/// A warning the user can read.
+///
+/// The Android build installs the `log` logger at `Info` and no tracing
+/// subscriber, so a `Debug` line never reaches the log and a `tracing` line
+/// goes nowhere.
+#[cfg(feature = "jni")]
+fn warn(message: &str) {
+    crate::jni::warn_log(message);
+}
+
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+fn warn(message: &str) {
+    tracing::warn!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
+fn warn(_message: &str) {}
+
+/// A line of information the user can read, on the same terms as [`warn`].
+#[cfg(feature = "jni")]
+fn info(message: &str) {
+    crate::jni::info_log(message);
+}
+
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+fn info(message: &str) {
+    tracing::info!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
+fn info(_message: &str) {}
 
 #[cfg(test)]
 mod tests {
