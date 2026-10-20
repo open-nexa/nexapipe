@@ -39,7 +39,33 @@ unsound = "none"
 # A version pulled from crates.io is worth saying out loud, but it is not a
 # reason to refuse to build: the lockfile pins a version that still exists.
 yanked = "warn"
-ignore = []
+#
+# The same three advisories are ignored for `cargo audit` in
+# ui-desktop/src-tauri/.cargo/audit.toml, and the two tools have to agree:
+# cargo-deny does not read that file, so an ignore that lives only there is
+# invisible here — and the desktop check failed on exactly these three until
+# they were written down in both places.
+#
+# RUSTSEC-2026-0367/0368/0369: symlink and SUID/SGID handling flaws in
+# `zip::ZipArchive::extract`, fixed only in zip >= 9.0.0. zip enters this
+# dependency tree solely through tauri-plugin-updater, and every published
+# version of that plugin — 2.14.0 and 3.0.0-alpha.3 included — pins
+# `zip ^4`, so the lockfile cannot move to the patched line. Exposure is
+# narrow in practice: the updater only extracts archives served by our own
+# release backend after minisign signature verification. Remove these three
+# and bump the lockfile as soon as a tauri-plugin-updater release allows
+# zip >= 9.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+]
+# An advisory on this list that no crate in the graph matches is worth
+# knowing about — it means the ignore can go. This file is used for two
+# graphs, though: the server's and the desktop app's, and the three above
+# belong to the desktop one, so the signal would fire on every server run
+# and teach people to ignore it.
+unused-ignored-advisory = "allow"
 
 [bans]
 # Several crates are in the graph at more than one version — a dependency
