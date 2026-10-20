@@ -18,13 +18,15 @@
 //!   stream from a backend that is working. Those are named as idle on purpose,
 //!   so that a reader can tell at the call site which kind of bound it has.
 //!
-//! Every constant here is a default that a deployment can raise — **except the
-//! ones that cannot yet.** [`Overrides`] is the shape reading them from
-//! configuration takes, and it is deliberately not wired to anything yet: the
-//! call sites use [`Deadlines::default`], so `header`, `body`, `response_idle`,
-//! `l4_flow` and `tls_hello` are fixed and neither `config.toml` nor an
-//! environment variable reaches them. The one bound that *is* configurable is the
-//! per-route `flow_timeout_secs`, which resolves `l4_flow` for that route alone.
+//! Every constant here is a default that a deployment can raise: the six keys of
+//! [`Overrides`] are read from the server's `[timeouts]` section (`header_secs`,
+//! `body_secs`, `response_idle_secs`, `l4_flow_secs`, `l4_idle_secs`,
+//! `tls_hello_secs`) and [`crate::config::Timeouts`] carries the resolved
+//! [`Deadlines`] to every call site. A key left out means the default, and the
+//! per-route `flow_timeout_secs` still overrides `l4_flow` for one route alone.
+//! The client library's counterpart module restates the constants and does not
+//! read configuration; raising one of these on the server does not move the
+//! client's own copies.
 //!
 //! Said plainly here because a module that documents tunables it does not honour
 //! is worse than one that documents none. None of them is a quota either way:
@@ -83,7 +85,7 @@ pub const DEFAULT_L4_IDLE_SECS: u64 = 60;
 /// connection open indefinitely with no read deadline at all.
 pub const DEFAULT_TLS_HELLO_SECS: u64 = 10;
 
-/// The five phase budgets, resolved.
+/// The per-phase budgets, resolved.
 ///
 /// A struct rather than loose constants so that a caller cannot accidentally use
 /// the body budget for a header read: the names are the documentation, and a
@@ -168,7 +170,7 @@ pub struct Overrides {
     pub tls_hello_secs: Option<u64>,
 }
 
-/// The longest wait any of these accepts: an hour spent waiting for a header is
+/// The longest wait any of these accepts: a day spent waiting for a header is
 /// not a slow client, it is one that is never going to send one.
 pub const MAX_SECS: u64 = 86_400;
 
@@ -206,9 +208,11 @@ mod tests {
 
     #[test]
     fn an_absurd_override_is_capped_rather_than_refused() {
-        // Capping rather than erroring: a typo in one key should not stop the
-        // server, which is the same rule the environment overrides follow. The
-        // cap is high enough that no legitimate configuration meets it.
+        // The cap is a backstop for callers that never ran the config
+        // validation, not the policy: `ProxyConfig::validate_timeouts` refuses
+        // anything past `MAX_SECS` (and zero) at load, where the operator is
+        // looking. The cap is high enough that no legitimate configuration
+        // meets it.
         let d = Deadlines::resolve(&Overrides {
             body_secs: Some(u64::MAX),
             ..Default::default()

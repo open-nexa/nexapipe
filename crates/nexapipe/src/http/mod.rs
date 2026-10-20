@@ -42,6 +42,86 @@ pub fn create_http_client(connect_timeout: std::time::Duration) -> HttpClient {
 
 const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
 
+/// The error a proxied response body can fail with.
+///
+/// `hyper::Error` cannot be built outside hyper — it has no public
+/// constructor, only `From<hyper::error::Parse>`, which is private — so a body
+/// that has to fail on its own cannot use it. A backend that answers with a
+/// head and then goes silent is exactly such a case, and the failure has to be
+/// reported rather than swallowed: a body that simply ends is a truncated
+/// response, and a truncated chunked response is one the client cannot tell
+/// from a whole one.
+#[derive(Debug)]
+pub enum BodyError {
+    /// The backend sent nothing for longer than the idle deadline.
+    Idle(std::time::Duration),
+    /// The connection to the backend failed.
+    Hyper(hyper::Error),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyError::Idle(idle) => {
+                write!(f, "backend sent nothing for {idle:?} mid-body")
+            }
+            BodyError::Hyper(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BodyError::Idle(_) => None,
+            BodyError::Hyper(e) => Some(e),
+        }
+    }
+}
+
+impl From<hyper::Error> for BodyError {
+    fn from(e: hyper::Error) -> Self {
+        BodyError::Hyper(e)
+    }
+}
+
+/// The body a proxied response carries.
+pub type ProxyBody = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, BodyError>;
+
+/// The backend's response body, with the gap between its frames bounded.
+///
+/// Idle, not a phase deadline: what is bounded is the gap, so it re-arms on
+/// every frame — which is what lets an SSE stream or a long transfer stay open
+/// for as long as both ends want, while a backend that sent the head and then
+/// went silent cannot hold this slot and its backend lease forever. The value
+/// comes from `[timeouts] response_idle_secs` through the caller.
+///
+/// The stream is the body a client is handed, so the failure it reports is
+/// the one the client sees: hyper aborts the connection rather than writing a
+/// complete-looking response that is missing its tail.
+fn idle_bounded<B>(
+    body: B,
+    idle: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<hyper::body::Frame<bytes::Bytes>, BodyError>>
+where
+    B: hyper::body::Body<Data = bytes::Bytes>,
+    B::Error: Into<BodyError>,
+{
+    let frames = http_body_util::BodyExt::into_data_stream(body).map_ok(hyper::body::Frame::data);
+    // `timeout` re-arms on every item, which is the idle semantics wanted
+    // here. Both `StreamExt` traits have a `timeout`-shaped surface, so the
+    // call is made by its full path rather than by an import.
+    let timed = tokio_stream::StreamExt::timeout(frames, idle);
+    timed.map(move |item| match item {
+        Ok(Ok(frame)) => Ok(frame),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            tracing::warn!("Backend sent nothing for {idle:?} mid-body, ending the response body");
+            Err(BodyError::Idle(idle))
+        }
+    })
+}
+
 /// The largest request body this proxy will read into memory.
 ///
 /// `content-length` is whatever the client says it is, and the request is
@@ -92,10 +172,7 @@ pub async fn proxy_request(
     client: &HttpClient,
     req: Request<Incoming>,
     config: Arc<RouteConfig>,
-) -> Result<
-    Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
-    anyhow::Error,
-> {
+) -> Result<Response<ProxyBody>, anyhow::Error> {
     // Answered, not raised: no `Host` means no route can match, which is the
     // same answer as a host no route matches — and the caller maps an `Err`
     // from here to a 502, which would blame a backend for a request that never
@@ -188,7 +265,12 @@ pub async fn proxy_request(
     // Held for as long as the buffered body is alive — see `read_body_limited`.
     // Dropping it here rather than at the end of the function is deliberate and
     // is what makes the budget mean what it says.
-    let (body, _body_reservation) = read_body_limited(req.into_body(), MAX_REQUEST_BODY).await?;
+    let (body, _body_reservation) = read_body_limited(
+        req.into_body(),
+        MAX_REQUEST_BODY,
+        config.timeouts().deadlines.body,
+    )
+    .await?;
 
     let mut builder = Request::builder().method(method).uri(new_uri);
 
@@ -232,15 +314,23 @@ pub async fn proxy_request(
         .get("content-type")
         .and_then(|h| h.to_str().ok());
 
+    // The idle deadline covers the body as well as the head: a backend that
+    // answers and then goes silent must not hold this request open. The
+    // streaming path has always bounded this; the plaintext listener had no
+    // bound at all, so a backend that sent the head and stalled kept the
+    // request — and the connection — for as long as it liked.
+    let idle = config.timeouts().deadlines.response_idle;
+
     if content_encoding.is_none()
         && should_compress(content_type)
         && let Some(encodings) = accept_encoding
         && encodings.contains("gzip")
     {
-        return compress_response(response, "gzip").await;
+        return compress_response(response, "gzip", idle).await;
     }
 
-    Ok(response.map(http_body_util::BodyExt::boxed_unsync))
+    Ok(response
+        .map(|body| http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync()))
 }
 
 /// Reads a request body whole, refusing one past `limit` or past what the
@@ -260,6 +350,7 @@ pub async fn proxy_request(
 async fn read_body_limited<B>(
     body: B,
     limit: usize,
+    body_deadline: std::time::Duration,
 ) -> anyhow::Result<(bytes::Bytes, crate::conn::limits::ByteReservation)>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
@@ -273,8 +364,8 @@ where
     // plaintext listener takes, and it had no bound at all, so a client that
     // opened a socket and then sent a byte of body every few seconds held the
     // connection, the task and the buffer indefinitely. The iroh path has always
-    // bounded this read; this is the same bound, in one place.
-    let body_deadline = crate::deadline::Deadlines::default().body;
+    // bounded this read; this is the same bound, in one place. The value comes
+    // from `[timeouts] body_secs` through the caller, not from here.
     let deadline_at = tokio::time::Instant::now() + body_deadline;
     loop {
         // A `loop` rather than `while let`, so that the deadline's own expiry is
@@ -323,8 +414,8 @@ fn should_compress(content_type: Option<&str>) -> bool {
 async fn compress_response(
     response: Response<hyper::body::Incoming>,
     encoding: &str,
-) -> anyhow::Result<Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>>
-{
+    idle: std::time::Duration,
+) -> anyhow::Result<Response<ProxyBody>> {
     let (parts, body) = response.into_parts();
     let mut body = body;
     let mut bytes: Vec<u8> = Vec::new();
@@ -333,7 +424,21 @@ async fn compress_response(
     // the size known rather than after the whole body has been collected. How
     // large a response is cannot be asked up front: a chunked one declares no
     // length at all, and a backend is free to send past the one it declared.
-    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+    //
+    // The idle bound is the one the uncompressed path uses: a backend that
+    // sends the head and then goes silent must not hold this read open either.
+    loop {
+        let frame =
+            match tokio::time::timeout(idle, http_body_util::BodyExt::frame(&mut body)).await {
+                Ok(Some(frame)) => frame,
+                // The body finished: this is the end, not a failure.
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "backend sent nothing for {idle:?} mid-body"
+                    ));
+                }
+            };
         let frame =
             frame.map_err(|e| anyhow::anyhow!("failed to read the response body: {}", e))?;
         // Anything that is not a data frame — trailers — carries no body bytes.
@@ -349,11 +454,10 @@ async fn compress_response(
             // What has been read still goes out, ahead of the body handed on:
             // dropping it would truncate the response. From here the rest is
             // streamed rather than held, so a large response costs one frame.
-            let read = futures_util::stream::once(futures_util::future::ready(
-                Ok::<_, hyper::Error>(hyper::body::Frame::data(bytes::Bytes::from(bytes))),
-            ));
-            let rest =
-                http_body_util::BodyExt::into_data_stream(body).map_ok(hyper::body::Frame::data);
+            let read = futures_util::stream::once(futures_util::future::ready(Ok::<_, BodyError>(
+                hyper::body::Frame::data(bytes::Bytes::from(bytes)),
+            )));
+            let rest = idle_bounded(body, idle);
             return Ok(Response::from_parts(
                 parts,
                 http_body_util::StreamBody::new(read.chain(rest)).boxed_unsync(),
@@ -392,10 +496,7 @@ async fn compress_response(
     ))
 }
 
-pub fn create_error_response(
-    status: StatusCode,
-    message: &str,
-) -> Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>> {
+pub fn create_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
@@ -572,14 +673,21 @@ pub async fn proxy_to_backend_streaming(
                 "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
             )));
         }
-        read_remaining_request_body(recv, &mut full_body, content_length).await?
+        read_remaining_request_body(
+            recv,
+            &mut full_body,
+            content_length,
+            timeouts.deadlines.body,
+        )
+        .await?
     } else if chunked {
         // A chunked body declares no length, so without this branch the request
         // went out carrying only the bytes that happened to arrive with the
         // head — and `transfer-encoding` is not forwarded, so the backend was
         // handed a body with no framing at all and no way to know it was
         // truncated. Decode the chunks and send one buffer with a length.
-        let reservation = read_chunked_request_body(recv, &mut full_body).await?;
+        let reservation =
+            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
         builder = builder.header("content-length", full_body.len());
         reservation
     } else {
@@ -699,8 +807,9 @@ pub async fn proxy_to_backend_streaming(
     // bounded is the gap between chunks, so this re-arms on every chunk — which
     // is what lets an SSE stream or a WebSocket stay open for as long as both
     // ends want, while a backend that accepted the request and then went silent
-    // cannot hold this slot and its backend lease forever.
-    let response_idle = crate::deadline::Deadlines::default().response_idle;
+    // cannot hold this slot and its backend lease forever. The value comes from
+    // `[timeouts] response_idle_secs` through the `timeouts` argument.
+    let response_idle = timeouts.deadlines.response_idle;
     loop {
         // A `loop` rather than `while let`: the three outcomes — a chunk, the
         // end of the body, and the backend going quiet — are told apart here,
@@ -883,6 +992,7 @@ fn parse_chunk_size(header: &[u8]) -> Result<usize, anyhow::Error> {
 async fn read_chunked_request_body(
     recv: &mut iroh::endpoint::RecvStream,
     body: &mut Vec<u8>,
+    body_deadline: std::time::Duration,
 ) -> Result<crate::conn::limits::ByteReservation, anyhow::Error> {
     let mut pending = std::mem::take(body);
     let mut buf = [0u8; 8192];
@@ -890,8 +1000,8 @@ async fn read_chunked_request_body(
 
     // A phase deadline, not a per-read one: a peer sending one chunk before
     // each expiry renews a per-read bound forever, and this holds a stream slot
-    // for as long as it keeps doing so.
-    let body_deadline = crate::deadline::Deadlines::default().body;
+    // for as long as it keeps doing so. The value comes from
+    // `[timeouts] body_secs` through the caller.
     let deadline_at = tokio::time::Instant::now() + body_deadline;
 
     loop {
@@ -950,6 +1060,7 @@ async fn read_remaining_request_body<R>(
     recv: &mut R,
     body: &mut Vec<u8>,
     content_length: usize,
+    body_deadline: std::time::Duration,
 ) -> Result<crate::conn::limits::ByteReservation, anyhow::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -968,8 +1079,8 @@ where
     // wanted for a slow but progressing upload, but on its own it re-arms on
     // every byte, which is exactly what a peer dripping one byte before each
     // expiry wants — and it is not a cap this path can enforce any more, since
-    // `REQUEST_BODY_READ_TIMEOUT` is gone.
-    let body_deadline = crate::deadline::Deadlines::default().body;
+    // `REQUEST_BODY_READ_TIMEOUT` is gone. The value comes from
+    // `[timeouts] body_secs` through the caller.
     let deadline_at = tokio::time::Instant::now() + body_deadline;
 
     while remaining > 0 {
@@ -1089,15 +1200,32 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deadline::Deadlines;
 
     /// A body of `len` bytes, which is what the limit has to be checked against.
     fn body_of(len: usize) -> Full<bytes::Bytes> {
         Full::new(bytes::Bytes::from(vec![b'x'; len]))
     }
 
+    /// `read_remaining_request_body` with the default `[timeouts]` body budget:
+    /// what these tests exercise is the cap and the reservation, not the
+    /// configured length of the deadline.
+    async fn read_body<R>(
+        recv: &mut R,
+        body: &mut Vec<u8>,
+        content_length: usize,
+    ) -> Result<crate::conn::limits::ByteReservation, anyhow::Error>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        read_remaining_request_body(recv, body, content_length, Deadlines::default().body).await
+    }
+
     #[tokio::test]
     async fn a_body_within_the_limit_is_read_whole() {
-        let (read, reservation) = read_body_limited(body_of(10), 10).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(10), 10, Deadlines::default().body)
+            .await
+            .unwrap();
         assert_eq!(read.len(), 10);
         assert_eq!(reservation.bytes(), 10, "the body is held for its lifetime");
     }
@@ -1106,13 +1234,17 @@ mod tests {
     async fn a_body_over_the_limit_is_refused() {
         // One frame is enough to exceed it, so this is the case the old
         // `collect()` could not catch without first holding all of it.
-        let err = read_body_limited(body_of(11), 10).await.unwrap_err();
+        let err = read_body_limited(body_of(11), 10, Deadlines::default().body)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("over the 10 byte limit"));
     }
 
     #[tokio::test]
     async fn an_empty_body_is_within_any_limit() {
-        let (read, reservation) = read_body_limited(body_of(0), 0).await.unwrap();
+        let (read, reservation) = read_body_limited(body_of(0), 0, Deadlines::default().body)
+            .await
+            .unwrap();
         assert!(read.is_empty());
         assert_eq!(reservation.bytes(), 0);
     }
@@ -1127,7 +1259,7 @@ mod tests {
         // What this pins is that the per-request limit refuses *before* anything
         // is reserved, so there is nothing to leak. The direct statement about
         // the budget's own arithmetic is `ByteBudget::bodies_are_bounded_across_the_process`.
-        let refused = read_body_limited(body_of(4096), 16).await;
+        let refused = read_body_limited(body_of(4096), 16, Deadlines::default().body).await;
         assert!(refused.is_err(), "a body over the limit must be refused");
     }
 
@@ -1413,9 +1545,7 @@ mod tests {
         let mut reader = ScriptedReader::pieces(&[b"a-few-bytes"], false);
         let mut body = Vec::new();
 
-        let err = read_remaining_request_body(&mut reader, &mut body, 64)
-            .await
-            .unwrap_err();
+        let err = read_body(&mut reader, &mut body, 64).await.unwrap_err();
 
         assert!(err.to_string().contains("did not finish within"), "{err}");
         assert_eq!(body, b"a-few-bytes");
@@ -1438,7 +1568,7 @@ mod tests {
         let mut stalled = ScriptedReader::pieces(&[b"a-few-bytes"], false);
         let mut stalled_body = Vec::new();
         assert!(
-            read_remaining_request_body(&mut stalled, &mut stalled_body, DECLARED)
+            read_body(&mut stalled, &mut stalled_body, DECLARED)
                 .await
                 .is_err(),
             "the read must not succeed"
@@ -1449,7 +1579,7 @@ mod tests {
         // be competing with it for the same budget rather than starting clean.
         let mut complete = ScriptedReader::pieces(&[&vec![b'x'; DECLARED]], true);
         let mut complete_body = Vec::new();
-        read_remaining_request_body(&mut complete, &mut complete_body, DECLARED)
+        read_body(&mut complete, &mut complete_body, DECLARED)
             .await
             .expect("the budget took the same size back");
         assert_eq!(complete_body.len(), DECLARED);
@@ -1474,7 +1604,7 @@ mod tests {
         let mut reader = ScriptedReader::pieces(&[], true);
         let mut body = vec![b'x'; DECLARED];
 
-        let reservation = read_remaining_request_body(&mut reader, &mut body, DECLARED)
+        let reservation = read_body(&mut reader, &mut body, DECLARED)
             .await
             .expect("a declared size inside the budget is admitted");
         assert_eq!(body.len(), DECLARED);
@@ -1503,7 +1633,7 @@ mod tests {
         let mut reader = ScriptedReader::pieces(&[], true);
         let mut body = vec![b'x'; BUFFERED];
 
-        let reservation = read_remaining_request_body(&mut reader, &mut body, 4)
+        let reservation = read_body(&mut reader, &mut body, 4)
             .await
             .expect("nothing is owed, so nothing fails");
         assert_eq!(body.len(), BUFFERED);
@@ -1523,7 +1653,7 @@ mod tests {
         let mut reader = ScriptedReader::pieces(&[&vec![b'x'; DECLARED]], true);
         let mut body = Vec::new();
 
-        let reservation = read_remaining_request_body(&mut reader, &mut body, DECLARED)
+        let reservation = read_body(&mut reader, &mut body, DECLARED)
             .await
             .expect("a body inside the budget is admitted");
         assert_eq!(body.len(), DECLARED);
@@ -1549,7 +1679,7 @@ mod tests {
         reader.feed(8192, 1024 * 1024 * 1024 + 1024 * 1024);
         let mut body: Vec<u8> = Vec::new();
 
-        let err = read_remaining_request_body(&mut reader, &mut body, usize::MAX)
+        let err = read_body(&mut reader, &mut body, usize::MAX)
             .await
             .unwrap_err();
         assert!(
@@ -1564,9 +1694,7 @@ mod tests {
         // Two bytes came in with the head, so five are still owed.
         let mut body = b"xx".to_vec();
 
-        read_remaining_request_body(&mut reader, &mut body, 7)
-            .await
-            .unwrap();
+        read_body(&mut reader, &mut body, 7).await.unwrap();
 
         assert_eq!(body, b"xxabcde");
     }
@@ -1576,13 +1704,128 @@ mod tests {
         let mut reader = ScriptedReader::pieces(&[b"abc"], true);
         let mut body = Vec::new();
 
-        let err = read_remaining_request_body(&mut reader, &mut body, 16)
-            .await
-            .unwrap_err();
+        let err = read_body(&mut reader, &mut body, 16).await.unwrap_err();
 
         assert!(
             err.to_string().contains("ended before content-length"),
             "{err}"
         );
+    }
+
+    /// A body that produces `frames` frames and then goes silent.
+    ///
+    /// What a backend that answered with a head and then stopped looks like to
+    /// the proxy: the frames that did arrive are delivered, and then nothing
+    /// comes — not an end, and not an error either.
+    struct StallingBody {
+        frames: usize,
+        sent: usize,
+    }
+
+    impl hyper::body::Body for StallingBody {
+        type Data = bytes::Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            if self.sent < self.frames {
+                self.sent += 1;
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    bytes::Bytes::from_static(b"chunk"),
+                ))))
+            } else {
+                // Silence: no frame, and no end of the body either.
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// A body that produces a frame every `gap` and never ends.
+    struct DrippingBody {
+        gap: std::time::Duration,
+        timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl DrippingBody {
+        fn new(gap: std::time::Duration) -> Self {
+            Self { gap, timer: None }
+        }
+    }
+
+    impl hyper::body::Body for DrippingBody {
+        type Data = bytes::Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            if self.timer.is_none() {
+                self.timer = Some(Box::pin(tokio::time::sleep(self.gap)));
+            }
+            let timer = self.timer.as_mut().expect("a timer was just set");
+            if timer.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            self.timer = None;
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                bytes::Bytes::from_static(b"chunk"),
+            ))))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_goes_silent_mid_body_ends_at_the_idle_deadline() {
+        // The observation this test exists for: `response_idle_secs` has to
+        // reach the response body of the plaintext listener, not merely the
+        // streamed one. A backend that sent the head and then went silent used
+        // to hold the request — and the connection — for as long as it liked.
+        let idle = std::time::Duration::from_secs(120);
+        let mut body = Box::pin(idle_bounded(StallingBody { frames: 1, sent: 0 }, idle));
+
+        // The frame the backend did send arrives.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+            .await
+            .expect("the frame must arrive")
+            .expect("the body must not end");
+        assert!(
+            first.is_ok(),
+            "the frame the backend sent must pass through: {first:?}"
+        );
+
+        // Then the backend goes silent, and the gap is bounded.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+            .await
+            .expect("the idle deadline must end the body")
+            .expect("the body must not end");
+        match second {
+            Err(BodyError::Idle(d)) => assert_eq!(d, idle),
+            other => panic!("expected an idle failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_drips_within_the_idle_deadline_stays_open() {
+        // The other half of the same rule: the deadline is idle, not a phase
+        // deadline, so it re-arms on every frame. A backend that keeps saying
+        // something — an SSE feed, a long transfer — is not cut off.
+        let idle = std::time::Duration::from_secs(120);
+        let mut body = Box::pin(idle_bounded(
+            DrippingBody::new(std::time::Duration::from_secs(100)),
+            idle,
+        ));
+
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+                .await
+                .expect("a frame must arrive")
+                .expect("the body must not end");
+            assert!(
+                frame.is_ok(),
+                "a frame within the idle deadline must pass through: {frame:?}"
+            );
+        }
     }
 }

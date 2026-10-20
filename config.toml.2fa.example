@@ -262,16 +262,28 @@ strategy = "round_robin"      # or "random", or "least_conn"
 # client_ports = [5432]    # tcp/udp only: which client ports this route matches
 # idle_timeout_secs = 60   # udp only: seconds of silence before a flow is closed
 
-# ===== Waiting on a backend (all optional) =====
-# One step of talking to a backend each, in seconds; a response body may stream
-# for as long as it needs to once the head has arrived. Read once at startup, so
-# changing either takes a restart.
+# ===== Waiting on a backend, and bounding each phase (all optional) =====
+# Seconds, all optional; leaving the section out keeps the defaults. The first
+# two cover one step of talking to a backend each; the six after them bound the
+# phases of the exchange itself. Read once at startup, so editing any of them
+# takes a restart.
 # [timeouts]
 # connect_secs = 10        # dialing it: HTTP requests, WebSocket upgrades,
 #                          # TLS passthrough and tcp tunnels all dial one
 #                          # connection, and all wait this long
 # response_secs = 30       # waiting for its answer: the status line, or for a
 #                          # websocket, the upgrade response
+# header_secs = 30         # a client sending its request head
+# body_secs = 300          # a client sending its request body
+# response_idle_secs = 120 # silence between response chunks
+# l4_flow_secs = 3600      # the whole life of an L4 tunnel; a route's own
+#                          # flow_timeout_secs overrides it per route
+# l4_idle_secs = 60        # silence between UDP datagrams
+# tls_hello_secs = 10      # the TLS ClientHello read
+#
+# A stream's first byte says which protocol it carries, so the wait for it is
+# the longer of header_secs and tls_hello_secs. `0` is refused for every key,
+# and so is anything past 86400 (a day); the two backend keys stop at 3600.
 
 # ===== Auxiliary listener (off by default) =====
 # Loopback only, nothing authenticates, so there is no `expose` here. Serves

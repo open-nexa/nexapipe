@@ -81,6 +81,18 @@ Other house rules:
 - New behaviour comes with a test; the L4 tests drive `l4::serve_stream` over a
   `tokio::io::duplex` pair, so a TCP or UDP flow can be tested without iroh.
 
+## Contributing with an AI agent
+
+An agent works here on the same terms as anyone else: a plan approved before the
+first edit, a branch based on `upstream/main`, and a pull request that says what
+it verified and what it did not.
+
+The mandatory rules for agent work are in [`AGENTS.md`](AGENTS.md). The
+end-to-end walkthrough — which verification each kind of change owes, how review
+rounds work, and what a finished agent pull request has to report — is
+[`docs/agent-contribution.md`](docs/agent-contribution.md). Read it if you are
+supervising an agent, or if you are one.
+
 ## Good first issues
 
 Bounded, real, and each one is useful on its own. Comments welcome before you

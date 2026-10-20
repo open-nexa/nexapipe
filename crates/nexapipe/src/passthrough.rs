@@ -34,12 +34,6 @@ const NAME_TYPE_HOST: u8 = 0x00;
 /// the cap keeps a hostile peer from making the proxy buffer without bound.
 const MAX_HANDSHAKE_LEN: usize = 16 * 1024;
 
-/// How long to wait for the rest of the `ClientHello` before giving up on it.
-///
-/// Not `[timeouts]`: this waits on the client's own bytes, and every key in that
-/// section is a wait on a backend.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// True when `first_byte` starts a TLS handshake record.
 pub fn is_tls_handshake(first_byte: u8) -> bool {
     first_byte == TLS_HANDSHAKE
@@ -56,7 +50,13 @@ pub async fn handle_iroh_stream(
     config: &RouteConfig,
     acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
-    let handshake = read_tls_record(&mut recv, initial, HANDSHAKE_TIMEOUT).await?;
+    // A phase deadline over the ClientHello read: the record header arrives
+    // first, then the handshake body, and a peer that sends five bytes and
+    // stalls must not hold the stream open. `[timeouts] tls_hello_secs`
+    // resolves it; the per-route surface does not reach here, because which
+    // route a hello belongs to is only knowable *after* it has been read.
+    let handshake =
+        read_tls_record(&mut recv, initial, config.timeouts().deadlines.tls_hello).await?;
     let Some((host, port, _session)) = resolve_backend(config, &handshake, acl).await else {
         return Ok(());
     };
@@ -85,7 +85,9 @@ pub async fn handle_tcp_stream(
     initial: Vec<u8>,
     config: &RouteConfig,
 ) -> anyhow::Result<()> {
-    let handshake = read_tls_record(&mut client, initial, HANDSHAKE_TIMEOUT).await?;
+    // Same deadline as the iroh path above: `[timeouts] tls_hello_secs`.
+    let handshake =
+        read_tls_record(&mut client, initial, config.timeouts().deadlines.tls_hello).await?;
     // `_session` is the lease, and it is bound rather than discarded: it is held
     // for the lifetime of this function, which is the lifetime of the copy — so
     // the balancer sees the session while it is running, not only while it is
@@ -443,6 +445,66 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RouteMode, Timeouts, TimeoutsConfig};
+    use crate::lb::LoadBalancingStrategy;
+    use crate::routes::Route;
+
+    #[tokio::test]
+    async fn the_configured_tls_hello_deadline_closes_a_stalled_hello() {
+        // The same observation the l4 idle test makes: `tls_hello_secs` has to
+        // reach `read_tls_record`, not merely parse. The bound here used to be
+        // a private constant; the key replaces the constant, and this asserts
+        // the replacement actually bit — a peer that sends the five record
+        // header bytes and then stalls must be dropped on the configured
+        // deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut timeouts = Timeouts::resolve(TimeoutsConfig::default());
+        timeouts.deadlines.tls_hello = std::time::Duration::from_secs(1);
+        let config = RouteConfig::with_timeouts(
+            vec![Route::new(
+                "app.test",
+                "/",
+                true,
+                vec!["127.0.0.1:1".to_string()],
+                LoadBalancingStrategy::RoundRobin,
+                RouteMode::Tcp,
+                None,
+            )],
+            timeouts,
+        );
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_tcp_stream(stream, Vec::new(), &config).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // A record header promising 255 bytes of handshake, then silence: the
+        // header alone must not hold the read.
+        client
+            .write_all(&[TLS_HANDSHAKE, 0x03, 0x01, 0x00, 0xff])
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+        assert!(
+            result.is_ok(),
+            "the handler must give up on the configured hello deadline"
+        );
+        // The deadline surfaces as "no complete hello" — the record reader
+        // treats an expired deadline like a stalled end, the truncated hello
+        // names no route, and the handler returns. What the key buys is the
+        // *when*: one second here, where the constant it replaced held the
+        // handler for ten.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the handler must return within the configured hello deadline, took {:?}",
+            started.elapsed()
+        );
+    }
 
     /// Builds a minimal but well-formed `ClientHello` carrying `sni`.
     fn client_hello_with_sni(sni: &str, include_extension: bool) -> Vec<u8> {
