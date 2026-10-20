@@ -179,6 +179,9 @@ pub struct LinkStatus {
     /// sample yet, a closed one has none either, and a path iroh cannot
     /// measure — a relay that does not report — has none at all. It is not a
     /// zero, and a UI must not draw it as one.
+    ///
+    /// The reading is also `None` while the path still carries quinn's initial
+    /// guess rather than a measurement — see [`rtt_of`].
     pub rtt: Option<std::time::Duration>,
 }
 
@@ -202,16 +205,37 @@ impl LinkStatus {
 /// The round-trip time of the path carrying the traffic, if it can be read.
 ///
 /// The selected path is the one the traffic takes, so that is the one whose
-/// latency is worth showing. A path iroh has not measured yet — right after
-/// the handshake — has no sample, which is `None` rather than zero.
+/// latency is worth showing.
+///
+/// Two readings are not measurements, and are reported as `None` rather than
+/// as a number:
+///
+/// - **quinn's guess.** The RTT estimator of a path starts at the transport's
+///   [`INITIAL_RTT`](crate::transport::INITIAL_RTT) and only replaces it once
+///   an acknowledgement arrives *on that path*. A path selected a moment ago —
+///   a direct path that just won hole punching, a relay path that just became
+///   the selected one — therefore reads as the guess, which is a number
+///   nobody measured.
+/// - **anything below a millisecond.** The UI draws whole milliseconds, and a
+///   reading that rounds to zero is drawn as a number nobody made.
 fn rtt_of(conn: &Connection) -> Option<std::time::Duration> {
     let paths = conn.paths();
     for path in paths.iter() {
         if path.is_selected() {
-            return conn.rtt(path.id());
+            let rtt = conn.rtt(path.id())?;
+            return is_measured_rtt(rtt).then_some(rtt);
         }
     }
     None
+}
+
+/// Whether `rtt` is a measured round-trip time rather than a guess.
+///
+/// Split out from [`rtt_of`] so the rule can be tested without a live
+/// connection: reading it off a connection needs an endpoint, and the rule is
+/// the part that has to be right.
+fn is_measured_rtt(rtt: std::time::Duration) -> bool {
+    rtt != crate::transport::INITIAL_RTT && rtt >= std::time::Duration::from_millis(1)
 }
 
 struct PooledConnection {
@@ -922,7 +946,30 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkKind, LinkStatus};
+    use super::{LinkKind, LinkStatus, is_measured_rtt};
+    use std::time::Duration;
+
+    /// quinn's estimator starts every path at the transport's initial RTT and
+    /// only replaces it once an acknowledgement arrives on that path, so a path
+    /// that was selected a moment ago reads as that guess. It is a number
+    /// nobody measured, and the UI has to be able to say so.
+    #[test]
+    fn quinns_initial_guess_is_not_a_measurement() {
+        // The guess itself is not a measurement.
+        assert!(!is_measured_rtt(crate::transport::INITIAL_RTT));
+        // A reading that differs from the guess is one.
+        assert!(is_measured_rtt(Duration::from_millis(334)));
+        assert!(is_measured_rtt(Duration::from_millis(20)));
+    }
+
+    /// The UI draws whole milliseconds: a reading that would be drawn as zero
+    /// is not a number anybody made either.
+    #[test]
+    fn a_reading_below_a_millisecond_is_not_drawn_as_zero() {
+        assert!(!is_measured_rtt(Duration::from_micros(0)));
+        assert!(!is_measured_rtt(Duration::from_micros(999)));
+        assert!(is_measured_rtt(Duration::from_millis(1)));
+    }
 
     /// The name crosses the JNI and Tauri boundaries, so the two sides can only stay in sync
     /// if `as_str` and `parse` agree — and an unfamiliar spelling must degrade to `Unknown`
