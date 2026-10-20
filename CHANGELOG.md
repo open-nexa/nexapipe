@@ -28,6 +28,14 @@ its defaults — which are on.
 
 ### Added
 
+- **The latency of the tunnel, on both clients.** A client already reported
+  *how* traffic reaches a backend — directly or through a relay — and now
+  reports how far away that path is as well: the round-trip time iroh
+  measures for the path carrying the traffic, shown beside the path badge
+  on the desktop dashboard and on the Android endpoint screen. The two are
+  read from one answer, so they cannot describe different paths, and a path
+  iroh has not measured yet shows nothing at all rather than "0 ms" — a
+  number nobody measured is not a number.
 - **Per-device Ed25519 keys.** An entry under
   `[auth.clients.<id>.devices.<name>]` can carry `public_key` — the public
   half of an Ed25519 pair, 64 hex characters — instead of `secret`, and that
