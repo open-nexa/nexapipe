@@ -12,11 +12,12 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Three things land in this cycle so far: the device credential can be a **key**
+Four things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
-deadline the operator can see and raise, and backend handling no longer stops at
+deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
-circuit-broken. No existing configuration key is removed or renamed, and the ones
+circuit-broken — and a name is spelled the same way in a client's list and in
+the server's routes. No existing configuration key is removed or renamed, and the ones
 this cycle adds — `public_key` under a device entry, the six `[timeouts]` phase
 keys, `[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so
 a `config.toml` that works on 0.6.1 still loads and behaves as it did: a device
