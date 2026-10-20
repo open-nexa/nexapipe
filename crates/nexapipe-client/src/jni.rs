@@ -1542,6 +1542,10 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             match RelayModeSpec::parse(Some(&cfg_mode), Some(&cfg_url), Some(cfg_token.as_str())) {
                 Ok(spec) => spec.unwrap_or(RelayModeSpec::Pinned),
                 Err(e) => {
+                    // The reason is what the user has to act on, and the log
+                    // line is behind the debug level: without this the app
+                    // says "could not start iroh" and nothing else.
+                    set_last_error(format!("invalid relay configuration: {e}"));
                     jni_log!("[iroh] invalid relay configuration: {e}");
                     return Err(());
                 }
@@ -1564,6 +1568,10 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
         let discovery = match DiscoveryMode::parse_or_default(&cfg_discovery) {
             Ok(mode) => mode,
             Err(e) => {
+                // The reason is what the user has to act on, and the log
+                // line is behind the debug level: without this the app says
+                // "could not start iroh" and nothing else.
+                set_last_error(format!("invalid discovery configuration: {e}"));
                 jni_log!("[iroh] invalid discovery configuration: {e}");
                 return Err(());
             }
