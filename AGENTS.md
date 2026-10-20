@@ -107,7 +107,7 @@ A PR therefore spans two repositories: its head branch is in `origin`, the PR it
 ## Commit & Pull Request Guidelines
 
 - The end-to-end walkthrough — lifecycle, verification by change type, the review loop and the handoff report — is [`docs/agent-contribution.md`](docs/agent-contribution.md). This file states the rules; that one shows the order to apply them in.
-- The agent commits and pushes its own verified work on its working branch (see Git Safety Rules); opening or merging the PR stays with the owner unless they ask for it.
+- The agent commits and pushes its own verified work on its working branch (see Git Safety Rules) and may open the pull request for that branch once it is pushed. Merging, closing, tagging and releasing stay with the owner.
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
 - Keep one logical change per commit.
 - Pull requests: describe what and why, link related issues, and add screenshots/videos for UI or VPN behavior changes.

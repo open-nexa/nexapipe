@@ -184,18 +184,20 @@ The subject says what changed and in which component; the body says why, and
 what was verified. Two unrelated fixes are two commits — or two PRs. No secrets,
 no generated artifacts, no `.workbuddy/` scratch files.
 
-### 7. Push, then describe
+### 7. Push, then describe and open
 
 ```bash
 git push origin <branch>
 ```
 
-That updates the PR when one is open on the branch. Pushing the working branch is
-ordinary execution, not a separate approval; opening or editing the pull request
-is. The PR description follows `.github/PULL_REQUEST_TEMPLATE.md`: what changed,
-why, how it was verified — the commands that were actually run, and an honest
-list of what was not run and why. Screenshots or a recording are required for UI
-and VPN behaviour.
+That updates the PR when one is open on the branch. Pushing the working branch
+and opening the pull request for a branch the agent just pushed are ordinary
+execution, not separate approvals. Editing a pull request the owner opened, or
+opening one for a branch the agent did not push, still needs their ask. The PR
+description follows `.github/PULL_REQUEST_TEMPLATE.md`: what changed, why, how it
+was verified — the commands that were actually run, and an honest list of what
+was not run and why. Screenshots or a recording are required for UI and VPN
+behaviour.
 
 The template is a file to read, not one `gh` applies. `gh pr create --body`
 takes the body verbatim: nothing fills the sections in, and a body that misses
@@ -205,8 +207,9 @@ checklist rows that do not apply — a ticked box for a command nobody ran is
 worse than no box at all. `gh pr create --body-file <path>` takes the body from
 a file, which is the easier way to write a long one.
 
-Opening or editing the pull request itself, in `upstream`, stays with the owner
-unless they asked for it.
+Opening the pull request for the branch the agent just pushed is allowed.
+Editing a pull request somebody else opened, or opening one for a branch the
+agent did not push, stays with the owner unless they asked.
 
 ### 8. Review is a loop on the same branch
 
@@ -217,9 +220,9 @@ the agent disagrees with is answered with a reason, not silently ignored.
 
 ### 9. Merging is the owner's decision
 
-The agent's part ends at a green branch and an honest report. Merging, closing,
-tagging and releasing are the owner's, and so is deleting the worktree — least
-of all one that still holds unpushed commits.
+The agent's part ends at a green branch, an opened pull request and an honest
+report. Merging, closing, tagging and releasing are the owner's, and so is
+deleting the worktree — least of all one that still holds unpushed commits.
 
 ## What an agent PR must be able to say
 
@@ -235,9 +238,8 @@ of all one that still holds unpushed commits.
 
 ## Handing back
 
-The final report to the owner is short and checkable: the branch and PR link (or
-"branch pushed, PR not opened — your call"), the files changed, the verification
-commands and their outcomes, what remains unverified, and any question that
-blocks the next step. When a step failed, say which one and what the error was;
-a partial result reported accurately is worth more than a clean summary that
-skips it.
+The final report to the owner is short and checkable: the branch and its PR link
+(or why no PR was opened), the files changed, the verification commands and
+their outcomes, what remains unverified, and any question that blocks the next
+step. When a step failed, say which one and what the error was; a partial result
+reported accurately is worth more than a clean summary that skips it.
