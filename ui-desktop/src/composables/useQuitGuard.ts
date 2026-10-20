@@ -1,10 +1,14 @@
 /**
  * What to do with a running proxy when the app is asked to go away.
  *
- * Two things can ask: the window's close request (title-bar button, Alt+F4, the macOS red
- * light) and the Quit item we install for macOS instead of Tauri's predefined one. They reach the
- * same question, because leaving by either door ends this process — there is no tray it could go
- * back to, so a closed window is a quit.
+ * Two things can ask to leave: the window's close request (title-bar button, Alt+F4, the macOS
+ * red light) and the Quit item we install for macOS instead of Tauri's predefined one. The tray
+ * menu has a Quit of its own, and it asks the same question.
+ *
+ * Whether a closed window is a quit is a setting, not a fact: with "minimize on close" on, the
+ * window goes to the tray and the app keeps running, so there is nothing to ask about the tunnel.
+ * With it off — or with no tray to hide into — a closed window ends the process, and the tunnel
+ * is worth a question first.
  *
  * What makes the two branches different is where the proxy lives:
  *   - **in this process** — it dies with the window, so "keep it running" can only mean staying
@@ -22,6 +26,7 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { useProxyStore } from '../stores/proxy';
 import { useConfigStore } from '../stores/config';
+import { usePrefsStore } from '../stores/prefs';
 import { confirm } from './useConfirm';
 import { translate } from '../i18n';
 import { useToast } from './useToast';
@@ -31,6 +36,39 @@ const QUIT_REQUESTED_EVENT = 'nexa://quit-requested';
 
 /** One question at a time: both this module's listeners can fire while an answer is pending. */
 let deciding = false;
+
+/**
+ * Whether the tray icon exists, remembered after the first answer.
+ *
+ * Asked once and kept, because it cannot change while the app runs: the tray is built at
+ * start-up and nothing rebuilds it. `undefined` means "not asked yet".
+ */
+let trayAvailable: boolean | undefined;
+
+/**
+ * Whether there is a tray to hide the window into.
+ *
+ * A window that hides with no tray to bring it back is an app nobody can reach again, so a
+ * missing tray means the close button keeps ending the app. The answer is a failure by default:
+ * a tray that could not be built must not be assumed into existence.
+ */
+async function hasTray(): Promise<boolean> {
+  if (trayAvailable === undefined) {
+    trayAvailable = await invoke<boolean>('is_tray_available').catch(() => false);
+  }
+  return trayAvailable;
+}
+
+/**
+ * Whether closing the window should hide it rather than end the app.
+ *
+ * Both have to be true: the user asked for it, and there is somewhere for the window to go.
+ */
+async function shouldMinimizeOnClose(): Promise<boolean> {
+  const { prefs } = usePrefsStore();
+  if (!prefs.minimizeOnClose) return false;
+  return hasTray();
+}
 
 /**
  * Whether the proxy outlives this process.
@@ -98,6 +136,12 @@ async function handleCloseRequested(): Promise<void> {
   if (deciding) return;
   deciding = true;
   try {
+    // A close that only hides the window is not a quit, so it does not ask about the tunnel:
+    // the tunnel keeps running, which is the whole point of hiding instead of closing.
+    if (await shouldMinimizeOnClose()) {
+      await getCurrentWindow().hide();
+      return;
+    }
     if (!(await decide())) return;
     await getCurrentWindow().destroy();
   } catch (error) {

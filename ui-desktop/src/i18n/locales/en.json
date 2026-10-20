@@ -258,6 +258,7 @@
     "launchAtStartupHint": "Automatically run the proxy when the app launches",
     "minimizeOnClose": "Minimize on Close",
     "minimizeOnCloseHint": "Minimize to the system tray when the close button is clicked",
+    "minimizeOnCloseUnavailable": "This desktop has no system tray, so closing the window still ends the app",
     "logLevel": "Log Level",
     "logLevelHint": "Controls the verbosity of log output",
     "about": "About",

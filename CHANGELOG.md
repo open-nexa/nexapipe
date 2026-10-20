@@ -127,9 +127,30 @@ its defaults — which are on.
   using the health probe rather than a request counter. The HTTP request paths,
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
+- **The desktop app can stay in the tray.** Closing the window used to end the
+  process, so a proxy that had to be started by hand every time the machine woke
+  was not the always-on proxy the settings page promised. The app now has a tray
+  icon: the window goes there instead of ending the app, and the icon brings it
+  back. "Minimize on close" is on by default, and the switch that was there for
+  it now works — on a desktop with no tray it says so and the close button
+  keeps ending the app, because a hidden window with nowhere to come back from
+  is an app nobody can reach.
 
 ### Changed
 
+- **"Launch at startup" writes a real entry.** The switch has been on the
+  settings page since the page existed, calling two commands that were never
+  registered — so it read `false` and wrote nothing, and looked like a setting
+  while behaving like a decoration. It now writes an entry for the platform: a
+  value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows, a
+  LaunchAgent in `~/Library/LaunchAgents` on macOS, a `.desktop` file in
+  `~/.config/autostart` on Linux. All three are per-user and need no elevation,
+  and none of them starts anything at the moment the switch is flipped — the
+  platform's own login mechanism reads the entry at the next login, so turning it
+  on does not put a second copy of the app on the machine mid-session. The entry
+  starts the app with `--background`, which means no window: the app comes up in
+  the tray instead of putting a window over whatever the user was doing at
+  login.
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which
   kind of credential a device has comes from the server's own record, not
   from a wire discriminator, so no message variant or scheme field was added,

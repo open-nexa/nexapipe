@@ -258,6 +258,7 @@
     "launchAtStartupHint": "应用启动时自动运行代理",
     "minimizeOnClose": "关闭时最小化",
     "minimizeOnCloseHint": "点击关闭按钮时最小化到系统托盘",
+    "minimizeOnCloseUnavailable": "当前桌面没有系统托盘，关闭窗口仍会退出应用",
     "logLevel": "日志级别",
     "logLevelHint": "控制日志输出的详细程度",
     "about": "关于",

@@ -7,12 +7,15 @@ import { useI18n } from "vue-i18n";
 import AppToggle from "../components/base/AppToggle.vue";
 import { useConfigStore } from "../stores/config";
 import { useProxyStore } from "../stores/proxy";
+import { usePrefsStore } from "../stores/prefs";
 import { useTheme } from "../composables/useTheme";
 import { useLocale } from "../composables/useLocale";
+import { useToast } from "../composables/useToast";
 import type { ThemePreference } from "../stores/prefs";
 
 const { t } = useI18n();
 const { config, credentialProtection, updateConfig } = useConfigStore();
+const toast = useToast();
 
 /**
  * Where the credential master key ended up, in the user's words.
@@ -73,25 +76,70 @@ const useServiceModel = computed({
 });
 
 const autoStart = ref(false);
-const minimizeOnClose = ref(true);
 const logLevel = ref("info");
 const isLoading = ref(false);
 
+/**
+ * Whether the app is set to start when the machine does.
+ *
+ * The switch used to call two commands that were never registered, so it read
+ * `false` and wrote nothing: a setting that looked like one and behaved like a
+ * decoration.
+ */
 async function loadSettings() {
   isLoading.value = true;
   try {
-    autoStart.value = await invoke<boolean>("is_auto_start_enabled").catch(() => false);
-  } catch {
+    autoStart.value = await invoke<boolean>("is_auto_start_enabled");
+  } catch (e) {
+    // A read that fails is not "off": the entry may well be there. The switch
+    // is left showing what is known, and the failure is reported rather than
+    // swallowed — a silent `false` is the lie this used to tell.
+    console.error("Failed to read the start-at-login setting:", e);
     autoStart.value = false;
+    toast.fromKey("error.autostart.read_failed");
   }
   isLoading.value = false;
 }
 
 async function saveAutoStart() {
+  const wanted = autoStart.value;
   try {
-    await invoke<string>("set_auto_start", { enabled: autoStart.value });
+    await invoke("set_auto_start", { enabled: wanted });
   } catch (e) {
     console.error("Failed to set auto start:", e);
+    // Put the switch back where it was: the setting did not change, so the
+    // switch must not pretend it did.
+    autoStart.value = !wanted;
+    toast.fromKey("error.autostart.write_failed");
+  }
+}
+
+/**
+ * Whether closing the window hides it to the tray instead of ending the app.
+ *
+ * A preference rather than a proxy setting, so it lives with the theme and the
+ * language.
+ */
+const { prefs, setMinimizeOnClose } = usePrefsStore();
+
+const minimizeOnClose = computed({
+  get: () => prefs.minimizeOnClose,
+  set: (value: boolean) => setMinimizeOnClose(value),
+});
+
+/**
+ * Whether there is a tray to hide the window into.
+ *
+ * Without one, a hidden window is an app nobody can reach, so the switch is
+ * offered only where it can be honoured.
+ */
+const trayAvailable = ref(true);
+
+async function loadTrayAvailability() {
+  try {
+    trayAvailable.value = await invoke<boolean>("is_tray_available");
+  } catch {
+    trayAvailable.value = false;
   }
 }
 
@@ -112,6 +160,7 @@ async function loadAppVersion() {
 }
 
 loadSettings();
+loadTrayAvailability();
 loadAppVersion();
 </script>
 
@@ -280,13 +329,14 @@ loadAppVersion();
             </svg>
             <div class="setting-info">
               <span class="setting-label">{{ t('settings.minimizeOnClose') }}</span>
-              <span class="setting-hint">{{ t('settings.minimizeOnCloseHint') }}</span>
+              <span class="setting-hint">{{ trayAvailable ? t('settings.minimizeOnCloseHint') : t('settings.minimizeOnCloseUnavailable') }}</span>
             </div>
           </div>
           <div class="setting-right">
-            <button 
-              class="toggle" 
+            <button
+              class="toggle"
               :class="{ active: minimizeOnClose }"
+              :disabled="!trayAvailable"
               @click="minimizeOnClose = !minimizeOnClose"
             >
               <div class="toggle-thumb"></div>
@@ -594,6 +644,13 @@ loadAppVersion();
 
 .toggle.active {
   background: var(--primary-500);
+}
+
+/* A switch that cannot be honoured says so by looking like it: dimmed, and
+   refusing the pointer rather than accepting a click it would throw away. */
+.toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .toggle-thumb {
