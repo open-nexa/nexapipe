@@ -260,7 +260,7 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
       # RUSTSEC advisories for everything in Cargo.lock. Unmaintained/unsound
       # advisories are informational (exit 0); vulnerabilities fail the job.
       - name: cargo audit
@@ -281,7 +281,10 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
-          tool: cargo-deny
+          # Pin the checker, not only the action that installs it: the policy
+          # file is schema-versioned (advisories and licences use `version = 2`)
+          # and a new cargo-deny release has to be adopted deliberately.
+          tool: cargo-deny@0.20.2
 
       - name: cargo deny (server)
         run: cargo deny check
@@ -498,7 +501,7 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
 
       # src-tauri has its own Cargo.lock (excluded from the root workspace), so the audit job at the repo
       # root never sees it.
@@ -688,6 +691,11 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        with:
+          # The action is pinned by SHA, but the builder it downloads is not
+          # unless it is pinned here too: without this, a new buildx release
+          # moves the build under the same workflow.
+          version: v0.38.0
 
       # No docker/login-action: nothing is pushed, so no credentials are asked
       # for — a pull request from a fork gets none either way.

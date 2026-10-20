@@ -8,8 +8,9 @@ name: Release
 #                    gradle assembleRelease with ABI splits)
 #   build-image    - the container image, one leg per architecture, pushed by
 #                    digest to ghcr.io/open-nexa/nexapipe
-#   publish-image  - merges those per-arch images into one manifest list and
-#                    tags it: the version, plus "latest" for a stable tag
+#   publish-image  - merges those per-arch images into one manifest list, tags
+#                    it (the version, plus "latest" for a stable tag), and then
+#                    signs the published digest and attests its provenance
 #   release        - assembles every artifact into a single GitHub Release with one
 #                    SHA256SUMS.txt
 #
@@ -1063,6 +1064,8 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        with:
+          version: v0.38.0
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
@@ -1087,11 +1090,17 @@ jobs:
           #
           # No buildx attestation here on purpose. With one enabled, buildx
           # pushes an index — the image plus its attestation — rather than the
-          # image alone, and the digest below would be that index's. The
-          # provenance that matters is attached to the published manifest
-          # list instead, in publish-image, where the thing a user pulls is
-          # the thing that is attested.
+          # image alone, and the digest below would be that index's, which
+          # publish-image would then have to flatten again. This is not the
+          # action's default: docker/build-push-action adds `mode=max`
+          # provenance by itself for a public repository (and `mode=min,
+          # inline-only` for a private one), so `provenance: false` is set
+          # explicitly here — as it is in the CI build-only job — to keep each
+          # leg a plain image. The provenance that matters is attached to the
+          # published manifest list instead, in publish-image, where the thing
+          # a user pulls is the thing that is attested.
           outputs: type=image,name=ghcr.io/open-nexa/nexapipe,push-by-digest=true,push=true
+          provenance: false
 
       # The digest is the only handle this leg's image has. It goes through an
       # artifact because a matrix job's outputs would only survive for one of
@@ -1150,6 +1159,8 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        with:
+          version: v0.38.0
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
