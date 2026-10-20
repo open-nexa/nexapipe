@@ -132,9 +132,15 @@ jobs:
 
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           VERSION="${TAG#v}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -455,9 +461,15 @@ jobs:
       - name: Resolve version
         id: meta
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           version="${TAG#v}"
           if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
             echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
@@ -611,6 +623,11 @@ jobs:
         id: opts
         env:
           INPUT_SIGNING_ONLY: ${{ inputs.signing_only }}
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           # Inputs are empty on tag-push runs, so the full flow runs by default.
@@ -620,7 +637,7 @@ jobs:
             SKIP_RUST=false
           fi
 
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           VERSION_NAME="${TAG#v}"
 
           # A version with a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
@@ -1119,9 +1136,15 @@ jobs:
     steps:
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
@@ -1236,9 +1259,15 @@ jobs:
 
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
