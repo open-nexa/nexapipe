@@ -1242,7 +1242,12 @@ class VpnViewModel : ViewModel() {
                                     relayUrl = relayUrl.value,
                                     relayAuthToken = relayAuthToken.value,
                                     deviceId = deviceId.value,
-                                    deviceKeys = deviceKeysByNodeId(),
+                                    // Read after the wait below, not here: the
+                                    // key is sealed by the import that armed the
+                                    // enrollment, and a map built before that
+                                    // write lands is a map without the key in
+                                    // it — which is the same as having no key.
+                                    deviceKeys = { deviceKeysByNodeId() },
                                     irohStarted = isIrohStarted.value,
                                     // The import that armed the enrollment sealed
                                     // the key off the main thread; joining here is

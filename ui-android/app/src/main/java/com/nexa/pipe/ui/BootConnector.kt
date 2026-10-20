@@ -114,7 +114,10 @@ object BootConnector {
             relayUrl = settings.loadRelayUrl(),
             relayAuthToken = settings.loadRelayAuthToken(),
             deviceId = settings.deviceId(),
-            deviceKeys = deviceKeys
+            // Read when the sequence asks for it: the boot path has nothing to
+            // wait for — the key was sealed in an earlier session — but the
+            // sequence is the one that decides when to read it.
+            deviceKeys = { deviceKeys }
         )
 
         // Throws when the attempt cannot be made; the caller decides what to do

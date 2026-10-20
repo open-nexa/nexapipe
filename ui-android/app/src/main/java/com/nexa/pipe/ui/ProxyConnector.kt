@@ -61,9 +61,12 @@ class ProxyConnector(private val log: ConnectionLog) {
          * The private half of each endpoint's device key, by endpoint ID.
          *
          * Read by the caller rather than here, because this class does not
-         * know where a sealed half lives.
+         * know where a sealed half lives. A function rather than a value: it
+         * is read after [awaitDeviceKeys] has run, because a key that is
+         * still being sealed at that point is a key that is not on disk yet,
+         * and a snapshot taken earlier would hand the native side nothing.
          */
-        val deviceKeys: Map<String, String> = emptyMap(),
+        val deviceKeys: () -> Map<String, String> = { emptyMap() },
         /**
          * Whether the iroh endpoint is already up.
          *
@@ -184,8 +187,9 @@ class ProxyConnector(private val log: ConnectionLog) {
         // write to land, rather than hand the native side a key that is not on
         // disk yet.
         plan.awaitDeviceKeys()
+        val deviceKeys = plan.deviceKeys()
         for (node in plan.nodes) {
-            val key = plan.deviceKeys[node.nodeId].orEmpty()
+            val key = deviceKeys[node.nodeId].orEmpty()
             if (key.isBlank()) continue
             IrohProxy.nativeSetDeviceKeyForNode(node.nodeId, key)
         }
