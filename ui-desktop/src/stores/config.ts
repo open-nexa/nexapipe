@@ -210,6 +210,11 @@ function normalizeNode(raw: unknown): NodeConfig | null {
   // `name` is cosmetic but it is the label an invite gave itself; dropping it here would blank
   // every imported node's name on the next reload.
   const name = asString(raw.name, '').trim();
+  // The device key and its public half. The private one is a credential and is
+  // stripped from the persisted shape, so it is normally empty here and comes
+  // back from the encrypted store; the public one is not a secret and stays.
+  const deviceKey = asString(raw.deviceKey, '').trim();
+  const publicKey = asString(raw.publicKey, '').trim();
   return {
     id: asString(raw.id, '') || generateNodeId(),
     connectionType,
@@ -219,6 +224,8 @@ function normalizeNode(raw: unknown): NodeConfig | null {
     ...(name ? { name } : {}),
     ...(twoFactor ? { twoFactor } : {}),
     ...(enrollment ? { enrollment } : {}),
+    ...(deviceKey ? { deviceKey } : {}),
+    ...(publicKey ? { publicKey } : {}),
   };
 }
 
@@ -388,11 +395,15 @@ function toPersisted(config: ProxyConfig): PersistedConfig {
     ...config,
     relayAuthToken: '',
     nodes: config.nodes.map((node) => {
-      const { twoFactor, enrollment, ...rest } = node;
+      const { twoFactor, enrollment, deviceKey, ...rest } = node;
       return {
         ...rest,
         ticket: '',
         endpointId: '',
+        // The device key is a credential: it lives in the encrypted store, and
+        // the copy that would be left here is the one thing an attacker would
+        // want. The public half is not — the server holds it too — so it stays.
+        deviceKey: '',
         ...(twoFactor ? { twoFactor: { ...twoFactor, secret: '' } } : {}),
         ...(enrollment ? { enrollment: { ...enrollment, token: '' } } : {}),
       };
@@ -440,6 +451,24 @@ async function persistCredentials(config: ProxyConfig): Promise<void> {
       await deleteCredential('totp', node.id);
     } else if (node.twoFactor.secret.trim()) {
       await putCredential('totp', node.twoFactor.secret, node.id);
+    } else if (node.deviceKey?.trim()) {
+      // A key node stores no seed: a secret left in the store would be a
+      // credential the server never issued this device, and the one thing
+      // that store is for is answering with what the server holds.
+      await deleteCredential('totp', node.id);
+    }
+
+    // A device key, when this node has one.
+    //
+    // Left alone when the node has neither a credential nor a pending
+    // enrollment: `accept_invite` put the key in the store when the invite
+    // was imported, and the enrollment that is about to spend its token
+    // offers exactly that key. Deleting it here would drop it before it was
+    // ever used.
+    if (node.deviceKey?.trim()) {
+      await putCredential('devicekey', node.deviceKey, node.id);
+    } else if (!node.deviceKey && !node.enrollment) {
+      await deleteCredential('devicekey', node.id);
     }
 
     if (!node.enrollment) {
@@ -530,9 +559,27 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
         clientId: node.twoFactor?.clientId ?? '',
         secret,
         algorithm: node.twoFactor?.algorithm ?? 'sha1',
+        // The device the secret was issued to travels with it: a credential
+        // kept without its name is one that no longer answers, because the
+        // server looks it up by that name.
+        ...(node.twoFactor?.device ? { device: node.twoFactor.device } : {}),
       };
     } else if (node.twoFactor?.secret.trim()) {
       await putCredential('totp', node.twoFactor.secret, node.id);
+    }
+
+    // A device key, when this node has one. The private half is the credential
+    // and lives in the store like the secret beside it; the public half is
+    // derived by the backend from that same key, so the two can never
+    // disagree about which key this is.
+    const deviceKey = stored?.deviceKey ?? null;
+    if (deviceKey) {
+      node.deviceKey = deviceKey;
+    } else if (node.deviceKey?.trim()) {
+      await putCredential('devicekey', node.deviceKey, node.id);
+    }
+    if (stored?.publicKey) {
+      node.publicKey = stored.publicKey;
     }
 
     const token = stored?.enrollment ?? null;
@@ -845,7 +892,15 @@ export function useConfigStore() {
       // is how a device ends up sharing the client's secret — which is the thing that makes
       // revoking one rotate every other one.
       const device = await ensureDeviceId();
-      node.enrollment = { clientId: accepted.enrollment.clientId, token: '', device };
+      node.enrollment = {
+        clientId: accepted.enrollment.clientId,
+        token: '',
+        device,
+        // The public half of the key the backend minted for this enrollment. The
+        // private one never comes here — it is in the store, and the enrollment
+        // offers it from there.
+        ...(accepted.publicKey ? { publicKey: accepted.publicKey } : {}),
+      };
       delete node.twoFactor;
     }
 
@@ -856,6 +911,11 @@ export function useConfigStore() {
     const stored = await takeInvitedNodeCredentials(node.id);
     node.ticket = stored.ticket ?? '';
     node.endpointId = stored.endpoint ?? '';
+    // The device key the backend minted for this enrollment, and the public
+    // half of it. The private half is a credential like the connection string
+    // above: it lives in the store, and the proxy reads it back from there.
+    node.deviceKey = stored.deviceKey ?? '';
+    node.publicKey = stored.publicKey ?? accepted.publicKey ?? '';
 
     await refreshConnectionMasks();
     return outcome;
@@ -887,6 +947,13 @@ export function useConfigStore() {
       algorithm: credential.algorithm,
       ...(device ? { device } : {}),
     };
+    // A key credential has no secret at all: the public half is what says which key this
+    // is, and the private one is already in the store — `accept_invite` put it there when
+    // the invite was imported, and it is what the enrollment offered.
+    const publicKey = credential.publicKey?.trim();
+    if (publicKey) {
+      node.publicKey = publicKey;
+    }
     delete node.enrollment;
     return node;
   }
@@ -918,16 +985,33 @@ export function useConfigStore() {
   /** Drops a node's credentials, which is what "this server has no 2FA" looks like. */
   function clearNodeTwoFactor(nodeId: string): void {
     const node = config.nodes.find((candidate) => candidate.id === nodeId);
-    if (node) delete node.twoFactor;
+    if (node) {
+      delete node.twoFactor;
+      // The key goes with the credential that proved itself with it: the
+      // private half belongs to that credential, and leaving it on disk would
+      // hand it to whatever node reuses this id next.
+      delete node.deviceKey;
+      delete node.publicKey;
+    }
     // The store is told as well: what is dropped here must not survive there.
     void deleteCredential('totp', nodeId).catch((error: unknown) => {
       console.error('[config] failed to delete the stored secret:', error);
     });
+    void deleteCredential('devicekey', nodeId).catch((error: unknown) => {
+      console.error('[config] failed to delete the stored device key:', error);
+    });
   }
 
-  /** Whether a node would perform a handshake: credentials with a secret in them. */
+  /**
+   * Whether a node would perform a handshake.
+   *
+   * A credential is a secret or a key: a key node stores no seed at all, so an
+   * empty secret there is not a missing credential. A node that is still
+   * waiting to enroll has neither yet — it has a token, not a credential.
+   */
   function hasTwoFactor(node: NodeConfig): boolean {
-    return !!node.twoFactor && node.twoFactor.secret.trim() !== '';
+    if (!node.twoFactor) return false;
+    return node.twoFactor.secret.trim() !== '' || !!node.deviceKey?.trim();
   }
 
   function removeNode(nodeId: string): void {
@@ -941,6 +1025,7 @@ export function useConfigStore() {
     void Promise.all([
       deleteCredential('totp', nodeId),
       deleteCredential('enrollment', nodeId),
+      deleteCredential('devicekey', nodeId),
       deleteCredential('ticket', nodeId),
       deleteCredential('endpoint', nodeId),
     ]).catch((error: unknown) => {

@@ -519,6 +519,10 @@ impl ServiceRunner {
                     domains: merged,
                     two_factor,
                     enrollment,
+                    // The device's own key, which belongs to the device rather
+                    // than to the credential: the same key is offered by the
+                    // enrollment and signs every handshake after it.
+                    device_key: n.device_key.clone(),
                 }
             })
             .collect();
@@ -669,6 +673,8 @@ impl ServiceRunner {
             client_id: credential.client_id,
             secret: credential.secret,
             algorithm: credential.algorithm,
+            public_key: credential.public_key,
+            device: credential.device,
         }))
     }
 

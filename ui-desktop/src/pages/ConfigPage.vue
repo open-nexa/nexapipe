@@ -513,40 +513,57 @@ function clearConfig() {
                     class="form-input"
                   />
                 </div>
-                <div class="node-2fa-field">
-                  <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
-                  <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
-                       the value: a mask sitting in the field is a value, and a user who adds one
-                       character to it would store bullets as the TOTP secret. -->
-                  <input
-                    :value="revealedSecrets[node.id] ?? ''"
-                    @change="onSecretChange(node, $event)"
-                    :type="secretInputType(node)"
-                    :placeholder="secretDisplay(node)"
-                    class="form-input"
-                  />
-                  <button
-                    v-if="secretMask(node.id)"
-                    type="button"
-                    class="node-2fa-reveal"
-                    :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
-                    @click="toggleSecret(node)"
-                  >
-                    {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
-                  </button>
-                </div>
-                <div class="node-2fa-field">
-                  <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>
-                  <select
-                    :value="node.twoFactor.algorithm"
-                    @change="setNodeTwoFactor(node.id, { algorithm: ($event.target as HTMLSelectElement).value as TwoFactorAlgorithm })"
-                    class="form-select"
-                  >
-                    <option value="sha1">SHA1</option>
-                    <option value="sha256">SHA256</option>
-                    <option value="sha512">SHA512</option>
-                  </select>
-                </div>
+                <!-- A credential that is a key has no secret to show and no algorithm to
+                     choose: the public half below is what the server holds, and the
+                     private half never leaves the machine. -->
+                <template v-if="node.publicKey">
+                  <div class="node-2fa-field">
+                    <label class="form-label">{{ t('node.twoFactorPublicKey') }}</label>
+                    <input
+                      :value="node.publicKey"
+                      type="text"
+                      readonly
+                      class="form-input"
+                    />
+                  </div>
+                  <p class="node-2fa-hint">{{ t('node.twoFactorKeyHint') }}</p>
+                </template>
+                <template v-else>
+                  <div class="node-2fa-field">
+                    <label class="form-label">{{ t('node.twoFactorSecret') }}</label>
+                    <!-- Empty until a reveal is open, with the mask as the placeholder rather than as
+                         the value: a mask sitting in the field is a value, and a user who adds one
+                         character to it would store bullets as the TOTP secret. -->
+                    <input
+                      :value="revealedSecrets[node.id] ?? ''"
+                      @change="onSecretChange(node, $event)"
+                      :type="secretInputType(node)"
+                      :placeholder="secretDisplay(node)"
+                      class="form-input"
+                    />
+                    <button
+                      v-if="secretMask(node.id)"
+                      type="button"
+                      class="node-2fa-reveal"
+                      :aria-label="revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal')"
+                      @click="toggleSecret(node)"
+                    >
+                      {{ revealedSecrets[node.id] !== undefined ? t('node.hide') : t('node.reveal') }}
+                    </button>
+                  </div>
+                  <div class="node-2fa-field">
+                    <label class="form-label">{{ t('node.twoFactorAlgorithm') }}</label>
+                    <select
+                      :value="node.twoFactor.algorithm"
+                      @change="setNodeTwoFactor(node.id, { algorithm: ($event.target as HTMLSelectElement).value as TwoFactorAlgorithm })"
+                      class="form-select"
+                    >
+                      <option value="sha1">SHA1</option>
+                      <option value="sha256">SHA256</option>
+                      <option value="sha512">SHA512</option>
+                    </select>
+                  </div>
+                </template>
                 <div class="node-2fa-field">
                   <label class="form-label">{{ t('node.twoFactorDevice') }}</label>
                   <!-- Read-only: which secret this node answers with is decided by what the

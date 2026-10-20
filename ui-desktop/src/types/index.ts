@@ -74,6 +74,14 @@ export interface IssuedCredential {
    * the server answered an enrollment that named no device.
    */
   device?: string | null;
+  /**
+   * The public half of the device key this credential was issued as, as 64 hex characters.
+   *
+   * Absent for a credential that is a secret, and that is how the two kinds are told apart: a key
+   * credential has an empty secret and an empty algorithm, and this is the only thing that says
+   * which key it is.
+   */
+  publicKey?: string | null;
 }
 
 export interface NodeConfig {
@@ -94,6 +102,24 @@ export interface NodeConfig {
    * landed in `twoFactor`, so a node is never left holding both.
    */
   enrollment?: EnrollmentToken;
+  /**
+   * This machine's own Ed25519 key for this endpoint, as 64 hex characters.
+   *
+   * A property of the *device* rather than of the credential: the same key is offered by the
+   * enrollment that spends the token and signs every handshake after it, so it exists before
+   * there is a credential to sign with.
+   *
+   * In memory only, like the secret beside it: the shape that is persisted strips it, and the
+   * encrypted store holds the only other copy.
+   */
+  deviceKey?: string;
+  /**
+   * The public half of that key, as 64 hex characters.
+   *
+   * Not a secret — the server holds the same one — so it is part of the persisted shape, and it
+   * is what the app shows to name the key an operator has on file.
+   */
+  publicKey?: string;
 }
 
 export interface ProxyConfig {
@@ -339,6 +365,14 @@ export interface InviteAccepted {
   relay?: string;
   totp?: InviteTotp;
   enrollment?: InviteEnrollment;
+  /**
+   * The public half of the device key this node will enroll with, as 64 hex characters.
+   *
+   * Absent for an invite that hands out a secret rather than a token. The private
+   * half never crosses this boundary: it is filed in the encrypted store and read
+   * from there when a connection needs it.
+   */
+  publicKey?: string;
 }
 
 /**
