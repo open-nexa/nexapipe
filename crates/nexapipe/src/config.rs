@@ -1,11 +1,13 @@
 use crate::conn::limits::LimitsConfig;
 use crate::routes::{L4Options, Route};
+use crate::toml_zeroize::{ZeroizedValue, zeroize_document};
 use nexapipe_client::secret::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
@@ -1765,21 +1767,34 @@ pub fn check_credential_file_permissions(_path: &str) -> anyhow::Result<()> {
 impl ProxyConfig {
     /// Load config and extract auth settings from TOML
     pub fn load_with_auth(path: &str) -> anyhow::Result<(Self, Option<crate::auth::AuthConfig>)> {
-        let content = std::fs::read_to_string(path)?;
+        // The file can hold the 2FA seeds in the clear, so the text it is read
+        // into is wiped when it goes out of scope.
+        let content = SecretString::new(std::fs::read_to_string(path)?);
 
         // Parse the base config
-        let mut base: Self = toml::from_str(&content)?;
+        let mut base: Self = toml::from_str(content.expose_secret())?;
         base.resolve_external_credentials(Path::new(path).parent())?;
 
         // Try to parse auth section separately
         // Note `toml::from_str`, not `str::parse`: `Value::from_str` reads a
         // single TOML *value*, so it rejects a whole document with "unexpected
         // content, expected nothing" and silently leaves 2FA disabled.
-        let auth_config = match toml::from_str::<toml::Value>(&content) {
+        let auth_config = match toml::from_str::<toml::Value>(content.expose_secret()) {
             Ok(toml_value) => {
-                if let Some(auth_section) = toml_value.get("auth") {
+                // The tree is a copy of the file in plain strings, the seeds
+                // included, and it is dropped on every way out of here — the
+                // error paths as much as the successful one. A guard wipes it
+                // on the way instead of leaving it to the allocator.
+                let mut toml_value = ZeroizedValue::new(toml_value);
+                // Moved out of the tree rather than borrowed out of it: a
+                // clone is a second copy of the seeds, and the section that is
+                // moved hands its strings to the zeroizing fields the parse
+                // fills.
+                let auth_section = toml_value
+                    .table_mut()
+                    .and_then(|table| table.remove("auth"));
+                if let Some(auth_section) = auth_section {
                     let auth_toml: AuthTomlConfig = auth_section
-                        .clone()
                         .try_into()
                         .map_err(|e| anyhow::anyhow!("Failed to parse auth config: {}", e))?;
 
@@ -1975,11 +1990,7 @@ impl ProxyConfig {
         secret: &str,
         force: bool,
     ) -> anyhow::Result<ClientSecretWrite> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, secret not written ({e})"))?;
+        let mut doc = read_config_document(path, "secret not written")?;
 
         let auth = sub_table(doc.as_table_mut(), "auth", path)?;
         let clients = sub_table(auth, "clients", path)?;
@@ -1991,7 +2002,7 @@ impl ProxyConfig {
         }
         client.insert("secret", toml_edit::value(secret));
 
-        write_config_file(path, &doc.to_string())?;
+        write_config_document(path, doc)?;
 
         Ok(if replaced {
             ClientSecretWrite::Replaced
@@ -2024,11 +2035,7 @@ impl ProxyConfig {
         client_id: &str,
         token: &str,
     ) -> anyhow::Result<()> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, token not written ({e})"))?;
+        let mut doc = read_config_document(path, "token not written")?;
 
         let auth = sub_table(doc.as_table_mut(), "auth", path)?;
         let clients = sub_table(auth, "clients", path)?;
@@ -2042,7 +2049,7 @@ impl ProxyConfig {
 
         client.insert("pending_enrollment", toml_edit::value(token));
 
-        write_config_file(path, &doc.to_string())
+        write_config_document(path, doc)
     }
 
     /// Spends the token: writes the issued `secret` and drops
@@ -2062,11 +2069,7 @@ impl ProxyConfig {
         client_id: &str,
         secret: &str,
     ) -> anyhow::Result<()> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, enrollment not saved ({e})"))?;
+        let mut doc = read_config_document(path, "enrollment not saved")?;
 
         let auth = sub_table(doc.as_table_mut(), "auth", path)?;
         let clients = sub_table(auth, "clients", path)?;
@@ -2075,7 +2078,7 @@ impl ProxyConfig {
         client.insert("secret", toml_edit::value(secret));
         client.remove("pending_enrollment");
 
-        write_config_file(path, &doc.to_string())
+        write_config_document(path, doc)
     }
 
     /// Spends the token for one named device: writes that device's own
@@ -2117,11 +2120,7 @@ impl ProxyConfig {
         device: &str,
         material: crate::auth::DeviceMaterial<'_>,
     ) -> anyhow::Result<()> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, enrollment not saved ({e})"))?;
+        let mut doc = read_config_document(path, "enrollment not saved")?;
 
         let auth = sub_table(doc.as_table_mut(), "auth", path)?;
         let clients = sub_table(auth, "clients", path)?;
@@ -2132,7 +2131,7 @@ impl ProxyConfig {
 
         client.remove("pending_enrollment");
 
-        write_config_file(path, &doc.to_string())
+        write_config_document(path, doc)
     }
 
     /// Writes one device's credential — a TOTP secret or a public key — under
@@ -2191,11 +2190,7 @@ impl ProxyConfig {
             );
         }
 
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, secret not written ({e})"))?;
+        let mut doc = read_config_document(path, "secret not written")?;
 
         let auth = sub_table(doc.as_table_mut(), "auth", path)?;
         let clients = sub_table(auth, "clients", path)?;
@@ -2217,7 +2212,7 @@ impl ProxyConfig {
 
         devices.insert(device, device_entry(material, path)?);
 
-        write_config_file(path, &doc.to_string())?;
+        write_config_document(path, doc)?;
 
         Ok(if replaced {
             ClientSecretWrite::Replaced
@@ -2240,11 +2235,7 @@ impl ProxyConfig {
     }
 
     fn remove_device_unlocked(path: &str, client_id: &str, device: &str) -> anyhow::Result<()> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, nothing revoked ({e})"))?;
+        let mut doc = read_config_document(path, "nothing revoked")?;
 
         // Not `sub_table`: revoking must never create the thing it is about to
         // delete, and an absent section is the operator naming something that
@@ -2275,7 +2266,7 @@ impl ProxyConfig {
             );
         }
 
-        write_config_file(path, &doc.to_string())
+        write_config_document(path, doc)
     }
 
     /// Drops a client and every device under it: all of
@@ -2285,11 +2276,7 @@ impl ProxyConfig {
     }
 
     fn remove_client_unlocked(path: &str, client_id: &str) -> anyhow::Result<()> {
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, nothing revoked ({e})"))?;
+        let mut doc = read_config_document(path, "nothing revoked")?;
 
         let clients = auth_clients(doc.as_table_mut());
         let Some(clients) = clients else {
@@ -2302,7 +2289,7 @@ impl ProxyConfig {
             );
         }
 
-        write_config_file(path, &doc.to_string())
+        write_config_document(path, doc)
     }
 }
 
@@ -2497,7 +2484,13 @@ impl Drop for ConfigLock {
 /// really are on disk in that window — the server refuses to *start* on a
 /// world-readable config, so handing one to every local account for the length
 /// of a write contradicts the check that exists to prevent it.
-pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
+///
+/// Crate-private on purpose: the text of a config is a copy of its
+/// credentials, so every write of one goes through [`write_config_document`],
+/// which zeroes the text it renders and the document it came from. A caller
+/// that reached this function directly would skip that, and the seeds would
+/// sit in the heap for as long as the allocator kept the buffer.
+pub(crate) fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     let target = Path::new(path);
     let directory = target
         .parent()
@@ -2594,6 +2587,50 @@ pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Reads the config file into a document, with the text it was read from
+/// wiped when it goes out of scope.
+///
+/// The file can hold the 2FA seeds in the clear, so its text is a copy of a
+/// credential: it is read into a buffer that is zeroed as soon as the
+/// document it was parsed into exists. `what` says what was not written, for
+/// the error a malformed file produces.
+pub(crate) fn read_config_document(
+    path: &str,
+    what: &str,
+) -> anyhow::Result<toml_edit::DocumentMut> {
+    let content = SecretString::new(
+        fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?,
+    );
+    content
+        .expose_secret()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{path} is not valid TOML, {what} ({e})"))
+}
+
+/// Writes a document to the config, and zeroes the copies of it that the
+/// write needed.
+///
+/// The document holds the 2FA seeds in the clear, and so does the text it is
+/// rendered into: a copy that would otherwise outlive the write by however
+/// long the allocator keeps the buffer. The document is zeroed too, so the
+/// tree it was parsed into does not keep them either.
+///
+/// What is left is one copy of every string on the write path: the raw text
+/// `toml_edit` keeps for each value it parsed, next to the decoded value
+/// above. It lives in a private `RawString` this crate cannot reach, and
+/// closing that would take `unsafe` or a fork of the library. See
+/// [`crate::toml_zeroize`].
+pub(crate) fn write_config_document(
+    path: &str,
+    mut document: toml_edit::DocumentMut,
+) -> anyhow::Result<()> {
+    let mut text = document.to_string();
+    let result = write_config_file(path, &text);
+    text.zeroize();
+    zeroize_document(&mut document);
+    result
 }
 
 /// What [`ProxyConfig::ensure_iroh_secret_key`] resolved the endpoint's
@@ -3232,11 +3269,7 @@ impl ProxyConfig {
         let key = iroh::SecretKey::generate();
         let hex = hex::encode(key.to_bytes());
 
-        let content =
-            fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut doc: toml_edit::DocumentMut = content.parse().map_err(|e| {
-            anyhow::anyhow!("{path} is not valid TOML, secret_key not written ({e})")
-        })?;
+        let mut doc = read_config_document(path, "secret_key not written")?;
 
         // `sub_table` rather than `entry("iroh")`: a config with no `[iroh]` at
         // all should gain the one key, not a header and a key.
@@ -3245,7 +3278,7 @@ impl ProxyConfig {
         })?;
         iroh_table.insert("secret_key", toml_edit::value(hex.as_str()));
 
-        write_config_file(path, &doc.to_string())?;
+        write_config_document(path, doc)?;
 
         Ok(hex)
     }
@@ -5930,6 +5963,28 @@ secret = "CLIENTSECRET"
             written.contains("# Turned on after the relay migration."),
             "the comment on the key above was lost:\n{written}"
         );
+    }
+
+    /// The read and the write are one pair, and the file that goes through
+    /// them comes back the way it was.
+    ///
+    /// Both helpers wipe the copies they make on the way — the text the file
+    /// was read into, the tree it was parsed into and the text it was rendered
+    /// into — and the point of that is that none of it touches the file: what
+    /// the operator wrote is what is still there, down to the comments.
+    #[test]
+    fn a_config_that_goes_through_the_helpers_comes_back_unchanged() {
+        let source = "# My edge box in the shed.\n\
+                      [iroh]\n\
+                      # Turned on after the relay migration.\n\
+                      relay_mode = \"pinned\"\n";
+        let (_dir, path) = scratch_config(source);
+
+        let document = read_config_document(&path, "nothing written").expect("the config parses");
+        write_config_document(&path, document).expect("the config is written");
+
+        let written = fs::read_to_string(&path).expect("the config is still there");
+        assert_eq!(written, source, "the file did not come back unchanged");
     }
 
     /// A key that is already configured is used as it stands. Writing a fresh
