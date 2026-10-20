@@ -1041,13 +1041,27 @@ class VpnViewModel : ViewModel() {
      */
     private suspend fun resolveIrohDnsOverrides(): String {
         // DNS origin and default relay servers used by iroh presets::N0.
-        val domains = listOf(
-            "dns.iroh.link",
-            "use1-1.relay.n0.iroh.link",
-            "usw1-1.relay.n0.iroh.link",
-            "euc1-1.relay.n0.iroh.link",
-            "aps1-1.relay.n0.iroh.link",
-        )
+        //
+        // Only the ones this configuration actually uses. The lookup's own
+        // host is asked about nothing when the lookup is off, and the n0
+        // relays are dialled by nobody when the relay is the operator's own
+        // or when there is none. Resolving a host the endpoint will never
+        // talk to is a question asked for nothing — and with the lookup off
+        // it is a question about n0 that the operator said not to ask.
+        val domains = mutableListOf<String>()
+        if (discoveryMode.value != "none") {
+            domains.add("dns.iroh.link")
+        }
+        if (relayMode.value != "custom" && relayMode.value != "disabled") {
+            domains.add("use1-1.relay.n0.iroh.link")
+            domains.add("usw1-1.relay.n0.iroh.link")
+            domains.add("euc1-1.relay.n0.iroh.link")
+            domains.add("aps1-1.relay.n0.iroh.link")
+        }
+        if (domains.isEmpty()) {
+            addLog("No iroh domain to pre-resolve: neither the lookup nor the n0 relays are in play")
+            return ""
+        }
 
         val overrides = kotlinx.coroutines.coroutineScope {
             domains.map { domain ->
@@ -1414,10 +1428,14 @@ class VpnViewModel : ViewModel() {
                             // (dns.iroh.link + relays) to work around the GFW
                             // dropping iroh.link UDP DNS responses. Re-resolved
                             // on every retry.
+                            //
+                            // Always handed over, empty included: the table on
+                            // the native side is replaced by the call, so a
+                            // configuration that resolves nothing has to say
+                            // so rather than keep what the last attempt left
+                            // behind.
                             val dnsOverrides = resolveIrohDnsOverrides()
-                            if (dnsOverrides.isNotEmpty()) {
-                                IrohProxy.nativeSetDnsOverride(dnsOverrides)
-                            }
+                            IrohProxy.nativeSetDnsOverride(dnsOverrides)
                             // Configure the relay mode
                             IrohProxy.nativeSetRelayConfig(
                                 relayMode.value,
