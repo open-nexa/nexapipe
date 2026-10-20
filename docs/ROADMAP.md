@@ -257,11 +257,16 @@ untouched. A wrong signature counts toward the lockout exactly like a wrong code
 TOTP's remaining role is the enrollment moment — the scan, the one-shot token —
 where a human is actually present and where none of the unattended paths
 (`--local-proxy`, the elevated service, the probe's reconnect loop, Android JNI)
-has to answer a prompt. What remains is the UI half, and it is the next
-release's: both apps still enroll and answer with TOTP secrets, and holding a
-key is v0.8.0 work in each. The library API (`Enrollment::with_key`,
+has to answer a prompt. **The UI half has landed too, and it is the whole of
+what was left.** Both apps now enroll with a key of their own when the invite
+is the one that carries a token: the private half is generated on the device,
+sealed at rest beside the other credentials and never leaves it, and the public
+half is what the server records and what the app shows. Nothing is asked of the
+user either way, and a server that predates keys ignores the offer and issues a
+secret as before — so the same invite works against both, and a node that
+already holds a TOTP secret keeps it. The library API (`Enrollment::with_key`,
 `TwoFactorAuth::with_key`) and `nexapipe client add <id> --device <name>
---public-key <hex>` are what the feature ships with today.
+--public-key <hex>` are what the feature ships with.
 
 ### 4.4 Operations and distribution (P1)
 
