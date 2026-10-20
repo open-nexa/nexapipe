@@ -29,6 +29,32 @@ The last line is the one agents get wrong. `gh` commands that write — opening 
 editing a pull request, commenting, labelling — are external effects just as much
 as a merge is. They need the same explicit approval.
 
+## The tools, and the prompts they raise
+
+Two mechanics come up on every task. Neither is a question for the owner — they
+are things worth knowing before the first command runs, because both turn an
+ordinary step into a round trip.
+
+**The file-access gate separates the project tree from everything outside it.**
+A file under the repository is read and written without asking. A file outside it
+is a different scope: the first call to it prompts, and a refusal can be
+remembered as a standing rule that blocks the next one. That is why the
+worktrees live inside the repository rather than beside it.
+
+**The safety check on a shell command reads a relative path as relative to the
+repository root, not to the current directory.** `rm -f build.log` run from
+`.worktrees/feature-x/` is checked as `<repo>/build.log` — a deletion at the top
+of the repository, not in the worktree. Write the path out:
+
+```bash
+rm -f "$PWD/build.log"            # resolved against the directory you are in
+```
+
+A recoverable delete is better than either, where the environment offers one.
+And a command blocked for this reason is not a tool failure to route around: it
+is a signal that the command was written in a form the checker cannot resolve,
+and rewriting it is cheaper than arguing with it.
+
 ## The lifecycle
 
 ### 1. Find out whether the work already exists
@@ -74,7 +100,8 @@ git merge-base --is-ancestor upstream/main HEAD
 The directory name is the branch name with `/` flattened to `-`
 (`v070/audit-fixes` → `.worktrees/v070-audit-fixes`). Worktrees live inside the
 repository and are git-ignored, so their files go through the same file-access
-path as the rest of the project.
+path as the rest of the project — a worktree outside the repository is a
+separate scope, and reading it is a prompt that can become a standing refusal.
 
 Searches and reads have to name the worktree explicitly: a search rooted at the
 repository root does not descend into `.worktrees/`, because each worktree is
