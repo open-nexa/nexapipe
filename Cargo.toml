@@ -10,6 +10,7 @@ resolver = "3"
 [workspace.package]
 version = "0.6.1"
 edition = "2024"
+license = "MIT"
 # 1.89 is where `File::lock` / `File::unlock` were stabilised, which the config
 # lock uses for `flock(2)` and `LockFileEx`. Declared rather than left implicit:
 # without it an older toolchain fails somewhere inside the dependency graph, on
