@@ -239,19 +239,31 @@ pub fn encode_link_status(id: &EndpointId, status: &LinkStatus) -> String {
 /// The guess is recognised by its value, and quinn leaves it in more than one
 /// way. A path validation measures the round trip of its challenge and puts
 /// that in its place, which is a measurement of its own and is reported as
-/// one; a path opened while another validated path exists starts from that
-/// path's conservative estimate rather than from the initial RTT. A round trip
-/// that happens to land exactly on the initial RTT is reported as no
-/// measurement at all.
+/// one; a path opened for the same peer address while another validated path
+/// to that address exists starts from that path's conservative estimate rather
+/// than from the initial RTT — quinn looks for a validated path on the same
+/// network path, so a direct path and a relay path do not seed each other. A
+/// round trip that happens to land exactly on the initial RTT is reported as
+/// no measurement at all.
 fn rtt_of(conn: &Connection) -> Option<std::time::Duration> {
     let paths = conn.paths();
     for path in paths.iter() {
         if path.is_selected() {
             let rtt = conn.rtt(path.id())?;
-            return is_measured_rtt(rtt).then_some(rtt);
+            return measured_rtt(rtt);
         }
     }
     None
+}
+
+/// The round trip of a path, when it is a measurement rather than a guess.
+///
+/// Split out of [`rtt_of`] so that a reading can be taken off a path the
+/// caller names rather than off whichever one is selected now: the two halves
+/// of a reading describe one path, and the selection can move under the
+/// reading.
+fn measured_rtt(rtt: std::time::Duration) -> Option<std::time::Duration> {
+    is_measured_rtt(rtt).then_some(rtt)
 }
 
 /// Whether `rtt` is a measured round-trip time rather than a guess.
@@ -287,9 +299,10 @@ impl PooledConnection {
 /// Drops the connections that are closed or idle, closing the idle ones.
 ///
 /// A connection that is only dropped stays open as far as QUIC is concerned:
-/// nothing closes it when the last handle goes away, so the socket and the NAT
-/// mapping on both sides live on — and the path watcher that still holds it
-/// keeps reporting a route for a connection the pool has abandoned.
+/// quinn closes a connection when its *last* handle goes away, and the path
+/// watcher still holds one, so the socket and the NAT mapping on both sides
+/// live on — and the watcher keeps reporting a route for a connection the pool
+/// has abandoned.
 ///
 /// The idle ones are closed with a reason, so the peer sees a connection that
 /// went away on purpose rather than one that vanished.
@@ -929,7 +942,7 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                     let Some(event) = event else {
                         break;
                     };
-                    let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event else {
+                    let iroh::endpoint::PathEvent::Selected { id, remote_addr, .. } = event else {
                         continue;
                     };
 
@@ -949,12 +962,18 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                         conn: Some(conn.clone()),
                         status: LinkStatus {
                             kind,
+                            // The round trip is read off the path the event
+                            // named, not off whichever path is selected at the
+                            // moment of the read: the two halves of a reading
+                            // describe one path, and the selection can move
+                            // between the event and the read.
+                            //
                             // An unknown kind has no path to measure, which
                             // is how [`LinkStatus::of`] reads it too.
                             rtt: if kind == LinkKind::Unknown {
                                 None
                             } else {
-                                rtt_of(&conn)
+                                conn.rtt(id).and_then(measured_rtt)
                             },
                         },
                     };
