@@ -360,17 +360,17 @@ impl ByteBudget {
     /// Adds `bytes` to the total, or returns the total as it was before the
     /// attempt.
     ///
-    /// Checked and added in one `fetch_update` rather than a load, a compare and
+    /// Checked and added in one `try_update` rather than a load, a compare and
     /// a store: two concurrent uploads must not both read a total that leaves
     /// room for one of them.
     pub fn try_reserve(&self, bytes: usize) -> Result<(), usize> {
         // Written as a `match` rather than a chain of `map`s because
-        // `fetch_update` hands back the total from *before* the attempt on both
+        // `try_update` hands back the total from *before* the attempt on both
         // paths, and only the `Err` case carries it: that is the number the
         // caller needs in order to say how much room was left.
         match self
             .held
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 let next = held.saturating_add(bytes);
                 (next <= self.max).then_some(next)
             }) {

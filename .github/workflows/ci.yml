@@ -93,6 +93,35 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # The floor the workspace declares, built on exactly that toolchain.
+  #
+  # `rust-version` in the root Cargo.toml is a promise, and until this job
+  # existed nothing checked it: every other job here runs a newer toolchain, so
+  # a change that quietly needed a newer standard library — or a dependency that
+  # did — landed without anyone noticing. This job is what makes the declared
+  # floor real.
+  #
+  # Pinned to the declared version rather than to "the oldest release that
+  # happens to work": the point is that the number in the Cargo.toml is the one
+  # that gets exercised. The name, this pin and that number move together.
+  msrv:
+    name: msrv (1.95.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: msrv
+      # `--locked` for the same reason as the other jobs: the floor is only
+      # meaningful against the dependency versions that actually ship.
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
