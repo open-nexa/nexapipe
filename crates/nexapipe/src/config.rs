@@ -1,3 +1,4 @@
+use crate::conn::limits::LimitsConfig;
 use crate::routes::{L4Options, Route};
 use crate::toml_zeroize::{ZeroizedValue, zeroize_document};
 use nexapipe_client::secret::SecretString;
@@ -679,6 +680,15 @@ pub struct ProxyConfig {
     /// Probing of `http` backends. Absent means the defaults, i.e. enabled.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// The ceilings the whole process runs under: connections per peer and in
+    /// total, streams in flight, and bytes held in request bodies. Absent means
+    /// the defaults, i.e. the constants this section replaced, unchanged.
+    ///
+    /// **Read once at startup**, not live: a budget that changed under an
+    /// in-flight upload would release bytes against a ceiling it was never
+    /// counted against. See [`crate::conn::limits`].
+    #[serde(default)]
+    pub limits: LimitsConfig,
     /// How long to wait on a backend, and how long each phase of a proxied
     /// exchange may hold its slot. Absent means the deadlines this section
     /// replaced, unchanged.
