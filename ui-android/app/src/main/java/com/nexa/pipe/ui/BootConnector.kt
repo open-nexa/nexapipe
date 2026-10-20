@@ -56,9 +56,11 @@ object BootConnector {
     /**
      * Connects, if the user asked for it.
      *
-     * Returns whether a tunnel was brought up. Every path that does not bring
-     * one up says why on the way out, because "the tunnel did not come back" on
-     * its own is a question the user cannot answer.
+     * Returns whether the sequence ran and the service was asked to establish
+     * the tunnel. The tunnel itself is the service's to establish, and it does
+     * that after this returns, so a `true` here is not yet a tunnel. Every path
+     * that does not bring one up says why on the way out, because "the tunnel
+     * did not come back" on its own is a question the user cannot answer.
      */
     suspend fun connectIfWanted(context: Context, log: (String) -> Unit): Boolean {
         val settings = SettingsManager(context)
@@ -125,7 +127,7 @@ object BootConnector {
         // about it. The sequence is the same one the screen runs, so a tunnel
         // brought up here is built exactly like one the user asked for.
         connector.prepare(context, plan)
-        log("boot: the tunnel is up")
+        log("boot: the proxy is up; asking the service to establish the tunnel")
 
         // The service is what holds the TUN and the notification; the sequence
         // above only brought the proxy up behind it.

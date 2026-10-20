@@ -115,6 +115,15 @@ class ProxyConnector(private val log: ConnectionLog) {
          */
         onCredentialIssued: suspend () -> Unit = {}
     ): Outcome {
+        // The native library is not loaded: every call below raises an
+        // UnsatisfiedLinkError, and that is an Error and not an Exception, so
+        // it would escape the caller's `catch (e: Exception)` and take the
+        // process down with it. The screen checks this before it gets here;
+        // the boot path does not, so the check is here as well.
+        if (!IrohProxy.isNativeLoaded()) {
+            throw Exception(AppStrings.get(R.string.error_native_library))
+        }
+
         // Inject the system DNS into iroh so it does not fall back to Google
         // DNS after the JNI system-DNS read fails on Android (unreliable
         // behind restrictive networks, backends unreachable).

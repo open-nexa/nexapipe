@@ -200,6 +200,12 @@ class NexaVpnService : VpnService() {
         val prepareIntent = prepare(this)
         if (prepareIntent != null) {
             Log.d(TAG, "VPN permission not granted")
+            // The service goes away with it: a foreground service with no
+            // tunnel behind it is a notification that says the tunnel is up
+            // over a tunnel that is not there, and there is nothing else this
+            // start was going to do. The boot path reaches this when the
+            // consent was withdrawn between its own check and this one.
+            shutdownService()
             return
         }
 
@@ -291,7 +297,38 @@ class NexaVpnService : VpnService() {
             // Nothing came up. A foreground service with no tunnel behind it is
             // a notification that says the tunnel is up over a tunnel that is
             // not there, so it goes away.
+            //
+            // The attempt may have brought the native side up before it
+            // failed, and that side is process-global: the iroh endpoint and
+            // the endpoint group with their warm backend connections outlive
+            // the service that started them, so a failed attempt would leave a
+            // live QUIC connection to the relay behind nothing that the user
+            // can see or stop. They are taken down here as well; the user's
+            // path does the same through releaseAllResources().
+            releaseBootResources()
             shutdownService()
+        }
+    }
+
+    /**
+     * Takes down what a failed boot attempt left running.
+     *
+     * The iroh endpoint and the endpoint group are process-global and outlive
+     * the service: the service owns the TUN and the notification, and the
+     * native side owns the connection to the relay and the warm backend
+     * connections behind it. A boot attempt that failed after the native side
+     * was up leaves all of it behind, with no service and no notification and
+     * nothing the user can stop.
+     */
+    private fun releaseBootResources() {
+        // The library may not be there at all, and the call would raise an
+        // UnsatisfiedLinkError — an Error, not an Exception — which would
+        // escape the catch below and take the process with it.
+        if (!IrohProxy.isNativeLoaded()) return
+        try {
+            IrohProxy.nativeDestroy()
+        } catch (e: Exception) {
+            Log.e(TAG, "boot: nativeDestroy failed: ${e.message}")
         }
     }
 
