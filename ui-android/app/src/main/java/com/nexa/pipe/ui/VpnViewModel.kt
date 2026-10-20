@@ -256,6 +256,19 @@ class VpnViewModel : ViewModel() {
     // CancellationException).
     private var connectJob: Job? = null
 
+    /**
+     * The device-key preparation still running, so a connect can wait for it.
+     *
+     * [updateNodeEnrollment] starts it because minting and sealing a key reach
+     * the keystore and the JNI bridge, neither of which belongs on the main
+     * thread the invite import runs on. The call that needs the key — the
+     * connect that fills the native tables — joins this first. Chained rather
+     * than replaced, so two enrollments in flight still reach the keystore one
+     * at a time, which is the rule the settings writer keeps.
+     */
+    @Volatile
+    private var deviceKeyPrep: Job? = null
+
     init {
         // Push channel from NexaVpnService: our VPN was revoked (or its
         // establishment was refused) because another VPN app (e.g. Clash)
@@ -704,7 +717,16 @@ class VpnViewModel : ViewModel() {
         // cannot be spent twice, and an endpoint whose key was lost after the
         // fact cannot enroll again from the same code.
         if (enrollment != null) {
-            prepareDeviceKeyForEnrollment(nodeId)
+            // Prepared off the main thread: the import that sets an enrollment
+            // runs on the UI thread, and both the keystore and the JNI bridge
+            // are slow enough to be felt as a dropped frame. `connect` joins
+            // this before it registers the key, so the token is never spent
+            // before the private half is on disk.
+            val previous = deviceKeyPrep
+            deviceKeyPrep = viewModelScope.launch(Dispatchers.IO) {
+                previous?.join()
+                prepareDeviceKeyForEnrollment(nodeId)
+            }
         }
         val updated = nodes.value.toMutableList()
         updated[index] = updated[index].copy(enrollment = enrollment)
@@ -724,6 +746,10 @@ class VpnViewModel : ViewModel() {
      * A server that predates keys ignores the offer and issues a secret as it
      * always has, and the endpoint uses that instead. The user is asked about
      * neither.
+     *
+     * Runs on the IO dispatcher, started by [updateNodeEnrollment]: the seal and
+     * the JNI call are both slow enough to drop a frame on the thread an invite
+     * import runs on, and the connect that needs the key waits for it.
      *
      * A key that cannot be sealed is not kept: the endpoint then enrolls with
      * a TOTP secret, which the server can revoke and this app can show the
@@ -1431,6 +1457,12 @@ class VpnViewModel : ViewModel() {
                             // it. Registered before the group starts, like every
                             // other credential — what is in the native tables at
                             // nativeStartProxy is what goes on the wire.
+                            //
+                            // The import that armed the enrollment sealed the key
+                            // off the main thread; joining here is what makes the
+                            // read below wait for that write to land, rather than
+                            // hand the native side a key that is not on disk yet.
+                            deviceKeyPrep?.join()
                             for (node in nodes.value) {
                                 val key = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
                                 if (key.isBlank()) continue
