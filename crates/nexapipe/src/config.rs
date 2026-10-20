@@ -1156,6 +1156,9 @@ impl ProxyConfig {
             // Refused rather than matched loosely: a wildcard without its dot
             // silently covers hosts that merely end in the same letters, so a
             // config using one is a config that routes more than it says.
+            if let Some(why) = catch_all_pattern_error(&host_pattern) {
+                anyhow::bail!("{label}: host_pattern {why}");
+            }
             if let Some(why) = crate::routes::host_pattern_error(&host_pattern) {
                 anyhow::bail!("{label}: host_pattern {why}");
             }
@@ -1425,6 +1428,27 @@ pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
             Err(e) => Err(anyhow::anyhow!("cannot create {}: {e}", path)),
         }
     })
+}
+
+/// Why `pattern` is the catch-all in another spelling, or `None` when it is not.
+///
+/// The fold a pattern goes through takes the trailing dots and the brackets
+/// off, so `*.`, `*..` and `[*]` all become `*` — the catch-all — and a
+/// pattern that reads as one host would match every one of them. The failure
+/// mode is silent: the pattern is folded before it is ever matched, so
+/// nothing says the route serves more than it says.
+///
+/// Refused where the pattern is configured, which is the only place an
+/// operator can see it. The catch-all itself is spelled `*` and is not
+/// refused: a config that says every host means every host.
+fn catch_all_pattern_error(pattern: &str) -> Option<String> {
+    if pattern == "*" || crate::routes::normalize_host(pattern) != "*" {
+        return None;
+    }
+    Some(format!(
+        "\"{pattern}\" is the catch-all \"*\" in another spelling, and that means every host: \
+         write \"*\" for every host, or a name for the host you mean"
+    ))
 }
 
 pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrategy {
@@ -1830,6 +1854,11 @@ impl ProxyConfig {
                             // loose one authorizes more than it names: the same
                             // refusal a route's `host_pattern` gets.
                             for host in client_toml.allow_hosts.iter().flatten() {
+                                if let Some(why) = catch_all_pattern_error(host) {
+                                    anyhow::bail!(
+                                        "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"
+                                    );
+                                }
                                 if let Some(why) = crate::routes::host_pattern_error(host) {
                                     anyhow::bail!(
                                         "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"

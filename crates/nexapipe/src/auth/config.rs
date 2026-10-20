@@ -577,16 +577,21 @@ impl ClientAcl {
                     // the trailing dots and the brackets off, which is right for
                     // a host and wrong for a pattern: `*.`, `*..` and `[*]` all
                     // fold into the catch-all, so an allow-list written as one
-                    // of them would authorize every host. A spelling that would
-                    // fold into the catch-all keeps its own shape here, and
-                    // matches nothing.
-                    .map(|h| {
+                    // of them would authorize every host.
+                    //
+                    // An entry that would fold into the catch-all is left out
+                    // rather than kept in its own spelling: a pattern is
+                    // matched, and a spelling that survives as a pattern can
+                    // still match something — the safe reading of an entry
+                    // nobody wrote as the catch-all is an entry that names no
+                    // host at all.
+                    .filter_map(|h| {
                         let folded = crate::routes::normalize_host(h);
                         if folded == "*" && h != "*" {
                             // The fold would have widened it into the catch-all.
-                            h.to_ascii_lowercase()
+                            None
                         } else {
-                            folded
+                            Some(folded)
                         }
                     })
                     .collect()
