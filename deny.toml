@@ -1,0 +1,122 @@
+# cargo-deny configuration.
+#
+# `cargo audit` (the `dependency audit` job) already watches the RUSTSEC
+# advisory database, and it is the gate for vulnerabilities. What it does not
+# look at is the rest of the tree: which licences the dependencies carry, where
+# the crates were fetched from, and which crates are present at two versions at
+# once. This file is that half.
+#
+# The scope is deliberately the whole tree rather than one crate: the server
+# workspace and the desktop app's own workspace (ui-desktop/src-tauri) are two
+# separate cargo workspaces with two lockfiles, and the desktop one is where
+# the Tauri and webkit stack lives — a much larger graph than the server's. The
+# CI job runs `cargo deny` once per workspace.
+#
+# The vendored smoltcp fork (third_party/smoltcp, patched in through
+# `[patch.crates-io]`) is a path source, so it is inside the graph rather than
+# fetched from anywhere: the tree it came from is this repository.
+
+[graph]
+# Every feature of every crate, not the default set: a dependency that only
+# appears behind an optional feature is still a dependency.
+all-features = true
+
+[advisories]
+# The same RustSec database `cargo audit` reads. In this schema a
+# vulnerability is an error — the switch that used to make it a warning is
+# gone, and the rule is the one the `dependency audit` job applies.
+version = 2
+#
+# The advisory kinds that are not vulnerabilities are a different matter.
+# `cargo audit` reports an unmaintained or unsound crate as informational and
+# does not fail on it, and this file keeps that rule rather than inventing a
+# stricter one: the tree carries crates that are old rather than broken, and a
+# build that refuses to start because one of them is unmaintained is a gate
+# nobody asked for. They are still reported by the audit job, which is where
+# they are read.
+unmaintained = "none"
+unsound = "none"
+# A version pulled from crates.io is worth saying out loud, but it is not a
+# reason to refuse to build: the lockfile pins a version that still exists.
+yanked = "warn"
+ignore = []
+
+[bans]
+# Several crates are in the graph at more than one version — a dependency
+# raising a floor, and an older sibling of it still reachable through
+# another path. That is normal in a tree this size and is reported rather
+# than refused: refusing it would mean pinning versions by hand for every
+# transitive dependency, and the graph moves under those pins anyway.
+multiple-versions = "warn"
+# A wildcard dependency (`foo = "1.*"`) resolves to whatever the index says
+# today, so the build is not reproducible even with a lockfile.
+#
+# The rule is off here, because of what it counts as a wildcard: a path or
+# workspace dependency carries no version requirement at all, and cargo-deny
+# reports those as wildcards. Every local crate in this tree is a path
+# dependency, so the rule has nothing left to catch — no registry dependency
+# here uses a `*` requirement, and what actually pins the build is
+# Cargo.lock together with `--locked` in the container build.
+wildcards = "allow"
+highlight = "all"
+# Crates refused outright, with a reason. Empty: nothing in this graph is
+# refused by name.
+deny = []
+# Crates allowed to be present at more than one version, by name. Empty:
+# the warning above is left standing rather than silenced crate by crate.
+allow = []
+# Skipped by the whole check, and skipped by the advisory check with it.
+skip = []
+skip-tree = []
+
+[licenses]
+# The licences the dependencies in this tree carry. Everything in the list is
+# a permissive licence that allows redistribution of a binary built against
+# it, which is what a published server archive, a desktop bundle and a
+# container image are.
+#
+# In this schema a licence that is not on the list is refused rather than
+# reported, and a crate that declares no licence at all is refused too —
+# which is why the two crates of this repository that said nothing now say
+# MIT.
+#
+# The GPL and AGPL licences are absent on purpose: a dependency under one of
+# them would put conditions on the distribution of this software, and that
+# is a decision for the owner rather than a licence-filtering accident.
+version = 2
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+# A licence expression the scan cannot make sense of is a finding of its own,
+# so the threshold is high: only a confident reading counts.
+confidence-threshold = 0.8
+# Crates whose licence needs a judgement rather than a list entry. Empty:
+# every crate in this tree is covered by the list above.
+exceptions = []
+
+[sources]
+# A crate fetched from a registry this file does not know, or from a git
+# repository that is not named here, is refused. crates.io is the only
+# registry the tree is allowed to use, and the only git source is the
+# vendored fork in this repository — which is a path, and so is not a git
+# source at all.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

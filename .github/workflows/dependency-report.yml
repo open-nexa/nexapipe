@@ -31,13 +31,13 @@ jobs:
     if: ${{ github.repository == 'open-nexa/nexapipe' }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       # cargo update --dry-run needs the resolver, not a build: no cache, no compile.
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm

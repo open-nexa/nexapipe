@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       # Pin the toolchain here as the other jobs do. Without it this job would
       # use whatever rustfmt the runner image happens to ship, so a format change
       # in a new rustfmt release would fail a PR that touched no Rust at all.
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       # Pin the toolchain, as the fmt job does. Clippy runs with -D warnings, so
       # a lint added by a new toolchain release turns this job red on a PR that
       # changed no Rust at all.
@@ -86,7 +86,7 @@ jobs:
         with:
           toolchain: 1.98.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: clippy
       # -D warnings: without this clippy exits 0 and the job is decorative.
@@ -106,12 +106,12 @@ jobs:
         # so one runner per OS is enough.
         os: [ubuntu-latest, macos-15]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: test-${{ matrix.os }}
       - name: cargo test
@@ -129,7 +129,7 @@ jobs:
     # same dependency tree more slowly, and this one now links and runs as well.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
@@ -170,12 +170,12 @@ jobs:
           - "uniffi"
           - "jni,local-proxy" # the release cdylib's feature set, on a host target
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
         with:
           toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: features-${{ matrix.features }}
       - name: cargo check
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - name: Resolve Android NDK
         id: ndk
@@ -223,11 +223,11 @@ jobs:
           targets: aarch64-linux-android x86_64-linux-android
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cargo-ndk
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: android-check
 
@@ -256,9 +256,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cargo-audit
       # RUSTSEC advisories for everything in Cargo.lock. Unmaintained/unsound
@@ -266,12 +266,37 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # What cargo audit does not look at: the licences the tree carries, where
+  # the crates were fetched from, and the crates that sit at two versions at
+  # once. The policy is deny.toml, at the repository root, and it says the
+  # same thing about advisories that the audit job above does — the
+  # difference is the rest of the file.
+  supply-chain:
+    name: supply chain (cargo deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny (server)
+        run: cargo deny check
+
+      # src-tauri is its own workspace with its own Cargo.lock, so the run
+      # above never sees it — and it is the larger of the two graphs.
+      - name: cargo deny (desktop)
+        run: cargo deny --manifest-path ui-desktop/src-tauri/Cargo.toml check
+
   secrets:
     name: secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           fetch-depth: 0
       # Free for public repositories. If a repo ever becomes private, add
@@ -281,7 +306,7 @@ jobs:
       # line: it has to be named in `.gitleaks.toml` instead. That file lists
       # the test fixtures that look like credentials and nothing else, which is
       # what lets this run as a gate.
-      - uses: gitleaks/gitleaks-action@v3
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3 @ 2026-05-30
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_CONFIG: .gitleaks.toml
@@ -292,8 +317,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/dependency-review-action@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0 @ 2026-05-08
         with:
           # glib 0.18 rides in with the gtk 0.18 stack tauri pulls in on Linux
           # (tao, muda and webkit2gtk all still require gtk ^0.18), and this
@@ -319,9 +344,9 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
@@ -359,7 +384,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       # Catch cross-platform compile breakage early: development happens on one machine, so anything inside
       # #[cfg(target_os = "linux"/"macos"/"windows")] is never compiled locally (the `?` on bool / PathBuf
@@ -391,7 +416,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           cache-on-failure: true
           workspaces: ui-desktop/src-tauri -> target
@@ -413,7 +438,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       # The same two as the Linux half of desktop-check: this job runs clippy and
       # the tests, which compile the whole crate and not just type-check it, so
@@ -439,7 +464,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           cache-on-failure: true
           workspaces: ui-desktop/src-tauri -> target
@@ -463,7 +488,7 @@ jobs:
         working-directory: ui-desktop
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
@@ -471,7 +496,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cargo-audit
 
@@ -481,7 +506,7 @@ jobs:
         working-directory: ui-desktop/src-tauri
         run: cargo audit
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
           node-version-file: ui-desktop/.nvmrc
           cache: npm
@@ -513,10 +538,10 @@ jobs:
       BUILD_TOOLS: 37.0.0
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6 @ 2026-10-14
         with:
           distribution: temurin
           java-version: '17'
@@ -549,7 +574,7 @@ jobs:
 
       - name: Upload test report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: android-unit-test-report
           # upload-artifact paths are relative to the workspace root and ignore defaults.run.
@@ -560,7 +585,7 @@ jobs:
         run: ./gradlew --no-daemon --stacktrace assembleDebug
 
       - name: Upload debug APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: android-app-debug-apk
           path: ui-android/app/build/outputs/apk/debug/*.apk
@@ -582,10 +607,10 @@ jobs:
       BUILD_TOOLS: 37.0.0
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6 @ 2026-10-14
         with:
           distribution: temurin
           java-version: '17'
@@ -624,7 +649,7 @@ jobs:
 
       - name: Upload lint report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: android-lint-report
           path: |
@@ -659,7 +684,7 @@ jobs:
             # an arm64 image needs an arm64 CPU (or QEMU over the whole build).
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
@@ -703,10 +728,10 @@ jobs:
   #     contents: read
   #     pull-requests: write
   #   steps:
-  #     - uses: actions/checkout@v7
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
   #       with:
   #         fetch-depth: 0
-  #     - uses: anthropics/claude-code-action@v1
+  #     - uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1 @ 2026-10-19
   #       with:
   #         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
   #         direct_prompt: |
