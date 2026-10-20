@@ -938,7 +938,9 @@ class VpnViewModel : ViewModel() {
     fun startIroh() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                ensureIrohStarted()
+                if (connector.ensureIrohStarted(isIrohStarted.value)) {
+                    isIrohStarted.value = true
+                }
             } catch (e: Exception) {
                 addLog("Error starting iroh: ${e.message}")
                 errorMessage.value = e.message ?: AppStrings.get(R.string.error_unknown)
@@ -947,238 +949,57 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * Starts the iroh endpoint if it is not up yet. nativeStartIroh already has
-     * a 30s timeout on the Rust side. Throwing means failure; the caller
-     * decides whether to retry.
-     */
-    private suspend fun ensureIrohStarted() {
-        if (isIrohStarted.value) return
-        addLog("Starting iroh first...")
-        val id = IrohProxy.nativeStartIroh()
-        if (id != null) {
-            isIrohStarted.value = true
-            addLog("Iroh started: $id")
-        } else {
-            throw Exception(AppStrings.get(R.string.error_start_iroh))
-        }
-    }
-
-    /**
-     * Reads the system DNS server list from ConnectivityManager and returns it
-     * as a comma-separated string of IPs.
+     * The connection sequence, without the screen around it.
      *
-     * By default iroh fails to read the system DNS on Android through JNI
-     * ("Null pointer in call_method obj argument") and falls back to Google DNS
-     * (8.8.8.8/8.8.4.4), which is unreliable behind restrictive networks and
-     * leaves the backend unreachable. Instead, Kotlin reads the system DNS
-     * straight from ConnectivityManager.getLinkProperties().dnsServers and
-     * hands it to nativeSetDnsServers on the Rust side, so iroh uses a custom
-     * DnsResolver instead of the broken JNI path.
-     *
-     * A connected Wi-Fi network is always preferred; cellular is only picked
-     * when no usable Wi-Fi exists. Only that network's DNS is read, so Wi-Fi
-     * and cellular DNS are never mixed. If the system DNS list is empty (an
-     * edge case), fall back to public DNS servers that are widely reachable
-     * from mainland China (AliDNS 223.5.5.5, 114DNS 114.114.114.114).
+     * The same sequence the boot receiver runs, so that a tunnel brought up at
+     * seven in the morning is built exactly like one the user asked for.
      */
-    private fun getSystemDnsServers(context: Context): String {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            ?: return ""
-        val selectedNetwork = UnderlyingNetworkSelector.selectPreferredNetwork(cm)
-        val servers = UnderlyingNetworkSelector
-            .dnsServers(cm, selectedNetwork)
-            .toCollection(linkedSetOf())
-        if (servers.isNotEmpty()) {
-            addLog(
-                "Using ${UnderlyingNetworkSelector.transportName(cm, selectedNetwork)} DNS: $servers"
-            )
+    private val connector = ProxyConnector(object : ProxyConnector.ConnectionLog {
+        override fun log(message: String) {
+            addLog(message)
         }
-
-        // Last-resort fallback: public DNS servers commonly reachable from
-        // mainland China. AliDNS + 114DNS cover the common cases.
-        if (servers.isEmpty()) {
-            addLog("No system DNS found, falling back to public DNS (223.5.5.5, 114.114.114.114)")
-            servers.add("223.5.5.5")
-            servers.add("114.114.114.114")
-        }
-
-        return servers.joinToString(",")
-    }
-
-    /**
-     * Pre-resolves the IPs of the iroh infrastructure domains and injects them
-     * into the OverrideResolver on the Rust side.
-     *
-     * The Great Firewall (GFW) drops UDP DNS responses for iroh.link domains,
-     * so iroh's internal hickory resolver times out on dns.iroh.link and
-     * *.relay.n0.iroh.link. Those domains are pre-resolved here with the system
-     * DNS (InetAddress, which may go through DoT / Private DNS and bypass the
-     * GFW) and returned as "domain=ip1,ip2;domain2=ip3" for connect() to pass
-     * to nativeSetDnsOverride. The OverrideResolver then returns the
-     * pre-resolved IPs directly for these domains, so pkarr resolve (HTTPS to
-     * dns.iroh.link/pkarr/<z32>) and the relay connection succeed.
-     */
-    private suspend fun resolveIrohDnsOverrides(): String {
-        // DNS origin and default relay servers used by iroh presets::N0.
-        val domains = listOf(
-            "dns.iroh.link",
-            "use1-1.relay.n0.iroh.link",
-            "usw1-1.relay.n0.iroh.link",
-            "euc1-1.relay.n0.iroh.link",
-            "aps1-1.relay.n0.iroh.link",
-        )
-
-        val overrides = kotlinx.coroutines.coroutineScope {
-            domains.map { domain ->
-                async(Dispatchers.IO) {
-                    try {
-                        val addrs = InetAddress.getAllByName(domain)
-                        val ips = addrs.mapNotNull { it.hostAddress }
-                        if (ips.isNotEmpty()) {
-                            addLog("Resolved iroh domain $domain -> $ips")
-                            "$domain=${ips.joinToString(",")}"
-                        } else {
-                            addLog("Failed to resolve iroh domain $domain (no IPs)")
-                            null
-                        }
-                    } catch (e: Exception) {
-                        addLog("Failed to resolve iroh domain $domain: ${e.message}")
-                        null
-                    }
-                }
-            }.awaitAll()
-        }
-
-        val result = overrides.filterNotNull().joinToString(";")
-        addLog("iroh DNS overrides: $result")
-        return result
-    }
-
-    /**
-     * Clears and re-adds the domain -> node mappings. Returns the list of all
-     * domains that have to be proxied; throws when there is no mapping at all.
-     */
-    private suspend fun addDomainMappings(): List<String> {
-        IrohProxy.nativeClearNodes()
-        var hasDomainMappings = false
-        for (node in nodes.value) {
-            if (node.domains.isNotEmpty()) {
-                for (domain in node.domains) {
-                    addLog("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId}")
-                    val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
-                    if (result != 0) {
-                        addLog("Failed to add domain mapping: $domain")
-                    } else {
-                        hasDomainMappings = true
-                    }
-                }
-            }
-        }
-        if (!hasDomainMappings) {
-            throw Exception(AppStrings.get(R.string.error_no_domain_mappings))
-        }
-        return nodes.value.flatMap { it.domains }
-    }
-
-    /**
-     * Builds the endpoint group the tunnel runs on. nativeStopProxy runs first so a
-     * previous attempt cannot leave half of one behind.
-     *
-     * Nothing is bound on loopback: on Android every app shares 127.0.0.1, so a
-     * local proxy port hands any of them an already-authenticated tunnel without
-     * the user being asked. The tunnel is entered through the TUN fd alone
-     * (nativeStartTunProxy), which is what the VPN permission covers.
-     *
-     * There is nothing to retry here: a failure is either a configuration error
-     * (malformed endpoint ID, no domains) or a group that could not be built,
-     * and both fail identically on every attempt. Either way the real reason is
-     * on the native side, so it leads the message instead of a generic string.
-     */
-    private suspend fun startEndpointGroup() {
-        addLog("Starting endpoint group...")
-        IrohProxy.nativeStopProxy()
-        val result = IrohProxy.nativeStartProxy()
-        if (result != 0) {
-            val reason = nativeFailureReason()
-            throw Exception(
-                AppStrings.get(R.string.error_invalid_proxy_config) +
-                    if (reason != null) ": $reason" else ""
-            )
-        }
-        addLog("Endpoint group started")
-    }
-
-    /**
-     * Human-readable reason for a failed native pre-connect.
-     *
-     * `nativePreconnect` returns the number of backends that answered. Zero means
-     * every configured endpoint ID was unreachable (wrong ID, server offline, or
-     * the relay/network blocks it). A negative value means the check itself could
-     * not run, e.g. no endpoint group or it exceeded its timeout.
-     */
-    private fun preconnectFailureReason(result: Int): String {
-        val targets = nodes.value
-            .map { it.nodeId }
-            .ifEmpty { listOf(AppStrings.get(R.string.error_configured_backends)) }
-            .joinToString(", ")
-        val base = if (result == 0) {
-            AppStrings.get(R.string.error_no_backend_reachable, targets)
-        } else {
-            AppStrings.get(R.string.error_preconnect_failed, result)
-        }
-        // A server that answered and then refused the connection (2FA, most
-        // often) leaves its reason on the native side. Without it a refusal
-        // looks exactly like an offline server.
-        val detail = nativeFailureReason()
-        return if (detail != null) {
-            "$base ${AppStrings.get(R.string.error_cause, detail)}"
-        } else {
-            base
-        }
-    }
-
-    /** Reason behind the last failed native call, or null when there is none. */
-    private fun nativeFailureReason(): String? = try {
-        IrohProxy.nativeTakeLastError()
-    } catch (e: Exception) {
-        addLog("Could not read the native error: ${e.message}")
-        null
-    }
+    })
 
     /**
      * Null when [id] is a valid endpoint ID, otherwise a message for the user.
      *
-     * The check runs through the native parser, so it can never disagree with the
-     * connection path. Best-effort by design: when the native library is not loaded the
-     * ID is accepted here and the connect-time pre-flight reports the problem instead.
+     * The check runs through the native parser, so it can never disagree with
+     * the connection path — and it is the same check the connection makes, so
+     * an ID that passes here passes there.
      */
-    private fun nodeIdFormatError(id: String): String? {
-        if (!IrohProxy.isNativeLoaded()) return null
-        val reason = try {
-            IrohProxy.nativeValidateNodeId(id)
-        } catch (e: Exception) {
-            addLog("Node ID validation unavailable: ${e.message}")
-            return null
-        } ?: return null
-        return AppStrings.get(R.string.error_invalid_endpoint_id, id, reason)
-    }
+    private fun nodeIdFormatError(id: String): String? = connector.nodeIdFormatError(id)
 
     /**
      * Validates every configured node before a connect attempt starts.
      *
-     * Without this a malformed ID only surfaced from deep inside the native proxy start:
-     * the native layer returns a bare -1 for every failure, the caller read that as
-     * "port in use", and the user got "Failed to start proxy on ports 8080..8089" after
-     * 10 ports x 3 attempts — a message that named neither the node nor the real cause.
+     * Without this a malformed ID only surfaced from deep inside the native
+     * proxy start: the native layer returns a bare -1 for every failure, the
+     * caller read that as "port in use", and the user got "Failed to start proxy
+     * on ports 8080..8089" after 10 ports x 3 attempts — a message that named
+     * neither the node nor the real cause.
      *
      * @return null when every ID parses, otherwise the reason for the first invalid one.
      */
-    private fun validateConfiguredNodeIds(): String? {
+    private fun validateConfiguredNodeIds(): String? =
+        connector.validateConfiguredNodeIds(nodes.value)
+
+    /**
+     * The private half of each endpoint's device key, by endpoint ID.
+     *
+     * Read from the sealed store rather than from the native tables, because
+     * the key has to be on disk before it is handed to the native side: a key
+     * that is only in memory is a key the next connect will not have.
+     */
+    private fun deviceKeysByNodeId(): Map<String, String> {
+        val manager = settingsManager ?: return emptyMap()
+        val keys = mutableMapOf<String, String>()
         for (node in nodes.value) {
-            val error = nodeIdFormatError(node.nodeId)
-            if (error != null) return error
+            val key = manager.deviceKeyFor(node.nodeId)
+            if (key.isNotBlank()) {
+                keys[node.nodeId] = key
+            }
         }
-        return null
+        return keys
     }
 
     /**
@@ -1378,123 +1199,35 @@ class VpnViewModel : ViewModel() {
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
                         withTimeout(ATTEMPT_TIMEOUT_MS) {
-                            // Inject the system DNS into iroh so it does not
-                            // fall back to Google DNS after the JNI system-DNS
-                            // read fails on Android (unreliable behind
-                            // restrictive networks, backends unreachable).
-                            // Re-read on every retry because the network may
-                            // have changed after releaseAllResources.
-                            val dnsServers = getSystemDnsServers(context)
-                            if (dnsServers.isNotEmpty()) {
-                                addLog("Injecting system DNS servers: $dnsServers")
-                                IrohProxy.nativeSetDnsServers(dnsServers)
-                            }
-                            // Pre-resolve the iroh infrastructure domains
-                            // (dns.iroh.link + relays) to work around the GFW
-                            // dropping iroh.link UDP DNS responses. Re-resolved
-                            // on every retry.
-                            val dnsOverrides = resolveIrohDnsOverrides()
-                            if (dnsOverrides.isNotEmpty()) {
-                                IrohProxy.nativeSetDnsOverride(dnsOverrides)
-                            }
-                            // Configure the relay mode
-                            IrohProxy.nativeSetRelayConfig(
-                                relayMode.value,
-                                relayUrl.value,
-                                relayAuthToken.value
-                            )
-                            // Configure the 2FA credentials (must be injected
-                            // before nativeStartProxy). Every endpoint carries
-                            // its own pair, so the native table is cleared
-                            // first: without that, an endpoint whose 2FA was
-                            // switched off would still hold the credentials of
-                            // an earlier connect for as long as the process
-                            // lives.
-                            IrohProxy.nativeClearNodeTwoFactor()
-                            // One name for this install, however many endpoints
-                            // it authenticates to, read when the enrollment
-                            // below is armed. Before any credential is
-                            // registered rather than after: what is in the
-                            // native tables at nativeStartProxy is what goes
-                            // on the wire.
-                            IrohProxy.nativeSetDeviceId(deviceId.value)
-                            for (node in nodes.value) {
-                                val otp = node.twoFactor?.takeIf { it.enabled } ?: continue
-                                IrohProxy.nativeSetTwoFactorForNode(
-                                    node.nodeId,
-                                    otp.clientId,
-                                    otp.secret,
-                                    otp.algorithm,
-                                    // The device this secret was issued to, or
-                                    // empty for one issued to the client —
-                                    // which is every pair this app could hold
-                                    // before devices existed, and every pair a
-                                    // plain invite will ever hand over. Those
-                                    // must keep answering unnamed: a server
-                                    // asked for a device it does not know
-                                    // refuses rather than falling back.
-                                    otp.device.orEmpty()
+                            // The sequence itself lives in [ProxyConnector], so
+                            // that a tunnel brought up at boot is built exactly
+                            // like one the user asked for.
+                            val outcome = connector.prepare(
+                                context,
+                                ProxyConnector.Plan(
+                                    nodes = nodes.value,
+                                    relayMode = relayMode.value,
+                                    relayUrl = relayUrl.value,
+                                    relayAuthToken = relayAuthToken.value,
+                                    deviceId = deviceId.value,
+                                    deviceKeys = deviceKeysByNodeId(),
+                                    irohStarted = isIrohStarted.value,
+                                    // The import that armed the enrollment sealed
+                                    // the key off the main thread; joining here is
+                                    // what makes the read below wait for that write
+                                    // to land, rather than hand the native side a key
+                                    // that is not on disk yet.
+                                    awaitDeviceKeys = { deviceKeyPrep?.join() }
                                 )
+                            ) {
+                                // The pre-connect is what spent the token: read the
+                                // secret it bought now, because a second connect has
+                                // nothing left to spend.
+                                collectIssuedCredential()
                             }
-                            // A token instead of credentials, for an endpoint that was
-                            // invited with one. Only where no secret exists: enrolling
-                            // rotates the secret, so an endpoint that already has one
-                            // must not spend a token again.
-                            for (node in nodes.value) {
-                                val enrollment = node.enrollment ?: continue
-                                val hasSecret = node.twoFactor?.takeIf { it.enabled }
-                                    ?.secret?.isNotBlank() == true
-                                if (hasSecret) continue
-                                IrohProxy.nativeSetEnrollmentForNode(
-                                    node.nodeId,
-                                    enrollment.clientId,
-                                    enrollment.token
-                                )
+                            if (outcome.startedIroh) {
+                                isIrohStarted.value = true
                             }
-                            // The device key of an endpoint that has one, for the
-                            // two things it is used for: the enrollment above
-                            // offers it, and every handshake after it signs with
-                            // it. Registered before the group starts, like every
-                            // other credential — what is in the native tables at
-                            // nativeStartProxy is what goes on the wire.
-                            //
-                            // The import that armed the enrollment sealed the key
-                            // off the main thread; joining here is what makes the
-                            // read below wait for that write to land, rather than
-                            // hand the native side a key that is not on disk yet.
-                            deviceKeyPrep?.join()
-                            for (node in nodes.value) {
-                                val key = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
-                                if (key.isBlank()) continue
-                                IrohProxy.nativeSetDeviceKeyForNode(node.nodeId, key)
-                            }
-                            ensureIrohStarted()
-                            val allDomains = addDomainMappings()
-                            startEndpointGroup()
-
-                            // Pre-connect: warm up iroh connections directly on the Rust side
-                            // and cache them in the shared connection pool. Unlike HTTP-based
-                            // warm-up through the local proxy, this does not depend on backends
-                            // answering plain HTTP requests, and it does not consume pooled
-                            // connections, so warm-up is reliable.
-                            //
-                            // This is also the only step that validates the configured endpoint
-                            // IDs against the network: nativeStartProxy merely parses them, so a
-                            // well-formed but nonexistent node ID (or a server that is down)
-                            // would sail through and the VPN would come up reporting "connected"
-                            // while every proxied request fails.
-                            addLog("Pre-connecting to backends (native warm-up)...")
-                            val preConnectedCount = IrohProxy.nativePreconnect()
-                            if (preConnectedCount <= 0) {
-                                // Fail the attempt: the retry loop gets another go, and if every
-                                // attempt fails the reason reaches errorMessage instead of a
-                                // green "connected" over a tunnel that reaches nothing.
-                                throw Exception(preconnectFailureReason(preConnectedCount))
-                            }
-                            addLog("Pre-connect completed: $preConnectedCount backend(s) warmed")
-                            // The pre-connect is what spent the token: read the secret it
-                            // bought now, because a second connect has nothing left to spend.
-                            collectIssuedCredential()
                             delay(1000)
                         }
 
