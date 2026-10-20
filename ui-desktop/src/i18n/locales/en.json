@@ -86,7 +86,8 @@
   "link": {
     "direct": "Direct",
     "relay": "Relay",
-    "connecting": "Connecting"
+    "connecting": "Connecting",
+    "rtt": "{count} ms"
   },
   "health": {
     "up": "Answers",

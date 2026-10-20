@@ -12,7 +12,7 @@ use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
-use nexapipe_client::LinkKind;
+use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -739,7 +739,8 @@ impl ProxyManager {
             return Vec::new();
         };
 
-        let kinds: HashMap<EndpointId, LinkKind> = group.link_kinds().await.into_iter().collect();
+        let statuses: HashMap<EndpointId, LinkStatus> =
+            group.link_statuses().await.into_iter().collect();
 
         self.config
             .nodes
@@ -752,10 +753,12 @@ impl ProxyManager {
                 // A node the group could not parse never got a pool, so there is nothing to
                 // report for it; dropping it keeps the list aligned with what actually dialed.
                 let addr = backend_addr(&node.connection)?;
+                let status = statuses.get(&addr.id).copied().unwrap_or_default();
                 Some(EndpointLink {
                     connection,
                     endpoint_id: addr.id.to_string(),
-                    link: kinds.get(&addr.id).copied().unwrap_or(LinkKind::Unknown),
+                    link: status.kind,
+                    rtt_ms: status.rtt.map(|rtt| rtt.as_millis() as u64),
                 })
             })
             .collect()

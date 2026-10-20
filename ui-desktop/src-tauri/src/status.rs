@@ -99,6 +99,12 @@ pub struct EndpointLink {
     pub endpoint_id: String,
     /// `direct`, `relay`, or `unknown` when the backend has no selected path yet.
     pub link: LinkKind,
+    /// The round-trip time of the path carrying the traffic, in milliseconds.
+    ///
+    /// `None` when iroh has no sample yet — a path that has just opened, or a
+    /// relay that does not report one. It is not a zero, and the UI must not
+    /// draw it as one.
+    pub rtt_ms: Option<u64>,
 }
 
 /// What the last probe of one configured node found.
@@ -258,17 +264,29 @@ mod tests {
     }
 
     /// The frontend keys nodes off `connection` and reads `link` as one of three fixed
-    /// spellings, so the wire shape has to stay put.
+    /// spellings, so the wire shape has to stay put — and the round-trip time
+    /// arrives as a number or as `null`, never as a zero standing in for "not
+    /// measured".
     #[test]
     fn serializes_endpoint_links() {
         let link = EndpointLink {
             connection: "node1ticket".to_string(),
             endpoint_id: "0123456789abcdef".to_string(),
             link: LinkKind::Relay,
+            rtt_ms: Some(23),
         };
         assert_eq!(
             serde_json::to_string(&link).unwrap(),
-            r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay"}"#
+            r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay","rttMs":23}"#
+        );
+
+        let unmeasured = EndpointLink {
+            rtt_ms: None,
+            ..link
+        };
+        assert_eq!(
+            serde_json::to_string(&unmeasured).unwrap(),
+            r#"{"connection":"node1ticket","endpointId":"0123456789abcdef","link":"relay","rttMs":null}"#
         );
     }
 
