@@ -6,12 +6,13 @@ to a relay, and by default that relay is one of the four n0 operates. Running
 your own is what turns "the fallback is somebody else's machine" into "the
 fallback is mine", and it costs one process on a host you already have.
 
-It does not turn NexaPipe into something with no third party in it. Endpoint ID
-discovery still asks n0 where to send QUIC packets, and a peer that advertises
-an N0 relay is still dialled through it. Read
+It does not turn NexaPipe into something with no third party in it on its own.
+Two other settings finish that job, and this page is deliberately silent about
+them because they are not about the relay: `discovery = "none"` takes n0's
+Endpoint ID lookup off the endpoint, and `relay_mode = "custom"` refuses to
+dial a peer through a relay other than the one you run. Read
 [What still depends on third-party infrastructure](iroh-boundaries.md) before
-you decide what your relay bought you; this page is deliberately silent about
-those two, because owning the relay does not change either of them.
+you decide what your relay bought you.
 
 | | |
 |---|---|
@@ -383,20 +384,21 @@ therefore configured directly on every client, or is not protected usefully.
 Restating this here rather than leaving it to the other page, because it is the
 part people assume:
 
-- **Endpoint ID discovery still goes to n0.** Turning a Node ID into "where do
-  I send QUIC packets" queries `dns.iroh.link`, over HTTPS and over DNS, and it
-  does that regardless of `relay_mode`; no NexaPipe setting turns it off. iroh
-  1.3.0 has `clear_address_lookup()`; NexaPipe does not call it.
-- **A peer's advertised relay is still dialled.** `allowed_relay_urls()` — the
-  set you would build an address filter from — has no production caller, so
-  `custom` bounds *this* endpoint and nothing else. If your requirement is "no
-  traffic of mine or my peers touches an n0 relay", `disabled` with successful
-  hole punching is still the only answer that ships, and it fails outright when
-  punching does not succeed.
 - **A relay is still a relay.** It cannot read what it carries — the traffic is
   QUIC end to end — but it does see that your endpoints talk, when, and roughly
   how much. What you bought is not invisibility; it is that the other party is
   you.
+
+And what it does change, since both are settings now:
+
+- **Endpoint ID discovery can be turned off.** `discovery = "none"` takes n0's
+  lookup off the endpoint, so nothing about it reaches `dns.iroh.link`. The
+  price is that a Node ID alone no longer reaches a peer — a ticket carries an
+  address, and a ticket is what `--generate-invite` produces.
+- **A peer naming somebody else's relay is refused.** A `custom` client dials
+  its peer through your relay and nothing else: a peer whose address names a
+  different relay, and a peer named only by a Node ID, are both refused rather
+  than quietly dialled through an n0 relay.
 
 Full reasoning in
 [What still depends on third-party infrastructure](iroh-boundaries.md).

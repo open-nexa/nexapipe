@@ -151,6 +151,19 @@ relay_mode = "default"
 # token.
 # relay_auth_token_file = ""
 
+# Whether this endpoint may use n0's address lookup — the DNS and pkarr
+# queries that turn a Node ID into "where do I send QUIC packets". It is the
+# one piece of n0's infrastructure that relay_mode does not reach, so it has a
+# setting of its own. Unset means n0.
+#   n0    - the endpoint publishes its address there and resolves other
+#           endpoints' addresses through it
+#   none  - no lookup at all. Nothing about this endpoint reaches n0's lookup
+#           service, and a Node ID alone no longer reaches this endpoint: a
+#           client has to bring an address of its own, which is what a ticket
+#           (--generate-invite) carries
+# A value that is present but unknown refuses the start.
+# discovery = "n0"
+
 # ============================================================
 # [log] - logging and rotation
 # ============================================================
