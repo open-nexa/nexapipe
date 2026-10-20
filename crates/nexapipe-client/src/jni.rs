@@ -1513,6 +1513,12 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
         return std::ptr::null_mut();
     }
 
+    // The reason left behind by an earlier failure is not the reason for this
+    // one: the caller reads it after a failed start, and a stale one is a
+    // reason for something that did not happen. The attempt below writes its
+    // own.
+    clear_last_error();
+
     let runtime = match get_runtime() {
         Some(r) => r,
         None => return std::ptr::null_mut(),
@@ -1641,10 +1647,17 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
         match tokio::time::timeout(IROH_BIND_TIMEOUT, builder.bind()).await {
             Ok(Ok(ep)) => Ok(ep),
             Ok(Err(e)) => {
+                // The reason the caller shows the user: "could not start iroh"
+                // on its own names nothing they can act on.
+                set_last_error(format!("failed to start the iroh endpoint: {e}"));
                 jni_log!("Failed to start iroh endpoint: {}", e);
                 Err(())
             }
             Err(_) => {
+                set_last_error(format!(
+                    "the iroh endpoint did not start within {}s",
+                    IROH_BIND_TIMEOUT.as_secs()
+                ));
                 jni_log!(
                     "iroh endpoint bind timed out after {}s",
                     IROH_BIND_TIMEOUT.as_secs()

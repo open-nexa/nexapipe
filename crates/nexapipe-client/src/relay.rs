@@ -389,7 +389,8 @@ fn is_n0_relay(url: &RelayUrl) -> bool {
 /// is written with: iroh-relay dials `http` and `ws` as `ws://` and
 /// everything else as `wss://`, so `https://relay.example.com` and
 /// `wss://relay.example.com` are one relay written two ways, and refusing the
-/// second would refuse a peer that named ours.
+/// second would refuse a peer that named ours. A URL the parser will not
+/// turn into a websocket URL names no relay at all.
 ///
 /// The port is the one the URL carries: the parser erases a port that is the
 /// scheme's default, so a URL that leaves the port out and a URL that writes
@@ -399,18 +400,31 @@ fn same_relay(a: &RelayUrl, b: &RelayUrl) -> bool {
         url.host_str()
             .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
     };
-    dial_scheme(a) == dial_scheme(b) && host(a) == host(b) && a.port() == b.port()
+    // A URL that cannot be dialled names no relay, so it is not ours either:
+    // two of them are not the same relay, they are two URLs that reach nothing.
+    match (dial_scheme(a), dial_scheme(b)) {
+        (Some(scheme_a), Some(scheme_b)) => {
+            scheme_a == scheme_b && host(a) == host(b) && a.port() == b.port()
+        }
+        _ => false,
+    }
 }
 
-/// The scheme a relay URL is dialled with.
+/// The scheme a relay URL is dialled with, or `None` when it cannot be
+/// dialled at all.
 ///
 /// iroh-relay turns `http` and `ws` into `ws://` and everything else into
 /// `wss://` before it connects, so the scheme a URL is written with is not the
 /// scheme it is dialled with.
-fn dial_scheme(url: &RelayUrl) -> &str {
+///
+/// The URL parser refuses that change for a scheme it does not treat as
+/// special — `foo://` cannot become `wss://` — and a URL it refuses is not a
+/// relay this endpoint can reach at all, so it names none.
+fn dial_scheme(url: &RelayUrl) -> Option<&str> {
     match url.scheme() {
-        "http" | "ws" => "ws",
-        _ => "wss",
+        "http" | "ws" => Some("ws"),
+        "https" | "wss" | "ftp" | "file" => Some("wss"),
+        _ => None,
     }
 }
 
@@ -700,6 +714,42 @@ mod tests {
             .with_relay_url("https://relay.example.com:8443".parse().unwrap());
 
         assert!(restriction.permits(&addr).is_err());
+    }
+
+    /// The default port and the written port are the same relay: the parser
+    /// erases a port that is the scheme's default, so the two spellings are
+    /// the same URL before the comparison sees them.
+    #[test]
+    fn the_default_port_and_the_written_port_are_the_same_relay() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let addr = EndpointAddr::new(node_id())
+            .with_relay_url("https://relay.example.com:443".parse().unwrap());
+
+        assert!(
+            restriction.permits(&addr).is_ok(),
+            "443 is what the URL without a port means"
+        );
+    }
+
+    /// A scheme the URL parser will not turn into a websocket URL names no
+    /// relay this endpoint can reach, so it is refused rather than dialled and
+    /// failed at.
+    #[test]
+    fn a_url_that_cannot_be_dialled_names_no_relay() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let url: RelayUrl = "foo://relay.example.com".parse().unwrap();
+        let addr = EndpointAddr::new(node_id()).with_relay_url(url);
+
+        assert!(
+            restriction.permits(&addr).is_err(),
+            "a URL that cannot be dialled is not our relay"
+        );
     }
 
     /// The websocket spelling of our relay is our relay: iroh-relay dials
