@@ -65,8 +65,13 @@ class ProxyConnector(private val log: ConnectionLog) {
          * is read after [awaitDeviceKeys] has run, because a key that is
          * still being sealed at that point is a key that is not on disk yet,
          * and a snapshot taken earlier would hand the native side nothing.
+         *
+         * The nodes are passed in rather than read from the caller: the plan
+         * carries a snapshot of them, and a key that is missing from the map
+         * is a key that is not registered — which is what a half-finished
+         * enrolment costs.
          */
-        val deviceKeys: () -> Map<String, String> = { emptyMap() },
+        val deviceKeys: (List<NodeConfig>) -> Map<String, String> = { emptyMap() },
         /**
          * Whether the iroh endpoint is already up.
          *
@@ -187,7 +192,7 @@ class ProxyConnector(private val log: ConnectionLog) {
         // write to land, rather than hand the native side a key that is not on
         // disk yet.
         plan.awaitDeviceKeys()
-        val deviceKeys = plan.deviceKeys()
+        val deviceKeys = plan.deviceKeys(plan.nodes)
         for (node in plan.nodes) {
             val key = deviceKeys[node.nodeId].orEmpty()
             if (key.isBlank()) continue

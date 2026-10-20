@@ -97,11 +97,6 @@ object BootConnector {
             log("boot: ${configured.size - endpoints.size} endpoint(s) left out, still waiting to be enrolled")
         }
 
-        val deviceKeys = endpoints.mapNotNull { node ->
-            val key = settings.deviceKeyFor(node.nodeId)
-            if (key.isBlank()) null else node.nodeId to key
-        }.toMap()
-
         val connector = ProxyConnector(object : ProxyConnector.ConnectionLog {
             override fun log(message: String) {
                 log(message)
@@ -114,10 +109,16 @@ object BootConnector {
             relayUrl = settings.loadRelayUrl(),
             relayAuthToken = settings.loadRelayAuthToken(),
             deviceId = settings.deviceId(),
-            // Read when the sequence asks for it: the boot path has nothing to
-            // wait for — the key was sealed in an earlier session — but the
-            // sequence is the one that decides when to read it.
-            deviceKeys = { deviceKeys }
+            // Read when the sequence asks for it, and for the endpoints it
+            // carries: the boot path has nothing to wait for — the key was
+            // sealed in an earlier session — but the sequence is the one that
+            // decides when to read it.
+            deviceKeys = { nodes ->
+                nodes.mapNotNull { node ->
+                    val key = settings.deviceKeyFor(node.nodeId)
+                    if (key.isBlank()) null else node.nodeId to key
+                }.toMap()
+            }
         )
 
         // Throws when the attempt cannot be made; the caller decides what to do

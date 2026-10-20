@@ -1021,11 +1021,16 @@ class VpnViewModel : ViewModel() {
      * Read from the sealed store rather than from the native tables, because
      * the key has to be on disk before it is handed to the native side: a key
      * that is only in memory is a key the next connect will not have.
+     *
+     * The nodes are the ones the caller asks about, not the current list: a
+     * connect carries a snapshot of the endpoints, and a key that is missing
+     * from the map is a key that is not registered — which is what a
+     * half-finished enrolment costs.
      */
-    private fun deviceKeysByNodeId(): Map<String, String> {
+    private fun deviceKeysByNodeId(nodes: List<NodeConfig>): Map<String, String> {
         val manager = settingsManager ?: return emptyMap()
         val keys = mutableMapOf<String, String>()
-        for (node in nodes.value) {
+        for (node in nodes) {
             val key = manager.deviceKeyFor(node.nodeId)
             if (key.isNotBlank()) {
                 keys[node.nodeId] = key
@@ -1247,7 +1252,9 @@ class VpnViewModel : ViewModel() {
                                     // enrollment, and a map built before that
                                     // write lands is a map without the key in
                                     // it — which is the same as having no key.
-                                    deviceKeys = { deviceKeysByNodeId() },
+                                    // And for the endpoints this plan carries,
+                                    // not for whatever the list says now.
+                                    deviceKeys = { nodeList -> deviceKeysByNodeId(nodeList) },
                                     irohStarted = isIrohStarted.value,
                                     // The import that armed the enrollment sealed
                                     // the key off the main thread; joining here is
