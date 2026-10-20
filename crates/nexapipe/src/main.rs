@@ -857,6 +857,7 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                     "created_at": seconds_of(&client.created_at),
                     "last_used": client.last_used,
                     "allow_hosts": client.allow_hosts,
+                    "allow_ports": client.allow_ports,
                     "invite_outstanding": client.pending_enrollment.is_some(),
                     "failed_attempts": client.failed_attempts,
                     "locked_out": client.is_locked_out(),
@@ -900,6 +901,21 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
             && !hosts.is_empty()
         {
             println!("    allow hosts {}", hosts.join(", "));
+        }
+        // Printed whenever the key is there, empty list included: an empty
+        // list is the strictest setting there is, and a line that only shows
+        // up for a non-empty list hides it exactly where it matters.
+        if let Some(ports) = &client.allow_ports {
+            let ports = if ports.is_empty() {
+                "none, every port is denied".to_string()
+            } else {
+                ports
+                    .iter()
+                    .map(|port| port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("    allow ports {ports}");
         }
         if client.pending_enrollment.is_some() {
             println!("    invite      outstanding");
