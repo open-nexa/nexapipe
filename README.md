@@ -939,6 +939,67 @@ and both are bounded by their own keys.
 
 Read once at startup, so editing any of these takes a restart.
 
+### `[limits]` — the ceilings the process runs under
+
+```toml
+[limits]
+max_connections_per_peer = 64         # default: 64 — one peer's connections at once
+max_connections_global = 4096         # default: 4096 — every peer's, together
+max_streams_global = 16384            # default: 16384 — streams in flight
+max_body_bytes = 1073741824           # default: 1 GiB — request bodies held at once
+```
+
+All are optional, and every default is the ceiling the server always used, so
+writing the section changes nothing until you put a number in it.
+
+Two of them answer the same question at different scales, and both are needed. A
+peer id is a public key, so a caller can invent as many of them as it likes:
+the per-peer ceiling stops one peer from holding thousands of connections, and
+the global one stops the *process* from being crowded out by however many peers
+exist. Neither subsumes the other. `max_streams_global` is the same idea one
+level down — every connection may open its own allowance, and the total is
+again a product of however many peers exist. `max_body_bytes` bounds memory:
+request bodies are read whole before being forwarded, so 64 MB per request is
+defensible and the same 64 MB times every stream at once is not.
+
+**Which path they cover.** The three connection and stream ceilings are counted
+against the **iroh tunnel**, because that is where a peer is: they bound what
+the tunneled clients may hold. The plaintext listener (`[server] listen_addr`)
+has no peer to count against and no ceiling of its own — it accepts a
+connection and serves it. `max_body_bytes` is the exception: request bodies are
+read through one reader shared by both listeners, so the byte budget bounds the
+plaintext listener as well.
+
+A **zero** is refused at startup for every key: a ceiling of 0 would refuse
+every connection rather than bound them, which is a typo rather than a setting,
+and the file is somewhere you can read the error. It is refused even when the
+matching environment variable is set — the environment overrides a value that
+*works*, not one that does not, and a typo hidden behind a variable is a typo
+that waits for the day the variable goes away. An **unknown key is refused at
+load**, before the server starts at all — a misspelled limit is a limit that
+silently does not apply, and the process would then run with a ceiling nobody
+wrote down.
+
+The effective ceilings are printed at startup:
+
+```
+Accepting at most 64 concurrent connections per peer, 4096 across the process, 16384 streams across the process, 1073741824 bytes of request bodies across the process
+```
+
+The four environment variables that named these ceilings before the section
+existed — `NEXAPIPE_MAX_CONNS_PER_PEER`, `NEXAPIPE_MAX_CONNS`,
+`NEXAPIPE_MAX_STREAMS` and `NEXAPIPE_MAX_BODY_BYTES` — still work, and
+**the environment wins** over the config: it is the last thing an operator
+sets, and in a container it is often the only thing they can set. A key both
+name is a warning in the log rather than a refusal, so the ambiguity is visible
+rather than silent. A value the environment cannot use — `0`, or something
+that is not a number — is ignored and the default is used instead, because a bad
+variable in a Dockerfile should not keep the server from starting.
+
+Read once at startup, so editing any of these takes a restart: a budget that
+changed under an in-flight upload would release bytes against a ceiling it was
+never counted against.
+
 ### `[admin]` — the auxiliary listener (off by default)
 
 ```toml
@@ -1120,6 +1181,7 @@ is one table:
 | `[health_check]` | Applied. `enabled` pauses and resumes probing; the rest takes effect for routes added or changed by a reload. |
 | `[backends]`, `[retry]`, `[circuit_breaker]` | Restart-only: read once at startup, like `[timeouts]`. |
 | `[timeouts]` | Restart-only: read once at startup, like `[server] listen_addr`. |
+| `[limits]` | Restart-only: read once at startup, like `[timeouts]`. |
 | `[peers] allow` | Restart-only for now. |
 | `[iroh]` | Restart-only: the endpoint is bound once. |
 | `[server] listen_addr` | Restart-only — moving a listener is a restart. |

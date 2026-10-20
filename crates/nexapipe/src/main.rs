@@ -564,6 +564,7 @@ async fn run_server_mode(
             admin: admin_config,
             metrics: metrics_config,
             backends: proxy_config.backends.clone(),
+            limits: proxy_config.limits,
         },
     )
     .await

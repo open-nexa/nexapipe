@@ -8,6 +8,7 @@ use crate::config::{
 };
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
+use crate::conn::limits::{EnvCaps, Limits, LimitsConfig};
 use crate::health::{HealthChecker, HealthProbes, ProbeKind, ProbeTarget};
 use crate::http;
 use crate::log;
@@ -148,6 +149,8 @@ pub struct ProxyOptions {
     /// How the proxy reaches the backends: the trust store an `https://`
     /// backend's certificate is checked against.
     pub backends: BackendsConfig,
+    /// The ceilings the whole process runs under. Absent means the defaults.
+    pub limits: LimitsConfig,
 }
 
 pub async fn run_proxy(
@@ -165,7 +168,23 @@ pub async fn run_proxy(
         admin: admin_config,
         metrics: metrics_config,
         backends,
+        limits: limits_config,
     } = options;
+
+    // The ceilings the process runs under, resolved once and here: they are
+    // read at startup and not live, because a budget that changed under an
+    // in-flight upload would release bytes against a ceiling it was never
+    // counted against.
+    //
+    // The body budget's ceiling is written into the process-wide budget before
+    // anything can read a body, so no request is ever counted against a
+    // ceiling it did not start under.
+    //
+    // The error is not wrapped: `anyhow`'s `Display` shows the outermost
+    // message only, and the one this returns already names the section and
+    // the key that cannot work.
+    let limits = Limits::resolve(&limits_config, &EnvCaps::from_environment())?;
+    conn::limits::init_body_budget(limits.max_body_bytes);
 
     // Read from for `nexapipe_uptime_seconds`. Taken here rather than in
     // `main` so a `--local-proxy` run never sets it: there is one process-wide
@@ -573,7 +592,7 @@ pub async fn run_proxy(
     // if every accepted connection and stream counts against the same state.
     // Both ceilings are here rather than only the per-peer one because an
     // `EndpointId` is a public key — see `conn::limits`.
-    let limiters = conn::limits::Limiters::from_env();
+    let limiters = conn::limits::Limiters::from_limits(&limits);
     tracing::info!("Accepting at most {}", limiters.describe());
     crate::metrics::METRICS.record_connection_limits(
         limiters.connections.max(),

@@ -453,6 +453,57 @@ path = "/health"
 # tls_hello_secs = 10
 
 # ============================================================
+# [limits] - the ceilings the whole process runs under
+# ============================================================
+# Every key is optional; leaving the section out keeps the ceilings this server
+# has always used.
+#
+#   max_connections_per_peer  connections one peer may hold at once. The client
+#                              pool opens a connection per in-flight request, so
+#                              a busy client holds several - this is here to stop
+#                              a peer from holding thousands, not to shape
+#                              traffic. Default: 64
+#   max_connections_global    connections the whole process may hold. A peer id
+#                              is a public key, so a caller can invent as many
+#                              peers as it likes and the total would be a
+#                              product of "64 times however many you care to
+#                              generate". Neither ceiling subsumes the other.
+#                              Default: 4096
+#   max_streams_global        streams in flight across every connection - each
+#                              connection may open its own allowance, so the
+#                              total is the same product one level down.
+#                              Default: 16384
+#   max_body_bytes            bytes of request bodies held at once. Bodies are
+#                              read whole before being forwarded, so 64 MB per
+#                              request is defensible and the same 64 MB times
+#                              every stream at once is not. Default: 1 GiB
+#
+# A zero is refused at startup for every key: a ceiling of 0 would refuse every
+# connection rather than bound them, which is a typo rather than a setting. It
+# is refused even when the matching environment variable is set - the
+# environment overrides a value that works, not one that does not. An unknown
+# key is refused at load, before the server starts at all - a misspelled limit
+# is one that silently does not apply.
+#
+# The three connection and stream ceilings are counted against the iroh
+# tunnel, because that is where a peer is. The plaintext listener has no peer
+# to count against and no ceiling of its own; the byte budget is shared by
+# both listeners and so does bound it.
+#
+# The four environment variables that named these ceilings before this section
+# existed - NEXAPIPE_MAX_CONNS_PER_PEER, NEXAPIPE_MAX_CONNS,
+# NEXAPIPE_MAX_STREAMS and NEXAPIPE_MAX_BODY_BYTES - still work, and the
+# environment wins over the config. A key both name is a warning in the log.
+#
+# NOT hot-reloadable: read once at startup, so editing any of these takes a
+# restart.
+# [limits]
+# max_connections_per_peer = 64
+# max_connections_global = 4096
+# max_streams_global = 16384
+# max_body_bytes = 1073741824
+
+# ============================================================
 # [admin] - the auxiliary listener (off by default)
 # ============================================================
 # A second, loopback-only listener that answers questions about this instance
