@@ -935,7 +935,7 @@ and both are bounded by their own keys.
 
 Read once at startup, so editing any of these takes a restart.
 
-### `[limits]` — the ceilings the whole process runs under
+### `[limits]` — the ceilings the process runs under
 
 ```toml
 [limits]
@@ -958,12 +958,23 @@ again a product of however many peers exist. `max_body_bytes` bounds memory:
 request bodies are read whole before being forwarded, so 64 MB per request is
 defensible and the same 64 MB times every stream at once is not.
 
-A **zero** is refused at startup for every key: it would refuse every connection
-rather than bounding them, which is a typo rather than a setting, and the file
-is somewhere you can read the error. An **unknown key is refused at load**,
-before the server starts at all — a misspelled limit is a limit that silently
-does not apply, and the process would then run with a ceiling nobody wrote
-down.
+**Which path they cover.** The three connection and stream ceilings are counted
+against the **iroh tunnel**, because that is where a peer is: they bound what
+the tunneled clients may hold. The plaintext listener (`[server] listen_addr`)
+has no peer to count against and no ceiling of its own — it accepts a
+connection and serves it. `max_body_bytes` is the exception: request bodies are
+read through one reader shared by both listeners, so the byte budget bounds the
+plaintext listener as well.
+
+A **zero** is refused at startup for every key: a ceiling of 0 would refuse
+every connection rather than bound them, which is a typo rather than a setting,
+and the file is somewhere you can read the error. It is refused even when the
+matching environment variable is set — the environment overrides a value that
+*works*, not one that does not, and a typo hidden behind a variable is a typo
+that waits for the day the variable goes away. An **unknown key is refused at
+load**, before the server starts at all — a misspelled limit is a limit that
+silently does not apply, and the process would then run with a ceiling nobody
+wrote down.
 
 The effective ceilings are printed at startup:
 

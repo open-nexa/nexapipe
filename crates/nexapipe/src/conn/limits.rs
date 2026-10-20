@@ -101,9 +101,12 @@ impl Limits {
     ///
     /// **A zero in the config is refused at startup**, because it would refuse
     /// every connection and the file is somewhere the operator can read the
-    /// error. The environment keeps the older rule of ignoring a value it
-    /// cannot use, because a bad variable in a Dockerfile should not take the
-    /// listener offline.
+    /// error. It is refused *before* the environment is consulted: the rule is
+    /// that the environment overrides a value that works, not one that does
+    /// not, so a zero in the file is a typo whether or not a variable happens
+    /// to name the same key. The environment keeps the older rule of ignoring
+    /// a value it cannot use, because a bad variable in a Dockerfile should
+    /// not take the listener offline.
     pub fn resolve(config: &LimitsConfig, env: &EnvCaps) -> anyhow::Result<Self> {
         Ok(Self {
             max_connections_per_peer: resolve_one(
@@ -156,9 +159,17 @@ fn resolve_one(
     let from_env = from_env.filter(|value| *value > 0);
     if let Some(value) = from_config {
         if value == 0 {
+            // Refused before the environment is consulted, on purpose. The
+            // rule is "the environment overrides a value that works, not one
+            // that does not": a zero is refused whatever else names the key,
+            // because it is a typo in a file the operator can read, and a typo
+            // hidden behind an environment variable is a typo that waits for
+            // the day the variable goes away.
             anyhow::bail!(
-                "{key} is 0: that refuses every connection rather than bounding them, which is a \
-                 typo rather than a setting. The smallest useful value is 1"
+                "{key} is 0: a ceiling of 0 would refuse every connection rather than bound them, \
+                 which is a typo rather than a setting. The smallest useful value is 1. It is \
+                 refused even when {env_var} is set, because the environment overrides a value \
+                 that works, not one that does not"
             );
         }
         if let Some(env_value) = from_env {
@@ -324,6 +335,14 @@ impl Drop for PeerGuard {
 pub struct Limiters {
     pub connections: Arc<ConnectionLimiter>,
     pub streams: Arc<StreamLimiter>,
+    /// The ceiling on request bodies these limiters were built with.
+    ///
+    /// Carried here rather than read from the process-wide budget when
+    /// [`Self::describe`] needs it: the budget is a static the HTTP path
+    /// reaches without a config, and a type that describes its own ceilings
+    /// should report the ones it was given rather than whatever the static
+    /// happens to hold.
+    pub max_body_bytes: usize,
 }
 
 impl Limiters {
@@ -335,6 +354,7 @@ impl Limiters {
                 limits.max_connections_global,
             )),
             streams: Arc::new(StreamLimiter::new(limits.max_streams_global)),
+            max_body_bytes: limits.max_body_bytes,
         }
     }
 
@@ -347,7 +367,7 @@ impl Limiters {
             self.connections.max(),
             self.connections.max_global(),
             self.streams.max_global(),
-            body_budget().max()
+            self.max_body_bytes
         )
     }
 }
@@ -1064,6 +1084,63 @@ mod tests {
         assert_eq!(
             limits.max_connections_per_peer,
             DEFAULT_MAX_CONNECTIONS_PER_PEER
+        );
+    }
+
+    #[test]
+    fn a_zero_in_the_config_is_refused_even_when_the_environment_names_the_key() {
+        // The rule is "the environment overrides a value that works, not one
+        // that does not". A zero in the file is a typo whether or not a
+        // variable happens to name the same key - and a typo hidden behind an
+        // environment variable is a typo that waits for the day the variable
+        // goes away.
+        let config = LimitsConfig {
+            max_connections_per_peer: Some(0),
+            ..LimitsConfig::default()
+        };
+        let env = EnvCaps {
+            max_connections_per_peer: Some(64),
+            ..EnvCaps::default()
+        };
+
+        let error = Limits::resolve(&config, &env)
+            .expect_err("a ceiling of zero is refused whatever else names the key");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("max_connections_per_peer"),
+            "the error names the key that cannot work: {message}"
+        );
+        assert!(
+            message.contains(ENV_MAX_CONNECTIONS_PER_PEER),
+            "the error says that the environment does not save it: {message}"
+        );
+    }
+
+    #[test]
+    fn the_limiters_describe_the_ceilings_they_were_built_with() {
+        // The body budget is a process-wide static, and the limiters must not
+        // read it behind the caller's back: a type that describes its own
+        // ceilings reports the ones it was given.
+        let limits = Limits {
+            max_connections_per_peer: 11,
+            max_connections_global: 22,
+            max_streams_global: 33,
+            max_body_bytes: 44,
+        };
+
+        let described = Limiters::from_limits(&limits).describe();
+        assert!(
+            described.contains("11 concurrent connections per peer"),
+            "{described}"
+        );
+        assert!(described.contains("22 across the process"), "{described}");
+        assert!(
+            described.contains("33 streams across the process"),
+            "{described}"
+        );
+        assert!(
+            described.contains("44 bytes of request bodies across the process"),
+            "{described}"
         );
     }
 }

@@ -465,10 +465,17 @@ path = "/health"
 #                              request is defensible and the same 64 MB times
 #                              every stream at once is not. Default: 1 GiB
 #
-# A zero is refused at startup for every key: it would refuse every connection
-# rather than bound them, which is a typo rather than a setting. An unknown key
-# is refused at load, before the server starts at all - a misspelled limit is
-# one that silently does not apply.
+# A zero is refused at startup for every key: a ceiling of 0 would refuse every
+# connection rather than bound them, which is a typo rather than a setting. It
+# is refused even when the matching environment variable is set - the
+# environment overrides a value that works, not one that does not. An unknown
+# key is refused at load, before the server starts at all - a misspelled limit
+# is one that silently does not apply.
+#
+# The three connection and stream ceilings are counted against the iroh
+# tunnel, because that is where a peer is. The plaintext listener has no peer
+# to count against and no ceiling of its own; the byte budget is shared by
+# both listeners and so does bound it.
 #
 # The four environment variables that named these ceilings before this section
 # existed - NEXAPIPE_MAX_CONNS_PER_PEER, NEXAPIPE_MAX_CONNS,

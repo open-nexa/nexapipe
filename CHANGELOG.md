@@ -42,9 +42,14 @@ its defaults — which are on.
   `max_streams_global` (16384) and `max_body_bytes` (1 GiB). Every key is
   optional and every default is the ceiling the server always used, so a config
   that does not mention the section behaves exactly as it did. A zero is refused
-  at startup for every key — it would refuse every connection rather than bound
-  them — and an unknown key is refused at load, before the server starts at all,
-  because a misspelled limit is one that silently does not apply. The four
+  at startup for every key — a ceiling of 0 would refuse every connection
+  rather than bound them — and it is refused even when the matching environment
+  variable is set, because the environment overrides a value that works, not
+  one that does not. An unknown key is refused at load, before the server
+  starts at all, because a misspelled limit is one that silently does not
+  apply. The three connection and stream ceilings are counted against the
+  iroh tunnel — that is where a peer is — while the byte budget is shared by
+  both listeners. The four
   environment variables still work and still win over the
   file, so a deployment that set them keeps the behaviour it had; a key both name
   is a warning in the log rather than a refusal, and the effective ceilings are
