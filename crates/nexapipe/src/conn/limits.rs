@@ -15,19 +15,185 @@
 //! subsumes the other, which is why both are here.
 
 use iroh::EndpointId;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-/// Concurrent connections one peer may hold, unless the environment overrides it.
+/// The `[limits]` section: the ceilings the whole process runs under.
+///
+/// Every key is optional, and every default is the constant the server used
+/// before this section existed, so a config that does not mention `[limits]`
+/// behaves exactly as it did — the section is a way to *write down* a ceiling,
+/// not a new one.
+///
+/// **Unknown keys are refused here**, for the reason they are refused under
+/// `[peers]`: a misspelled limit is a limit that silently does not apply, and
+/// the process then runs with a ceiling nobody wrote down. Refused at load,
+/// where the error names the key, rather than ignored at runtime, where
+/// nothing would say so.
+///
+/// **A zero is refused at startup**, in [`Limits::resolve`]: it would refuse
+/// every connection, which is a typo rather than a setting.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Concurrent connections one peer may hold.
+    pub max_connections_per_peer: Option<usize>,
+    /// Concurrent connections the whole process may hold.
+    pub max_connections_global: Option<usize>,
+    /// Concurrent streams the whole process may have in flight.
+    pub max_streams_global: Option<usize>,
+    /// Bytes of request bodies the whole process may hold at once.
+    pub max_body_bytes: Option<usize>,
+}
+
+/// What the environment says about the ceilings.
+///
+/// Read once at startup, like everything else here. A value that is not a
+/// positive number is a warning and not an outage: the environment is set in
+/// a Dockerfile or a shell profile, and a bad value there should not keep the
+/// server from starting — the default is used instead and the log says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnvCaps {
+    pub max_connections_per_peer: Option<usize>,
+    pub max_connections_global: Option<usize>,
+    pub max_streams_global: Option<usize>,
+    pub max_body_bytes: Option<usize>,
+}
+
+impl EnvCaps {
+    /// Reads the four environment variables that name these ceilings.
+    pub fn from_environment() -> Self {
+        Self {
+            max_connections_per_peer: cap_from_env(ENV_MAX_CONNECTIONS_PER_PEER),
+            max_connections_global: cap_from_env(ENV_MAX_CONNECTIONS_GLOBAL),
+            max_streams_global: cap_from_env(ENV_MAX_STREAMS_GLOBAL),
+            max_body_bytes: cap_from_env(ENV_MAX_BODY_BYTES_GLOBAL),
+        }
+    }
+}
+
+/// The ceilings the process runs with, resolved once at startup.
+///
+/// The file answers "was this key written?"; this answers "how much may this
+/// process do at once?", which is the question every accept path and every
+/// body reader actually asks. Reading either side of the config directly would
+/// put an `.unwrap_or(...)` in each of them, and one of them would eventually
+/// disagree with the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_connections_per_peer: usize,
+    pub max_connections_global: usize,
+    pub max_streams_global: usize,
+    pub max_body_bytes: usize,
+}
+
+impl Limits {
+    /// Resolves the ceilings from the config and the environment.
+    ///
+    /// **The environment wins over the config.** It is the last thing an
+    /// operator sets, and in a container it is often the only thing they can
+    /// set without editing a file the image does not own. A key both name is
+    /// a *warning* rather than a refusal: the effective ceilings are logged at
+    /// startup, so the ambiguity is visible rather than silent, and refusing to
+    /// boot over a resource knob is a heavier hand than this deserves.
+    ///
+    /// **A zero in the config is refused at startup**, because it would refuse
+    /// every connection and the file is somewhere the operator can read the
+    /// error. It is refused *before* the environment is consulted: the rule is
+    /// that the environment overrides a value that works, not one that does
+    /// not, so a zero in the file is a typo whether or not a variable happens
+    /// to name the same key. The environment keeps the older rule of ignoring
+    /// a value it cannot use, because a bad variable in a Dockerfile should
+    /// not take the listener offline.
+    pub fn resolve(config: &LimitsConfig, env: &EnvCaps) -> anyhow::Result<Self> {
+        Ok(Self {
+            max_connections_per_peer: resolve_one(
+                "[limits] max_connections_per_peer",
+                config.max_connections_per_peer,
+                env.max_connections_per_peer,
+                ENV_MAX_CONNECTIONS_PER_PEER,
+                DEFAULT_MAX_CONNECTIONS_PER_PEER,
+            )?,
+            max_connections_global: resolve_one(
+                "[limits] max_connections_global",
+                config.max_connections_global,
+                env.max_connections_global,
+                ENV_MAX_CONNECTIONS_GLOBAL,
+                DEFAULT_MAX_CONNECTIONS_GLOBAL,
+            )?,
+            max_streams_global: resolve_one(
+                "[limits] max_streams_global",
+                config.max_streams_global,
+                env.max_streams_global,
+                ENV_MAX_STREAMS_GLOBAL,
+                DEFAULT_MAX_STREAMS_GLOBAL,
+            )?,
+            max_body_bytes: resolve_one(
+                "[limits] max_body_bytes",
+                config.max_body_bytes,
+                env.max_body_bytes,
+                ENV_MAX_BODY_BYTES_GLOBAL,
+                DEFAULT_MAX_BODY_BYTES_GLOBAL,
+            )?,
+        })
+    }
+}
+
+/// One ceiling, from whichever source names it.
+///
+/// The order is the environment, then the config, then the default — see
+/// [`Limits::resolve`] for why the environment outranks the file.
+fn resolve_one(
+    key: &str,
+    from_config: Option<usize>,
+    from_env: Option<usize>,
+    env_var: &str,
+    default: usize,
+) -> anyhow::Result<usize> {
+    // A zero from the environment is ignored rather than obeyed: it would
+    // refuse everything, and the environment is a source an operator cannot
+    // always edit. [`EnvCaps::from_environment`] already drops such a value,
+    // so this is the belt to that braces.
+    let from_env = from_env.filter(|value| *value > 0);
+    if let Some(value) = from_config {
+        if value == 0 {
+            // Refused before the environment is consulted, on purpose. The
+            // rule is "the environment overrides a value that works, not one
+            // that does not": a zero is refused whatever else names the key,
+            // because it is a typo in a file the operator can read, and a typo
+            // hidden behind an environment variable is a typo that waits for
+            // the day the variable goes away.
+            anyhow::bail!(
+                "{key} is 0: a ceiling of 0 would refuse every connection rather than bound them, \
+                 which is a typo rather than a setting. The smallest useful value is 1. It is \
+                 refused even when {env_var} is set, because the environment overrides a value \
+                 that works, not one that does not"
+            );
+        }
+        if let Some(env_value) = from_env {
+            tracing::warn!(
+                "{env_var}={env_value} and {key}={value} are both set; the environment wins and the \
+                 config's value is ignored. Remove one of them to say which was meant"
+            );
+            return Ok(env_value);
+        }
+        return Ok(value);
+    }
+    Ok(from_env.unwrap_or(default))
+}
+
+/// Concurrent connections one peer may hold, unless the config or the environment
+/// overrides it.
 ///
 /// Deliberately generous: the client pool opens a connection per in-flight
 /// request, so a busy client holds several at once. This is here to stop a peer
 /// from holding thousands, not to shape traffic.
 pub const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 64;
 
-/// Concurrent connections the whole process may hold, unless the environment
-/// overrides it.
+/// Concurrent connections the whole process may hold, unless the config or the
+/// environment overrides it.
 ///
 /// A multiple of [`DEFAULT_MAX_CONNECTIONS_PER_PEER`] rather than a round number:
 /// it reads as "the peers you would plausibly have, each at its own cap", which
@@ -68,14 +234,6 @@ struct Counts {
 }
 
 impl ConnectionLimiter {
-    /// A limiter using the caps from the environment, or the defaults.
-    pub fn from_env() -> Arc<Self> {
-        Arc::new(Self::with_caps(
-            max_connections_per_peer(),
-            max_connections_global(),
-        ))
-    }
-
     /// A limiter with the per-peer cap only, and the global one left generous.
     ///
     /// For tests and for callers that want the historical behaviour.
@@ -177,14 +335,26 @@ impl Drop for PeerGuard {
 pub struct Limiters {
     pub connections: Arc<ConnectionLimiter>,
     pub streams: Arc<StreamLimiter>,
+    /// The ceiling on request bodies these limiters were built with.
+    ///
+    /// Carried here rather than read from the process-wide budget when
+    /// [`Self::describe`] needs it: the budget is a static the HTTP path
+    /// reaches without a config, and a type that describes its own ceilings
+    /// should report the ones it was given rather than whatever the static
+    /// happens to hold.
+    pub max_body_bytes: usize,
 }
 
 impl Limiters {
-    /// Both from the environment, which is how the server builds them.
-    pub fn from_env() -> Self {
+    /// The ceilings the server runs with, resolved once at startup.
+    pub fn from_limits(limits: &Limits) -> Self {
         Self {
-            connections: ConnectionLimiter::from_env(),
-            streams: StreamLimiter::from_env(),
+            connections: Arc::new(ConnectionLimiter::with_caps(
+                limits.max_connections_per_peer,
+                limits.max_connections_global,
+            )),
+            streams: Arc::new(StreamLimiter::new(limits.max_streams_global)),
+            max_body_bytes: limits.max_body_bytes,
         }
     }
 
@@ -193,47 +363,34 @@ impl Limiters {
     pub fn describe(&self) -> String {
         format!(
             "{} concurrent connections per peer, {} across the process, {} streams across the \
-             process",
+             process, {} bytes of request bodies across the process",
             self.connections.max(),
             self.connections.max_global(),
-            self.streams.max_global()
+            self.streams.max_global(),
+            self.max_body_bytes
         )
     }
 }
 
-/// The cap to run with: [`ENV_MAX_CONNECTIONS_PER_PEER`] when it parses, else
-/// [`DEFAULT_MAX_CONNECTIONS_PER_PEER`].
-///
-/// Read once when the limiter is built, not per connection.
-pub fn max_connections_per_peer() -> usize {
-    cap_from_env(
-        ENV_MAX_CONNECTIONS_PER_PEER,
-        DEFAULT_MAX_CONNECTIONS_PER_PEER,
-    )
-}
-
-/// The process-wide cap: [`ENV_MAX_CONNECTIONS_GLOBAL`] when it parses, else
-/// [`DEFAULT_MAX_CONNECTIONS_GLOBAL`].
-pub fn max_connections_global() -> usize {
-    cap_from_env(ENV_MAX_CONNECTIONS_GLOBAL, DEFAULT_MAX_CONNECTIONS_GLOBAL)
-}
-
 /// One env var to one cap, with the same "a bad value is a warning, not an
-/// outage" rule for both.
-fn cap_from_env(var: &str, default: usize) -> usize {
+/// outage" rule the config file follows for a number it cannot use.
+///
+/// `None` means the variable is absent or unusable, and the caller falls back
+/// to the config or the default.
+fn cap_from_env(var: &str) -> Option<usize> {
     let Ok(raw) = std::env::var(var) else {
-        return default;
+        return None;
     };
     match parse_max(&raw) {
-        Some(max) => max,
+        Some(max) => Some(max),
         None => {
-            tracing::warn!("{var}={raw} is not a positive number, using {default}");
-            default
+            tracing::warn!("{var}={raw} is not a positive number, ignoring it");
+            None
         }
     }
 }
 
-/// Concurrent streams the whole process may have in flight, unless the
+/// Concurrent streams the whole process may have in flight, unless the config or the
 /// environment overrides it.
 ///
 /// A multiple of [`MAX_CONCURRENT_STREAMS_PER_CONNECTION`] for the same reason
@@ -274,14 +431,6 @@ impl StreamLimiter {
         }
     }
 
-    /// A limiter using [`ENV_MAX_STREAMS_GLOBAL`], or the default.
-    pub fn from_env() -> Arc<Self> {
-        Arc::new(Self::new(cap_from_env(
-            ENV_MAX_STREAMS_GLOBAL,
-            DEFAULT_MAX_STREAMS_GLOBAL,
-        )))
-    }
-
     /// Takes a slot, or returns `None` when the process is at its ceiling.
     ///
     /// Refused rather than awaited: a stream that waits is a task held open, and
@@ -301,7 +450,7 @@ impl StreamLimiter {
     }
 }
 
-/// Bytes of request bodies the whole process may hold at once, unless the
+/// Bytes of request bodies the whole process may hold at once, unless the config or the
 /// environment overrides it.
 ///
 /// A gibibyte, which is sixteen of the largest body a single request may carry.
@@ -346,15 +495,33 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 #[derive(Debug)]
 pub struct ByteBudget {
     held: AtomicUsize,
-    max: usize,
+    /// The ceiling, in an atomic rather than a plain field so that it can be
+    /// written once at startup, from the configuration, without the budget
+    /// having to be built with it.
+    ///
+    /// See [`init_body_budget`] for why it is written rather than baked in.
+    max: AtomicUsize,
 }
 
 impl ByteBudget {
-    pub fn new(max: usize) -> Self {
+    /// A budget with a ceiling.
+    ///
+    /// `const` so the process-wide one can be a `static` rather than a
+    /// `OnceLock`: the value it holds has to be settable after it exists.
+    pub const fn new(max: usize) -> Self {
         Self {
             held: AtomicUsize::new(0),
-            max,
+            max: AtomicUsize::new(max),
         }
+    }
+
+    /// Sets the ceiling this budget enforces.
+    ///
+    /// Called once at startup, before any request is served. The `held` counter
+    /// is untouched by it: what is already reserved stays reserved, and the new
+    /// ceiling applies to what comes after.
+    pub fn set_max(&self, max: usize) {
+        self.max.store(max, Ordering::Relaxed);
     }
 
     /// Adds `bytes` to the total, or returns the total as it was before the
@@ -364,6 +531,10 @@ impl ByteBudget {
     /// a store: two concurrent uploads must not both read a total that leaves
     /// room for one of them.
     pub fn try_reserve(&self, bytes: usize) -> Result<(), usize> {
+        // Read once, outside the closure: the closure may run more than once,
+        // and the ceiling it compares against should be the same one every
+        // attempt sees.
+        let max = self.max.load(Ordering::Relaxed);
         // Written as a `match` rather than a chain of `map`s because
         // `try_update` hands back the total from *before* the attempt on both
         // paths, and only the `Err` case carries it: that is the number the
@@ -372,7 +543,7 @@ impl ByteBudget {
             .held
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 let next = held.saturating_add(bytes);
-                (next <= self.max).then_some(next)
+                (next <= max).then_some(next)
             }) {
             Ok(_) => Ok(()),
             Err(held) => Err(held),
@@ -394,23 +565,38 @@ impl ByteBudget {
     }
 
     pub fn max(&self) -> usize {
-        self.max
+        self.max.load(Ordering::Relaxed)
     }
 }
 
-/// The process-wide body budget, resolved from the environment on first use.
+/// The process-wide body budget.
 ///
-/// Held for the life of the process: the caps are read once at startup, like
-/// every other limit here, and a budget that changed under an in-flight upload
-/// would release bytes against a ceiling it was never counted against.
+/// A `static` rather than a `OnceLock`, because the ceiling it enforces is
+/// written into it after it exists: the budget has to be reachable from the
+/// body readers, which are deep inside the HTTP path and hold no config, and
+/// the ceiling comes from the configuration, which is read at startup.
+///
+/// The ceiling it starts with is the default one, and
+/// [`init_body_budget`] replaces it before the first request is served.
+static BUDGET: ByteBudget = ByteBudget::new(DEFAULT_MAX_BODY_BYTES_GLOBAL);
+
+/// The process-wide body budget.
 pub fn body_budget() -> &'static ByteBudget {
-    static BUDGET: OnceLock<ByteBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        ByteBudget::new(cap_from_env(
-            ENV_MAX_BODY_BYTES_GLOBAL,
-            DEFAULT_MAX_BODY_BYTES_GLOBAL,
-        ))
-    })
+    &BUDGET
+}
+
+/// Sets the ceiling the process-wide body budget enforces.
+///
+/// Called once at startup, from the resolved [`Limits`], before any request
+/// is served — so no upload is ever counted against a ceiling it was not
+/// counted against when it started.
+///
+/// Writing the ceiling rather than building the budget with it is what lets
+/// the value come from `config.toml` and not only from the environment: the
+/// budget is a `static` that the HTTP path reaches without a config, and its
+/// ceiling is a separate write.
+pub fn init_body_budget(max: usize) {
+    BUDGET.set_max(max);
 }
 
 /// Holds a reservation for as long as the body it was taken for is alive.
@@ -758,6 +944,203 @@ mod tests {
         assert!(
             ByteReservation::take(1).is_ok(),
             "a released budget admits the next body"
+        );
+    }
+
+    #[test]
+    fn the_body_budget_ceiling_can_be_written_after_it_exists() {
+        // The point of the write: the budget is a `static` the HTTP path
+        // reaches without a config, and its ceiling comes from one.
+        let budget = ByteBudget::new(DEFAULT_MAX_BODY_BYTES_GLOBAL);
+        assert_eq!(budget.max(), DEFAULT_MAX_BODY_BYTES_GLOBAL);
+
+        budget.set_max(100);
+        assert_eq!(budget.max(), 100);
+
+        // And the ceiling is the one that is enforced, not just the one that is
+        // reported.
+        budget.try_reserve(60).expect("the first body fits");
+        assert!(
+            budget.try_reserve(60).is_err(),
+            "the ceiling that was written is the one that applies"
+        );
+
+        // What is already reserved stays reserved: the write is about the
+        // ceiling, not about the bytes held under the old one.
+        assert_eq!(budget.held(), 60);
+    }
+
+    #[test]
+    fn an_absent_section_resolves_to_the_defaults() {
+        let limits = Limits::resolve(&LimitsConfig::default(), &EnvCaps::default())
+            .expect("the defaults are usable");
+
+        assert_eq!(
+            limits.max_connections_per_peer,
+            DEFAULT_MAX_CONNECTIONS_PER_PEER
+        );
+        assert_eq!(
+            limits.max_connections_global,
+            DEFAULT_MAX_CONNECTIONS_GLOBAL
+        );
+        assert_eq!(limits.max_streams_global, DEFAULT_MAX_STREAMS_GLOBAL);
+        assert_eq!(limits.max_body_bytes, DEFAULT_MAX_BODY_BYTES_GLOBAL);
+    }
+
+    #[test]
+    fn the_config_names_the_ceiling() {
+        let config = LimitsConfig {
+            max_connections_per_peer: Some(11),
+            max_connections_global: Some(22),
+            max_streams_global: Some(33),
+            max_body_bytes: Some(44),
+        };
+
+        let limits = Limits::resolve(&config, &EnvCaps::default()).expect("the config is usable");
+        assert_eq!(limits.max_connections_per_peer, 11);
+        assert_eq!(limits.max_connections_global, 22);
+        assert_eq!(limits.max_streams_global, 33);
+        assert_eq!(limits.max_body_bytes, 44);
+    }
+
+    #[test]
+    fn the_environment_outranks_the_config() {
+        let config = LimitsConfig {
+            max_connections_per_peer: Some(11),
+            ..LimitsConfig::default()
+        };
+        let env = EnvCaps {
+            max_connections_per_peer: Some(7),
+            ..EnvCaps::default()
+        };
+
+        let limits = Limits::resolve(&config, &env).expect("the two sources are usable");
+        assert_eq!(
+            limits.max_connections_per_peer, 7,
+            "the environment is the last thing an operator sets, so it wins"
+        );
+        assert_eq!(
+            limits.max_connections_global, DEFAULT_MAX_CONNECTIONS_GLOBAL,
+            "a key only one of them names is unaffected by the other"
+        );
+    }
+
+    #[test]
+    fn a_zero_ceiling_in_the_config_is_refused() {
+        let config = LimitsConfig {
+            max_connections_global: Some(0),
+            ..LimitsConfig::default()
+        };
+
+        let error = Limits::resolve(&config, &EnvCaps::default())
+            .expect_err("a ceiling of zero refuses every connection");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("max_connections_global"),
+            "the error names the key that cannot work: {message}"
+        );
+    }
+
+    #[test]
+    fn every_ceiling_is_refused_when_it_is_zero() {
+        // One rule for all four, so a typo is refused wherever it is written
+        // rather than in one key only.
+        for config in [
+            LimitsConfig {
+                max_connections_per_peer: Some(0),
+                ..LimitsConfig::default()
+            },
+            LimitsConfig {
+                max_connections_global: Some(0),
+                ..LimitsConfig::default()
+            },
+            LimitsConfig {
+                max_streams_global: Some(0),
+                ..LimitsConfig::default()
+            },
+            LimitsConfig {
+                max_body_bytes: Some(0),
+                ..LimitsConfig::default()
+            },
+        ] {
+            assert!(
+                Limits::resolve(&config, &EnvCaps::default()).is_err(),
+                "a ceiling of zero is refused whatever it bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_ceiling_in_the_environment_is_ignored() {
+        // The environment keeps the older rule: a bad value in a Dockerfile
+        // should not keep the server from starting.
+        let env = EnvCaps {
+            max_connections_per_peer: Some(0),
+            ..EnvCaps::default()
+        };
+
+        let limits =
+            Limits::resolve(&LimitsConfig::default(), &env).expect("the default is usable");
+        assert_eq!(
+            limits.max_connections_per_peer,
+            DEFAULT_MAX_CONNECTIONS_PER_PEER
+        );
+    }
+
+    #[test]
+    fn a_zero_in_the_config_is_refused_even_when_the_environment_names_the_key() {
+        // The rule is "the environment overrides a value that works, not one
+        // that does not". A zero in the file is a typo whether or not a
+        // variable happens to name the same key - and a typo hidden behind an
+        // environment variable is a typo that waits for the day the variable
+        // goes away.
+        let config = LimitsConfig {
+            max_connections_per_peer: Some(0),
+            ..LimitsConfig::default()
+        };
+        let env = EnvCaps {
+            max_connections_per_peer: Some(64),
+            ..EnvCaps::default()
+        };
+
+        let error = Limits::resolve(&config, &env)
+            .expect_err("a ceiling of zero is refused whatever else names the key");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("max_connections_per_peer"),
+            "the error names the key that cannot work: {message}"
+        );
+        assert!(
+            message.contains(ENV_MAX_CONNECTIONS_PER_PEER),
+            "the error says that the environment does not save it: {message}"
+        );
+    }
+
+    #[test]
+    fn the_limiters_describe_the_ceilings_they_were_built_with() {
+        // The body budget is a process-wide static, and the limiters must not
+        // read it behind the caller's back: a type that describes its own
+        // ceilings reports the ones it was given.
+        let limits = Limits {
+            max_connections_per_peer: 11,
+            max_connections_global: 22,
+            max_streams_global: 33,
+            max_body_bytes: 44,
+        };
+
+        let described = Limiters::from_limits(&limits).describe();
+        assert!(
+            described.contains("11 concurrent connections per peer"),
+            "{described}"
+        );
+        assert!(described.contains("22 across the process"), "{described}");
+        assert!(
+            described.contains("33 streams across the process"),
+            "{described}"
+        );
+        assert!(
+            described.contains("44 bytes of request bodies across the process"),
+            "{described}"
         );
     }
 }

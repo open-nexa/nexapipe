@@ -17,3 +17,4 @@ pub mod routes;
 pub mod shutdown;
 pub mod status;
 pub mod stream_util;
+pub(crate) mod toml_zeroize;
