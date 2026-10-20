@@ -240,6 +240,50 @@ impl RouteMode {
     }
 }
 
+/// The wire protocol a route speaks to its backends.
+///
+/// A separate thing from [`RouteMode`], which is about the *client*: how the
+/// proxy serves the request that arrives. This is about what the proxy says
+/// to the backend once the request has been rewritten.
+///
+/// * [`Self::Http1`] (default) — HTTP/1.1. An `https://` backend is spoken to
+///   over TLS, where the handshake negotiates HTTP/2 with any backend that
+///   offers it, and a cleartext one is spoken to over HTTP/1.1.
+/// * [`Self::H2c`] — HTTP/2 in the clear, with prior knowledge. There is
+///   nothing on a cleartext connection to negotiate, so the client has to know
+///   that the backend speaks h2 and start speaking it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendProtocol {
+    #[default]
+    Http1,
+    H2c,
+}
+
+impl BackendProtocol {
+    /// The spelling used in the config file.
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendProtocol::Http1 => "http1",
+            BackendProtocol::H2c => "h2c",
+        }
+    }
+}
+
+/// Reads the `backend_protocol` key.
+///
+/// Refused rather than guessed: a backend that only speaks h2 and a client
+/// that speaks h1 do not talk to each other, and the operator should read
+/// about that here rather than in the log of every request that failed.
+pub fn get_backend_protocol(value: &Option<String>) -> anyhow::Result<BackendProtocol> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") | Some("http1") => Ok(BackendProtocol::Http1),
+        Some("h2c") => Ok(BackendProtocol::H2c),
+        Some(other) => anyhow::bail!(
+            "{other:?} is not a backend protocol; expected \"http1\" (the default) or \"h2c\""
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteConfig {
     pub host_pattern: String,
@@ -249,6 +293,13 @@ pub struct RouteConfig {
     pub path_is_prefix: Option<bool>,
     pub strategy: Option<String>,
     pub backends: Vec<String>,
+    /// `"http1"` (default) or `"h2c"`. See [`BackendProtocol`].
+    ///
+    /// Only about the hop to the backend. An `https://` backend speaks HTTP/2
+    /// whenever the handshake agrees on it, whatever this says; `"h2c"` is for
+    /// the backend that speaks HTTP/2 in the clear, where there is no handshake
+    /// to agree on anything.
+    pub backend_protocol: Option<String>,
     /// `"http"` (default), `"passthrough"`, `"tcp"` or `"udp"`. See [`RouteMode`].
     pub mode: Option<String>,
     /// Several modes at once, sharing this route's `backends` — the ordinary way
@@ -631,6 +682,165 @@ pub struct ProxyConfig {
     /// Whether `/metrics` is served. Absent means it is not.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// How the proxy reaches the backends. Absent means the defaults, i.e. the
+    /// machine's own trust store and nothing else.
+    #[serde(default)]
+    pub backends: BackendsConfig,
+    /// How often a failed request is tried again. Absent means it is not.
+    #[serde(default)]
+    pub retry: RetryConfig,
+    /// When a backend that keeps failing stops being picked. Absent means it
+    /// is, with the defaults.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+}
+
+/// The `[backends]` section: how the proxy reaches the backends themselves.
+///
+/// One key today, and it is about trust rather than about transport: the
+/// certificates an `https://` backend is checked against. The transport is
+/// decided per route — an `http://` backend is fetched in the clear, an
+/// `https://` one over a TLS session this process originates.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct BackendsConfig {
+    /// A PEM file of extra CA certificates to trust when verifying an
+    /// `https://` backend, for a backend whose certificate is signed by an
+    /// internal authority the machine does not know.
+    ///
+    /// The machine's own roots are trusted as well; this *adds* to them, it
+    /// does not replace them. There is deliberately no way to trust a
+    /// certificate without checking it: a proxy that connects to a backend
+    /// without knowing who it is talking to can be redirected by whoever
+    /// answers the name.
+    pub ca_file: Option<String>,
+}
+
+/// The `[retry]` section: how often a request that failed is tried again.
+///
+/// Off by default, because a retry is a second attempt at something the
+/// backend may already have done: a request that failed on the way *to* the
+/// backend is safe to try again, and one that failed after the backend had it
+/// is not, unless the request was idempotent to begin with. What may be
+/// retried, and what may not, is spelled out in `crate::http`.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RetryConfig {
+    /// How many times a request may be tried again after it failed. Default: 0,
+    /// which is no retry at all.
+    ///
+    /// A retry asks the route for a *different* backend where the route has
+    /// one, because the backend that just failed is the one most likely to
+    /// fail again.
+    pub attempts: Option<u64>,
+    /// Milliseconds to wait before the next attempt. Default: 100.
+    ///
+    /// Not zero by default: a backend that refused the connection because it
+    /// is restarting refuses the next one too, and asking again immediately
+    /// turns one outage into as many attempts as the section allows.
+    pub backoff_ms: Option<u64>,
+}
+
+/// The `[retry]` section with every default filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    /// How many *extra* attempts a failed request may have. Zero means one
+    /// try and no more.
+    pub attempts: u32,
+    /// How long to wait between two attempts.
+    pub backoff: std::time::Duration,
+}
+
+impl Retry {
+    const DEFAULT_BACKOFF_MS: u64 = 100;
+    /// The most attempts a section may ask for. A hundred is already a
+    /// request that has been failing for a minute; more than that is a
+    /// request that should have been given up on.
+    const MAX_ATTEMPTS: u64 = 16;
+    const MAX_BACKOFF_MS: u64 = 60_000;
+
+    pub fn resolve(config: RetryConfig) -> Self {
+        Retry {
+            attempts: config.attempts.unwrap_or(0).min(Self::MAX_ATTEMPTS) as u32,
+            backoff: std::time::Duration::from_millis(
+                config
+                    .backoff_ms
+                    .unwrap_or(Self::DEFAULT_BACKOFF_MS)
+                    .min(Self::MAX_BACKOFF_MS),
+            ),
+        }
+    }
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self::resolve(RetryConfig::default())
+    }
+}
+
+/// The `[circuit_breaker]` section: when a backend that keeps failing stops
+/// being picked.
+///
+/// A health probe says what a backend looked like the last time somebody
+/// asked. A circuit breaker says what the traffic itself found: this backend
+/// refused the last five connections, so stop sending it any until it has had
+/// a chance to come back. The two answer different questions and are meant to
+/// be on at the same time.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct CircuitBreakerConfig {
+    /// `false` leaves every backend in rotation however it fails. Default:
+    /// `true`.
+    pub enabled: Option<bool>,
+    /// Consecutive failures before a backend stops being picked. Default: 5.
+    ///
+    /// More than one, because a single refused connection is a blip and a
+    /// backend taken out of rotation on one is a backend that stays out.
+    pub failure_threshold: Option<u64>,
+    /// Seconds before an open circuit lets a request through to try the
+    /// backend again. Default: 30.
+    ///
+    /// The request that gets through is a trial: it decides whether the
+    /// circuit closes again, and the backend is out of rotation until it
+    /// answers.
+    pub reset_secs: Option<u64>,
+}
+
+/// The `[circuit_breaker]` section with every default filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitBreaker {
+    pub enabled: bool,
+    pub failure_threshold: usize,
+    pub reset: std::time::Duration,
+}
+
+impl CircuitBreaker {
+    const DEFAULT_FAILURE_THRESHOLD: u64 = 5;
+    const DEFAULT_RESET_SECS: u64 = 30;
+    const MAX_FAILURE_THRESHOLD: u64 = 1000;
+    const MAX_RESET_SECS: u64 = 3600;
+
+    pub fn resolve(config: CircuitBreakerConfig) -> Self {
+        CircuitBreaker {
+            enabled: config.enabled.unwrap_or(true),
+            failure_threshold: config
+                .failure_threshold
+                .unwrap_or(Self::DEFAULT_FAILURE_THRESHOLD)
+                .clamp(1, Self::MAX_FAILURE_THRESHOLD) as usize,
+            reset: std::time::Duration::from_secs(
+                config
+                    .reset_secs
+                    .unwrap_or(Self::DEFAULT_RESET_SECS)
+                    .min(Self::MAX_RESET_SECS),
+            ),
+        }
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::resolve(CircuitBreakerConfig::default())
+    }
 }
 
 /// The `[peers]` section: a server-side allow-list of client public keys.
@@ -855,6 +1065,16 @@ impl ProxyConfig {
         Timeouts::resolve(self.timeouts)
     }
 
+    /// The `[retry]` settings this config resolves to.
+    pub fn retry(&self) -> Retry {
+        Retry::resolve(self.retry)
+    }
+
+    /// The `[circuit_breaker]` settings this config resolves to.
+    pub fn circuit_breaker(&self) -> CircuitBreaker {
+        CircuitBreaker::resolve(self.circuit_breaker)
+    }
+
     /// Whether the config file this was read from holds a credential.
     ///
     /// Asked about the *file*, not about what the process is running with: the
@@ -976,6 +1196,29 @@ impl ProxyConfig {
                 }
             }
 
+            // `h2c` is HTTP/2 in the clear, and an `https://` backend is spoken
+            // to over TLS — so the two cannot be combined: the client would
+            // start h2 in the clear at a port that expects TLS. Refused here
+            // rather than at the first request, because every request to that
+            // route would fail the same way.
+            let backend_protocol = get_backend_protocol(&route_config.backend_protocol)
+                .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+            if backend_protocol == BackendProtocol::H2c && modes.contains(&RouteMode::Http) {
+                for backend in &route_config.backends {
+                    if url::Url::parse(backend)
+                        .map(|url| url.scheme() == "https")
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "{label}: backend_protocol = \"h2c\" speaks HTTP/2 in the clear, but \
+                             backend \"{backend}\" is https://. An https backend speaks HTTP/2 \
+                             through the TLS handshake, which is what backend_protocol = \
+                             \"http1\" already does; drop the key."
+                        );
+                    }
+                }
+            }
+
             // Only meaningful for `tcp` / `udp`, where they are harmless defaults
             // otherwise; the other modes never read them.
             let l4_options = L4Options {
@@ -1003,7 +1246,9 @@ impl ProxyConfig {
                     route_config.path_rewrite.clone(),
                 )
                 .with_l4_options(l4_options)
-                .with_modes(modes.clone()),
+                .with_modes(modes.clone())
+                .with_backend_protocol(backend_protocol)
+                .with_circuit_breaker(self.circuit_breaker()),
             );
 
             tracing::info!(
@@ -1236,9 +1481,16 @@ fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
 
 /// Rejects a backend URL that cannot work.
 ///
-/// TLS is terminated by the backend now, so an `https://` backend can only
-/// fail: this process would speak plaintext at a TLS port. Saying so at startup
-/// beats serving 502s, and either fix is a one-line config change.
+/// Two schemes are fetchable: `http://` and `https://`. The second one means
+/// this process *originates* a TLS session towards the backend and verifies
+/// the certificate it gets back — it still holds no certificate of its own and
+/// still terminates nothing on the client's behalf. A backend that only
+/// speaks TLS on the same port as its plain listener is a `passthrough`
+/// route's business; a backend that is *fetched* over TLS is this.
+///
+/// Anything else is refused at startup rather than attempted, because a
+/// request to it cannot work and the operator would rather read about it here
+/// than in a 502.
 pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::Result<()> {
     // Passthrough only needs a host and a port — the scheme carries no meaning
     // because those bytes are never interpreted — but it still has to name one.
@@ -1268,11 +1520,11 @@ pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::
     })?;
 
     match url.scheme() {
-        "http" => Ok(()),
+        "http" | "https" => Ok(()),
         scheme => anyhow::bail!(
-            "{label}: backend \"{backend}\" uses {scheme}://, but TLS is terminated by the backend \
-             now. Point the route at its http:// listener, or set mode = \"passthrough\" to forward \
-             the TLS session to it untouched."
+            "{label}: backend \"{backend}\" uses {scheme}://, which is not a scheme this proxy can \
+             fetch; expected http://host:port or https://host:port. A backend that serves TLS \
+             only, with no plain listener beside it, belongs to a passthrough route."
         ),
     }
 }
@@ -3069,6 +3321,135 @@ backends = ["http://10.0.0.5:8080"]
         );
     }
 
+    /// The `[circuit_breaker]` section, and what it does when it is not
+    /// there.
+    #[test]
+    fn the_circuit_breaker_section_is_read_and_bounded() {
+        let breaker = CircuitBreaker::resolve(CircuitBreakerConfig::default());
+        assert!(breaker.enabled, "the circuit is on unless it is turned off");
+        assert_eq!(breaker.failure_threshold, 5);
+        assert_eq!(breaker.reset, std::time::Duration::from_secs(30));
+
+        let config = parse(
+            r#"
+[circuit_breaker]
+enabled = false
+failure_threshold = 2
+reset_secs = 10
+"#,
+        );
+        let breaker = config.circuit_breaker();
+        assert!(!breaker.enabled);
+        assert_eq!(breaker.failure_threshold, 2);
+        assert_eq!(breaker.reset, std::time::Duration::from_secs(10));
+
+        // A threshold of zero would take every backend out on its first
+        // failure, which is not what anybody means by zero.
+        let config = parse(
+            r#"
+[circuit_breaker]
+failure_threshold = 0
+"#,
+        );
+        assert_eq!(config.circuit_breaker().failure_threshold, 1);
+    }
+
+    /// The `[retry]` section, and what it does when it is not there.
+    #[test]
+    fn the_retry_section_is_read_and_bounded() {
+        // Absent means no retry at all: a second attempt at something the
+        // backend may already have done is not a decision to make by default.
+        assert_eq!(Retry::resolve(RetryConfig::default()).attempts, 0);
+
+        let config = parse(
+            r#"
+[retry]
+attempts = 3
+backoff_ms = 250
+"#,
+        );
+        let retry = config.retry();
+        assert_eq!(retry.attempts, 3);
+        assert_eq!(retry.backoff, std::time::Duration::from_millis(250));
+
+        // A section that asks for a hundred attempts gets a number that is
+        // still a number of attempts and not a denial of service.
+        let config = parse(
+            r#"
+[retry]
+attempts = 1000
+"#,
+        );
+        assert_eq!(config.retry().attempts, 16);
+    }
+
+    /// The protocol a route speaks to its backends, and what happens when the
+    /// key says something nobody speaks.
+    #[test]
+    fn the_backend_protocol_is_read_and_refused_when_it_is_nonsense() {
+        assert_eq!(
+            get_backend_protocol(&None).expect("the default"),
+            BackendProtocol::Http1
+        );
+        assert_eq!(
+            get_backend_protocol(&Some("http1".to_string())).expect("http1"),
+            BackendProtocol::Http1
+        );
+        assert_eq!(
+            get_backend_protocol(&Some("h2c".to_string())).expect("h2c"),
+            BackendProtocol::H2c
+        );
+
+        let error = get_backend_protocol(&Some("h3".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("h2c"),
+            "the message has to say what is accepted: {error}"
+        );
+    }
+
+    /// `h2c` is HTTP/2 in the clear; an `https://` backend speaks it through
+    /// the TLS handshake instead, and the two cannot be combined.
+    #[test]
+    fn an_h2c_route_refuses_an_https_backend() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["https://caddy:443"]
+backend_protocol = "h2c"
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("h2c"),
+            "the message has to name the key that caused it: {error}"
+        );
+    }
+
+    /// A cleartext backend with `h2c` is what the key is for, and it is
+    /// accepted.
+    #[test]
+    fn an_h2c_route_accepts_a_cleartext_backend() {
+        let config = parse(
+            r#"
+[[routes]]
+host_pattern = "fn.iakl.top"
+mode = "http"
+backends = ["http://10.0.0.5:8080"]
+backend_protocol = "h2c"
+"#,
+        );
+
+        let routes = config.build_routes().expect("the route is valid");
+        assert_eq!(routes[0].backend_protocol(), BackendProtocol::H2c);
+    }
+
+    /// A backend whose scheme is neither `http` nor `https` cannot be fetched
+    /// at all, and the message has to name the backend that carries it.
     #[test]
     fn build_routes_rejects_a_backend_that_cannot_work() {
         let config = parse(
@@ -3076,13 +3457,13 @@ backends = ["http://10.0.0.5:8080"]
 [[routes]]
 host_pattern = "fn.iakl.top"
 mode = "http"
-backends = ["https://caddy:443"]
+backends = ["ftp://caddy:443"]
 "#,
         );
 
         let error = config.build_routes().unwrap_err().to_string();
         assert!(
-            error.contains("https://"),
+            error.contains("ftp://"),
             "the message has to name the offending backend, got: {error}"
         );
     }
@@ -3765,16 +4146,20 @@ domains = ["fn.iroh.iakl.top"]
         let route = &config.routes.as_ref().unwrap()[0];
         assert!(route.redirect_to_https.unwrap_or(false));
         assert!(route.cert_path.is_some());
-        // Parsing it is not the same as honouring it: the https backend is
-        // refused, with a message that says what to do instead.
-        assert!(validate_backend("route fn", RouteMode::Http, &route.backends[0]).is_err());
+        // Parsing it is not the same as honouring it: the backend is fetched
+        // over a TLS session this process originates, and the certificate it
+        // presents is checked against the machine's trust store.
+        assert!(validate_backend("route fn", RouteMode::Http, &route.backends[0]).is_ok());
     }
 
     #[test]
-    fn http_backends_must_be_plain_http() {
+    fn http_backends_must_name_a_scheme_that_can_be_fetched() {
         assert!(validate_backend("route a", RouteMode::Http, "http://10.0.0.5:8080").is_ok());
-        assert!(validate_backend("route a", RouteMode::Http, "https://example.com").is_err());
+        // An `https://` backend is fetched over a TLS session this process
+        // originates: it verifies the certificate, it does not hold one.
+        assert!(validate_backend("route a", RouteMode::Http, "https://example.com").is_ok());
         assert!(validate_backend("route a", RouteMode::Http, "10.0.0.5:8080").is_err());
+        assert!(validate_backend("route a", RouteMode::Http, "ftp://example.com").is_err());
 
         // Passthrough never interprets the bytes, so the scheme is not its
         // business — a TLS target is conventionally written either way.

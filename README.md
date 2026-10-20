@@ -16,8 +16,9 @@ NexaPipe is a Rust workspace with four parts:
 
 - **`nexapipe`** — the server: an L7 reverse proxy plus an L4 tunnel that accept
   traffic over iroh/QUIC and forward it to your real backends. It can also serve
-  plain HTTP directly. TLS is not terminated here — it is passed through to the
-  backend, which owns the certificates.
+  plain HTTP directly. TLS is not terminated here: a client's session is passed
+  through by SNI, and an `https://` backend in `http` mode is a client-side TLS
+  session the server originates, not one it terminates.
 - **`nexapipe-client`** — the client library: connection pooling, domain-to-node
   routing, a local HTTP proxy, and a smoltcp-based TUN proxy. Shipped as an
   `rlib`, a `cdylib` (Android JNI) and a UniFFI binding.
@@ -728,6 +729,7 @@ strategy = "round_robin"          # or "random" or "least_conn"
 backends = ["http://192.0.2.20:18188"]
 mode = "http"                     # default
 # path_rewrite = "/api"
+# backend_protocol = "h2c"        # HTTP/2 in the clear; see below
 
 [[routes]]
 host_pattern = "app.example.com"
@@ -755,14 +757,26 @@ backends = ["http://host.docker.internal:18080"]
 
 | Mode | What it does | Transport security |
 | --- | --- | --- |
-| `http` (default) | Parses the request, applies `path_pattern` / `path_rewrite`, and re-issues it with the shared HTTP client. Backends must be `http://` — an `https://` backend is rejected at startup. | Encrypted on the way in (QUIC; plain HTTP when it arrives on `listen_addr`) but **plain HTTP from the server to the backend**. Anything sensitive belongs on a `passthrough` route, or on a `tcp` route whose payload carries its own TLS. |
+| `http` (default) | Parses the request, applies `path_pattern` / `path_rewrite`, and re-issues it with the shared HTTP client. A backend may be `http://` or `https://`. An `https://` one is reached over a TLS session the server originates and verifies against the machine's trust store — the server still holds no certificate and still terminates nothing. | QUIC-encrypted on the way in. From the server to the backend it is **plain HTTP** for an `http://` backend and **TLS** for an `https://` one. |
 | `passthrough` | Copies bytes. The route is selected by SNI, so `path_pattern` and `path_rewrite` do not apply and the backend may be a bare `host:port`. | End to end: the bytes are TLS and the server never terminates them, so the client validates the backend's own certificate. See [TLS](#tls). |
-| `tcp` | Carries a raw TCP flow to `backends`, selected by the host name in the L4 preface. No HTTP parsing, no `path_pattern`, no health check. See [TCP & UDP](#tcp--udp). | QUIC-encrypted up to the server; from there it is the tunnelled protocol verbatim — TLS, SSH or anything else is yours to bring. |
+| `tcp` | Carries a raw TCP flow to `backends`, selected by the host name in the L4 preface. No HTTP parsing, no `path_pattern`; probed by connecting. See [TCP & UDP](#tcp--udp). | QUIC-encrypted up to the server; from there it is the tunnelled protocol verbatim — TLS, SSH or anything else is yours to bring. |
 | `udp` | Carries UDP flows — one QUIC bi-stream per flow, one datagram per frame. Same selection as `tcp`, plus `idle_timeout_secs`. | QUIC-encrypted up to the server; payload security is the tunnelled protocol's job (DTLS, WireGuard, …). |
 
-No mode terminates TLS for a backend: the hop from the server to `backends` is as
+No mode terminates TLS for a client: the hop from the server to `backends` is as
 encrypted as what you put on the wire, and only `passthrough` keeps the client's
-TLS session intact all the way there.
+TLS session intact all the way there. An `https://` backend in `http` mode is a
+TLS **client** session this process originates, not a server session it
+terminates: the backend's certificate is verified against the system roots plus
+`[backends] ca_file`.
+
+`backend_protocol` is about the hop to the backend. Left out, a cleartext
+backend is spoken to over HTTP/1.1, and an `https://` one negotiates HTTP/2
+through ALPN whenever the backend offers it. `backend_protocol = "h2c"` is for a
+cleartext backend that speaks HTTP/2 with prior knowledge; it is refused
+together with an `https://` backend, which speaks h2 through the handshake
+instead. WebSocket upgrades are HTTP/1.1: an `https://` backend is reached over
+TLS, and a route with `backend_protocol = "h2c"` refuses a WebSocket rather than
+sending it an upgrade over the wrong protocol.
 
 A route serves **one** mode with `mode = "..."` and **several** with
 `modes = [...]`; they may be written together and the route serves the union,
@@ -791,8 +805,11 @@ path = "/health"   # appended to the backend URL
 
 Each `mode = "http"` backend is probed with `GET {backend}{path}` and leaves the
 pool after `threshold` *consecutive* failures — one lost probe never empties it —
-returning on the first probe that succeeds. `passthrough`, `tcp` and `udp` routes
-are never probed: a TLS listener and a database cannot answer an HTTP request.
+returning on the first probe that succeeds. A `passthrough` or `tcp` route is
+probed by connecting to it (for `passthrough`, by completing the TLS handshake),
+which says a process is listening rather than that it works. A `udp`-only route
+is not probed: there is nothing to connect to, and a probe that invented a
+datagram would report an answer no backend gave.
 
 **Set `enabled = false` when your backends cannot answer a health endpoint** — a
 static file server, a device's admin UI. Every backend then stays in the pool and
@@ -804,6 +821,76 @@ changing them takes effect on restart or for routes added by a reload.
 clamped silently, and each of the three then meant something nobody would ask for
 — a probe round every second, a probe that can never finish, or a single failure
 emptying the pool. A config that says `0` is refused at load.
+
+### `[backends]` — reaching an `https://` backend
+
+```toml
+[backends]
+ca_file = "/etc/nexapipe/internal-ca.pem"   # optional
+```
+
+An `https://` backend is verified against the machine's own trust store plus
+the PEM certificates in `ca_file`. The file **adds** to the system roots; it
+does not replace them. There is deliberately no switch to skip verification: a
+proxy that connects to a backend without knowing who answers is a proxy that
+whoever answers can redirect. A host with no usable system roots — a container
+without `ca-certificates`, say — falls back to Mozilla's bundled roots and logs
+that it did.
+
+The same trust store covers HTTP requests and WebSocket upgrades. HTTP/2 to an
+`https://` backend is negotiated through ALPN; there is nothing to configure for
+that. The section is read once at startup, so changing it takes a restart.
+
+### `[retry]` — trying a failed request again
+
+```toml
+[retry]
+attempts = 2       # extra attempts after the first; default: 0 (off)
+backoff_ms = 100   # wait between attempts; default: 100
+```
+
+A retry asks the route for a **different** backend, because the one that just
+failed is the one most likely to fail again. A route with one backend has
+nobody else to ask, so it asks that one again. The rule is the same on the
+plaintext listener and on the iroh tunnel's streaming path.
+
+What may be tried again depends on what failed:
+
+- A request that **never reached** the backend — the connection was refused,
+  the name did not resolve, the TLS handshake failed — is tried again whatever
+  its method is. The backend never saw it.
+- A request that **was carried and then lost** is tried again only when it is
+  idempotent. `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE` are; a
+  `POST` that charges a card is not.
+
+An answer is never retried, nor is a response the client has already started to
+receive. A WebSocket is a conversation and is never retried. `attempts` counts
+extra tries (2 means up to three in total) and is capped at 16; `backoff_ms` is
+capped at 60000. The section is read once at startup.
+
+### `[circuit_breaker]` — a backend that keeps failing leaves the rotation
+
+```toml
+[circuit_breaker]
+enabled = true          # default: true
+failure_threshold = 5   # consecutive failures before it leaves; default: 5
+reset_secs = 30         # how long it stays out; default: 30
+```
+
+When the HTTP request paths see `failure_threshold` consecutive failures that
+say a backend is unreachable, that backend stops being picked. While it is out,
+a route with no serving backend answers 503 instead of spending a connect
+timeout re-learning what the traffic already showed. The backend is given a
+trial after `reset_secs`; an answer closes the circuit and resets the count.
+
+A health probe says what a backend looked like the last time somebody asked; the
+circuit says what the traffic itself found. The two answer different questions
+and run at the same time. A response that broke halfway is not counted — the
+backend answered. The counter covers the HTTP request paths, including the
+tunnel's streaming path and a WebSocket handshake; a WebSocket session that dies
+after the upgrade does not count. TCP and UDP routes have no request failure to
+count and keep using the health probe. `failure_threshold` is capped at 1000 and
+`reset_secs` at 3600. The section is read once at startup.
 
 ### `[timeouts]` — waiting on a backend, and bounding each phase
 
@@ -1027,6 +1114,7 @@ is one table:
 | `[[routes]]` | Applied. Backends are re-probed; connections already open keep the route they were authorized against. |
 | `[auth]` | Applied, including `enabled` — turning 2FA on gates connections opened after the reload. Config file permissions are no longer checked; keep the file private or move its secrets out. |
 | `[health_check]` | Applied. `enabled` pauses and resumes probing; the rest takes effect for routes added or changed by a reload. |
+| `[backends]`, `[retry]`, `[circuit_breaker]` | Restart-only: read once at startup, like `[timeouts]`. |
 | `[timeouts]` | Restart-only: read once at startup, like `[server] listen_addr`. |
 | `[peers] allow` | Restart-only for now. |
 | `[iroh]` | Restart-only: the endpoint is bound once. |
@@ -1043,7 +1131,10 @@ typo cannot take a working instance down.
 ## TLS
 
 TLS is terminated **by the backend**, never by this proxy: the proxy holds no
-certificate and never sees a plaintext byte of an `https://` request.
+certificate and never sees a plaintext byte of an `https://` request. The one TLS
+session it originates is the client half of a hop to an `https://` backend in
+`http` mode — that is still not a session it terminates, and it holds no
+certificate for any client.
 
 1. A client opens a TLS session as usual — through the local HTTP proxy, the
    TUN, or straight at `[server] listen_addr`.

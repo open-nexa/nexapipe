@@ -187,8 +187,11 @@ redact_query = true
 # ============================================================
 
 # 1) Plain HTTP: parse the request, apply path_pattern / path_rewrite, re-issue
-#    it with the shared client. Backends must be http:// - an https:// backend
-#    is rejected at startup (the backend terminates TLS; the hop to it is plain).
+#    it with the shared client. A backend may be http:// or https:// - an
+#    https:// backend is reached over a TLS session the server originates and
+#    verifies, so the server holds no certificate and still terminates nothing.
+#    The backend's certificate is validated against the machine's trust store;
+#    see [backends].
 [[routes]]
 host_pattern = "app.example.com"
 path_pattern = "/"
@@ -197,6 +200,21 @@ strategy = "round_robin"          # or "random" or "least_conn"
 backends = ["http://127.0.0.1:18080", "http://127.0.0.2:18080"]
 mode = "http"                     # the default; may be omitted
 # path_rewrite = "/api"           # rewrite the path prefix before forwarding
+# backend_protocol = "h2c"        # speak HTTP/2 to a cleartext backend; see below
+#
+#    `backend_protocol` says how the server speaks to THIS route's backends.
+#    Left out, the server speaks HTTP/1.1 to a cleartext backend, and HTTP/2
+#    to an https:// one whenever the TLS handshake agrees on it - there is
+#    nothing to configure for that. "h2c" is for the backend that speaks
+#    HTTP/2 in the clear: there is no handshake on a cleartext connection to
+#    agree on anything, so the server has to know and start speaking h2. An
+#    https:// backend cannot be h2c - it speaks h2 through the handshake.
+#
+#    A WebSocket upgrade follows the same scheme. An https:// backend is reached
+#    over TLS and verified against the trust store in [backends]; a cleartext
+#    backend is reached in the clear. A route with backend_protocol = "h2c"
+#    refuses a WebSocket rather than sending it an HTTP/1.1 upgrade the backend
+#    did not ask for - WebSocket over HTTP/2 is not implemented.
 
 # 2) passthrough: selected by SNI, bytes are copied verbatim, the backend
 #    terminates TLS. The backend may be a bare host:port, and path_pattern /
@@ -246,9 +264,10 @@ backends = ["127.0.0.1:443"]
 # [health_check] - probing http backends
 # ============================================================
 # Every `mode = "http"` backend is asked `GET {backend}{path}` on a timer and
-# leaves the pool after `threshold` consecutive failures. `passthrough`, `tcp`
-# and `udp` routes are never probed: they cannot answer an HTTP request, and a
-# failed probe would only take a healthy backend out of rotation.
+# leaves the pool after `threshold` consecutive failures. A `passthrough` or
+# `tcp` route is probed by connecting to it (for passthrough, by completing the
+# TLS handshake), which says a process is listening rather than that it works.
+# A `udp`-only route is not probed: there is nothing to connect to.
 #
 # Set `enabled = false` when your backends cannot answer a probe on `{path}` -
 # one that replies 5xx to an unknown path, or one that does not speak HTTP at
@@ -262,6 +281,83 @@ interval = 10
 timeout = 5
 threshold = 3
 path = "/health"
+
+# ============================================================
+# [backends] - how the server reaches the backends
+# ============================================================
+# The trust store an https:// backend's certificate is checked against: the
+# machine's own roots, plus whatever `ca_file` names. A backend signed by an
+# internal authority needs that authority, and everything else keeps working.
+#
+# There is deliberately no way to skip the check: a proxy that connects to a
+# backend without knowing who it is talking to can be redirected by whoever
+# answers the name. A backend whose certificate this server cannot verify is a
+# backend this server does not reach.
+#
+# A host with no roots of its own - a container image without
+# `ca-certificates`, say - falls back to Mozilla's bundled roots rather than
+# trusting nothing at all.
+#
+# NOT hot-reloadable: read once at startup, so editing this takes a restart.
+# [backends]
+# ca_file = "/etc/nexapipe/internal-ca.pem"
+
+# ============================================================
+# [retry] - trying a failed request again
+# ============================================================
+# How many times a request that failed may be tried again, and how long to
+# wait between two attempts. Left out, a failed request is not tried again.
+# Both the iroh tunnel and the plaintext listener apply it.
+#
+# `attempts` is the number of extra attempts, so 2 means up to three tries in
+# total. It is capped at 16; `backoff_ms` is capped at 60000.
+#
+# A retry asks the route for a *different* backend, because the one that just
+# failed is the one most likely to fail again. A route with a single backend
+# has nobody else to ask and is asked again.
+#
+# What may be tried again depends on what failed:
+#
+#   - A request that never reached the backend - the connection was refused,
+#     the name did not resolve, the handshake failed - is tried again whatever
+#     it is. The backend never saw it.
+#   - A request that was carried and then lost is tried again only if it is
+#     idempotent. A GET is; a POST that charges a card is not, and the only
+#     way to know is what the method says.
+#
+# An answer is never retried, and neither is a response the client has already
+# started to receive.
+#
+# NOT hot-reloadable: read once at startup, so editing this takes a restart.
+# [retry]
+# attempts = 2
+# backoff_ms = 100
+
+# ============================================================
+# [circuit_breaker] - a backend that keeps failing leaves the rotation
+# ============================================================
+# How many failures in a row take a backend out of rotation, and how long it
+# stays out. The circuit is on unless `enabled = false`. While it is open the
+# route answers 503 rather than dialling a backend that is known to be down -
+# which spends a whole connect timeout to say what the server already knows.
+# `failure_threshold` is capped at 1000 and `reset_secs` at 3600.
+#
+# A health probe says what a backend looked like the last time somebody asked.
+# The circuit says what the traffic itself found. The two answer different
+# questions, and both are on at once: the probe is periodic and the failure is
+# immediate. The circuit counts the HTTP request paths, including the tunnel's
+# streaming path and a WebSocket handshake; a session that dies after the upgrade
+# does not count. A TCP or UDP route keeps using the health probe.
+#
+# The failures that count are the ones that say the backend is unreachable: the
+# connection was refused, the name did not resolve, the answer never came. A
+# response that broke halfway is not the backend's fault - it answered.
+#
+# NOT hot-reloadable: read once at startup, so editing this takes a restart.
+# [circuit_breaker]
+# enabled = true
+# failure_threshold = 5
+# reset_secs = 30
 
 # ============================================================
 # [timeouts] - waiting on a backend, and bounding each phase

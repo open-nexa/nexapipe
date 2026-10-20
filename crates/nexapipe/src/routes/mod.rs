@@ -1,5 +1,5 @@
 use crate::auth::ClientAcl;
-use crate::config::{RouteMode, Timeouts};
+use crate::config::{BackendProtocol, CircuitBreaker, Retry, RouteMode, Timeouts};
 use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,6 +144,12 @@ pub struct Route {
     /// decided before matching, by its first byte.
     modes: Vec<RouteMode>,
     backend_pool: Arc<BackendPool>,
+    /// The wire protocol the backends of this route are spoken to.
+    ///
+    /// Part of the route rather than of the pool, because it is a property of
+    /// the hop to the backend and every backend of a route is reached the same
+    /// way. See [`crate::config::BackendProtocol`].
+    backend_protocol: BackendProtocol,
     path_rewrite: Option<String>,
     l4: L4Options,
 }
@@ -168,9 +174,20 @@ impl Route {
             path_is_prefix,
             modes: vec![mode],
             backend_pool: Arc::new(BackendPool::new(backends, strategy)),
+            backend_protocol: BackendProtocol::default(),
             path_rewrite,
             l4: L4Options::default(),
         }
+    }
+
+    /// Speak to this route's backends with this protocol.
+    ///
+    /// A builder rather than another constructor argument: the protocol is
+    /// about the hop to the backend, and a route that does not name one speaks
+    /// HTTP/1.1 — which is what the default says.
+    pub fn with_backend_protocol(mut self, protocol: BackendProtocol) -> Self {
+        self.backend_protocol = protocol;
+        self
     }
 
     /// Serve several modes from one route instead of one.
@@ -306,6 +323,21 @@ impl Route {
         &self.backend_pool
     }
 
+    /// The wire protocol this route's backends are spoken to.
+    pub fn backend_protocol(&self) -> BackendProtocol {
+        self.backend_protocol
+    }
+
+    /// Run the circuit on this route's backends with these settings.
+    ///
+    /// A builder rather than a constructor argument: a pool built in code —
+    /// in a test, or by the local proxy — has no circuit, and one built from a
+    /// config has the settings the config resolved to.
+    pub fn with_circuit_breaker(self, breaker: CircuitBreaker) -> Self {
+        self.backend_pool.set_circuit_breaker(breaker);
+        self
+    }
+
     /// What makes this the same route across a reload, for the two things that
     /// hang off it: its backend pool and the health probe watching that pool.
     ///
@@ -425,6 +457,13 @@ impl<T> BackendLookup<T> {
 
 pub struct BackendInfo {
     pub url: String,
+    /// The wire protocol this backend is to be spoken to.
+    ///
+    /// Carried with the address because it is the other half of "where this
+    /// request goes": the same address is reached differently depending on
+    /// what the route says, and a caller that picked the backend has to pick
+    /// the client with it.
+    pub protocol: BackendProtocol,
     pub path_rewrite: Option<String>,
     pub path_pattern: String,
     pub path_is_prefix: bool,
@@ -432,7 +471,46 @@ pub struct BackendInfo {
     /// backend: dropping it is what releases the backend's slot in the balancer,
     /// so nothing reads this field — moving it along with the requests is the
     /// whole point. See [`crate::lb::BackendLease`].
-    _lease: BackendLease,
+    ///
+    /// Taken rather than borrowed, because the work against a backend is not
+    /// over when the response head arrives: a body that is still streaming is
+    /// a backend that is still busy, and the caller that owns the body is the
+    /// one that has to keep the lease until it is dropped.
+    _lease: Option<BackendLease>,
+}
+
+impl BackendInfo {
+    /// Takes the lease out, so the caller can hold it for as long as the work
+    /// lasts.
+    ///
+    /// The lease counts the backend as busy until it is dropped, and the work
+    /// is not over when the response head is in: the body may still be
+    /// streaming. A caller that keeps the lease with the body is what makes
+    /// `least_conn` count what is really in flight.
+    pub fn take_lease(&mut self) -> Option<BackendLease> {
+        self._lease.take()
+    }
+
+    /// The backend answered.
+    ///
+    /// What the circuit counts. A backend that answers is a backend that is
+    /// up, however long it took.
+    pub fn report_success(&self) {
+        if let Some(lease) = &self._lease {
+            lease.record_success();
+        }
+    }
+
+    /// The backend did not answer.
+    ///
+    /// What the circuit counts. Only the failures that say the backend is
+    /// unreachable are counted — a response that broke halfway says something
+    /// else, and the backend did answer.
+    pub fn report_failure(&self) {
+        if let Some(lease) = &self._lease {
+            lease.record_failure();
+        }
+    }
 }
 
 /// What the L4 tunnel needs in order to serve one flow.
@@ -478,6 +556,14 @@ pub struct RouteConfig {
     /// not part of the routing table and a reload leaves it alone: changing a
     /// timeout takes a restart, like every key outside `[[routes]]`.
     timeouts: Timeouts,
+    /// How often a failed request is tried again, and on which backend.
+    ///
+    /// Held here rather than threaded down to each handler because this object
+    /// is what every one of them already receives, for the same reason the
+    /// deadlines are: routing and the rules its choices are carried out under
+    /// arrive together. A reload leaves it alone, like every key outside
+    /// `[[routes]]`.
+    retry: Retry,
 }
 
 impl RouteConfig {
@@ -485,6 +571,7 @@ impl RouteConfig {
         Self {
             routes: Arc::new(RwLock::new(routes)),
             timeouts: Timeouts::default(),
+            retry: Retry::default(),
         }
     }
 
@@ -497,6 +584,20 @@ impl RouteConfig {
         Self {
             routes: Arc::new(RwLock::new(routes)),
             timeouts,
+            retry: Retry::default(),
+        }
+    }
+
+    /// A table whose flows wait on these deadlines and retry like this.
+    ///
+    /// The only construction that matters outside a test: defaults exist so a
+    /// table built anywhere else — the local proxy, the tests — behaves exactly
+    /// as it did before this field existed.
+    pub fn with_settings(routes: Vec<Route>, timeouts: Timeouts, retry: Retry) -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(routes)),
+            timeouts,
+            retry,
         }
     }
 
@@ -505,11 +606,31 @@ impl RouteConfig {
         self.timeouts
     }
 
+    /// How often a request that failed is tried again.
+    pub fn retry(&self) -> Retry {
+        self.retry
+    }
+
     /// Backend for an HTTP request. Callers answer
     /// [`BackendLookup::NoRoute`] with `404` and [`BackendLookup::Unavailable`]
     /// with `503` — see the enum for why the two are not one answer.
     pub async fn get_backend(&self, host: &str, path: &str) -> BackendLookup<BackendInfo> {
         self.get_backend_with_acl(host, path, None).await
+    }
+
+    /// [`Self::get_backend`], preferring a backend that is not on the list.
+    ///
+    /// The list is the backends an earlier attempt already failed against, and
+    /// it is what a retry is built on: the backend that just failed is the one
+    /// most likely to fail again.
+    pub async fn get_backend_excluding(
+        &self,
+        host: &str,
+        path: &str,
+        exclude: &[String],
+    ) -> BackendLookup<BackendInfo> {
+        self.get_backend_with_acl_excluding(host, path, None, exclude)
+            .await
     }
 
     /// [`Self::get_backend`] under a client's host authorization.
@@ -523,6 +644,19 @@ impl RouteConfig {
         host: &str,
         path: &str,
         acl: Option<&ClientAcl>,
+    ) -> BackendLookup<BackendInfo> {
+        self.get_backend_with_acl_excluding(host, path, acl, &[])
+            .await
+    }
+
+    /// [`Self::get_backend_with_acl`], preferring a backend that is not on the
+    /// list.
+    pub async fn get_backend_with_acl_excluding(
+        &self,
+        host: &str,
+        path: &str,
+        acl: Option<&ClientAcl>,
+        exclude: &[String],
     ) -> BackendLookup<BackendInfo> {
         if acl.is_some_and(|acl| !acl.allows(host)) {
             tracing::debug!("Host {host} is not allowed for this client, answering 404");
@@ -548,7 +682,7 @@ impl RouteConfig {
         // A route matched, so this stopped being a routing question: every
         // backend behind it is down, and dialling one anyway spends a whole
         // connect timeout delivering the refusal the caller can write now.
-        let Some(lease) = route.backend_pool().select_backend().await else {
+        let Some(lease) = route.backend_pool().select_backend_excluding(exclude).await else {
             tracing::warn!(
                 "Route {}:{} matched host={host} path={path} but no backend is healthy -> 503",
                 route.host_pattern(),
@@ -565,10 +699,11 @@ impl RouteConfig {
         );
         BackendLookup::Found(BackendInfo {
             url: lease.url().to_string(),
+            protocol: route.backend_protocol(),
             path_rewrite: route.path_rewrite().clone(),
             path_pattern: route.path_pattern().to_string(),
             path_is_prefix: route.path_is_prefix(),
-            _lease: lease,
+            _lease: Some(lease),
         })
     }
 

@@ -31,4 +31,12 @@ regexes = [
     # `generic-api-key` entropy threshold, so the scanner reads it as a
     # credential. It is a fixture: it appears only in this test module.
     '''^KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP$''',
+
+    # `a_websocket_reaches_an_https_backend_over_tls`
+    # (crates/nexapipe/tests/data_plane.rs) sends the RFC 6455 example
+    # `Sec-WebSocket-Key` in its upgrade request. It is a protocol fixture, not
+    # a credential: the test backend reads the request and answers `101`
+    # without validating the nonce, and the value is the one published in the
+    # RFC.
+    '''^dGhlIHNhbXBsZSBub25jZQ==$''',
 ]

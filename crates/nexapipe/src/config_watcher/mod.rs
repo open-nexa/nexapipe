@@ -3,7 +3,7 @@ use crate::config::ProxyConfig;
 use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
 use crate::health::HealthProbes;
-use crate::proxy::{HttpClient, sync_health_checks};
+use crate::proxy::{BackendClients, sync_health_checks};
 use crate::routes::RouteConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 pub struct ConfigWatcher {
     config_path: String,
     route_config: Arc<RouteConfig>,
-    http_client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     /// Health probes already running, and the pool each one is watching, so a
     /// reload can tell a route that was rebuilt from one that is still here.
     health_probes: Arc<Mutex<HealthProbes>>,
@@ -83,7 +83,7 @@ impl ConfigWatcher {
     pub fn new(
         config_path: String,
         route_config: Arc<RouteConfig>,
-        http_client: Arc<HttpClient>,
+        clients: Arc<BackendClients>,
         health_probes: Arc<Mutex<HealthProbes>>,
         health_enabled: Arc<std::sync::atomic::AtomicBool>,
         auth: Option<AuthState>,
@@ -92,7 +92,7 @@ impl ConfigWatcher {
         ConfigWatcher {
             config_path,
             route_config,
-            http_client,
+            clients,
             health_probes,
             health_enabled,
             auth,
@@ -177,7 +177,7 @@ impl ConfigWatcher {
         );
         sync_health_checks(
             &self.route_config,
-            &self.http_client,
+            &self.clients,
             &self.health_probes,
             &new_config.health_check,
             &self.health_enabled,
@@ -775,9 +775,10 @@ mod tests {
         let watcher = ConfigWatcher::new(
             path,
             Arc::new(RouteConfig::new(Vec::new())),
-            Arc::new(crate::http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),
@@ -1014,9 +1015,10 @@ mod tests {
         let watcher = ConfigWatcher::new(
             path_str,
             Arc::new(RouteConfig::new(Vec::new())),
-            Arc::new(crate::http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),
@@ -1094,9 +1096,10 @@ mod tests {
         let watcher = ConfigWatcher::new(
             path_str,
             Arc::new(RouteConfig::new(Vec::new())),
-            Arc::new(crate::http::create_http_client(
-                crate::config::Timeouts::default().connect,
-            )),
+            Arc::new(
+                crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
+                    .expect("the default trust store is always usable"),
+            ),
             Arc::new(Mutex::new(HealthProbes::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Some(state.clone()),

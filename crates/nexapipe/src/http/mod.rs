@@ -1,21 +1,32 @@
+use crate::config::BackendProtocol;
 use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
-use ::http::{Request, Response, StatusCode};
+use ::http::{Method, Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 /// Client used to reach backends.
 ///
-/// Plaintext HTTP only: TLS is terminated by the backend (Caddy &co), so this
-/// process never speaks TLS to anything but the iroh endpoint. An `https://`
-/// backend is rejected when the config is loaded rather than silently attempted.
+/// Speaks HTTP/1.1 to every backend and HTTP/2 to the ones that offer it: an
+/// `https://` backend negotiates h2 through ALPN, and a cleartext one is
+/// spoken to over HTTP/1.1 unless its route asks for h2c.
+///
+/// One client serves both schemes. The connector reads the scheme off the
+/// request URI, and the pool keeps one set of connections per scheme and
+/// authority — so an `http://` and an `https://` backend on the same host are
+/// two sets, and neither is handed a connection the other opened.
+///
+/// TLS here is a client-side thing: this process never holds a certificate and
+/// never terminates a session. It *originates* one towards a backend the route
+/// names as `https://`, and checks the certificate it gets back.
 pub type HttpClient = hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<bytes::Bytes>,
 >;
 
@@ -26,18 +37,380 @@ pub type HttpClient = hyper_util::client::legacy::Client<
 /// made after the response head arrives, for a pooled connection that was closed
 /// meanwhile. It is a builder setting, not something a caller passes per request,
 /// because that is the only place the transport enforces it.
-pub fn create_http_client(connect_timeout: std::time::Duration) -> HttpClient {
+///
+/// `ca_file` names a PEM file of extra CA certificates to trust when verifying
+/// an `https://` backend. It is the machine's own roots *plus* that file: a
+/// backend signed by an internal authority needs the internal authority, and
+/// everything else keeps working.
+pub fn create_http_client(
+    connect_timeout: std::time::Duration,
+    ca_file: Option<&std::path::Path>,
+) -> anyhow::Result<HttpClient> {
+    Ok(create_http_client_with_tls(
+        tls_client_config(ca_file)?,
+        connect_timeout,
+    ))
+}
+
+/// The HTTP/1.1 client around a TLS configuration that is already built.
+///
+/// Split out so [`BackendClients`] can build the trust store once and hand a
+/// clone to each client, rather than reading the machine's roots (and the
+/// operator's CA file) twice for the same process.
+fn create_http_client_with_tls(
+    tls: rustls::ClientConfig,
+    connect_timeout: std::time::Duration,
+) -> HttpClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
     http_connector.set_connect_timeout(Some(connect_timeout));
+    // The connector is handed the URI of the backend, `https://` included, and
+    // it is the one that decides to put TLS on top of the socket. A connector
+    // that insists on `http://` would refuse the address before the TLS layer
+    // ever saw it.
+    http_connector.enforce_http(false);
+
+    // The connector is what decides between plaintext and TLS, and it decides
+    // by the scheme of the URI it is handed — so the same client reaches an
+    // `http://` backend and an `https://` one.
+    //
+    // `enable_all_versions` is also what puts the protocols on the table: the
+    // ALPN list the handshake offers is `h2` first and `http/1.1` second, so a
+    // backend that speaks h2 gets it and a backend that does not falls back to
+    // HTTP/1.1 without anybody having to say which it is.
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_all_versions()
+        .wrap_connector(http_connector);
 
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .pool_max_idle_per_host(100)
         .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
         .http1_title_case_headers(true)
         .http1_ignore_invalid_headers_in_responses(true)
-        .build(http_connector)
+        // The HTTP/2 settings are the same idea as the HTTP/1 ones above: a
+        // pooled connection is kept while it answers and dropped when it stops
+        // answering. Without them an h2 connection to a backend that went away
+        // stays in the pool until something else notices.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The h2 half needs a clock of its own: an HTTP/2 connection
+        // carries its own timeouts — a ping that has to be answered, a
+        // stream that has to be reset — and without a timer the client
+        // panics the first time it negotiates h2 with a backend.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .build(connector)
+}
+
+/// The clients the proxy reaches backends through.
+///
+/// Two of them, because the protocol to the backend is a property of the route
+/// and not of the process: a backend that speaks HTTP/2 in the clear is reached
+/// with a client that starts speaking h2, and everything else is reached with
+/// the client that speaks HTTP/1.1 and negotiates h2 over TLS when a backend
+/// offers it.
+///
+/// The two are separate objects rather than one client that decides per
+/// request, because the protocol is decided when the connection is made and
+/// not when the request is sent: a pooled connection is a connection to one
+/// backend in one protocol, and a client that mixed the two would hand an h1
+/// connection to a backend that only speaks h2.
+#[derive(Clone)]
+pub struct BackendClients {
+    /// HTTP/1.1, and HTTP/2 where a backend negotiates it over TLS.
+    http: Arc<HttpClient>,
+    /// HTTP/2 in the clear, with prior knowledge.
+    h2c: Arc<HttpClient>,
+    /// TLS for a connection that is not the pooled client's: a WebSocket holds
+    /// one connection for the whole session, and its handshake is HTTP/1.1.
+    /// The ALPN list this carries is `http/1.1` alone.
+    tls: Arc<rustls::ClientConfig>,
+}
+
+impl BackendClients {
+    /// Builds both clients, with the same connect deadline and the same trust
+    /// store.
+    pub fn new(
+        connect_timeout: std::time::Duration,
+        ca_file: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let tls = tls_client_config(ca_file)?;
+        let mut websocket_tls = tls.clone();
+        // A WebSocket upgrade is HTTP/1.1. Offering h2 here would let a
+        // backend agree to a protocol this path cannot speak, so the raw
+        // connection asks for the one version it can carry.
+        websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(BackendClients {
+            http: Arc::new(create_http_client_with_tls(tls.clone(), connect_timeout)),
+            h2c: Arc::new(create_h2c_client_with_tls(tls, connect_timeout)),
+            tls: Arc::new(websocket_tls),
+        })
+    }
+
+    /// The client that speaks this protocol.
+    pub fn for_protocol(&self, protocol: BackendProtocol) -> &HttpClient {
+        match protocol {
+            BackendProtocol::Http1 => &self.http,
+            BackendProtocol::H2c => &self.h2c,
+        }
+    }
+
+    /// Opens one connection to a backend, for a WebSocket session.
+    ///
+    /// This is not the pooled client: a WebSocket holds its connection for the
+    /// whole conversation, so it needs the socket itself rather than a request
+    /// the pool may reuse. An `https://` backend is still reached over a TLS
+    /// session this process originates and verifies, with the same trust store
+    /// as the pooled clients; a cleartext one is handed back as it is.
+    pub(crate) async fn connect_stream(
+        &self,
+        backend_url: &str,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<BackendStream> {
+        let url = url::Url::parse(backend_url)
+            .map_err(|e| anyhow::anyhow!("invalid backend URL: {e}"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
+            .to_string();
+        let port = url.port_or_known_default().unwrap_or(80);
+        let scheme = url.scheme().to_string();
+
+        let connect = async {
+            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to backend: {e}"))?;
+            // A WebSocket carries its own message framing; Nagle would only add
+            // latency to every frame.
+            let _ = tcp.set_nodelay(true);
+
+            match scheme.as_str() {
+                "http" => Ok(BackendStream::Plain(tcp)),
+                "https" => {
+                    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                        .map_err(|e| {
+                            anyhow::anyhow!("cannot verify the backend certificate for {host}: {e}")
+                        })?;
+                    let connector = tokio_rustls::TlsConnector::from(self.tls.clone());
+                    let tls = connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("TLS handshake with backend failed: {e}"))?;
+                    Ok(BackendStream::Tls(Box::new(tls)))
+                }
+                other => anyhow::bail!(
+                    "backend {backend_url} uses {other}://, which cannot carry a WebSocket"
+                ),
+            }
+        };
+
+        tokio::time::timeout(connect_timeout, connect)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
+    }
+}
+
+/// A dedicated backend connection, for a flow that owns it for its lifetime.
+///
+/// Plain or TLS, so the WebSocket path does not have to know which one it got
+/// after the dial: it writes the upgrade request and pipes the session either
+/// way.
+pub(crate) enum BackendStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl AsyncRead for BackendStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            BackendStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            BackendStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Builds the client that speaks HTTP/2 in the clear, with prior knowledge.
+///
+/// The other name for this is h2c, and the "prior knowledge" is the whole
+/// point: a cleartext connection has no handshake to negotiate a protocol in,
+/// so the client has to know that the backend speaks h2 and start speaking it.
+/// A backend that does not answer h2 gets a connection reset, which is a
+/// failure the route's own configuration is responsible for avoiding.
+pub fn create_h2c_client(
+    connect_timeout: std::time::Duration,
+    ca_file: Option<&std::path::Path>,
+) -> anyhow::Result<HttpClient> {
+    Ok(create_h2c_client_with_tls(
+        tls_client_config(ca_file)?,
+        connect_timeout,
+    ))
+}
+
+/// The h2c client around a TLS configuration that is already built.
+fn create_h2c_client_with_tls(
+    tls: rustls::ClientConfig,
+    connect_timeout: std::time::Duration,
+) -> HttpClient {
+    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    http_connector.set_nodelay(true);
+    http_connector.set_keepalive(Some(std::time::Duration::from_secs(30)));
+    http_connector.set_connect_timeout(Some(connect_timeout));
+    // As in `create_http_client`: the connector is handed the URI and does not
+    // get to refuse the scheme.
+    http_connector.enforce_http(false);
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_all_versions()
+        .wrap_connector(http_connector);
+
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        // The one setting that makes this client h2: every connection it
+        // opens is an h2 connection, whatever the peer says or does not say.
+        .http2_only(true)
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The clock the h2 half needs, for the same reason the other client
+        // has one: an h2 connection times things on its own.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .build(connector)
+}
+
+/// The TLS configuration a backend handshake is made with.
+///
+/// The certificate is verified against the machine's own trust store, and there
+/// is no way to turn that off: a proxy that connects to a backend without
+/// checking who it is talking to is a proxy that can be redirected by whoever
+/// answers the name. A backend whose certificate this process cannot verify is
+/// a backend this proxy does not reach.
+///
+/// The provider is named rather than left to the process-wide default, so the
+/// client does not depend on the order things happen to be installed in — the
+/// iroh handshake installs a provider of its own, and the two must not race.
+fn tls_client_config(ca_file: Option<&std::path::Path>) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the ring provider supports the default protocol versions")
+        .with_root_certificates(root_store(ca_file)?)
+        .with_no_client_auth())
+}
+
+/// The certificates a backend's certificate is checked against.
+///
+/// The machine's own roots rather than a list this project ships: a
+/// certificate the browser on the same machine trusts is a certificate this
+/// proxy trusts, and a bundled list goes stale without anybody noticing.
+///
+/// A host with no roots of its own — a minimal container image without
+/// `ca-certificates`, say — falls back to Mozilla's bundled ones, because a
+/// proxy that cannot verify anything is a proxy that cannot reach an
+/// `https://` backend at all. The fallback is a weaker guarantee and says so
+/// in the log, rather than turning every handshake into a message about a
+/// missing issuer.
+fn root_store(ca_file: Option<&std::path::Path>) -> anyhow::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+
+    // The platform loader reports what it could not read alongside what it
+    // read, rather than failing as a whole: one unreadable store on a machine
+    // with several is still a store.
+    let native = rustls_native_certs::load_native_certs();
+    if !native.certs.is_empty() {
+        let mut rejected = 0usize;
+        for cert in native.certs {
+            if roots.add(cert).is_err() {
+                rejected += 1;
+            }
+        }
+        tracing::info!(
+            "Loaded {} CA certificates from the system trust store ({rejected} rejected)",
+            roots.len()
+        );
+    } else {
+        tracing::warn!(
+            "The system trust store holds no usable certificates ({} errors); falling back to \
+             Mozilla's bundled roots for backend TLS",
+            native.errors.len()
+        );
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    // The file the operator named is read here rather than at the first
+    // handshake: a CA file that cannot be read is a config that cannot work,
+    // and the operator should read about it at startup rather than in the log
+    // of a request that failed to verify.
+    if let Some(path) = ca_file {
+        let pem = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("cannot read the CA file {}: {e}", path.display()))?;
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut reader)
+            .map_err(|e| anyhow::anyhow!("cannot parse the CA file {}: {e}", path.display()))?;
+        if certs.is_empty() {
+            anyhow::bail!(
+                "the CA file {} holds no certificates; it should hold one or more PEM-encoded \
+                 certificates",
+                path.display()
+            );
+        }
+        let mut rejected = 0usize;
+        for cert in certs {
+            if roots
+                .add(rustls::pki_types::CertificateDer::from(cert))
+                .is_err()
+            {
+                rejected += 1;
+            }
+        }
+        tracing::info!(
+            "Loaded the CA file {} ({} certificates, {rejected} rejected)",
+            path.display(),
+            roots.len()
+        );
+    }
+
+    Ok(roots)
 }
 
 const MAX_COMPRESS_SIZE: usize = 1024 * 1024;
@@ -168,11 +541,20 @@ fn forwards_request_header(name: &str) -> bool {
     .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
-pub async fn proxy_request(
-    client: &HttpClient,
-    req: Request<Incoming>,
+///
+/// The request body is a parameter rather than `Incoming` so that the path can
+/// be driven by something other than a live connection — a test, mostly. The
+/// body is read whole either way, and what comes back does not depend on where
+/// the request came from.
+pub async fn proxy_request<B>(
+    clients: &BackendClients,
+    req: Request<B>,
     config: Arc<RouteConfig>,
-) -> Result<Response<ProxyBody>, anyhow::Error> {
+) -> Result<Response<ProxyBody>, anyhow::Error>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     // Answered, not raised: no `Host` means no route can match, which is the
     // same answer as a host no route matches — and the caller maps an `Err`
     // from here to a 502, which would blame a backend for a request that never
@@ -182,6 +564,9 @@ pub async fn proxy_request(
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(crate::routes::host_without_port)
+        // Owned, because the request is moved into the body read below and
+        // the host is needed after that.
+        .map(str::to_string)
     else {
         return Ok(create_error_response(
             StatusCode::NOT_FOUND,
@@ -193,7 +578,10 @@ pub async fn proxy_request(
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(req.uri().path());
+        .unwrap_or(req.uri().path())
+        // Owned, for the same reason the host is: the request is moved into
+        // the body read below, and the path is needed after that.
+        .to_string();
 
     let accept_encoding = req
         .headers()
@@ -203,7 +591,9 @@ pub async fn proxy_request(
     let headers_clone = req.headers().clone();
     let method = req.method().clone();
 
-    let backend_info: BackendInfo = match config.get_backend(host, path).await {
+    // The first backend is chosen before the body is read, so a request for a
+    // host nobody serves is answered without reading what it carries.
+    let mut backend_info: BackendInfo = match config.get_backend(&host, &path).await {
         BackendLookup::Found(info) => info,
         // No route serves this host: saying 404 beats guessing at one.
         BackendLookup::NoRoute => {
@@ -224,13 +614,145 @@ pub async fn proxy_request(
         }
     };
 
-    // `backend_info` carries the lease (see `BackendInfo::_lease`), so the
-    // backend is counted as busy until this function returns — which is until
-    // the response head is in hand, and exactly what the deadline below bounds.
-    // A response whose body *then* streams is not counted for the whole stream,
-    // so `least_conn` sees a long-running transfer as finished; that skews a
-    // balance decision at worst, and it is the one path the lease cannot follow
-    // without owning the response body.
+    // Read once, for every attempt: the body cannot be read twice, and what
+    // goes out is the same bytes whichever backend receives it.
+    //
+    // Held for as long as the buffered body is alive — see `read_body_limited`.
+    // Dropping it here rather than at the end of the function is deliberate and
+    // is what makes the budget mean what it says.
+    let (body, _body_reservation) = read_body_limited(
+        req.into_body(),
+        MAX_REQUEST_BODY,
+        config.timeouts().deadlines.body,
+    )
+    .await?;
+
+    let attempts = config.retry().attempts;
+    let backoff = config.retry().backoff;
+    // The backends that already failed this request. A retry asks somebody
+    // else, because the one that just failed is the one most likely to fail
+    // again.
+    let mut tried: Vec<String> = Vec::new();
+    let mut attempt = 0u32;
+
+    loop {
+        let outcome = attempt_backend(
+            clients,
+            &config,
+            &backend_info,
+            &method,
+            &headers_clone,
+            &path,
+            &body,
+        )
+        .await;
+
+        let response = match outcome {
+            Ok(response) => {
+                // The backend answered, so it is up: the circuit is told, and
+                // a backend that was out of rotation comes back into it.
+                backend_info.report_success();
+                response
+            }
+            Err(failure) => {
+                // Only a failure that says the backend is unreachable counts
+                // against it. A response that broke halfway is a different
+                // thing: the backend did answer.
+                if failure.backend_is_down() {
+                    backend_info.report_failure();
+                }
+
+                // Two questions, and the failure answers both: may this be
+                // tried again at all, and is there another backend to try it
+                // on.
+                if attempt >= attempts || !failure.retry.may_retry(&method) {
+                    return Err(failure.error);
+                }
+                attempt += 1;
+
+                tracing::warn!(
+                    "Request to {} failed ({}); trying another backend ({attempt}/{attempts})",
+                    backend_info.url,
+                    failure.error,
+                );
+
+                tried.push(backend_info.url.clone());
+                match config.get_backend_excluding(&host, &path, &tried).await {
+                    BackendLookup::Found(info) => backend_info = info,
+                    // Nobody else to ask. The failure is the answer: the pool
+                    // being empty is a consequence of it, not a new fact.
+                    BackendLookup::NoRoute | BackendLookup::Unavailable => {
+                        return Err(failure.error);
+                    }
+                }
+
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+                continue;
+            }
+        };
+
+        let content_encoding = response.headers().get("content-encoding");
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+
+        // The idle deadline covers the body as well as the head: a backend that
+        // answers and then goes silent must not hold this request open. The
+        // streaming path has always bounded this; the plaintext listener had no
+        // bound at all, so a backend that sent the head and stalled kept the
+        // request — and the connection — for as long as it liked.
+        let idle = config.timeouts().deadlines.response_idle;
+
+        // The lease moves out of the backend info and into the body, because
+        // the work against that backend is not over when the response head
+        // arrives: a body that is still streaming is a backend that is still
+        // busy. See `LeasedBody`.
+        let lease = backend_info.take_lease();
+
+        if content_encoding.is_none()
+            && should_compress(content_type)
+            && let Some(encodings) = accept_encoding
+            && encodings.contains("gzip")
+        {
+            // The whole body is read and compressed here, so the backend is
+            // done with it before the answer goes out: the lease goes back
+            // with the `backend_info` that is dropped at the end of this
+            // function.
+            return compress_response(response, "gzip", idle).await;
+        }
+
+        return Ok(response.map(|body| {
+            let body = http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync();
+            http_body_util::BodyExt::boxed_unsync(LeasedBody {
+                inner: body,
+                _lease: lease,
+            })
+        }));
+    }
+}
+
+/// One attempt at one backend: the answer, or the reason there was none.
+///
+/// Split out of [`proxy_request`] so that the retry loop above it is about
+/// retrying and this is about asking. The request is rebuilt for every
+/// attempt, because the backend it goes to may be a different one.
+async fn attempt_backend(
+    clients: &BackendClients,
+    config: &RouteConfig,
+    backend_info: &BackendInfo,
+    method: &Method,
+    headers: &::http::HeaderMap,
+    path: &str,
+    body: &bytes::Bytes,
+) -> Result<Response<hyper::body::Incoming>, ProxyFailure> {
+    // The client is picked by the protocol the route speaks to its backends,
+    // which is decided by the route rather than by the request: a backend that
+    // speaks h2 in the clear is reached with the h2c client, everything else
+    // with the one that speaks HTTP/1.1 and negotiates h2 over TLS.
+    let client = clients.for_protocol(backend_info.protocol);
     let response_deadline = config.timeouts().response;
 
     let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
@@ -262,19 +784,9 @@ pub async fn proxy_request(
     .parse::<http::Uri>()
     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
-    // Held for as long as the buffered body is alive — see `read_body_limited`.
-    // Dropping it here rather than at the end of the function is deliberate and
-    // is what makes the budget mean what it says.
-    let (body, _body_reservation) = read_body_limited(
-        req.into_body(),
-        MAX_REQUEST_BODY,
-        config.timeouts().deadlines.body,
-    )
-    .await?;
+    let mut builder = Request::builder().method(method.clone()).uri(new_uri);
 
-    let mut builder = Request::builder().method(method).uri(new_uri);
-
-    for (name, value) in headers_clone.iter() {
+    for (name, value) in headers.iter() {
         // Preserve the client's original Host header so backend virtual-host
         // routing works; drop the rest that only meant something for the hop
         // from the client to here.
@@ -284,7 +796,7 @@ pub async fn proxy_request(
         builder = builder.header(name, value);
     }
 
-    let proxied_req = builder.body(Full::new(body))?;
+    let proxied_req = builder.body(Full::new(body.clone()))?;
 
     tracing::debug!(
         "Proxying request: {} {} -> {}://{}:{}",
@@ -295,42 +807,62 @@ pub async fn proxy_request(
         backend_port
     );
 
-    let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
-    {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("backend request failed: {}", e))?,
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "backend {}:{} did not respond within {:?}",
-                backend_host,
-                backend_port,
-                response_deadline
-            ));
-        }
-    };
-
-    let content_encoding = response.headers().get("content-encoding");
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|h| h.to_str().ok());
-
-    // The idle deadline covers the body as well as the head: a backend that
-    // answers and then goes silent must not hold this request open. The
-    // streaming path has always bounded this; the plaintext listener had no
-    // bound at all, so a backend that sent the head and stalled kept the
-    // request — and the connection — for as long as it liked.
-    let idle = config.timeouts().deadlines.response_idle;
-
-    if content_encoding.is_none()
-        && should_compress(content_type)
-        && let Some(encodings) = accept_encoding
-        && encodings.contains("gzip")
-    {
-        return compress_response(response, "gzip", idle).await;
+    match tokio::time::timeout(response_deadline, client.request(proxied_req)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(ProxyFailure {
+            error: anyhow::anyhow!("backend request failed: {e}"),
+            partial: None,
+            // A connect error means the request was never carried: the
+            // connection was refused, the name did not resolve, the handshake
+            // failed. Nothing reached the backend, so asking again is free of
+            // consequence whatever the request was. Anything else means the
+            // request was sent and the answer did not come, which only an
+            // idempotent request may be asked twice.
+            retry: if e.is_connect() {
+                Retryability::Always
+            } else {
+                Retryability::IfIdempotent
+            },
+        }),
+        Err(_) => Err(ProxyFailure {
+            error: anyhow::anyhow!(
+                "backend {backend_host}:{backend_port} did not respond within {response_deadline:?}"
+            ),
+            partial: None,
+            // The request was carried: the deadline expired after it went out.
+            retry: Retryability::IfIdempotent,
+        }),
     }
+}
 
-    Ok(response
-        .map(|body| http_body_util::StreamBody::new(idle_bounded(body, idle)).boxed_unsync()))
+/// A response body that keeps its backend busy until the body is done.
+///
+/// The lease is what the balancer counts, and a backend that is still
+/// streaming a response is still busy with it. A balancer that cannot see
+/// that hands the next request to a backend that is already working, which
+/// is the whole failure `least_conn` exists to avoid.
+///
+/// Holding the lease in the body is what makes the count true: the body is
+/// dropped when the client has read it — or when the connection goes away
+/// instead — and the backend is free again then. The streaming path has
+/// always held its lease for the whole flow; this is the same rule on the
+/// path that did not.
+struct LeasedBody {
+    inner: ProxyBody,
+    /// Kept, never read: dropping it is what releases the backend.
+    _lease: Option<crate::lb::BackendLease>,
+}
+
+impl hyper::body::Body for LeasedBody {
+    type Data = bytes::Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
 }
 
 /// Reads a request body whole, refusing one past `limit` or past what the
@@ -560,6 +1092,66 @@ pub struct ProxySummary {
 pub struct ProxyFailure {
     pub error: anyhow::Error,
     pub partial: Option<ProxySummary>,
+    /// What may be done about this failure.
+    pub retry: Retryability,
+}
+
+/// What may be done about a failed attempt.
+///
+/// The question is never "did it fail" but "may it be tried again", and the
+/// answer depends on two things that are easy to confuse:
+///
+/// - **Did the request reach the backend?** A connection that was refused
+///   never carried it, so the backend did not act on it and asking again is
+///   free of consequence — whatever the request was.
+/// - **Is the request safe to send twice?** A `GET` is. A `POST` that
+///   charges a card is not, and the only way to know is what the method says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryability {
+    /// The request was never carried to the backend. It may be tried again
+    /// whatever it is.
+    Always,
+    /// The request was carried and no answer came. It may be tried again only
+    /// if sending it twice is safe, which is what an idempotent method is.
+    IfIdempotent,
+    /// Nothing may be tried again: the client already has part of the answer,
+    /// or the failure says nothing about the backend.
+    Never,
+}
+
+impl ProxyFailure {
+    /// Whether this failure says the backend is unreachable.
+    ///
+    /// A failure after the answer started is not the backend's fault: it
+    /// answered, and the connection broke on the way back. Neither is a
+    /// request that never left this process.
+    pub fn backend_is_down(&self) -> bool {
+        self.partial.is_none() && self.retry != Retryability::Never
+    }
+}
+
+impl Retryability {
+    /// Whether this failure may be tried again for this method.
+    pub fn may_retry(self, method: &Method) -> bool {
+        match self {
+            Retryability::Always => true,
+            Retryability::IfIdempotent => is_idempotent(method),
+            Retryability::Never => false,
+        }
+    }
+}
+
+/// Whether sending this request twice is safe.
+///
+/// The idempotent methods of RFC 9110: the same request may be sent again
+/// without the server doing the work twice. Everything else — `POST` above
+/// all — may not, which is why a request that was carried and lost is only
+/// retried when its method says it is safe.
+pub fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
 }
 
 impl From<anyhow::Error> for ProxyFailure {
@@ -567,6 +1159,7 @@ impl From<anyhow::Error> for ProxyFailure {
         ProxyFailure {
             error,
             partial: None,
+            retry: Retryability::Never,
         }
     }
 }
@@ -578,6 +1171,20 @@ impl From<::http::Error> for ProxyFailure {
 }
 
 impl ProxyFailure {
+    /// A failure before any of the answer reached the client.
+    ///
+    /// `retry` is what the failure says about trying again: a request that was
+    /// never carried may be, and one that was carried and lost may only be
+    /// when the method is idempotent. This is the same distinction
+    /// [`proxy_request`] makes, for the tunnel path.
+    pub(crate) fn unanswered(error: anyhow::Error, retry: Retryability) -> Self {
+        ProxyFailure {
+            error,
+            partial: None,
+            retry,
+        }
+    }
+
     /// A failure that happened `written` bytes into a `status` response.
     ///
     /// Used on the paths where the count is of bytes the client actually
@@ -590,6 +1197,10 @@ impl ProxyFailure {
                 status: status.as_u16(),
                 bytes_sent: written,
             }),
+            // The client has part of the answer, so there is nothing to try
+            // again: it would be a second answer to a request that was already
+            // answered.
+            retry: Retryability::Never,
         }
     }
 }
@@ -598,19 +1209,114 @@ impl ProxyFailure {
 // client with its deadlines, which every caller would have to build in order to
 // pass the same two things — see the note on `conn::handle_bidi_stream`.
 #[allow(clippy::too_many_arguments)]
+/// The body of a request, read once and ready to be sent to a backend.
+///
+/// Read outside the attempt, because the bytes come off the client's stream
+/// and that stream has them only once: a retry that had to read them again
+/// would wait for bytes that are never coming.
+pub struct RequestBody {
+    /// The bytes, whole.
+    pub bytes: Vec<u8>,
+    /// The length to declare to the backend, when the client declared none.
+    ///
+    /// A chunked request has no length of its own; the proxy reads the chunks
+    /// and sends one buffer with a length of its own.
+    pub content_length: Option<usize>,
+    /// Held for as long as the body is alive, so the process budget counts
+    /// what it holds now rather than what it ever read. See
+    /// [`crate::conn::limits::ByteReservation`].
+    pub reservation: crate::conn::limits::ByteReservation,
+}
+
+/// Reads the body of a request off the client's stream.
+///
+/// The bytes that arrived with the head are `body_data`; the rest is read
+/// here. What comes back is whole: either every byte the client promised, or
+/// an error — a body that stops halfway is a request that was never sent.
+pub async fn read_request_body(
+    req: &Request<()>,
+    recv: &mut iroh::endpoint::RecvStream,
+    body_data: Vec<u8>,
+    timeouts: crate::config::Timeouts,
+) -> Result<RequestBody, ProxyFailure> {
+    // A chunked body is sent as one buffer with a length of our own, so only a
+    // request whose `content-length` we could not read takes that path. One we
+    // could read is forwarded with the header it arrived with.
+    let declared_length = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let chunked = declared_length.is_none() && request_is_chunked(req);
+
+    let mut full_body = body_data;
+    // Held for as long as the body is alive, which is until the request is
+    // done: the buffer is handed to the backend and dropped with the request.
+    // Same rule as `read_body_limited` on the plaintext path, and the reason
+    // the two are worth keeping in step — one without the other leaves the
+    // process budget counting a fraction of what it actually holds.
+    let (reservation, content_length) = if let Some(content_length) = declared_length {
+        // Checked before the body is read, not after: `content_length` is the
+        // size of the buffer this is about to fill.
+        if content_length > MAX_REQUEST_BODY {
+            return Err(ProxyFailure::from(anyhow::anyhow!(
+                "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
+            )));
+        }
+        let reservation = read_remaining_request_body(
+            recv,
+            &mut full_body,
+            content_length,
+            timeouts.deadlines.body,
+        )
+        .await?;
+        (reservation, None)
+    } else if chunked {
+        // A chunked body declares no length, so without this branch the request
+        // went out carrying only the bytes that happened to arrive with the
+        // head — and `transfer-encoding` is not forwarded, so the backend was
+        // handed a body with no framing at all and no way to know it was
+        // truncated. Decode the chunks and send one buffer with a length.
+        let reservation =
+            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
+        (reservation, Some(full_body.len()))
+    } else {
+        (crate::conn::limits::ByteReservation::empty(), None)
+    };
+
+    // The body is complete at this point in every branch above, and this is the
+    // only place it is whole: what goes out is a reconstructed request with its
+    // own framing, so its size on the way out is not what arrived.
+    crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
+
+    Ok(RequestBody {
+        bytes: full_body,
+        content_length,
+        reservation,
+    })
+}
+
+// One more argument than clippy allows: the alternative is a struct bundling the
+// client with its deadlines, which every caller would have to build in order to
+// pass the same two things — see the note on `conn::handle_bidi_stream`.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_to_backend_streaming(
-    client: &HttpClient,
+    clients: &BackendClients,
     // How long the backend may take to answer. Not read off the client, because
     // it is not the client's: the client owns the deadline for every dial, this
     // is the one for a single answer. See `crate::config::Timeouts`.
     timeouts: crate::config::Timeouts,
     req: &Request<()>,
     backend_url: &str,
-    body_data: Vec<u8>,
+    // The protocol this backend is spoken to, which decides the client. It
+    // comes from the route rather than from the URL, because the same URL is
+    // reached differently depending on what the route says.
+    protocol: BackendProtocol,
+    body: &RequestBody,
     send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
     request_id: &str,
 ) -> Result<ProxySummary, ProxyFailure> {
+    let client = clients.for_protocol(protocol);
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
@@ -635,12 +1341,7 @@ pub async fn proxy_to_backend_streaming(
     // A chunked body is sent as one buffer with a length of our own, so only a
     // request whose `content-length` we could not read takes that path. One we
     // could read is forwarded with the header it arrived with.
-    let declared_length = req
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    let chunked = declared_length.is_none() && request_is_chunked(req);
+    let chunked = body.content_length.is_some();
 
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
@@ -659,47 +1360,14 @@ pub async fn proxy_to_backend_streaming(
         builder = builder.header(name, value);
     }
 
-    let mut full_body = body_data;
-    // Held for as long as the body is alive, which is until this function
-    // returns: the buffer is handed to the backend below and dropped with the
-    // request. Same rule as `read_body_limited` on the plaintext path, and the
-    // reason the two are worth keeping in step — one without the other leaves
-    // the process budget counting a fraction of what it actually holds.
-    let _body_reservation = if let Some(content_length) = declared_length {
-        // Checked before the body is read, not after: `content_length` is the
-        // size of the buffer this is about to fill.
-        if content_length > MAX_REQUEST_BODY {
-            return Err(ProxyFailure::from(anyhow::anyhow!(
-                "request body of {content_length} bytes is over the {MAX_REQUEST_BODY} byte limit"
-            )));
-        }
-        read_remaining_request_body(
-            recv,
-            &mut full_body,
-            content_length,
-            timeouts.deadlines.body,
-        )
-        .await?
-    } else if chunked {
-        // A chunked body declares no length, so without this branch the request
-        // went out carrying only the bytes that happened to arrive with the
-        // head — and `transfer-encoding` is not forwarded, so the backend was
-        // handed a body with no framing at all and no way to know it was
-        // truncated. Decode the chunks and send one buffer with a length.
-        let reservation =
-            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
-        builder = builder.header("content-length", full_body.len());
-        reservation
-    } else {
-        crate::conn::limits::ByteReservation::empty()
-    };
+    // The length the proxy declares for a body the client did not give one
+    // for. The client's own `content-length` is dropped above, because this
+    // one is the truth.
+    if let Some(content_length) = body.content_length {
+        builder = builder.header("content-length", content_length);
+    }
 
-    // The body is complete at this point in every branch above, and this is the
-    // only place it is whole: what goes out is a reconstructed request with its
-    // own framing, so its size on the way out is not what arrived.
-    crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
-
-    let proxied_req = builder.body(Full::new(full_body.into()))?;
+    let proxied_req = builder.body(Full::new(body.bytes.clone().into()))?;
 
     tracing::debug!(
         "Proxying request via client (streaming): {} {}",
@@ -713,15 +1381,32 @@ pub async fn proxy_to_backend_streaming(
     let response_deadline = timeouts.response;
     let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
     {
-        Ok(result) => result.map_err(|e| {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
             tracing::error!("Failed to send request: {:?}", e);
-            anyhow::anyhow!("failed to send request: {:?}", e)
-        })?,
+            // A connect error means the request was never carried: the
+            // connection was refused, the name did not resolve, the handshake
+            // failed. Anything else means the request went out and the answer
+            // did not come, which only an idempotent request may be asked
+            // twice. The tunnel path needs this exactly as the plaintext one
+            // does, or `[retry]` would only work on one of them.
+            let retry = if e.is_connect() {
+                Retryability::Always
+            } else {
+                Retryability::IfIdempotent
+            };
+            return Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("failed to send request: {e:?}"),
+                retry,
+            ));
+        }
         Err(_) => {
-            return Err(ProxyFailure::from(anyhow::anyhow!(
-                "backend did not respond within {:?}",
-                response_deadline
-            )));
+            return Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("backend did not respond within {:?}", response_deadline),
+                // The request was carried: the deadline expired after it went
+                // out.
+                Retryability::IfIdempotent,
+            ));
         }
     };
 
@@ -734,11 +1419,15 @@ pub async fn proxy_to_backend_streaming(
     response_buf
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status_text).as_bytes());
 
-    let original_was_chunked = parts
+    // Whether the backend framed the body with a transfer coding of its own
+    // that is not `chunked`. Such a body is still encoded when it arrives, and
+    // the header that says so is dropped below, so it is not framed again
+    // either.
+    let other_transfer_coding = parts
         .headers
         .get("transfer-encoding")
         .and_then(|h| h.to_str().ok())
-        .map(|v| v.to_lowercase().contains("chunked"))
+        .map(|v| !v.to_lowercase().split(',').any(|c| c.trim() == "chunked"))
         .unwrap_or(false);
     let has_content_length = parts.headers.get("content-length").is_some();
 
@@ -759,7 +1448,17 @@ pub async fn proxy_to_backend_streaming(
         response_buf.extend_from_slice(b"\r\n");
     }
 
-    let use_chunked = !has_content_length && original_was_chunked;
+    // Whether the body is framed for the client, which is a question about
+    // what the *client* can be told rather than about what the backend said.
+    //
+    // The client on the other end of the tunnel speaks HTTP/1.1, and HTTP/1.1
+    // has no way to say "the body ends when this stream ends": a body with no
+    // length has to be chunked, or the client waits for a connection close
+    // that never comes. A backend that speaks HTTP/2 never sends a length at
+    // all — the stream carries the end — so a response from an h2 backend is
+    // exactly the case that has to be framed here. A backend that sent no
+    // length over HTTP/1.1 means the same thing, and is framed the same way.
+    let use_chunked = !has_content_length && !other_transfer_coding;
     if use_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
@@ -1827,5 +2526,614 @@ mod tests {
                 "a frame within the idle deadline must pass through: {frame:?}"
             );
         }
+    }
+}
+
+/// A backend that speaks TLS, and the client that reaches it.
+///
+/// The certificate is made here rather than kept in the repository: a key in
+/// the tree is a key somebody has to trust not to be used, and a test that
+/// needs one can make one in a millisecond.
+#[cfg(test)]
+mod transport {
+    use super::*;
+    use rcgen::{CertificateParams, IsCa, KeyPair};
+    use std::convert::Infallible;
+    use tokio::io::AsyncWriteExt;
+
+    /// The CA that signs the backend's certificate, and the backend's own
+    /// certificate and key.
+    struct Pki {
+        /// The CA certificate, PEM-encoded, which is what `[backends] ca_file`
+        /// points at.
+        ca_pem: String,
+        server_cert: Vec<u8>,
+        server_key: Vec<u8>,
+    }
+
+    /// A CA of our own, and a certificate for `127.0.0.1` signed by it.
+    fn pki() -> Pki {
+        let mut ca_params =
+            CertificateParams::new(Vec::<String>::new()).expect("a CA with no names is a CA");
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().expect("a key pair");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("a self-signed CA");
+
+        let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .expect("a certificate for the loopback address");
+        server_params.is_ca = IsCa::NoCa;
+        let server_key = KeyPair::generate().expect("a key pair");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .expect("a certificate signed by the CA");
+
+        Pki {
+            ca_pem: ca_cert.pem(),
+            server_cert: server_cert.der().to_vec(),
+            server_key: server_key.serialize_der(),
+        }
+    }
+
+    /// A backend on the loopback address that answers every request with
+    /// `hello`, over TLS.
+    ///
+    /// `alpn` is what the backend offers the handshake: `["http/1.1"]` for a
+    /// backend that speaks one version, `["h2"]` for one that speaks the
+    /// other and only the other. A client that cannot offer one of them fails
+    /// the handshake, which is what makes the h2 test a test.
+    async fn tls_backend(pki: &Pki, alpn: &[&[u8]]) -> u16 {
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            pki.server_cert.clone(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(pki.server_key.clone())
+            .expect("a DER private key");
+        // The provider is named rather than left to the process-wide default:
+        // more than one is compiled in, and rustls refuses to guess which one
+        // a process should use.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("a server configuration");
+        server_config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(|_req| async {
+                                Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                    bytes::Bytes::from_static(b"hello"),
+                                )))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// The backend is reached over TLS, and the answer comes back.
+    #[tokio::test]
+    async fn an_https_backend_is_reached_over_tls() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        let client = create_http_client(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+            .expect("a client");
+
+        let response = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers");
+        assert_eq!(response.status(), 200);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// A WebSocket owns a raw connection rather than a pooled one, so it cannot
+    /// use the HTTP client. It still reaches an `https://` backend over TLS,
+    /// with the same CA file the pooled clients use.
+    #[tokio::test]
+    async fn an_https_backend_can_be_reached_as_a_raw_stream() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+                .expect("the clients");
+        let mut stream = clients
+            .connect_stream(
+                &format!("https://127.0.0.1:{port}/"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("the TLS connection is up");
+
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut reply = Vec::new();
+        stream
+            .read_to_end(&mut reply)
+            .await
+            .expect("the answer is read");
+
+        assert!(
+            String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 200"),
+            "the raw TLS stream should carry the backend's answer: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// A certificate nobody vouches for is refused, which is the whole point of
+    /// checking one.
+    #[tokio::test]
+    async fn a_certificate_that_is_not_vouched_for_is_refused() {
+        let pki = pki();
+        let port = tls_backend(&pki, &[b"http/1.1"]).await;
+        // No CA file: the machine's own roots, which know nothing about the
+        // certificate this backend just presented.
+        let client = create_http_client(std::time::Duration::from_secs(5), None).expect("a client");
+
+        let result = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await;
+        assert!(
+            result.is_err(),
+            "a certificate signed by an authority this process does not trust must not be \
+             accepted: {:?}",
+            result.map(|r| r.status())
+        );
+    }
+
+    /// A backend that speaks HTTP/2 and nothing else, over TLS.
+    ///
+    /// The backend offers `h2` and only `h2`, so a client that did not speak
+    /// it would fail the handshake rather than fall back: the answer coming
+    /// back is the proof that the connection was HTTP/2.
+    async fn h2_tls_backend(pki: &Pki) -> u16 {
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            pki.server_cert.clone(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(pki.server_key.clone())
+            .expect("a DER private key");
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("a server configuration");
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls);
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req| async {
+                            Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                bytes::Bytes::from_static(b"hello"),
+                            )))
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A backend that speaks HTTP/2 in the clear, and nothing else.
+    async fn h2c_backend() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req| async {
+                            Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                bytes::Bytes::from_static(b"hello"),
+                            )))
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A backend that speaks HTTP/2 over TLS is reached over HTTP/2, without
+    /// anybody having to say so: the handshake agrees on it.
+    #[tokio::test]
+    async fn an_https_backend_is_reached_over_http2() {
+        let pki = pki();
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &pki.ca_pem).expect("the CA file");
+
+        let port = h2_tls_backend(&pki).await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), Some(ca_path.as_path()))
+                .expect("the clients");
+        let client = clients.for_protocol(BackendProtocol::Http1);
+
+        let response = client
+            .get(format!("https://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers over h2");
+        assert_eq!(response.status(), 200);
+    }
+
+    /// A backend that speaks HTTP/2 in the clear is reached over HTTP/2, by
+    /// the client that starts speaking it — there is no handshake on a
+    /// cleartext connection to agree on anything.
+    #[tokio::test]
+    async fn a_cleartext_backend_is_reached_over_http2() {
+        let port = h2c_backend().await;
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+        let client = clients.for_protocol(BackendProtocol::H2c);
+
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/").parse().expect("a URI"))
+            .await
+            .expect("the backend answers over h2");
+        assert_eq!(response.status(), 200);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+    }
+
+    /// A backend on the loopback address that answers every request with
+    /// `hello`, in the clear.
+    async fn hello_backend() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(|_req| async {
+                                Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                    bytes::Bytes::from_static(b"hello"),
+                                )))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// An address nothing is listening on.
+    ///
+    /// The port is taken by a UDP socket, so the connection to it is refused
+    /// rather than timing out — which is what a backend that is down looks
+    /// like. A UDP socket rather than a closed TCP one, because a TCP port
+    /// that is given back can be handed to the next listener that asks for
+    /// one, and these tests run beside each other.
+    ///
+    /// The socket is returned so the caller can keep it: the address stays
+    /// dead for as long as the test holds it.
+    async fn dead_backend() -> (String, tokio::net::UdpSocket) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback socket");
+        let port = socket.local_addr().expect("an address").port();
+        (format!("http://127.0.0.1:{port}"), socket)
+    }
+
+    /// A backend that accepts the connection and then says nothing, and how
+    /// many connections it accepted.
+    async fn silent_backend() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    // Held open, saying nothing: the request was carried and
+                    // the answer never came.
+                    let _stream = stream;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        (port, accepted)
+    }
+
+    /// A route table with the given backends, and a retry that tries again.
+    fn route_table(backends: Vec<String>, attempts: u32) -> Arc<crate::routes::RouteConfig> {
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "retry.test",
+            "/",
+            true,
+            backends,
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        );
+        Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry {
+                attempts,
+                backoff: std::time::Duration::ZERO,
+            },
+        ))
+    }
+
+    fn get_request(host: &str) -> Request<Full<bytes::Bytes>> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("http://{host}/"))
+            .header("host", host)
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request")
+    }
+
+    /// A request that failed against one backend is tried against the next.
+    #[tokio::test]
+    async fn a_failed_request_is_tried_on_another_backend() {
+        let (dead, _guard) = dead_backend().await;
+        let port = hello_backend().await;
+        let alive = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![dead, alive], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let response = proxy_request(&clients, get_request("retry.test"), config)
+            .await
+            .expect("the second backend answers");
+
+        assert_eq!(response.status(), 200);
+    }
+
+    /// A request that was carried and lost is not tried again, unless it is
+    /// safe to send twice.
+    #[tokio::test]
+    async fn a_post_that_reached_a_backend_is_not_tried_again() {
+        let (port, accepted) = silent_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![backend], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request");
+        let result = proxy_request(&clients, request, config).await;
+
+        assert!(
+            result.is_err(),
+            "the backend never answered, so the request failed"
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a POST may not be sent twice, so it was tried once"
+        );
+    }
+
+    /// The same request, but one that is safe to send twice.
+    #[tokio::test]
+    async fn a_get_that_reached_a_backend_is_tried_again() {
+        let (port, accepted) = silent_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let config = route_table(vec![backend], 1);
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        let result = proxy_request(&clients, get_request("retry.test"), config).await;
+
+        assert!(result.is_err(), "the backend never answered");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a GET may be sent twice, so it was"
+        );
+    }
+
+    /// A backend that keeps failing is taken out of rotation, and the route
+    /// answers 503 rather than dialling it again.
+    ///
+    /// The point of the circuit: the answer comes without a connect timeout,
+    /// because the proxy already knows the backend is down.
+    #[tokio::test]
+    async fn a_backend_that_keeps_failing_is_taken_out_of_rotation() {
+        let (dead, _guard) = dead_backend().await;
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "circuit.test",
+            "/",
+            true,
+            vec![dead],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        )
+        .with_circuit_breaker(crate::config::CircuitBreaker {
+            enabled: true,
+            failure_threshold: 2,
+            reset: std::time::Duration::from_secs(60),
+        });
+        let config = Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry::default(),
+        ));
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        // The first two requests fail against the backend.
+        for _ in 0..2 {
+            let result = proxy_request(&clients, get_request("circuit.test"), config.clone()).await;
+            assert!(
+                result.is_err(),
+                "the backend is not there, so the request fails"
+            );
+        }
+
+        // The third finds the circuit open, and the route says so instead of
+        // dialling a backend that is known to be down.
+        let response = proxy_request(&clients, get_request("circuit.test"), config)
+            .await
+            .expect("the route answers");
+        assert_eq!(
+            response.status(),
+            503,
+            "a route whose only backend is out of rotation has nothing to offer"
+        );
+    }
+
+    /// A backend stays busy for as long as its response is out there.
+    ///
+    /// The count is what `least_conn` balances on, and a response whose body
+    /// has not been read yet is a request the backend is still working on. A
+    /// balancer that cannot see that hands the next request to a backend that
+    /// is already busy.
+    #[tokio::test]
+    async fn a_backend_stays_busy_until_its_response_is_dropped() {
+        let port = hello_backend().await;
+        let backend = format!("http://127.0.0.1:{port}");
+        let route = crate::routes::Route::new(
+            "busy.test",
+            "/",
+            true,
+            vec![backend.clone()],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        );
+        let config = Arc::new(crate::routes::RouteConfig::new(vec![route]));
+        let pool = config.routes().await[0].backend_pool().clone();
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://busy.test/")
+            .header("host", "busy.test")
+            .body(Full::new(bytes::Bytes::new()))
+            .expect("a request");
+        let response = proxy_request(&clients, request, config.clone())
+            .await
+            .expect("the backend answers");
+
+        assert_eq!(
+            pool.outstanding(&backend).await,
+            1,
+            "the response is still out there, so the backend is still busy with it"
+        );
+
+        drop(response);
+
+        assert_eq!(
+            pool.outstanding(&backend).await,
+            0,
+            "the body is gone, so the backend is free again"
+        );
+    }
+
+    /// The CA file is read at startup, so a file that cannot be read is an
+    /// error the operator sees rather than a handshake that fails later.
+    #[test]
+    fn a_ca_file_that_cannot_be_read_is_refused() {
+        let error = create_http_client(
+            std::time::Duration::from_secs(1),
+            Some(std::path::Path::new("/nonexistent/nexapipe-ca.pem")),
+        )
+        .expect_err("a CA file that does not exist cannot be used");
+        assert!(
+            error.to_string().contains("cannot read the CA file"),
+            "the message has to name the file: {error}"
+        );
     }
 }

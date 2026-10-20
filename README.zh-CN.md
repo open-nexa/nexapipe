@@ -14,8 +14,9 @@
 NexaPipe 是一个 Rust workspace，由四部分组成：
 
 - **`nexapipe`** —— 服务端：一个 L7 反向代理加一条 L4 隧道，通过 iroh/QUIC 接收
-  流量并转发到真实后端；也可以直接提供明文 HTTP。TLS 不在这里终止 —— 而是透传给
-  持有证书的后端。
+  流量并转发到真实后端；也可以直接提供明文 HTTP。TLS 不在这里终止：客户端的会话
+  按 SNI 透传，而 `http` 模式里到 `https://` 后端的那一段是本进程作为客户端发起的
+  TLS 会话，不是它终止的会话。
 - **`nexapipe-client`** —— 客户端库：连接池、域名到节点的路由、本地 HTTP 代理，
   以及基于 smoltcp 的 TUN 代理。以 `rlib`、`cdylib`（Android JNI）和 UniFFI 绑定
   三种形式发布。
@@ -648,6 +649,7 @@ strategy = "round_robin"          # 或 "random" / "least_conn"
 backends = ["http://192.0.2.20:18188"]
 mode = "http"                     # 默认
 # path_rewrite = "/api"
+# backend_protocol = "h2c"        # 明文 HTTP/2；见下文
 
 [[routes]]
 host_pattern = "app.example.com"
@@ -675,13 +677,21 @@ backends = ["http://host.docker.internal:18080"]
 
 | 模式 | 作用 | 传输安全 |
 | --- | --- | --- |
-| `http`（默认） | 解析请求，应用 `path_pattern` / `path_rewrite`，然后用共享的 HTTP 客户端重新发起。后端必须是 `http://` —— `https://` 后端在启动时会被拒绝。 | 入口段加密（QUIC；经 `listen_addr` 到达时是明文 HTTP），但**从服务端到后端是明文 HTTP**。任何敏感内容都应放在 `passthrough` 路由上，或放在载荷自带 TLS 的 `tcp` 路由上。 |
+| `http`（默认） | 解析请求，应用 `path_pattern` / `path_rewrite`，然后用共享的 HTTP 客户端重新发起。后端可以是 `http://` 或 `https://`；后者由服务端主动发起并校验 TLS 会话 —— 服务端仍然不持有证书、也不终止任何会话。 | 入口段由 QUIC 加密；服务端到后端这一段，`http://` 后端是**明文 HTTP**，`https://` 后端是 **TLS**。 |
 | `passthrough` | 复制字节。路由由 SNI 选择，因此 `path_pattern` 与 `path_rewrite` 不适用，后端也可以是裸 `host:port`。 | 端到端：字节是 TLS，服务端从不终止它，因此客户端校验的是后端自己的证书。见 [TLS](#tls)。 |
-| `tcp` | 把裸 TCP 流送到 `backends`，由 L4 前导中的主机名选择。不做 HTTP 解析，不适用 `path_pattern`，没有健康检查。见 [TCP 与 UDP](#tcp-与-udp)。 | 到服务端为止由 QUIC 加密；之后是隧穿协议的原始字节 —— TLS、SSH 或任何东西都由你自己提供。 |
+| `tcp` | 把裸 TCP 流送到 `backends`，由 L4 前导中的主机名选择。不做 HTTP 解析，不适用 `path_pattern`；通过连接来探测。见 [TCP 与 UDP](#tcp-与-udp)。 | 到服务端为止由 QUIC 加密；之后是隧穿协议的原始字节 —— TLS、SSH 或任何东西都由你自己提供。 |
 | `udp` | 承载 UDP 流 —— 每条流一条 QUIC 双向流，每个数据报一帧。选择方式同 `tcp`，另有 `idle_timeout_secs`。 | 到服务端为止由 QUIC 加密；载荷安全由隧穿协议负责（DTLS、WireGuard 等）。 |
 
-没有任何模式会为后端终止 TLS：从服务端到 `backends` 这一段，加密程度取决于你放上
-去的东西，只有 `passthrough` 能让客户端的 TLS 会话一直完整地抵达后端。
+没有任何模式会为客户端终止 TLS：从服务端到 `backends` 这一段，加密程度取决于你放上
+去的东西，只有 `passthrough` 能让客户端的 TLS 会话一直完整地抵达后端。`http` 模式
+里的 `https://` 后端是**本进程作为客户端发起**的 TLS 会话，不是它作为服务端终止的
+会话：后端证书按系统根证书加上 `[backends] ca_file` 校验。
+
+`backend_protocol` 只描述到后端这一段。不写时，明文后端用 HTTP/1.1，`https://` 后端
+在它支持时通过 ALPN 协商到 HTTP/2。`backend_protocol = "h2c"` 用于带 prior knowledge
+的明文 HTTP/2 后端；它与 `https://` 后端一起写会被拒绝 —— 后者通过握手协商 h2。
+WebSocket 升级是 HTTP/1.1：`https://` 后端会走 TLS，而 `backend_protocol = "h2c"` 的
+路由会明确拒绝 WebSocket，而不是把 HTTP/1.1 升级请求发给一个期待 h2 的后端。
 
 一条路由用 `mode = "..."` 提供**一种**模式，用 `modes = [...]` 提供**多种**模式；
 两者可以同时写，路由提供的是并集，重复项会被合并。一条*连接*用哪种模式，仍然由它的
@@ -708,7 +718,9 @@ path = "/health"   # 追加到后端 URL 之后
 
 每个 `mode = "http"` 的后端都会被 `GET {backend}{path}` 探测，**连续**失败
 `threshold` 次后离开后端池 —— 单次失败永远不会摘除它 —— 第一次探测成功即恢复。
-`passthrough`、`tcp`、`udp` 路由从不探测：TLS 监听器和数据库无法回答一个 HTTP 请求。
+`passthrough` 或 `tcp` 路由通过连接来探测（`passthrough` 会完成 TLS 握手），这只说明
+有进程在监听，不说明它能正常工作。只承载 `udp` 的路由不探测：没有可连接的目标，而
+编造一个数据报的探测只会报告后端从未给出的回答。
 
 **当你的后端无法提供健康检查端点时，请设 `enabled = false`** —— 静态文件服务器、
 设备管理的 Web UI。关闭后所有后端都留在池里、流量照常转发。`enabled` 是热生效的：
@@ -718,6 +730,64 @@ path = "/health"   # 追加到后端 URL 之后
 `interval`、`timeout`、`threshold` 都至少为 `1`：写 `0` 过去会被静默改成 `1`，而三者
 各自的含义都不是任何人想要的 —— 每秒一轮探测、永远无法完成的探测、或一次失败就摘空
 后端池。写 `0` 的配置在加载时会被拒绝。
+
+### `[backends]` —— 如何连接 `https://` 后端
+
+```toml
+[backends]
+ca_file = "/etc/nexapipe/internal-ca.pem"   # 可选
+```
+
+`https://` 后端的证书会按机器自己的信任库加上 `ca_file` 中的 PEM 证书校验。这个文件
+是**追加**到系统根证书上的，不会替换它们。这里故意没有跳过校验的开关：一个不知道
+自己在和谁说话就建立连接的反向代理，任何能应答该名字的人都能把它重定向。机器上
+没有可用系统根证书时（例如没有安装 `ca-certificates` 的容器），会回落到 Mozilla
+内置根证书，并在日志里说明。
+
+同一份信任库同时用于 HTTP 请求和 WebSocket 升级。到 `https://` 后端的 HTTP/2 通过
+ALPN 协商，不需要额外配置。这一段只在启动时读取一次，改动需要重启。
+
+### `[retry]` —— 失败请求的重试
+
+```toml
+[retry]
+attempts = 2       # 首次尝试之后的额外次数；默认 0（关闭）
+backoff_ms = 100   # 两次尝试之间的等待；默认 100
+```
+
+重试会向路由要一个**不同的**后端，因为刚刚失败的那个最可能再次失败。只有单个后端
+的路由没有别人可问，只能再问它一次。明文监听器和 iroh 隧道的流式路径使用同一套规则。
+
+哪些失败可以重试，取决于失败发生在哪一步：
+
+- **没有到达后端**的请求 —— 连接被拒绝、域名解析失败、TLS 握手失败 —— 无论什么
+  方法都可以重试。后端根本没看到它。
+- **已经送到后端、随后丢失**的请求，只有幂等方法才能重试。`GET`、`HEAD`、`PUT`、
+  `DELETE`、`OPTIONS`、`TRACE` 是；一个会扣款的 `POST` 不是。
+
+已经拿到的应答不会被重试，客户端已经开始接收的响应也不会。WebSocket 是一段会话，
+从不重试。`attempts` 是额外尝试次数（2 表示最多三次），上限 16；`backoff_ms` 上限
+60000。这一段只在启动时读取一次。
+
+### `[circuit_breaker]` —— 持续失败的后端离开轮转
+
+```toml
+[circuit_breaker]
+enabled = true          # 默认 true
+failure_threshold = 5   # 连续失败多少次后离开；默认 5
+reset_secs = 30         # 离开多久；默认 30
+```
+
+当 HTTP 请求路径连续看到 `failure_threshold` 次“后端不可达”的失败后，这个后端就不再
+被选中。它离开轮转期间，如果一条路由没有任何可服务的后端，会直接回 503，而不是花掉
+一整个连接超时去重新确认流量已经证明的事实。`reset_secs` 之后会给它一次试探请求；
+一次应答会关闭熔断并把失败计数归零。
+
+健康探测说明的是“上一次有人问它时它什么样”，熔断说明的是“流量自己发现了什么”。
+两者回答不同问题，并且同时运行。响应传到一半断掉不算失败 —— 后端已经应答了。计数器
+覆盖 HTTP 请求路径，包括隧道的流式路径与 WebSocket 握手；WebSocket 升级成功之后会话
+断掉不算。`tcp` 与 `udp` 路由没有请求失败可计，仍然依赖健康探测。`failure_threshold`
+上限 1000，`reset_secs` 上限 3600。这一段只在启动时读取一次。
 
 ### `[timeouts]` —— 等待后端的时间，以及每个阶段的期限
 
@@ -917,6 +987,7 @@ allow = [
 | `[[routes]]` | 生效。后端会被重新探测；已建立的连接保留其授权时所用的路由。 |
 | `[auth]` | 生效，含 `enabled` —— 打开 2FA 会开始对重载之后新建的连接生效。配置文件权限已不再检查；请保持文件私有或把密钥移出。 |
 | `[health_check]` | 生效。`enabled` 暂停/恢复探测；其余键对重载新增或改动的路由生效。 |
+| `[backends]`、`[retry]`、`[circuit_breaker]` | 需重启：启动时读取一次，与 `[timeouts]` 同理。 |
 | `[timeouts]` | 需重启：启动时读取一次，与 `[server] listen_addr` 同理。 |
 | `[peers] allow` | 目前需重启。 |
 | `[iroh]` | 需重启：端点只绑定一次。 |
@@ -933,7 +1004,8 @@ allow = [
 ## TLS
 
 TLS 由**后端**终止，而不是本代理：代理不持有任何证书，也永远看不到一个 `https://`
-请求的明文。
+请求的明文。它唯一主动发起的 TLS 会话，是 `http` 模式中到 `https://` 后端那一段的
+客户端一侧 —— 这仍然不是它终止的会话，它也不为任何客户端持有证书。
 
 1. 客户端照常发起 TLS 会话 —— 经由本地 HTTP 代理、TUN，或直接连到
    `[server] listen_addr`。

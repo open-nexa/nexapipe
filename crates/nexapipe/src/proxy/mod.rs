@@ -3,8 +3,8 @@ pub mod local_proxy;
 use crate::admin;
 use crate::auth::AuthConfig;
 use crate::config::{
-    AdminConfig, HealthCheckConfig, IrohConfig, LocalProxyConfig, MetricsConfig, RouteMode,
-    ServerConfig,
+    AdminConfig, BackendsConfig, HealthCheckConfig, IrohConfig, LocalProxyConfig, MetricsConfig,
+    RouteMode, ServerConfig,
 };
 use crate::config_watcher::{ConfigWatcher, PlaintextListener};
 use crate::conn;
@@ -16,7 +16,6 @@ use crate::routes::RouteConfig;
 use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
 use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
-use hyper_util::client::legacy;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use iroh::endpoint::BindOpts;
@@ -33,8 +32,7 @@ use tracing::Instrument;
 
 /// Shared by the startup path and the config watcher, which spawns checkers for
 /// routes that appear in a reload.
-pub type HttpClient =
-    legacy::Client<legacy::connect::HttpConnector, http_body_util::Full<bytes::Bytes>>;
+pub use crate::http::BackendClients;
 
 /// One background `GET /health` probe per `http` route, kept in step with the
 /// routes that are live.
@@ -47,7 +45,7 @@ pub type HttpClient =
 /// checks from the pool traffic actually uses.
 pub async fn sync_health_checks(
     config: &Arc<RouteConfig>,
-    http_client: &Arc<HttpClient>,
+    clients: &Arc<BackendClients>,
     probes: &tokio::sync::Mutex<HealthProbes>,
     health: &HealthCheckConfig,
     enabled: &Arc<std::sync::atomic::AtomicBool>,
@@ -76,6 +74,7 @@ pub async fn sync_health_checks(
         let kind = if route.serves(RouteMode::Http) {
             ProbeKind::Http {
                 path: health.path.clone(),
+                protocol: route.backend_protocol(),
             }
         } else if route.serves(RouteMode::Passthrough) || route.serves(RouteMode::Tcp) {
             ProbeKind::Tcp
@@ -118,7 +117,7 @@ pub async fn sync_health_checks(
 
         let health_checker = HealthChecker::new(
             target.pool.clone(),
-            http_client.clone(),
+            clients.clone(),
             std::time::Duration::from_secs(health.interval.max(1)),
             std::time::Duration::from_secs(health.timeout.max(1)),
             health.threshold,
@@ -145,6 +144,9 @@ pub struct ProxyOptions {
     pub admin: Option<AdminConfig>,
     /// Whether `/metrics` is served on it.
     pub metrics: MetricsConfig,
+    /// How the proxy reaches the backends: the trust store an `https://`
+    /// backend's certificate is checked against.
+    pub backends: BackendsConfig,
 }
 
 pub async fn run_proxy(
@@ -161,6 +163,7 @@ pub async fn run_proxy(
         health_check,
         admin: admin_config,
         metrics: metrics_config,
+        backends,
     } = options;
 
     // Read from for `nexapipe_uptime_seconds`. Taken here rather than in
@@ -171,7 +174,20 @@ pub async fn run_proxy(
     // Dialling a backend is bounded by `[timeouts] connect_secs`, read once here
     // because it is a builder setting: the connector applies it to every dial,
     // including the ones made later for a pooled connection the backend closed.
-    let http_client = Arc::new(http::create_http_client(config.timeouts().connect));
+    //
+    // The trust store is read here too, for the same reason: a CA file that
+    // cannot be read is a config that cannot work, and the operator should
+    // read about it at startup rather than in the log of a request that failed
+    // to verify.
+    let ca_file = backends
+        .ca_file
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|path| !path.as_os_str().is_empty());
+    let clients = Arc::new(
+        http::BackendClients::new(config.timeouts().connect, ca_file)
+            .context("cannot prepare the clients for the backends")?,
+    );
 
     let health_probes = Arc::new(tokio::sync::Mutex::new(HealthProbes::new()));
     let health_enabled = Arc::new(std::sync::atomic::AtomicBool::new(health_check.enabled));
@@ -184,7 +200,7 @@ pub async fn run_proxy(
     let peers = Arc::new(conn::peers::PeerRegistry::new());
     sync_health_checks(
         &config,
-        &http_client,
+        &clients,
         &health_probes,
         &health_check,
         &health_enabled,
@@ -221,7 +237,7 @@ pub async fn run_proxy(
     let config_watcher = Arc::new(ConfigWatcher::new(
         config_path.to_string(),
         config.clone(),
-        http_client.clone(),
+        clients.clone(),
         health_probes,
         health_enabled,
         auth_state.clone(),
@@ -548,7 +564,7 @@ pub async fn run_proxy(
     let mut http_server = None;
     if let Some(http_listener) = http_listener {
         let config_clone = config.clone();
-        let http_client_clone = http_client.clone();
+        let clients_clone = clients.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
         let in_flight_clone = in_flight.clone();
 
@@ -556,7 +572,7 @@ pub async fn run_proxy(
             if let Err(e) = start_http_server(
                 http_listener,
                 config_clone,
-                http_client_clone,
+                clients_clone,
                 shutdown_signal_clone,
                 in_flight_clone,
             )
@@ -573,7 +589,7 @@ pub async fn run_proxy(
                 match incoming {
                     Some(incoming) => {
                         let config_clone = config.clone();
-                        let http_client_clone = http_client.clone();
+                        let clients_clone = clients.clone();
                         let auth_state_clone = auth_state.clone();
                         let limiters_clone = limiters.clone();
                         let peers_clone = peers.clone();
@@ -591,7 +607,7 @@ pub async fn run_proxy(
                             conn::handle_incoming(
                                 incoming,
                                 config_clone,
-                                http_client_clone,
+                                clients_clone,
                                 auth_state_clone,
                                 limiters_clone,
                                 guard,
@@ -653,7 +669,7 @@ pub async fn run_proxy(
 async fn start_http_server(
     listener: TcpListener,
     config: Arc<RouteConfig>,
-    client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     shutdown_signal: Arc<ShutdownSignal>,
     in_flight: Arc<InFlight>,
 ) -> anyhow::Result<()> {
@@ -688,7 +704,7 @@ async fn start_http_server(
                 tracing::debug!("New connection on the plaintext listener from: {}", addr);
 
                 let config_clone = config.clone();
-                let client_clone = client.clone();
+                let clients_clone = clients.clone();
                 let remote_addr_str = addr.to_string();
                 let in_flight_clone = in_flight.clone();
                 // Counted here rather than in the task's first line, for the
@@ -758,7 +774,7 @@ async fn start_http_server(
                         proxy_handler(
                             req,
                             config_clone.clone(),
-                            client_clone.clone(),
+                            clients_clone.clone(),
                             remote_addr_str.clone(),
                             request_id,
                         )
@@ -871,7 +887,7 @@ fn with_request_id<T>(mut response: hyper::Response<T>, request_id: &str) -> hyp
 async fn proxy_handler(
     req: hyper::Request<Incoming>,
     config: Arc<RouteConfig>,
-    client: Arc<HttpClient>,
+    clients: Arc<BackendClients>,
     remote_addr: String,
     request_id: String,
 ) -> Result<hyper::Response<http::ProxyBody>, anyhow::Error> {
@@ -897,7 +913,7 @@ async fn proxy_handler(
         ));
     }
 
-    let response = match http::proxy_request(&client, req, config.clone()).await {
+    let response = match http::proxy_request(&clients, req, config.clone()).await {
         Ok(resp) => resp,
         Err(e) => {
             // The detail goes to the log, not to the client: `e` is an
