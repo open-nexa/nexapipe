@@ -404,6 +404,7 @@ fn the_port_acl_is_visible_in_the_client_list() {
          \n\
          [auth.clients.strict]\n\
          secret = \"MFRGGZDFMZTWQ2LK\"\n\
+         allow_hosts = []\n\
          allow_ports = []\n",
     );
 
@@ -432,5 +433,12 @@ fn the_port_acl_is_visible_in_the_client_list() {
     assert!(
         text.contains("allow ports none, every port is denied"),
         "the empty list has to be visible:\n{text}"
+    );
+    // The same for the names: an empty `allow_hosts` denies every host, and a
+    // line that only shows up for a non-empty list hides the strictest
+    // setting there is.
+    assert!(
+        text.contains("allow hosts none, every host is denied"),
+        "the empty host list has to be visible:\n{text}"
     );
 }

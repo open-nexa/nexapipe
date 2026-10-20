@@ -897,10 +897,16 @@ fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
             "    last used   {}",
             stamp(client.last_used.map(|at| at as i64))
         );
-        if let Some(hosts) = &client.allow_hosts
-            && !hosts.is_empty()
-        {
-            println!("    allow hosts {}", hosts.join(", "));
+        // Printed whenever the key is there, empty list included: an empty
+        // list is the strictest setting there is, and a line that only shows
+        // up for a non-empty list hides it exactly where it matters.
+        if let Some(hosts) = &client.allow_hosts {
+            let hosts = if hosts.is_empty() {
+                "none, every host is denied".to_string()
+            } else {
+                hosts.join(", ")
+            };
+            println!("    allow hosts {hosts}");
         }
         // Printed whenever the key is there, empty list included: an empty
         // list is the strictest setting there is, and a line that only shows
