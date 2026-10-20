@@ -10,6 +10,13 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+**The next release is v1.0.0.** The v0.7.0 release planned for this cycle was
+cancelled after a review of the project against comparable products; the scope
+that replaced it, and the items that were deliberately dropped from it, are
+recorded in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
+Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
+and its meaning.
+
 ## [Unreleased]
 
 Three things land in this cycle so far: the device credential can be a **key**

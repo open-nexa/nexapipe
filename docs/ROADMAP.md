@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-20 ([§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease — in v0.7.0; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
+| Last updated | 2026-10-20 (**the v0.7.0 release is cancelled; the next release is v1.0.0** — see [§0](#0-the-v100-decision-2026-10-20) for what that cycle contains and what it does not; [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease — in v1.0.0; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -36,6 +36,57 @@ absent does not mean nobody has noticed it — raise it in an issue. See
 not scheduled; this document holds capability work only. Where an audit found
 basic defects, they were fixed and are noted in
 [section 4](#4-self-review-what-is-missing) for the record, not for planning.
+
+---
+
+## 0. The v1.0.0 decision (2026-10-20)
+
+A review of the project against comparable products — Tailscale and Headscale
+for the mesh half, frp and Pangolin for the service-exposure half — was
+followed by a decision on what the next release is for. **The v0.7.0 release
+is cancelled; the next release is v1.0.0.** This section records what that
+cycle contains and, more usefully, what it deliberately does not.
+
+The comparison that produced it is in [section 2](#2-competitive-landscape);
+the finding behind most of these items is that NexaPipe is a *service
+exposure* product sitting where Tailscale's *mesh* product sits, and that the
+distance between them is mostly one architectural fact: **the server owns the
+route table, so the destination is always the server's choice.** Everything
+below follows from that.
+
+### In this release
+
+| Item | What it is |
+|---|---|
+| **Always-on, on every client** | The desktop app starts with the system and hides in the tray; Android comes up after a reboot. A client that has to be opened by hand is not a client a person leaves running |
+| **Latency, shown** | The probe already runs every 30 s; the round trip it measures reaches the UI on both clients |
+| **Host *and* port authorization** | `allow_hosts` grows a port dimension, so "this client may reach that host" stops meaning "on any port" |
+| **The iroh boundary, closed** | `relay_mode = "custom"` really excludes the n0 relays, and Endpoint ID discovery can be switched off — the "no third party" claim becomes true rather than aspirational |
+| **A performance baseline** | Numbers to compare against, so "is it fast enough" stops being a matter of opinion |
+| **Config and state, separated** | `config.toml` becomes what a human writes; everything the process writes goes somewhere else |
+| **One address space on both clients** | Android stops hard-coding `10.0.1.0/24` and takes the same candidate-block policy the desktop already has |
+| **One domain-matching rule on both sides** | The client and the server stop disagreeing about what `*.example.com` means |
+| **The UniFFI surface, completed** | The binding exports the proxy, the health and the statistics, not just a way to send one request |
+
+### Deliberately not in this release
+
+| Item | Why not |
+|---|---|
+| **Arbitrary destinations** | Letting a client name the address to dial is an open relay. The route table stays the only thing that decides where a connection goes |
+| **An iOS client** | Distribution through the App Store costs money and time; a network-extension client is a product of its own |
+| **Key expiry and rotation** | A personal deployment with a handful of devices gains little from a key that expires on its own, and revocation already exists |
+| **A relay of our own** | The relay is iroh's component. This project configures it and does not ship one |
+| **Packaging for brew / winget / scoop** | Download archives and a container image are enough for now |
+| **A mesh** | NexaPipe does not become a mesh. The server keeps the route table; the client keeps talking to the server |
+| **The device inventory in the apps** | Worth doing, and it is now an item in [section 4](#4-self-review-what-is-missing) rather than part of this release |
+
+### One thing to be clear about
+
+The backend-handling work — `https://` backends, HTTP/2, `[retry]` and
+`[circuit_breaker]` — is **already merged** (PR #172) and is therefore part of
+v1.0.0. It was reviewed as "not needed" afterwards, which was read as "not a
+priority to build more of", not as a request to revert shipped and tested
+code. A revert is a separate decision and has not been made.
 
 ---
 
@@ -157,14 +208,22 @@ needs nothing installed, identity and authorization, observability.
    admits:
    - Hole punching succeeds most of the time, not always; everything else goes
      through a relay.
-   - Running your own relay is possible (`relay_mode = "custom"`) but there is no
-     deployment guide, no compose file, no image. The fallback path is a footnote.
+   - Running your own relay is possible (`relay_mode = "custom"`) and
+     [documented end to end](self-hosted-relay.md) — but the relay itself is
+     **iroh's component, not ours**: this project configures one and does not
+     ship, package or maintain it. The deployment shape is the upstream
+     `iroh-relay` binary, and a guide to running it is the most this project
+     owes.
    - iroh still resolves Endpoint IDs through `dns.iroh.link` and cannot stop
      talking to n0 relays on the far side, so "no third-party infrastructure" is
-     not literally true today.
+     not literally true today. **Both halves are being closed in v1.0.0** — see
+     [§0](#0-the-v100-decision-2026-10-20): `relay_mode = "custom"` will
+     really exclude the n0 relays, and Endpoint ID discovery becomes
+     switchable.
 
-   Making self-hosted relay a first-class deployment is therefore a roadmap item,
-   not a docs cleanup.
+   Shipping a relay of our own is deliberately not a roadmap item: it would be
+   iroh's component under a different name, and the fallback path is a
+   footnote either way.
 
 **Not ours to fight.**
 
@@ -202,8 +261,8 @@ somewhere even though they are fixed rather than scheduled.
 
 | # | Gap | Where |
 |---|---|---|
-| C3 | **Closed in v0.7.0.** An `https://` backend is reached over a TLS session this process originates and verifies, against the machine's roots plus `[backends] ca_file`; there is no insecure switch. HTTP/2 is negotiated through ALPN with an `https://` backend and `backend_protocol = "h2c"` covers a cleartext h2 backend. `[retry]` tries a failed request again — on another backend where the route has one — and both the plaintext listener and the iroh tunnel apply the same rule: a request that never reached the backend is retried whatever its method, one that was carried and lost only when it is idempotent, and never an answer, a partly received response or a WebSocket. A WebSocket to an `https://` backend goes over TLS as well; a `backend_protocol = "h2c"` route refuses one, and the WebSocket path is HTTP/1.1, so it cannot use a backend that offers only h2. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`. | `http/mod.rs`, `conn/mod.rs` |
-| C4 | **Closed in v0.7.0.** `least_conn` keeps a backend's lease for as long as its response body is out there, so a streaming backend counts as busy until the body is dropped. `[circuit_breaker]` takes a backend out of rotation after consecutive unreachable failures and returns it for a trial after the cooldown; a route with nothing serving answers 503 instead of dialling. The counter covers the HTTP request paths, including the tunnel's streaming path and a WebSocket handshake; a session that dies after the upgrade does not count, and TCP/UDP routes keep using the health probe. An all-unhealthy pool still refuses instead of falling back to the first, except a pool of one, which is handed out because there is nothing to choose between. | `lb/mod.rs`, `http/mod.rs` |
+| C3 | **Closed in v1.0.0.** An `https://` backend is reached over a TLS session this process originates and verifies, against the machine's roots plus `[backends] ca_file`; there is no insecure switch. HTTP/2 is negotiated through ALPN with an `https://` backend and `backend_protocol = "h2c"` covers a cleartext h2 backend. `[retry]` tries a failed request again — on another backend where the route has one — and both the plaintext listener and the iroh tunnel apply the same rule: a request that never reached the backend is retried whatever its method, one that was carried and lost only when it is idempotent, and never an answer, a partly received response or a WebSocket. A WebSocket to an `https://` backend goes over TLS as well; a `backend_protocol = "h2c"` route refuses one, and the WebSocket path is HTTP/1.1, so it cannot use a backend that offers only h2. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`. | `http/mod.rs`, `conn/mod.rs` |
+| C4 | **Closed in v1.0.0.** `least_conn` keeps a backend's lease for as long as its response body is out there, so a streaming backend counts as busy until the body is dropped. `[circuit_breaker]` takes a backend out of rotation after consecutive unreachable failures and returns it for a trial after the cooldown; a route with nothing serving answers 503 instead of dialling. The counter covers the HTTP request paths, including the tunnel's streaming path and a WebSocket handshake; a session that dies after the upgrade does not count, and TCP/UDP routes keep using the health probe. An all-unhealthy pool still refuses instead of falling back to the first, except a pool of one, which is handed out because there is nothing to choose between. | `lb/mod.rs`, `http/mod.rs` |
 | C7 | **Closed in v0.5.0, apart from the one mode that cannot be.** A route serving `http` *and* another mode shares one pool, so the other modes always did inherit its health — and since v0.4.0 they answer `BackendFailed` / hang up when it is empty. `passthrough` and `tcp` routes are probed now, by connecting to them: a TLS backend by completing its handshake, which says a process is listening and nothing about whether it works. A `udp`-only route is still not probed, because there is nothing to connect to and a probe that invented a datagram would report an answer no backend gave. | `health/mod.rs` |
 
 ### 4.2 Observability beyond the access log (P1)
@@ -479,6 +538,29 @@ and those are in [§6](#hardening-sweep--after-v060).
 | P2 | **Secrets that outlive their use.** TOTP secrets, enrollment tokens and the relay bearer sit in process-wide `String`s on the client and are never zeroized; `auth.rs` derives `Debug` over them where `provisioning.rs` deliberately does not; a response parser computes its body offset from a lossy UTF-8 conversion and then slices the original bytes. — the `Debug` half and the parser half were fixed in `#164`; the credentials themselves are now wiped when they go out of scope, on `v070/zeroize-secrets` | `crates/nexapipe-client/src/jni.rs:29`, `:44-51`; `auth.rs:76`, `:124`, `:489`; `http.rs:127-144` |
 | P2 | **Supply chain hygiene.** Actions pinned by tag rather than SHA; base images by floating tag, one from a self-hosted registry; `cargo build` in the Dockerfiles without `--locked`, though CI has it everywhere; images published with no signature and no provenance; `workflow_dispatch` input interpolated into a `run:` block. | `.github/workflows/*.yml`; `deny.toml`; `Dockerfile:8`, `:33`; `Dockerfile-aarch64:3`, `:34`; `release.yml` (the five dispatch inputs now reach the scripts through `env`) — fixed on `v070/supply-chain` (see [R18](#hardening-sweep--after-v060)) |
 
+### 4.10 The device inventory in the apps (P1)
+
+The devices that hold a credential are known to the server and to nobody else. The
+desktop app shows the *nodes* it can reach; it does not show the *devices*
+enrolled under a client, and Android shows neither. The whole inventory is a
+server-side shell command — `nexapipe client list`, `nexapipe client revoke
+--device` — and a config file.
+
+What is missing is the one screen a personal deployment needs first: the list
+of devices, when each was last seen, and a button that revokes one, **in the
+app**. A person who loses a phone should not have to find a shell to answer
+that.
+
+The data is already where an app could read it — the admin listener answers
+`GET /v1/clients` — so this is a surface, not a protocol. The part that has to
+be right is the consequence: a revoked device does not merely stop being able
+to connect, it loses the connections it is holding, and the screen has to say
+so rather than implying the device is merely locked out.
+
+| # | Gap | Where |
+|---|---|---|
+| — | **Neither app lists or revokes a device.** The desktop app reaches an admin API that already answers the question and has no screen for it; Android has neither the command nor the view. Revocation is a server-side operation that has to be reachable from a phone. | `crates/nexapipe/src/main.rs` (`client list\|add\|revoke`); `crates/nexapipe/src/admin/mod.rs` (`GET /v1/clients`); `ui-desktop/src-tauri/src/status.rs`; `ui-android/app/src/main/java/com/nexa/pipe/ui/` |
+
 ---
 
 ## 5. Platform policy
@@ -579,10 +661,10 @@ Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase.
 contributed iOS client would be accepted and clearly marked community-maintained.
 
 **Progress.** Four of the five shipped in v0.4.0, and the half that remained
-closed in v0.7.0:
+closed in v1.0.0:
 
 - **R12** backend handling — `[timeouts]`, `least_conn`, and a refusal when
-  every backend of a multi-backend route is down. **Completed in v0.7.0** with
+  every backend of a multi-backend route is down. **Completed in v1.0.0** with
   session-held `least_conn` leases, `[retry]`, `[circuit_breaker]`, `https://`
   backends (TLS with a verified certificate, HTTP/2 through ALPN) and h2c; see
   [4.1](#41-backend-handling-p2).
@@ -628,7 +710,7 @@ left standing, and the one thing Phase 1 handed over half-done:
 | R9 | **Client resilience, the second half** | Health decides which node the next request goes to, and a node that could not be dialled is marked down by the request that found out rather than by the probe thirty seconds later. `select` answers `Option<usize>`, so "none of them" is sayable for the first time. The group is still not mutable, so a down node is skipped rather than removed. See [4.6](#46-client-resilience-p1) |
 | C7 | **A probe for the backends that cannot answer `GET /health`** | `passthrough` and `tcp` routes are probed by connecting, a TLS backend by completing its handshake. A `udp`-only route is deliberately still unprobed. See [4.1](#41-backend-handling-p2) |
 | — | **Traffic you can see** | The client counts what each node carried, the desktop shows it per node, the Android notification shows live rates, and the server's `/metrics` gained `nexapipe_traffic_bytes_total`. The number is tunnel payload: no headers, nothing discarded, and nothing counted twice — the TUN interface pump is deliberately not instrumented. See [4.2](#42-observability-beyond-the-access-log-p1) |
-| R6 | **Distribution, three of its four parts** | A container image published to GHCR with the release archives, a self-hosted relay documented end to end, and a systemd unit for the relay there and for the server in both READMEs. Still open: any of Homebrew, winget and scoop. See [4.4](#44-operations-and-distribution-p1) |
+| R6 | **Distribution, and the two parts that were decided against** | A container image published to GHCR with the release archives, a self-hosted relay documented end to end, and a systemd unit for the relay there and for the server in both READMEs. The two parts that are **not** planned: shipping a relay of our own (the relay is iroh's component — we configure one and do not package or maintain it) and any of Homebrew, winget and scoop (postponed). See [4.4](#44-operations-and-distribution-p1) and [§0](#0-the-v100-decision-2026-10-20) |
 | — | **The root workspace compiles on Windows** | It had no Windows job at all, so `crates/*` had never been built for `x86_64-pc-windows-msvc` outside a release tag. Check only, no tests: the integration tests spawn the binary and reach for `cfg(unix)` fixtures. See [4.4](#44-operations-and-distribution-p1) |
 
 The desktop credential door is not one of these either, though it ships in the
