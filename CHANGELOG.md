@@ -104,6 +104,28 @@ its defaults — which are on.
 
 ### Changed
 
+- **The client's list of names and the server's routes are spelled the same
+  way.** A pattern is a name (`app.example.com`), a dotted wildcard
+  (`*.example.com` — its subdomains, and not the name itself) or the
+  catch-all (`*`), on both sides. Three places used to answer "is this name
+  mine?" differently: the server matched a request or a preface against a
+  route's `host_pattern` strictly, the client read a bare domain as the name
+  *and* every subdomain, and the desktop carried a second copy of the
+  client's rule that only applied on some platforms — on Windows a query is
+  local-delivered to the app's own DNS server and on macOS and Linux it
+  reaches the library's, so the same config answered differently depending on
+  the machine. The rule now lives in `nexapipe-proto`, which both sides
+  already link.
+
+  **This changes what a bare domain means in a client's list.** `example.com`
+  used to mean the name and every subdomain on the client; it means the name
+  alone now, which is what the server always read it as. A client that wants
+  the subdomains writes `*.example.com`, and a client carrying an older list
+  says so in its log, once, at startup. A wildcard without the dot
+  (`*example.com`) used to be a bare `ends_with` on the client and matched
+  `notexample.com` with it; it matches nothing now, and the server has always
+  refused the spelling. The dot-prefixed spelling (`.example.com`) is refused
+  as well: it is the suffix form a resolver uses, not a pattern here.
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which
   kind of credential a device has comes from the server's own record, not
   from a wire discriminator, so no message variant or scheme field was added,

@@ -657,6 +657,15 @@ the label boundary, and without it `*.example.com` would also match
 somebody else. A pattern like `*example.com` is refused at startup, in
 `host_pattern` and in a client's `allow_hosts` alike.
 
+**The client's list of names is spelled the same way**, so a pattern can be
+copied from one list to the other: `app.example.com` is that name and nothing
+else, `*.example.com` is its subdomains and not the name itself, and `*` is
+every name. The two used to disagree — the client read a bare domain as the
+name *and* every subdomain, while the server read it as the name alone — so a
+subdomain the client put in the tunnel was a name the server had no route
+for, and the failure looked like the tunnel was broken. A client that still
+carries an older list says so in its log, once, at startup.
+
 ### `[server]` — direct ingress (off by default)
 
 | Key | Default | Notes |
