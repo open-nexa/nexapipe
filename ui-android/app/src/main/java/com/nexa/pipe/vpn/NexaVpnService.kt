@@ -187,8 +187,10 @@ class NexaVpnService : VpnService() {
         this.allowTakeover = allowTakeover
         isUserStarted = true
         // A new session begins: clear the stale "revoked" marker from a
-        // previous session (consumed by VpnViewModel.syncVpnServiceState()).
+        // previous session (consumed by VpnViewModel.syncVpnServiceState()),
+        // and the reason that came with it.
         wasRevoked = false
+        lastRevokeReason = null
 
         // A new session clears the teardown marker: the same service instance
         // is reused when the user stops and starts again without the process
@@ -1136,6 +1138,17 @@ class NexaVpnService : VpnService() {
         var wasRevoked: Boolean = false
             private set
 
+        /**
+         * Why the slot was lost, kept because the event that carries the reason
+         * may reach no listener at all: a boot connection is refused with no
+         * screen to report to, and the reason is what the user needs then.
+         * Cleared with [wasRevoked] when a new session starts.
+         */
+        @Volatile
+        @JvmStatic
+        var lastRevokeReason: String? = null
+            private set
+
         // Push channel for the "VPN slot lost" event so a foreground UI
         // updates immediately instead of waiting for the next resume-time
         // syncVpnServiceState() call. The reason is the message to show: the
@@ -1150,6 +1163,10 @@ class NexaVpnService : VpnService() {
         }
 
         private fun notifyVpnRevoked(reason: String) {
+            // Kept whether or not anyone is listening: a boot connection is
+            // refused with no screen to report to, and the reason is what the
+            // user is told when the app is opened afterwards.
+            lastRevokeReason = reason
             revokedListener?.invoke(reason)
         }
 

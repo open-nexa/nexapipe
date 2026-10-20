@@ -1512,12 +1512,18 @@ class VpnViewModel : ViewModel() {
         // revoked-listener registered (app was backgrounded or the ViewModel
         // was recreated): align the UI now instead of showing a stale
         // "Connected".
-        if (isVpnRunning.value && !isConnecting.value && NexaVpnService.wasRevoked) {
+        //
+        // Not conditioned on a session this ViewModel knew about: a boot
+        // connection refused because another app owns the slot never had one,
+        // and the reason for it is exactly what the user is missing — the boot
+        // path has no screen to report to, so this is where it is reported.
+        if (!isConnecting.value && NexaVpnService.wasRevoked) {
             // Same reason as the revoked listener above: the session is over, so its counters
             // and the poll behind them go with it.
             stopLinkPolling()
             isVpnRunning.value = false
-            errorMessage.value = AppStrings.get(R.string.error_vpn_taken_over)
+            errorMessage.value = NexaVpnService.lastRevokeReason
+                ?: AppStrings.get(R.string.error_vpn_taken_over)
             addLog("Synced UI state: tunnel was revoked by another app")
         }
     }
