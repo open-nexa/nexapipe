@@ -2474,7 +2474,13 @@ impl Drop for ConfigLock {
 /// really are on disk in that window — the server refuses to *start* on a
 /// world-readable config, so handing one to every local account for the length
 /// of a write contradicts the check that exists to prevent it.
-pub fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
+///
+/// Crate-private on purpose: the text of a config is a copy of its
+/// credentials, so every write of one goes through [`write_config_document`],
+/// which zeroes the text it renders and the document it came from. A caller
+/// that reached this function directly would skip that, and the seeds would
+/// sit in the heap for as long as the allocator kept the buffer.
+pub(crate) fn write_config_file(path: &str, contents: &str) -> anyhow::Result<()> {
     let target = Path::new(path);
     let directory = target
         .parent()
