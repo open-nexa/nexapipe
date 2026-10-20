@@ -63,6 +63,10 @@ nexapipe-proto.workspace = true
 # dropped: the validator is built from the secret, and without this it kept a
 # second copy of the credential in the heap for as long as the process lived.
 totp-rs = { version = '6.0', features = ['gen_secret', 'zeroize'] }
+# The same crate, for the copies of a config the TOML parsers make on the way
+# to the typed values: the file can hold the seeds in the clear, and those
+# copies are wiped when they go out of scope. See `toml_zeroize`.
+zeroize.workspace = true
 base32 = '0.5'
 # Challenge binding: AUTH_RESPONSE is signed HMAC-SHA256(secret, nonce||timestamp).
 hmac = '0.13'
