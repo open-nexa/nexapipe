@@ -802,7 +802,7 @@ body can run as long as it needs to.
 | `response_idle_secs` | idle, not a phase deadline: the gap between response chunks, re-armed on every chunk, on every path that proxies a response. An SSE stream or a long transfer stays open; a backend that sent the head and went silent does not hold the slot. | a backend that streams with long gaps between chunks. |
 | `l4_flow_secs` | a phase deadline over the whole life of an L4 tunnel, TCP and UDP alike — a flow has no protocol-level end, so this is the one stop against a peer renewing it forever. | long-lived SSH or database sessions over the tunnel. A route's own `flow_timeout_secs` overrides it per route. |
 | `l4_idle_secs` | idle between UDP datagrams in either direction. | a UDP flow that legitimately pauses longer than a minute between datagrams. |
-| `tls_hello_secs` | a phase deadline over the TLS `ClientHello` read, which had no bound at all. It also covers the wait for the session's first byte, on both listeners. | clients on a very slow link sending the hello in dribbles. |
+| `tls_hello_secs` | a phase deadline over the TLS `ClientHello` read, which had no bound at all. The wait for the session's first byte is the longer of this and `header_secs`, on both listeners — the protocol is unknown until that byte arrives, so a short `header_secs` must not close a TLS session. | clients on a very slow link sending the hello in dribbles. |
 
 `0` is refused at load for every key, and so is anything past `86400` (a day):
 zero closes the phase the moment it opens, and a bound that long never fires.

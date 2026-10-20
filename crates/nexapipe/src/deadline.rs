@@ -85,7 +85,7 @@ pub const DEFAULT_L4_IDLE_SECS: u64 = 60;
 /// connection open indefinitely with no read deadline at all.
 pub const DEFAULT_TLS_HELLO_SECS: u64 = 10;
 
-/// The five phase budgets, resolved.
+/// The per-phase budgets, resolved.
 ///
 /// A struct rather than loose constants so that a caller cannot accidentally use
 /// the body budget for a header read: the names are the documentation, and a
@@ -170,7 +170,7 @@ pub struct Overrides {
     pub tls_hello_secs: Option<u64>,
 }
 
-/// The longest wait any of these accepts: an hour spent waiting for a header is
+/// The longest wait any of these accepts: a day spent waiting for a header is
 /// not a slow client, it is one that is never going to send one.
 pub const MAX_SECS: u64 = 86_400;
 
@@ -208,9 +208,11 @@ mod tests {
 
     #[test]
     fn an_absurd_override_is_capped_rather_than_refused() {
-        // Capping rather than erroring: a typo in one key should not stop the
-        // server, which is the same rule the environment overrides follow. The
-        // cap is high enough that no legitimate configuration meets it.
+        // The cap is a backstop for callers that never ran the config
+        // validation, not the policy: `ProxyConfig::validate_timeouts` refuses
+        // anything past `MAX_SECS` (and zero) at load, where the operator is
+        // looking. The cap is high enough that no legitimate configuration
+        // meets it.
         let d = Deadlines::resolve(&Overrides {
             body_secs: Some(u64::MAX),
             ..Default::default()

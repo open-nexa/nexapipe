@@ -778,13 +778,15 @@ impl ProxyConfig {
         Ok(())
     }
 
-    /// Every `[timeouts]` value is a wait for one step of talking to a backend,
-    /// and neither end of the range is a number anyone would dial: zero is a
-    /// deadline that expires before the round trip it is meant to bound, so
-    /// every request to every backend fails; anything past the ceiling is not a
+    /// Two families of wait live in `[timeouts]`: the two backend keys cover
+    /// one step of talking to a backend, and the six phase keys bound a phase
+    /// of the exchange itself. Neither end of either range is a number anyone
+    /// would dial: zero is a deadline that expires before the round trip (or
+    /// the phase) it is meant to bound; anything past the ceiling is not a
     /// longer wait but a missing one, and the symptom is a request slot held
     /// until the client gives up. Refused at load, where the operator is
-    /// looking, rather than discovered as "all requests fail 502".
+    /// looking, rather than discovered as "all requests fail 502" — or, for an
+    /// L4 flow, as a tunnel that closes the instant it opens.
     fn validate_timeouts(&self) -> anyhow::Result<()> {
         for (key, secs) in [
             ("connect_secs", self.timeouts.connect_secs),

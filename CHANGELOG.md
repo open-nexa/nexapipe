@@ -44,7 +44,7 @@ that names none of the new keys leaves every deadline at its default.
   secret, and the client authenticates every later connection with
   `TwoFactorAuth::with_key`. An older server ignores the offered key and
   issues a secret as before, which the client then uses.
-- **Six `[timeouts]` keys for the per-phase deadlines.** `header_secs`,
+- **Six `[timeouts]` keys for the per-phase budgets.** `header_secs`,
   `body_secs`, `response_idle_secs`, `l4_flow_secs`, `l4_idle_secs` and
   `tls_hello_secs` bound, respectively, how long a client may take to send its
   request head (default 30), its request body (300), how silent a response body
@@ -81,7 +81,10 @@ that names none of the new keys leaves every deadline at its default.
   plaintext listener too, where a backend that sent its head and then went
   silent used to hold the request open for as long as it liked; such a
   response now fails instead of being truncated quietly, so the client can
-  tell a short body from a whole one. One of these is a behaviour change
+  tell a short body from a whole one. On that listener the body is handed on as
+  data chunks, so an HTTP/1.1 response trailer is dropped — the streamed iroh
+  path has always done the same, and request trailers are not forwarded either.
+  One of these is a behaviour change
   worth noticing: an L4 tunnel now closes after an hour of existence even if
   it is busy, so a long-lived SSH or database session over the tunnel needs
   `l4_flow_secs` raised (or a per-route `flow_timeout_secs`).

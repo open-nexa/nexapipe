@@ -264,12 +264,13 @@ threshold = 3
 path = "/health"
 
 # ============================================================
-# [timeouts] - waiting on a backend
+# [timeouts] - waiting on a backend, and bounding each phase
 # ============================================================
-# Both keys are seconds and both are optional; leaving the section out keeps the
-# deadlines this server has always used. Neither one bounds how long a request
-# may take - each covers one step of talking to a backend, and a response body
-# may then stream for as long as it needs:
+# Every key is seconds and optional; leaving the section out keeps the deadlines
+# this server has always used. The first two keys cover one step of talking to a
+# backend each - neither bounds how long a request may take, and a response body
+# may then stream for as long as it needs (the six keys further down bound the
+# phases of the exchange itself):
 #
 #   connect_secs   dialing a backend: the HTTP request paths (including a
 #                  WebSocket upgrade), TLS passthrough and tcp tunnels all dial
@@ -281,9 +282,10 @@ path = "/health"
 #                  arrives. Raise it for an API that computes before it answers.
 #                  Default: 30
 #
-# `0` is refused at startup, and so is anything past 3600: the first is a
-# deadline no backend can meet, and the second is not a slow backend but one
-# that has stopped answering - and then nothing is holding the request slot.
+# For these two keys `0` is refused at startup, and so is anything past 3600:
+# the first is a deadline no backend can meet, and the second is not a slow
+# backend but one that has stopped answering - and then nothing is holding the
+# request slot.
 #
 # The six keys below bound the phases of the exchange itself rather than the
 # backend's patience: how long a *client* may take to send its head and body,
@@ -314,9 +316,9 @@ path = "/health"
 #                      Default: 3600
 #   l4_idle_secs       idle between UDP datagrams in either direction.
 #                      Default: 60
-#   tls_hello_secs     a phase deadline over the TLS ClientHello read, and
-#                      over the wait for the session's first byte.
-#                      Default: 10
+#   tls_hello_secs     a phase deadline over the TLS ClientHello read. The
+#                      wait for the session's first byte is the longer of
+#                      this and `header_secs`. Default: 10
 #
 # A stream's first byte says which protocol it carries, and until it arrives
 # the protocol is unknown - so the wait for it is the longer of `header_secs`
@@ -324,9 +326,10 @@ path = "/health"
 # cut off a TLS session or an L4 tunnel: neither ever sends a request head,
 # and both are bounded by their own keys.
 #
-# `0` is refused at startup for every key, and so is anything past 86400 (a
-# day): the first closes the phase the moment it opens, and the second is a
-# bound that never fires.
+# These six take the wider ceiling: `0` is refused for every key, and so is
+# anything past 86400 (a day) - the first closes the phase the moment it opens,
+# and the second is a bound that never fires. The two backend keys above keep
+# the tighter 3600.
 #
 # NOT hot-reloadable: read once at startup, so editing any of these takes a
 # restart.
