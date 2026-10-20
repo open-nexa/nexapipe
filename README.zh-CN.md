@@ -827,6 +827,47 @@ tls_hello_secs = 10      # 默认：10 —— 读取 TLS ClientHello 的上限�
 
 这些键都在启动时读取一次，改动需要重启。
 
+### `[limits]` —— 整个进程运行时的上限
+
+```toml
+[limits]
+max_connections_per_peer = 64         # 默认：64 —— 单个对端同时持有的连接数
+max_connections_global = 4096         # 默认：4096 —— 所有对端合计的连接数
+max_streams_global = 16384            # 默认：16384 —— 在途的流
+max_body_bytes = 1073741824           # 默认：1 GiB —— 同时持有的请求体字节
+```
+
+所有键都可以不写，默认值就是服务端一直以来的上限，所以写上这一段但什么都不填，什么都
+不会改变。
+
+其中两个键回答的是同一个问题的不同尺度，缺一不可。对端 ID 是一把公钥，调用方想造多少
+就能造多少：单对端上限挡住一个对端持有成千上万条连接，全局上限挡住**进程**被「有多少个
+对端存在」这件事挤爆。两者谁也替代不了谁。`max_streams_global` 是同一个道理往下一层
+—— 每条连接都能开出自己的额度，而总量同样是「有多少个对端存在」的乘积。
+`max_body_bytes` 约束的是内存：请求体在转发之前是整个读进来的，所以「每个请求 64 MB」
+站得住，「每个请求 64 MB 乘以所有在途的流」站不住。
+
+所有键写 `0` 都会在加载时被拒绝：那会拒掉所有连接，而不是给连接设上限，这属于笔误而不
+是配置。**不认识的键同样在加载时被拒绝** —— 拼错的限额就是一个静默不生效的限额，进程
+于是跑在一个没人写下过的上限里。
+
+生效的上限会在启动时打印出来：
+
+```
+Accepting at most 64 concurrent connections per peer, 4096 across the process, 16384 streams across the process, 1073741824 bytes of request bodies across the process
+```
+
+在 `[limits]` 出现之前就用来指定这些上限的四个环境变量 ——
+`NEXAPIPE_MAX_CONNS_PER_PEER`、`NEXAPIPE_MAX_CONNS`、`NEXAPIPE_MAX_STREAMS`、
+`NEXAPIPE_MAX_BODY_BYTES` —— 仍然有效，而且**环境变量优先于配置**：它是运维最后设置
+的东西，在容器里往往也是唯一能设置的东西。两边都写了同一个键时，日志里会告警而不是
+拒绝启动，所以这种歧义是可见的，而不是无声的。环境变量里用不了的值 —— `0`，或者根本
+不是数字 —— 会被忽略并改用默认值，因为 Dockerfile 里一个写坏的环境变量不该让服务端起
+不来。
+
+这些键都在启动时读取一次，改动需要重启：在上传进行到一半时改动预算，会让它按一个它从
+未被计入的上限来归还字节。
+
 ### `[admin]` —— 辅助监听（默认关闭）
 
 ```toml
@@ -989,6 +1030,7 @@ allow = [
 | `[health_check]` | 生效。`enabled` 暂停/恢复探测；其余键对重载新增或改动的路由生效。 |
 | `[backends]`、`[retry]`、`[circuit_breaker]` | 需重启：启动时读取一次，与 `[timeouts]` 同理。 |
 | `[timeouts]` | 需重启：启动时读取一次，与 `[server] listen_addr` 同理。 |
+| `[limits]` | 需重启：启动时读取一次，与 `[timeouts]` 同理。 |
 | `[peers] allow` | 目前需重启。 |
 | `[iroh]` | 需重启：端点只绑定一次。 |
 | `[server] listen_addr` | 需重启 —— 迁移监听等同于重启。 |

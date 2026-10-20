@@ -12,22 +12,42 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Three things land in this cycle so far: the device credential can be a **key**
+Four things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
-deadline the operator can see and raise, and backend handling no longer stops at
+deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
-circuit-broken. No existing configuration key is removed or renamed, and the ones
-this cycle adds — `public_key` under a device entry, the six `[timeouts]` phase
-keys, `[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so
-a `config.toml` that works on 0.6.1 still loads and behaves as it did: a device
+circuit-broken — and the ceilings the process runs under are now something a
+config file can say rather than only an environment variable can. No existing
+configuration key is removed or renamed, and the ones this cycle adds —
+`public_key` under a device entry, the six `[timeouts]` phase keys, `[limits]`,
+`[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so a
+`config.toml` that works on 0.6.1 still loads and behaves as it did: a device
 entry that carries a `secret` is checked exactly as before, a `[timeouts]`
-section that names none of the new keys leaves every deadline at its default.
+section that names none of the new keys leaves every deadline at its default,
+and a config with no `[limits]` section runs with the ceilings it always ran
+with.
 Leaving `[retry]` out keeps one try and no second chance, leaving `[backends]`
 out uses the machine's own trust store, and leaving `[circuit_breaker]` out uses
 its defaults — which are on.
 
 ### Added
 
+- **A `[limits]` section for the process-wide ceilings.** The connections one peer
+  may hold, the connections the whole process may hold, the streams in flight and
+  the bytes of request bodies held at once were reachable only through four
+  environment variables, so a deployment that described itself in a `config.toml`
+  had to describe its own limits somewhere else — and a limit nobody wrote down
+  is a limit nobody knows is in force. `[limits]` names all four:
+  `max_connections_per_peer` (default 64), `max_connections_global` (4096),
+  `max_streams_global` (16384) and `max_body_bytes` (1 GiB). Every key is
+  optional and every default is the ceiling the server always used, so a config
+  that does not mention the section behaves exactly as it did. Zero is refused at
+  load for every key — it would refuse every connection rather than bound them —
+  and so is an unknown key, because a misspelled limit is one that silently does
+  not apply. The four environment variables still work and still win over the
+  file, so a deployment that set them keeps the behaviour it had; a key both name
+  is a warning in the log rather than a refusal, and the effective ceilings are
+  printed at startup. Read once at startup, so editing them takes a restart.
 - **Per-device Ed25519 keys.** An entry under
   `[auth.clients.<id>.devices.<name>]` can carry `public_key` — the public
   half of an Ed25519 pair, 64 hex characters — instead of `secret`, and that
