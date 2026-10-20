@@ -1144,7 +1144,7 @@ impl ProxyConfig {
             // Refused rather than matched loosely: a wildcard without its dot
             // silently covers hosts that merely end in the same letters, so a
             // config using one is a config that routes more than it says.
-            if let Some(why) = crate::routes::host_pattern_error(&host_pattern) {
+            if let Some(why) = crate::routes::pattern_error(&host_pattern) {
                 anyhow::bail!("{label}: host_pattern {why}");
             }
 
@@ -1799,7 +1799,7 @@ impl ProxyConfig {
                             // loose one authorizes more than it names: the same
                             // refusal a route's `host_pattern` gets.
                             for host in client_toml.allow_hosts.iter().flatten() {
-                                if let Some(why) = crate::routes::host_pattern_error(host) {
+                                if let Some(why) = crate::routes::pattern_error(host) {
                                     anyhow::bail!(
                                         "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"
                                     );

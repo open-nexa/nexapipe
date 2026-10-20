@@ -6,27 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Compares host names the way DNS does: case-insensitively, without a
-/// trailing dot.
-///
-/// A `Host` header may arrive in any case (`API.example.com`) and may carry a
-/// fully-qualified trailing dot (`api.example.com.`) — both name the same host
-/// the route was written for. Matching them raw would let such a request slip
-/// past its route and reach a different service entirely. Both the pattern and
-/// every input go through here, so a config written with uppercase letters
-/// keeps working too.
-pub(crate) fn normalize_host(host: &str) -> String {
-    // Every trailing dot, not just one: a name may arrive carrying more than
-    // the single dot of a fully-qualified spelling, and leaving one behind
-    // makes it a different string than the route it names.
-    let host = host.trim_end_matches('.');
-    // An IPv6 literal is bracketed in a `Host` header — that is how its port is
-    // told apart from the address — and may be written the same way in a
-    // config. The brackets are not part of the name, so both sides lose them
-    // here and a pattern spelled `[::1]` matches a request for `[::1]:8080`.
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    host.to_ascii_lowercase()
-}
+// The one host-matching rule, and the one place it lives.
+//
+// It is in `nexapipe-proto` rather than here because the client library links
+// the same crate and has to answer the same question: the client decides
+// which names it proxies, the server decides which names a route serves, and
+// a name the two spell differently is a name the client tunnels and the
+// server has no route for. The rule and the drift it replaced are written up
+// in `nexapipe_proto::host`.
+pub(crate) use nexapipe_proto::{host_matches, normalize_host, pattern_error};
 
 /// The host a `Host` header names, with the port taken off.
 ///
@@ -46,59 +34,6 @@ pub(crate) fn host_without_port(host: &str) -> &str {
         }
     } else {
         host.split(':').next().unwrap_or(host)
-    }
-}
-
-/// Whether a (already folded) host matches a (already folded) pattern.
-///
-/// The one host-matching rule, shared by route patterns and
-/// [`ClientAcl`] allowlists so the two can never drift apart: an exact
-/// name, a `*.suffix` wildcard, or the bare `*` catch-all.
-///
-/// The dot is load-bearing. Without it a wildcard is a bare `ends_with`, so
-/// `*.example.com` would also match `notexample.com` — a host that merely
-/// ends in the same letters, belonging to somebody else entirely.
-pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
-    match pattern.strip_prefix('*') {
-        None => pattern == host,
-        // `*` on its own is the catch-all: how "send everything here" is
-        // spelled now that there is no default backend.
-        Some("") => true,
-        // A `*` followed by anything but a dot matches nothing. Those are
-        // refused when the config is loaded, so reaching here means the
-        // pattern came from somewhere that skipped the check — and the one
-        // thing it must not do is quietly match more than it says.
-        Some(rest) => rest
-            .strip_prefix('.')
-            .and_then(|suffix| host.strip_suffix(suffix))
-            // The label boundary: the apex itself is not under the wildcard,
-            // which is what DNS means by `*.example.com`.
-            .is_some_and(|prefix| prefix.ends_with('.')),
-    }
-}
-
-/// Why `pattern` cannot be matched with, or `None` when it can.
-///
-/// Checked when a config is loaded rather than left to the matcher, because the
-/// failure mode of a loose wildcard is silent: `allow_hosts = ["*iakl.top"]`
-/// looks like it names one domain and in fact authorizes every host ending in
-/// those letters, `eviliakl.top` included. Refusing to start is the only
-/// answer an operator can see.
-pub(crate) fn host_pattern_error(pattern: &str) -> Option<String> {
-    if pattern.is_empty() {
-        return Some("is empty; name the host, or use \"*\" for every host".to_string());
-    }
-
-    // Not a wildcard at all, so there is nothing a `*` could get wrong.
-    let rest = pattern.strip_prefix('*')?;
-    match rest.strip_prefix('.') {
-        None if rest.is_empty() => None,
-        Some(suffix) if !suffix.is_empty() => None,
-        _ => Some(format!(
-            "\"{pattern}\" has to be \"*\" or start with \"*.\": the dot is what marks the \
-             label boundary, and without it the pattern also matches any host that merely \
-             ends in the same letters"
-        )),
     }
 }
 
@@ -1786,14 +1721,14 @@ mod tests {
 
     #[test]
     fn a_loose_wildcard_is_refused_when_the_config_loads() {
-        assert!(host_pattern_error("*").is_none());
-        assert!(host_pattern_error("*.example.com").is_none());
-        assert!(host_pattern_error("example.com").is_none());
+        assert!(pattern_error("*").is_none());
+        assert!(pattern_error("*.example.com").is_none());
+        assert!(pattern_error("example.com").is_none());
 
-        let why = host_pattern_error("*iakl.top").expect("*iakl.top must be refused");
+        let why = pattern_error("*iakl.top").expect("*iakl.top must be refused");
         assert!(why.contains("label boundary"), "{why}");
         assert!(
-            host_pattern_error("").is_some(),
+            pattern_error("").is_some(),
             "an empty pattern names nothing"
         );
     }

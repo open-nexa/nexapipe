@@ -38,6 +38,14 @@
 //! * `UDP` — [`udp::encode_frame`] / [`udp::decode_frame`] framing, one datagram per
 //!   frame, because a byte stream has no message boundaries of its own.
 //!
+//! # Host patterns
+//!
+//! The preface carries a host name, and both sides have to agree on what a
+//! name means: the client decides whether a name is one it proxies, the
+//! server decides whether a name is one a route serves. That agreement is one
+//! rule, and it lives here — see [`host`] for the rule itself and for why it
+//! used to be three.
+//!
 //! # First byte back
 //!
 //! The server answers with exactly one byte, [`Status`], before any payload. A client
@@ -51,9 +59,11 @@
 //! produced an empty path, matched no route and was forwarded to `default_backend`.
 //! A preface that fails to decode is now a loud error instead of a silent default.
 
+mod host;
 mod preface;
 mod udp;
 
+pub use host::{host_matches, host_matches_any, normalize_host, pattern_error};
 pub use preface::{
     L4Proto, MAX_HOST_LEN, MAX_PREFACE_LEN, PREFACE_MAGIC, PREFACE_VERSION, Preface, Status,
     is_l4_preface,
