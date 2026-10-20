@@ -1,6 +1,10 @@
 target
 .workbuddy
 
+# Working branches are checked out inside the repository, under .worktrees/.
+# Each one is a separate git repository, so the parent must not track it.
+.worktrees
+
 # run_android.ps1 logcat capture (same name is already ignored inside ui-android/)
 nexa_vpn_log.txt
 

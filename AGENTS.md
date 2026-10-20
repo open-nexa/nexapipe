@@ -57,27 +57,43 @@ Do not jump straight into edits. For any task that writes something:
 
 No approval is needed for read-only work: answering questions, reading files, searching, explaining code, or producing a report / scan-only listing. Anything that writes, deletes, or has external effects does need it.
 
+## Repositories & GitHub CLI (MANDATORY)
+
+This checkout is a **fork**, and the two remotes are not interchangeable:
+
+- `origin` — the fork `yixinin/nexapipe`. Branches are pushed here, so this is where a pull request's **head** branch lives.
+- `upstream` — the project `open-nexa/nexapipe`. Pull requests are opened, reviewed and merged **here**, against `upstream`'s `main`.
+
+A PR therefore spans two repositories: its head branch is in `origin`, the PR itself is in `upstream`. `git push origin <branch>` updates an open PR; `gh pr merge` acts on the upstream PR.
+
+- The `gh` CLI's default repository is set to `open-nexa/nexapipe` for this checkout (`git config remote.origin.gh-resolved`), so `gh pr list`, `gh pr view` and `gh pr checks` work **without** `-R`; passing `-R open-nexa/nexapipe` is still correct and harmless. Asking the fork instead returns an empty list — that is a wrong answer, not "there are no pull requests".
+- `gh` is authenticated as `yixinin` with the `repo` scope, so it reads both repositories.
+- Before starting work, look for an existing PR on the branch you are about to touch: `gh pr list --state open --json number,title,headRefName`. A branch that already carries an open PR is where a fix belongs (see the PR-fix exception in the worktree rules below), not a new branch.
+- `origin/main` and `upstream/main` are usually the same commit, but the fork's `main` can lag. `upstream/main` is the one to branch from.
+
 ## Git Safety Rules (MANDATORY)
 
-- **Committing and pushing working branches is allowed.** Once the work is verified, the agent may `git commit` it on its working branch and `git push` that branch to the fork (`origin`), including the head branch of an open PR. Stage files by name, review `git status` before committing, and never commit secrets.
+- **Committing and pushing working branches is allowed.** Once the work is verified, the agent may `git commit` it on its working branch and `git push` that branch to the fork (`origin`), including the head branch of an open PR — the PR itself lives in `upstream` (see Repositories & GitHub CLI). Stage files by name, review `git status` before committing, and never commit secrets.
 - **Still ask first** before anything that rewrites or removes shared history or publishes a release: force-push (`--force`, `--force-with-lease`), pushing to `main`, deleting a remote branch or tag, pushing tags, and `gh release ...`.
 - Do not run history/discard commands (`git reset --hard`, `git checkout --`, `git clean -fd`, `git stash` without being asked, branch switches that drop work) unless explicitly requested.
 
 ## Git Workflow — Worktrees & Branch Base (MANDATORY)
 
-- **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `/Users/ipine/rust/nexapipe` and stays on `main`. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
-- **Every new branch is based on the newest `main`.** Do not start from the local `main` ref alone: the fork's `main` regularly lags upstream. Resolve the upstream head first, fetch it into the fork, and branch off that commit:
+- **Anything that changes code must be done in a dedicated git worktree, never in the main checkout.** The main checkout is `~/rust/nexapipe` and stays on `main`; the worktrees under `.worktrees/` are separate checkouts that happen to live inside it, and the main checkout's own working tree is not one of them. This covers code, docs, configuration and CI files — every write goes through a branch in a worktree. Only read-only work may happen in the main checkout: reading, searching, explaining code, answering questions, producing a report or a scan-only listing.
+- **Every new branch is based on the newest `main`.** Do not start from the local `main` ref alone: the fork's `main` regularly lags upstream. Fetch the upstream head and branch off that commit:
 
   ```bash
-  gh api repos/open-nexa/nexapipe/commits/main --jq .sha   # -> <sha>
-  git fetch --no-tags origin <sha>
-  git worktree add /Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch> -b <branch> <sha>
-  cd /Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch>
-  git merge-base --is-ancestor <sha> HEAD   # verify the branch really sits on newest main
+  git fetch --no-tags upstream main
+  git worktree add .worktrees/<branch> -b <branch> upstream/main
+  cd .worktrees/<branch>
+  git merge-base --is-ancestor upstream/main HEAD   # verify the branch really sits on newest main
   ```
 
-  If the upstream lookup is unreachable, degrade to a fast-forward update of the local `main` (`git fetch --no-tags origin main`, fast-forward only — never `reset --hard`) and state explicitly in the reply which commit was used as the base.
-- **Worktree location:** `/Users/ipine/WorkBuddy/Worktrees/nexapipe/<branch-name>` for every working branch. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+  The directory path is the branch name verbatim (`v070/audit-fixes` → `.worktrees/v070/audit-fixes`), so two branch names can never land on the same directory. Create the parent directory first: `git worktree add` does not.
+
+  If the `upstream` remote is missing, add it once with `git remote add upstream git@github.com:open-nexa/nexapipe.git`. If the upstream lookup is unreachable, fall back to the fork: run `git fetch --no-tags origin main` and then `git merge --ff-only origin/main` from the local `main` — a fetch only moves `origin/main`, and the local branch is moved by the merge, never by `reset --hard` — then branch off `origin/main`. State explicitly in the reply which commit was used as the base.
+- **Worktree location:** `<repo>/.worktrees/<branch>`, with the branch name used verbatim (`v070/audit-fixes` → `.worktrees/v070/audit-fixes`) — inside the repository rather than beside it, so that reading and writing a worktree's files goes through the same file-access path as the rest of the project instead of prompting for a separate permission on every call. `.worktrees/` is listed in `.gitignore` and `.dockerignore`. Keep `<repo>/.workbuddy/` worktrees for throwaway simulations only (merge rehearsals, release-note scratch): those are git-ignored and expire with the task.
+- **Point searches and reads at the worktree you are working in.** A search rooted at the repository root does not descend into `.worktrees/`: each worktree is a separate git repository and a hidden directory, and the search tools skip both. The same holds for `.workbuddy/`.
 - **Exception — a fix to an open PR reuses that PR's branch and worktree.** When the task is fixing a bug in an existing open PR, work on that PR's own head branch, in that branch's existing worktree. Do not open a fresh branch and do not create a second worktree for it: the fix belongs in the PR that carries the defect, not in a parallel branch that has to be cherry-picked afterwards. Locate the worktree with `git worktree list` before starting, and check `git status` in it — if it holds unrelated uncommitted work, stop and ask instead of mixing the fix into it. The "newest `main`" rule above governs new branches only; a PR branch keeps its own base and history.
 - Set the worktree up only after the plan is approved; until then stay read-only.
 - **Never delete a worktree on your own initiative**, least of all one holding unpushed commits — ask first. After a reboot, `/private/tmp` is gone, so run `git worktree prune` before rebuilding anything that referenced it.
@@ -90,6 +106,7 @@ No approval is needed for read-only work: answering questions, reading files, se
 
 ## Commit & Pull Request Guidelines
 
+- The end-to-end walkthrough — lifecycle, verification by change type, the review loop and the handoff report — is [`docs/agent-contribution.md`](docs/agent-contribution.md). This file states the rules; that one shows the order to apply them in.
 - The agent commits and pushes its own verified work on its working branch (see Git Safety Rules); opening or merging the PR stays with the owner unless they ask for it.
 - The history uses short generic subjects (e.g. `update`); prefer focused, descriptive messages like `fix(local-proxy): handle CONNECT tunnel close` or `feat(conn): add connection keepalive`.
 - Keep one logical change per commit.
