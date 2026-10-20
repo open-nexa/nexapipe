@@ -1351,6 +1351,16 @@ class VpnViewModel : ViewModel() {
     fun checkVpnPermission(context: Context): Boolean {
         val granted = VpnService.prepare(context) == null
         vpnPermissionGranted.value = granted
+        if (granted) {
+            // The permission is back, so the warning the boot path left behind
+            // is no longer true. Nothing else clears it: the boot path only
+            // runs at the next restart, and the screen tells the user to open
+            // the app to grant it — so without this the warning outlives the
+            // thing it is about, and the app tells the user to fix something
+            // that is already fixed.
+            settingsManager?.saveVpnConsentMissing(false)
+            vpnConsentMissing.value = false
+        }
         return granted
     }
 
