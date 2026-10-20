@@ -5613,6 +5613,31 @@ allow_hosts = ["*iakl.top"]
         assert!(err.to_string().contains("label boundary"), "{err}");
     }
 
+    /// A pattern that folds into the catch-all is not the catch-all: `*..`
+    /// and `[*]` both do. A client that may reach every host — or a route that
+    /// serves every host — because of a spelling nobody meant is the one thing
+    /// the shared rule must not do.
+    #[test]
+    fn a_pattern_that_folds_into_the_catch_all_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[auth]
+
+[auth.clients.device]
+secret = "JBSWY3DPEHPK3PXP"
+allow_hosts = ["*.."]
+"#,
+        )
+        .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("catch-all"), "{err}");
+    }
+
     /// `window` is handed to the TOTP library as a `u8`, so 300 was truncated
     /// to 44 by the cast: a code valid for ±22 minutes instead of ±30 seconds.
     #[test]

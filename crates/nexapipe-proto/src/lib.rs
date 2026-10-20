@@ -63,7 +63,7 @@ mod host;
 mod preface;
 mod udp;
 
-pub use host::{host_matches, host_matches_any, normalize_host, pattern_error};
+pub use host::{host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error};
 pub use preface::{
     L4Proto, MAX_HOST_LEN, MAX_PREFACE_LEN, PREFACE_MAGIC, PREFACE_VERSION, Preface, Status,
     is_l4_preface,

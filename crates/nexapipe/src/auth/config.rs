@@ -527,7 +527,10 @@ impl ClientAcl {
             Some(hosts) => ClientAcl::Restricted(
                 hosts
                     .iter()
-                    .map(|h| crate::routes::normalize_host(h))
+                    // Folded as a pattern, not as a host: a spelling that
+                    // would fold into the catch-all keeps its own shape, so an
+                    // allow-list can never end up authorizing every host.
+                    .map(|h| crate::routes::normalize_pattern(h))
                     .collect(),
             ),
         }

@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 // a name the two spell differently is a name the client tunnels and the
 // server has no route for. The rule and the drift it replaced are written up
 // in `nexapipe_proto::host`.
-pub(crate) use nexapipe_proto::{host_matches, normalize_host, pattern_error};
+pub(crate) use nexapipe_proto::{host_matches, normalize_host, normalize_pattern, pattern_error};
 
 /// The host a `Host` header names, with the port taken off.
 ///
@@ -104,7 +104,10 @@ impl Route {
         path_rewrite: Option<String>,
     ) -> Self {
         Route {
-            host_pattern: normalize_host(host_pattern),
+            // The pattern is folded as a pattern, not as a host: a spelling
+            // that would fold into the catch-all keeps its own shape, so a
+            // route can never end up serving every host.
+            host_pattern: normalize_pattern(host_pattern),
             path_pattern: path_pattern.to_string(),
             path_is_prefix,
             modes: vec![mode],

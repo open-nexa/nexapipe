@@ -77,6 +77,24 @@ pub fn normalize_host(host: &str) -> String {
     host.to_ascii_lowercase()
 }
 
+/// The folded form of a *pattern*.
+///
+/// The case is folded, as for a host, and the trailing dots and the brackets
+/// are taken off — but not when taking them off would leave the catch-all.
+/// `*.`, `*..` and `[*]` all fold to `*`, and a pattern that means "every
+/// host" where the configuration said something narrower is the one mistake
+/// this rule must not make: such a pattern keeps its own shape here, and so
+/// matches nothing rather than everything.
+pub fn normalize_pattern(pattern: &str) -> String {
+    let folded = normalize_host(pattern);
+    if folded == "*" && pattern != "*" {
+        // The fold would have widened it into the catch-all.
+        pattern.to_ascii_lowercase()
+    } else {
+        folded
+    }
+}
+
 /// Whether a (already folded) host matches a (already folded) pattern.
 ///
 /// The one host-matching rule: an exact name, a `*.suffix` wildcard, or the
@@ -135,24 +153,52 @@ pub fn pattern_error(pattern: &str) -> Option<String> {
         ));
     }
 
+    // A pattern that folds into the catch-all is not the catch-all: `*.`,
+    // `*..` and `[*]` all do. A pattern that means "every host" where the
+    // configuration said something narrower is the one mistake this rule must
+    // not make — it is refused here, where an operator can see it, and matched
+    // as nothing there.
+    let folds_to_catch_all =
+        pattern.contains('*') && pattern != "*" && normalize_host(pattern) == "*";
+
     // Not a wildcard at all, so there is nothing a `*` could get wrong.
-    let rest = pattern.strip_prefix('*')?;
+    let Some(rest) = pattern.strip_prefix('*') else {
+        if folds_to_catch_all {
+            return Some(catch_all_message(pattern));
+        }
+        return None;
+    };
     match rest.strip_prefix('.') {
-        None if rest.is_empty() => None,
-        Some(suffix) if !suffix.is_empty() => None,
-        _ => Some(format!(
-            "\"{pattern}\" has to be \"*\" or start with \"*.\": the dot is what marks the \
-             label boundary, and without it the pattern also matches any host that merely \
-             ends in the same letters"
-        )),
+        None if rest.is_empty() => {}
+        Some(suffix) if !suffix.is_empty() => {}
+        _ => {
+            return Some(format!(
+                "\"{pattern}\" has to be \"*\" or start with \"*.\": the dot is what marks the \
+                 label boundary, and without it the pattern also matches any host that merely \
+                 ends in the same letters"
+            ));
+        }
     }
+    if folds_to_catch_all {
+        return Some(catch_all_message(pattern));
+    }
+    None
+}
+
+/// The refusal for a pattern that is the catch-all in another spelling.
+fn catch_all_message(pattern: &str) -> String {
+    format!(
+        "\"{pattern}\" is the catch-all \"*\" in another spelling, and that means every host: \
+         write \"*\" for every host, or a name for the host you mean"
+    )
 }
 
 /// Whether `host` matches any of `patterns`.
 ///
 /// The list is held as it was configured — a pattern may still carry its `*` —
-/// and the host is folded once, so a caller that asks this per request pays
-/// for one allocation rather than one per pattern.
+/// and the host is folded once. Each pattern is folded as it is examined, so
+/// a caller that asks this per request pays for one allocation for the host
+/// and one per pattern.
 ///
 /// A pattern that [`pattern_error`] would refuse matches nothing here, which
 /// is the safe direction: a configuration that was never meant to be loaded
@@ -161,7 +207,7 @@ pub fn host_matches_any(patterns: &[String], host: &str) -> bool {
     let host = normalize_host(host);
     patterns
         .iter()
-        .any(|pattern| host_matches(&normalize_host(pattern), &host))
+        .any(|pattern| host_matches(&normalize_pattern(pattern), &host))
 }
 
 #[cfg(test)]
@@ -263,5 +309,43 @@ mod tests {
         let patterns = vec!["*.example.com".to_string()];
         assert!(host_matches_any(&patterns, "www.example.com"));
         assert!(!host_matches_any(&patterns, "example.com"));
+    }
+
+    /// A pattern that folds into the catch-all is not the catch-all.
+    ///
+    /// `*.`, `*..` and `[*]` all fold to `*`, and a pattern that means "every
+    /// host" where the configuration said something narrower is the one mistake
+    /// this rule must not make: a route that serves every host, or a client's
+    /// allow-list that authorizes every host, because of a spelling nobody
+    /// meant.
+    #[test]
+    fn a_pattern_that_folds_into_the_catch_all_matches_nothing() {
+        for pattern in ["*.", "*..", "[*]"] {
+            assert!(
+                pattern_error(pattern).is_some(),
+                "{pattern:?} is the catch-all in another spelling and must be refused"
+            );
+            let folded = normalize_pattern(pattern);
+            assert!(!host_matches(&folded, "example.com"), "{pattern:?}");
+            assert!(!host_matches(&folded, "www.example.com"), "{pattern:?}");
+            assert!(
+                !host_matches_any(&[pattern.to_string()], "example.com"),
+                "{pattern:?}"
+            );
+        }
+        // The catch-all itself is still the catch-all.
+        assert!(pattern_error("*").is_none());
+        assert!(host_matches(&normalize_pattern("*"), "example.com"));
+        assert!(host_matches_any(&["*".to_string()], "example.com"));
+    }
+
+    /// The fold takes the case and the trailing dots off a pattern, and the
+    /// shape of a pattern that folds into the catch-all is kept.
+    #[test]
+    fn a_pattern_keeps_its_shape_when_it_is_folded() {
+        assert_eq!(normalize_pattern("EXAMPLE.com."), "example.com");
+        assert_eq!(normalize_pattern("*.example.com."), "*.example.com");
+        assert_eq!(normalize_pattern("*."), "*.");
+        assert_eq!(normalize_pattern("[*]"), "[*]");
     }
 }
