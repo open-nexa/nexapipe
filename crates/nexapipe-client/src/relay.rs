@@ -383,16 +383,35 @@ fn is_n0_relay(url: &RelayUrl) -> bool {
 /// The comparison is on the host and the port rather than on the URL: a
 /// fully-qualified name ends in a dot, and the specification encourages that
 /// spelling, so two ends of the same relay can spell it differently and still
-/// be on it. A trailing dot is the same host, and the port a URL leaves out
-/// is the one it defaults to.
+/// be on it. A trailing dot is the same host.
+///
+/// The scheme is the one the relay is *dialled* with rather than the one it
+/// is written with: iroh-relay dials `http` and `ws` as `ws://` and
+/// everything else as `wss://`, so `https://relay.example.com` and
+/// `wss://relay.example.com` are one relay written two ways, and refusing the
+/// second would refuse a peer that named ours.
+///
+/// The port is the one the URL carries: the parser erases a port that is the
+/// scheme's default, so a URL that leaves the port out and a URL that writes
+/// the default are the same URL before the comparison ever sees them.
 fn same_relay(a: &RelayUrl, b: &RelayUrl) -> bool {
     let host = |url: &RelayUrl| {
         url.host_str()
             .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
     };
-    a.scheme() == b.scheme()
-        && host(a) == host(b)
-        && a.port_or_known_default() == b.port_or_known_default()
+    dial_scheme(a) == dial_scheme(b) && host(a) == host(b) && a.port() == b.port()
+}
+
+/// The scheme a relay URL is dialled with.
+///
+/// iroh-relay turns `http` and `ws` into `ws://` and everything else into
+/// `wss://` before it connects, so the scheme a URL is written with is not the
+/// scheme it is dialled with.
+fn dial_scheme(url: &RelayUrl) -> &str {
+    match url.scheme() {
+        "http" | "ws" => "ws",
+        _ => "wss",
+    }
 }
 
 #[cfg(test)]
@@ -664,20 +683,40 @@ mod tests {
         );
     }
 
-    /// A port the URL leaves out is the one it defaults to, so the two
-    /// spellings of the same relay are the same relay.
+    /// A relay on another port is another relay: the port says where the
+    /// connection goes, so a peer naming a different one is not naming ours.
+    ///
+    /// The port a URL leaves out is the one its scheme defaults to, and the
+    /// URL parser erases it, so "the default port" and "the written port" are
+    /// the same URL before the comparison ever sees them — there is no second
+    /// spelling of the default port to tell apart.
     #[test]
-    fn the_default_port_and_the_written_port_are_the_same_relay() {
+    fn a_relay_on_another_port_is_refused() {
         let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
             .unwrap()
             .unwrap();
         let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
         let addr = EndpointAddr::new(node_id())
-            .with_relay_url("https://relay.example.com:443".parse().unwrap());
+            .with_relay_url("https://relay.example.com:8443".parse().unwrap());
+
+        assert!(restriction.permits(&addr).is_err());
+    }
+
+    /// The websocket spelling of our relay is our relay: iroh-relay dials
+    /// `https://` as `wss://`, so a peer that names it the other way is still
+    /// naming ours and must not be refused for it.
+    #[test]
+    fn the_websocket_spelling_of_our_relay_is_our_relay() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction(DiscoveryMode::None).unwrap();
+        let url: RelayUrl = "wss://relay.example.com".parse().unwrap();
+        let addr = EndpointAddr::new(node_id()).with_relay_url(url);
 
         assert!(
             restriction.permits(&addr).is_ok(),
-            "443 is what the URL without a port means"
+            "https:// and wss:// are dialled the same way"
         );
     }
 

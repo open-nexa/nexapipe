@@ -980,7 +980,16 @@ class VpnViewModel : ViewModel() {
             isIrohStarted.value = true
             addLog("Iroh started: $id")
         } else {
-            throw Exception(AppStrings.get(R.string.error_start_iroh))
+            // The native side says why when it can — a relay URL or a discovery
+            // mode it could not read — and the reason is the part the user has
+            // to act on. Without it the app says "failed to start iroh" and
+            // nothing else, and the reason sits in the log behind the debug
+            // level.
+            val reason = nativeFailureReason()
+            throw Exception(
+                AppStrings.get(R.string.error_start_iroh) +
+                    if (reason != null) ": $reason" else ""
+            )
         }
     }
 

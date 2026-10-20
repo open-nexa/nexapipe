@@ -408,6 +408,25 @@ impl OverrideResolver {
             nameservers,
         }
     }
+
+    /// The addresses an override holds for `host`, if it holds any.
+    ///
+    /// The name is folded before the lookup: iroh asks for the fully-qualified
+    /// spelling — every relay hostname it dials ends in a dot — and an override
+    /// stored without the dot would otherwise never be found, and the query
+    /// would fall through to the resolver the override exists to avoid.
+    fn override_for(&self, host: &str) -> Option<&Vec<IpAddr>> {
+        self.overrides.get(&override_key(host))
+    }
+}
+
+/// The key a domain is stored and looked up under.
+///
+/// A name and the same name with a trailing dot are the same name, and DNS
+/// names are case-insensitive, so both are folded away on the way in and on
+/// the way out.
+fn override_key(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_lowercase()
 }
 
 impl fmt::Debug for OverrideResolver {
@@ -424,7 +443,7 @@ impl fmt::Debug for OverrideResolver {
 
 impl Resolver for OverrideResolver {
     fn lookup_ipv4(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv4Addr>, DnsError>> {
-        if let Some(ips) = self.overrides.get(&host) {
+        if let Some(ips) = self.override_for(&host) {
             let ipv4s: Vec<Ipv4Addr> = ips
                 .iter()
                 .filter_map(|ip| match ip {
@@ -457,7 +476,7 @@ impl Resolver for OverrideResolver {
     }
 
     fn lookup_ipv6(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv6Addr>, DnsError>> {
-        if let Some(ips) = self.overrides.get(&host) {
+        if let Some(ips) = self.override_for(&host) {
             let ipv6s: Vec<Ipv6Addr> = ips
                 .iter()
                 .filter_map(|ip| match ip {
@@ -708,7 +727,7 @@ fn set_dns_override(env: &mut Env<'_>, overrides: JString) -> jint {
         }
         let mut parts = entry.splitn(2, '=');
         let domain = match parts.next() {
-            Some(d) => d.trim().to_lowercase(),
+            Some(d) => override_key(d),
             None => continue,
         };
         if domain.is_empty() {
@@ -2950,6 +2969,53 @@ fn stop_tun_proxy() -> jint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override is stored and looked up under the same name, whatever
+    /// spelling either side uses: a name and the same name with a trailing
+    /// dot are the same name, and so is the same name in another case.
+    ///
+    /// The trailing dot is not a corner case: every relay hostname iroh dials
+    /// is fully qualified, and it is iroh that asks the resolver for it.
+    #[test]
+    fn an_override_is_found_however_the_name_is_spelled() {
+        assert_eq!(
+            override_key("APS1-1.relay.n0.iroh.link."),
+            override_key("aps1-1.relay.n0.iroh.link")
+        );
+        assert_eq!(
+            override_key("aps1-1.relay.n0.iroh.link."),
+            "aps1-1.relay.n0.iroh.link"
+        );
+        assert_eq!(override_key(" dns.iroh.link. "), "dns.iroh.link");
+    }
+
+    /// The lookup finds an override that was stored under the name without the
+    /// dot, when the query carries it: iroh asks for the fully-qualified
+    /// spelling, and an override that is not found is an override that does
+    /// not exist.
+    #[test]
+    fn an_override_stored_without_the_dot_is_found_with_it() {
+        let mut overrides: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        overrides.insert(
+            override_key("aps1-1.relay.n0.iroh.link"),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))],
+        );
+        let resolver = OverrideResolver::new(Vec::new(), overrides);
+
+        let qualified = resolver.override_for("aps1-1.relay.n0.iroh.link.");
+        let plain = resolver.override_for("aps1-1.relay.n0.iroh.link");
+        let other = resolver.override_for("other.example.com");
+
+        assert!(
+            qualified.is_some(),
+            "the fully-qualified spelling finds the override"
+        );
+        assert!(plain.is_some(), "the plain spelling finds it too");
+        assert!(
+            other.is_none(),
+            "a name that was never overridden is not overridden"
+        );
+    }
 
     /// A key is the credential for a node that has one: the node stores no
     /// secret at all, so the TOTP path would find nothing to build from and
