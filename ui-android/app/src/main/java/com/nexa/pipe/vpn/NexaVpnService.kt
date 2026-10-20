@@ -205,6 +205,14 @@ class NexaVpnService : VpnService() {
             // over a tunnel that is not there, and there is nothing else this
             // start was going to do. The boot path reaches this when the
             // consent was withdrawn between its own check and this one.
+            //
+            // The native side goes with it: this start was handed a proxy that
+            // is already up — the boot path brings the native side up before
+            // it asks the service to establish, and so does the screen — and
+            // that side is process-global, so a service that goes away with it
+            // still running leaves a live connection to the relay behind
+            // nothing that the user can see or stop.
+            releaseNativeResources()
             shutdownService()
             return
         }
@@ -287,48 +295,65 @@ class NexaVpnService : VpnService() {
             return
         }
 
-        val up = try {
-            BootConnector.connectIfWanted(this@NexaVpnService) { Log.i(TAG, it) }
-        } catch (e: Exception) {
-            Log.w(TAG, "boot connect failed: ${e.message}")
-            false
-        }
-        if (!up) {
-            // Nothing came up. A foreground service with no tunnel behind it is
-            // a notification that says the tunnel is up over a tunnel that is
-            // not there, so it goes away.
-            //
-            // The attempt may have brought the native side up before it
-            // failed, and that side is process-global: the iroh endpoint and
-            // the endpoint group with their warm backend connections outlive
-            // the service that started them, so a failed attempt would leave a
-            // live QUIC connection to the relay behind nothing that the user
-            // can see or stop. They are taken down here as well; the user's
-            // path does the same through releaseAllResources().
-            releaseBootResources()
-            shutdownService()
+        when (val outcome = BootConnector.connectIfWanted(this@NexaVpnService) { Log.i(TAG, it) }) {
+            is BootConnector.BootOutcome.Established -> {
+                // The tunnel itself is the service's to establish, and it does
+                // that after this returns.
+            }
+            is BootConnector.BootOutcome.Failed -> {
+                Log.w(TAG, "boot connect failed: ${outcome.cause.message}")
+                // The attempt may have brought the native side up before it
+                // failed, and that side is process-global: the iroh endpoint
+                // and the endpoint group with their warm backend connections
+                // outlive the service that started them, so a failed attempt
+                // would leave a live QUIC connection to the relay behind
+                // nothing that the user can see or stop. They are taken down
+                // here as well; the user's path does the same through
+                // releaseAllResources().
+                releaseNativeResources()
+                shutdownService()
+            }
+            is BootConnector.BootOutcome.Skipped -> {
+                // Nothing was started, so nothing is left behind to take
+                // down: the native side is process-global, and what is running
+                // in it may belong to a session that is not this one's to end.
+                shutdownService()
+            }
         }
     }
 
     /**
-     * Takes down what a failed boot attempt left running.
+     * Takes down the native side of a start that is not going to happen.
      *
      * The iroh endpoint and the endpoint group are process-global and outlive
      * the service: the service owns the TUN and the notification, and the
      * native side owns the connection to the relay and the warm backend
-     * connections behind it. A boot attempt that failed after the native side
-     * was up leaves all of it behind, with no service and no notification and
-     * nothing the user can stop.
+     * connections behind it. A start that is refused after the native side was
+     * brought up — a boot attempt that failed, a tunnel that could not be
+     * established because the consent was withdrawn — leaves all of it behind,
+     * with no service and no notification and nothing the user can stop.
+     *
+     * The teardown is process-global, so it takes down whatever else is
+     * running in the process as well. It is therefore only for a start that
+     * brought the native side up: an attempt that started nothing must not
+     * call it, or it ends a session that belongs to somebody else.
+     *
+     * It runs on the teardown scope and not on the caller's thread: the
+     * native stop closes the endpoint and the warm connections behind it, and
+     * that blocks for as long as they take — long enough to be the system's
+     * "the app is not responding" on the main thread.
      */
-    private fun releaseBootResources() {
-        // The library may not be there at all, and the call would raise an
-        // UnsatisfiedLinkError — an Error, not an Exception — which would
-        // escape the catch below and take the process with it.
-        if (!IrohProxy.isNativeLoaded()) return
-        try {
-            IrohProxy.nativeDestroy()
-        } catch (e: Exception) {
-            Log.e(TAG, "boot: nativeDestroy failed: ${e.message}")
+    private fun releaseNativeResources() {
+        teardownScope.launch {
+            // The library may not be there at all, and the call would raise an
+            // UnsatisfiedLinkError — an Error, not an Exception — which would
+            // escape the catch below and take the process with it.
+            if (!IrohProxy.isNativeLoaded()) return@launch
+            try {
+                IrohProxy.nativeDestroy()
+            } catch (e: Exception) {
+                Log.e(TAG, "nativeDestroy failed: ${e.message}")
+            }
         }
     }
 

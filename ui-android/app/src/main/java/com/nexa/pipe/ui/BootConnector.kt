@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.VpnService
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.vpn.NexaVpnService
+import kotlinx.coroutines.CancellationException
 
 /**
  * Brings the tunnel back after the machine has been restarted.
@@ -54,19 +55,61 @@ object BootConnector {
         configured.filter { it.enrollment == null }
 
     /**
+     * What a boot attempt did.
+     *
+     * The distinction that matters is not whether the tunnel came up, but
+     * whether the attempt touched the native side at all: the iroh endpoint
+     * and the endpoint group are process-global, so a teardown that runs for
+     * an attempt that started nothing takes down whatever else is running in
+     * the process — a session the user is using, for one.
+     */
+    sealed interface BootOutcome {
+
+        /**
+         * The attempt never touched the native side.
+         *
+         * Nothing was wanted, or nothing was available to connect to. There
+         * is nothing left behind, and nothing that may be taken down.
+         */
+        data object Skipped : BootOutcome
+
+        /**
+         * The attempt failed after it may have brought the native side up.
+         *
+         * The cause travels with it, because the reason is what the user
+         * needs.
+         */
+        data class Failed(val cause: Throwable) : BootOutcome
+
+        /**
+         * The proxy is up and the service was asked to establish the tunnel.
+         */
+        data object Established : BootOutcome
+
+        /**
+         * Whether the native side has to be taken down because of this.
+         *
+         * Only a failure does: it is the one outcome that can have brought
+         * the native side up and not kept it.
+         */
+        val needsNativeRelease: Boolean
+            get() = this is Failed
+    }
+
+    /**
      * Connects, if the user asked for it.
      *
-     * Returns whether the sequence ran and the service was asked to establish
-     * the tunnel. The tunnel itself is the service's to establish, and it does
-     * that after this returns, so a `true` here is not yet a tunnel. Every path
-     * that does not bring one up says why on the way out, because "the tunnel
-     * did not come back" on its own is a question the user cannot answer.
+     * Returns what the attempt did. The tunnel itself is the service's to
+     * establish, and it does that after this returns, so
+     * [BootOutcome.Established] is not yet a tunnel. Every path that does not
+     * bring one up says why on the way out, because "the tunnel did not come
+     * back" on its own is a question the user cannot answer.
      */
-    suspend fun connectIfWanted(context: Context, log: (String) -> Unit): Boolean {
+    suspend fun connectIfWanted(context: Context, log: (String) -> Unit): BootOutcome {
         val settings = SettingsManager(context)
         if (!settings.autoConnectOnBoot()) {
             log("boot: the tunnel was not asked to come back")
-            return false
+            return BootOutcome.Skipped
         }
 
         // Android does not promise that the permission a VPN app was given
@@ -76,14 +119,14 @@ object BootConnector {
         if (VpnService.prepare(context) != null) {
             log("boot: the VPN permission has to be granted again before the tunnel can come back")
             settings.saveVpnConsentMissing(true)
-            return false
+            return BootOutcome.Skipped
         }
         settings.saveVpnConsentMissing(false)
 
         val configured = settings.loadNodes()
         if (configured.isEmpty()) {
             log("boot: no endpoint is configured, so there is nothing to connect to")
-            return false
+            return BootOutcome.Skipped
         }
 
         // An endpoint that is still waiting to be enrolled is left out: the
@@ -93,7 +136,7 @@ object BootConnector {
         val endpoints = endpointsUsableAtBoot(configured)
         if (endpoints.isEmpty()) {
             log("boot: every endpoint is still waiting to be enrolled, which a boot cannot do")
-            return false
+            return BootOutcome.Skipped
         }
         if (endpoints.size != configured.size) {
             log("boot: ${configured.size - endpoints.size} endpoint(s) left out, still waiting to be enrolled")
@@ -123,24 +166,39 @@ object BootConnector {
             }
         )
 
-        // Throws when the attempt cannot be made; the caller decides what to do
-        // about it. The sequence is the same one the screen runs, so a tunnel
-        // brought up here is built exactly like one the user asked for.
-        connector.prepare(context, plan)
-        log("boot: the proxy is up; asking the service to establish the tunnel")
+        // The sequence throws when the attempt cannot be made, and the attempt
+        // is the same one the screen runs, so a tunnel brought up here is
+        // built exactly like one the user asked for.
+        //
+        // It is caught here rather than by the caller, because from here on
+        // the native side may be up: the sequence brings the iroh endpoint
+        // and the endpoint group up, and a failure after that leaves them
+        // behind. The caller has to be told that they are there.
+        return try {
+            connector.prepare(context, plan)
+            log("boot: the proxy is up; asking the service to establish the tunnel")
 
-        // The service is what holds the TUN and the notification; the sequence
-        // above only brought the proxy up behind it.
-        val domains = endpoints.flatMap { it.domains }.distinct()
-        val intent = Intent(context, NexaVpnService::class.java).apply {
-            action = NexaVpnService.ACTION_START
-            putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(domains))
-            // Carried through to the service: it is the only thing that lets
-            // establish() past its own guard. A boot never carries it — see
-            // the note about taking the slot at the top of this file.
-            putExtra(NexaVpnService.EXTRA_ALLOW_TAKEOVER, false)
+            // The service is what holds the TUN and the notification; the
+            // sequence above only brought the proxy up behind it.
+            val domains = endpoints.flatMap { it.domains }.distinct()
+            val intent = Intent(context, NexaVpnService::class.java).apply {
+                action = NexaVpnService.ACTION_START
+                putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(domains))
+                // Carried through to the service: it is the only thing that lets
+                // establish() past its own guard. A boot never carries it — see
+                // the note about taking the slot at the top of this file.
+                putExtra(NexaVpnService.EXTRA_ALLOW_TAKEOVER, false)
+            }
+            context.startForegroundService(intent)
+            BootOutcome.Established
+        } catch (e: CancellationException) {
+            // A cancelled attempt is not a failed attempt: the service is
+            // going away, and that is not a reason to report a failure that
+            // never happened — nor to take the native side down on the way
+            // out.
+            throw e
+        } catch (e: Exception) {
+            BootOutcome.Failed(e)
         }
-        context.startForegroundService(intent)
-        return true
     }
 }

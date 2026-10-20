@@ -254,6 +254,15 @@ class ProxyConnector(private val log: ConnectionLog) {
      * connection: the settings page has a button that does exactly that.
      */
     suspend fun ensureIrohStarted(alreadyStarted: Boolean): Boolean {
+        // The native library may not be there at all: the call below raises an
+        // UnsatisfiedLinkError, which is an Error and not an Exception, so it
+        // would escape the caller's `catch (e: Exception)` and take the
+        // process down with it. prepare() checks this too, but this is public
+        // and the screen can reach it on its own — without a connection
+        // behind it — so the check has to be here as well.
+        if (!IrohProxy.isNativeLoaded()) {
+            throw Exception(AppStrings.get(R.string.error_native_library))
+        }
         if (alreadyStarted) return false
         log.log("Starting iroh first...")
         val id = IrohProxy.nativeStartIroh()

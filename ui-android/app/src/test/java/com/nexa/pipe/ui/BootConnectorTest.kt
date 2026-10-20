@@ -1,6 +1,7 @@
 package com.nexa.pipe.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -56,5 +57,16 @@ class BootConnectorTest {
         )
 
         assertTrue(BootConnector.endpointsUsableAtBoot(listOf(waiting)).isEmpty())
+    }
+
+    @Test
+    fun only_a_failed_attempt_leaves_the_native_side_to_be_taken_down() {
+        // The native side is process-global: a teardown that runs for an
+        // attempt that started nothing takes down whatever else is running in
+        // the process — a session the user is using, for one. Only a failure
+        // can have brought the native side up and not kept it.
+        assertFalse(BootConnector.BootOutcome.Skipped.needsNativeRelease)
+        assertFalse(BootConnector.BootOutcome.Established.needsNativeRelease)
+        assertTrue(BootConnector.BootOutcome.Failed(Exception("no network")).needsNativeRelease)
     }
 }
