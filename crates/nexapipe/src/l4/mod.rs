@@ -207,14 +207,19 @@ where
     // A client whose allowlist does not name this host is refused exactly the
     // way an unconfigured one is — `NoRoute`, not a distinct status, so the
     // answer cannot be used to probe which hosts exist behind the tunnel.
+    //
+    // The port is checked here too, and for the same reason: a tunnel preface
+    // names the port the client wants, so it is a port this client may or may
+    // not reach.
     if let Some(acl) = acl
-        && !acl.allows(&preface.host)
+        && !acl.allows_target(&preface.host, preface.port)
     {
         let _ = write_status(&mut stream, Status::NoRoute).await;
         tracing::warn!(
-            "L4 {}: host {} is not allowed for this client, closing",
+            "L4 {}: {}:{} is not allowed for this client, closing",
             preface.proto.name(),
-            preface.host
+            preface.host,
+            preface.port
         );
         return Ok(());
     }
@@ -890,6 +895,42 @@ mod tests {
         // The route exists and its backend would answer; only the ACL refuses.
         let config = config_with("127.0.0.1:1", "127.0.0.1:1");
         let acl = ClientAcl::from_hosts(Some(&["elsewhere.test".to_string()]));
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                Some(&acl),
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Tcp, "db.test", 5432))
+            .await
+            .unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::NoRoute);
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    /// A client whose port list does not name the port it asked for is refused
+    /// the same way one asking for an off-list host is: `NoRoute`, not a
+    /// distinct status, so the answer cannot be used to probe which ports are
+    /// open behind the tunnel.
+    #[tokio::test]
+    async fn a_port_off_the_clients_port_list_answers_no_route() {
+        use crate::auth::ClientAcl;
+
+        // The route exists and its backend would answer; only the ACL refuses.
+        let config = config_with("127.0.0.1:1", "127.0.0.1:1");
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
             serve_stream(

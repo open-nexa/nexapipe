@@ -1682,8 +1682,10 @@ question:
   connection's nonce followed by its timestamp in little-endian bytes, keyed by
   the client's secret — or an Ed25519 signature over those same bytes, for a
   device registered with a public key.
-- `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
-  at the handshake.
+- `allow_hosts` and `allow_ports` — *what may it touch once it is here*, folded
+  into a `ClientAcl` at the handshake: which names it may reach, and which
+  services on them. A host is a name; a port is a service on that name, and a
+  client that may have the name does not automatically get every service on it.
 
 The limits that remain are deliberate: a revocation (a deleted client, a rotated
 secret, an edited `allow_hosts`) takes effect on *new* connections only, because

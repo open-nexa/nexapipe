@@ -35,17 +35,37 @@ pub(crate) fn normalize_host(host: &str) -> String {
 /// and every request to it 404s. A bracketed literal keeps its brackets here;
 /// [`normalize_host`] drops them.
 pub(crate) fn host_without_port(host: &str) -> &str {
+    host_and_port(host).0
+}
+
+/// The host a `Host` header names, and the port it names if it names one.
+///
+/// The port is `None` when the header names none: the request did not say
+/// which port it wanted, and the proxy routes by host alone, so there is no
+/// port to hold against the client that asked.
+///
+/// Split off the same way [`host_without_port`] takes the port off, so the two
+/// cannot disagree about where the host ends.
+pub(crate) fn host_and_port(host: &str) -> (&str, Option<u16>) {
     if host.starts_with('[') {
         match host.find(']') {
             // Up to and including the closing bracket: a port can only follow
             // it, and the colons inside belong to the address.
-            Some(end) => &host[..=end],
+            Some(end) => {
+                let port = host[end + 1..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse().ok());
+                (&host[..=end], port)
+            }
             // A bracket that is never closed is not a port separator, so
             // nothing is taken off.
-            None => host,
+            None => (host, None),
         }
     } else {
-        host.split(':').next().unwrap_or(host)
+        match host.split_once(':') {
+            Some((name, port)) => (name, port.parse().ok()),
+            None => (host, None),
+        }
     }
 }
 
@@ -615,7 +635,7 @@ impl RouteConfig {
     /// [`BackendLookup::NoRoute`] with `404` and [`BackendLookup::Unavailable`]
     /// with `503` — see the enum for why the two are not one answer.
     pub async fn get_backend(&self, host: &str, path: &str) -> BackendLookup<BackendInfo> {
-        self.get_backend_with_acl(host, path, None).await
+        self.get_backend_with_acl(host, path, None, None).await
     }
 
     /// [`Self::get_backend`], preferring a backend that is not on the list.
@@ -629,23 +649,28 @@ impl RouteConfig {
         path: &str,
         exclude: &[String],
     ) -> BackendLookup<BackendInfo> {
-        self.get_backend_with_acl_excluding(host, path, None, exclude)
+        self.get_backend_with_acl_excluding(host, path, None, None, exclude)
             .await
     }
 
-    /// [`Self::get_backend`] under a client's host authorization.
+    /// [`Self::get_backend`] under a client's authorization.
     ///
     /// One rule beyond the plain lookup: a host the ACL does not list is
-    /// refused before any route is consulted, and the refusal is
-    /// indistinguishable from "no route" — a 404, not a 403, so a client cannot
-    /// use the difference to probe which hosts exist behind the proxy.
+    /// refused before any route is consulted, and so is a port the ACL does
+    /// list — the refusal is indistinguishable from "no route" — a 404, not a
+    /// 403, so a client cannot use the difference to probe which hosts exist
+    /// behind the proxy.
+    ///
+    /// [port] is the port the client named, if it named one. `None` means it
+    /// named none, and there is then no port to hold against it.
     pub async fn get_backend_with_acl(
         &self,
         host: &str,
         path: &str,
+        port: Option<u16>,
         acl: Option<&ClientAcl>,
     ) -> BackendLookup<BackendInfo> {
-        self.get_backend_with_acl_excluding(host, path, acl, &[])
+        self.get_backend_with_acl_excluding(host, path, port, acl, &[])
             .await
     }
 
@@ -655,11 +680,21 @@ impl RouteConfig {
         &self,
         host: &str,
         path: &str,
+        port: Option<u16>,
         acl: Option<&ClientAcl>,
         exclude: &[String],
     ) -> BackendLookup<BackendInfo> {
         if acl.is_some_and(|acl| !acl.allows(host)) {
             tracing::debug!("Host {host} is not allowed for this client, answering 404");
+            return BackendLookup::NoRoute;
+        }
+
+        // The port half of the same question. Only asked when the client named
+        // one: a request that names no port has no port to hold against it.
+        if let (Some(acl), Some(port)) = (acl, port)
+            && !acl.allows_port(port)
+        {
+            tracing::debug!("Port {port} is not allowed for this client, answering 404");
             return BackendLookup::NoRoute;
         }
 
@@ -1495,7 +1530,7 @@ mod tests {
         // The allowed host reaches its own route.
         assert_eq!(
             config
-                .get_backend_with_acl("api.iakl.top", "/", Some(&acl))
+                .get_backend_with_acl("api.iakl.top", "/", None, Some(&acl))
                 .await
                 .backend()
                 .expect("an allowed host reaches its route")
@@ -1505,7 +1540,7 @@ mod tests {
         // A routed host the allowlist never named is refused, not served.
         assert!(
             config
-                .get_backend_with_acl("admin.iakl.top", "/", Some(&acl))
+                .get_backend_with_acl("admin.iakl.top", "/", None, Some(&acl))
                 .await
                 .is_no_route()
         );
@@ -1513,7 +1548,7 @@ mod tests {
         // route for a host the server does not serve.
         assert!(
             config
-                .get_backend_with_acl("typo.iakl.top", "/", Some(&acl))
+                .get_backend_with_acl("typo.iakl.top", "/", None, Some(&acl))
                 .await
                 .is_no_route()
         );
@@ -1540,7 +1575,7 @@ mod tests {
         ]));
         assert_eq!(
             config
-                .get_backend_with_acl("other.iakl.top", "/", Some(&acl))
+                .get_backend_with_acl("other.iakl.top", "/", None, Some(&acl))
                 .await
                 .backend()
                 .expect("the allowlist names this host")
@@ -1553,7 +1588,7 @@ mod tests {
         let narrow = ClientAcl::from_hosts(Some(&["api.iakl.top".to_string()]));
         assert!(
             config
-                .get_backend_with_acl("other.iakl.top", "/", Some(&narrow))
+                .get_backend_with_acl("other.iakl.top", "/", None, Some(&narrow))
                 .await
                 .is_no_route()
         );
@@ -1960,6 +1995,100 @@ mod tests {
                 .await
                 .backend()
                 .expect("the literal host reaches the route")
+                .url,
+            "http://10.0.0.5:8080"
+        );
+    }
+    /// The port a `Host` header names, and the host it names beside it.
+    ///
+    /// The two are split the same way for every shape: an IPv6 literal keeps
+    /// its brackets, and a header that names no port says so rather than
+    /// guessing one.
+    #[test]
+    fn a_host_header_is_split_into_its_host_and_its_port() {
+        assert_eq!(host_and_port("api.example.com"), ("api.example.com", None));
+        assert_eq!(
+            host_and_port("api.example.com:8443"),
+            ("api.example.com", Some(8443))
+        );
+        assert_eq!(
+            host_and_port("[::1]:8080"),
+            ("[::1]", Some(8080)),
+            "the brackets belong to the address and the port follows them"
+        );
+        assert_eq!(
+            host_and_port("[::1]"),
+            ("[::1]", None),
+            "a literal with no port names no port"
+        );
+        assert_eq!(
+            host_and_port("api.example.com:not-a-port"),
+            ("api.example.com", None),
+            "a port that does not parse is not a port"
+        );
+    }
+
+    /// The host and the port are taken apart by one rule, so the two cannot
+    /// disagree about where the host ends.
+    #[test]
+    fn the_host_is_the_same_whether_or_not_the_port_is_read() {
+        for header in [
+            "api.example.com",
+            "api.example.com:8443",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert_eq!(
+                host_without_port(header),
+                host_and_port(header).0,
+                "{header} splits one way"
+            );
+        }
+    }
+
+    /// A client that may reach a host on one port only is refused the other,
+    /// and the refusal is the same 404 a host it may not reach gets — so the
+    /// difference cannot be used to probe what exists.
+    #[tokio::test]
+    async fn a_port_the_acl_does_not_list_is_refused_the_way_a_host_is() {
+        use crate::auth::ClientAcl;
+
+        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
+
+        assert_eq!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", Some(443), Some(&acl))
+                .await
+                .backend()
+                .expect("the port is on the list")
+                .url,
+            "http://10.0.0.5:8080"
+        );
+        assert!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", Some(8443), Some(&acl))
+                .await
+                .is_no_route(),
+            "a port the list does not name is refused"
+        );
+    }
+
+    /// A request that names no port has no port to hold against the client:
+    /// the proxy routes by host and ignores the port otherwise.
+    #[tokio::test]
+    async fn a_request_that_names_no_port_is_not_held_against_the_port_list() {
+        use crate::auth::ClientAcl;
+
+        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
+
+        assert_eq!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", None, Some(&acl))
+                .await
+                .backend()
+                .expect("no port was named, so none is refused")
                 .url,
             "http://10.0.0.5:8080"
         );

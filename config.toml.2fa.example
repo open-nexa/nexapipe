@@ -186,6 +186,14 @@ created_at = "1723756800"
 # refusals look exactly like "no route" (404 / NoRoute / hang-up), so the
 # restriction cannot be used to probe which hosts exist.
 # allow_hosts = ["api.example.com", "*.db.example.com"]
+# The same question asked of ports rather than of names: a host is a name, a
+# port is a service on that name, and a client that may have the name does not
+# automatically get every service on it. Left unset, the client may reach
+# every port (the default). An empty list means "may connect, may reach
+# nothing". Checked where the client names a port — the tunnel preface always
+# does, and an HTTP request's Host header may — and a request that names no
+# port is not checked, because there is no port to hold against it.
+# allow_ports = [443, 8443]
 # The server also writes `failed_attempts`, `locked_until` and `last_used` back
 # into a client that has failed a handshake, so a lockout survives a restart.
 # Nothing to configure; and `pending_enrollment`, written by the enrollment

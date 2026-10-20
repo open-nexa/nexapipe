@@ -128,6 +128,22 @@ pub struct ClientAuth {
     /// connect and nothing else", not "no restriction".
     #[serde(default)]
     pub allow_hosts: Option<Vec<String>>,
+    /// Ports this client may reach; `None` means every port.
+    ///
+    /// The other half of `allow_hosts`, and it answers a question the host
+    /// list cannot: a host that serves three services on three ports is one
+    /// name and three things to reach, and a client that may have the name
+    /// does not automatically get all three.
+    ///
+    /// Checked where the client names a port: the tunnel preface carries one,
+    /// and an HTTP request's `Host` header may. A request that names no port
+    /// is not checked — the proxy routes by host and ignores the port
+    /// otherwise, so there is no port to hold against it.
+    ///
+    /// An empty list denies every port: `allow_ports = []` is "this client may
+    /// connect and reach nothing", not "no restriction".
+    #[serde(default)]
+    pub allow_ports: Option<Vec<u16>>,
     /// A one-time enrollment token waiting to be exchanged for a new secret.
     ///
     /// `None` means no enrollment is outstanding, so a client with no token
@@ -191,6 +207,7 @@ impl std::fmt::Debug for ClientAuth {
             .field("secret", &"<redacted>")
             .field("created_at", &self.created_at)
             .field("allow_hosts", &self.allow_hosts)
+            .field("allow_ports", &self.allow_ports)
             .field(
                 "pending_enrollment",
                 &crate::config::redacted(&self.pending_enrollment),
@@ -312,6 +329,7 @@ impl AuthConfig {
                             secret: SecretString::default(),
                             created_at: String::new(),
                             allow_hosts: None,
+                            allow_ports: None,
                             pending_enrollment: None,
                             // Names and stamps only. A snapshot exists so a
                             // wrong code does not copy a credential, and every
@@ -479,7 +497,7 @@ impl ClientAuth {
     /// removes the client — or its `allow_hosts` — does not change what a
     /// connection already holding its credentials may reach.
     pub fn acl(&self) -> ClientAcl {
-        ClientAcl::from_hosts(self.allow_hosts.as_deref())
+        ClientAcl::from_hosts_and_ports(self.allow_hosts.as_deref(), self.allow_ports.as_deref())
     }
 }
 
@@ -495,12 +513,18 @@ pub fn generate_enrollment_token() -> String {
     hex::encode(bytes)
 }
 
-/// Which hosts one authenticated client may reach.
+/// Which hosts, and which ports, one authenticated client may reach.
 ///
 /// 2FA answers *who* may connect; this answers *what they may touch once they
 /// have*. Without it, one client's secret is a key to every route and every
-/// backend, so a single leaked enrollment is a full-backend compromise. A
-/// client with no `allow_hosts` is [`ClientAcl::Unrestricted`] — the historical
+/// backend, so a single leaked enrollment is a full-backend compromise.
+///
+/// The two questions are separate because they answer different things. A host
+/// is a name; a port is a service on that name, and a client that may have
+/// the name does not automatically get every service on it. `allow_hosts` says
+/// which names, `allow_ports` says which services.
+///
+/// A client with neither configured is unrestricted — the historical
 /// behaviour, kept as the default so existing configs mean what they meant.
 ///
 /// The patterns are folded and matched by the same rules a route's
@@ -510,40 +534,91 @@ pub fn generate_enrollment_token() -> String {
 /// A denial is always reported to the client the way "no route" is — 404,
 /// `Status::NoRoute`, or a hang-up — never a 403, which would confirm to a
 /// compromised client that the host it asked for exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientAcl {
-    /// No `allow_hosts` configured: every route is fair game.
-    Unrestricted,
-    /// Only hosts matching one of these folded patterns.
-    Restricted(Vec<String>),
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientAcl {
+    /// The folded host patterns. `None` means every host.
+    hosts: Option<Vec<String>>,
+    /// The ports this client may reach. `None` means every port.
+    ports: Option<Vec<u16>>,
 }
 
 impl ClientAcl {
+    /// An ACL that permits everything.
+    ///
+    /// The same as the default, and named because "the default" says where the
+    /// value came from rather than what it means.
+    pub fn unrestricted() -> Self {
+        ClientAcl::default()
+    }
+
     /// Folds `hosts` into an ACL. `None` is unrestricted; an empty list
     /// restricts to nothing.
     pub fn from_hosts(hosts: Option<&[String]>) -> Self {
-        match hosts {
-            None => ClientAcl::Unrestricted,
-            Some(hosts) => ClientAcl::Restricted(
+        ClientAcl::from_hosts_and_ports(hosts, None)
+    }
+
+    /// Folds `hosts` and `ports` into an ACL.
+    ///
+    /// `None` for either is unrestricted on that axis; an empty list
+    /// restricts to nothing on it. The two are independent: a client may be
+    /// limited to one host and every port, or every host and one port.
+    pub fn from_hosts_and_ports(hosts: Option<&[String]>, ports: Option<&[u16]>) -> Self {
+        ClientAcl {
+            hosts: hosts.map(|hosts| {
                 hosts
                     .iter()
                     .map(|h| crate::routes::normalize_host(h))
-                    .collect(),
-            ),
+                    .collect()
+            }),
+            ports: ports.map(|ports| ports.to_vec()),
         }
     }
 
     /// Whether `host` may be reached by a client governed by this ACL.
+    ///
+    /// The host half on its own: what a route lookup asks, where the port is
+    /// not the client's to choose.
     pub fn allows(&self, host: &str) -> bool {
-        match self {
-            ClientAcl::Unrestricted => true,
-            ClientAcl::Restricted(patterns) => {
+        match &self.hosts {
+            None => true,
+            Some(patterns) => {
                 let host = crate::routes::normalize_host(host);
                 patterns
                     .iter()
                     .any(|pattern| crate::routes::host_matches(pattern, &host))
             }
         }
+    }
+
+    /// Whether this client may reach `port`.
+    ///
+    /// The port half on its own, for the places that have a port and no host:
+    /// a tunnel preface names both, but a check that only knows the port
+    /// still has to be able to ask about it.
+    pub fn allows_port(&self, port: u16) -> bool {
+        match &self.ports {
+            None => true,
+            Some(ports) => ports.contains(&port),
+        }
+    }
+
+    /// Whether `host` on `port` may be reached by a client governed by this
+    /// ACL.
+    ///
+    /// Both halves have to say yes. A port the client named and the ACL does
+    /// not list is a refusal, and it is refused the same way a host is: as
+    /// "no route", so the difference cannot be used to probe what exists.
+    pub fn allows_target(&self, host: &str, port: u16) -> bool {
+        self.allows(host) && self.allows_port(port)
+    }
+
+    /// Whether this ACL says anything about ports at all.
+    ///
+    /// A client with no `allow_ports` is not limited by one, and a place that
+    /// has no port to check — a TLS passthrough, where the route picks the
+    /// port and the client never names one — asks this rather than guessing.
+    pub fn limits_ports(&self) -> bool {
+        self.ports.is_some()
     }
 }
 
@@ -556,6 +631,7 @@ mod tests {
             secret: SecretString::default(),
             created_at: "0".to_string(),
             allow_hosts: None,
+            allow_ports: None,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
@@ -695,9 +771,9 @@ mod tests {
     #[test]
     fn an_absent_allow_hosts_leaves_a_client_unrestricted() {
         let acl = ClientAcl::from_hosts(None);
-        assert_eq!(acl, ClientAcl::Unrestricted);
+        assert_eq!(acl, ClientAcl::unrestricted());
         assert!(acl.allows("anything.test"));
-        assert_eq!(client().acl(), ClientAcl::Unrestricted);
+        assert_eq!(client().acl(), ClientAcl::unrestricted());
     }
 
     /// The patterns mean what a route's `host_pattern` means: exact or
@@ -732,6 +808,79 @@ mod tests {
         let acl = ClientAcl::from_hosts(Some(&[]));
         assert!(!acl.allows("api.example.com"));
         assert!(!acl.allows("anything.test"));
+    }
+
+    /// A client with no `allow_ports` keeps the historical reach: every port.
+    /// The port list is new, and a config that does not mention it must mean
+    /// what it meant before it existed.
+    #[test]
+    fn an_absent_allow_ports_leaves_a_client_unrestricted() {
+        let acl = ClientAcl::from_hosts_and_ports(None, None);
+        assert!(acl.allows_port(443));
+        assert!(acl.allows_port(1));
+        assert!(
+            !acl.limits_ports(),
+            "a client with no port list is not limited by one"
+        );
+    }
+
+    /// The port list is a list, and a port that is not on it is refused.
+    #[test]
+    fn an_allow_ports_list_limits_the_ports_a_client_may_reach() {
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443, 8443]));
+
+        assert!(acl.allows_port(443));
+        assert!(acl.allows_port(8443));
+        assert!(
+            !acl.allows_port(22),
+            "a port the list does not name is not reachable"
+        );
+        assert!(acl.limits_ports());
+    }
+
+    /// `allow_ports = []` is "may connect, may reach nothing", not "no
+    /// restriction" — the same reading `allow_hosts = []` has.
+    #[test]
+    fn an_empty_allow_ports_denies_every_port() {
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[]));
+        assert!(!acl.allows_port(443));
+        assert!(!acl.allows_port(80));
+    }
+
+    /// The two halves answer different questions and neither replaces the
+    /// other: a client may have the host and not the port, or the port and not
+    /// the host.
+    #[test]
+    fn the_host_and_the_port_are_independent() {
+        let acl =
+            ClientAcl::from_hosts_and_ports(Some(&["api.example.com".to_string()]), Some(&[443]));
+
+        assert!(
+            acl.allows_target("api.example.com", 443),
+            "the host and the port are both named"
+        );
+        assert!(
+            !acl.allows_target("api.example.com", 8443),
+            "the host is named but the port is not"
+        );
+        assert!(
+            !acl.allows_target("admin.example.com", 443),
+            "the port is named but the host is not"
+        );
+    }
+
+    /// A client that names no port has no port to hold against it: the proxy
+    /// routes by host and ignores the port otherwise, so there is nothing to
+    /// refuse.
+    #[test]
+    fn a_port_the_client_did_not_name_is_not_checked() {
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
+
+        assert!(acl.allows("anything.test"));
+        assert!(
+            !acl.allows_port(80),
+            "the list still refuses a port that is named"
+        );
     }
 
     /// The patterns themselves are folded, so a config written with uppercase

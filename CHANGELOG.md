@@ -128,6 +128,24 @@ its defaults — which are on.
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
 
+- **`allow_ports` limits a client to the services it may reach.** `allow_hosts`
+  says which *names* a client may reach, and a name is not a service: a host
+  that answers on three ports is one name and three things to reach, so a
+  client that may have the name does not automatically get all three. The new
+  key is the other half of the same question — `allow_ports = [443, 8443]` —
+  and the two are independent: a client may be limited to one host and every
+  port, or every host and one port.
+  Checked where the client names a port. The tunnel preface always names one,
+  and an HTTP request's `Host` header may; a request that names no port is not
+  checked, because the proxy routes by host and ignores the port otherwise, so
+  there is no port to hold against it. A TLS passthrough is not checked either:
+  the route picks the port and the client never names one.
+  A refusal looks exactly like "no route" — a 404, a `NoRoute`, a hang-up —
+  so it cannot be used to probe what is open behind the proxy. Left unset, a
+  client keeps the reach it had; an empty list means "may connect, may reach
+  nothing", the same reading `allow_hosts = []` has. A port of zero is refused
+  at startup, because no client ever asks for it.
+
 ### Changed
 
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which

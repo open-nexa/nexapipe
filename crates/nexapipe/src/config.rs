@@ -1683,6 +1683,12 @@ pub struct ClientAuthToml {
     /// into the client's [`crate::auth::ClientAcl`] when a connection
     /// authenticates.
     pub allow_hosts: Option<Vec<String>>,
+    /// Ports this client may reach; `None` means every port.
+    ///
+    /// The other half of `allow_hosts`: a host is a name, a port is a service
+    /// on that name, and a client that may have the name does not
+    /// automatically get every service on it.
+    pub allow_ports: Option<Vec<u16>>,
     /// A one-time enrollment token outstanding for this client, written by
     /// `--generate-invite --registration` and cleared by whoever spends it. Not
     /// written back by `save_auth_state`: it belongs to the operator, not to
@@ -1830,6 +1836,18 @@ impl ProxyConfig {
                                     );
                                 }
                             }
+                            // A port of zero is not a port a client can ask
+                            // for: no flow arrives from it and no request names
+                            // it, so an entry that lists it authorizes nothing
+                            // and looks like it authorizes something.
+                            if let Some(ports) = &client_toml.allow_ports
+                                && ports.contains(&0)
+                            {
+                                anyhow::bail!(
+                                    "[auth.clients.{id}]: allow_ports contains port 0; no client \
+                                     ever asks for it, so that entry can never match"
+                                );
+                            }
                             // A name in this table is a credential's whole
                             // identity: it is what the device sends, what the
                             // log line for every outcome carries, and what an
@@ -1914,6 +1932,7 @@ impl ProxyConfig {
                                         .created_at
                                         .unwrap_or_else(crate::auth::config::default_created_at),
                                     allow_hosts: client_toml.allow_hosts,
+                                    allow_ports: client_toml.allow_ports,
                                     pending_enrollment: client_toml.pending_enrollment,
                                     devices,
                                     unnamed_device_allowed: client_toml
