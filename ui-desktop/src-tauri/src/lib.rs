@@ -1881,9 +1881,14 @@ pub fn run() {
             // tray on purpose, and a window appearing over whatever the user
             // was doing at login is exactly what it was meant to avoid.
             //
+            // Unless there is no tray to come up in. The tray is built on a
+            // best-effort basis and can fail — a bare session, a container, a
+            // Linux host without a StatusNotifier — and an app with no window
+            // and no tray icon is an app nobody can reach again.
+            //
             // Best effort on every platform, and deliberately not fatal: a build with no
             // window to show must still start.
-            if !autostart::is_background_launch() {
+            if !autostart::is_background_launch() || !TRAY_AVAILABLE.load(Ordering::Relaxed) {
                 if let Some(window) = app.get_webview_window("main") {
                     let handle = window.clone();
                     tauri::async_runtime::spawn(async move {

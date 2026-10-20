@@ -110,7 +110,12 @@ async function showWindow(): Promise<void> {
     // appearing over whatever the user was doing at login is exactly what the
     // background flag exists to prevent. The backend's own fallback knows the
     // same thing and does not show it either.
-    if (await isBackgroundLaunch()) {
+    //
+    // Unless there is no tray to come up in. The tray is built on a best-effort
+    // basis and can fail — a bare session, a container, a Linux host without a
+    // StatusNotifier — and an app with no window and no tray icon is an app
+    // nobody can reach again.
+    if ((await isBackgroundLaunch()) && (await isTrayAvailable())) {
       mark('background');
       return;
     }
@@ -125,6 +130,20 @@ async function showWindow(): Promise<void> {
     console.warn('[window] could not show the window:', error);
   } finally {
     void flushStartupTiming();
+  }
+}
+
+/**
+ * Whether the tray icon exists.
+ *
+ * A failure is a "no": a tray that cannot be reached cannot be come back to,
+ * and the window has to be shown instead.
+ */
+async function isTrayAvailable(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('is_tray_available');
+  } catch {
+    return false;
   }
 }
 
