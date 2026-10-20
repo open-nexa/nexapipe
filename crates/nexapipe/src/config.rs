@@ -266,7 +266,8 @@ pub struct RouteConfig {
     /// when the backend port is the same one the client asked for.
     pub client_ports: Option<Vec<u16>>,
     /// `udp` routes: seconds of silence before a flow is closed. The server
-    /// default (`l4::DEFAULT_UDP_IDLE_TIMEOUT`) applies when this is absent.
+    /// default (`[timeouts] l4_idle_secs`, itself 60) applies when this is
+    /// absent.
     pub idle_timeout_secs: Option<u64>,
     /// `tcp` / `udp` routes: seconds one flow may run before it is closed. The
     /// server default (`deadline::DEFAULT_L4_FLOW_SECS`) applies when absent.
@@ -378,14 +379,28 @@ pub struct LogConfig {
     pub redact_query: Option<bool>,
 }
 
-/// The `[timeouts]` section: how long one round trip to a backend may take.
+/// The `[timeouts]` section: how long one round trip to a backend may take,
+/// and how long each phase of a proxied exchange may hold its slot.
 ///
-/// Deliberately not "how long a request may take". Every deadline here covers
-/// one step of talking to a backend — dialing it, or waiting for its answer —
-/// and none of them covers the request as a whole: once a response head
-/// arrives, streaming its body may run for as long as it needs to, on purpose,
-/// because "slow backend" is not the same failure as "silent backend". A
-/// timeout is here because its expiration is a diagnostic, not a quota.
+/// Two families of wait live here, and keeping them in one section is the point:
+/// they are all "a bound that expires as a diagnostic, not a quota", and a
+/// deployment that needs one of them raised usually needs to reason about the
+/// others beside it.
+///
+/// The first family covers one step of talking to a backend — dialing it, or
+/// waiting for its answer — and deliberately not the request as a whole: once
+/// a response head arrives, streaming its body may run for as long as it needs
+/// to, on purpose, because "slow backend" is not the same failure as "silent
+/// backend".
+///
+/// The second family bounds the phases of the exchange itself: how long a
+/// client may take to send its head and body, how long a streamed response may
+/// stay silent between chunks, how long an L4 flow may run and how idle a UDP
+/// flow may go, how long a TLS hello may take. See
+/// [`crate::deadline`] for which of these are phase deadlines — taken once and
+/// never renewed, which is what stops a one-byte trickle from holding a slot
+/// forever — and which are idle timeouts, correct only where the phase is
+/// meant to stay open.
 ///
 /// Every key is optional, and every default is the constant the server used
 /// before this section existed, so writing `[timeouts]` and nothing under it
@@ -416,6 +431,67 @@ pub struct TimeoutsConfig {
     /// answers, and what stops a backend that accepts the connection and then
     /// says nothing from holding the request slot until the client gives up.
     pub response_secs: Option<u64>,
+    /// Seconds a client may take to send its request head. Default: 30.
+    ///
+    /// A **phase deadline**, taken once when the head starts arriving: a client
+    /// that trickles one byte of `Host:` every few seconds holds a slot, a task
+    /// and a connection slot, and a per-read timeout is exactly what it wants.
+    /// This is the number that closes that. See [`crate::deadline`].
+    ///
+    /// It bounds the head, not the stream: the first byte says which protocol
+    /// the stream carries, and until it arrives the protocol is unknown, so the
+    /// wait for it is the longer of this and [`Self::tls_hello_secs`]. A short
+    /// `header_secs` therefore never cuts off a TLS session or an L4 tunnel —
+    /// neither of them sends a request head at all.
+    pub header_secs: Option<u64>,
+    /// Seconds a client may take to send a request body once the head is in.
+    /// Default: 300.
+    ///
+    /// A **phase deadline**, separate from the head because a large upload
+    /// legitimately takes longer than a header does; one budget for both would
+    /// be too short for uploads or too loose against a stalled one.
+    pub body_secs: Option<u64>,
+    /// Seconds a backend response body may stay silent before it is treated as
+    /// dead. Default: 120.
+    ///
+    /// **Idle, not a phase deadline**, and deliberately so: a streamed response
+    /// or a server-sent-events stream is supposed to be open for as long as the
+    /// two ends want. What must not be possible is a backend that sent the head
+    /// and then said nothing at all, so the bound is on the gap between chunks
+    /// and re-arms on every chunk by design.
+    ///
+    /// It applies to every path that proxies a response, the plaintext
+    /// listener included: there the body is handed to the client as it arrives,
+    /// and a backend that stalls mid-body fails the response rather than
+    /// truncating it quietly.
+    pub response_idle_secs: Option<u64>,
+    /// Seconds an L4 tunnel may run before it is closed. Default: 3600.
+    ///
+    /// A **phase deadline**, because an L4 flow has no protocol-level end: a
+    /// backend connection that never closes and never sends is indistinguishable
+    /// from one being used, and bounding the whole flow is what stops a peer
+    /// from renewing it indefinitely. Raise it for long-lived SSH or a database
+    /// session over the tunnel; a per-route [`crate::routes`] `flow_timeout_secs`
+    /// overrides it for one route alone.
+    pub l4_flow_secs: Option<u64>,
+    /// Seconds between two UDP datagrams in either direction before an L4 flow
+    /// is considered idle. Default: 60.
+    ///
+    /// **Idle**, because a UDP flow has no "complete" to wait for; this bounds
+    /// the gap, not the flow, and re-arming on every datagram is the correct
+    /// shape here.
+    pub l4_idle_secs: Option<u64>,
+    /// Seconds a TLS ClientHello may take to arrive. Default: 10.
+    ///
+    /// A **phase deadline**. The client sends the record header and then the
+    /// body of it; a peer that sends the five header bytes and nothing else
+    /// would otherwise hold the connection open indefinitely with no read
+    /// deadline at all.
+    ///
+    /// It also covers the wait for the session's first byte, on both
+    /// listeners: that byte is what says a TLS session is starting, so it
+    /// belongs to the hello rather than to the head.
+    pub tls_hello_secs: Option<u64>,
 }
 
 /// The `[timeouts]` section with every default filled in.
@@ -425,10 +501,16 @@ pub struct TimeoutsConfig {
 /// field of the config directly would put `.unwrap_or(TEN_SECONDS)` in every
 /// call site — three of them today — and one of them would eventually disagree
 /// with the others.
+///
+/// `deadlines` carries the per-phase budgets ([`crate::deadline::Deadlines`])
+/// resolved from the same section, so a handler that needs "how long may the
+/// client take to send its head" reads it off the `Timeouts` it was already
+/// handed rather than reaching the config itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub connect: std::time::Duration,
     pub response: std::time::Duration,
+    pub deadlines: crate::deadline::Deadlines,
 }
 
 impl Timeouts {
@@ -437,11 +519,20 @@ impl Timeouts {
     const DEFAULT_CONNECT: std::time::Duration = std::time::Duration::from_secs(10);
     const DEFAULT_RESPONSE: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// The longest wait either key accepts: an hour spent dialing, or waiting
-    /// for a status line, is not a slow backend but one that will never answer.
+    /// The longest wait either dial key accepts: an hour spent dialing, or
+    /// waiting for a status line, is not a slow backend but one that will never
+    /// answer.
     const MAX_SECS: u64 = 3600;
 
     pub fn resolve(config: TimeoutsConfig) -> Self {
+        let deadlines = crate::deadline::Deadlines::resolve(&crate::deadline::Overrides {
+            header_secs: config.header_secs,
+            body_secs: config.body_secs,
+            response_idle_secs: config.response_idle_secs,
+            l4_flow_secs: config.l4_flow_secs,
+            l4_idle_secs: config.l4_idle_secs,
+            tls_hello_secs: config.tls_hello_secs,
+        });
         Timeouts {
             connect: config
                 .connect_secs
@@ -449,6 +540,7 @@ impl Timeouts {
             response: config
                 .response_secs
                 .map_or(Self::DEFAULT_RESPONSE, std::time::Duration::from_secs),
+            deadlines,
         }
     }
 }
@@ -528,7 +620,8 @@ pub struct ProxyConfig {
     /// Probing of `http` backends. Absent means the defaults, i.e. enabled.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
-    /// How long to wait on a backend. Absent means the deadlines this section
+    /// How long to wait on a backend, and how long each phase of a proxied
+    /// exchange may hold its slot. Absent means the deadlines this section
     /// replaced, unchanged.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
@@ -685,13 +778,15 @@ impl ProxyConfig {
         Ok(())
     }
 
-    /// Every `[timeouts]` value is a wait for one step of talking to a backend,
-    /// and neither end of the range is a number anyone would dial: zero is a
-    /// deadline that expires before the round trip it is meant to bound, so
-    /// every request to every backend fails; anything past the ceiling is not a
+    /// Two families of wait live in `[timeouts]`: the two backend keys cover
+    /// one step of talking to a backend, and the six phase keys bound a phase
+    /// of the exchange itself. Neither end of either range is a number anyone
+    /// would dial: zero is a deadline that expires before the round trip (or
+    /// the phase) it is meant to bound; anything past the ceiling is not a
     /// longer wait but a missing one, and the symptom is a request slot held
     /// until the client gives up. Refused at load, where the operator is
-    /// looking, rather than discovered as "all requests fail 502".
+    /// looking, rather than discovered as "all requests fail 502" — or, for an
+    /// L4 flow, as a tunnel that closes the instant it opens.
     fn validate_timeouts(&self) -> anyhow::Result<()> {
         for (key, secs) in [
             ("connect_secs", self.timeouts.connect_secs),
@@ -713,6 +808,41 @@ impl ProxyConfig {
                      request slot held until the client gives up, which is the failure a timeout \
                      exists to prevent",
                     max = Timeouts::MAX_SECS
+                );
+            }
+        }
+
+        // The per-phase budgets take the ceiling from `crate::deadline`, not
+        // `Timeouts::MAX_SECS`: `l4_flow_secs` defaults to an hour and a
+        // long-lived tunnel is exactly the case an operator raises it for, so
+        // its ceiling is a day, not an hour. Zero is refused for the same reason
+        // as above, with a different reading — here zero does not fail every
+        // request, it closes every flow the instant it opens, which looks like a
+        // working server that transfers nothing.
+        for (key, secs) in [
+            ("header_secs", self.timeouts.header_secs),
+            ("body_secs", self.timeouts.body_secs),
+            ("response_idle_secs", self.timeouts.response_idle_secs),
+            ("l4_flow_secs", self.timeouts.l4_flow_secs),
+            ("l4_idle_secs", self.timeouts.l4_idle_secs),
+            ("tls_hello_secs", self.timeouts.tls_hello_secs),
+        ] {
+            let Some(secs) = secs else {
+                continue;
+            };
+            if secs == 0 {
+                anyhow::bail!(
+                    "[timeouts] {key} is 0: the phase it bounds would close the moment it \
+                     opens, and nothing would ever get through. It is a whole number of \
+                     seconds, and the shortest wait anyone asks for is 1"
+                );
+            }
+            if secs > crate::deadline::MAX_SECS {
+                anyhow::bail!(
+                    "[timeouts] {key} is {secs}s, past the {max}s ceiling: a bound that long \
+                     never fires within a process lifetime, which is the failure a timeout \
+                     exists to prevent",
+                    max = crate::deadline::MAX_SECS
                 );
             }
         }
@@ -3257,6 +3387,107 @@ backends = ["http://10.0.0.5:8080"]
         let error = config.build_routes().unwrap_err().to_string();
         assert!(
             error.contains("86400s"),
+            "the message has to quote the number it refused, got: {error}"
+        );
+    }
+
+    /// The per-phase budgets resolve into `Timeouts::deadlines` beside the dial
+    /// deadlines, each key answering for its own phase and the rest staying at
+    /// their defaults.
+    #[test]
+    fn a_phase_deadline_override_reaches_the_deadlines() {
+        let config = parse(
+            r#"
+[timeouts]
+body_secs = 60
+l4_flow_secs = 7200
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        config
+            .build_routes()
+            .expect("raising a phase deadline is not an error");
+        let deadlines = config.timeouts().deadlines;
+        assert_eq!(
+            deadlines.body,
+            std::time::Duration::from_secs(60),
+            "the one that was written"
+        );
+        assert_eq!(
+            deadlines.l4_flow,
+            std::time::Duration::from_secs(7200),
+            "raising an L4 flow past its one-hour default is the documented reason the key exists"
+        );
+        assert_eq!(
+            deadlines.header,
+            std::time::Duration::from_secs(crate::deadline::DEFAULT_HEADER_SECS),
+            "the one that was not written"
+        );
+        assert_eq!(
+            deadlines.response_idle,
+            std::time::Duration::from_secs(crate::deadline::DEFAULT_RESPONSE_IDLE_SECS)
+        );
+    }
+
+    /// Zero is refused on the phase budgets for the reason it is refused on the
+    /// dial ones, with a different reading: here it does not fail every request,
+    /// it closes every flow the instant it opens.
+    #[test]
+    fn build_routes_rejects_a_zero_phase_deadline() {
+        let config = parse(
+            r#"
+[timeouts]
+header_secs = 0
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+
+        let error = config.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("header_secs is 0"),
+            "the message has to name the key nobody can meet, got: {error}"
+        );
+    }
+
+    /// The phase budgets take their ceiling from `crate::deadline` (a day), not
+    /// from the dial keys (an hour): a long-lived tunnel is exactly the case
+    /// `l4_flow_secs` exists to be raised for, so a day must be accepted here
+    /// where `response_secs = 86400` is refused.
+    #[test]
+    fn a_phase_deadline_may_reach_a_day_but_no_further() {
+        let ok = parse(
+            r#"
+[timeouts]
+l4_flow_secs = 86400
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        ok.build_routes()
+            .expect("a day is the ceiling the deadline module itself enforces");
+
+        let over = parse(
+            r#"
+[timeouts]
+l4_flow_secs = 86401
+
+[[routes]]
+host_pattern = "app.iakl.top"
+backends = ["http://10.0.0.5:8080"]
+"#,
+        );
+        let error = over.build_routes().unwrap_err().to_string();
+        assert!(
+            error.contains("86401s"),
             "the message has to quote the number it refused, got: {error}"
         );
     }

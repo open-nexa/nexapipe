@@ -47,13 +47,11 @@ use tokio::net::{TcpStream, UdpSocket};
 
 /// How long a client may take to spell out a complete preface.
 ///
-/// Not `[timeouts]`: this waits on the client's own bytes, and every other wait
-/// in that section is a wait on a backend.
+/// A phase deadline, but not one of the six in [`crate::deadline`]: the preface
+/// is protocol mechanics on a stream that has already passed the handshake, and
+/// the audit's six timeout gaps did not include it. Kept here until it earns a
+/// key.
 const PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a UDP flow may sit idle before it is torn down, unless the route sets
-/// `idle_timeout_secs`. Kept well above a typical DNS or database keep-alive interval.
-pub const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Concurrent L4 flows allowed on one QUIC connection, unless the route says otherwise.
 ///
@@ -318,8 +316,10 @@ where
     let connect_timeout = config.timeouts().connect;
     // Both bounds are per route, and both have a server default: the idle one is
     // the gap between packets, the flow one is how long the flow may last. See
-    // `L4Options::flow_timeout` for why they are not the same number.
-    let deadlines = crate::deadline::Deadlines::default();
+    // `L4Options::flow_timeout` for why they are not the same number. The
+    // defaults come from `[timeouts]` (`l4_flow_secs`, `l4_idle_secs`) through
+    // the config the connection arrived under, not from here.
+    let deadlines = config.timeouts().deadlines;
     let result = match preface.proto {
         L4Proto::Tcp => {
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
@@ -333,7 +333,7 @@ where
             .await
         }
         L4Proto::Udp => {
-            let idle = route.idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT);
+            let idle = route.idle_timeout.unwrap_or(deadlines.l4_idle);
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
             serve_udp(stream, &route.backend, leftover, idle, flow_timeout).await
         }
@@ -995,6 +995,79 @@ mod tests {
 
         assert_eq!(read_status(&mut client_read).await, Status::NoRoute);
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_configured_udp_idle_deadline_closes_a_silent_flow() {
+        // The observation this test exists for: `l4_idle_secs` has to reach the
+        // flow it names, not merely parse. A key resolved into `Deadlines` and
+        // then read by nobody parses, validates and does nothing — which is
+        // exactly the shape this wiring arrived in, so the assertion is on the
+        // flow's lifetime, not on the config's arithmetic.
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = udp.recv_from(&mut buf).await else {
+                    return;
+                };
+                let _ = udp.send_to(&buf[..n], from).await;
+            }
+        });
+
+        // One second of silence closes the flow; the sixty-second default the
+        // key overrides would not, so a regression back to the constant fails
+        // this on its three-second outer bound.
+        let mut timeouts =
+            crate::config::Timeouts::resolve(crate::config::TimeoutsConfig::default());
+        timeouts.deadlines.l4_idle = Duration::from_secs(1);
+        let config = RouteConfig::with_timeouts(
+            vec![udp_route("turn.test", &udp_addr.to_string(), None)],
+            timeouts,
+        );
+
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Udp, "turn.test", 3478))
+            .await
+            .unwrap();
+        assert_eq!(read_status(&mut client_read).await, Status::Ok);
+
+        // One round trip proves the flow works, then the client goes silent.
+        client_write
+            .write_all(&encode_frame_to_vec(b"ping").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_udp_frame(&mut client_read).await, b"ping");
+
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut [0u8; 1]),
+        )
+        .await;
+        // EOF or an error both count as closed; only a hang fails.
+        assert!(
+            closed.is_ok(),
+            "the flow must close within the configured idle deadline"
+        );
+        assert!(task.await.unwrap().is_ok());
+        echo.abort();
     }
 
     #[tokio::test]
