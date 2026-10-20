@@ -1294,11 +1294,16 @@ impl ProxyConfig {
         }
 
         tracing::debug!("Config file exists, reading content");
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+        // The file can hold the 2FA secrets in the clear, so the text it lands
+        // in is wiped once the parse has copied them into the zeroizing fields
+        // it fills.
+        let content = SecretString::new(
+            fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?,
+        );
 
         tracing::debug!("Config content read successfully, parsing TOML");
-        let mut config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(content.expose_secret())
             .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
         config.resolve_external_credentials(path.parent())?;
 
@@ -2914,12 +2919,15 @@ fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
 /// (`check_credential_file_permissions`): this file *is* the credential now,
 /// so one another account can read or write refuses the load.
 fn read_credential_file(full: &Path, what: &str) -> anyhow::Result<Option<SecretString>> {
-    let content = match fs::read_to_string(full) {
+    // The file holds the credential in the clear, so the buffer it lands in is
+    // wiped when it goes out of scope: wrap the read before trimming, so the
+    // copy that outlives this function is the zeroizing one.
+    let content = SecretString::new(match fs::read_to_string(full) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => anyhow::bail!("cannot read the {what} file {}: {e}", full.display()),
-    };
-    let content = content.trim();
+    });
+    let content = content.expose_secret().trim();
     if content.is_empty() {
         anyhow::bail!(
             "{}: the {what} file holds nothing; write the credential into it and nothing else",

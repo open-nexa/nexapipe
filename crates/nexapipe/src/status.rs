@@ -72,7 +72,7 @@ pub async fn status(config_path: &str, json: bool) -> anyhow::Result<()> {
     // Every one, and all of them before anything is printed: a run that prints
     // three sections and then fails is a run whose output gets read as complete.
     for name in ["status", "routes", "clients", "connections", "health"] {
-        answers.push(get(&client, &base, name, &token).await?);
+        answers.push(get(&client, &base, name, token.expose_secret().as_str()).await?);
     }
 
     if json {

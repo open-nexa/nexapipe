@@ -48,6 +48,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
+use nexapipe_client::secret::SecretString;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -100,7 +101,7 @@ pub struct AdminState {
     metrics_enabled: bool,
     /// `None` when the token could not be made, which closes `/v1/*` rather
     /// than opening it.
-    token: Option<String>,
+    token: Option<SecretString>,
 }
 
 impl AdminState {
@@ -111,7 +112,7 @@ impl AdminState {
         peers: Arc<PeerRegistry>,
         auth: Option<AuthState>,
         metrics_enabled: bool,
-        token: Option<String>,
+        token: Option<SecretString>,
     ) -> Self {
         Self {
             routes,
@@ -229,7 +230,7 @@ async fn managed_response(
     is_get: bool,
     state: &Arc<AdminState>,
 ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
-    let Some(token) = state.token.as_deref() else {
+    let Some(token) = state.token.as_ref() else {
         // Unavailable rather than unauthorized: there is no token to present,
         // so "try again with credentials" would be a lie.
         return text(
@@ -241,7 +242,8 @@ async fn managed_response(
     let presented = authorization
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_token);
-    let authorized = presented.is_some_and(|presented| matches_token(presented, token));
+    let authorized =
+        presented.is_some_and(|presented| matches_token(presented, token.expose_secret().as_str()));
     if !authorized {
         let response = text(StatusCode::UNAUTHORIZED, "unauthorized");
         return with_header(response, hyper::header::WWW_AUTHENTICATE, WWW_AUTHENTICATE);

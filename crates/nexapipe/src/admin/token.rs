@@ -23,6 +23,7 @@
 //! serving without one is the thing the token exists to prevent.
 use crate::auth::totp::constant_time_eq;
 use crate::config::check_credential_file_permissions;
+use nexapipe_client::secret::SecretString;
 use std::path::Path;
 
 /// What is appended to the config path to get the token file:
@@ -41,7 +42,7 @@ pub fn token_file_path(config_path: &str) -> String {
 ///
 /// `None` when it could not be read or could not be created, which leaves
 /// `/v1/*` unavailable rather than open.
-pub fn load_or_create(config_path: &str) -> Option<String> {
+pub fn load_or_create(config_path: &str) -> Option<SecretString> {
     let path = token_file_path(config_path);
 
     if Path::new(&path).exists() {
@@ -81,7 +82,7 @@ pub fn load_or_create(config_path: &str) -> Option<String> {
 /// start: a token it minted itself would be one the server does not know about,
 /// and every `/v1/*` request would then be refused with a token that looks
 /// correct.
-pub fn load_existing(config_path: &str) -> Option<String> {
+pub fn load_existing(config_path: &str) -> Option<SecretString> {
     let path = token_file_path(config_path);
 
     if !Path::new(&path).exists() {
@@ -98,23 +99,29 @@ pub fn load_existing(config_path: &str) -> Option<String> {
 }
 
 /// Reads an existing token file.
-fn load(path: &str) -> Result<String, String> {
+fn load(path: &str) -> Result<SecretString, String> {
     // A credential, so the same check that gates a key file gates this: a
     // token any account can read is not a token.
     check_credential_file_permissions(path).map_err(|e| e.to_string())?;
 
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read it ({e})"))?;
-    let token = raw.trim().to_string();
+    // The file holds the token in the clear, so the buffer it lands in is
+    // wiped when it goes out of scope: wrap the read before trimming, so the
+    // copy that outlives this function is the zeroizing one.
+    let raw = SecretString::new(
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read it ({e})"))?,
+    );
+    let token = raw.expose_secret().trim();
     if token.is_empty() {
         return Err("it is empty".to_string());
     }
-    Ok(token)
+    Ok(SecretString::new(token.to_string()))
 }
 
 /// Generates a token and writes it where only this account can read it.
-fn create(path: &str) -> Result<String, String> {
-    let token = generate();
-    write_private(path, &token).map_err(|e| format!("cannot write it ({e})"))?;
+fn create(path: &str) -> Result<SecretString, String> {
+    let token = SecretString::new(generate());
+    write_private(path, token.expose_secret().as_str())
+        .map_err(|e| format!("cannot write it ({e})"))?;
 
     // Checked after the write rather than before: the file this is about is
     // the one that now exists, and a mode the OS did not apply is a real
@@ -221,7 +228,24 @@ mod tests {
         let first = load_or_create(&config).expect("the token is created");
         let second = load_or_create(&config).expect("the token is read back");
         assert_eq!(first, second);
-        assert_eq!(first.len(), TOKEN_BYTES * 2, "hex encoded, {first}");
+        assert_eq!(first.expose_secret().len(), TOKEN_BYTES * 2, "hex encoded");
+    }
+
+    /// The token is a credential, so it is never printed: not by a debug dump,
+    /// not by a failed assertion. The value a test can see is the redacted one.
+    #[test]
+    fn the_token_is_never_printed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[admin]\n").expect("seed the config");
+        let config = config.to_string_lossy().into_owned();
+
+        let token = load_or_create(&config).expect("the token is created");
+        let shown = format!("{token:?}");
+        assert!(
+            !shown.contains(token.expose_secret()),
+            "the token reached a debug dump"
+        );
     }
 
     /// The token file is next to the config, not inside it: writing to the

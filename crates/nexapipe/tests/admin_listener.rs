@@ -17,6 +17,7 @@ use nexapipe::conn::peers::PeerRegistry;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RouteConfig};
 use nexapipe::shutdown::{InFlight, ShutdownSignal};
+use nexapipe_client::secret::SecretString;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,7 +61,7 @@ async fn spawn_admin_with_clients(
         peers,
         auth,
         metrics_enabled,
-        token.map(str::to_string),
+        token.map(|token| SecretString::new(token.to_string())),
     ));
     let signal = shutdown.clone();
 
@@ -539,8 +540,12 @@ fn a_token_in_the_config_is_never_the_token_that_is_used() {
     assert!(config.admin.is_some(), "[admin] was not read");
 
     let token = admin::token::load_or_create(path.to_str().unwrap()).expect("a token is generated");
-    assert_ne!(token, "from-the-config");
-    assert_eq!(token.len(), 64, "32 random bytes, hex encoded: {token}");
+    assert_ne!(token.expose_secret(), "from-the-config");
+    assert_eq!(
+        token.expose_secret().len(),
+        64,
+        "32 random bytes, hex encoded"
+    );
 }
 
 /// The one address rule that has no escape hatch: unlike the plaintext
