@@ -23,6 +23,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
+use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::relay::RelayModeSpec;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -318,6 +319,23 @@ pub async fn run_proxy(
         }
         builder = builder.relay_mode(relay.relay_mode());
     }
+
+    // Whether this endpoint may use n0's address lookup — the DNS and pkarr
+    // queries that turn a Node ID into an address. It is the one piece of n0's
+    // infrastructure a relay setting does not reach, so it gets a setting of
+    // its own; `none` takes the lookup services off the endpoint, and a peer
+    // then has to bring an address of its own (a ticket) to be reachable.
+    //
+    // A value that is present but unknown refuses the start, the same rule the
+    // relay modes follow: a config that says one thing and does another is
+    // worse than a config that does not start.
+    let discovery = match iroh_config.as_ref().and_then(|c| c.discovery.as_deref()) {
+        Some(value) => DiscoveryMode::parse(value)
+            .with_context(|| format!("invalid [iroh] discovery: {value:?}"))?,
+        None => DiscoveryMode::default(),
+    };
+    tracing::info!("Discovery: {}", discovery.describe());
+    builder = discovery.apply(builder);
 
     if let Some(iroh_cfg) = iroh_config {
         // Use configured secret key for stable endpoint identity.

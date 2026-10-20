@@ -91,6 +91,18 @@ pub struct IrohConfig {
     ///
     /// A [`SecretString`], for the same reason the key above is one.
     pub relay_auth_token: Option<SecretString>,
+    /// Whether this endpoint may use n0's address lookup — the DNS and pkarr
+    /// queries that turn a Node ID into "where do I send QUIC packets".
+    ///
+    /// `"n0"` (the default) keeps it: the endpoint publishes its own address
+    /// there and resolves other endpoints' addresses through it. `"none"`
+    /// switches it off, and nothing this endpoint sends reaches n0's lookup
+    /// service — at the price of a Node ID no longer being enough to reach
+    /// this endpoint: a peer has to bring an address of its own (a ticket).
+    ///
+    /// A value that is present but unknown refuses the start, the same rule
+    /// the relay modes follow.
+    pub discovery: Option<String>,
     pub bind_port: Option<u16>,
     /// Also bind the IPv6 wildcard (`[::]`) on the same port.
     ///
@@ -181,6 +193,7 @@ impl std::fmt::Debug for IrohConfig {
             .field("relay_url", &self.relay_url)
             .field("relay_mode", &self.relay_mode)
             .field("relay_auth_token", &redacted(&self.relay_auth_token))
+            .field("discovery", &self.discovery)
             .field("bind_port", &self.bind_port)
             .field("bind_ipv6", &self.bind_ipv6)
             .field("secret_key", &redacted(&self.secret_key))
@@ -5068,6 +5081,7 @@ pending_enrollment = "TOKEN"
             relay_url: Some("https://relay.example".to_string()),
             relay_mode: Some("custom".to_string()),
             relay_auth_token: Some(SecretString::new("bearer-secret".to_string())),
+            discovery: Some("none".to_string()),
             bind_port: Some(1234),
             bind_ipv6: Some(true),
             secret_key: Some(SecretString::new("ed25519-private-key".to_string())),
