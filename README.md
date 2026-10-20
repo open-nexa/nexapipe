@@ -295,6 +295,12 @@ cosign verify ghcr.io/open-nexa/nexapipe:latest \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 
+The identity above is the tag the release was published from. If a release is
+re-run by hand, dispatch the workflow against the tag itself (`Run workflow` →
+the tag), not a branch: a run started from a branch signs with
+`refs/heads/<branch>` as its identity, and this command rejects that on
+purpose.
+
 The attestation says what was built and from which source revision. It is
 looked up by digest, and the digest is what the tag resolves to:
 

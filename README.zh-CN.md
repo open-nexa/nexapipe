@@ -262,6 +262,10 @@ cosign verify ghcr.io/open-nexa/nexapipe:latest \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 
+上面这条 identity 对应的是发布时所用的标签。手工重跑发布时，请把 workflow
+dispatch 到标签本身（`Run workflow` 里选择该标签），而不是分支：从分支发起的
+运行，证书 identity 是 `refs/heads/<branch>`，这条命令会有意拒绝它。
+
 来源证明说明构建了什么、来自哪个源码版本，它按 digest 查询，而 digest 就是标签
 实际指向的内容：
 
