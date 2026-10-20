@@ -29,6 +29,10 @@
     "keep": "Keep the proxy",
     "kept": "The proxy is still running, so the app stays open."
   },
+  "tray": {
+    "show": "Open Nexa",
+    "quit": "Quit"
+  },
   "common": {
     "save": "Save",
     "cancel": "Cancel",
@@ -391,6 +395,12 @@
     "logs": {
       "dir_unreadable": "The log directory could not be read.",
       "read_failed": "The log file could not be read."
+    },
+    "autostart": {
+      "read_failed": "It could not be read whether this app starts at login. See the logs for details.",
+      "write_failed": "The start-at-login setting could not be changed. See the logs for details.",
+      "exe_path": "The path of the running app could not be resolved, so there is nothing to start.",
+      "unsupported_platform": "Starting at login is not available on this platform."
     }
   }
 }

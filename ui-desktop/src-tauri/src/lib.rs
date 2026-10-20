@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod credentials;
 pub mod error;
 pub mod gate;
@@ -5,6 +6,7 @@ mod proxy;
 pub mod quit;
 pub mod service;
 pub mod status;
+pub mod tray;
 
 use error::{codes, AppError};
 use nexapipe_client::auth::DeviceKey;
@@ -23,7 +25,7 @@ use status::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
 use tokio::sync::RwLock;
 
 lazy_static::lazy_static! {
@@ -31,6 +33,14 @@ lazy_static::lazy_static! {
     static ref STARTUP_ERROR: Arc<RwLock<Option<AppError>>> = Arc::new(RwLock::new(None));
     static ref LOG_CURSOR: Arc<RwLock<Option<LogCursor>>> = Arc::new(RwLock::new(None));
 }
+
+/// Whether the tray icon could be created.
+///
+/// The window's close button can only mean "keep running" if there is a tray to
+/// keep running in: without one, the window is the only way back into the app,
+/// and hiding it would leave a running app nobody can reach. The renderer asks
+/// before it hides anything.
+static TRAY_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Whether [`take_runtime_credentials`] has answered already.
 ///
@@ -1660,6 +1670,61 @@ async fn log_startup_timing(marks: Vec<(String, f64)>) {
     );
 }
 
+/// Whether this app is started when the machine starts.
+///
+/// See [`autostart`]. A read that fails is a failure rather than "off": a
+/// switch that claims to be off while the entry is there is the same silent
+/// lie it used to tell.
+#[tauri::command]
+async fn is_auto_start_enabled() -> Result<bool, AppError> {
+    autostart::is_enabled()
+}
+
+/// Arranges for this app to start when the machine starts, or not.
+///
+/// Writes the entry and stops there. The platform's own login mechanism is
+/// what starts the app next time, so switching this on does not launch a
+/// second copy of the app in the middle of the session.
+#[tauri::command]
+async fn set_auto_start(enabled: bool) -> Result<(), AppError> {
+    autostart::set_enabled(enabled)
+}
+
+/// Whether this launch was asked for by the machine rather than by a person.
+///
+/// True when the start-up entry started the app: the window stays hidden and
+/// the app waits in the tray.
+#[tauri::command]
+async fn is_background_launch() -> bool {
+    autostart::is_background_launch()
+}
+
+/// Whether the tray icon could be created.
+///
+/// The renderer needs this before it lets a closed window hide instead of
+/// closing: a window that hides with no tray to bring it back is an app that
+/// cannot be reached again.
+#[tauri::command]
+async fn is_tray_available() -> bool {
+    TRAY_AVAILABLE.load(Ordering::Relaxed)
+}
+
+/// Rewrites the tray menu in the user's language.
+///
+/// The translations live in the renderer, which is the only side that knows
+/// which language is in use, so the words are handed over rather than looked
+/// up here.
+///
+/// Infallible on purpose: the labels are a nicety, and a tray whose menu is in
+/// the wrong language is still a working tray. The failure is logged, because
+/// it is worth knowing about.
+#[tauri::command]
+async fn set_tray_labels(app: AppHandle, show_label: String, quit_label: String) {
+    if let Err(e) = tray::set_labels(&app, &show_label, &quit_label) {
+        tracing::warn!("the tray menu could not be relabelled: {e}");
+    }
+}
+
 /// How long the window stays hidden waiting for the frontend to paint, before it is shown
 /// anyway.
 ///
@@ -1792,6 +1857,18 @@ pub fn run() {
             // waits for it explicitly — see `stale_hijack_cleanup`.
             tauri::async_runtime::spawn(stale_hijack_cleanup());
 
+            // The tray icon: the app's second home, and the one it starts in
+            // when the machine starts it. Built before the window is shown so
+            // that a launch with no window still has a way back into the app.
+            //
+            // Best effort: a desktop with no tray — a bare session, a
+            // container — must still be able to run the app, and what is lost
+            // there is an icon rather than the application.
+            match tray::build(app.handle()) {
+                Ok(()) => TRAY_AVAILABLE.store(true, Ordering::Relaxed),
+                Err(e) => tracing::warn!("the tray icon could not be created: {e}"),
+            }
+
             // The window is created hidden (`visible: false`) and shown by the frontend
             // once it has something to paint, so a slow start shows no window rather
             // than an empty one. This is the backstop for the case where the frontend
@@ -1800,16 +1877,22 @@ pub fn run() {
             // that did not start, so it is shown anyway once the wait has clearly run
             // long enough to be a failure rather than a slow machine.
             //
+            // Not for a launch the machine asked for: that one comes up in the
+            // tray on purpose, and a window appearing over whatever the user
+            // was doing at login is exactly what it was meant to avoid.
+            //
             // Best effort on every platform, and deliberately not fatal: a build with no
             // window to show must still start.
-            if let Some(window) = app.get_webview_window("main") {
-                let handle = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(FIRST_PAINT_FALLBACK).await;
-                    if let Err(e) = handle.show() {
-                        tracing::warn!("the fallback could not show the window: {e}");
-                    }
-                });
+            if !autostart::is_background_launch() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let handle = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(FIRST_PAINT_FALLBACK).await;
+                        if let Err(e) = handle.show() {
+                            tracing::warn!("the fallback could not show the window: {e}");
+                        }
+                    });
+                }
             }
 
             Ok(())
@@ -1851,6 +1934,11 @@ pub fn run() {
             clear_credentials,
             credential_store_status,
             log_startup_timing,
+            is_auto_start_enabled,
+            set_auto_start,
+            is_background_launch,
+            is_tray_available,
+            set_tray_labels,
             quit::finish_quit
         ]);
 

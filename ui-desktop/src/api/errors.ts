@@ -55,6 +55,11 @@ export const ERROR_CODES = [
   'credentials.gate_failed',
   // invite
   'invite.parse_failed',
+  // autostart
+  'autostart.read_failed',
+  'autostart.write_failed',
+  'autostart.exe_path',
+  'autostart.unsupported_platform',
   // logs
   'logs.dir_unreadable',
   'logs.read_failed',
