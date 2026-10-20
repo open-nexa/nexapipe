@@ -137,8 +137,13 @@ pub struct ClientAuth {
     ///
     /// Checked where the client names a port: the tunnel preface carries one,
     /// and an HTTP request's `Host` header may. A request that names no port
-    /// is not checked — the proxy routes by host and ignores the port
-    /// otherwise, so there is no port to hold against it.
+    /// is not checked, because there is no port to hold against it.
+    ///
+    /// The tunnel is where the list separates services: the preface names the
+    /// port the client wants, and that is the port the proxy dials. The HTTP
+    /// path routes by host alone, so a port named in a `Host` header is
+    /// checked but is not the port the request is served from — two services
+    /// of one host are told apart by the tunnel, not by this list.
     ///
     /// An empty list denies every port that is checked: `allow_ports = []` is
     /// "this client may connect and reach nothing it names a port for", not
