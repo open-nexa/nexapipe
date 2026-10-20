@@ -38,6 +38,15 @@ const QUIT_REQUESTED_EVENT = 'nexa://quit-requested';
 let deciding = false;
 
 /**
+ * A quit asked for while another question was open.
+ *
+ * Kept rather than dropped: a Quit that does nothing is a Quit the app never
+ * registered, and the user has no way of telling that from one that was
+ * ignored.
+ */
+let pendingQuit = false;
+
+/**
  * Whether the tray icon exists, remembered after the first answer.
  *
  * Asked once and kept, because it cannot change while the app runs: the tray is built at
@@ -132,6 +141,18 @@ async function decide(): Promise<boolean> {
   return true;
 }
 
+/**
+ * Asks the quit that could not be asked while another question was open.
+ *
+ * Called when a question is answered: a quit asked for in the meantime is
+ * asked then, rather than dropped.
+ */
+function askPendingQuit(): void {
+  if (!pendingQuit) return;
+  pendingQuit = false;
+  void handleQuitRequested();
+}
+
 async function handleCloseRequested(): Promise<void> {
   if (deciding) return;
   deciding = true;
@@ -148,11 +169,17 @@ async function handleCloseRequested(): Promise<void> {
     console.error('[quit] could not close the window:', error);
   } finally {
     deciding = false;
+    askPendingQuit();
   }
 }
 
 async function handleQuitRequested(): Promise<void> {
-  if (deciding) return;
+  if (deciding) {
+    // A question is already open, and a second one cannot be answered while
+    // the first is. The request is kept for when that one is answered.
+    pendingQuit = true;
+    return;
+  }
   deciding = true;
   try {
     if (!(await decide())) return;
@@ -163,6 +190,7 @@ async function handleQuitRequested(): Promise<void> {
     console.error('[quit] could not quit:', error);
   } finally {
     deciding = false;
+    askPendingQuit();
   }
 }
 

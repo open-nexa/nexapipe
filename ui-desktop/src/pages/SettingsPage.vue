@@ -157,9 +157,12 @@ const minimizeOnClose = computed({
  * Whether there is a tray to hide the window into.
  *
  * Without one, a hidden window is an app nobody can reach, so the switch is
- * offered only where it can be honoured.
+ * offered only where it can be honoured. `null` is "not known yet": the
+ * answer is a question for the app, and until it comes back the switch says
+ * nothing about a tray that may not be there — and cannot be turned on for a
+ * tray that does not exist.
  */
-const trayAvailable = ref(true);
+const trayAvailable = ref<boolean | null>(null);
 
 async function loadTrayAvailability() {
   try {
@@ -356,14 +359,14 @@ loadAppVersion();
             </svg>
             <div class="setting-info">
               <span class="setting-label">{{ t('settings.minimizeOnClose') }}</span>
-              <span class="setting-hint">{{ trayAvailable ? t('settings.minimizeOnCloseHint') : t('settings.minimizeOnCloseUnavailable') }}</span>
+              <span class="setting-hint">{{ trayAvailable === false ? t('settings.minimizeOnCloseUnavailable') : t('settings.minimizeOnCloseHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
             <button
               class="toggle"
               :class="{ active: minimizeOnClose }"
-              :disabled="!trayAvailable"
+              :disabled="trayAvailable !== true"
               @click="minimizeOnClose = !minimizeOnClose"
             >
               <div class="toggle-thumb"></div>
