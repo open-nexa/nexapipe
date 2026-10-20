@@ -159,8 +159,8 @@ relay_mode = "default"
 #           endpoints' addresses through it
 #   none  - no lookup at all. Nothing about this endpoint reaches n0's lookup
 #           service, and a Node ID alone no longer reaches this endpoint: a
-#           client has to bring an address of its own, which is what a ticket
-#           (--generate-invite) carries
+#           client has to bring an address of its own, which is what the
+#           ticket the server prints at start-up carries
 # A value that is present but unknown refuses the start.
 # discovery = "n0"
 

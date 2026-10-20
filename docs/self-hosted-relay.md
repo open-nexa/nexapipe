@@ -394,11 +394,13 @@ And what it does change, since both are settings now:
 - **Endpoint ID discovery can be turned off.** `discovery = "none"` takes n0's
   lookup off the endpoint, so nothing about it reaches `dns.iroh.link`. The
   price is that a Node ID alone no longer reaches a peer — a ticket carries an
-  address, and a ticket is what `--generate-invite` produces.
+  address, and the ticket the server prints at start-up is one.
 - **A peer naming somebody else's relay is refused.** A `custom` client dials
   its peer through your relay and nothing else: a peer whose address names a
-  different relay, and a peer named only by a Node ID, are both refused rather
-  than quietly dialled through an n0 relay.
+  different relay is refused rather than quietly dialled through an n0 relay.
+  A peer named only by a Node ID is dialled while the endpoint may still ask
+  n0 where it is — that is the operator's own trade — and refused once
+  `discovery = "none"` leaves no way to reach it at all.
 
 Full reasoning in
 [What still depends on third-party infrastructure](iroh-boundaries.md).

@@ -47,7 +47,7 @@ n0 nor resolves anyone else's through it.
 
 **What it costs.** A Node ID on its own is no longer enough to reach the
 endpoint. A peer has to bring an address of its own — a ticket, which is what
-`--generate-invite` produces, or an explicit `EndpointAddr`. That is the trade:
+the server prints at start-up, or an explicit `EndpointAddr`. That is the trade:
 no third party learns which Node ID is being asked about, and nothing about
 this endpoint goes to a lookup service, in exchange for handing the address
 over instead of looking it up.
