@@ -189,10 +189,10 @@ created_at = "1723756800"
 # The same question asked of ports rather than of names: a host is a name, a
 # port is a service on that name, and a client that may have the name does not
 # automatically get every service on it. Left unset, the client may reach
-# every port (the default). An empty list means "may connect, may reach
-# nothing". Checked where the client names a port — the tunnel preface always
-# does, and an HTTP request's Host header may — and a request that names no
-# port is not checked, because there is no port to hold against it.
+# every port (the default). Checked where the client names a port — the tunnel
+# preface always does, and an HTTP request's Host header may — and a request
+# that names no port is not checked, because there is no port to hold against
+# it. An empty list denies every port that is checked.
 # allow_ports = [443, 8443]
 # The server also writes `failed_attempts`, `locked_until` and `last_used` back
 # into a client that has failed a handshake, so a lockout survives a restart.

@@ -140,8 +140,9 @@ pub struct ClientAuth {
     /// is not checked — the proxy routes by host and ignores the port
     /// otherwise, so there is no port to hold against it.
     ///
-    /// An empty list denies every port: `allow_ports = []` is "this client may
-    /// connect and reach nothing", not "no restriction".
+    /// An empty list denies every port that is checked: `allow_ports = []` is
+    /// "this client may connect and reach nothing it names a port for", not
+    /// "no restriction".
     #[serde(default)]
     pub allow_ports: Option<Vec<u16>>,
     /// A one-time enrollment token waiting to be exchanged for a new secret.
