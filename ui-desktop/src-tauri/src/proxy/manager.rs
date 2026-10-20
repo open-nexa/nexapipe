@@ -8,6 +8,7 @@ use nexapipe_client::auth::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
 use nexapipe_client::connection_pool::parse_endpoint_addr;
+use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
@@ -233,6 +234,11 @@ pub struct ProxyManagerConfig {
     /// Bearer token for a `custom` relay that requires one. Only ever read together with
     /// `relay_url`, and never logged.
     pub relay_auth_token: String,
+    /// Whether this endpoint may use n0's address lookup — the DNS and pkarr
+    /// queries that turn a Node ID into an address. `"n0"` (the default) keeps
+    /// it; `"none"` switches it off, and a peer then has to bring an address
+    /// of its own (a ticket) to be reachable.
+    pub discovery_mode: String,
 }
 
 struct ProxyInstance {
@@ -358,18 +364,40 @@ impl ProxyManager {
             );
         }
         tracing::info!("Relay: {}", relay.describe());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it.
+        let restriction = relay.dial_restriction();
+        if let Some(restriction) = &restriction {
+            tracing::info!(
+                "Peers are dialled through {} and nothing else",
+                restriction.relay()
+            );
+        }
+        // Whether this endpoint may ask n0 where a peer is. It is the one piece
+        // of n0's infrastructure a relay setting does not reach, so it gets a
+        // setting of its own.
+        let discovery =
+            DiscoveryMode::parse(&self.config.discovery_mode).map_err(StartError::Other)?;
+        tracing::info!("Discovery: {}", discovery.describe());
         // Bind IPv4 only. On hosts where IPv6 exists but cannot carry full-size QUIC
         // datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big" filtered), iroh's net
         // report calls v6 usable, relay dials and path migration move traffic onto v6 —
         // where every datagram above the real MTU fails (sendmsg 10040), which reads as a
         // connection that dies a few seconds in. With no v6 socket the net report stays
         // v4-only and relay dials stop preferring v6. The TUN is IPv4-only anyway.
-        let ep_builder = Endpoint::builder(presets::N0)
+        let mut ep_builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .bind_addr("0.0.0.0:0")
             .map_err(|e| anyhow::anyhow!("Failed to configure the IPv4-only socket: {}", e))?
             .transport_config(transport_tuning.transport_config())
             .relay_mode(relay.relay_mode());
+        ep_builder = discovery.apply(ep_builder);
+        if let Some(restriction) = restriction {
+            ep_builder = ep_builder.hooks(restriction);
+        }
 
         let iroh_endpoint = ep_builder
             .bind()
