@@ -241,7 +241,16 @@ class SecretStore {
      * unreachable replaces the key every stored credential is sealed under and
      * makes all of them unreadable. Only a read that succeeded and came back
      * empty means there is no key yet.
+     *
+     * Two threads must not reach [generate] together either, and that is the
+     * same hazard with a different cause: generating a key under an alias that
+     * already exists replaces it, so of two keys created for an alias that had
+     * none, the second makes everything the first sealed unreadable. The
+     * settings writer seals from its own coroutine and the device-key
+     * preparation from another, so two threads do reach this at once — hence
+     * the lock, which also makes [cachedKey] safe to read here.
      */
+    @Synchronized
     private fun key(): SecretKey? {
         cachedKey?.let { return it }
         val store = keyStore ?: return null
