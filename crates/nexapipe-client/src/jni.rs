@@ -2003,8 +2003,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
     }
 }
 
-/// How each configured backend is currently reached: one `<endpointId>=<kind>` pair per
-/// backend, joined with `;`, where `kind` is `direct`, `relay` or `unknown`.
+/// How each configured backend is currently reached, and how far away it is: one
+/// `<endpointId>=<kind>/<rttMs>` entry per backend, joined with `;`, where `kind` is `direct`,
+/// `relay` or `unknown` and `rttMs` is the round-trip time in milliseconds, or `-` when iroh has
+/// no sample yet.
 ///
 /// This is the *runtime* answer, read off the paths iroh actually selected — not the relay URL
 /// from the configuration, which only names a relay that may be used. A backend that has never
@@ -2044,20 +2046,28 @@ fn link_kinds(env: &mut Env<'_>) -> jstring {
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.link_kinds().await })
+        runtime.block_on(async move { endpoint_group.link_statuses().await })
     }));
 
-    let kinds = match result {
-        Ok(kinds) => kinds,
+    let statuses = match result {
+        Ok(statuses) => statuses,
         Err(_) => {
             jni_log!("[DEBUG:jni] Panic occurred during nativeLinkKinds");
             return std::ptr::null_mut();
         }
     };
 
-    let encoded = kinds
+    let encoded = statuses
         .iter()
-        .map(|(id, kind)| format!("{}={}", id, kind.as_str()))
+        .map(|(id, status)| {
+            // `-` for "no sample yet", so that an unmeasured path is not read as
+            // a round trip of zero milliseconds.
+            let rtt = match status.rtt {
+                Some(rtt) => rtt.as_millis().to_string(),
+                None => "-".to_string(),
+            };
+            format!("{}={}/{}", id, status.kind.as_str(), rtt)
+        })
         .collect::<Vec<_>>()
         .join(";");
 
