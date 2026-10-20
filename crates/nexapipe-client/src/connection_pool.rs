@@ -202,6 +202,24 @@ impl LinkStatus {
     }
 }
 
+/// The wire form of one link reading: `<endpoint id>=<kind>/<rtt in ms>`.
+///
+/// The JNI boundary carries the readings in this form and the Kotlin side reads
+/// them back: the id, the kind, and the round trip in whole milliseconds.
+/// `-` stands for a reading with no sample, so that an unmeasured path is not
+/// read as a round trip of zero milliseconds.
+///
+/// A function of its own so that the form is testable without an endpoint:
+/// the Kotlin decoder has its own tests, and the two halves of a contract
+/// that only one side tests can drift apart without anything failing.
+pub fn encode_link_status(id: &EndpointId, status: &LinkStatus) -> String {
+    let rtt = match status.rtt {
+        Some(rtt) => rtt.as_millis().to_string(),
+        None => "-".to_string(),
+    };
+    format!("{}={}/{}", id, status.kind.as_str(), rtt)
+}
+
 /// The round-trip time of the path carrying the traffic, if it can be read.
 ///
 /// The selected path is the one the traffic takes, so that is the one whose
@@ -1022,7 +1040,7 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkKind, LinkStatus, is_measured_rtt};
+    use super::{LinkKind, LinkStatus, encode_link_status, is_measured_rtt};
     use std::time::Duration;
 
     /// quinn's estimator starts every path at the transport's initial RTT and
@@ -1082,5 +1100,34 @@ mod tests {
         let status = LinkStatus::default();
         assert_eq!(status.kind, LinkKind::Unknown);
         assert_eq!(status.rtt, None);
+    }
+
+    /// The reading crosses the JNI boundary as `<id>=<kind>/<rtt>`, and the
+    /// Kotlin side reads it back. The form is a contract between the two
+    /// halves, so it is pinned here: the Kotlin decoder has its own tests,
+    /// and a form only one side tests can drift apart without anything
+    /// failing.
+    #[test]
+    fn a_link_reading_carries_the_kind_and_the_round_trip() {
+        let id = iroh::SecretKey::generate().public();
+        let status = LinkStatus {
+            kind: LinkKind::Relay,
+            rtt: Some(Duration::from_millis(15)),
+        };
+
+        assert_eq!(encode_link_status(&id, &status), format!("{}=relay/15", id));
+    }
+
+    /// A reading with no sample says so, rather than saying zero — a zero
+    /// would be drawn as a round trip of no time at all.
+    #[test]
+    fn a_link_reading_without_a_sample_says_so() {
+        let id = iroh::SecretKey::generate().public();
+        let status = LinkStatus {
+            kind: LinkKind::Direct,
+            rtt: None,
+        };
+
+        assert_eq!(encode_link_status(&id, &status), format!("{}=direct/-", id));
     }
 }

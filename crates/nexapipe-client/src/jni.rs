@@ -2059,15 +2059,7 @@ fn link_kinds(env: &mut Env<'_>) -> jstring {
 
     let encoded = statuses
         .iter()
-        .map(|(id, status)| {
-            // `-` for "no sample yet", so that an unmeasured path is not read as
-            // a round trip of zero milliseconds.
-            let rtt = match status.rtt {
-                Some(rtt) => rtt.as_millis().to_string(),
-                None => "-".to_string(),
-            };
-            format!("{}={}/{}", id, status.kind.as_str(), rtt)
-        })
+        .map(|(id, status)| crate::connection_pool::encode_link_status(id, status))
         .collect::<Vec<_>>()
         .join(";");
 
