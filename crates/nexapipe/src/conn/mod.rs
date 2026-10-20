@@ -141,6 +141,44 @@ fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
         .map(|pos| from + pos)
 }
 
+/// The two deadlines an iroh stream starts with.
+///
+/// The first byte says which protocol a stream carries, and the wait for it
+/// is not the HTTP head's: `header_secs` bounds an HTTP request head, and a
+/// TLS or L4 client that is slow to speak must not be cut off by it. Those two
+/// protocols have their own budgets, and a client on them never sends a
+/// request head at all.
+///
+/// Until the byte arrives the protocol is unknown, so the wait is the longer
+/// of the two budgets — the head's, because an HTTP client may take that long
+/// to start, and the hello's, because a TLS client may take that long and is
+/// not an HTTP client at all. The head itself is still bounded by
+/// `header_secs` from the moment the stream opened, so a client that trickles
+/// a head renews nothing.
+struct StreamBudgets {
+    /// The whole request head, from the moment the stream opened.
+    head: tokio::time::Instant,
+    /// The first byte, which says which protocol this stream carries.
+    identify: tokio::time::Instant,
+    /// When the stream opened, so the budgets can be reported in seconds.
+    open: tokio::time::Instant,
+}
+
+impl StreamBudgets {
+    fn new(deadlines: &crate::deadline::Deadlines, open: tokio::time::Instant) -> Self {
+        Self {
+            head: open + deadlines.header,
+            identify: open + deadlines.header.max(deadlines.tls_hello),
+            open,
+        }
+    }
+
+    /// How long the first byte may take.
+    fn identify_budget(&self) -> std::time::Duration {
+        self.identify - self.open
+    }
+}
+
 // One more argument than clippy allows, and bundling them into a struct would
 // just move the list somewhere else while making every call site build one. The
 // id is last because it is the newest thing this stream carries.
@@ -172,10 +210,24 @@ pub async fn handle_bidi_stream(
     // A phase deadline over the whole head, taken once and never renewed: a
     // peer that drips one byte before each expiry renews nothing. The bound is
     // `[timeouts] header_secs` through the routes.
-    let header_secs = config.timeouts().deadlines.header.as_secs();
-    let head_deadline = tokio::time::Instant::now() + config.timeouts().deadlines.header;
+    let timeouts = config.timeouts();
+    let open = tokio::time::Instant::now();
+    let budgets = StreamBudgets::new(&timeouts.deadlines, open);
+    let header_secs = timeouts.deadlines.header.as_secs();
+    let identify_secs = budgets.identify_budget().as_secs();
+
+    // The first read identifies the protocol and is bounded by the budget
+    // above; every read after it is part of the head and is bounded by the
+    // head's own deadline.
+    let mut identifying = true;
     loop {
-        let read = tokio::time::timeout_at(head_deadline, recv.read(&mut read_buf)).await;
+        let (deadline, secs, what) = if identifying {
+            identifying = false;
+            (budgets.identify, identify_secs, "first byte")
+        } else {
+            (budgets.head, header_secs, "request head")
+        };
+        let read = tokio::time::timeout_at(deadline, recv.read(&mut read_buf)).await;
         match read {
             Ok(Ok(None)) => break,
             Ok(Ok(Some(n))) => {
@@ -242,12 +294,8 @@ pub async fn handle_bidi_stream(
                 return Err(e.into());
             }
             Err(_) => {
-                tracing::warn!(
-                    "No complete request head from {} within {}s",
-                    peer,
-                    header_secs
-                );
-                return Err(anyhow::anyhow!("no request head within {}s", header_secs));
+                tracing::warn!("No {} from {} within {}s", what, peer, secs);
+                return Err(anyhow::anyhow!("no {} within {}s", what, secs));
             }
         }
     }
@@ -2188,12 +2236,53 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, blocking_config_write,
+        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, blocking_config_write,
         constant_time_eq, enrollment_verdict, find_headers_end, issue_enrolled_secret,
         undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_short_head_budget_does_not_cut_off_a_tls_or_l4_client() {
+        // The observation this test exists for: the first byte says which
+        // protocol a stream carries, and the wait for it must not be the HTTP
+        // head's budget. A short `header_secs` used to close a TLS or an L4
+        // stream before it could be classified, which took the tunnel down
+        // with it — and neither protocol ever sends a request head, so the
+        // head's budget was never the right one for them.
+        let deadlines = crate::deadline::Deadlines {
+            header: std::time::Duration::from_secs(1),
+            tls_hello: std::time::Duration::from_secs(10),
+            ..crate::deadline::Deadlines::default()
+        };
+        let open = tokio::time::Instant::now();
+        let budgets = StreamBudgets::new(&deadlines, open);
+
+        assert_eq!(
+            budgets.identify_budget(),
+            std::time::Duration::from_secs(10),
+            "the first byte is bounded by the hello budget, not the head's"
+        );
+        assert_eq!(
+            budgets.head - open,
+            std::time::Duration::from_secs(1),
+            "the head itself is still bounded by header_secs"
+        );
+    }
+
+    #[test]
+    fn the_default_budgets_leave_an_http_client_the_room_it_had() {
+        // The other half: with the defaults the first byte waits exactly as
+        // long as it did before, so nothing about an ordinary HTTP client
+        // changes.
+        let deadlines = crate::deadline::Deadlines::default();
+        let open = tokio::time::Instant::now();
+        let budgets = StreamBudgets::new(&deadlines, open);
+
+        assert_eq!(budgets.identify_budget(), deadlines.header);
+        assert_eq!(budgets.head - open, deadlines.header);
+    }
 
     /// The shape an enrollment takes when the client named a device and offered
     /// no key: a secret of that device's own.

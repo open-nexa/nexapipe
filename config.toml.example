@@ -294,14 +294,17 @@ path = "/health"
 # renewed - what a one-byte trickle cannot outwait) versus idle (re-armed on
 # every chunk or datagram, correct only where the phase is meant to stay open):
 #
-#   header_secs        a phase deadline over the whole request head.
-#                      Default: 30
+#   header_secs        a phase deadline over the whole request head. On the
+#                      plaintext listener it covers the whole wait for the
+#                      head, the peek that tells a TLS session from a request
+#                      included. Default: 30
 #   body_secs          a phase deadline over the whole request body, separate
 #                      from the head because a large upload legitimately takes
 #                      longer. Default: 300
-#   response_idle_secs idle between response chunks, so an SSE stream or a
-#                      long transfer stays open while a silent backend does
-#                      not hold the slot. Default: 120
+#   response_idle_secs idle between response chunks, on every path that proxies
+#                      a response, so an SSE stream or a long transfer stays
+#                      open while a silent backend does not hold the slot.
+#                      Default: 120
 #   l4_flow_secs       a phase deadline over the whole life of an L4 tunnel,
 #                      TCP and UDP alike: a flow has no protocol-level end, so
 #                      this is the one stop against a peer renewing it
@@ -311,8 +314,15 @@ path = "/health"
 #                      Default: 3600
 #   l4_idle_secs       idle between UDP datagrams in either direction.
 #                      Default: 60
-#   tls_hello_secs     a phase deadline over the TLS ClientHello read.
+#   tls_hello_secs     a phase deadline over the TLS ClientHello read, and
+#                      over the wait for the session's first byte.
 #                      Default: 10
+#
+# A stream's first byte says which protocol it carries, and until it arrives
+# the protocol is unknown - so the wait for it is the longer of `header_secs`
+# and `tls_hello_secs`, never the head's alone. A short `header_secs` does not
+# cut off a TLS session or an L4 tunnel: neither ever sends a request head,
+# and both are bounded by their own keys.
 #
 # `0` is refused at startup for every key, and so is anything past 86400 (a
 # day): the first closes the phase the moment it opens, and the second is a

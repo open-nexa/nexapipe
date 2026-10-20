@@ -129,11 +129,6 @@ pub async fn sync_health_checks(
     }
 }
 
-/// How long the plaintext listener waits for a first byte before handing the
-/// connection to the HTTP server. Long enough for a TLS `ClientHello` to
-/// arrive, short enough not to park the task.
-const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// What [`run_proxy`] needs from the parsed config file.
 ///
 /// A struct rather than a longer argument list: these are all "a section of
@@ -703,12 +698,25 @@ async fn start_http_server(
 
                 tokio::spawn(async move {
                     let _connection = guard;
+                    // One budget for the whole exchange, taken when the
+                    // connection is accepted: the wait to tell a TLS session
+                    // from an HTTP request is part of the wait for the head,
+                    // not time on top of it. A client that has said nothing by
+                    // the end of it is closed, rather than held for the
+                    // classification wait and then a fresh header budget on
+                    // top of that.
+                    let deadlines = config_clone.timeouts().deadlines;
+                    let head_deadline = tokio::time::Instant::now() + deadlines.header;
+
                     // The listener speaks HTTP, but a client may also open a
                     // TLS session straight at it. One peeked byte tells the two
                     // apart — a request line can never start with 0x16 — and a
                     // TLS session goes to the passthrough path, since this
                     // process has no key material and never decrypts anything.
-                    if is_tls_connection(&stream).await {
+                    // The peek waits for the hello budget, and never past the
+                    // head budget: a client that has said nothing by then is
+                    // not going to send a request either.
+                    if is_tls_connection(&stream, head_deadline, deadlines.tls_hello).await {
                         tracing::debug!("TLS session on the plaintext listener from: {}", remote_addr_str);
                         if let Err(e) =
                             passthrough::handle_tcp_stream(stream, Vec::new(), &config_clone).await
@@ -722,12 +730,15 @@ async fn start_http_server(
                     // header read timeout: a client that opens a socket and
                     // sends nothing holds the connection open for as long as it
                     // likes. This is the listener an operator may expose. The
-                    // bound is `[timeouts] header_secs` through the routes.
+                    // bound is `[timeouts] header_secs` through the routes, and
+                    // what is left of it after the classification wait is what
+                    // hyper gets — the two are one budget, not two.
+                    let remaining = remaining_budget(head_deadline);
                     let mut http_builder = Builder::new(hyper_util::rt::TokioExecutor::new());
                     http_builder
                         .http1()
                         .timer(TokioTimer::new())
-                        .header_read_timeout(Some(config_clone.timeouts().deadlines.header));
+                        .header_read_timeout(Some(remaining));
 
                     // One id and one span per request. `service_fn` is called
                     // once per request rather than once per connection, which
@@ -805,10 +816,32 @@ pub(crate) fn plaintext_auth_conflict(
     })
 }
 
+/// What is left of a connection's budget.
+///
+/// The classification wait is part of the budget rather than time on top of
+/// it, so this is what the HTTP server gets for the head: the whole
+/// connection, less what the wait for the first byte already spent. A budget
+/// that is spent is spent — the result is zero, and the connection is closed
+/// rather than given a fresh deadline.
+fn remaining_budget(deadline: tokio::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
 /// True when the peer opened a TLS session rather than sending a request.
-async fn is_tls_connection(stream: &tokio::net::TcpStream) -> bool {
+///
+/// The peek waits for `hello` — the budget a TLS client has to start its
+/// handshake — and never past `deadline`, the budget this connection has for
+/// its whole exchange. A timeout, an EOF or an error all mean "not a TLS
+/// session, as far as this listener is concerned": the connection is handed to
+/// the HTTP server, which owns the read timeouts and the error responses.
+async fn is_tls_connection(
+    stream: &tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+    hello: std::time::Duration,
+) -> bool {
     let mut first = [0u8; 1];
-    match tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.peek(&mut first)).await {
+    let until = (tokio::time::Instant::now() + hello).min(deadline);
+    match tokio::time::timeout_at(until, stream.peek(&mut first)).await {
         Ok(Ok(1)) => passthrough::is_tls_handshake(first[0]),
         // EOF, error, or a peer that never sends anything: hand it to the HTTP
         // server, which owns read timeouts and error responses.
@@ -835,10 +868,7 @@ async fn proxy_handler(
     client: Arc<HttpClient>,
     remote_addr: String,
     request_id: String,
-) -> Result<
-    hyper::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>>,
-    anyhow::Error,
-> {
+) -> Result<hyper::Response<http::ProxyBody>, anyhow::Error> {
     let start = std::time::Instant::now();
     let method = req.method().to_string();
     let uri = req.uri().to_string();
@@ -966,8 +996,34 @@ const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
-    use super::{may_bind_plaintext, plaintext_auth_conflict, response_has_body};
+    use super::{may_bind_plaintext, plaintext_auth_conflict, remaining_budget, response_has_body};
     use std::net::SocketAddr;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_header_budget_is_what_is_left_of_the_connection_budget() {
+        // The observation this test exists for: the wait to tell a TLS
+        // session from an HTTP request is part of the wait for the head, not
+        // time on top of it. hyper gets what is left of the one budget, so a
+        // client that says nothing is closed after `header_secs` in total
+        // rather than after the classification wait and then a fresh header
+        // deadline on top of that.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            remaining_budget(deadline),
+            std::time::Duration::from_secs(30)
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            remaining_budget(deadline),
+            std::time::Duration::from_secs(20)
+        );
+
+        // A budget that is spent is spent: the connection is closed rather
+        // than given a fresh deadline.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert_eq!(remaining_budget(deadline), std::time::Duration::ZERO);
+    }
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
         let ip: std::net::IpAddr = ip.parse().expect("valid IP");

@@ -437,6 +437,12 @@ pub struct TimeoutsConfig {
     /// that trickles one byte of `Host:` every few seconds holds a slot, a task
     /// and a connection slot, and a per-read timeout is exactly what it wants.
     /// This is the number that closes that. See [`crate::deadline`].
+    ///
+    /// It bounds the head, not the stream: the first byte says which protocol
+    /// the stream carries, and until it arrives the protocol is unknown, so the
+    /// wait for it is the longer of this and [`Self::tls_hello_secs`]. A short
+    /// `header_secs` therefore never cuts off a TLS session or an L4 tunnel —
+    /// neither of them sends a request head at all.
     pub header_secs: Option<u64>,
     /// Seconds a client may take to send a request body once the head is in.
     /// Default: 300.
@@ -453,6 +459,11 @@ pub struct TimeoutsConfig {
     /// two ends want. What must not be possible is a backend that sent the head
     /// and then said nothing at all, so the bound is on the gap between chunks
     /// and re-arms on every chunk by design.
+    ///
+    /// It applies to every path that proxies a response, the plaintext
+    /// listener included: there the body is handed to the client as it arrives,
+    /// and a backend that stalls mid-body fails the response rather than
+    /// truncating it quietly.
     pub response_idle_secs: Option<u64>,
     /// Seconds an L4 tunnel may run before it is closed. Default: 3600.
     ///
@@ -476,6 +487,10 @@ pub struct TimeoutsConfig {
     /// body of it; a peer that sends the five header bytes and nothing else
     /// would otherwise hold the connection open indefinitely with no read
     /// deadline at all.
+    ///
+    /// It also covers the wait for the session's first byte, on both
+    /// listeners: that byte is what says a TLS session is starting, so it
+    /// belongs to the hello rather than to the head.
     pub tls_hello_secs: Option<u64>,
 }
 

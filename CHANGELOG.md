@@ -47,13 +47,17 @@ that names none of the new keys leaves every deadline at its default.
 - **Six `[timeouts]` keys for the per-phase deadlines.** `header_secs`,
   `body_secs`, `response_idle_secs`, `l4_flow_secs`, `l4_idle_secs` and
   `tls_hello_secs` bound, respectively, how long a client may take to send its
-  request head (default 30), its request body (300), how silent a streamed
-  response may go between chunks (120), how long an L4 tunnel may run (3600),
-  how idle a UDP flow may go (60) and how long a TLS ClientHello may take
-  (10). Every key is optional; absent means the default, and the per-route
+  request head (default 30), its request body (300), how silent a response body
+  may go between chunks (120), how long an L4 tunnel may run (3600), how idle a
+  UDP flow may go (60) and how long a TLS ClientHello may take (10). Every key
+  is optional; absent means the default, and the per-route
   `flow_timeout_secs` still overrides `l4_flow_secs` for one route alone. Zero
   is refused at load — a zero deadline closes the phase the moment it opens —
-  and so is anything past a day, which is a bound that never fires.
+  and so is anything past a day, which is a bound that never fires. A stream's
+  first byte says which protocol it carries, and until it arrives the protocol
+  is unknown, so the wait for it is the longer of `header_secs` and
+  `tls_hello_secs`: a short `header_secs` never cuts off a TLS session or an
+  L4 tunnel, neither of which sends a request head at all.
 
 ### Changed
 
@@ -72,10 +76,14 @@ that names none of the new keys leaves every deadline at its default.
   that, a client that trickled one byte before each expiry could hold a
   header read, a body read or an L4 flow open indefinitely; now a phase
   deadline is taken once and never renewed, and only the bounds that are
-  *meant* to re-arm — a streamed response's gap between chunks, a UDP flow's
-  gap between datagrams — do. One of these is a behaviour change worth
-  noticing: an L4 tunnel now closes after an hour of existence even if it is
-  busy, so a long-lived SSH or database session over the tunnel needs
+  *meant* to re-arm — a response's gap between chunks, a UDP flow's
+  gap between datagrams — do. The idle bound on a response body now covers the
+  plaintext listener too, where a backend that sent its head and then went
+  silent used to hold the request open for as long as it liked; such a
+  response now fails instead of being truncated quietly, so the client can
+  tell a short body from a whole one. One of these is a behaviour change
+  worth noticing: an L4 tunnel now closes after an hour of existence even if
+  it is busy, so a long-lived SSH or database session over the tunnel needs
   `l4_flow_secs` raised (or a per-route `flow_timeout_secs`).
 
 ## [0.6.1] — 2026-10-11
