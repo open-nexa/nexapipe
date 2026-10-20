@@ -143,7 +143,9 @@ its defaults — which are on.
   A refusal looks exactly like "no route" — a 404, a `NoRoute`, a hang-up —
   so it cannot be used to probe what is open behind the proxy. Left unset, a
   client keeps the reach it had; an empty list denies every port that is
-  checked — the same reading `allow_hosts = []` has for the names it denies.
+  checked. The reading `allow_hosts = []` has is the stricter of the two: it
+  denies every name, with no path around it, while a port is only denied
+  where one is checked.
   A port of zero is refused at startup, because no client ever asks for it.
 
 ### Changed
