@@ -1415,8 +1415,18 @@ public key while it spends its one-shot token (the library exposes this as
 every later handshake goes out signed (`TwoFactorAuth::with_key`). The human
 moment stays where it was — scanning the invite, spending the token, once —
 which is why TOTP is the enrollment-time factor rather than a prompt on every
-connection. Both apps still enroll and answer with TOTP secrets; holding a key
-is the next release's half in each.
+connection.
+
+**Both apps do exactly that now.** A `v=2` registration invite — the one that
+carries a token rather than a secret — enrolls the device with a key of its own
+on the desktop and on Android, with nothing asked of you: the private half is
+generated on the device, sealed at rest beside the other credentials, and never
+leaves it, and the public half is what the server records and what the app
+displays, so you can tell which key a server has on file. A server that
+predates keys ignores the offer and issues a secret as before, so the same
+invite works against both, and a node that already holds a TOTP secret keeps
+it. The invite format does not change: this is decided by the kind of invite,
+not by anything you choose.
 
 ---
 

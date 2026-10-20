@@ -48,6 +48,15 @@ class SettingsManager(context: Context) {
         // too — it is what a registration invite hands out — so it is kept out
         // of the backed-up list alongside the secrets.
         const val ENROLLMENT_PREFIX = "enrollment_token_"
+        // Prefix of the per-endpoint device keys: the private half of the
+        // Ed25519 key an endpoint proves itself with.
+        //
+        // A credential like the seeds beside it, and kept in the same file
+        // because that file is the one backup excludes — but a stronger one: a
+        // seed is a copy of something the server holds, while this half is
+        // the only one there is. It never appears in the backed-up endpoint
+        // list, and it never leaves the device.
+        const val DEVICE_KEY_PREFIX = "device_key_"
         // Read once by `migrateLegacyTwoFactor` and then deleted: 2FA used to
         // be one app-wide setting, it now belongs to an endpoint.
         const val KEY_2FA_ENABLED = "two_factor_enabled"
@@ -210,6 +219,20 @@ class SettingsManager(context: Context) {
                     editor.remove(key)
                 }
             }
+            if (key.startsWith(DEVICE_KEY_PREFIX)) {
+                val nodeId = key.removePrefix(DEVICE_KEY_PREFIX)
+                val node = nodes.firstOrNull { it.nodeId == nodeId }
+                // A key lives with the credential it proves: either the
+                // enrollment that is about to spend a token, or the public
+                // half the server answered with. Neither means it is stale —
+                // the node was cleared, or the invite it was made for is
+                // gone.
+                val keepsKey = node?.twoFactor?.publicKey != null ||
+                    !node?.enrollment?.token.isNullOrBlank()
+                if (!keepsKey) {
+                    editor.remove(key)
+                }
+            }
         }
 
         var allSealed = true
@@ -321,6 +344,37 @@ class SettingsManager(context: Context) {
     /** Records the answer to [plaintextCredentialConsent] for good. */
     fun savePlaintextCredentialConsent(accepted: Boolean) {
         prefs.edit { putBoolean(KEY_PLAINTEXT_CONSENT, accepted) }
+    }
+
+    /**
+     * The private half of an endpoint's device key, or empty when it has none.
+     *
+     * The credential that proves this device to the server, and the only copy
+     * there is: the server holds the public half and nobody else holds this
+     * one. It is read from the file backup excludes, and it is never written
+     * into the endpoint list that is backed up.
+     */
+    fun deviceKeyFor(nodeId: String): String =
+        secrets.unseal(secretPrefs.getString(DEVICE_KEY_PREFIX + nodeId, "") ?: "")
+
+    /**
+     * Stores the private half of an endpoint's device key, sealed.
+     *
+     * Returns whether it was sealed. A key that could not be sealed is not
+     * written at all: this half is the credential, and a copy of it in the
+     * clear on a device that has just said it cannot protect one is worse than
+     * no key — the endpoint then enrolls with a TOTP secret instead, which the
+     * server can revoke.
+     */
+    fun saveDeviceKey(nodeId: String, privateKeyHex: String): Boolean {
+        val sealed = secrets.sealOrNull(privateKeyHex) ?: return false
+        secretPrefs.edit { putString(DEVICE_KEY_PREFIX + nodeId, sealed) }
+        return true
+    }
+
+    /** Forgets an endpoint's device key, which is what a cleared credential does. */
+    fun clearDeviceKey(nodeId: String) {
+        secretPrefs.edit { remove(DEVICE_KEY_PREFIX + nodeId) }
     }
 
     /**

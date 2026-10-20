@@ -20,7 +20,7 @@ import { invoke } from '@tauri-apps/api/core';
  * credential rather than configuration: a ticket names an endpoint and carries how to reach
  * it, so anyone holding one can connect.
  */
-export type CredentialKind = 'totp' | 'enrollment' | 'relay' | 'ticket' | 'endpoint';
+export type CredentialKind = 'totp' | 'enrollment' | 'devicekey' | 'relay' | 'ticket' | 'endpoint';
 
 /**
  * One node's credentials, in full.
@@ -32,6 +32,21 @@ export type CredentialKind = 'totp' | 'enrollment' | 'relay' | 'ticket' | 'endpo
 export interface NodeCredentials {
   totp: string | null;
   enrollment: string | null;
+  /**
+   * The private half of this node's device key, when it has one.
+   *
+   * A credential like the secret beside it, and it crosses this boundary for the same reason: the
+   * proxy needs it to sign, and in the service mode the service is a separate process with no
+   * store of its own.
+   */
+  deviceKey: string | null;
+  /**
+   * The public half of that key, as 64 hex characters.
+   *
+   * Derived by the backend from the private half, so the two cannot disagree about which key this
+   * is. Not a secret — the server holds the same one.
+   */
+  publicKey?: string | null;
   ticket: string | null;
   endpoint: string | null;
 }

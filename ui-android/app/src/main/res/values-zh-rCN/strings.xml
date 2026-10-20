@@ -129,6 +129,11 @@
     <string name="two_factor_secret">TOTP 密钥</string>
     <string name="two_factor_secret_placeholder">JBSWY3DPEHPK3PXP</string>
     <string name="two_factor_algorithm">算法</string>
+    <string name="two_factor_credential_type">凭据类型</string>
+    <string name="two_factor_type_key">设备密钥</string>
+    <string name="two_factor_public_key">公钥</string>
+    <string name="two_factor_public_key_copy">复制</string>
+    <string name="two_factor_key_hint">该端点用自己的密钥证明身份。私钥半部从不离开本机，服务端只保存上面的公钥半部——因此该端点可被单独吊销，且配置泄露不再等于以它的身份登入。</string>
     <string name="two_factor_sha1">SHA1（默认）</string>
     <string name="two_factor_sha256">SHA256</string>
     <string name="two_factor_sha512">SHA512</string>

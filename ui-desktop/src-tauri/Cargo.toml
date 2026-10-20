@@ -1,3 +1,17 @@
+# Its own workspace, said out loud.
+#
+# The root workspace excludes this crate and this crate has its own lockfile,
+# so it was never a member — but "excluded" is not the same as "a workspace of
+# its own", and cargo keeps walking up until it finds a root that does not
+# exclude it. Inside a worktree (`.worktrees/<branch>/ui-desktop/src-tauri`,
+# where every branch is built) that walk leaves this directory and finds the
+# repository root, which then claims a package it knows nothing about and the
+# build stops with "current package believes it's in a workspace when it's not".
+#
+# An empty `[workspace]` table ends the walk here, which is what this crate
+# has always been.
+[workspace]
+
 [package]
 name = "nexa"
 version = "0.6.1"

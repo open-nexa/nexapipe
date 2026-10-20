@@ -187,7 +187,11 @@ fun EndpointDetailScreen(
                 clientId = config.clientId,
                 secret = config.secret,
                 algorithm = config.algorithm,
-                device = if (sameCredential) current.device else null
+                device = if (sameCredential) current.device else null,
+                // A scanned code is always a secret, so it replaces whatever
+                // credential was here — a key included. The view model drops
+                // the key that went with it.
+                publicKey = null
             )
         }
         // The secret in the field now came from the camera, not from storage,
@@ -511,10 +515,70 @@ fun EndpointDetailScreen(
                                 singleLine = true
                             )
 
-                            Spacer(modifier = Modifier.height(8.dp))
-                            val secretLocked =
-                                storedSecretPresent && !secretReplaced && !credentialUnlock.unlocked
-                            OutlinedTextField(
+                            if (twoFactor.publicKey != null) {
+                                // A credential that is a key has no secret to
+                                // show and no algorithm to choose: the public
+                                // half below is what the server holds, and the
+                                // private half never leaves this device. The
+                                // scan and share buttons are gone with it —
+                                // there is nothing here to copy to another
+                                // device, and a scanned secret would be a
+                                // different kind of credential entirely.
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    stringResource(R.string.two_factor_credential_type),
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    stringResource(R.string.two_factor_type_key),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    stringResource(R.string.two_factor_public_key),
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                OutlinedTextField(
+                                    value = twoFactor.publicKey,
+                                    onValueChange = {},
+                                    readOnly = true,
+                                    label = { Text(stringResource(R.string.two_factor_public_key)) },
+                                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                                        fontFamily = FontFamily.Monospace
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                // A text button rather than a copy glyph: the
+                                // core icon set has no copy icon, and the one
+                                // this would borrow says "share" instead.
+                                TextButton(
+                                    onClick = {
+                                        copyToClipboard(
+                                            twoFactor.publicKey,
+                                            localizedContext.getString(
+                                                R.string.two_factor_public_key
+                                            )
+                                        )
+                                    }
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.two_factor_public_key_copy),
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = stringResource(R.string.two_factor_key_hint),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                val secretLocked =
+                                    storedSecretPresent && !secretReplaced && !credentialUnlock.unlocked
+                                OutlinedTextField(
                                 // Locked only while the field still holds the
                                 // secret this page opened with, and only until
                                 // the device confirms who is asking. A field
@@ -654,6 +718,7 @@ fun EndpointDetailScreen(
                                         maxLines = 1
                                     )
                                 }
+                            }
                             }
 
                             twoFactorImportWarning?.let { warning ->

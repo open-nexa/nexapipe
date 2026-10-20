@@ -4,7 +4,9 @@ use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_client::auth::{Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth};
+use nexapipe_client::auth::{
+    DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
+};
 use nexapipe_client::connection_pool::parse_endpoint_addr;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
@@ -117,6 +119,13 @@ pub struct ProxyNodeConfig {
     /// so re-importing the same invite after the credential landed is a no-op.
     #[allow(dead_code)]
     pub enrollment: Option<NodeEnrollment>,
+    /// This machine's own Ed25519 key for this endpoint, as 64 hex characters.
+    ///
+    /// A property of the *device* rather than of the credential: the same key is offered by
+    /// the enrollment that spends the token and signs every handshake after it, so it exists
+    /// before there is a credential to sign with. A node whose credential is a secret simply
+    /// has one it never used — the server ignored the offer.
+    pub device_key: Option<String>,
 }
 
 /// The 2FA credentials one node is configured with.
@@ -165,6 +174,18 @@ fn backend_addr(connection: &ConnectionConfig) -> Option<EndpointAddr> {
         ConnectionConfig::Ticket(ticket) => parse_endpoint_addr(None, Some(ticket)).ok(),
         ConnectionConfig::EndpointId(id) => parse_endpoint_addr(Some(id), None).ok(),
     }
+}
+
+/// The device key a node carries, read from the spelling it is stored in.
+///
+/// `None` when it has none, and also when the stored value is not a key: a
+/// credential nobody can read is no credential, and a node that answered with
+/// a key the server does not hold would be refused for a reason that says
+/// nothing about this side.
+fn key_for(node: &ProxyNodeConfig) -> Option<iroh::SecretKey> {
+    let spelled = node.device_key.as_deref()?;
+    let key = DeviceKey::from_hex(spelled).ok()?;
+    Some(key.secret_key().clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -371,11 +392,22 @@ impl ProxyManager {
         // been resolved to the backend ID its pool is keyed by. A node with no credentials keeps
         // none, so it opens no auth stream.
         for node in &self.config.nodes {
-            let has_secret = node
-                .two_factor
-                .as_ref()
-                .is_some_and(|tf| !tf.secret.trim().is_empty());
-            if !has_secret && node.enrollment.is_none() {
+            // A credential is a secret or a key, and which one it is comes from
+            // the record rather than from a flag: a key node stores no seed at
+            // all, so a secret that is empty is not a credential that is
+            // missing.
+            let two_factor = node.two_factor.as_ref();
+            let has_secret = two_factor.is_some_and(|tf| !tf.secret.trim().is_empty());
+            // A key is a credential only once it names the device it was
+            // issued to: the name comes back from the enrollment, and until
+            // then the key is an offer rather than something to answer with.
+            let has_key = two_factor.is_some_and(|tf| {
+                !has_secret
+                    && node.device_key.is_some()
+                    && tf.device.as_deref().is_some_and(|d| !d.trim().is_empty())
+            });
+            let has_credential = has_secret || has_key;
+            if !has_credential && node.enrollment.is_none() {
                 continue;
             }
 
@@ -389,10 +421,11 @@ impl ProxyManager {
                 }
             };
 
-            // A node holding a secret authenticates with it and never enrolls: enrolling
-            // rotates the server-side secret, so doing it on every start would invalidate
-            // every other device that already scanned the same invite.
-            if let Some(enrollment) = node.enrollment.as_ref().filter(|_| !has_secret) {
+            // A node holding a credential authenticates with it and never
+            // enrolls: enrolling rotates the server-side secret, so doing it on
+            // every start would invalidate every other device that already
+            // scanned the same invite.
+            if let Some(enrollment) = node.enrollment.as_ref().filter(|_| !has_credential) {
                 // The server looks an enrollment up by client_id too, so a token with no
                 // id can never match any pending entry there.
                 if enrollment.client_id.trim().is_empty() {
@@ -417,6 +450,20 @@ impl ProxyManager {
                 let enrollment = match device {
                     Some(device) => enrollment.with_device(device),
                     None => enrollment,
+                };
+                // A device key is offered here rather than asked for: the
+                // server records the public half under the device's name and
+                // issues no secret at all, so the private half never has to be
+                // anywhere but this machine. A server that predates keys
+                // ignores the offer and issues a secret as it always has.
+                //
+                // Only with a name, because the server refuses a key that
+                // names no device — and a refusal that reads as a bad token
+                // would be a lie: the token was fine and the device had no
+                // name.
+                let enrollment = match (device, key_for(node)) {
+                    (Some(_), Some(key)) => enrollment.with_key(key),
+                    _ => enrollment,
                 };
                 endpoint_group
                     .set_enrollment_for(&addr.id.to_string(), Some(enrollment))
@@ -445,17 +492,28 @@ impl ProxyManager {
                 );
             }
 
-            let auth = TwoFactorAuth::new(
-                &two_factor.client_id,
-                &two_factor.secret,
-                TotpAlgorithm::from_name(&two_factor.algorithm),
-            )
-            .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?;
+            // A key is the credential where there is one: the node stores no
+            // secret at all, so the TOTP path would find nothing to build from
+            // and the node would answer with nothing. A node that does hold a
+            // secret uses it — the server may have ignored the key and issued
+            // one instead, and then the secret is what it holds.
+            let device = two_factor.device.as_deref().map(str::trim);
+            let auth = match (has_secret, key_for(node), device) {
+                (false, Some(key), Some(device)) if !device.is_empty() => {
+                    TwoFactorAuth::with_key(&two_factor.client_id, key, device)
+                }
+                _ => TwoFactorAuth::new(
+                    &two_factor.client_id,
+                    &two_factor.secret,
+                    TotpAlgorithm::from_name(&two_factor.algorithm),
+                )
+                .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?,
+            };
             // Named only when the node carries a name: an empty one is not the
             // unnamed device, it is a field somebody left blank, and enrolling
             // or answering as "" would be refused by the server with a message
             // about printable ASCII that says nothing about this side.
-            let auth = match two_factor.device.as_deref().map(str::trim) {
+            let auth = match device {
                 Some(device) if !device.is_empty() => auth.with_device(device),
                 _ => auth,
             };

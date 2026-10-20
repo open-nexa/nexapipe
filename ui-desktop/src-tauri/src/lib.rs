@@ -7,6 +7,7 @@ pub mod service;
 pub mod status;
 
 use error::{codes, AppError};
+use nexapipe_client::auth::DeviceKey;
 use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
@@ -322,6 +323,10 @@ async fn start_proxy(
                 domains: merged,
                 two_factor,
                 enrollment,
+                // The device's own key, which belongs to the device rather
+                // than to the credential: the same key is offered by the
+                // enrollment and signs every handshake after it.
+                device_key: n.device_key.clone(),
             }
         })
         .collect();
@@ -767,6 +772,14 @@ pub struct InviteAccepted {
     pub relay: Option<String>,
     pub totp: Option<InviteTotpPayload>,
     pub enrollment: Option<InviteEnrollmentPayload>,
+    /// The public half of the device key this node will enroll with, as 64 hex
+    /// characters.
+    ///
+    /// `None` for an invite that hands out a secret rather than a token, and
+    /// for one whose key could not be stored. The private half never crosses
+    /// this boundary: it is filed in the store and read from there when a
+    /// connection needs it.
+    pub public_key: Option<String>,
 }
 
 /// Reads a `nexapipe://` invite pasted into the UI.
@@ -859,6 +872,42 @@ fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
         )?;
     }
 
+    // A registration invite is the one moment a device key can be offered: the
+    // token in it is the human moment, and the key is what this machine proves
+    // itself with from then on. Minted here so it is on file before the token
+    // is spent — a token cannot be spent twice, and a node whose key was lost
+    // afterwards cannot enroll again from the same code.
+    //
+    // Only for a node that has no key yet: the key belongs to the device, and
+    // replacing it here would leave the server holding the old public half
+    // while this machine signs with a new one. Re-importing the same invite
+    // keeps the key it already has.
+    //
+    // The private half is filed in the store and never crosses to the
+    // renderer; only the public half does, because it is not a secret and it
+    // is what names this key to an operator.
+    let public_key = match &invite.enrollment {
+        Some(_) => {
+            let key = match credentials::get(&credentials::secret_key(
+                credentials::CredentialKind::DeviceKey,
+                &node_id,
+            ))? {
+                Some(spelled) => DeviceKey::from_hex(&spelled)
+                    .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?,
+                None => {
+                    let key = DeviceKey::generate();
+                    credentials::put(
+                        &credentials::secret_key(credentials::CredentialKind::DeviceKey, &node_id),
+                        &key.private_hex(),
+                    )?;
+                    key
+                }
+            };
+            Some(key.public_hex())
+        }
+        None => None,
+    };
+
     // What `take_invited_node_credentials` answers from: the connection string
     // this node is identified by was filed by an invite the user just imported,
     // so the configuration is allowed to read it back — once.
@@ -885,6 +934,7 @@ fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
             .map(|enrollment| InviteEnrollmentPayload {
                 client_id: enrollment.client_id.clone(),
             }),
+        public_key,
     })
 }
 
@@ -963,6 +1013,8 @@ async fn take_issued_credential(
                     client_id: credential.client_id,
                     secret: credential.secret,
                     algorithm: credential.algorithm,
+                    public_key: credential.public_key,
+                    device: credential.device,
                 })
         }
         None => None,
@@ -1237,6 +1289,7 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
     let kind = match kind {
         "totp" => credentials::CredentialKind::TotpSecret,
         "enrollment" => credentials::CredentialKind::EnrollmentToken,
+        "devicekey" => credentials::CredentialKind::DeviceKey,
         "relay" => credentials::CredentialKind::RelayToken,
         "ticket" => credentials::CredentialKind::Ticket,
         "endpoint" => credentials::CredentialKind::EndpointId,
@@ -1271,6 +1324,20 @@ fn credential_kind(kind: &str, node_id: Option<String>) -> Result<String, AppErr
 struct NodeCredentials {
     totp: Option<String>,
     enrollment: Option<String>,
+    /// The private half of this node's device key, when it has one.
+    ///
+    /// A credential like the secret beside it, and it crosses this boundary for
+    /// the same reason: the proxy needs it to sign, and in the service mode the
+    /// service is a separate process with no store of its own.
+    device_key: Option<String>,
+    /// The public half of that key, as 64 hex characters.
+    ///
+    /// Derived from the private half rather than stored beside it, so the two
+    /// can never disagree about which key this is. Not a secret — the server
+    /// holds the same one — and it is what the app shows to name the key an
+    /// operator has on file.
+    #[serde(default)]
+    public_key: Option<String>,
     ticket: Option<String>,
     endpoint: Option<String>,
 }
@@ -1285,6 +1352,16 @@ struct RuntimeCredentials {
 
 /// Reads one node's credentials out of the store.
 fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
+    let device_key = credentials::get(&credentials::secret_key(
+        credentials::CredentialKind::DeviceKey,
+        node_id,
+    ))?;
+    // Derived rather than stored: a value that could disagree with the private
+    // half beside it would name the wrong key to an operator.
+    let public_key = device_key
+        .as_deref()
+        .and_then(|spelled| DeviceKey::from_hex(spelled).ok())
+        .map(|key| key.public_hex());
     Ok(NodeCredentials {
         totp: credentials::get(&credentials::secret_key(
             credentials::CredentialKind::TotpSecret,
@@ -1294,6 +1371,8 @@ fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
             credentials::CredentialKind::EnrollmentToken,
             node_id,
         ))?,
+        device_key,
+        public_key,
         ticket: credentials::get(&credentials::secret_key(
             credentials::CredentialKind::Ticket,
             node_id,

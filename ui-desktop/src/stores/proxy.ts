@@ -445,6 +445,10 @@ async function start(): Promise<void> {
       // which answers with the client's own secret — the shape every server understood
       // before a client could have several.
       two_factor_device: node.twoFactor?.device ?? null,
+      // This machine's own Ed25519 key for this endpoint. A property of the device
+      // rather than of the credential: the same key is offered by the enrollment
+      // that spends the token and signs every handshake after it.
+      device_key: node.deviceKey ?? null,
       // A registration invite's token, spent on the first connection of this run.
       enrollment_client_id: node.enrollment?.clientId ?? null,
       enrollment_token: node.enrollment?.token ?? null,

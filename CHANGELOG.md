@@ -49,6 +49,15 @@ its defaults — which are on.
   secret, and the client authenticates every later connection with
   `TwoFactorAuth::with_key`. An older server ignores the offered key and
   issues a secret as before, which the client then uses.
+- **Both apps can hold a device key.** A `v=2` registration invite — the one
+  that carries a one-shot token instead of a secret — now enrolls the device
+  with a key of its own on both the desktop and Android, with nothing asked of
+  the user and no change to the invite format. The private half is generated on
+  the device, sealed at rest beside the other credentials, and never leaves it;
+  the public half is what the server records and what the app displays, so an
+  operator can tell which key a server has on file. A server that predates keys
+  ignores the offer and issues a secret as before, which the app then uses, so
+  the same invite works against both.
 - **Six `[timeouts]` keys for the per-phase budgets.** `header_secs`,
   `body_secs`, `response_idle_secs`, `l4_flow_secs`, `l4_idle_secs` and
   `tls_hello_secs` bound, respectively, how long a client may take to send its

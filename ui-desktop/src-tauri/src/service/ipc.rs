@@ -59,6 +59,15 @@ pub struct NodeInput {
     /// UI that knows nothing about devices keeps working untouched.
     #[serde(default)]
     pub two_factor_device: Option<String>,
+    /// This machine's own Ed25519 key for this endpoint, as 64 hex characters.
+    ///
+    /// A property of the *device* rather than of the credential: the same key
+    /// is offered by the enrollment that spends the token and signs every
+    /// handshake after it, so it exists before there is a credential to sign
+    /// with. Optional for the same reason the other fields are — an older UI
+    /// knows nothing about keys.
+    #[serde(default)]
+    pub device_key: Option<String>,
     /// A one-time enrollment token instead of a secret: the service spends it on the first
     /// connection and answers with the credential the server issued. Optional for the same
     /// reason the 2FA fields are — an older UI has nothing to say about enrollment.
@@ -98,7 +107,10 @@ impl NodeInput {
     }
     pub fn two_factor(&self) -> Option<NodeTwoFactor> {
         let secret = self.two_factor_secret.as_deref().unwrap_or_default().trim();
-        if secret.is_empty() {
+        // A credential is a secret or a key, and which one it is comes from
+        // what is there rather than from a flag: a key node stores no seed at
+        // all, so an empty secret is not a missing credential.
+        if secret.is_empty() && self.device_key.is_none() {
             return None;
         }
         Some(NodeTwoFactor {
@@ -172,6 +184,18 @@ pub struct IssuedCredentialPayload {
     pub secret: String,
     /// Lowercase algorithm name, which is what `twoFactorAlgorithm` holds.
     pub algorithm: String,
+    /// The public half of the device key this credential was issued as, as 64
+    /// hex characters.
+    ///
+    /// `None` for a credential that is a secret, and that is how the two kinds
+    /// are told apart: a key credential has an empty secret and an empty
+    /// algorithm, and this is the only thing that says which key it is.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// The device the server filed this credential under, which has to be kept
+    /// with it: the server looks a credential up by that name.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 // Hand-written rather than derived, for the same reason as `NodeInput`'s: this
@@ -183,6 +207,8 @@ impl std::fmt::Debug for IssuedCredentialPayload {
             .field("client_id", &self.client_id)
             .field("secret", &REDACTED)
             .field("algorithm", &self.algorithm)
+            .field("public_key", &self.public_key)
+            .field("device", &self.device)
             .finish()
     }
 }
@@ -317,6 +343,7 @@ mod tests {
             two_factor_secret: None,
             two_factor_algorithm: None,
             two_factor_device: None,
+            device_key: None,
             enrollment_client_id: None,
             enrollment_token: None,
             enrollment_device: None,
@@ -330,6 +357,22 @@ mod tests {
         let mut node = node();
         node.two_factor_client_id = Some("client-001".to_string());
         assert!(node.two_factor().is_none());
+    }
+
+    /// A key node stores no seed at all, so an empty secret is not a missing credential:
+    /// the key is what this node proves itself with.
+    #[test]
+    fn a_node_with_a_key_carries_credentials_without_a_secret() {
+        let mut node = node();
+        node.two_factor_client_id = Some("client-001".to_string());
+        node.two_factor_device = Some("laptop".to_string());
+        node.device_key = Some("ab".repeat(32));
+
+        let two_factor = node.two_factor().expect("the node carries a key");
+        assert_eq!(two_factor.client_id, "client-001");
+        assert_eq!(two_factor.secret, "", "a key node stores no seed");
+        assert_eq!(two_factor.device.as_deref(), Some("laptop"));
+        assert_eq!(node.device_key.as_deref(), Some("ab".repeat(32).as_str()));
     }
 
     #[test]

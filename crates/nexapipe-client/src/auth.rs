@@ -624,6 +624,89 @@ impl TwoFactorAuth {
     }
 }
 
+/// A device's own Ed25519 key: the credential a device proves itself with when
+/// nobody is there to read a code off a screen.
+///
+/// The private half is the credential and never leaves the device; the public
+/// half is what the server stores, under the name of the device the key was
+/// issued to. Both are lowercase hex, because that is the spelling the server's
+/// config file uses and the only spelling an app has to write down — an app
+/// that keeps a key across a restart has nowhere else to put it but a string.
+///
+/// The type exists so that both apps agree on that spelling, and so that
+/// neither of them has to do Ed25519 itself: Android's cryptography API has no
+/// Ed25519 below API 33, and the app supports API 26.
+#[derive(Clone)]
+pub struct DeviceKey {
+    key: iroh::SecretKey,
+}
+
+impl DeviceKey {
+    /// A fresh key pair. The private half is never handed to anybody; the
+    /// public half is what an enrollment offers.
+    pub fn generate() -> Self {
+        Self {
+            key: iroh::SecretKey::generate(),
+        }
+    }
+
+    /// Reads a private half back from the spelling it was stored in.
+    ///
+    /// The length is what is checked, and it is checked strictly: a key is 32
+    /// bytes, so a stored key is 64 hex characters, and anything else is a
+    /// string that is not a key. The bytes themselves are not a point on a
+    /// curve — an Ed25519 private key is arbitrary bytes, and a key that was
+    /// never offered to a server simply proves nothing.
+    pub fn from_hex(spelled: &str) -> Result<Self, ClientError> {
+        let trimmed = spelled.trim();
+        let decoded = hex::decode(trimmed).map_err(|_| {
+            ClientError::InvalidConfig(
+                "a device key is 64 hex characters, and this is not hex".into(),
+            )
+        })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+            ClientError::InvalidConfig(format!(
+                "a device key is 64 hex characters, and this one is {} characters",
+                trimmed.len()
+            ))
+        })?;
+        Ok(Self {
+            key: iroh::SecretKey::from_bytes(&bytes),
+        })
+    }
+
+    /// The private half, lowercase hex — the spelling an app persists.
+    ///
+    /// It is the credential, so it is written down the way a TOTP secret is:
+    /// encrypted at rest, behind the operating system's own door, and never
+    /// shown on a screen.
+    pub fn private_hex(&self) -> String {
+        hex::encode(self.key.to_bytes())
+    }
+
+    /// The public half, lowercase hex — the spelling the server stores and the
+    /// one an app displays.
+    pub fn public_hex(&self) -> String {
+        hex::encode(self.key.public().as_bytes())
+    }
+
+    /// The key itself, for the paths that need to sign with it.
+    pub fn secret_key(&self) -> &iroh::SecretKey {
+        &self.key
+    }
+}
+
+impl fmt::Debug for DeviceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The key's own `Debug` is redacted, so this cannot leak the private
+        // half — but the public half is named, because it is not a secret and
+        // it is what identifies this device to an operator.
+        f.debug_struct("DeviceKey")
+            .field("public_key", &self.public_hex())
+            .finish()
+    }
+}
+
 /// A credential the server issued during enrollment, in the form an app can
 /// store it.
 ///
@@ -1075,7 +1158,7 @@ pub mod auth_protocol {
 #[cfg(test)]
 mod tests {
     use super::{
-        Enrollment, IssuedCredential, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth,
+        DeviceKey, Enrollment, IssuedCredential, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth,
         TwoFactorConfig, auth_protocol::AuthMessage, device_id_is_usable,
     };
 
@@ -1443,5 +1526,61 @@ mod tests {
         );
 
         assert!(device_id_is_usable(&"x".repeat(MAX_DEVICE_ID_LEN)));
+    }
+
+    /// A key survives the trip through the spelling an app stores it in, which
+    /// is the only trip it ever makes: the private half is written down,
+    /// sealed, and read back on the next start.
+    #[test]
+    fn a_device_key_round_trips_through_its_own_spelling() {
+        let key = DeviceKey::generate();
+        let private = key.private_hex();
+        let public = key.public_hex();
+
+        assert_eq!(private.len(), 64, "a private half is 32 bytes of hex");
+        assert_eq!(public.len(), 64, "a public half is 32 bytes of hex");
+        assert_ne!(private, public, "the two halves are not the same bytes");
+        assert!(
+            private
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{private} is lowercase hex"
+        );
+
+        let read_back = DeviceKey::from_hex(&private).expect("a key reads back");
+        assert_eq!(read_back.private_hex(), private);
+        assert_eq!(read_back.public_hex(), public);
+    }
+
+    /// A key is 32 bytes, so a stored key is 64 hex characters. Anything else
+    /// is a string that is not a key, and an app that reads one has to be told
+    /// rather than handed a credential that proves nothing.
+    #[test]
+    fn a_device_key_that_is_not_a_key_is_refused() {
+        assert!(DeviceKey::from_hex("").is_err(), "empty");
+        assert!(DeviceKey::from_hex("not hex at all").is_err(), "not hex");
+        assert!(
+            DeviceKey::from_hex(&"a".repeat(63)).is_err(),
+            "one character short"
+        );
+        assert!(
+            DeviceKey::from_hex(&"a".repeat(65)).is_err(),
+            "one character long"
+        );
+    }
+
+    /// The key's own `Debug` is redacted, and this wrapper must not undo that:
+    /// a `Debug` that prints a private half turns every log line and panic
+    /// message that touches one into a credential disclosure.
+    #[test]
+    fn a_device_key_never_prints_its_private_half() {
+        let key = DeviceKey::generate();
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains(&key.private_hex()), "{rendered}");
+        assert!(
+            rendered.contains(&key.public_hex()),
+            "the public half is not a secret and is what names the device: {rendered}"
+        );
     }
 }

@@ -122,6 +122,39 @@ object IrohProxy {
     ): Int
 
     /**
+     * Mints a device key and hands back its private half, as 64 hex characters.
+     *
+     * The key is generated in Rust because Android's cryptography API has no
+     * Ed25519 below API 33, and this app supports API 26.
+     *
+     * The private half is the credential: it proves this device to the server
+     * and never leaves the device. It is sealed at rest like every other
+     * credential here, and read back on every start. The public half is what
+     * the server stores, and the app displays it so an operator can tell which
+     * key a server holds.
+     *
+     * Null when the key could not be handed over, which is a failure rather
+     * than a key that proves nothing.
+     */
+    external fun nativeGenerateDeviceKey(): String?
+
+    /**
+     * Registers the device key of one endpoint.
+     *
+     * nodeId: endpoint ID this key belongs to.
+     * key:    the private half, as 64 hex characters — what
+     *         [nativeGenerateDeviceKey] handed out.
+     *
+     * A key is offered by the enrollment that spends the node's token, and
+     * signs every handshake after it. A node whose enrollment has not happened
+     * yet has a key but no device name, and the name is what the server
+     * answers with — so the key is an offer until then, not a credential.
+     *
+     * Must be called before nativeStartProxy.
+     */
+    external fun nativeSetDeviceKeyForNode(nodeId: String, key: String): Int
+
+    /**
      * Registers a one-time enrollment token for one endpoint, in place of
      * credentials.
      *
@@ -150,20 +183,25 @@ object IrohProxy {
      *
      * `clientId`, `secret` and `algorithm` on three lines, with the device the
      * server named on a fourth when it named one — which every server that
-     * predates devices leaves off. Null when this run enrolled nothing. Only
-     * the first call after a successful connect ever returns anything, and what
-     * it returns is the sole copy: without it the device is left holding an
-     * invite the server has already forgotten.
+     * predates devices leaves off — and the public key on a fifth when the
+     * credential is a key. A key credential has an empty secret and an empty
+     * algorithm, and that last line is how the two kinds are told apart.
+     *
+     * Null when this run enrolled nothing. Only the first call after a
+     * successful connect ever returns anything, and what it returns is the sole
+     * copy: without it the device is left holding an invite the server has
+     * already forgotten.
      */
     external fun nativeTakeIssuedCredential(): String?
 
     /**
-     * Drops every credential set with [nativeSetTwoFactorForNode], and every
-     * token set with [nativeSetEnrollmentForNode].
+     * Drops every credential set with [nativeSetTwoFactorForNode], every token
+     * set with [nativeSetEnrollmentForNode], and every key set with
+     * [nativeSetDeviceKeyForNode].
      *
-     * Both tables answer the same question — how this endpoint authenticates —
-     * so one call clears both; a stale entry in either would otherwise keep
-     * applying to an endpoint that no longer has one.
+     * All three tables answer the same question — how this endpoint
+     * authenticates — so one call clears them all; a stale entry in any of them
+     * would otherwise keep applying to an endpoint that no longer has one.
      *
      * Read the configuration back through this pair on every connect: the
      * native tables outlive a single session.

@@ -95,6 +95,14 @@ pub enum CredentialKind {
     TotpSecret,
     /// A node's one-time enrollment token.
     EnrollmentToken,
+    /// A node's own Ed25519 key: the private half, as 64 hex characters.
+    ///
+    /// A credential like the secret beside it, and a stronger one — the server
+    /// holds the public half and nobody else holds this one, so what the
+    /// desktop keeps here is the only copy there is. It never leaves the
+    /// machine, and the app has no way to show it: there is nothing to read
+    /// off a screen, which is the whole point of a key.
+    DeviceKey,
     /// The bearer token a custom relay asks for. Not per-node: it is a global setting.
     RelayToken,
     /// The ticket a node reaches its server by. An address-bearing invite string,
@@ -112,6 +120,7 @@ impl CredentialKind {
         match self {
             CredentialKind::TotpSecret => "totp",
             CredentialKind::EnrollmentToken => "enrollment",
+            CredentialKind::DeviceKey => "devicekey",
             CredentialKind::RelayToken => "relay",
             CredentialKind::Ticket => "ticket",
             CredentialKind::EndpointId => "endpoint",
@@ -1301,6 +1310,13 @@ mod tests {
         assert_eq!(
             super::secret_key(CredentialKind::EnrollmentToken, "node-1"),
             "enrollment:node-1"
+        );
+        // A device key is a credential like the secret beside it, and it is
+        // filed under its node the same way: a key that outlived the node it
+        // belonged to would be handed to whatever node reuses that id.
+        assert_eq!(
+            super::secret_key(CredentialKind::DeviceKey, "node-1"),
+            "devicekey:node-1"
         );
         assert_eq!(
             super::secret_key(CredentialKind::RelayToken, "ignored"),
