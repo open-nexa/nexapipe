@@ -62,13 +62,18 @@ and rewriting it is cheaper than arguing with it.
 Before writing anything, look for a pull request that already covers the area:
 
 ```bash
-gh pr list --state open --json number,title,headRefName
+gh pr list --repo open-nexa/nexapipe --state open --json number,title,headRefName
 ```
 
 A PR's head branch lives in `origin` (the fork); the PR itself lives in
 `upstream` (`open-nexa/nexapipe`). If the branch you are about to touch has an
 open PR, the work belongs on that branch and in that branch's worktree — see
 step 3 — not on a fresh one.
+
+The `--repo` flag is what lets the command reach the upstream pull requests
+from a fork checkout. `gh repo set-default open-nexa/nexapipe` sets it once per
+checkout, but that setting is local to the machine and does not travel with a
+clone, so a command that has to work anywhere keeps the flag.
 
 For what to work on, the issues and the "Good first issues" list in
 `CONTRIBUTING.md` are the sources. An agent should not invent scope: a task that
@@ -92,16 +97,22 @@ Every new branch starts from the newest `upstream/main`, never from the local
 
 ```bash
 git fetch --no-tags upstream main
-git worktree add .worktrees/<branch> -b <branch> upstream/main
-cd .worktrees/<branch>
+mkdir -p .worktrees/<owner>            # the parent of the branch's path
+git worktree add .worktrees/<owner>/<name> -b <owner>/<name> upstream/main
+cd .worktrees/<owner>/<name>
 git merge-base --is-ancestor upstream/main HEAD
 ```
 
-The directory name is the branch name with `/` flattened to `-`
-(`v070/audit-fixes` → `.worktrees/v070-audit-fixes`). Worktrees live inside the
-repository and are git-ignored, so their files go through the same file-access
-path as the rest of the project — a worktree outside the repository is a
-separate scope, and reading it is a prompt that can become a standing refusal.
+The directory path is the branch name verbatim (`v070/audit-fixes` →
+`.worktrees/v070/audit-fixes`), so two branch names can never land on the same
+directory — flattening the slashes to dashes would let `a/b-c` and `a-b/c` both
+ask for `a-b-c`. The parent directory has to exist first; `git worktree add`
+does not create it.
+
+Worktrees live inside the repository and are git-ignored, so their files go
+through the same file-access path as the rest of the project — a worktree
+outside the repository is a separate scope, and reading it is a prompt that can
+become a standing refusal.
 
 Searches and reads have to name the worktree explicitly: a search rooted at the
 repository root does not descend into `.worktrees/`, because each worktree is
@@ -129,9 +140,9 @@ a behaviour change, and a test that was not run is not a test that passed.
 
 | What changed | Run locally | CI job that confirms it |
 | --- | --- | --- |
-| `crates/nexapipe/`, `crates/nexapipe-proto/` | `cargo test --workspace`; `cargo clippy --workspace --all-targets -- -D warnings`; `rustfmt --edition 2024 <file>` | `test (ubuntu-latest)`, `test (macos-15)`, `cargo test (windows-latest)`, `clippy`, `rustfmt` |
+| `crates/nexapipe/`, `crates/nexapipe-proto/` | `cargo test --workspace`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `rustfmt --edition 2024 <file>` | `test (ubuntu-latest)`, `test (macos-15)`, `cargo test (windows-latest)`, `clippy`, `rustfmt` |
 | `crates/nexapipe-client/`, feature-gated code | `cargo check -p nexapipe-client --features <features>` for each feature set you touched | `client features (local-proxy)`, `(jni,local-proxy)`, `(tun-proxy)`, `(uniffi)`, `(webpki-roots)` |
-| The TUN proxy or the L4 client | `cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo test -p nexapipe-client --features tun-proxy` | `android ndk (tun-proxy / jni)` |
+| The TUN proxy or the L4 client | `cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo ndk -t x86_64 --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy`; `cargo test -p nexapipe-client --features tun-proxy` | `android ndk (tun-proxy / jni)` |
 | `ui-android/` | `cd ui-android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin` | `android app (unit tests + debug build)`, `android lint` |
 | `ui-desktop/` frontend | `cd ui-desktop && npm ci && npm run build && npm run lint:i18n && npm run lint:tokens` | `desktop frontend (typecheck + build + linters)` |
 | `ui-desktop/src-tauri/` | `cd ui-desktop/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib` | `desktop rust (clippy + tests)`, `desktop cargo check (macos-15 / ubuntu-22.04 / windows-latest)` |
