@@ -689,6 +689,10 @@ pub struct ProxyConfig {
     /// How often a failed request is tried again. Absent means it is not.
     #[serde(default)]
     pub retry: RetryConfig,
+    /// When a backend that keeps failing stops being picked. Absent means it
+    /// is, with the defaults.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 /// The `[backends]` section: how the proxy reaches the backends themselves.
@@ -771,6 +775,71 @@ impl Retry {
 impl Default for Retry {
     fn default() -> Self {
         Self::resolve(RetryConfig::default())
+    }
+}
+
+/// The `[circuit_breaker]` section: when a backend that keeps failing stops
+/// being picked.
+///
+/// A health probe says what a backend looked like the last time somebody
+/// asked. A circuit breaker says what the traffic itself found: this backend
+/// refused the last five connections, so stop sending it any until it has had
+/// a chance to come back. The two answer different questions and are meant to
+/// be on at the same time.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct CircuitBreakerConfig {
+    /// `false` leaves every backend in rotation however it fails. Default:
+    /// `true`.
+    pub enabled: Option<bool>,
+    /// Consecutive failures before a backend stops being picked. Default: 5.
+    ///
+    /// More than one, because a single refused connection is a blip and a
+    /// backend taken out of rotation on one is a backend that stays out.
+    pub failure_threshold: Option<u64>,
+    /// Seconds before an open circuit lets a request through to try the
+    /// backend again. Default: 30.
+    ///
+    /// The request that gets through is a trial: it decides whether the
+    /// circuit closes again, and the backend is out of rotation until it
+    /// answers.
+    pub reset_secs: Option<u64>,
+}
+
+/// The `[circuit_breaker]` section with every default filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitBreaker {
+    pub enabled: bool,
+    pub failure_threshold: usize,
+    pub reset: std::time::Duration,
+}
+
+impl CircuitBreaker {
+    const DEFAULT_FAILURE_THRESHOLD: u64 = 5;
+    const DEFAULT_RESET_SECS: u64 = 30;
+    const MAX_FAILURE_THRESHOLD: u64 = 1000;
+    const MAX_RESET_SECS: u64 = 3600;
+
+    pub fn resolve(config: CircuitBreakerConfig) -> Self {
+        CircuitBreaker {
+            enabled: config.enabled.unwrap_or(true),
+            failure_threshold: config
+                .failure_threshold
+                .unwrap_or(Self::DEFAULT_FAILURE_THRESHOLD)
+                .clamp(1, Self::MAX_FAILURE_THRESHOLD) as usize,
+            reset: std::time::Duration::from_secs(
+                config
+                    .reset_secs
+                    .unwrap_or(Self::DEFAULT_RESET_SECS)
+                    .min(Self::MAX_RESET_SECS),
+            ),
+        }
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::resolve(CircuitBreakerConfig::default())
     }
 }
 
@@ -1001,6 +1070,11 @@ impl ProxyConfig {
         Retry::resolve(self.retry)
     }
 
+    /// The `[circuit_breaker]` settings this config resolves to.
+    pub fn circuit_breaker(&self) -> CircuitBreaker {
+        CircuitBreaker::resolve(self.circuit_breaker)
+    }
+
     /// Whether the config file this was read from holds a credential.
     ///
     /// Asked about the *file*, not about what the process is running with: the
@@ -1173,7 +1247,8 @@ impl ProxyConfig {
                 )
                 .with_l4_options(l4_options)
                 .with_modes(modes.clone())
-                .with_backend_protocol(backend_protocol),
+                .with_backend_protocol(backend_protocol)
+                .with_circuit_breaker(self.circuit_breaker()),
             );
 
             tracing::info!(
@@ -3244,6 +3319,39 @@ backends = ["http://10.0.0.5:8080"]
             message.contains("host_pattern = \"*\""),
             "the error must say what to write instead: {message}"
         );
+    }
+
+    /// The `[circuit_breaker]` section, and what it does when it is not
+    /// there.
+    #[test]
+    fn the_circuit_breaker_section_is_read_and_bounded() {
+        let breaker = CircuitBreaker::resolve(CircuitBreakerConfig::default());
+        assert!(breaker.enabled, "the circuit is on unless it is turned off");
+        assert_eq!(breaker.failure_threshold, 5);
+        assert_eq!(breaker.reset, std::time::Duration::from_secs(30));
+
+        let config = parse(
+            r#"
+[circuit_breaker]
+enabled = false
+failure_threshold = 2
+reset_secs = 10
+"#,
+        );
+        let breaker = config.circuit_breaker();
+        assert!(!breaker.enabled);
+        assert_eq!(breaker.failure_threshold, 2);
+        assert_eq!(breaker.reset, std::time::Duration::from_secs(10));
+
+        // A threshold of zero would take every backend out on its first
+        // failure, which is not what anybody means by zero.
+        let config = parse(
+            r#"
+[circuit_breaker]
+failure_threshold = 0
+"#,
+        );
+        assert_eq!(config.circuit_breaker().failure_threshold, 1);
     }
 
     /// The `[retry]` section, and what it does when it is not there.

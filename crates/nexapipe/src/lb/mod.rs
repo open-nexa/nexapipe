@@ -1,6 +1,7 @@
+use crate::config::CircuitBreaker;
 use rand;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
@@ -65,15 +66,125 @@ impl BackendStatus {
 /// to await anything — can always happen, and never waits behind a health probe.
 #[derive(Debug)]
 struct BackendEntry {
+    /// The address, kept beside the health status so that the circuit can
+    /// name the backend it is talking about without waiting on a lock.
+    url: String,
     status: RwLock<BackendStatus>,
     in_flight: AtomicUsize,
+    /// The circuit this backend's failures are counted on.
+    ///
+    /// A plain mutex rather than the async lock the health status uses: the
+    /// circuit is read and written on every request, and it never waits for
+    /// anything.
+    circuit: Mutex<CircuitState>,
+    /// The settings the circuit runs with.
+    ///
+    /// Absent means the circuit is off — a pool built in code, rather than
+    /// from a config, behaves as it always did. Set once, when the route is
+    /// built.
+    breaker: OnceLock<CircuitBreaker>,
+}
+
+/// Where a backend's circuit stands.
+///
+/// Two states, not three: a circuit is closed (traffic flows, failures are
+/// counted) or open (the backend is out of rotation until the cooldown
+/// passes). The trial request that the cooldown allows is not a state of its
+/// own — it is a closed circuit that re-opens on the first failure instead of
+/// on the fifth, which is the same rule with one fewer step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Closed,
+    Open,
+}
+
+#[derive(Debug)]
+struct CircuitState {
+    phase: Phase,
+    /// Consecutive failures, reset by a success.
+    failures: usize,
+    /// When the circuit opened, for the cooldown.
+    opened_at: Option<std::time::Instant>,
+}
+
+impl CircuitState {
+    fn new() -> Self {
+        CircuitState {
+            phase: Phase::Closed,
+            failures: 0,
+            opened_at: None,
+        }
+    }
 }
 
 impl BackendEntry {
     fn new(url: String) -> Self {
         BackendEntry {
+            url: url.clone(),
             status: RwLock::new(BackendStatus::new(url)),
             in_flight: AtomicUsize::new(0),
+            circuit: Mutex::new(CircuitState::new()),
+            breaker: OnceLock::new(),
+        }
+    }
+
+    /// The settings the circuit runs with, if it runs with any.
+    fn breaker(&self) -> Option<&CircuitBreaker> {
+        self.breaker.get()
+    }
+
+    /// Whether a request may be sent to this backend right now.
+    ///
+    /// An open circuit says no until its cooldown has passed. The check does
+    /// not change the state: whether the request that gets through is the
+    /// trial one is decided by what happens to it.
+    fn circuit_allows(&self) -> bool {
+        let Some(breaker) = self.breaker() else {
+            return true;
+        };
+        if !breaker.enabled {
+            return true;
+        }
+        let circuit = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+        match circuit.phase {
+            Phase::Closed => true,
+            Phase::Open => circuit
+                .opened_at
+                .map(|at| at.elapsed() >= breaker.reset)
+                .unwrap_or(true),
+        }
+    }
+
+    /// The backend answered.
+    fn circuit_succeeded(&self) {
+        let mut circuit = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+        circuit.phase = Phase::Closed;
+        circuit.failures = 0;
+        circuit.opened_at = None;
+    }
+
+    /// The backend did not answer.
+    fn circuit_failed(&self) {
+        let Some(breaker) = self.breaker() else {
+            return;
+        };
+        if !breaker.enabled {
+            return;
+        }
+        let mut circuit = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+        circuit.failures += 1;
+        // A circuit that is open re-opens on the first failure: the trial
+        // request that the cooldown let through failed, and the backend is
+        // still down.
+        if circuit.phase == Phase::Open || circuit.failures >= breaker.failure_threshold {
+            circuit.phase = Phase::Open;
+            circuit.opened_at = Some(std::time::Instant::now());
+            tracing::warn!(
+                "Backend {} failed {} time(s) in a row; it is out of rotation for {:?}",
+                self.url,
+                circuit.failures,
+                breaker.reset
+            );
         }
     }
 }
@@ -97,6 +208,23 @@ impl BackendLease {
     /// The address this flow is to be forwarded to.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The backend answered.
+    ///
+    /// What the circuit counts: a backend that answers is a backend that is
+    /// up, however slowly it answered.
+    pub fn record_success(&self) {
+        self.entry.circuit_succeeded();
+    }
+
+    /// The backend did not answer.
+    ///
+    /// What the circuit counts: a backend that refuses connections or that
+    /// never sends a status line is a backend that is down, and after enough
+    /// of those it stops being picked.
+    pub fn record_failure(&self) {
+        self.entry.circuit_failed();
     }
 }
 
@@ -135,6 +263,16 @@ impl BackendPool {
             backends: backend_statuses,
             strategy,
             round_robin_index: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    /// The settings the circuit on every backend of this pool runs with.
+    ///
+    /// Set once, when the route is built: a pool built in code — a test, the
+    /// local proxy — has no circuit at all and behaves as it always did.
+    pub fn set_circuit_breaker(&self, breaker: CircuitBreaker) {
+        for backend in &self.backends {
+            let _ = backend.breaker.set(breaker);
         }
     }
 
@@ -244,7 +382,7 @@ impl BackendPool {
                 untried.push(*i);
             }
         }
-        let healthy_backends = if untried.is_empty() {
+        let mut healthy_backends = if untried.is_empty() {
             if !exclude.is_empty() {
                 tracing::debug!(
                     "Every healthy backend behind this route has been tried; trying one of them \
@@ -255,6 +393,30 @@ impl BackendPool {
         } else {
             untried
         };
+
+        // The ones whose circuit is not open. A backend that keeps failing is
+        // out of rotation until its cooldown passes: the route answers 503
+        // rather than dialling a backend that is known to be down, which
+        // spends a whole connect timeout to say the same thing.
+        let serving: Vec<usize> = healthy_backends
+            .iter()
+            .copied()
+            .filter(|i| self.backends[*i].circuit_allows())
+            .collect();
+        if serving.len() < healthy_backends.len() {
+            tracing::warn!(
+                "{} of {} healthy backend(s) behind this route are out of rotation; \
+                 the circuit is open on them",
+                healthy_backends.len() - serving.len(),
+                healthy_backends.len()
+            );
+        }
+        if serving.is_empty() {
+            // Every healthy backend has an open circuit. That is an answer:
+            // the route is configured and nothing behind it is serving.
+            return None;
+        }
+        healthy_backends = serving;
 
         let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {
@@ -547,6 +709,113 @@ mod tests {
             (first.as_str(), second.as_str()),
             ("http://a:80", "http://b:80"),
             "both are idle, so the two picks should not land on the same backend"
+        );
+    }
+
+    /// A circuit that opens on the second failure and stays open for a minute.
+    fn breaker(threshold: usize) -> CircuitBreaker {
+        CircuitBreaker {
+            enabled: true,
+            failure_threshold: threshold,
+            reset: std::time::Duration::from_secs(60),
+        }
+    }
+
+    /// A backend that keeps failing is out of rotation.
+    ///
+    /// The point of a circuit: the route stops dialling a backend that is
+    /// known to be down, and answers instead of spending a connect timeout to
+    /// find out what it already knows.
+    #[tokio::test]
+    async fn a_backend_that_keeps_failing_leaves_the_rotation() {
+        let pool = pool(&["http://a:80"]);
+        pool.set_circuit_breaker(breaker(2));
+
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+
+        assert!(
+            pool.select_backend().await.is_none(),
+            "the backend has failed twice in a row, so the circuit is open and it is not picked"
+        );
+    }
+
+    /// One failure is not enough: a backend that blipped once is still a
+    /// backend.
+    #[tokio::test]
+    async fn one_failure_does_not_take_a_backend_out() {
+        let pool = pool(&["http://a:80"]);
+        pool.set_circuit_breaker(breaker(2));
+
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+
+        assert!(
+            pool.select_backend().await.is_some(),
+            "one failure is a blip, not a verdict"
+        );
+    }
+
+    /// A backend that answers is a backend that is up, and the circuit says
+    /// so.
+    #[tokio::test]
+    async fn a_backend_that_answers_closes_the_circuit() {
+        let pool = pool(&["http://a:80"]);
+        pool.set_circuit_breaker(breaker(2));
+
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_success();
+
+        // The failure count went back to zero, so the next failure is the
+        // first one again and the backend stays in rotation.
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+        assert!(
+            pool.select_backend().await.is_some(),
+            "the success reset the count, so one failure does not open the circuit"
+        );
+    }
+
+    /// An open circuit lets a request through again once the cooldown has
+    /// passed: the backend is given a chance to come back.
+    #[tokio::test]
+    async fn an_open_circuit_lets_a_request_through_after_the_cooldown() {
+        let pool = pool(&["http://a:80"]);
+        pool.set_circuit_breaker(CircuitBreaker {
+            enabled: true,
+            failure_threshold: 1,
+            reset: std::time::Duration::from_millis(1),
+        });
+
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+        assert!(pool.select_backend().await.is_none(), "the circuit is open");
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(
+            pool.select_backend().await.is_some(),
+            "the cooldown has passed, so the backend is given another chance"
+        );
+    }
+
+    /// A pool with no circuit behaves as it always did.
+    #[tokio::test]
+    async fn a_pool_without_a_circuit_keeps_every_backend() {
+        let pool = pool(&["http://a:80"]);
+
+        let lease = pool.select_backend().await.expect("a backend");
+        lease.record_failure();
+        lease.record_failure();
+        lease.record_failure();
+
+        assert!(
+            pool.select_backend().await.is_some(),
+            "a pool built in code has no circuit, so the backend stays in rotation"
         );
     }
 

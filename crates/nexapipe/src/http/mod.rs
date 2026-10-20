@@ -504,8 +504,20 @@ where
         .await;
 
         let response = match outcome {
-            Ok(response) => response,
+            Ok(response) => {
+                // The backend answered, so it is up: the circuit is told, and
+                // a backend that was out of rotation comes back into it.
+                backend_info.report_success();
+                response
+            }
             Err(failure) => {
+                // Only a failure that says the backend is unreachable counts
+                // against it. A response that broke halfway is a different
+                // thing: the backend did answer.
+                if failure.backend_is_down() {
+                    backend_info.report_failure();
+                }
+
                 // Two questions, and the failure answers both: may this be
                 // tried again at all, and is there another backend to try it
                 // on.
@@ -961,6 +973,17 @@ pub enum Retryability {
     /// Nothing may be tried again: the client already has part of the answer,
     /// or the failure says nothing about the backend.
     Never,
+}
+
+impl ProxyFailure {
+    /// Whether this failure says the backend is unreachable.
+    ///
+    /// A failure after the answer started is not the backend's fault: it
+    /// answered, and the connection broke on the way back. Neither is a
+    /// request that never left this process.
+    pub fn backend_is_down(&self) -> bool {
+        self.partial.is_none() && self.retry != Retryability::Never
+    }
 }
 
 impl Retryability {
@@ -2638,16 +2661,20 @@ mod transport {
 
     /// An address nothing is listening on.
     ///
-    /// The port is taken and given back, so the connection to it is refused
+    /// The port is taken by a UDP socket, so the connection to it is refused
     /// rather than timing out — which is what a backend that is down looks
-    /// like.
-    async fn dead_backend() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    /// like. A UDP socket rather than a closed TCP one, because a TCP port
+    /// that is given back can be handed to the next listener that asks for
+    /// one, and these tests run beside each other.
+    ///
+    /// The socket is returned so the caller can keep it: the address stays
+    /// dead for as long as the test holds it.
+    async fn dead_backend() -> (String, tokio::net::UdpSocket) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
-            .expect("a loopback listener");
-        let port = listener.local_addr().expect("an address").port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}")
+            .expect("a loopback socket");
+        let port = socket.local_addr().expect("an address").port();
+        (format!("http://127.0.0.1:{port}"), socket)
     }
 
     /// A backend that accepts the connection and then says nothing, and how
@@ -2701,11 +2728,11 @@ mod transport {
         ))
     }
 
-    fn get_request() -> Request<Full<bytes::Bytes>> {
+    fn get_request(host: &str) -> Request<Full<bytes::Bytes>> {
         Request::builder()
             .method("GET")
-            .uri("http://retry.test/")
-            .header("host", "retry.test")
+            .uri(format!("http://{host}/"))
+            .header("host", host)
             .body(Full::new(bytes::Bytes::new()))
             .expect("a request")
     }
@@ -2713,14 +2740,14 @@ mod transport {
     /// A request that failed against one backend is tried against the next.
     #[tokio::test]
     async fn a_failed_request_is_tried_on_another_backend() {
-        let dead = dead_backend().await;
+        let (dead, _guard) = dead_backend().await;
         let port = hello_backend().await;
         let alive = format!("http://127.0.0.1:{port}");
         let config = route_table(vec![dead, alive], 1);
         let clients =
             BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
 
-        let response = proxy_request(&clients, get_request(), config)
+        let response = proxy_request(&clients, get_request("retry.test"), config)
             .await
             .expect("the second backend answers");
 
@@ -2765,13 +2792,69 @@ mod transport {
         let clients =
             BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
 
-        let result = proxy_request(&clients, get_request(), config).await;
+        let result = proxy_request(&clients, get_request("retry.test"), config).await;
 
         assert!(result.is_err(), "the backend never answered");
         assert_eq!(
             accepted.load(std::sync::atomic::Ordering::Relaxed),
             2,
             "a GET may be sent twice, so it was"
+        );
+    }
+
+    /// A backend that keeps failing is taken out of rotation, and the route
+    /// answers 503 rather than dialling it again.
+    ///
+    /// The point of the circuit: the answer comes without a connect timeout,
+    /// because the proxy already knows the backend is down.
+    #[tokio::test]
+    async fn a_backend_that_keeps_failing_is_taken_out_of_rotation() {
+        let (dead, _guard) = dead_backend().await;
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "circuit.test",
+            "/",
+            true,
+            vec![dead],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        )
+        .with_circuit_breaker(crate::config::CircuitBreaker {
+            enabled: true,
+            failure_threshold: 2,
+            reset: std::time::Duration::from_secs(60),
+        });
+        let config = Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry::default(),
+        ));
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+        // The first two requests fail against the backend.
+        for _ in 0..2 {
+            let result = proxy_request(&clients, get_request("circuit.test"), config.clone()).await;
+            assert!(
+                result.is_err(),
+                "the backend is not there, so the request fails"
+            );
+        }
+
+        // The third finds the circuit open, and the route says so instead of
+        // dialling a backend that is known to be down.
+        let response = proxy_request(&clients, get_request("circuit.test"), config)
+            .await
+            .expect("the route answers");
+        assert_eq!(
+            response.status(),
+            503,
+            "a route whose only backend is out of rotation has nothing to offer"
         );
     }
 

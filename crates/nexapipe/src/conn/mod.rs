@@ -468,9 +468,22 @@ pub async fn handle_bidi_stream(
                 .await;
 
                 let failure = match result {
-                    Ok(summary) => break Ok(summary),
+                    Ok(summary) => {
+                        // The backend answered, so it is up: the circuit is
+                        // told, and a backend that was out of rotation comes
+                        // back into it.
+                        backend.report_success();
+                        break Ok(summary);
+                    }
                     Err(failure) => failure,
                 };
+
+                // Only a failure that says the backend is unreachable counts
+                // against it. A response that broke halfway is a different
+                // thing: the backend did answer.
+                if failure.backend_is_down() {
+                    backend.report_failure();
+                }
 
                 // Two questions, and the failure answers both: may this be
                 // tried again at all, and is there another backend to try it

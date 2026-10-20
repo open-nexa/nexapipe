@@ -1,5 +1,5 @@
 use crate::auth::ClientAcl;
-use crate::config::{BackendProtocol, Retry, RouteMode, Timeouts};
+use crate::config::{BackendProtocol, CircuitBreaker, Retry, RouteMode, Timeouts};
 use crate::lb::{BackendLease, BackendPool, LoadBalancingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -328,6 +328,16 @@ impl Route {
         self.backend_protocol
     }
 
+    /// Run the circuit on this route's backends with these settings.
+    ///
+    /// A builder rather than a constructor argument: a pool built in code —
+    /// in a test, or by the local proxy — has no circuit, and one built from a
+    /// config has the settings the config resolved to.
+    pub fn with_circuit_breaker(self, breaker: CircuitBreaker) -> Self {
+        self.backend_pool.set_circuit_breaker(breaker);
+        self
+    }
+
     /// What makes this the same route across a reload, for the two things that
     /// hang off it: its backend pool and the health probe watching that pool.
     ///
@@ -479,6 +489,27 @@ impl BackendInfo {
     /// `least_conn` count what is really in flight.
     pub fn take_lease(&mut self) -> Option<BackendLease> {
         self._lease.take()
+    }
+
+    /// The backend answered.
+    ///
+    /// What the circuit counts. A backend that answers is a backend that is
+    /// up, however long it took.
+    pub fn report_success(&self) {
+        if let Some(lease) = &self._lease {
+            lease.record_success();
+        }
+    }
+
+    /// The backend did not answer.
+    ///
+    /// What the circuit counts. Only the failures that say the backend is
+    /// unreachable are counted — a response that broke halfway says something
+    /// else, and the backend did answer.
+    pub fn report_failure(&self) {
+        if let Some(lease) = &self._lease {
+            lease.record_failure();
+        }
     }
 }
 
