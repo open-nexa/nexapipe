@@ -691,7 +691,14 @@ class NexaVpnService : VpnService() {
     private fun shutdownService() {
         runCatching {
             createNotificationChannel()
-            startForeground(NOTIFICATION_ID, createNotification())
+            // The text says what is true: the tunnel is not up. The default
+            // says "Connected", and this notification is posted rather than
+            // skipped — so for as long as the removal takes, the shade would
+            // claim a tunnel that was never there.
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(getString(R.string.notification_text_connecting))
+            )
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
