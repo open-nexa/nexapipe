@@ -1,4 +1,5 @@
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::discovery::DiscoveryMode;
 use crate::relay::RelayModeSpec;
 use crate::secret::SecretString;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
@@ -154,6 +155,12 @@ static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
 // entry is replaced or the process ends.
 static RELAY_AUTH_TOKEN: Lazy<Mutex<SecretString>> =
     Lazy::new(|| Mutex::new(SecretString::default()));
+
+// Whether this endpoint may use n0's address lookup, from Kotlin settings.
+// "n0" = the default (a Node ID is looked up through dns.iroh.link), "none" =
+// no lookup at all, and a peer then has to bring an address of its own.
+// An empty value means nothing has been injected yet, which falls back to "n0".
+static DISCOVERY_MODE: Mutex<String> = Mutex::new(String::new());
 
 // Reason behind the last failed native call, so Kotlin can read it back.
 //
@@ -765,6 +772,43 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| {
         set_relay_config(env, relay_mode, relay_url, relay_auth_token)
+    })
+}
+
+/// Configure whether this endpoint may use n0's address lookup.
+///
+/// discovery_mode: "n0" (the default — a Node ID is looked up through
+/// dns.iroh.link) or "none" (no lookup at all; a peer then has to bring an
+/// address of its own, which is what a ticket carries).
+///
+/// Must be called before nativeStartIroh.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDiscoveryMode(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    discovery_mode: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        if env.exception_check() {
+            jni_log!("JNI exception pending before nativeSetDiscoveryMode");
+            env.exception_clear();
+            return -1;
+        }
+
+        let mode_str = match discovery_mode.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => {
+                jni_log!("Failed to get discovery_mode string from JNI");
+                return -1;
+            }
+        };
+
+        jni_log!("[DEBUG:jni] nativeSetDiscoveryMode: mode='{mode_str}'");
+
+        if let Ok(mut mode) = DISCOVERY_MODE.lock() {
+            *mode = mode_str;
+        }
+        0
     })
 }
 
@@ -1510,7 +1554,35 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             );
         }
         jni_log!("[iroh] relay: {}", relay.describe());
-        let builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it.
+        let restriction = relay.dial_restriction();
+        if let Some(restriction) = &restriction {
+            jni_log!(
+                "[iroh] peers are dialled through {} and nothing else",
+                restriction.relay()
+            );
+        }
+        // Whether this endpoint may ask n0 where a peer is. It is the one piece
+        // of n0's infrastructure a relay setting does not reach, so it gets a
+        // setting of its own.
+        let cfg_discovery = DISCOVERY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
+        let discovery = match DiscoveryMode::parse(&cfg_discovery) {
+            Ok(mode) => mode,
+            Err(e) => {
+                jni_log!("[iroh] invalid discovery configuration: {e}");
+                return Err(());
+            }
+        };
+        jni_log!("[iroh] discovery: {}", discovery.describe());
+        let mut builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
+        builder = discovery.apply(builder);
+        if let Some(restriction) = restriction {
+            builder = builder.hooks(restriction);
+        }
         // Always wrap hickory with OverrideResolver:
         // - For iroh infrastructure domains in DNS_OVERRIDES (dns.iroh.link, *.relay.n0.iroh.link),
         //   return Kotlin's pre-resolved IPs directly, bypassing the GFW's blocking of iroh.link
