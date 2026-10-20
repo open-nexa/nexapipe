@@ -160,7 +160,9 @@ async function handleCloseRequested(): Promise<void> {
     // A close that only hides the window is not a quit, so it does not ask about the tunnel:
     // the tunnel keeps running, which is the whole point of hiding instead of closing.
     if (await shouldMinimizeOnClose()) {
-      await getCurrentWindow().hide();
+      // A quit is waiting to be asked, and it is asked in the window: hiding it now would put
+      // the question where nobody can see it, and the window would flash up and vanish.
+      if (!pendingQuit) await getCurrentWindow().hide();
       return;
     }
     if (!(await decide())) return;
@@ -216,14 +218,29 @@ export async function initQuitGuard(): Promise<() => void> {
     console.debug('[quit] close listener unavailable:', error);
   }
 
+  let listening = false;
   try {
     cleanup.push(
       await listen(QUIT_REQUESTED_EVENT, () => {
         void handleQuitRequested();
       }),
     );
+    listening = true;
   } catch (error) {
     console.debug('[quit] quit listener unavailable:', error);
+  }
+
+  if (listening) {
+    // The Rust side cannot tell whether anybody is listening: Tauri delivers an
+    // event to the webviews that have a listener for it and does not mention
+    // the ones that do not, so an emit to nobody still succeeds and the emit
+    // cannot be asked whether the question arrived. The listener says so
+    // itself.
+    try {
+      await invoke('quit_guard_ready');
+    } catch (error) {
+      console.debug('[quit] could not announce the quit listener:', error);
+    }
   }
 
   return () => {

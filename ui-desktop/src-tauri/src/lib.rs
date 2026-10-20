@@ -1944,7 +1944,8 @@ pub fn run() {
             is_background_launch,
             is_tray_available,
             set_tray_labels,
-            quit::finish_quit
+            quit::finish_quit,
+            quit::quit_guard_ready
         ]);
 
     // macOS only: the predefined Quit item terminates the process before any event carrying a

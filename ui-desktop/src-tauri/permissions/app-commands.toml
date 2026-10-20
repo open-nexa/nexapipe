@@ -157,6 +157,11 @@ description = "Enables the put_credential command without any pre-configured sco
 commands.allow = ["put_credential"]
 
 [[permission]]
+identifier = "allow-quit-guard-ready"
+description = "Enables the quit_guard_ready command without any pre-configured scope."
+commands.allow = ["quit_guard_ready"]
+
+[[permission]]
 identifier = "allow-reveal-credential"
 description = "Enables the reveal_credential command without any pre-configured scope."
 commands.allow = ["reveal_credential"]
