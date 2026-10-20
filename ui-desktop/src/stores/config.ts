@@ -953,6 +953,18 @@ export function useConfigStore() {
     const publicKey = credential.publicKey?.trim();
     if (publicKey) {
       node.publicKey = publicKey;
+    } else {
+      // The server ignored the offer and issued a secret — an older server does exactly
+      // that. The key was never recorded there, so it is not a credential this node
+      // answers with, and keeping it would make the page present a TOTP node as a key node
+      // on every launch: `node_credentials` re-derives the public half from the stored
+      // private one, so nothing but deleting both makes the display match the handshake
+      // (`manager.rs` answers with the secret whenever there is one).
+      delete node.publicKey;
+      delete node.deviceKey;
+      void deleteCredential('devicekey', node.id).catch((error: unknown) => {
+        console.error('[config] failed to delete the device key the server ignored:', error);
+      });
     }
     delete node.enrollment;
     return node;
