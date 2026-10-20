@@ -124,12 +124,7 @@ fixes both. *Hard, and the largest item here.*
 `ui-desktop/src-tauri/src/proxy/dns.rs` maps addresses but never opens a UDP
 flow. *Hard.*
 
-**5. `https://` backends in `http` mode** — they are rejected at startup
-(`validate_http_backend` in `crates/nexapipe/src/config.rs`), so the
-proxy-to-backend hop is always plaintext. Accepting them lets an operator keep
-that hop encrypted when the backend is on another host. *Medium.*
-
-**6. A short demo** — `screenshots/` holds a few stills and the README links
+**5. A short demo** — `screenshots/` holds a few stills and the README links
 them, but there is no end-to-end walkthrough: one recording of the Android flow
 (scan invite → reach a service) and one of the desktop app would do more for the
 project than several of the items above. *Easy, and no Rust required.*
@@ -138,7 +133,7 @@ project than several of the items above. *Easy, and no Rust required.*
 
 Mostly so that `good first issue` actually means something. That label is
 reserved for work that has a defined outcome, does not need project-wide context
-to start, and has someone willing to answer questions on it — like the six
+to start, and has someone willing to answer questions on it — like the five
 listed above.
 
 | Label | Means |

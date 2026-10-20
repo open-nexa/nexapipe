@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-17 ([§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
+| Last updated | 2026-10-20 ([§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease — in v0.7.0; [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come; v0.6.1 shipped the config-surface improvements in [Phase 3.5](#phase-35--v061-configured) and the size-and-performance measurement work is tracked in [Phase 3.6 / v0.6.2](#phase-36--v062-weighed); a full security and stability audit is recorded in [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and its three capability items in [§6](#hardening-sweep--after-v060)) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -202,8 +202,8 @@ somewhere even though they are fixed rather than scheduled.
 
 | # | Gap | Where |
 |---|---|---|
-| C3 | **Still open.** HTTP/1.1 only towards backends: the client is `legacy::Client<HttpConnector>` with only `http1_*` configuration, `https://` backends are rejected at load time, and there is no retry and no circuit breaking. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`, each optional and defaulted to the constant it replaced. | `http/mod.rs:13-32` |
-| C4 | **Partly closed in v0.4.0.** `least_conn` exists, and an all-unhealthy pool now refuses instead of falling back to the first — except a pool of one, which is still handed out because there is nothing to choose between. Still open: no retry, no circuit breaking, and `least_conn` counts requests rather than sockets (see the note at `http::proxy_request`). | `lb/mod.rs` |
+| C3 | **Closed in v0.7.0.** An `https://` backend is reached over a TLS session this process originates and verifies, against the machine's roots plus `[backends] ca_file`; there is no insecure switch. HTTP/2 is negotiated through ALPN with an `https://` backend and `backend_protocol = "h2c"` covers a cleartext h2 backend. `[retry]` tries a failed request again — on another backend where the route has one — and both the plaintext listener and the iroh tunnel apply the same rule: a request that never reached the backend is retried whatever its method, one that was carried and lost only when it is idempotent, and never an answer, a partly received response or a WebSocket. A WebSocket to an `https://` backend goes over TLS as well; a `backend_protocol = "h2c"` route refuses one, and the WebSocket path is HTTP/1.1, so it cannot use a backend that offers only h2. The *configurable timeout* half is done (v0.4.0): `[timeouts] connect_secs` / `response_secs`. | `http/mod.rs`, `conn/mod.rs` |
+| C4 | **Closed in v0.7.0.** `least_conn` keeps a backend's lease for as long as its response body is out there, so a streaming backend counts as busy until the body is dropped. `[circuit_breaker]` takes a backend out of rotation after consecutive unreachable failures and returns it for a trial after the cooldown; a route with nothing serving answers 503 instead of dialling. The counter covers the HTTP request paths, including the tunnel's streaming path and a WebSocket handshake; a session that dies after the upgrade does not count, and TCP/UDP routes keep using the health probe. An all-unhealthy pool still refuses instead of falling back to the first, except a pool of one, which is handed out because there is nothing to choose between. | `lb/mod.rs`, `http/mod.rs` |
 | C7 | **Closed in v0.5.0, apart from the one mode that cannot be.** A route serving `http` *and* another mode shares one pool, so the other modes always did inherit its health — and since v0.4.0 they answer `BackendFailed` / hang up when it is empty. `passthrough` and `tcp` routes are probed now, by connecting to them: a TLS backend by completing its handshake, which says a process is listening and nothing about whether it works. A `udp`-only route is still not probed, because there is nothing to connect to and a probe that invented a datagram would report an answer no backend gave. | `health/mod.rs` |
 
 ### 4.2 Observability beyond the access log (P1)
@@ -573,10 +573,14 @@ equivalent is carried by Phase 1 below, and shipped in v0.4.0.
 Per [Platform policy](#5-platform-policy), no iOS work is planned in this phase. A
 contributed iOS client would be accepted and clearly marked community-maintained.
 
-**Progress.** Four of the five shipped in v0.4.0, one of them half:
+**Progress.** Four of the five shipped in v0.4.0, and the half that remained
+closed in v0.7.0:
 
 - **R12** backend handling — `[timeouts]`, `least_conn`, and a refusal when
-  every backend of a multi-backend route is down.
+  every backend of a multi-backend route is down. **Completed in v0.7.0** with
+  session-held `least_conn` leases, `[retry]`, `[circuit_breaker]`, `https://`
+  backends (TLS with a verified certificate, HTTP/2 through ALPN) and h2c; see
+  [4.1](#41-backend-handling-p2).
 - **R15** the client DNS cache.
 - **R10** transport parity: IPv6 inside the TUN, on Android and on the desktop,
   plus `[iroh] bind_ipv6` on the server. The UDP half of this turned out to be

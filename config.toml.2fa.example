@@ -249,7 +249,10 @@ created_at = "1723756800"
 # ===== Routes =====
 # Which mode applies is decided before any matching happens, by the first byte
 # of the stream, so the modes never see each other's traffic:
-#   http (default)   re-issues a parsed request to an http:// backend
+#   http (default)   re-issues a parsed request to an http:// or https://
+#                    backend; an https:// one is reached over TLS and verified
+#                    against the machine's roots (see config.toml.example for
+#                    [backends] ca_file, [retry] and [circuit_breaker])
 #   passthrough      copies raw bytes; TLS stays with the backend (Caddy)
 #   tcp / udp        L4 tunnel, one QUIC bi-stream per flow
 [[routes]]

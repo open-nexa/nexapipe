@@ -12,14 +12,19 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Two things land in this cycle so far: the device credential can be a **key**
-instead of a shared secret, and every phase of a proxied exchange now runs
-under a deadline the operator can see and raise. No existing configuration key
-is removed or renamed, and the ones this cycle adds — `public_key` under a
-device entry, the six `[timeouts]` phase keys — are optional, so a `config.toml`
-that works on 0.6.1 still loads and behaves as it did: a device entry that
-carries a `secret` is checked exactly as before, and a `[timeouts]` section
-that names none of the new keys leaves every deadline at its default.
+Three things land in this cycle so far: the device credential can be a **key**
+instead of a shared secret, every phase of a proxied exchange now runs under a
+deadline the operator can see and raise, and backend handling no longer stops at
+plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
+circuit-broken. No existing configuration key is removed or renamed, and the ones
+this cycle adds — `public_key` under a device entry, the six `[timeouts]` phase
+keys, `[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so
+a `config.toml` that works on 0.6.1 still loads and behaves as it did: a device
+entry that carries a `secret` is checked exactly as before, a `[timeouts]`
+section that names none of the new keys leaves every deadline at its default.
+Leaving `[retry]` out keeps one try and no second chance, leaving `[backends]`
+out uses the machine's own trust store, and leaving `[circuit_breaker]` out uses
+its defaults — which are on.
 
 ### Added
 
@@ -58,6 +63,35 @@ that names none of the new keys leaves every deadline at its default.
   is unknown, so the wait for it is the longer of `header_secs` and
   `tls_hello_secs`: a short `header_secs` never cuts off a TLS session or an
   L4 tunnel, neither of which sends a request head at all.
+- **Backend TLS and HTTP/2.** A route may name an `https://` backend, and the
+  proxy reaches it over a TLS session it originates and verifies — against the
+  machine's own roots plus an optional `[backends] ca_file`, with no switch that
+  skips the check. The proxy still holds no certificate and still terminates
+  nothing; this is the client half of a handshake. HTTP/2 is negotiated through
+  ALPN with an `https://` backend that offers it, and
+  `backend_protocol = "h2c"` reaches a cleartext backend that speaks HTTP/2 with
+  prior knowledge. A WebSocket upgrade uses the same trust store and reaches an
+  `https://` backend over TLS as well; an `h2c` route refuses a WebSocket
+  because an upgrade is HTTP/1.1. A backend that offers only h2 over TLS can
+  serve HTTP requests, but this proxy's WebSocket path is HTTP/1.1 and cannot
+  use it.
+- **`[retry]` tries a failed request again.** `attempts` (default 0, capped at
+  16) is the number of extra attempts and `backoff_ms` (default 100, capped at
+  60000) the wait between them. A retry asks the route for a different backend
+  where it has one. A request that never reached the backend is retried whatever
+  its method is; one that was carried and lost is retried only when it is
+  idempotent. An answer, a response already partly received, and a WebSocket are
+  never retried. The plaintext listener and the iroh tunnel both apply it.
+- **`[circuit_breaker]` takes a failing backend out of rotation.** It is on by
+  default: `failure_threshold` consecutive unreachable-backend failures (default
+  5, capped at 1000) open the circuit for `reset_secs` (default 30, capped at
+  3600), during which a route with nothing else serving answers 503 instead of
+  dialling a backend the traffic already showed is down. A trial request after
+  the cooldown can close it again, and an answer resets the count. Failures that
+  broke halfway are not counted — the backend answered — and TCP/UDP routes keep
+  using the health probe rather than a request counter. The HTTP request paths,
+  the tunnel's streaming path and a WebSocket handshake all feed the counter; a
+  session that dies after the upgrade does not.
 
 ### Changed
 
@@ -88,6 +122,19 @@ that names none of the new keys leaves every deadline at its default.
   worth noticing: an L4 tunnel now closes after an hour of existence even if
   it is busy, so a long-lived SSH or database session over the tunnel needs
   `l4_flow_secs` raised (or a per-route `flow_timeout_secs`).
+- **`least_conn` counts a streaming response until it ends.** The lease that
+  holds a backend's outstanding count used to be released when the response
+  head arrived, so a large download or an SSE feed counted as finished while
+  the backend was still working on it and the next request could be sent to an
+  already-busy backend. The lease now travels with the body and is released
+  when the body is dropped — by the client reading it, or by the connection
+  going away. The tunnel path already worked this way; both paths now agree.
+- **The circuit breaker is on by default.** A backend that fails five requests
+  in a row leaves rotation for thirty seconds even when `[circuit_breaker]` is
+  absent. An operator who wants the old behaviour — every
+  request dials whichever backend the balancer picked — sets `enabled = false`.
+  A single-backend route can therefore answer 503 for up to `reset_secs` after
+  five consecutive connect failures, where it used to return 502 each time.
 
 ## [0.6.1] — 2026-10-11
 
