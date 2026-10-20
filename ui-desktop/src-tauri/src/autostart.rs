@@ -187,10 +187,13 @@ mod platform {
     const LABEL: &str = "com.nexa.ui";
 
     /// Where the user agent goes.
-    fn plist_path() -> Result<PathBuf, AppError> {
+    ///
+    /// The code is the one the caller reports a failure under: not finding
+    /// the agent and not being able to write it are different failures.
+    fn plist_path(code: &str) -> Result<PathBuf, AppError> {
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
             AppError::with_detail(
-                codes::AUTOSTART_WRITE_FAILED,
+                code,
                 "HOME is not set, so there is no place to put a LaunchAgent",
             )
         })?;
@@ -201,12 +204,22 @@ mod platform {
     }
 
     pub fn is_enabled() -> Result<bool, AppError> {
-        let path = plist_path()?;
-        Ok(path.exists())
+        let path = plist_path(codes::AUTOSTART_READ_FAILED)?;
+        // `metadata` rather than `exists`: the latter answers "no" for an
+        // agent that cannot be read as well as for one that is not there,
+        // and a read failure is not the same answer as "off".
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AppError::with_detail(
+                codes::AUTOSTART_READ_FAILED,
+                format!("the LaunchAgent could not be read: {e}"),
+            )),
+        }
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
-        let path = plist_path()?;
+        let path = plist_path(codes::AUTOSTART_WRITE_FAILED)?;
         if !enabled {
             // Removing a file that is not there is the outcome the caller
             // asked for, so it is not a failure.
@@ -354,10 +367,13 @@ mod platform {
     use std::path::PathBuf;
 
     /// Where the desktop session looks for what to start with it.
-    fn desktop_path() -> Result<PathBuf, AppError> {
+    ///
+    /// The code is the one the caller reports a failure under: not finding
+    /// the entry and not being able to write it are different failures.
+    fn desktop_path(code: &str) -> Result<PathBuf, AppError> {
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
             AppError::with_detail(
-                codes::AUTOSTART_WRITE_FAILED,
+                code,
                 "HOME is not set, so there is no place to put an autostart entry",
             )
         })?;
@@ -368,12 +384,22 @@ mod platform {
     }
 
     pub fn is_enabled() -> Result<bool, AppError> {
-        let path = desktop_path()?;
-        Ok(path.exists())
+        let path = desktop_path(codes::AUTOSTART_READ_FAILED)?;
+        // `metadata` rather than `exists`: the latter answers "no" for an
+        // entry that cannot be read as well as for one that is not there,
+        // and a read failure is not the same answer as "off".
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AppError::with_detail(
+                codes::AUTOSTART_READ_FAILED,
+                format!("the autostart entry could not be read: {e}"),
+            )),
+        }
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
-        let path = desktop_path()?;
+        let path = desktop_path(codes::AUTOSTART_WRITE_FAILED)?;
         if !enabled {
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
