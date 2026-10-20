@@ -19,11 +19,19 @@
 //!   a home relay and not as a net_report probe target. Asking for `custom` with an
 //!   n0-operated URL is rejected outright, because that would make "am I off the
 //!   official relays?" impossible to answer from the configuration alone.
+//!
+//! The second rule is about *this* endpoint's own traffic. A peer's traffic is
+//! another matter, and it is what [`RelayRestriction`] is for: `custom` says no
+//! n0 relay is used, and a peer that hands over an address naming one is not
+//! dialled through it either. What iroh resolves on its own — a peer named only
+//! by a Node ID — is covered by turning the lookup off, which is
+//! [`crate::discovery::DiscoveryMode`]'s job.
 
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail};
-use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
+use iroh::endpoint::{BeforeConnectOutcome, EndpointHooks};
+use iroh::{EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl};
 
 use crate::secret::SecretString;
 
@@ -157,17 +165,22 @@ impl RelayModeSpec {
         }
     }
 
-    /// Relay URLs this mode permits, when the set is closed.
+    /// The restriction this mode places on dialling a peer, if it places one.
     ///
-    /// `None` means "not restricted". Used by the caller to build an
-    /// `AddrFilter` that drops relay addresses outside the set, which is the only
-    /// way to stop this endpoint dialling an N0 relay a *peer* advertises.
-    pub fn allowed_relay_urls(&self) -> Option<Vec<RelayUrl>> {
+    /// `None` means the mode places no restriction of its own, and the
+    /// difference between that and "anything goes" is worth spelling out:
+    ///
+    /// - `default` and `pinned` put n0's relays in play on purpose, so a peer
+    ///   may name any of them.
+    /// - `disabled` needs no restriction here: `RelayMode::Disabled` takes the
+    ///   relay transport off the endpoint, so this endpoint cannot dial *any*
+    ///   relay — not its own, and not one a peer names either.
+    /// - `custom` is the one that needs one, and it is what
+    ///   [`RelayRestriction`] is for.
+    pub fn dial_restriction(&self) -> Option<RelayRestriction> {
         match self {
-            Self::Disabled => Some(Vec::new()),
-            Self::Default => None,
-            Self::Pinned => Some(vec![pinned_relay_url()]),
-            Self::Custom { url, .. } => Some(vec![url.clone()]),
+            Self::Custom { url, .. } => Some(RelayRestriction::through(url.clone())),
+            Self::Default | Self::Pinned | Self::Disabled => None,
         }
     }
 
@@ -191,6 +204,114 @@ impl RelayModeSpec {
             ),
         }
     }
+}
+
+/// The restriction `custom` places on dialling a peer.
+///
+/// `custom` says: this endpoint uses one relay, the one the operator runs, and
+/// nothing else. iroh's `relay_mode` only bounds the relay *this* endpoint
+/// registers with and probes through — a peer that hands over an address
+/// naming a different relay is still dialled through it. That is how a
+/// "custom" deployment could still put a peer's traffic through an n0 relay,
+/// and it is the gap this closes.
+///
+/// It applies to the addresses the application hands to iroh:
+///
+/// - A peer that names a relay other than ours is not dialled through it.
+/// - A peer named only by a Node ID is not dialled at all, because finding its
+///   address means asking n0, and n0's answer may be an n0 relay.
+///
+/// The second is why `custom` asks for a ticket rather than a Node ID: a
+/// ticket carries the address, so the peer is dialled through the relay the
+/// ticket names — which is the one the operator runs, on both ends.
+///
+/// What it cannot cover is a peer whose address iroh resolves *after* the
+/// check, which is the bare-Node-ID case above, and a peer's own choice of
+/// relay when the peer is dialled through a path this endpoint does not
+/// control. Turning n0's lookup off as well — see
+/// [`crate::discovery::DiscoveryMode`] — is what closes the second half.
+#[derive(Debug, Clone)]
+pub struct RelayRestriction {
+    /// The one relay a peer may be dialled through.
+    relay: RelayUrl,
+}
+
+impl RelayRestriction {
+    /// The restriction for a relay: peers are dialled through it and nothing else.
+    pub fn through(relay: RelayUrl) -> Self {
+        Self { relay }
+    }
+
+    /// The relay peers are dialled through.
+    pub fn relay(&self) -> &RelayUrl {
+        &self.relay
+    }
+
+    /// Whether `addr` may be dialled under this restriction.
+    ///
+    /// `Err` says why not, in a sentence meant to be read in a log.
+    pub fn permits(&self, addr: &EndpointAddr) -> Result<(), String> {
+        let mut named = addr.relay_urls().peekable();
+        if named.peek().is_some() {
+            // A peer may name more than one relay. Ours is among them, so the
+            // restriction is satisfied whichever one iroh picks; ours is not,
+            // then there is nothing here this endpoint may dial through.
+            if named.all(|other| other == &self.relay) {
+                return Ok(());
+            }
+            return Err(format!(
+                "the peer names a relay this endpoint does not use, and this endpoint only uses {}",
+                self.relay
+            ));
+        }
+
+        if addr.ip_addrs().next().is_some() {
+            // A direct address: no relay is involved, so nothing to refuse.
+            return Ok(());
+        }
+
+        Err(format!(
+            "the peer is named only by a Node ID, and finding its address means asking n0, \
+             which may answer with an n0 relay; this endpoint only uses {}",
+            self.relay
+        ))
+    }
+}
+
+impl EndpointHooks for RelayRestriction {
+    async fn before_connect<'a>(
+        &'a self,
+        remote_addr: &'a EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> BeforeConnectOutcome {
+        match self.permits(remote_addr) {
+            Ok(()) => BeforeConnectOutcome::Accept,
+            Err(why) => {
+                warn(&format!("[iroh] refusing to dial the peer: {why}"));
+                BeforeConnectOutcome::Reject
+            }
+        }
+    }
+}
+
+/// Says something that has to be seen, wherever this build logs.
+///
+/// The Android build has no `tracing` subscriber — it logs through `log`, at
+/// a level the app shows — and the desktop has no `log` backend. So the two
+/// are told apart here rather than at every call site.
+#[cfg(feature = "jni")]
+fn warn(message: &str) {
+    log::warn!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+fn warn(message: &str) {
+    tracing::warn!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
+fn warn(message: &str) {
+    let _ = message;
 }
 
 fn pinned_relay_url() -> RelayUrl {
@@ -218,6 +339,11 @@ mod tests {
     use super::*;
 
     const OWN_RELAY: &str = "https://relay.example.com";
+
+    /// A Node ID to hang an address off. Any one will do: nothing here dials.
+    fn node_id() -> iroh::EndpointId {
+        iroh::SecretKey::generate().public()
+    }
 
     #[test]
     fn nothing_configured_defers_to_the_caller() {
@@ -341,13 +467,85 @@ mod tests {
         let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
             .unwrap()
             .unwrap();
-        let allowed = spec.allowed_relay_urls().expect("custom is a closed set");
-        assert_eq!(allowed.len(), 1);
-        assert_eq!(allowed[0].to_string(), "https://relay.example.com/");
+        let restriction = spec
+            .dial_restriction()
+            .expect("custom restricts which relay a peer is dialled through");
+        assert_eq!(
+            restriction.relay().to_string(),
+            "https://relay.example.com/"
+        );
     }
 
     #[test]
-    fn default_is_unrestricted() {
-        assert!(RelayModeSpec::Default.allowed_relay_urls().is_none());
+    fn the_modes_that_put_n0_relays_in_play_restrict_nothing() {
+        // `default` and `pinned` use n0's relays on purpose, so a peer may
+        // name any of them. `disabled` takes the relay transport off the
+        // endpoint entirely, so no relay can be dialled at all — below us,
+        // not by a restriction of ours.
+        for spec in [
+            RelayModeSpec::Default,
+            RelayModeSpec::Pinned,
+            RelayModeSpec::Disabled,
+        ] {
+            assert!(spec.dial_restriction().is_none(), "{spec:?}");
+        }
+    }
+
+    /// A peer named only by a Node ID has to be looked up, and looking one up
+    /// means asking n0 — so under `custom` it is not dialled at all.
+    #[test]
+    fn a_peer_named_only_by_a_node_id_is_refused() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction().unwrap();
+        let addr = EndpointAddr::new(node_id());
+
+        let why = restriction
+            .permits(&addr)
+            .expect_err("a bare Node ID is refused");
+        assert!(why.contains("Node ID"), "{why}");
+        assert!(why.contains("asking n0"), "{why}");
+    }
+
+    /// The peer that matters: one on the same relay, named by a ticket.
+    #[test]
+    fn a_peer_naming_our_relay_is_dialled() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction().unwrap();
+        let addr = EndpointAddr::new(node_id()).with_relay_url(OWN_RELAY.parse().unwrap());
+
+        assert!(restriction.permits(&addr).is_ok());
+    }
+
+    /// A peer on somebody else's relay — an n0 one, in the case that matters.
+    #[test]
+    fn a_peer_naming_another_relay_is_refused() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction().unwrap();
+        let addr = EndpointAddr::new(node_id())
+            .with_relay_url("https://aps1-1.relay.n0.iroh.link.".parse().unwrap());
+
+        let why = restriction
+            .permits(&addr)
+            .expect_err("another relay is refused");
+        assert!(why.contains("relay this endpoint does not use"), "{why}");
+    }
+
+    /// A peer with a direct address uses no relay at all, so there is nothing
+    /// to refuse — the direct path is the one the restriction is not about.
+    #[test]
+    fn a_peer_with_a_direct_address_is_dialled() {
+        let spec = RelayModeSpec::parse(Some("custom"), Some(OWN_RELAY), None)
+            .unwrap()
+            .unwrap();
+        let restriction = spec.dial_restriction().unwrap();
+        let addr = EndpointAddr::new(node_id()).with_ip_addr("192.0.2.1:443".parse().unwrap());
+
+        assert!(restriction.permits(&addr).is_ok());
     }
 }
