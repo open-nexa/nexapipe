@@ -372,43 +372,26 @@ impl BackendPool {
             return None;
         }
 
-        // The ones that have not been tried yet, when there are any. A pool
-        // whose every healthy backend is on the list falls back to the whole
-        // set, because the alternative is not to try at all.
-        let mut untried: Vec<usize> = Vec::new();
-        for i in &healthy_backends {
-            let url = &self.backends[*i].status.read().await.url;
-            if !exclude.iter().any(|e| e == url) {
-                untried.push(*i);
-            }
-        }
-        let mut healthy_backends = if untried.is_empty() {
-            if !exclude.is_empty() {
-                tracing::debug!(
-                    "Every healthy backend behind this route has been tried; trying one of them \
-                     again, because there is nobody else to ask"
-                );
-            }
-            healthy_backends
-        } else {
-            untried
-        };
-
         // The ones whose circuit is not open. A backend that keeps failing is
         // out of rotation until its cooldown passes: the route answers 503
         // rather than dialling a backend that is known to be down, which
         // spends a whole connect timeout to say the same thing.
+        //
+        // Filtered before the exclusion list, not after: an untried backend
+        // whose circuit is open cannot be asked either, and preferring it over
+        // a tried backend that is still serving would refuse a request that
+        // has somewhere to go.
+        let healthy_count = healthy_backends.len();
         let serving: Vec<usize> = healthy_backends
             .iter()
             .copied()
             .filter(|i| self.backends[*i].circuit_allows())
             .collect();
-        if serving.len() < healthy_backends.len() {
+        if serving.len() < healthy_count {
             tracing::warn!(
-                "{} of {} healthy backend(s) behind this route are out of rotation; \
-                 the circuit is open on them",
-                healthy_backends.len() - serving.len(),
-                healthy_backends.len()
+                "{} of {healthy_count} healthy backend(s) behind this route are out of \
+                 rotation; the circuit is open on them",
+                healthy_count - serving.len(),
             );
         }
         if serving.is_empty() {
@@ -417,6 +400,28 @@ impl BackendPool {
             return None;
         }
         healthy_backends = serving;
+
+        // The ones that have not been tried yet, when there are any. A pool
+        // whose every serving backend is on the list falls back to the whole
+        // set, because the alternative is not to try at all.
+        let mut untried: Vec<usize> = Vec::new();
+        for i in &healthy_backends {
+            let url = &self.backends[*i].status.read().await.url;
+            if !exclude.iter().any(|e| e == url) {
+                untried.push(*i);
+            }
+        }
+        let healthy_backends = if untried.is_empty() {
+            if !exclude.is_empty() {
+                tracing::debug!(
+                    "Every serving backend behind this route has been tried; trying one of them \
+                     again, because there is nobody else to ask"
+                );
+            }
+            healthy_backends
+        } else {
+            untried
+        };
 
         let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {
@@ -739,6 +744,35 @@ mod tests {
         assert!(
             pool.select_backend().await.is_none(),
             "the backend has failed twice in a row, so the circuit is open and it is not picked"
+        );
+    }
+
+    /// A retry prefers a backend it has not tried, but a backend whose circuit
+    /// is open is not a choice at all. When the only untried backend is out,
+    /// the retry goes back to one that is still serving instead of refusing.
+    #[tokio::test]
+    async fn a_retry_does_not_let_an_open_circuit_hide_a_serving_backend() {
+        let pool = pool(&["http://a:80", "http://b:80"]);
+        pool.set_circuit_breaker(breaker(1));
+
+        let first = pool.select_backend().await.expect("a backend");
+        assert_eq!(first.url(), "http://a:80");
+        let tried = first.url().to_string();
+        drop(first);
+
+        let second = pool.select_backend().await.expect("a backend");
+        assert_eq!(second.url(), "http://b:80");
+        second.record_failure();
+        drop(second);
+
+        let next = pool
+            .select_backend_excluding(&[tried])
+            .await
+            .expect("A is still serving, so the retry has somewhere to go");
+        assert_eq!(
+            next.url(),
+            "http://a:80",
+            "the untried backend's open circuit must not hide the tried one that still serves"
         );
     }
 
