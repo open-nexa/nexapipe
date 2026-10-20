@@ -99,10 +99,10 @@ impl Limits {
     /// startup, so the ambiguity is visible rather than silent, and refusing to
     /// boot over a resource knob is a heavier hand than this deserves.
     ///
-    /// **A zero in the config is refused**, because it would refuse every
-    /// connection and the file is somewhere the operator can read the error.
-    /// The environment keeps the older rule of ignoring a value it cannot
-    /// use, because a bad variable in a Dockerfile should not take the
+    /// **A zero in the config is refused at startup**, because it would refuse
+    /// every connection and the file is somewhere the operator can read the
+    /// error. The environment keeps the older rule of ignoring a value it
+    /// cannot use, because a bad variable in a Dockerfile should not take the
     /// listener offline.
     pub fn resolve(config: &LimitsConfig, env: &EnvCaps) -> anyhow::Result<Self> {
         Ok(Self {

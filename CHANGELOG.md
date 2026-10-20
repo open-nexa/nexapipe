@@ -41,10 +41,11 @@ its defaults — which are on.
   `max_connections_per_peer` (default 64), `max_connections_global` (4096),
   `max_streams_global` (16384) and `max_body_bytes` (1 GiB). Every key is
   optional and every default is the ceiling the server always used, so a config
-  that does not mention the section behaves exactly as it did. Zero is refused at
-  load for every key — it would refuse every connection rather than bound them —
-  and so is an unknown key, because a misspelled limit is one that silently does
-  not apply. The four environment variables still work and still win over the
+  that does not mention the section behaves exactly as it did. A zero is refused
+  at startup for every key — it would refuse every connection rather than bound
+  them — and an unknown key is refused at load, before the server starts at all,
+  because a misspelled limit is one that silently does not apply. The four
+  environment variables still work and still win over the
   file, so a deployment that set them keeps the behaviour it had; a key both name
   is a warning in the log rather than a refusal, and the effective ceilings are
   printed at startup. Read once at startup, so editing them takes a restart.

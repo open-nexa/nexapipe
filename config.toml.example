@@ -465,10 +465,10 @@ path = "/health"
 #                              request is defensible and the same 64 MB times
 #                              every stream at once is not. Default: 1 GiB
 #
-# `0` is refused at load for every key: it would refuse every connection
+# A zero is refused at startup for every key: it would refuse every connection
 # rather than bound them, which is a typo rather than a setting. An unknown key
-# is refused at load too - a misspelled limit is one that silently does not
-# apply.
+# is refused at load, before the server starts at all - a misspelled limit is
+# one that silently does not apply.
 #
 # The four environment variables that named these ceilings before this section
 # existed - NEXAPIPE_MAX_CONNS_PER_PEER, NEXAPIPE_MAX_CONNS,

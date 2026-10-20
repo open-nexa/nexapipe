@@ -958,10 +958,12 @@ again a product of however many peers exist. `max_body_bytes` bounds memory:
 request bodies are read whole before being forwarded, so 64 MB per request is
 defensible and the same 64 MB times every stream at once is not.
 
-`0` is refused at load for every key: it would refuse every connection rather
-than bounding them, which is a typo rather than a setting. An **unknown key is
-also refused at load** — a misspelled limit is a limit that silently does not
-apply, and the process then runs with a ceiling nobody wrote down.
+A **zero** is refused at startup for every key: it would refuse every connection
+rather than bounding them, which is a typo rather than a setting, and the file
+is somewhere you can read the error. An **unknown key is refused at load**,
+before the server starts at all — a misspelled limit is a limit that silently
+does not apply, and the process would then run with a ceiling nobody wrote
+down.
 
 The effective ceilings are printed at startup:
 
