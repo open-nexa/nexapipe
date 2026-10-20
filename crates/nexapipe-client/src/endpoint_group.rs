@@ -1,6 +1,6 @@
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::connection_pool::{IrohConnectionPool, LinkKind, PRECONNECT_TIMEOUT};
+use crate::connection_pool::{IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT};
 use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
 use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
@@ -1357,19 +1357,31 @@ impl EndpointGroup {
         asked
     }
 
-    /// How traffic is currently reaching each backend: direct, or via a relay.
+    /// How traffic is currently reaching each backend, and how far away it is.
     ///
     /// One entry per *distinct backend*, because that is what a link describes — two domains
     /// served by the same node share one connection pool and therefore one answer.
     ///
     /// A backend that has never connected reports [`LinkKind::Unknown`]; the caller decides
-    /// whether that means "not connected yet" or "not connected at all".
-    pub async fn link_kinds(&self) -> Vec<(EndpointId, LinkKind)> {
-        let mut kinds = Vec::new();
+    /// whether that means "not connected yet" or "not connected at all". The round-trip time
+    /// is `None` until iroh has a sample, which is not the same as zero.
+    pub async fn link_statuses(&self) -> Vec<(EndpointId, LinkStatus)> {
+        let mut statuses = Vec::new();
         for (backend_id, pool) in self.unique_pools() {
-            kinds.push((backend_id, pool.link_kind().await));
+            statuses.push((backend_id, pool.link_status().await));
         }
-        kinds
+        statuses
+    }
+
+    /// How traffic is currently reaching each backend: direct, or via a relay.
+    ///
+    /// The kind on its own, for the callers that only draw an icon.
+    pub async fn link_kinds(&self) -> Vec<(EndpointId, LinkKind)> {
+        self.link_statuses()
+            .await
+            .into_iter()
+            .map(|(id, status)| (id, status.kind))
+            .collect()
     }
 
     /// Closes and forgets every cached connection to every backend, keeping the endpoints.

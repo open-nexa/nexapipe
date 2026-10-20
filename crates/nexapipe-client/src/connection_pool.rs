@@ -21,6 +21,11 @@ const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 /// Interval of the background watcher that removes closed/stale connections from the pool.
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+/// How often the round-trip time is re-read.
+///
+/// A second is quick enough for a figure that reads as "now" and slow enough
+/// to be free: iroh keeps the estimate in memory and reading it is a lookup.
+const RTT_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 /// Budget for the connect half of a preconnect.
 ///
 /// Deliberately shorter than [`PRECONNECT_TIMEOUT`]: the caller cancels the whole
@@ -159,6 +164,56 @@ impl LinkKind {
     }
 }
 
+/// How a backend is reached right now, and how long a round trip takes.
+///
+/// The two belong together: the round trip is only meaningful for the path
+/// that is carrying the traffic, and the path can change under the reading —
+/// a direct path that opens replaces a relay one, and with it the latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkStatus {
+    /// Whether traffic goes straight to the peer or through a relay.
+    pub kind: LinkKind,
+    /// The round-trip time of the path carrying the traffic.
+    ///
+    /// `None` means "not measured": a connection that has just opened has no
+    /// sample yet, a closed one has none either, and a path iroh cannot
+    /// measure — a relay that does not report — has none at all. It is not a
+    /// zero, and a UI must not draw it as one.
+    pub rtt: Option<std::time::Duration>,
+}
+
+impl LinkStatus {
+    /// Reads both halves off a live connection.
+    ///
+    /// A closed connection has no path left to report, so the caller gets
+    /// [`LinkStatus::default`] rather than a stale answer.
+    pub fn of(conn: &Connection) -> Self {
+        let kind = LinkKind::of(conn);
+        if kind == LinkKind::Unknown {
+            return Self::default();
+        }
+        Self {
+            kind,
+            rtt: rtt_of(conn),
+        }
+    }
+}
+
+/// The round-trip time of the path carrying the traffic, if it can be read.
+///
+/// The selected path is the one the traffic takes, so that is the one whose
+/// latency is worth showing. A path iroh has not measured yet — right after
+/// the handshake — has no sample, which is `None` rather than zero.
+fn rtt_of(conn: &Connection) -> Option<std::time::Duration> {
+    let paths = conn.paths();
+    for path in paths.iter() {
+        if path.is_selected() {
+            return conn.rtt(path.id());
+        }
+    }
+    None
+}
+
 struct PooledConnection {
     conn: Connection,
     created_at: std::time::Instant,
@@ -182,11 +237,11 @@ pub struct IrohConnectionPool {
     inner: Arc<IrohConnectionPoolInner>,
 }
 
-/// Lock order, observed everywhere: `connections`, then `link_kind`, then
+/// Lock order, observed everywhere: `connections`, then `link_status`, then
 /// `ep` — and never nested.
 ///
 /// Nesting is what makes a pool that dials while another task shuts it down
-/// deadlock-prone: `link_kind` is also taken by the per-connection path
+/// deadlock-prone: `link_status` is also taken by the per-connection path
 /// watcher, and `ep` by every dial, so holding one while waiting for another
 /// turns a slow shutdown into a stall for every request.
 struct IrohConnectionPoolInner {
@@ -221,14 +276,14 @@ struct IrohConnectionPoolInner {
     /// next `nativeStartProxy`/`nativePreconnect` with "Endpoint is closed"
     /// and tear down a running tunnel on proxy restart / reconnect.
     owns_endpoint: bool,
-    /// The last observed [`LinkKind`] for this backend.
+    /// The last observed [`LinkStatus`] for this backend.
     ///
     /// A pool hands its connections out to whoever is proxying traffic, so at any moment the
-    /// pool itself may hold none — and a UI asking "direct or relay?" every few seconds must
-    /// not be answered with "unknown" just because a request is in flight. The path watcher
-    /// writes here; [`IrohConnectionPool::link_kind`] reads it whenever no pooled connection
-    /// can be asked directly.
-    link_kind: Mutex<LinkKind>,
+    /// pool itself may hold none — and a UI asking "direct or relay, and how far?" every few
+    /// seconds must not be answered with "unknown" just because a request is in flight. The path
+    /// watcher writes here; [`IrohConnectionPool::link_status`] reads it whenever no pooled
+    /// connection can be asked directly.
+    link_status: Mutex<LinkStatus>,
 }
 
 impl IrohConnectionPool {
@@ -254,7 +309,7 @@ impl IrohConnectionPool {
             issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: true,
-            link_kind: Mutex::new(LinkKind::Unknown),
+            link_status: Mutex::new(LinkStatus::default()),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -270,7 +325,7 @@ impl IrohConnectionPool {
             issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: false,
-            link_kind: Mutex::new(LinkKind::Unknown),
+            link_status: Mutex::new(LinkStatus::default()),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
@@ -502,25 +557,32 @@ impl IrohConnectionPool {
         Ok(conn)
     }
 
-    /// How traffic to this backend is currently routed.
+    /// How traffic to this backend is currently routed, and how far away it is.
     ///
     /// A pooled connection is asked directly when there is one, because its path list is the
     /// truth right now; otherwise the last value the path watcher recorded is used. Without
     /// that fallback a UI polling while requests are in flight — the pool empty, every
     /// connection out on loan — would read "unknown" and flap.
-    pub async fn link_kind(&self) -> LinkKind {
+    pub async fn link_status(&self) -> LinkStatus {
         let connections = self.inner.connections.lock().await;
         for pooled in connections.iter().rev() {
             if pooled.is_live() {
-                let kind = LinkKind::of(&pooled.conn);
-                if kind != LinkKind::Unknown {
-                    return kind;
+                let status = LinkStatus::of(&pooled.conn);
+                if status.kind != LinkKind::Unknown {
+                    return status;
                 }
             }
         }
         drop(connections);
 
-        *self.inner.link_kind.lock().await
+        *self.inner.link_status.lock().await
+    }
+
+    /// How traffic to this backend is currently routed, without the latency.
+    ///
+    /// The kind on its own, for the callers that only draw an icon.
+    pub async fn link_kind(&self) -> LinkKind {
+        self.link_status().await.kind
     }
 
     /// Ensure at least one live connection to the backend is cached in the
@@ -637,7 +699,7 @@ impl IrohConnectionPool {
         }
         // Every connection is gone, so the last observed kind describes nothing any more.
         // Leaving it would let the UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_kind.lock().await = LinkKind::Unknown;
+        *self.inner.link_status.lock().await = LinkStatus::default();
 
         // Only close the endpoint if this pool owns it (created via `new()`).
         // Pools created via `new_with_endpoint()` share a caller-owned endpoint
@@ -681,7 +743,7 @@ impl IrohConnectionPool {
         }
         // Nothing is connected any more, so the last observed kind describes nothing.
         // Leaving it would let a UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_kind.lock().await = LinkKind::Unknown;
+        *self.inner.link_status.lock().await = LinkStatus::default();
     }
 }
 
@@ -736,35 +798,63 @@ fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<Strin
 /// event would leave the answer at [`LinkKind::Unknown`] for as long as the connection stays
 /// on its first path — which, for a backend behind a symmetric NAT, is forever.
 fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
-    let kind = LinkKind::of(&conn);
+    let status = LinkStatus::of(&conn);
     // `try_lock`, not `lock`: this runs on the caller's task, and a lock held elsewhere must
     // not stall a connection being handed out. Losing the race only costs one stale reading.
     if let Some(inner) = inner.upgrade()
-        && let Ok(mut slot) = inner.link_kind.try_lock()
+        && let Ok(mut slot) = inner.link_status.try_lock()
     {
-        *slot = kind;
+        *slot = status;
     }
 
     tokio::spawn(async move {
         let mut path_events = conn.path_events();
-        while let Some(event) = path_events.next().await {
-            let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event else {
-                continue;
-            };
+        // The round-trip time moves on its own: iroh re-estimates it from every
+        // acknowledgement, and says nothing when it does. A path event is rare —
+        // the connection may sit on one path for hours — so the latency is
+        // refreshed on a tick instead, or the reading a user sees would be the
+        // one the connection happened to have when it opened.
+        let mut ticker = tokio::time::interval(RTT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = path_events.next() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event else {
+                        continue;
+                    };
 
-            let kind = if remote_addr.is_ip() {
-                LinkKind::Direct
-            } else if remote_addr.is_relay() {
-                LinkKind::Relay
-            } else {
-                LinkKind::Unknown
-            };
+                    let kind = if remote_addr.is_ip() {
+                        LinkKind::Direct
+                    } else if remote_addr.is_relay() {
+                        LinkKind::Relay
+                    } else {
+                        LinkKind::Unknown
+                    };
 
-            let Some(inner) = inner.upgrade() else {
-                // Pool dropped; nobody is left to tell.
-                break;
-            };
-            *inner.link_kind.lock().await = kind;
+                    let Some(inner) = inner.upgrade() else {
+                        // Pool dropped; nobody is left to tell.
+                        break;
+                    };
+                    *inner.link_status.lock().await = LinkStatus {
+                        kind,
+                        rtt: rtt_of(&conn),
+                    };
+                }
+                _ = ticker.tick() => {
+                    let Some(inner) = inner.upgrade() else {
+                        // Pool dropped; nobody is left to tell.
+                        break;
+                    };
+                    let status = LinkStatus::of(&conn);
+                    if status.kind == LinkKind::Unknown {
+                        continue;
+                    }
+                    *inner.link_status.lock().await = status;
+                }
+            }
         }
     });
 }
@@ -832,7 +922,7 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::LinkKind;
+    use super::{LinkKind, LinkStatus};
 
     /// The name crosses the JNI and Tauri boundaries, so the two sides can only stay in sync
     /// if `as_str` and `parse` agree — and an unfamiliar spelling must degrade to `Unknown`
@@ -860,5 +950,14 @@ mod tests {
             serde_json::to_string(&LinkKind::Unknown).unwrap(),
             "\"unknown\""
         );
+    }
+
+    /// A link with no path is nothing at all — not a direct link with no
+    /// latency, which is what a caller would draw as "0 ms".
+    #[test]
+    fn a_link_with_no_path_has_neither_a_kind_nor_a_latency() {
+        let status = LinkStatus::default();
+        assert_eq!(status.kind, LinkKind::Unknown);
+        assert_eq!(status.rtt, None);
     }
 }

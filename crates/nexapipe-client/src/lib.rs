@@ -46,7 +46,7 @@ pub mod uniffi_bindings;
 pub mod jni;
 
 pub use client::IrohProxyClient;
-pub use connection_pool::{IrohConnectionPool, LinkKind};
+pub use connection_pool::{IrohConnectionPool, LinkKind, LinkStatus};
 pub use endpoint_group::{
     DomainMapping, EndpointGroup, NodeConfig, PooledConnection, PreconnectReport,
 };
