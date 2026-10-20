@@ -77,13 +77,14 @@ multiple-versions = "warn"
 # A wildcard dependency (`foo = "1.*"`) resolves to whatever the index says
 # today, so the build is not reproducible even with a lockfile.
 #
-# The rule is off here, because of what it counts as a wildcard: a path or
-# workspace dependency carries no version requirement at all, and cargo-deny
-# reports those as wildcards. Every local crate in this tree is a path
-# dependency, so the rule has nothing left to catch — no registry dependency
-# here uses a `*` requirement, and what actually pins the build is
-# Cargo.lock together with `--locked` in the container build.
-wildcards = "allow"
+# cargo-deny also calls a path or workspace dependency a wildcard, because it
+# carries no version requirement at all — and this tree is built almost
+# entirely out of those. `allow-wildcard-paths` is what tells the two apart:
+# with every local crate marked `publish = false` they are private, so their
+# path dependencies are allowed, while a registry dependency that says `*`
+# still fails the check.
+wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 # Crates refused outright, with a reason. Empty: nothing in this graph is
 # refused by name.
@@ -132,6 +133,10 @@ allow = [
 # A licence expression the scan cannot make sense of is a finding of its own,
 # so the threshold is high: only a confident reading counts.
 confidence-threshold = 0.8
+# This file is used for two graphs (see the note under [advisories]), and
+# WTFPL above is only reached through the desktop's `tun` crate — the
+# "allowed but never encountered" warning would fire on every server run.
+unused-allowed-license = "allow"
 # Crates whose licence needs a judgement rather than a list entry. Empty:
 # every crate in this tree is covered by the list above.
 exceptions = []
@@ -139,9 +144,8 @@ exceptions = []
 [sources]
 # A crate fetched from a registry this file does not know, or from a git
 # repository that is not named here, is refused. crates.io is the only
-# registry the tree is allowed to use, and the only git source is the
-# vendored fork in this repository — which is a path, and so is not a git
-# source at all.
+# registry the tree is allowed to use. The vendored smoltcp fork is a path
+# dependency, not a git source, so `allow-git` stays empty.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
