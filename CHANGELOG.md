@@ -89,6 +89,29 @@ that names none of the new keys leaves every deadline at its default.
   it is busy, so a long-lived SSH or database session over the tunnel needs
   `l4_flow_secs` raised (or a per-route `flow_timeout_secs`).
 
+### Security
+
+- **The published image is signed, and says where it came from.** Every image
+  released to GHCR now carries a cosign signature made with a key that is
+  minted for the release run through GitHub's OIDC — nothing is stored, so
+  nothing can be copied out of a secret — and a provenance attestation saying
+  what was built and from which source revision. The README says how to check
+  both; a tag is still a tag, and none of this changes what a pull gives you.
+- **The build no longer follows what it is told to.** Every action in every
+  workflow is pinned to a commit SHA rather than a tag, both Dockerfiles build
+  with `--locked` against the lockfile in this repository, and their base
+  images are pinned by digest rather than by a name that can be moved. A
+  compromised upstream action or a re-pushed base image no longer changes
+  what a release builds. The tag a hand-triggered release run builds with
+  reaches the script as a value rather than as text, so it cannot become
+  shell on the way in.
+- **`cargo deny` runs over both cargo workspaces.** The licences the
+  dependency tree may carry, the registries it may fetch from and the
+  duplicate versions it may hold are now a written policy (`deny.toml`) and a
+  gate, beside the two `cargo audit` jobs — which watch advisories and
+  nothing else. The check found two crates of this repository carrying no
+  licence at all; both say MIT now.
+
 ## [0.6.1] — 2026-10-11
 
 Two configuration keys are added (`[iroh] secret_key_file` and

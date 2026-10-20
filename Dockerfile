@@ -1,4 +1,11 @@
-FROM rust:alpine AS builder
+# Every base image is pinned by digest, not by tag: a tag is a name that can
+# be moved to different content at any time, and a digest is the content
+# itself. `rust:alpine` here is the 1.x-alpine3.24 image built on 2026-10-15.
+#
+# To move to a newer image, resolve the digest of the tag you want and replace
+# it here — leaving the tag in place, so the line still says what it is:
+#   docker buildx imagetools inspect rust:alpine --format '{{.Manifest.Digest}}'
+FROM rust:alpine@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 AS builder
 
 RUN apk add --no-cache musl-dev gcc make cmake ninja perl coreutils
 
@@ -15,9 +22,15 @@ COPY third_party ./third_party
 # default, which leaves rustc unable to produce one, so expect this and move on:
 #   warning: dropping unsupported crate type `cdylib` for target `...-unknown-linux-musl`
 # The binary links the rlib, which is built either way; nothing is missing.
-RUN cargo build --release -p nexapipe
+#
+# --locked: the build uses the lockfile in this repository and refuses to
+# resolve anything else. Without it a build that cannot reach the index, or
+# that sees a newer version than the lockfile pins, silently produces a
+# different binary than the one the lockfile describes.
+RUN cargo build --release --locked -p nexapipe
 
-FROM alpine:3.24
+# alpine:3.24, pinned by digest like the builder above.
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 RUN apk add --no-cache ca-certificates tzdata
 

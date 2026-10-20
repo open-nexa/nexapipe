@@ -8,8 +8,9 @@ name: Release
 #                    gradle assembleRelease with ABI splits)
 #   build-image    - the container image, one leg per architecture, pushed by
 #                    digest to ghcr.io/open-nexa/nexapipe
-#   publish-image  - merges those per-arch images into one manifest list and
-#                    tags it: the version, plus "latest" for a stable tag
+#   publish-image  - merges those per-arch images into one manifest list, tags
+#                    it (the version, plus "latest" for a stable tag), and then
+#                    signs the published digest and attests its provenance
 #   release        - assembles every artifact into a single GitHub Release with one
 #                    SHA256SUMS.txt
 #
@@ -126,15 +127,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           VERSION="${TAG#v}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -156,13 +163,13 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry & target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: ${{ matrix.target }}
 
       - name: Install cross
         if: ${{ matrix.cross }}
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cross
 
@@ -289,7 +296,7 @@ jobs:
           Get-ChildItem dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.target }}
           path: dist/*
@@ -367,7 +374,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -400,7 +407,7 @@ jobs:
             libpam0g-dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
         with:
           node-version: 24
           cache: npm
@@ -413,7 +420,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           # The Rust workspace is under src-tauri/ (its target dir is src-tauri/target).
           cache-on-failure: true
@@ -455,9 +462,15 @@ jobs:
       - name: Resolve version
         id: meta
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           version="${TAG#v}"
           if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
             echo "::error::tag '$TAG' is not a valid v<major>.<minor>.<patch>"
@@ -547,7 +560,7 @@ jobs:
           find release-artifact -type f | sort
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
           # upload-artifact paths are relative to the workspace root and ignore defaults.run.
@@ -562,7 +575,7 @@ jobs:
         # Guarded with hashFiles so it stays a no-op when the failure happened before
         # anything was staged (e.g. the build itself failed).
         if: failure() && hashFiles('ui-desktop/release-artifact/**') != ''
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: dist-desktop-${{ matrix.os }}-${{ matrix.arch }}
           path: ui-desktop/release-artifact/**
@@ -603,7 +616,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -611,6 +624,11 @@ jobs:
         id: opts
         env:
           INPUT_SIGNING_ONLY: ${{ inputs.signing_only }}
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           # Inputs are empty on tag-push runs, so the full flow runs by default.
@@ -620,7 +638,7 @@ jobs:
             SKIP_RUST=false
           fi
 
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           VERSION_NAME="${TAG#v}"
 
           # A version with a hyphen (v0.2.0-rc.1 / -beta.1 / -alpha.3) is a
@@ -649,7 +667,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6 @ 2026-10-14
         with:
           distribution: temurin
           java-version: '17'
@@ -732,13 +750,13 @@ jobs:
 
       - name: Install cargo-ndk
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
           tool: cargo-ndk
 
       - name: Cache cargo artifacts
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 @ 2026-06-23
         with:
           path: |
             ~/.cargo/registry/index
@@ -986,7 +1004,7 @@ jobs:
 
       - name: Upload APK artifact
         if: steps.opts.outputs.skip_rust != 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: dist-apk
           path: |
@@ -1040,12 +1058,14 @@ jobs:
             runner: ubuntu-22.04-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        with:
+          version: v0.38.0
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
@@ -1067,7 +1087,20 @@ jobs:
           # when both architectures are known to have built. A release whose
           # arm64 leg failed must not leave an amd64-only image under the
           # version tag.
+          #
+          # No buildx attestation here on purpose. With one enabled, buildx
+          # pushes an index — the image plus its attestation — rather than the
+          # image alone, and the digest below would be that index's, which
+          # publish-image would then have to flatten again. This is not the
+          # action's default: docker/build-push-action adds `mode=max`
+          # provenance by itself for a public repository (and `mode=min,
+          # inline-only` for a private one), so `provenance: false` is set
+          # explicitly here — as it is in the CI build-only job — to keep each
+          # leg a plain image. The provenance that matters is attached to the
+          # published manifest list instead, in publish-image, where the thing
+          # a user pulls is the thing that is attested.
           outputs: type=image,name=ghcr.io/open-nexa/nexapipe,push-by-digest=true,push=true
+          provenance: false
 
       # The digest is the only handle this leg's image has. It goes through an
       # artifact because a matrix job's outputs would only survive for one of
@@ -1081,7 +1114,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -1104,17 +1137,30 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # The signing key is minted for this run rather than stored: the OIDC
+      # token is what binds the signature to this workflow and this ref.
+      id-token: write
+      # The provenance attestation is written to GitHub's attestation store.
+      attestations: write
     steps:
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 @ 2025-12-16
+        with:
+          version: v0.38.0
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3 @ 2026-01-27
@@ -1124,13 +1170,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 @ 2026-10-07
         with:
           pattern: digests-*
           merge-multiple: true
           path: /tmp/digests
 
       - name: Create manifest list
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
@@ -1160,9 +1207,55 @@ jobs:
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
           docker buildx imagetools inspect "ghcr.io/open-nexa/nexapipe:${VERSION}"
 
+          # The digest of the list that was just published. This is the handle
+          # a user pulls, and the one the signature and the provenance
+          # attestation below are bound to: the per-architecture digests are
+          # not what `docker pull ghcr.io/open-nexa/nexapipe:0.7.0` resolves to.
+          digest="$(docker buildx imagetools inspect "ghcr.io/open-nexa/nexapipe:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::could not read the published digest"
+            exit 1
+          fi
+          echo "Published ghcr.io/open-nexa/nexapipe@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # The signature is made with the workflow's own identity rather than a
+      # key that sits in a secret: the OIDC token below is minted for this
+      # run, and the certificate says which workflow, which repository and
+      # which ref it was minted for. A key in a secret could be copied; a
+      # token cannot.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3 @ 2025-06-23
+
+      - name: Sign the published image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # The signature travels with the image as an OCI referrer, so
+          # `cosign verify ghcr.io/open-nexa/nexapipe@<digest>` is what a
+          # reader runs. The certificate identity is the workflow, not a
+          # person: see the verification snippet in the README.
+          cosign sign --yes "ghcr.io/open-nexa/nexapipe@${DIGEST}"
+
+      # The provenance attestation says what was built and from which source
+      # revision, in the form GitHub's own attestation store keeps. It is
+      # pushed to the registry next to the image, so it is found by digest.
+      - name: Attest the provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2 @ 2025-06-11
+        with:
+          subject-name: ghcr.io/open-nexa/nexapipe
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
   release:
     name: publish release
-    needs: [build, build-desktop, build-apk]
+    # publish-image is a need as well: the image is pushed by digest and then
+    # signed, so a failed signature or attestation has to keep the GitHub
+    # Release from being created over an unsigned image. A signing_only run
+    # skips both jobs anyway.
+    needs: [build, build-desktop, build-apk, publish-image]
     # A signing_only dispatch run uploads nothing to publish.
     if: ${{ inputs.signing_only != true && needs.build-apk.outputs.skip_rust != 'true' }}
     runs-on: ubuntu-latest
@@ -1174,35 +1267,41 @@ jobs:
       # gh requires the working directory to be a git repo; fetch-depth: 0 keeps
       # --generate-notes able to diff against the previous tag
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Resolve version
         shell: bash
+        env:
+          # Through the environment rather than into the script text: a value
+          # interpolated into a `run:` block is text the shell runs, and a
+          # dispatch input is a value somebody typed.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Download server artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 @ 2026-10-07
         with:
           pattern: ${{ env.BIN_NAME }}-*
           merge-multiple: true
           path: dist-server
 
       - name: Download desktop artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 @ 2026-10-07
         with:
           pattern: dist-desktop-*
           merge-multiple: true
           path: dist-desktop
 
       - name: Download APK artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 @ 2026-10-07
         with:
           pattern: dist-apk
           merge-multiple: true

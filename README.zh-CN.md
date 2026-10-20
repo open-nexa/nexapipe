@@ -250,6 +250,34 @@ docker compose up -d
 `docker-compose.override.yml` 里设置 `image:`，以免改动被版本跟踪的文件。`latest`
 只跟随正式发布，预发布标签不会占用它。
 
+#### 校验官方镜像
+
+每个发布的镜像都带签名和来源证明（provenance attestation），所以"GHCR 上的镜像
+确实是这个仓库构建出来的"是可以自己验证的事，而不是别人告诉你的一句话。签名密钥
+由 GitHub 的 OIDC 在发布时临时签发，不落盘保存，也就无法从某个密钥库里被复制走。
+
+```bash
+cosign verify ghcr.io/open-nexa/nexapipe:latest \
+    --certificate-identity-regexp 'https://github\.com/open-nexa/nexapipe/\.github/workflows/release\.yml@refs/tags/v.*' \
+    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+上面这条 identity 对应的是发布时所用的标签。手工重跑发布时，请把 workflow
+dispatch 到标签本身（`Run workflow` 里选择该标签），而不是分支：从分支发起的
+运行，证书 identity 是 `refs/heads/<branch>`，这条命令会有意拒绝它。
+
+来源证明说明构建了什么、来自哪个源码版本，它按 digest 查询，而 digest 就是标签
+实际指向的内容：
+
+```bash
+docker buildx imagetools inspect ghcr.io/open-nexa/nexapipe:latest
+gh attestation verify oci://ghcr.io/open-nexa/nexapipe@sha256:<digest> \
+    --repo open-nexa/nexapipe
+```
+
+这两步都不会改变你拉到的内容 —— 标签还是那个标签。它们是留给那些更愿意验证、
+而不是更愿意相信的人的。
+
 #### 修改配置文件
 
 配置文件每 5 秒重新读取一次，改动无需重启 —— 但**凡是会写入这个文件的操作，

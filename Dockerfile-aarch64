@@ -1,4 +1,11 @@
-FROM rust:1.98-alpine AS builder
+# Not built by CI, and not exercised by any workflow: release.yml builds the
+# arm64 image from the plain Dockerfile on an arm64 runner. This file is kept
+# for a manual cross-build from an amd64 host, so its two base-image digests
+# are not verified on every run.
+#
+# Pinned by digest, not by tag: see the note in the Dockerfile. This is
+# rust:1.98-alpine, the 1.98.1-alpine3.24 image.
+FROM rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
 
 RUN apk add --no-cache musl-dev gcc make cmake ninja perl coreutils aarch64-linux-musl-gcc
 RUN rustup target add aarch64-unknown-linux-musl
@@ -19,9 +26,17 @@ COPY third_party ./third_party
 # default, which leaves rustc unable to produce one, so expect this and move on:
 #   warning: dropping unsupported crate type `cdylib` for target `aarch64-unknown-linux-musl`
 # The binary links the rlib, which is built either way; nothing is missing.
-RUN cargo build --release --target=aarch64-unknown-linux-musl -p nexapipe
+#
+# --locked, for the reason the Dockerfile gives.
+RUN cargo build --release --locked --target=aarch64-unknown-linux-musl -p nexapipe
 
-FROM registry.it.iakl.top/alpine:3.24
+# The runtime image comes from a mirror, because a hosted runner has no route
+# to Docker Hub from where this is built. The digest is the content digest of
+# alpine:3.24 upstream: a pull-through cache serves the manifest it fetched,
+# byte for byte, so the digest is the same on both sides — and if the mirror
+# ever serves something else, the build fails with "manifest unknown" rather
+# than quietly building against an image nobody pinned.
+FROM registry.it.iakl.top/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 RUN apk add --no-cache ca-certificates tzdata
 
