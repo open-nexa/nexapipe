@@ -6,7 +6,8 @@ rust-version.workspace = true
 description = "Iroh-based proxy client library supporting multiple platforms"
 keywords = ["iroh", "proxy", "p2p", "quinn"]
 categories = ["network-programming"]
-license = "MIT"
+license.workspace = true
+publish = false
 
 [lib]
 crate-type = ["lib", "cdylib"]

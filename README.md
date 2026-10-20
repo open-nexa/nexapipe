@@ -282,6 +282,38 @@ Pinning a version instead of following it: replace `:latest` with a tag such as
 you are not editing a tracked file. `latest` only ever follows releases; a
 pre-release tag never takes it.
 
+#### Checking the published image
+
+Every published image carries a signature and a provenance attestation, so
+"the image on GHCR is the one this repository built" is something you can
+check rather than something you are told. The signing key is minted for the
+release run through GitHub's OIDC, so it is never stored anywhere and cannot
+be copied out of a secret.
+
+```bash
+cosign verify ghcr.io/open-nexa/nexapipe:latest \
+    --certificate-identity-regexp 'https://github\.com/open-nexa/nexapipe/\.github/workflows/release\.yml@refs/tags/v.*' \
+    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+The identity above is the tag the release was published from. If a release is
+re-run by hand, dispatch the workflow against the tag itself (`Run workflow` →
+the tag), not a branch: a run started from a branch signs with
+`refs/heads/<branch>` as its identity, and this command rejects that on
+purpose.
+
+The attestation says what was built and from which source revision. It is
+looked up by digest, and the digest is what the tag resolves to:
+
+```bash
+docker buildx imagetools inspect ghcr.io/open-nexa/nexapipe:latest
+gh attestation verify oci://ghcr.io/open-nexa/nexapipe@sha256:<digest> \
+    --repo open-nexa/nexapipe
+```
+
+Neither step changes what you pull — a tag is still a tag. They are there for
+the reader who would rather check than trust.
+
 #### Editing the config file
 
 The file is re-read every 5 seconds, so an edit needs no restart — but **run
