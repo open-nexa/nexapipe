@@ -713,9 +713,11 @@ async fn start_http_server(
                     // apart — a request line can never start with 0x16 — and a
                     // TLS session goes to the passthrough path, since this
                     // process has no key material and never decrypts anything.
-                    // The peek waits for the hello budget, and never past the
-                    // head budget: a client that has said nothing by then is
-                    // not going to send a request either.
+                    // The peek waits for whichever budget is longer — the
+                    // hello's, or what is left of the head's. Until the first
+                    // byte arrives the protocol is unknown, so a short
+                    // `header_secs` must not close a TLS session before its
+                    // `ClientHello` can say what it is.
                     if is_tls_connection(&stream, head_deadline, deadlines.tls_hello).await {
                         tracing::debug!("TLS session on the plaintext listener from: {}", remote_addr_str);
                         if let Err(e) =
@@ -829,18 +831,22 @@ fn remaining_budget(deadline: tokio::time::Instant) -> std::time::Duration {
 
 /// True when the peer opened a TLS session rather than sending a request.
 ///
-/// The peek waits for `hello` — the budget a TLS client has to start its
-/// handshake — and never past `deadline`, the budget this connection has for
-/// its whole exchange. A timeout, an EOF or an error all mean "not a TLS
-/// session, as far as this listener is concerned": the connection is handed to
-/// the HTTP server, which owns the read timeouts and the error responses.
+/// The peek waits for whichever is longer: `hello`, the budget a TLS client
+/// has to start its handshake, or what remains of `deadline`, the budget this
+/// connection has for a request head. Until the first byte arrives the
+/// protocol is unknown, so the shorter of the two is the wrong answer — a
+/// short `header_secs` must not close a TLS session before its `ClientHello`
+/// classifies it, which is the same choice `conn::handle_bidi_stream` makes
+/// for an iroh stream. A timeout, an EOF or an error all mean "not a TLS
+/// session, as far as this listener is concerned": the connection is handed
+/// to the HTTP server, which owns the read timeouts and the error responses.
 async fn is_tls_connection(
     stream: &tokio::net::TcpStream,
     deadline: tokio::time::Instant,
     hello: std::time::Duration,
 ) -> bool {
     let mut first = [0u8; 1];
-    let until = (tokio::time::Instant::now() + hello).min(deadline);
+    let until = deadline.max(tokio::time::Instant::now() + hello);
     match tokio::time::timeout_at(until, stream.peek(&mut first)).await {
         Ok(Ok(1)) => passthrough::is_tls_handshake(first[0]),
         // EOF, error, or a peer that never sends anything: hand it to the HTTP
@@ -996,7 +1002,10 @@ const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
-    use super::{may_bind_plaintext, plaintext_auth_conflict, remaining_budget, response_has_body};
+    use super::{
+        is_tls_connection, may_bind_plaintext, plaintext_auth_conflict, remaining_budget,
+        response_has_body,
+    };
     use std::net::SocketAddr;
 
     #[tokio::test(start_paused = true)]
@@ -1023,6 +1032,38 @@ mod tests {
         // than given a fresh deadline.
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         assert_eq!(remaining_budget(deadline), std::time::Duration::ZERO);
+    }
+
+    /// The first byte decides which protocol a stream carries, so the plaintext
+    /// listener must take the longer of `header_secs` and `tls_hello_secs` for
+    /// it, exactly as the iroh path does. With the shorter of the two, a short
+    /// `header_secs` closed a TLS session before its `ClientHello` could
+    /// classify it — on a configuration the README says is safe.
+    #[tokio::test]
+    async fn a_short_head_budget_still_lets_a_tls_client_classify() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Later than the head's budget, earlier than the hello's: the old
+            // `min` gave up at the head's deadline and called this a request.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &[0x16])
+                .await
+                .unwrap();
+        });
+
+        let (server, _) = listener.accept().await.unwrap();
+        let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let is_tls =
+            is_tls_connection(&server, head_deadline, std::time::Duration::from_secs(2)).await;
+        client.await.unwrap();
+
+        assert!(
+            is_tls,
+            "a TLS client slower than header_secs but within tls_hello_secs must still classify"
+        );
     }
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
