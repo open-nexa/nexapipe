@@ -669,6 +669,119 @@ fn redact_query(uri: &str) -> String {
     out
 }
 
+/// What a tunnelled flow said about itself, when it could be read.
+///
+/// The L4 tunnel carries bytes, so the line for one of its flows used to say
+/// only what the tunnel did with them. A flow that speaks TLS or plaintext HTTP
+/// says more than that, and this is what it said — read off the wire, without
+/// the proxy terminating anything.
+///
+/// It is a log-line concern and lives here rather than with the code that reads
+/// the bytes, because the redaction of a query string is this module's rule and
+/// a sniffed request target is a query string like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowDetail {
+    /// A TLS handshake. `sni` is the name it asked for, if it asked for one:
+    /// a client that connects by address asks for nothing.
+    Tls { sni: Option<String> },
+    /// A plaintext HTTP request, and the status the origin answered with.
+    ///
+    /// `status` is `None` when the origin never answered — the flow broke
+    /// before the response head arrived, which is not the same as an answer.
+    Http {
+        method: String,
+        target: String,
+        version: String,
+        status: Option<u16>,
+    },
+}
+
+/// Builds one access line.
+///
+/// The id goes last of the fixed columns, not first: everything before it
+/// keeps the column it had, so a script that splits this line on spaces still
+/// finds the host, the status and the duration where it always did. The
+/// identity and the flow's own facts follow it, each at the end of the line,
+/// for the same reason.
+///
+/// Separate from the writing, so a test can say what the line looks like
+/// without arming the global logger.
+#[allow(clippy::too_many_arguments)]
+fn access_line(
+    request_id: &str,
+    remote_addr: &str,
+    method: &str,
+    uri: &str,
+    status: u16,
+    duration_ms: u64,
+    bytes_sent: usize,
+    identity: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "{} - - [{}] \"{} {}\" {} {} {}ms id={}{}{}",
+        remote_addr,
+        Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
+        method,
+        uri,
+        status,
+        bytes_sent,
+        duration_ms,
+        request_id,
+        identity,
+        detail
+    )
+}
+
+/// The suffix a flow's facts add to its access line.
+///
+/// Appended after the request id and the identity, so the columns before it
+/// keep the meaning they have had: the status on a flow's line is still what
+/// the tunnel did, not what the origin behind it answered.
+fn flow_detail_suffix(detail: &FlowDetail) -> String {
+    match detail {
+        FlowDetail::Tls { sni } => {
+            // A dash rather than an empty field, because "this was a TLS
+            // handshake that named no host" and "this was not TLS at all" are
+            // not the same answer.
+            format!(" sni={}", sni.as_deref().unwrap_or("-"))
+        }
+        FlowDetail::Http {
+            method,
+            target,
+            version,
+            status,
+        } => {
+            // The target is the client's own bytes, so it is sanitized and
+            // redacted like any other URI in this file: a query value is
+            // where tokens travel, and a control character would let the
+            // client write the next line of the log itself.
+            let target = redact_query(&sanitize(target));
+            let method = sanitize(method);
+            let version = sanitize(version);
+            format!(
+                " http=\"{method} {target} {version}\" http_status={}",
+                status
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            )
+        }
+    }
+}
+
+/// Strips the characters that would break a log line out of a sniffed value.
+///
+/// A client controls these bytes, and a log line is read by people and by
+/// scripts: a newline in here would append a line of the client's choosing,
+/// and a quote would end the quoted part early. Both are dropped rather than
+/// replaced, because a value that cannot be printed is not a value.
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"')
+        .collect()
+}
+
 /// The ` client=… device=…` suffix of one access line: whose request it was.
 ///
 /// Both fields are printable ASCII by the time they get here — `conn` rejects a
@@ -729,6 +842,69 @@ pub fn log_access(
     bytes_sent: usize,
     who: Option<&PeerIdentity>,
 ) {
+    write_access_line(
+        request_id,
+        remote_addr,
+        method,
+        uri,
+        status,
+        duration_ms,
+        bytes_sent,
+        who,
+        None,
+    );
+}
+
+/// The line for a tunnelled flow rather than a request.
+///
+/// The first four arguments are the same facts the request line carries: the
+/// protocol where a method would be, the target where a URI would be, and the
+/// outcome of the tunnel itself. `detail` is what the flow said about itself —
+/// the name a TLS handshake asked for, the request line and status a
+/// plaintext HTTP flow exchanged — and it is appended to the line rather than
+/// folded into the columns before it, so a script that reads the status of a
+/// flow keeps reading the outcome of the tunnel.
+#[allow(clippy::too_many_arguments)]
+pub fn log_access_flow(
+    request_id: &str,
+    remote_addr: &str,
+    proto: &str,
+    target: &str,
+    status: u16,
+    duration_ms: u64,
+    bytes_sent: usize,
+    who: Option<&PeerIdentity>,
+    detail: Option<&FlowDetail>,
+) {
+    write_access_line(
+        request_id,
+        remote_addr,
+        proto,
+        target,
+        status,
+        duration_ms,
+        bytes_sent,
+        who,
+        detail,
+    );
+}
+
+/// Builds the line and hands it to the sink.
+///
+/// One function behind both entry points, so a flow's line and a request's
+/// line are the same line with one more field at the end of one of them.
+#[allow(clippy::too_many_arguments)]
+fn write_access_line(
+    request_id: &str,
+    remote_addr: &str,
+    method: &str,
+    uri: &str,
+    status: u16,
+    duration_ms: u64,
+    bytes_sent: usize,
+    who: Option<&PeerIdentity>,
+    detail: Option<&FlowDetail>,
+) {
     // Decided before anything is formatted: a proxy with the access log turned
     // off used to build the line for every request and then drop it, paying for
     // a `Local::now()` and an allocation per request to log nothing.
@@ -758,21 +934,22 @@ pub fn log_access(
     // Printed last, so everything before it keeps the column it had.
     let identity = access_identity(who);
 
+    // And after that: what the flow said about itself. It goes at the very
+    // end for the same reason the id does — a new field must not move a
+    // column that a script already knows where to find.
+    let detail = detail.map(flow_detail_suffix).unwrap_or_default();
+
     if let Some(target) = target {
-        // The id goes last, not first: everything before it keeps the column
-        // it had, so a script that splits this line on spaces still finds the
-        // host, the status and the duration where it always did.
-        let line = format!(
-            "{} - - [{}] \"{} {}\" {} {} {}ms id={}{}",
-            remote_addr,
-            Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
-            method,
-            uri,
-            status,
-            bytes_sent,
-            duration_ms,
+        let line = access_line(
             request_id,
-            identity
+            remote_addr,
+            method,
+            &uri,
+            status,
+            duration_ms,
+            bytes_sent,
+            &identity,
+            &detail,
         );
 
         match target {
@@ -804,13 +981,17 @@ pub fn log_access(
         }
     }
 
+    // The same facts as the line above, and the same redacted detail: the
+    // event and the file have to agree, or redacting the file only moves the
+    // leak next door.
     tracing::info!(
-        "Access: {} {} {} {} {}ms",
+        "Access: {} {} {} {} {}ms{}",
         remote_addr,
         method,
         uri,
         status,
-        duration_ms
+        duration_ms,
+        detail
     );
 }
 
@@ -860,6 +1041,100 @@ mod tests {
         // `init` was not called (a library embedder, or an already installed
         // global logger).
         assert!(REDACT_QUERY.load(Ordering::Relaxed));
+    }
+
+    /// The suffix a flow's facts add to a line.
+    #[test]
+    fn a_flow_says_what_it_was() {
+        assert_eq!(
+            flow_detail_suffix(&FlowDetail::Tls {
+                sni: Some("www.example.com".to_string())
+            }),
+            " sni=www.example.com"
+        );
+
+        // A TLS handshake that named no host is not the same answer as a flow
+        // that was not TLS at all.
+        assert_eq!(flow_detail_suffix(&FlowDetail::Tls { sni: None }), " sni=-");
+
+        assert_eq!(
+            flow_detail_suffix(&FlowDetail::Http {
+                method: "GET".to_string(),
+                target: "/v1/items".to_string(),
+                version: "HTTP/1.1".to_string(),
+                status: Some(404),
+            }),
+            " http=\"GET /v1/items HTTP/1.1\" http_status=404"
+        );
+
+        // An origin that never answered is not an answer.
+        assert_eq!(
+            flow_detail_suffix(&FlowDetail::Http {
+                method: "GET".to_string(),
+                target: "/v1/items".to_string(),
+                version: "HTTP/1.1".to_string(),
+                status: None,
+            }),
+            " http=\"GET /v1/items HTTP/1.1\" http_status=-"
+        );
+    }
+
+    /// A sniffed target is a URI like any other, so its query values are
+    /// redacted too.
+    #[test]
+    fn a_sniffed_target_is_redacted() {
+        assert_eq!(
+            flow_detail_suffix(&FlowDetail::Http {
+                method: "GET".to_string(),
+                target: "/api/v1/items?token=hunter2".to_string(),
+                version: "HTTP/1.1".to_string(),
+                status: Some(200),
+            }),
+            " http=\"GET /api/v1/items?token=<redacted> HTTP/1.1\" http_status=200"
+        );
+    }
+
+    /// The client owns these bytes, and a log line is read by people and by
+    /// scripts: a newline in here would write the next line of the log
+    /// itself, and a quote would end the quoted part early.
+    #[test]
+    fn a_sniffed_value_cannot_break_the_line() {
+        let suffix = flow_detail_suffix(&FlowDetail::Http {
+            method: "GET".to_string(),
+            target: "/x\r\nGET /secret HTTP/1.1".to_string(),
+            version: "HTTP/1.1".to_string(),
+            status: None,
+        });
+
+        assert!(!suffix.contains('\n'), "the line can be broken: {suffix}");
+        assert!(!suffix.contains('\r'), "the line can be broken: {suffix}");
+        assert_eq!(
+            suffix.matches('"').count(),
+            2,
+            "the quoting is broken: {suffix}"
+        );
+    }
+
+    /// The columns before the id keep the shape they have had, and the flow's
+    /// own facts go at the very end.
+    #[test]
+    fn a_flow_facts_do_not_move_the_columns() {
+        let line = access_line(
+            "abc123",
+            "203.0.113.9",
+            "TCP",
+            "db.test:5432",
+            200,
+            12,
+            0,
+            "",
+            " sni=www.example.com",
+        );
+
+        assert!(
+            line.contains("\"TCP db.test:5432\" 200 0 12ms id=abc123 sni=www.example.com"),
+            "unexpected line: {line}"
+        );
     }
 
     #[test]

@@ -1212,6 +1212,22 @@ off, and the plaintext HTTP listener, do not run a handshake, and a line
 answering "whose request was this" with a dash on all of them is noise rather
 than an answer.
 
+**A tunneled flow says what it was.** An L4 flow carries bytes, so its line
+records what the tunnel did with them. When the first bytes of a flow say what
+the flow is, the line says that too — the name a TLS handshake asked for, or
+the request line and the status of a plaintext HTTP exchange:
+
+```text
+203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "TCP db.test:5432" 200 0 12ms id=3f9ac1… sni=www.example.com
+203.0.113.9 - - [29/Sep/2026:13:52:05 +0800] "TCP api.test:80" 200 0 12ms id=3f9ac1… http="GET /v1/items HTTP/1.1" http_status=404
+```
+
+The status column still holds the outcome of the tunnel — `200` is a flow that
+worked, whatever the origin behind it answered — so a script that reads it
+keeps reading what it read before. A query string in a sniffed target is
+redacted like any other, and a flow that says nothing recognizable (SSH, a
+database protocol) gets no field at all rather than a guess.
+
 ### `[acme]`
 
 Removed. Certificates belong to the backend now; the section is still parsed but
@@ -1361,11 +1377,19 @@ written in.
 
 ### What it costs
 
-L4 flows are opaque: the access log records bytes rather than a request line, and
-there is no health check. Concurrency is bounded per QUIC connection — a client
-that opens too many flows gets `0x03 too many flows` instead of silently queueing.
-Because one UDP flow is one bi-stream, a TUN device can hold several hundred at
-once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under [QUIC tuning](#quic-tuning).
+L4 flows are opaque: the proxy does not read them, so there is no health check
+and no path rewriting. The access log says what the tunnel did with them — and,
+when the first bytes of a flow say what the flow is, what the flow was: the
+name a TLS handshake asked for, or the request line and the status of a
+plaintext HTTP exchange. It is a reading of the client's own bytes and nothing
+more: the route was chosen by the preface, before a single payload byte
+arrived, so nothing the log says can name a different backend than the one that
+served the flow.
+
+Concurrency is bounded per QUIC connection — a client that opens too many flows
+gets `0x03 too many flows` instead of silently queueing. Because one UDP flow
+is one bi-stream, a TUN device can hold several hundred at once; see
+`NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under [QUIC tuning](#quic-tuning).
 
 ### Which clients can use it
 
