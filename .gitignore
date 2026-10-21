@@ -14,6 +14,10 @@ nexa_vpn_log.txt
 logs/*
 !logs/.gitkeep
 config.toml
+# The runtime state the server keeps beside the configuration: the 2FA
+# counters, written by the server and by nobody else. It is the same kind of
+# file as the configuration above — one machine's runtime, not the repository's.
+state.toml
 # The endpoint identity key the docker setup generates into ./secrets/iroh.key
 # (NEXAPIPE_IROH_SECRET_KEY_FILE). The directory itself stays untracked the
 # same way config/ is: a private key has no business in the repo.

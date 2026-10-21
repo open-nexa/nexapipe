@@ -1716,9 +1716,13 @@ pub struct ClientAuthToml {
     /// above. Defaults to `true`, which is the only spelling a client that
     /// predates the device table can authenticate under.
     pub unnamed_device_allowed: Option<bool>,
-    /// Runtime counters written back by the server (see
-    /// `config_watcher::save_auth_state`); read here so a lockout survives a
-    /// restart.
+    /// Runtime counters, read here so a lockout survives a restart.
+    ///
+    /// The server writes these to its own state file now, beside this one, and
+    /// not here — see [`crate::auth::state`]. They are still read from this
+    /// file, so a deployment that counted here before the state file existed
+    /// keeps its lockouts; the state file takes over once it has an entry for
+    /// this client.
     pub failed_attempts: Option<u32>,
     pub locked_until: Option<u64>,
     pub last_used: Option<u64>,
@@ -1743,8 +1747,10 @@ pub struct DeviceAuthToml {
     /// signs its handshake instead of answering with a TOTP code.
     pub public_key: Option<String>,
     pub created_at: Option<String>,
-    /// Written back by the server, read here, so "when did this device last
-    /// connect" survives a restart.
+    /// Read here so "when did this device last connect" survives a restart.
+    ///
+    /// The stamp is written to the server's state file, beside the
+    /// configuration, and not here — see [`crate::auth::state`].
     pub last_used: Option<u64>,
 }
 
@@ -1798,7 +1804,7 @@ impl ProxyConfig {
         // Note `toml::from_str`, not `str::parse`: `Value::from_str` reads a
         // single TOML *value*, so it rejects a whole document with "unexpected
         // content, expected nothing" and silently leaves 2FA disabled.
-        let auth_config = match toml::from_str::<toml::Value>(content.expose_secret()) {
+        let mut auth_config = match toml::from_str::<toml::Value>(content.expose_secret()) {
             Ok(toml_value) => {
                 // The tree is a copy of the file in plain strings, the seeds
                 // included, and it is dropped on every way out of here — the
@@ -1989,6 +1995,21 @@ impl ProxyConfig {
             }
             Err(_) => None,
         };
+
+        // The counters the server counted live in their own file now, beside
+        // this one. They are moved onto the configuration the caller gets, so
+        // everything downstream — the connection layer, the admin view, the
+        // client list — reads one answer and does not have to know which file
+        // it came from.
+        //
+        // A state file that cannot be read stops the load: the lockouts it
+        // holds are unknown, and a server that started anyway would have just
+        // reset every one of them.
+        if let Some(auth) = auth_config.as_mut() {
+            let state_path = crate::auth::state::path_for(path);
+            let state = crate::auth::state::load(&state_path)?;
+            crate::auth::state::apply(&state, auth);
+        }
 
         Ok((base, auth_config))
     }
