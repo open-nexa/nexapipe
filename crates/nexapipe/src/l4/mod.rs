@@ -477,10 +477,10 @@ where
             // has to be able to find. `flow_timeout_secs` on the route raises it
             // — the default is meant to be generous, not invisible.
             tracing::warn!(
-                "L4 TCP: closing the flow to {host}:{port} after {flow_timeout:?}, which is the \
-                 whole-flow bound; raise flow_timeout_secs on the route for longer sessions. \
-                 The other end of the copy may also have stopped without finishing, which is \
-                 what the copy gives up on after a half-close"
+                "L4 TCP: closing the flow to {host}:{port} on a timeout — either the \
+                 whole-flow bound ({flow_timeout:?}) expired, which flow_timeout_secs on the \
+                 route raises, or the other end of the copy stopped without finishing and the \
+                 copy gave up on it. The debug line says which of the two it was"
             );
         }
         // A real transport failure, which is what the other paths report too.
