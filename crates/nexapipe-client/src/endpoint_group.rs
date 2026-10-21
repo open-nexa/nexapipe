@@ -947,8 +947,8 @@ impl EndpointGroup {
     /// the backend it is sent to is named by that same list. A lookup that
     /// knew only exact names and parent labels would not find the
     /// `*.example.com` mapping at all — the request would go to the default
-    /// backend or to none, which is the two halves of one client disagreeing
-    /// about a pattern the configuration spells once.
+    /// backend or to none: the two halves of one client disagreeing about a
+    /// pattern the configuration spells once.
     ///
     /// The exact name comes first, and a wildcard only after it: a bare
     /// pattern is that name and nothing else, so `example.com` never answers
