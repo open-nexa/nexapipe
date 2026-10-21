@@ -20,6 +20,13 @@ when it was imported from the former standalone repository.
     `CONNECT`, and extracts SNI from the raw ClientHello for TLS.
   - *TUN* — a real tunnel (WinTun on Windows) with its own local DNS server, so
     any application works without per-app proxy configuration.
+- **An explicit DNS strategy** — what happens to the machine's own name
+  resolution while the tunnel is up: `scoped` (only the configured domains go
+  through the tunnel, and the machine's own names keep resolving where they
+  did), `global` (every query goes through it), or `none` (the machine's DNS is
+  not touched and the tunnel's own resolver waits for a PAC file or a hosts
+  entry to point at it). The strategy is never changed for you: a machine that
+  cannot be scoped says so rather than having its whole DNS replaced.
 - **Optional elevated background service** (`nexa-service`) that owns the TUN
   device; the UI talks to it over a local IPC channel. TUN is only offered when
   the service is installed — nothing is probed and nothing is silently

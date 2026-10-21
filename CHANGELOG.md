@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Eleven things land in this cycle so far: the device credential can be a **key**
+Thirteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -30,8 +30,10 @@ can be held to the ports it may reach and not only to the names, both clients
 can say how far away the path carrying the traffic is, the desktop app can
 stay in the tray instead of ending with its window, the third-party boundary
 is two settings now rather than one, the Android app can bring the tunnel back
-after a restart, and the Android client picks its address block instead of
-hard-coding one.
+after a restart, the Android client picks its address block instead of
+hard-coding one, the server's runtime state lives in a file of its own beside
+the configuration instead of inside it, and the desktop says what it does to
+the machine's DNS instead of deciding for itself.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -237,6 +239,22 @@ lookup, which is what a config written before the key existed does.
   read from it, so a deployment that was counting there keeps its lockouts
   until the state file has an entry for that client. They are not written back
   there any more, and `config.toml` is never rewritten for them.
+- **The desktop says what it does to the machine's DNS, instead of deciding
+  for itself.** What happens to a machine's name resolution while the tunnel is
+  up is now a setting — `scoped`, `global` or `none` — with `scoped` as the
+  default. Scoped points only the configured domains at the tunnel and leaves
+  everything else — an internal zone, another tunnel's names — resolving where
+  it always did; global points every query at the tunnel; none does not touch
+  the machine's DNS at all, and the tunnel's own resolver keeps running for a
+  PAC file or a hosts entry to point at.
+  **This changes what the desktop does on a machine it cannot scope.** It used
+  to fall through to the global hijack — silently replacing the machine's whole
+  DNS — whenever the per-domain mechanism was unavailable (a Windows machine
+  that takes its NRPT rules from a domain policy, say) or the configured domain
+  list could not be named to the operating system at all (a bare `*`, or a name
+  without a dot). Now it refuses the tunnel and says why, and the global
+  strategy is one setting away for the machine that needs it. A machine that
+  could be scoped is unaffected: it was already scoped.
 - **The Android client picks its address block instead of hard-coding one.**
   The TUN used to claim `10.0.1.0/24` whatever network it was on, and that is
   the block a great many home routers hand out — on those networks the tunnel

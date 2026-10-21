@@ -204,6 +204,7 @@ async fn start_proxy(
     local_addr: Option<String>,
     dns_addr: Option<String>,
     upstream_dns: Option<String>,
+    dns_strategy: Option<String>,
     load_balancing: Option<String>,
     tun_name: Option<String>,
     use_service: Option<bool>,
@@ -274,6 +275,7 @@ async fn start_proxy(
             local_addr: local_addr.clone(),
             dns_addr: dns_addr.clone(),
             upstream_dns: upstream_dns.clone(),
+            dns_strategy: dns_strategy.clone(),
             load_balancing: load_balancing.clone(),
             tun_name: tun_name.clone(),
             use_tun: Some(use_tun),
@@ -356,6 +358,16 @@ async fn start_proxy(
     let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
     let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
 
+    // What the machine's DNS is asked to do. Read here rather than deeper
+    // down, so a spelling nobody knows is refused before anything is changed:
+    // a strategy that is not known must not be read as "leave the machine's
+    // DNS alone" or "replace all of it".
+    let dns_strategy = match dns_strategy.as_deref() {
+        Some(value) => proxy::dns_config::DnsStrategy::parse(value)
+            .map_err(|e| AppError::cause(codes::PROXY_INVALID_DNS_STRATEGY, e.to_string()))?,
+        None => proxy::dns_config::DnsStrategy::default(),
+    };
+
     // The in-process path is the one that had no validation at all, so it
     // re-checks after the defaults have been substituted: the caller's values
     // were already refused above, and this catches a default that stops being
@@ -370,6 +382,7 @@ async fn start_proxy(
         local_proxy_addr: local_addr,
         dns_listen_addr: dns_addr,
         upstream_dns,
+        dns_strategy,
         load_balancing,
         tun_name,
         use_tun,

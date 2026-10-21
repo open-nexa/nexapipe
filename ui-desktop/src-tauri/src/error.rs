@@ -24,6 +24,12 @@ pub mod codes {
     pub const PROXY_NO_NODES: &str = "proxy.no_nodes";
     /// The load-balancing strategy string did not match a known strategy.
     pub const PROXY_INVALID_LOAD_BALANCING: &str = "proxy.invalid_load_balancing";
+    /// The DNS strategy string did not match a known strategy.
+    ///
+    /// Its own code, because the two say different things: a load-balancing
+    /// strategy that is not known picks a backend, while a DNS strategy that is
+    /// not known says what happens to the machine's own name resolution.
+    pub const PROXY_INVALID_DNS_STRATEGY: &str = "proxy.invalid_dns_strategy";
     /// `ProxyManager::start` failed asynchronously, after `start_proxy` had already returned.
     pub const PROXY_START_FAILED: &str = "proxy.start_failed";
     /// No configured backend could be reached, so the proxy would have forwarded to nothing.
