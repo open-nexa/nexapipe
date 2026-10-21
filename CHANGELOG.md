@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Sixteen things land in this cycle so far: the device credential can be a **key**
+Nineteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -35,8 +35,11 @@ hard-coding one, the server's runtime state lives in a file of its own beside
 the configuration instead of inside it, the desktop says what it does to the
 machine's DNS instead of deciding for itself, the access log says what a
 tunnelled flow was instead of only what the tunnel did with it, an app that
-is not written in Rust can configure a client through the UniFFI surface, and
-the paths that carry the traffic can be measured instead of assumed.
+is not written in Rust can configure a client through the UniFFI surface, the
+paths that carry the traffic can be measured instead of assumed, the first
+result of those measurements is written down, a route that rewrites the paths
+it serves now rewrites them for the tunnel as well, and the Android client's
+tunnel descriptor is closed exactly once.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -257,7 +260,27 @@ lookup, which is what a config written before the key existed does.
   checked. The reading `allow_hosts = []` has is the stricter of the two: it
   denies every name, with no path around it, while a port is only denied
   where one is checked.
-  A port of zero is refused at startup, because no client ever asks for it.
+  a port of zero is refused at startup, because no client ever asks for it.
+
+- **The first benchmark result is written down.** The three benchmarks that
+  landed with the cycle have been running in CI since they were added, and
+  their output was going into an artifact nobody opened — which is the same
+  thing as no measurement at all. The numbers are now in
+  [`docs/benchmarks.md`](docs/benchmarks.md) and in §F1 of
+  [`docs/size-perf-roadmap.md`](docs/size-perf-roadmap.md), together with the
+  machine they were measured on, because a criterion number only means
+  something on the machine that produced it.
+  The result is one hotspot and one decision that there is no hotspot. The
+  virtual-address bookkeeping is 30% of the TUN's per-packet path — 2.3 µs
+  of 7.3 µs — for what should be a hash lookup, and the reason is a `String`
+  clone and a second `HashMap` write on every packet. The L4 copy loop is not
+  where the time is: a whole flow's life is 42 µs, and the copy inside it is
+  a fraction of that, so the candidate list's first item — bigger buffers in
+  the copy loops — was the wrong first move and is not made.
+  The list of what the numbers do **not** cover is written down next to them:
+  the DNS forward branch, the idle wake-up rate, the per-flow memory, and
+  both crates' HTTP request paths. Those are still expectations, and saying
+  so is what keeps the ones that are results honest.
 
 ### Changed
 
@@ -404,6 +427,40 @@ lookup, which is what a config written before the key existed does.
   request dials whichever backend the balancer picked — sets `enabled = false`.
   A single-backend route can therefore answer 503 for up to `reset_secs` after
   five consecutive connect failures, where it used to return 502 each time.
+
+### Fixed
+
+- **A route's path rewrite reaches the tunnel.** A route may pair a
+  `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
+  writes when the service behind the route is not at the path the client asks
+  for. The rewrite was applied on the plaintext listener and not on the
+  tunnel, which is the path every real client takes: the route looked
+  configured, `curl` against the listener saw the rewrite, and nothing else
+  did. The rule now lives in one place — the route's own backend — and both
+  paths use it, so the two cannot drift apart again.
+  A WebSocket upgrade is part of that. The tunnel serves it and the plaintext
+  listener answers it with 426, so the tunnel is the only place a WebSocket
+  is served at all, and the upgrade went out with the path the client asked
+  for rather than the one the route rewrites it to. It goes out with the
+  rewritten path now, like every other request the route serves.
+- **The Android client's tunnel descriptor is closed exactly once.** The
+  descriptor the VPN hands over belongs to the native side from the JNI
+  boundary on: it is taken there, before the first thing that can fail, and it
+  is closed there on every path out of that function — the successful one and
+  the failing ones alike.
+  It used to be closed in two places, on two different paths. The native side
+  closed it inside the tunnel setup, but only once both halves of the
+  read/write pair had been duplicated, so a failure after that point left it
+  closed by the native side and closed again by the Kotlin side, which closed
+  it on the assumption that a failed call meant the native side had never
+  taken it. It had. Between the two closes the number can be handed to
+  something else — a socket, a file, another TUN — and the second close then
+  closes that instead. On a phone that is an unrelated file in the process,
+  and the failure is silent.
+  The ownership is now a property of the type rather than of every call site
+  remembering to close, and the Kotlin side closes the descriptor only in the
+  one case where it is still its own: a native method that was never entered
+  at all.
 
 ### Security
 
