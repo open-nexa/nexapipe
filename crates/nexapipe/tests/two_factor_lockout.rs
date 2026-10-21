@@ -673,7 +673,13 @@ fn keeps_the_device_table_when_it_writes_counters() {
     let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let client = &reloaded.clients["client-001"];
-    assert_eq!(client.devices.len(), 2, "{client:?}");
+    // The device names, not the client: a `ClientAuth` carries a credential.
+    assert_eq!(
+        client.devices.len(),
+        2,
+        "the devices are still there: {:?}",
+        client.devices.keys().collect::<Vec<_>>()
+    );
     assert_eq!(
         client.devices["laptop"].secret.as_str(),
         "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"

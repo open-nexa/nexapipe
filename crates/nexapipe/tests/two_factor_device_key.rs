@@ -363,8 +363,13 @@ fn keeps_a_key_device_when_it_writes_counters() {
     let phone = &reloaded.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));
     assert!(phone.secret.expose_secret().is_empty());
+    // The stamp, not the device: a `DeviceAuth` carries a credential, and its
+    // `Debug` redacts it — but a message that prints the whole struct is a
+    // message about a credential to anyone reading the code, and to anyone
+    // reading the log when the assertion fails.
     assert!(
         phone.last_used.is_some(),
-        "the stamp comes back on the next load: {phone:?}"
+        "the stamp comes back on the next load: {:?}",
+        phone.last_used
     );
 }
