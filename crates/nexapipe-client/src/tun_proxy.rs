@@ -2305,8 +2305,8 @@ mod tests {
         Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
         DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UpstreamResolvers, answer_ttl,
         answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at, handle_dns_query,
-        lock_cache, next_activity, parse_dns_query, read_u32, remember_answer,
-        resolve_tcp_window, set_answer_ttls, wait_for_stop,
+        lock_cache, next_activity, parse_dns_query, read_u32, remember_answer, resolve_tcp_window,
+        set_answer_ttls, wait_for_stop,
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
