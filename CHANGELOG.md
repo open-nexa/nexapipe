@@ -431,6 +431,17 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A config that could not be loaded is tried again.** The watcher noticed a
+  changed file by its modification time alone, and only a *newer* one: a file
+  restored from a backup, checked out by `git`, or written twice inside one
+  second was never reloaded. The stamp was also advanced before the reload
+  ran, so a file that was read while it was half-written — the common case,
+  since the config is saved on every change — was never tried again and the
+  server kept the routes it had for ever. The watcher now compares the file's
+  time *and* its length, reloads a file that is older as well as a newer one,
+  and only remembers a file once it has been loaded successfully. A failed
+  load is retried, with a wait that grows so a file that is simply wrong does
+  not fill the log.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks

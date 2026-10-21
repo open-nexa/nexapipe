@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// Watches `config.toml` and applies a change to the live routing table.
 ///
@@ -79,6 +80,104 @@ pub struct PlaintextListener {
     pub exposed: bool,
 }
 
+/// How often the watcher looks at the file.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The longest the watcher waits before trying the same file again after a
+/// failed load.
+///
+/// A file that is wrong stays wrong, and a log line every five seconds for
+/// ever is not a thing anyone wants to read. The wait starts at the poll
+/// interval and doubles, so a file that was half-written is retried soon.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+/// What the watcher remembers between ticks.
+///
+/// Two things: the file as it was when it was last loaded **successfully**,
+/// and what to do about a load that failed.
+#[derive(Debug, Clone, Copy)]
+struct WatchState {
+    /// The file as it was when it was last loaded.
+    loaded: FileStamp,
+    /// When a failed load may be tried again.
+    retry_at: Instant,
+    /// How long the next wait is. Doubles after every failure.
+    retry_delay: Duration,
+}
+
+impl WatchState {
+    fn new(loaded: FileStamp, now: Instant) -> Self {
+        Self {
+            loaded,
+            retry_at: now,
+            retry_delay: Duration::ZERO,
+        }
+    }
+
+    /// Whether the file as it is now should be loaded.
+    ///
+    /// The stamp is compared as a whole, and **neither half has to be
+    /// newer**: the time *or* the length being different is enough. A file
+    /// that replaced another one — restored from a backup, checked out by
+    /// `git` — can be *older* than the one it replaces, and a file written
+    /// twice inside one second has the same time and a different length.
+    ///
+    /// A file that failed to load is tried again once the backoff says so.
+    fn should_load(&self, current: FileStamp, now: Instant) -> bool {
+        current != self.loaded && now >= self.retry_at
+    }
+
+    /// The file was loaded: this is the one to compare against next time.
+    fn loaded(&mut self, current: FileStamp, now: Instant) {
+        self.loaded = current;
+        self.retry_at = now;
+        self.retry_delay = Duration::ZERO;
+    }
+
+    /// The load failed: try again after a wait that grows.
+    ///
+    /// A file that was half-written when it was read is worth retrying soon;
+    /// a file that is simply wrong is worth retrying every so often rather
+    /// than on every tick, which is a log line every five seconds for ever.
+    fn failed(&mut self, now: Instant) {
+        self.retry_delay = (self.retry_delay * 2)
+            .max(POLL_INTERVAL)
+            .min(MAX_RETRY_DELAY);
+        self.retry_at = now + self.retry_delay;
+    }
+}
+
+/// What the file looked like the last time it was read.
+///
+/// The length is here as well as the time, for the two reasons the state's
+/// own comment gives: a file written twice inside one second has the same
+/// time and a different length, and a file that replaced another one can be
+/// older.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+impl FileStamp {
+    /// The stamp of a file that has not been loaded yet.
+    const UNKNOWN: Self = Self {
+        modified: std::time::SystemTime::UNIX_EPOCH,
+        len: 0,
+    };
+
+    /// The stamp of the file as it is now.
+    async fn read(path: &str) -> std::io::Result<Self> {
+        let metadata = fs::metadata(path).await?;
+        Ok(Self {
+            modified: metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            len: metadata.len(),
+        })
+    }
+}
+
 impl ConfigWatcher {
     pub fn new(
         config_path: String,
@@ -111,26 +210,37 @@ impl ConfigWatcher {
         // The asynchronous one, like the check below: a synchronous
         // `std::fs::metadata` in an async function blocks the runtime's
         // thread, and the runtime has few of them.
-        let mut last_modified = fs::metadata(&self.config_path)
-            .await
-            .map(|m| m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mut state = WatchState::new(
+            FileStamp::read(&self.config_path)
+                .await
+                // A file that is not there yet is a file that has not been
+                // loaded: the first tick loads it, whatever its time says.
+                .unwrap_or(FileStamp::UNKNOWN),
+            Instant::now(),
+        );
 
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
 
-            match fs::metadata(&self.config_path).await {
-                Ok(metadata) => {
-                    if let Ok(modified) = metadata.modified()
-                        && modified > last_modified
-                    {
-                        last_modified = modified;
-                        self.reload_config().await;
-                    }
-                }
+            let current = match FileStamp::read(&self.config_path).await {
+                Ok(current) => current,
                 Err(e) => {
                     tracing::warn!("Failed to check config file: {}", e);
+                    continue;
                 }
+            };
+
+            let now = Instant::now();
+            if !state.should_load(current, now) {
+                continue;
+            }
+
+            if self.reload_config().await {
+                // Only now: a reload that failed keeps the old stamp, so the
+                // file is tried again rather than ignored for ever.
+                state.loaded(current, now);
+            } else {
+                state.failed(now);
             }
         }
     }
@@ -144,14 +254,19 @@ impl ConfigWatcher {
     /// here, and keeping the previous routes costs far less than dropping every
     /// connection. The two halves fail independently: one refusing does not
     /// stop the other from being applied.
-    async fn reload_config(&self) {
+    /// Whether the new config was applied.
+    ///
+    /// `false` means the file was read and could not be used, and the file is
+    /// worth trying again: a half-written file is the common case, and it
+    /// becomes a good file a moment later.
+    async fn reload_config(&self) -> bool {
         tracing::info!("Detected config change, reloading...");
 
         let new_config = match ProxyConfig::from_file(&self.config_path) {
             Ok(config) => config,
             Err(e) => {
                 tracing::error!("Config not reloaded, keeping the current routes: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -167,7 +282,7 @@ impl ConfigWatcher {
             Ok(routes) => routes,
             Err(e) => {
                 tracing::error!("Config not reloaded, keeping the current routes: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -192,6 +307,7 @@ impl ConfigWatcher {
             "Config reloaded: {} routes now live",
             self.route_config.routes().await.len()
         );
+        true
     }
 
     /// Applies the `[auth]` section of a freshly read config to the live 2FA
@@ -527,6 +643,166 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A file written twice inside one second has the same time and a
+    /// different length — and it is a different file.
+    #[test]
+    fn a_file_written_twice_inside_one_second_is_a_change() {
+        let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let state = WatchState::new(
+            FileStamp {
+                modified: time,
+                len: 10,
+            },
+            Instant::now(),
+        );
+        let now = Instant::now();
+
+        assert!(
+            !state.should_load(
+                FileStamp {
+                    modified: time,
+                    len: 10
+                },
+                now
+            ),
+            "the same file is not a change"
+        );
+        assert!(
+            state.should_load(
+                FileStamp {
+                    modified: time,
+                    len: 11
+                },
+                now
+            ),
+            "a different length is a change, time or not"
+        );
+    }
+
+    /// A file that replaced another one — restored from a backup, checked out
+    /// by `git` — can be *older* than the one it replaces.
+    #[test]
+    fn an_older_file_is_still_a_change() {
+        let older = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        let newer = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let state = WatchState::new(
+            FileStamp {
+                modified: newer,
+                len: 10,
+            },
+            Instant::now(),
+        );
+
+        assert!(
+            state.should_load(
+                FileStamp {
+                    modified: older,
+                    len: 10
+                },
+                Instant::now()
+            ),
+            "an older file is a different file"
+        );
+    }
+
+    /// A file that failed to load is tried again.
+    ///
+    /// The old behaviour advanced the stamp before the reload ran, so a file
+    /// that was read too early — half-written — was never tried again, and the
+    /// server kept the routes it had for ever.
+    #[test]
+    fn a_failed_load_is_tried_again() {
+        let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut state = WatchState::new(
+            FileStamp {
+                modified: time,
+                len: 10,
+            },
+            Instant::now(),
+        );
+        let now = Instant::now();
+        let half_written = FileStamp {
+            modified: time,
+            len: 11,
+        };
+
+        assert!(
+            state.should_load(half_written, now),
+            "the change is noticed"
+        );
+        state.failed(now);
+
+        assert!(
+            !state.should_load(half_written, now),
+            "not straight away: the backoff"
+        );
+        assert!(
+            state.should_load(half_written, now + POLL_INTERVAL),
+            "and again once the backoff is over"
+        );
+    }
+
+    /// The wait grows after every failure, and it stops growing.
+    ///
+    /// A file that is wrong stays wrong, and a log line every five seconds for
+    /// ever is not a thing anyone wants to read.
+    #[test]
+    fn the_retry_backoff_grows_and_is_capped() {
+        let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut state = WatchState::new(
+            FileStamp {
+                modified: time,
+                len: 10,
+            },
+            Instant::now(),
+        );
+        let now = Instant::now();
+
+        state.failed(now);
+        assert_eq!(
+            state.retry_delay, POLL_INTERVAL,
+            "the first wait is one tick"
+        );
+
+        state.failed(now + POLL_INTERVAL);
+        assert_eq!(
+            state.retry_delay,
+            POLL_INTERVAL * 2,
+            "the second wait is twice as long"
+        );
+
+        for _ in 0..20 {
+            state.failed(now);
+        }
+        assert_eq!(
+            state.retry_delay, MAX_RETRY_DELAY,
+            "the wait stops growing at the cap"
+        );
+    }
+
+    /// A load that worked is remembered, so the same file is not loaded again.
+    #[test]
+    fn a_loaded_file_is_not_loaded_again() {
+        let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let stamp = FileStamp {
+            modified: time,
+            len: 10,
+        };
+        let mut state = WatchState::new(FileStamp::UNKNOWN, Instant::now());
+        let now = Instant::now();
+
+        assert!(
+            state.should_load(stamp, now),
+            "a file that was never loaded is loaded"
+        );
+        state.loaded(stamp, now);
+
+        assert!(
+            !state.should_load(stamp, now),
+            "and not again until it changes"
+        );
+    }
+
     use crate::auth::{ClientAuth, DeviceAuth};
     use crate::conn::peers::PeerIdentity;
     use nexapipe_proto::secret::SecretString;
