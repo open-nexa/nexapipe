@@ -203,15 +203,16 @@ class VpnViewModel : ViewModel() {
         kotlinx.coroutines.flow.MutableStateFlow(VpnTakeoverChoice.Ask)
 
     /**
-     * Runtime link type per backend (endpoint ID -> direct/relay), reported by iroh and
-     * refreshed while the tunnel is up. Empty whenever nothing is connected, which is what
-     * keeps the UI from drawing a stale icon after a disconnect.
+     * What the tunnel reports per backend: the kind of path carrying its traffic and the
+     * round-trip time of that path, both read off iroh's runtime state and refreshed while
+     * the tunnel is up. Empty whenever nothing is connected, which is what keeps the UI from
+     * drawing a stale icon after a disconnect.
      */
-    val linkKinds = kotlinx.coroutines.flow.MutableStateFlow<Map<String, LinkKind>>(emptyMap())
+    val linkReadings = kotlinx.coroutines.flow.MutableStateFlow(LinkReadings())
 
     /**
      * What each backend has carried, keyed by endpoint ID: cumulative bytes since the proxy
-     * was started, plus the flows open to it right now. Refreshed alongside [linkKinds], and
+     * was started, plus the flows open to it right now. Refreshed alongside [linkReadings], and
      * empty whenever nothing is connected, for the same reason.
      *
      * A node that is absent has carried nothing — the native side leaves those out instead of
@@ -252,7 +253,7 @@ class VpnViewModel : ViewModel() {
 
     // Serialize connect/disconnect so concurrent native calls cannot race.
     private val connectionMutex = Mutex()
-    // Refreshes `linkKinds` while the tunnel is up: a connection can be upgraded from relay to
+    // Refreshes `linkReadings` while the tunnel is up: a connection can be upgraded from relay to
     // direct at any moment, so the icon has to be re-read rather than sampled once.
     private var linkPollJob: Job? = null
     // Keeps a handle on the connect coroutine so disconnect can cancel it
@@ -353,7 +354,7 @@ class VpnViewModel : ViewModel() {
      */
     fun refreshLinkKinds() {
         if (!IrohProxy.isNativeLoaded()) {
-            if (linkKinds.value.isNotEmpty()) linkKinds.value = emptyMap()
+            if (linkReadings.value.kinds.isNotEmpty()) linkReadings.value = LinkReadings()
             return
         }
         val raw = try {
@@ -364,10 +365,10 @@ class VpnViewModel : ViewModel() {
         }
         if (raw == null) {
             // Nothing has been started, or the endpoint group is gone: no link to report.
-            if (linkKinds.value.isNotEmpty()) linkKinds.value = emptyMap()
+            if (linkReadings.value.kinds.isNotEmpty()) linkReadings.value = LinkReadings()
             return
         }
-        linkKinds.value = parseLinkKinds(raw)
+        linkReadings.value = parseLinkReadings(raw)
     }
 
     /**
@@ -399,21 +400,6 @@ class VpnViewModel : ViewModel() {
         withContext(Dispatchers.Main) { traffic.value = totals }
     }
 
-    /** Decodes `id=direct;id2=relay` — the format the native side writes. */
-    private fun parseLinkKinds(raw: String): Map<String, LinkKind> {
-        val parsed = linkedMapOf<String, LinkKind>()
-        for (entry in raw.split(";")) {
-            val separator = entry.indexOf('=')
-            if (separator <= 0) continue
-            parsed[entry.substring(0, separator)] = when (entry.substring(separator + 1)) {
-                "direct" -> LinkKind.DIRECT
-                "relay" -> LinkKind.RELAY
-                else -> LinkKind.UNKNOWN
-            }
-        }
-        return parsed
-    }
-
     /**
      * Starts re-reading what the tunnel reports per backend — the link type and what each one
      * has carried; no-op when a poll is already running.
@@ -436,7 +422,7 @@ class VpnViewModel : ViewModel() {
     private fun stopLinkPolling() {
         linkPollJob?.cancel()
         linkPollJob = null
-        linkKinds.value = emptyMap()
+        linkReadings.value = LinkReadings()
         traffic.value = emptyMap()
     }
 

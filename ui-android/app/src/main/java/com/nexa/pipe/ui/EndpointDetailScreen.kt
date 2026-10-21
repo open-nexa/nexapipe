@@ -53,7 +53,7 @@ fun EndpointDetailScreen(
     val localizedContext = rememberLocalizedContext()
     val clipboardManager = LocalClipboardManager.current
     val nodes by viewModel.nodes.collectAsState()
-    val linkKinds by viewModel.linkKinds.collectAsState()
+    val linkReadings by viewModel.linkReadings.collectAsState()
     val node = nodes.firstOrNull { it.nodeId == nodeId }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -389,7 +389,7 @@ fun EndpointDetailScreen(
             // How traffic is reaching this backend right now. Only rendered while there is a
             // connection to it: without one there is no link kind to report, and a stale icon
             // would be worse than none.
-            linkKindOf(linkKinds, node.nodeId)?.let { linkKind ->
+            linkKindOf(linkReadings.kinds, node.nodeId)?.let { linkKind ->
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -411,6 +411,16 @@ fun EndpointDetailScreen(
                                     style = MaterialTheme.typography.bodyMedium,
                                     fontWeight = FontWeight.Medium
                                 )
+                                // How far the path is, when iroh has measured it. A path
+                                // with no sample says nothing at all rather than "0 ms",
+                                // which would read as a measurement.
+                                linkRttOf(linkReadings.rtts, node.nodeId)?.let { rtt ->
+                                    Text(
+                                        text = stringResource(R.string.link_rtt, rtt),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                                 Text(
                                     text = when (linkKind) {
                                         LinkKind.DIRECT -> stringResource(R.string.link_direct_body)

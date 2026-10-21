@@ -13,7 +13,7 @@ use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
-use nexapipe_client::LinkKind;
+use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -317,6 +317,24 @@ impl ProxyManager {
             .iter()
             .flat_map(|node| node.domains.iter().cloned())
             .collect();
+
+        // What the list is worth saying, once, before anything is started.
+        //
+        // A pattern that matches nothing is a warning: the domain is not
+        // proxied, and the name resolves for real instead — so a spelling the
+        // rule refuses has to be said out loud, because the scope the
+        // operating system is given still covers it. The client library has
+        // the notes; the desktop never asked for them.
+        let notes = nexapipe_client::domain_notes(&all_domains);
+        for (pattern, why) in &notes.unusable {
+            tracing::warn!("The proxy-domain pattern \"{pattern}\" matches nothing: {why}");
+        }
+        for pattern in &notes.narrowed {
+            tracing::info!(
+                "The proxy-domain pattern \"{pattern}\" names that host only; \"*.{pattern}\" \
+                 covers its subdomains"
+            );
+        }
 
         let nodes: Vec<NodeConfig> = self
             .config
@@ -768,7 +786,8 @@ impl ProxyManager {
             return Vec::new();
         };
 
-        let kinds: HashMap<EndpointId, LinkKind> = group.link_kinds().await.into_iter().collect();
+        let statuses: HashMap<EndpointId, LinkStatus> =
+            group.link_statuses().await.into_iter().collect();
 
         self.config
             .nodes
@@ -781,10 +800,12 @@ impl ProxyManager {
                 // A node the group could not parse never got a pool, so there is nothing to
                 // report for it; dropping it keeps the list aligned with what actually dialed.
                 let addr = backend_addr(&node.connection)?;
+                let status = statuses.get(&addr.id).copied().unwrap_or_default();
                 Some(EndpointLink {
                     connection,
                     endpoint_id: addr.id.to_string(),
-                    link: kinds.get(&addr.id).copied().unwrap_or(LinkKind::Unknown),
+                    link: status.kind,
+                    rtt_ms: status.rtt.map(|rtt| rtt.as_millis() as u64),
                 })
             })
             .collect()

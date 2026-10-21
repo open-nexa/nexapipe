@@ -384,3 +384,61 @@ fn revoking_an_id_the_server_would_refuse_is_an_error() {
         "nothing was revoked:\n{written}"
     );
 }
+
+/// The port ACL is visible where the host ACL is: an operator who cannot see
+/// the restriction cannot tell that it is on.
+///
+/// The empty list matters most here — it is the strictest setting there is,
+/// and a line that only shows up for a non-empty list hides it exactly where
+/// it matters.
+#[test]
+fn the_port_acl_is_visible_in_the_client_list() {
+    let (_dir, path) = scratch_config(
+        "config.toml",
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.acme]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443, 8443]\n\
+         \n\
+         [auth.clients.strict]\n\
+         secret = \"MFRGGZDFMZTWQ2LK\"\n\
+         allow_hosts = []\n\
+         allow_ports = []\n",
+    );
+
+    let (ok, text) = run(&path, &["client", "list", "--json"]);
+    assert!(ok, "{text}");
+    let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("valid JSON");
+    let clients = parsed.as_array().expect("a list of clients");
+    let acme = clients
+        .iter()
+        .find(|client| client["id"] == "acme")
+        .expect("the acme client");
+    assert_eq!(
+        acme["allow_ports"],
+        serde_json::json!([443, 8443]),
+        "{acme}"
+    );
+    let strict = clients
+        .iter()
+        .find(|client| client["id"] == "strict")
+        .expect("the strict client");
+    assert_eq!(strict["allow_ports"], serde_json::json!([]), "{strict}");
+
+    let (ok, text) = run(&path, &["client", "list"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("allow ports 443, 8443"), "{text}");
+    assert!(
+        text.contains("allow ports none, every port is denied"),
+        "the empty list has to be visible:\n{text}"
+    );
+    // The same for the names: an empty `allow_hosts` denies every host, and a
+    // line that only shows up for a non-empty list hides the strictest
+    // setting there is.
+    assert!(
+        text.contains("allow hosts none, every host is denied"),
+        "the empty host list has to be visible:\n{text}"
+    );
+}

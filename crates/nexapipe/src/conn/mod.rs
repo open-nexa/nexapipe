@@ -313,7 +313,7 @@ pub async fn handle_bidi_stream(
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .map(crate::routes::host_without_port);
+        .map(crate::routes::host_and_port);
 
     let path = request
         .uri()
@@ -327,7 +327,11 @@ pub async fn handle_bidi_stream(
     // Answered, not raised: no `Host` means nothing to look up, and it is worth
     // no less here than in `http::proxy_request`.
     let lookup: BackendLookup<BackendInfo> = match host {
-        Some(h) => config.get_backend_with_acl(h, path, acl.as_deref()).await,
+        Some((h, port)) => {
+            config
+                .get_backend_with_acl(h, path, port, acl.as_deref())
+                .await
+        }
         None => BackendLookup::NoRoute,
     };
 
@@ -526,9 +530,9 @@ pub async fn handle_bidi_stream(
 
                 tried.push(backend.url.clone());
                 let next = match host {
-                    Some(h) => {
+                    Some((h, port)) => {
                         config
-                            .get_backend_with_acl_excluding(h, path, acl.as_deref(), &tried)
+                            .get_backend_with_acl_excluding(h, path, port, acl.as_deref(), &tried)
                             .await
                     }
                     None => BackendLookup::NoRoute,
@@ -1802,7 +1806,7 @@ async fn perform_authentication(
     // client" would make the reason an oracle: anyone could walk a client's
     // counter up to the lockout and, from the change in the reply, learn that
     // the id they guessed exists. The real reason goes to the log instead.
-    let mut verified_acl = ClientAcl::Unrestricted;
+    let mut verified_acl = ClientAcl::unrestricted();
     let is_valid = match outcome {
         Ok(true) => {
             // Which device this was, if it named one, recorded under the same
@@ -2541,6 +2545,7 @@ mod tests {
                 secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
                 created_at: "0".to_string(),
                 allow_hosts: None,
+                allow_ports: None,
                 pending_enrollment: token.map(|t| SecretString::new(t.to_string())),
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,

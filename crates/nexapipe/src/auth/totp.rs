@@ -325,6 +325,7 @@ mod tests {
             secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             created_at: String::new(),
             allow_hosts: None,
+            allow_ports: None,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
@@ -348,6 +349,7 @@ mod tests {
             secret: SecretString::new("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             created_at: String::new(),
             allow_hosts: None,
+            allow_ports: None,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "laptop".to_string(),

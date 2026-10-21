@@ -410,16 +410,35 @@ object EndpointInviteCodec {
         return parts.map { it.trim() }
     }
 
-    /** Returns null when any entry is not a bare hostname. */
+    /** Returns null when any entry is not a pattern this client can match with. */
     private fun normalizeDomains(domains: List<String>): List<String>? {
         val out = LinkedHashSet<String>()
         for (raw in domains) {
-            val domain = raw.trim().trimEnd('.').lowercase(Locale.ROOT)
+            val domain = normalizePattern(raw.trim())
             if (domain.isEmpty()) return null
             if (domain.any { it.isWhitespace() || it == '/' || it == '?' || it == '#' }) return null
             out += domain
         }
         return out.toList()
+    }
+
+    /**
+     * The folded form of a pattern, mirroring `nexapipe_proto::normalize_pattern`.
+     *
+     * The case is folded and the trailing dots and the brackets are taken off —
+     * but not when taking them off would leave the catch-all. `*.`, `*..` and
+     * `[*]` all fold to `*`, and a pattern that means "every host" where the
+     * invite said something narrower is the one mistake this must not make:
+     * folded into `*`, it would hand the client the catch-all and the client
+     * would proxy every host. Kept in its own shape, it matches nothing.
+     */
+    private fun normalizePattern(pattern: String): String {
+        val folded = pattern.trimEnd('.').trim { it == '[' || it == ']' }.lowercase(Locale.ROOT)
+        if (folded == "*" && pattern != "*") {
+            // The fold would have widened it into the catch-all.
+            return pattern.lowercase(Locale.ROOT)
+        }
+        return folded
     }
 
     /** Uppercase Base32 without padding, or null when the input is not Base32. */
