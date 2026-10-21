@@ -455,6 +455,17 @@ lookup, which is what a config written before the key existed does.
   The server now says so once, at startup and after a reload, when the config
   holds a credential and the file is readable by anyone but its owner. It
   names the path and the mode. It does not refuse to start.
+- **A config that could not be loaded is tried again.** The watcher noticed a
+  changed file by its modification time alone, and only a *newer* one: a file
+  restored from a backup, checked out by `git`, or written twice inside one
+  second was never reloaded. The stamp was also advanced before the reload
+  ran, so a file that was read while it was half-written — the common case,
+  since the config is saved on every change — was never tried again and the
+  server kept the routes it had for ever. The watcher now compares the file's
+  time *and* its length, reloads a file that is older as well as a newer one,
+  and only remembers a file once it has been loaded successfully. A failed
+  load is retried, with a wait that grows so a file that is simply wrong does
+  not fill the log.
 - **The tunnel answers a request it cannot route before reading its body.**
   A request for a host no route serves had its body read and buffered first —
   up to 64 MiB per stream, held in memory, for a request with no backend to
