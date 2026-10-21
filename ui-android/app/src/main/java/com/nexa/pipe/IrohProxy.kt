@@ -73,6 +73,17 @@ object IrohProxy {
     external fun nativeSetRelayConfig(relayMode: String, relayUrl: String, authToken: String): Int
 
     /**
+     * Configures whether this endpoint may use n0's address lookup.
+     *
+     * discoveryMode: "n0" (the default — a Node ID is looked up through
+     *                dns.iroh.link) or "none" (no lookup at all; a peer then
+     *                has to bring an address of its own, which is what a
+     *                ticket carries).
+     * Must be called before nativeStartIroh.
+     */
+    external fun nativeSetDiscoveryMode(discoveryMode: String): Int
+
+    /**
      * Names this device, once, for every **enrollment** it spends.
      *
      * deviceId: printable ASCII without spaces, as

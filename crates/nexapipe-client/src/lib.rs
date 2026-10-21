@@ -5,6 +5,7 @@ pub mod auth;
 pub mod client;
 pub mod connection_pool;
 pub mod deadline;
+pub mod discovery;
 pub mod endpoint_group;
 pub mod error;
 pub mod flow;
@@ -57,6 +58,7 @@ pub mod jni;
 
 pub use client::IrohProxyClient;
 pub use connection_pool::{IrohConnectionPool, LinkKind};
+pub use discovery::DiscoveryMode;
 pub use endpoint_group::{
     DomainMapping, EndpointGroup, NodeConfig, PooledConnection, PreconnectReport,
 };
@@ -65,7 +67,7 @@ pub use flow::{FlowId, FlowKind, FlowRegistry, FlowView};
 pub use http::{HttpRequest, HttpResponse};
 pub use lb::LoadBalancingStrategy;
 pub use provisioning::{EndpointInvite, EndpointTarget, InviteTotp};
-pub use relay::{PINNED_RELAY_URL, RelayModeSpec};
+pub use relay::{PINNED_RELAY_URL, RelayModeSpec, RelayRestriction};
 pub use secret::{Secret, SecretBytes, SecretString};
 pub use transport::{TransportTuning, transport_config, transport_config_with_tuning};
 
