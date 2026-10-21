@@ -443,6 +443,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The desktop's DNS server keeps its sockets.** The desktop had a second
+  DNS implementation — its own resolver chain, its own timeouts, its own
+  socket handling — and like the client's it built **a new UDP socket for
+  every query** it forwarded. It now uses the same shared resolvers, so every
+  lookup leaves from the same source port and the NAT mapping the router
+  keeps for it is the one that stays. The chain, the order and the windows
+  are unchanged.
 - **The config file's permission rule is said once, and it is a warning.**
   The comment beside the first-run config claimed that the server refuses to
   start over a world-readable config, and that the check was keyed off 2FA
@@ -466,6 +473,14 @@ lookup, which is what a config written before the key existed does.
   and only remembers a file once it has been loaded successfully. A failed
   load is retried, with a wait that grows so a file that is simply wrong does
   not fill the log.
+- **The tunnel answers a request it cannot route before reading its body.**
+  A request for a host no route serves had its body read and buffered first —
+  up to 64 MiB per stream, held in memory, for a request with no backend to
+  go to. Worse, the client waited for the refusal until the body arrived, so
+  a client with no body to send waited out the body deadline (60 s) instead
+  of being told there was nowhere to send it. The lookup now comes first and
+  the body is read only for a request that is going somewhere. The plaintext
+  listener already did it this way round.
 - **The plaintext listener counts its connections.** Every connection it
   accepted was spawned with no ceiling, so an exposed listener was an unbounded
   number of tasks and file descriptors; only the header timeout bounded a
