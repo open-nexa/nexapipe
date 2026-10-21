@@ -1161,7 +1161,7 @@ impl ProxyConfig {
             // The translation from the configuration's spelling of a route to
             // the route the server serves is a `TryFrom`, and it takes the
             // spec apart with a pattern that names every field — see
-            // `impl TryFrom<&RouteSpec> for Route`.
+            // `impl TryFrom<RouteSpec> for Route`.
             //
             // The spec is copied because the configuration is shared and this
             // is a read of it; the copy happens once per route, when the
@@ -1331,11 +1331,8 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
 
         // Only meaningful for `tcp` / `udp`, where they are harmless defaults
         // otherwise; the other modes never read them.
-
-        // Only meaningful for `tcp` / `udp`, where they are harmless defaults
-        // otherwise; the other modes never read them.
         let l4_options = L4Options {
-            client_ports: client_ports.clone(),
+            client_ports,
             idle_timeout: idle_timeout_secs.map(std::time::Duration::from_secs),
             flow_timeout: flow_timeout_secs.map(std::time::Duration::from_secs),
         };
@@ -1344,15 +1341,15 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
             &host_pattern,
             &path_pattern,
             path_is_prefix,
-            backends.clone(),
+            backends,
             strategy,
             // The first mode only seeds the constructor; `with_modes` then
             // puts the whole set on the route.
             modes[0],
-            path_rewrite.clone(),
+            path_rewrite,
         )
         .with_l4_options(l4_options)
-        .with_modes(modes.clone())
+        .with_modes(modes)
         .with_backend_protocol(backend_protocol))
     }
 }
@@ -3448,7 +3445,7 @@ mod tests {
             backends: vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()],
             backend_protocol: Some("h2c".to_string()),
             mode: Some("tcp".to_string()),
-            modes: None,
+            modes: Some(vec!["udp".to_string()]),
             path_rewrite: Some("/rewritten".to_string()),
             client_ports: Some(vec![8443]),
             idle_timeout_secs: Some(11),
@@ -3496,6 +3493,11 @@ mod tests {
         assert!(
             route.modes().contains(&RouteMode::Tcp),
             "the mode was carried over: {:?}",
+            route.modes()
+        );
+        assert!(
+            route.modes().contains(&RouteMode::Udp),
+            "the modes list was carried over: {:?}",
             route.modes()
         );
         assert!(
