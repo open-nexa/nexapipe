@@ -11,6 +11,7 @@ import { usePrefsStore } from "../stores/prefs";
 import { useTheme } from "../composables/useTheme";
 import { useLocale } from "../composables/useLocale";
 import { useToast } from "../composables/useToast";
+import { errorKey } from "../api/errors";
 import type { ThemePreference } from "../stores/prefs";
 
 const { t } = useI18n();
@@ -104,7 +105,11 @@ async function loadSettings() {
     // silent `false` is the lie this used to tell: it claimed the entry was
     // gone, and clicking the switch then wrote it back.
     console.error("Failed to read the start-at-login setting:", e);
-    toast.fromKey("error.autostart.read_failed");
+    // The backend says which failure it was, and its own code names the one
+    // the user can act on ("the path of the running app could not be
+    // resolved"); the generic one is only the fallback for a failure that
+    // carries no code.
+    toast.fromKey(errorKey(e, "error.autostart.read_failed"));
   }
   isLoading.value = false;
 }
@@ -122,7 +127,7 @@ async function saveAutoStart() {
     // Put the switch back where it was: the setting did not change, so the
     // switch must not pretend it did.
     autoStart.value = !wanted;
-    toast.fromKey("error.autostart.write_failed");
+    toast.fromKey(errorKey(e, "error.autostart.write_failed"));
   }
 }
 
