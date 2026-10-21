@@ -138,11 +138,14 @@ its defaults — which are on.
   and an HTTP request's `Host` header may; a request that names no port is not
   checked, because there is no port to hold against it. A TLS passthrough is
   not checked either: the route picks the port and the client never names one.
-  What the list separates is the tunnel: the preface names the port the client
-  wants, and that is the port the proxy dials. The HTTP path routes by host
-  alone, so a port named in a `Host` header is checked but is not the port the
-  request is served from — two services of one host are told apart by the
-  tunnel, not by this list.
+  What the list separates is the tunnel: the preface names the service the
+  client wants, and the route's backend is where that service is answered
+  from — `client_ports` only picks the route, it never decides where the
+  connection goes. So the tunnel holds the list against two ports: the one
+  the preface names, and the one the route answers on. The HTTP path routes by
+  host alone, so a port named in a `Host` header is checked but is not the
+  port the request is served from — two services of one host are told apart by
+  the tunnel, not by this list.
   A refusal looks exactly like "no route" — a 404, a `NoRoute`, a hang-up —
   so it cannot be used to probe what is open behind the proxy. Left unset, a
   client keeps the reach it had; an empty list denies every port that is

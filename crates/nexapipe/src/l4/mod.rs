@@ -284,6 +284,31 @@ where
         return Ok(());
     };
 
+    // The port the connection is dialled on is the route's, not the preface's:
+    // the preface names the service the client wants and the route decides
+    // where that service is answered from — `client_ports` is only a selector,
+    // and it never decides where the connection goes.
+    //
+    // So the port the client names is not necessarily the port it reaches, and
+    // a client that may not reach the port it is answered on must not reach it
+    // by asking for another one: the port the connection actually goes to is
+    // held against the list as well.
+    //
+    // The refusal is `NoRoute` like every other one, so it cannot be used to
+    // probe which ports are open behind the tunnel.
+    if let Some(acl) = acl
+        && let Some((_, backend_port)) = parse_backend_addr(&route.backend)
+        && !acl.allows_port(backend_port)
+    {
+        let _ = write_status(&mut stream, Status::NoRoute).await;
+        tracing::warn!(
+            "L4 {}: the route answers on port {backend_port}, which is not allowed for this \
+             client, closing",
+            preface.proto.name()
+        );
+        return Ok(());
+    }
+
     // Count the flow after the route matched but before dialling: a flow that cannot
     // even be admitted should not consume a backend connection first.
     let Some(_flow) = limiter.try_acquire() else {
@@ -929,7 +954,10 @@ mod tests {
         use crate::auth::ClientAcl;
 
         // The route exists and its backend would answer; only the ACL refuses.
-        let config = config_with("127.0.0.1:1", "127.0.0.1:1");
+        // The backend answers on a port that *is* on the list, so what refuses
+        // here is the port the client asked for and not the one it would have
+        // been answered on.
+        let config = config_with("127.0.0.1:443", "127.0.0.1:1");
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
@@ -954,6 +982,99 @@ mod tests {
 
         assert_eq!(read_status(&mut client_read).await, Status::NoRoute);
         assert!(task.await.unwrap().is_ok());
+    }
+
+    /// The preface names the service the client wants and the route decides
+    /// where that service is answered from: `client_ports` only selects the
+    /// route, and it never decides where the connection goes.
+    ///
+    /// So a client that may ask for one port must not reach the service on
+    /// another one by naming the first: the port the connection is dialled to
+    /// is held against the list as well.
+    #[tokio::test]
+    async fn a_route_answered_on_an_off_list_port_answers_no_route() {
+        use crate::auth::ClientAcl;
+
+        // The route answers on 5432 whatever port the preface names.
+        let config = config_with("127.0.0.1:5432", "127.0.0.1:1");
+        // The port the client asks for is on its list; the one it would be
+        // answered on is not.
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[6432]));
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                Some(&acl),
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Tcp, "db.test", 6432))
+            .await
+            .unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::NoRoute);
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    /// A client that may reach both the port it asks for and the port the
+    /// route answers on is unaffected: both are on its list, and the flow is
+    /// served as usual.
+    #[tokio::test]
+    async fn a_client_that_may_reach_both_ports_reaches_its_backend() {
+        use crate::auth::ClientAcl;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = socket.read(&mut buf).await.unwrap();
+            socket.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let config = config_with(&backend_addr.to_string(), "127.0.0.1:1");
+        // The port the client asks for, and the one the route answers on.
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[backend_addr.port(), 6432]));
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                Some(&acl),
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&preface(L4Proto::Tcp, "db.test", 6432))
+            .await
+            .unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::Ok);
+        client_write.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client_read.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        drop(client_write);
+        drop(client_read);
+        task.await.unwrap().unwrap();
+        echo.await.unwrap();
     }
 
     /// The allowlist check happens before the flow limiter too, so a client

@@ -1686,11 +1686,12 @@ question:
   into a `ClientAcl` at the handshake: which names it may reach, and which
   services on them. A host is a name; a port is a service on that name, and the
   port list is what keeps a client off the services of a name it may have.
-  It is honoured where the client names the port it wants, which the tunnel
-  preface always does. The HTTP path routes by host alone, so there it refuses
-  a request that names a port off the list — and a request that names no port
-  is not held against it. Two services of one host are separated by the
-  tunnel, not by the list.
+  The tunnel holds it against two ports: the one the preface names and the one
+  the route answers on, because `client_ports` only picks the route — so a
+  client cannot reach a service by asking for another port. The HTTP path
+  routes by host alone, so there it refuses a request that names a port off the
+  list — and a request that names no port is not held against it. Two services
+  of one host are separated by the tunnel, not by the list.
 
 The limits that remain are deliberate: a revocation (a deleted client, a rotated
 secret, an edited `allow_hosts` or `allow_ports`) takes effect on *new*
