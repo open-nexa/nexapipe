@@ -41,7 +41,7 @@ impl IrohProxyClient {
 
     pub async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse, ClientError> {
         let conn = self.conn_pool.get_connection().await?;
-        let response = Self::exchange(&conn, request.to_bytes().as_slice()).await?;
+        let response = exchange_over(&conn, request.to_bytes().as_slice()).await?;
         self.conn_pool.return_connection(conn).await;
 
         HttpResponse::parse(&response)
@@ -49,32 +49,10 @@ impl IrohProxyClient {
 
     pub async fn send_raw(&self, data: &[u8]) -> Result<Vec<u8>, ClientError> {
         let conn = self.conn_pool.get_connection().await?;
-        let response = Self::exchange(&conn, data).await?;
+        let response = exchange_over(&conn, data).await?;
         self.conn_pool.return_connection(conn).await;
 
         Ok(response)
-    }
-
-    /// Writes `payload` on a fresh bidirectional stream and reads the peer's
-    /// whole reply, under `EXCHANGE_TIMEOUT`.
-    async fn exchange(conn: &Connection, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
-        let request = async {
-            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
-
-            send.write_all(payload).await?;
-            send.finish().map_err(|e| anyhow::anyhow!(e))?;
-
-            let response = recv
-                .read_to_end(MAX_RESPONSE_SIZE)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            Ok::<_, ClientError>(response)
-        };
-
-        timeout(EXCHANGE_TIMEOUT, request)
-            .await
-            .map_err(|_| ClientError::TimeoutError)?
     }
 
     pub async fn open_bi_stream(
@@ -89,6 +67,36 @@ impl IrohProxyClient {
     pub async fn close(&self) {
         self.conn_pool.close_all().await;
     }
+}
+
+/// Writes `payload` on a fresh bidirectional stream and reads the peer's whole
+/// reply, under `EXCHANGE_TIMEOUT`.
+///
+/// Free rather than a method, because the exchange is over a *connection* and
+/// not over a pool: the callers that hold one — the single-endpoint client
+/// here, the endpoint group behind the UniFFI surface — differ in where the
+/// connection came from and not in what is done with it.
+pub(crate) async fn exchange_over(
+    conn: &Connection,
+    payload: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    let request = async {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+
+        send.write_all(payload).await?;
+        send.finish().map_err(|e| anyhow::anyhow!(e))?;
+
+        let response = recv
+            .read_to_end(MAX_RESPONSE_SIZE)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok::<_, ClientError>(response)
+    };
+
+    timeout(EXCHANGE_TIMEOUT, request)
+        .await
+        .map_err(|_| ClientError::TimeoutError)?
 }
 
 pub async fn create_client(

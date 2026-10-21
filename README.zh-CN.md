@@ -1545,6 +1545,30 @@ proxy.run().await?;   // run() 阻塞；从别处调用 stop() 来结束它
 
 同一个 `EndpointGroup` 由本地代理与 TUN 代理共用，因此一个连接池同时服务两者。
 
+### UniFFI 表面
+
+`uniffi` feature 把同一个客户端打包给不是用 Rust 写的应用 —— Swift、Kotlin、
+Python。它是一个对象加一个本地代理：
+
+```text
+ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, ... })
+    .node_id() .server_ids() .preconnect()
+    .link_statuses() .traffic() .flows() .close_flow()
+    .send_request(HttpRequest) .send_raw(host, bytes)
+    .drop_connections() .close()
+LocalProxy::new(client, "127.0.0.1:8081", domains)  ->  .stop()
+```
+
+每台服务器带着自己的凭据 —— 节点 ID 或 ticket、它服务的域名，以及一个 TOTP
+secret 或一次性注册令牌 —— 因为每台服务器各自有一份 `[auth.clients]` 条目，而
+同一个客户端可能既连一台要 2FA 的、也连一台不要的。`link_statuses()` 给出的是
+桌面端与 Android 端显示的同一条路径与往返时延。
+
+**TUN 不在其中。** TUN 需要一个包来源和一个包去向 —— Android 上是文件描述符，
+iOS 上是 `NEPacketTunnelFlow` —— 两者都跨不过 UniFFI 的边界：UniFFI 传的是值，
+而一条活的包流不是值。要隧道本身的应用只能走 C ABI，本 crate 同样会构建它。
+能跨过去的是本地代理那半边，因为它是一个套接字、一个端口和一份域名列表。
+
 Cargo feature：
 
 | Feature | 用途 |
