@@ -514,13 +514,13 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
 fn restrict_to_owner_system_and_admins(path: &Path, sddl: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{GetLastError, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{GetLastError, LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        SetFileSecurityW,
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
     };
 
     unsafe {

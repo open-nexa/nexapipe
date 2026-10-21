@@ -64,15 +64,12 @@ fn check_acl_alignment() {
         )
     });
     let handler_marker = "tauri::generate_handler![";
-    let handler_open = lib_rs
-        .find(handler_marker)
-        .unwrap_or_else(|| {
-            panic!(
-                "ACL alignment check: {} does not call `tauri::generate_handler![ ... ]`",
-                lib_rs_path.display()
-            )
-        })
-        + handler_marker.len();
+    let handler_open = lib_rs.find(handler_marker).unwrap_or_else(|| {
+        panic!(
+            "ACL alignment check: {} does not call `tauri::generate_handler![ ... ]`",
+            lib_rs_path.display()
+        )
+    }) + handler_marker.len();
     let handler_block = match lib_rs[handler_open..].find(']') {
         Some(end) => &lib_rs[handler_open..handler_open + end],
         None => panic!(
@@ -146,8 +143,7 @@ fn check_acl_alignment() {
     }
 
     // 4. Compare.
-    let missing_from_manifest: Vec<&String> =
-        registered.difference(&granted_in_manifest).collect();
+    let missing_from_manifest: Vec<&String> = registered.difference(&granted_in_manifest).collect();
     let missing_from_capability: Vec<&String> = granted_in_manifest
         .difference(&granted_in_capability)
         .collect();
