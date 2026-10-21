@@ -274,6 +274,32 @@ impl ConnectionLimiter {
         })
     }
 
+    /// Takes a slot for a connection that has no peer identity.
+    ///
+    /// The plaintext listener has no `EndpointId`: a plain TCP connection is
+    /// not a peer in the sense the per-peer cap is about, and a cap keyed on
+    /// the source address would be a different design — NAT puts many clients
+    /// behind one address, and IPv6 hands a client an address of its own.
+    ///
+    /// What it can have is the process-wide slot, and that is what this takes.
+    /// So an exposed listener shares one ceiling with the tunnel, which is
+    /// what a process-wide ceiling is for: the two are one process, and the
+    /// work they are doing is one process's work.
+    ///
+    /// The returned guard holds it: drop it and the count goes back down, so a
+    /// connection that ends any way gives its slot back without the accept
+    /// loop having to remember to.
+    pub fn try_acquire_global(self: &Arc<Self>) -> Option<GlobalGuard> {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.total >= self.max_global {
+            return None;
+        }
+        counts.total += 1;
+        Some(GlobalGuard {
+            limiter: self.clone(),
+        })
+    }
+
     /// Connections `peer` is holding right now, for tests and diagnostics.
     ///
     /// A poisoned lock is recovered rather than reported as zero: the counters
@@ -300,6 +326,15 @@ impl ConnectionLimiter {
         self.max_global
     }
 
+    /// Gives back a slot that was taken without a peer.
+    ///
+    /// Only the process-wide count moves: there was no peer to count, so
+    /// there is no per-peer entry to take down.
+    fn release_global(&self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.total = counts.total.saturating_sub(1);
+    }
+
     fn release(&self, peer: EndpointId) {
         let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         counts.total = counts.total.saturating_sub(1);
@@ -309,6 +344,20 @@ impl ConnectionLimiter {
                 counts.per_peer.remove(&peer);
             }
         }
+    }
+}
+
+/// Holds one process-wide slot until the connection it belongs to is dropped.
+///
+/// The peer-less counterpart of [`PeerGuard`]: the plaintext listener has no
+/// peer to count, so this counts the process.
+pub struct GlobalGuard {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl Drop for GlobalGuard {
+    fn drop(&mut self) {
+        self.limiter.release_global();
     }
 }
 
@@ -769,6 +818,81 @@ mod tests {
         // The cap is per peer, so another peer is unaffected.
         assert!(limiter.try_acquire(peer(2)).is_some());
         assert!(limiter.try_acquire(a).is_none());
+    }
+
+    /// A connection with no peer takes a process-wide slot, and gives it back.
+    ///
+    /// The plaintext listener has no peer to count, so the slot it takes is
+    /// the process's — and it is the same count the tunnel's connections take.
+    #[test]
+    fn a_peer_less_connection_takes_a_process_wide_slot() {
+        let limiter = Arc::new(ConnectionLimiter::with_caps(10, 2));
+
+        let first = limiter.try_acquire_global().expect("the first slot");
+        let second = limiter.try_acquire_global().expect("the second slot");
+        assert_eq!(limiter.total(), 2);
+        assert!(
+            limiter.try_acquire_global().is_none(),
+            "the third is refused: the process is at its ceiling"
+        );
+
+        drop(first);
+        assert_eq!(limiter.total(), 1, "the slot came back");
+        let third = limiter.try_acquire_global().expect("the freed slot");
+        assert_eq!(limiter.total(), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.total(), 0, "every slot came back");
+    }
+
+    /// The two counts are one count.
+    ///
+    /// A listener that is exposed and a tunnel are one process, and the work
+    /// they are doing is one process's work: a ceiling that each of them had
+    /// a copy of would be twice the ceiling the operator asked for.
+    #[test]
+    fn a_peer_less_connection_shares_the_count_with_a_peer() {
+        let limiter = Arc::new(ConnectionLimiter::with_caps(10, 2));
+        let a = peer(1);
+
+        let _global = limiter.try_acquire_global().expect("the listener's slot");
+        let _peer = limiter.try_acquire(a).expect("the tunnel's slot");
+        assert_eq!(limiter.total(), 2);
+
+        // And the ceiling is the ceiling for both.
+        assert!(
+            limiter.try_acquire(a).is_none(),
+            "the process is full, whoever asks"
+        );
+        assert!(
+            limiter.try_acquire_global().is_none(),
+            "the process is full, whoever asks"
+        );
+    }
+
+    /// The per-peer cap does not apply to a connection with no peer, and the
+    /// global one does not apply to a peer on its own: the two ceilings mean
+    /// different things and neither stands in for the other.
+    #[test]
+    fn the_two_ceilings_are_independent() {
+        let limiter = Arc::new(ConnectionLimiter::with_caps(1, 10));
+        let a = peer(1);
+
+        let held = limiter.try_acquire(a).expect("the peer's slot");
+        assert!(
+            limiter.try_acquire(a).is_none(),
+            "the peer is at its own ceiling"
+        );
+        let global = limiter.try_acquire_global().expect("the process's slot");
+        assert_eq!(
+            limiter.total(),
+            2,
+            "the process is nowhere near its own ceiling"
+        );
+
+        drop(held);
+        drop(global);
     }
 
     #[test]

@@ -481,6 +481,14 @@ lookup, which is what a config written before the key existed does.
   of being told there was nowhere to send it. The lookup now comes first and
   the body is read only for a request that is going somewhere. The plaintext
   listener already did it this way round.
+- **The plaintext listener counts its connections.** Every connection it
+  accepted was spawned with no ceiling, so an exposed listener was an unbounded
+  number of tasks and file descriptors; only the header timeout bounded a
+  single one. The listener now takes a slot from the same process-wide count
+  the tunnel takes, and a connection over the ceiling is closed and logged.
+  The per-peer cap cannot apply — a plain TCP connection has no peer identity
+  — so an exposed listener shares one ceiling with the tunnel rather than
+  having one of its own.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks
