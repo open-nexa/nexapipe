@@ -857,6 +857,39 @@ async fn a_head_past_the_limit_with_a_host_never_reaches_a_backend() {
     );
 }
 
+/// A request that names more than one host is refused, and reaches no backend.
+///
+/// The two halves of this proxy used to resolve an ambiguous request
+/// differently: the route and the access check read the **first** `Host`
+/// header, and the backend was handed **all** of them. A client that was
+/// allowed for `app.test` could therefore send that name first and a second
+/// one behind it, and a backend that picks the last one would serve the
+/// second name's vhost to a request that was authorised for the first.
+///
+/// The unit tests cover the parser and the header count; this one is the
+/// whole path, because the claim is about what reaches a backend.
+#[tokio::test]
+async fn a_request_with_more_than_one_host_is_refused() {
+    let backend = spawn_backend("never").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET / HTTP/1.1\r\nHost: app.test\r\nHost: internal.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).contains("400"),
+        "a request with two hosts should be answered with 400, got {:?}",
+        status_of(&reply)
+    );
+    assert!(
+        backend.seen().is_empty(),
+        "a request that names two hosts must not reach a backend: the host that was \
+         authorised and the host that would be served are two different hosts"
+    );
+}
+
 /// The head deadline is 30 s, so this one waits that long before it can assert
 /// anything. Run it explicitly: `cargo test -p nexapipe --test data_plane -- --ignored`.
 #[tokio::test]
