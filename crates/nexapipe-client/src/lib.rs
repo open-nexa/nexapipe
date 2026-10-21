@@ -33,6 +33,16 @@ pub mod local_proxy;
 #[cfg(feature = "tun-proxy")]
 pub mod virtual_ip;
 
+// The block of addresses the tunnel claims, and the pools inside it. One
+// address space on both clients: the desktop walks a list of candidate blocks
+// and keeps the first the host will let it use, and Android takes the same
+// list. The two halves have to agree on which block it is — the Kotlin side
+// configures the VPN's addresses and routes, the Rust side hands out the
+// per-domain addresses inside the same block — so it is one value rather than
+// a constant compiled into each side.
+#[cfg(feature = "tun-proxy")]
+pub mod virtual_block;
+
 // TUN proxy: implements a userspace TCP/IP stack in Rust with smoltcp. Shared by
 // the Android client (fd-based entry point) and the desktop app (IP-packet
 // reader/writer entry point); the fd plumbing itself is Android-gated inside.

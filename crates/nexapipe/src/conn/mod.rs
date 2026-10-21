@@ -98,20 +98,29 @@ pub(crate) mod auth_close_code {
 /// The live 2FA state a connection authenticates against.
 ///
 /// The config is shared: every connection reads it to validate, and the ones
-/// that fail write their lockout counters back into it. The path is where
-/// those counters are persisted, so a lockout survives a restart.
+/// that fail write their lockout counters back into it. Two files are
+/// involved: the configuration, which is the operator's and holds the
+/// credentials, and the state file beside it, which holds the counters the
+/// server counted. The path is the configuration's — the enrollment flow
+/// writes a token into it — and the state path is derived from it.
 #[derive(Clone)]
 pub struct AuthState {
     config: Arc<tokio::sync::RwLock<AuthConfig>>,
     path: String,
+    state_path: String,
 }
 
 impl AuthState {
     /// Wraps a freshly loaded config together with the file it came from.
     pub fn new(config: AuthConfig, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let state_path = crate::auth::state::path_for(&path)
+            .to_string_lossy()
+            .into_owned();
         Self {
             config: Arc::new(tokio::sync::RwLock::new(config)),
-            path: path.into(),
+            path,
+            state_path,
         }
     }
 
@@ -120,9 +129,20 @@ impl AuthState {
         &self.config
     }
 
-    /// The config file the runtime counters are persisted to.
+    /// The config file the enrollment token is written to.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// The state file the runtime counters are persisted to.
+    ///
+    /// Beside the configuration rather than inside it: the counters are what
+    /// the server learned while it was running, and writing them into the
+    /// operator's file would move its modification time every time a client
+    /// mistyped a code — which the configuration watcher watches, so a
+    /// lockout was a configuration reload.
+    pub fn state_path(&self) -> &str {
+        &self.state_path
     }
 }
 
@@ -1254,7 +1274,7 @@ async fn enroll_client(
                 client.record_failure(max_attempts, lockout_duration);
             }
             let snapshot = cfg.counter_snapshot();
-            if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+            if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
                 save_auth_state(path, &snapshot)
             })
             .await
@@ -1262,7 +1282,7 @@ async fn enroll_client(
                 tracing::warn!(
                     "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
                     client_id,
-                    auth.path(),
+                    auth.state_path(),
                     e
                 );
             }
@@ -1402,7 +1422,7 @@ async fn enroll_client(
             client.record_success();
         }
         let snapshot = cfg.counter_snapshot();
-        if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+        if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
             save_auth_state(path, &snapshot)
         })
         .await
@@ -1410,7 +1430,7 @@ async fn enroll_client(
             tracing::warn!(
                 "2FA: failed to persist the cleared counter for '{}' to {}: {}",
                 client_id,
-                auth.path(),
+                auth.state_path(),
                 e
             );
         }
@@ -1547,12 +1567,15 @@ where
     result.map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
 }
 
-/// Serialises writes to the config file, independently of the caller.
+/// Serialises writes to the config file and to the state file beside it,
+/// independently of the caller.
 ///
 /// A `static` because it has to outlive the task that asked for the write: the
 /// auth lock is released when a handshake is cancelled, and this is what keeps
 /// that cancellation from letting the next write start on top of a running
-/// one.
+/// one. The two files have a lock each of their own; this gate is what keeps
+/// the two kinds of write from running at the same time, which is no slower
+/// than the writes themselves and one thing less to reason about.
 fn config_write_gate() -> &'static tokio::sync::Mutex<()> {
     static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     GATE.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1837,7 +1860,7 @@ async fn perform_authentication(
                     client.record_success();
                 }
                 let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
                     save_auth_state(path, &snapshot)
                 })
                 .await
@@ -1845,7 +1868,7 @@ async fn perform_authentication(
                     tracing::warn!(
                         "2FA: failed to persist auth state for '{}' to {}: {}",
                         client_id,
-                        auth.path(),
+                        auth.state_path(),
                         e
                     );
                 }
@@ -1865,7 +1888,7 @@ async fn perform_authentication(
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
                 let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.path().to_string(), move |path| {
+                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
                     save_auth_state(path, &snapshot)
                 })
                 .await
@@ -1873,7 +1896,7 @@ async fn perform_authentication(
                     tracing::warn!(
                         "2FA: failed to persist lockout for '{}' to {}: {}",
                         client_id,
-                        auth.path(),
+                        auth.state_path(),
                         e
                     );
                 }

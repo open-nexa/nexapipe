@@ -10,18 +10,34 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+**The next release is v1.0.0.** The v0.7.0 release planned for this cycle was
+cancelled after a review of the project against comparable products; the scope
+that replaced it, and the items that were deliberately dropped from it, are
+recorded in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
+Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
+and its meaning.
+
 ## [Unreleased]
 
-Five things land in this cycle so far: the device credential can be a **key**
+Thirteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
 circuit-broken — the ceilings the process runs under are now something a
-config file can say rather than only an environment variable can, and a name is
-spelled the same way in a client's list and in the server's routes. No existing
-configuration key is removed or renamed, and the ones this cycle adds —
-`public_key` under a device entry, the six `[timeouts]` phase keys, `[limits]`,
-`[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so a
+config file can say rather than only an environment variable can, a name is
+spelled the same way in a client's list and in the server's routes, a client
+can be held to the ports it may reach and not only to the names, both clients
+can say how far away the path carrying the traffic is, the desktop app can
+stay in the tray instead of ending with its window, the third-party boundary
+is two settings now rather than one, the Android app can bring the tunnel back
+after a restart, the Android client picks its address block instead of
+hard-coding one, the server's runtime state lives in a file of its own beside
+the configuration instead of inside it, and the desktop says what it does to
+the machine's DNS instead of deciding for itself.
+No existing configuration key is removed or renamed, and the ones this cycle
+adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
+`[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
+`allow_ports` under a client entry and `[iroh] discovery` — are optional, so a
 `config.toml` that works on 0.6.1 still loads and behaves as it did: a device
 entry that carries a `secret` is checked exactly as before, a `[timeouts]`
 section that names none of the new keys leaves every deadline at its default,
@@ -29,7 +45,9 @@ and a config with no `[limits]` section runs with the ceilings it always ran
 with.
 Leaving `[retry]` out keeps one try and no second chance, leaving `[backends]`
 out uses the machine's own trust store, and leaving `[circuit_breaker]` out uses
-its defaults — which are on.
+its defaults — which are on. Leaving `allow_ports` out leaves a client with
+every port it had, and leaving `[iroh] discovery` out keeps n0's address
+lookup, which is what a config written before the key existed does.
 
 ### Added
 
@@ -157,6 +175,26 @@ its defaults — which are on.
   using the health probe rather than a request counter. The HTTP request paths,
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
+- **The Android app can bring the tunnel back after a restart.** A proxy that
+  has to be switched on by hand every time the phone is switched on is not an
+  always-on proxy, and on a phone that is the difference between a machine
+  that is protected and a machine that is not. "Reconnect after a restart"
+  brings it back by itself: a `BOOT_COMPLETED` receiver starts the VPN
+  service, which waits for a network, builds the tunnel with the same sequence
+  a connection the user asked for uses, and establishes it.
+  The switch is off until the user turns it on — a proxy that reconnects
+  without being asked forwards traffic without being asked.
+  Two things it does not do, on purpose. It does not take the VPN slot from
+  another app: the boot path never answers the takeover question, because a
+  tunnel that quietly revoked somebody else's VPN at seven in the morning
+  would be a surprise nobody could prepare for. And it does not enrol an
+  endpoint: enrolling spends a token and answers with a credential that has
+  to be stored, and a boot has nobody to ask about a device that cannot
+  protect one — an endpoint waiting for that waits for the user.
+  Android does not promise that the permission a VPN app was given survives a
+  restart, so the boot path asks rather than assumes. When the permission is
+  gone the tunnel stays down and the settings page says so, rather than
+  leaving a switch that is on and nothing that happened.
 - **The desktop app can stay in the tray.** Closing the window used to end the
   process, so a proxy that had to be started by hand every time the machine woke
   was not the always-on proxy the settings page promised. The app now has a tray
@@ -194,6 +232,53 @@ its defaults — which are on.
 
 ### Changed
 
+- **The configuration and the runtime state are two files.** `config.toml` is
+  the operator's file — what they wrote, what they read, what they keep in
+  version control — and it no longer carries what a running server learns.
+  The 2FA counters (`failed_attempts`, `locked_until`, `last_used`) move to
+  `state.toml` beside it, in the same shape and with the same client and
+  device names, and the server writes that file and nobody else does. The
+  separation is not only tidiness: the server watches the configuration's
+  modification time, so a server that wrote its counters into the
+  configuration turned every mistyped code into a configuration reload — the
+  routes rebuilt and the health checks restarted, because a stranger typed a
+  code wrong. The counters are now written where nothing is watching them.
+  Nothing has to be set up: the state file appears the first time a client
+  authenticates or mistypes a code, it is `0600`, and a state file that cannot
+  be read stops the server from starting — the lockouts it holds would be
+  unknown, and starting anyway would reset every one of them. A configuration
+  written before the state file existed still works: the three counter keys are
+  read from it, so a deployment that was counting there keeps its lockouts
+  until the state file has an entry for that client. They are not written back
+  there any more, and `config.toml` is never rewritten for them.
+- **The desktop says what it does to the machine's DNS, instead of deciding
+  for itself.** What happens to a machine's name resolution while the tunnel is
+  up is now a setting — `scoped`, `global` or `none` — with `scoped` as the
+  default. Scoped points only the configured domains at the tunnel and leaves
+  everything else — an internal zone, another tunnel's names — resolving where
+  it always did; global points every query at the tunnel; none does not touch
+  the machine's DNS at all, and the tunnel's own resolver keeps running for a
+  PAC file or a hosts entry to point at.
+  **This changes what the desktop does on a machine it cannot scope.** It used
+  to fall through to the global hijack — silently replacing the machine's whole
+  DNS — whenever the per-domain mechanism was unavailable (a Windows machine
+  that takes its NRPT rules from a domain policy, say) or the configured domain
+  list could not be named to the operating system at all (a bare `*`, or a name
+  without a dot). Now it refuses the tunnel and says why, and the global
+  strategy is one setting away for the machine that needs it. A machine that
+  could be scoped is unaffected: it was already scoped.
+- **The Android client picks its address block instead of hard-coding one.**
+  The TUN used to claim `10.0.1.0/24` whatever network it was on, and that is
+  the block a great many home routers hand out — on those networks the tunnel
+  swallowed the router's own addresses and the device could not reach the
+  machine that was serving it. The app now walks the same list of candidate
+  blocks the desktop has always used (`198.18.0.0/24` first) and takes the
+  first one nothing on the device has claimed, and every address inside it —
+  the DNS server, the per-domain answers, the IPv6 half — is derived from that
+  block rather than written down on both sides. The list itself now lives in
+  the client library, so the two clients cannot drift apart. The desktop's
+  layout is untouched: it keeps its own addresses inside the block and its own
+  fixed ULA, and only the block and the list are shared.
 - **"Launch at startup" writes a real entry.** The switch has been on the
   settings page since the page existed, calling two commands that were never
   registered — so it read `false` and wrote nothing, and looked like a setting
@@ -293,6 +378,15 @@ its defaults — which are on.
 
 ### Security
 
+- **The certificate verifier and the bundled roots were patched.** Three new
+  RustSec advisories landed against crates this tree already carried:
+  RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
+  RUSTSEC-2026-0383 (`webpki-root-certs`). All three are about the same thing:
+  the `emSign` intermediates the root programmes distrusted were still
+  accepted, so a certificate chaining to one of them was still trusted. Both
+  lockfiles now pin the patched releases — `rustls-webpki` 0.103.16 and
+  `webpki-roots`/`webpki-root-certs` 1.0.10 — and nothing else in the tree
+  moves.
 - **The published image is signed, and says where it came from.** Every image
   released to GHCR now carries a cosign signature made with a key that is
   minted for the release run through GitHub's OIDC — nothing is stored, so

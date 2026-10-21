@@ -337,12 +337,15 @@ goes wrong:
   mounts `./config:/app/config` for exactly this reason — a directory mount is
   resolved by name on every lookup, so it always sees the current file. Putting
   `./config.toml:/app/config/config.toml` back reintroduces the trap.
-- **Two writers, no lock.** The server rewrites the whole file to persist the
-  `failed_attempts` / `locked_until` / `last_used` counters whenever a 2FA
-  attempt happens (`save_auth_state`). Every write on both sides is a
+- **Two writers, no lock.** The server rewrites the whole file to file an
+  enrollment (`pending_enrollment`). Every write on both sides is a
   read-modify-write with no locking, so an overlapping host edit and flush lose
   one of them. A `pending_enrollment` token is the worst case: the server never
   writes it back, so losing the race costs you the invite and prints nothing.
+  The 2FA counters used to be in this list too — the server rewrote the file to
+  persist `failed_attempts` / `locked_until` / `last_used` whenever a 2FA
+  attempt happened. They live in `state.toml` now, a file of the server's own,
+  so that race is gone with them.
 - **The host binary is not the server's binary.** `--generate-invite` derives the
   endpoint from `[iroh] secret_key`, so a `nexapipe` built from another commit
   than the running one can issue an invite pointing at an endpoint nobody is
@@ -355,12 +358,12 @@ goes wrong:
   into a sidecar file or the environment.
 
 The mount is read-write on purpose: the server writes `[iroh] secret_key` into
-`config.toml` on the first start, and the 2FA counters back into it after every
-attempt, so a `:ro` mount would cost a lockout its persistence and log an error
-on every attempt — and leave the Node ID changing on every restart. Set
-`NEXAPIPE_NO_PERSIST_IDENTITY=1` if the config genuinely has to stay read-only,
-and pin `[iroh] secret_key` by hand in that case, so the identity at least
-survives.
+`config.toml` on the first start, and the 2FA counters into `state.toml` beside
+it after every attempt, so a `:ro` mount would cost a lockout its persistence
+and log an error on every attempt — and leave the Node ID changing on every
+restart. Set `NEXAPIPE_NO_PERSIST_IDENTITY=1` if the config genuinely has to stay
+read-only, and pin `[iroh] secret_key` by hand in that case, so the identity at
+least survives.
 
 Editing with an editor is fine as long as it saves in place — the default for
 `vim` and for a shell `>` redirect. Whatever you changed, confirm the server
@@ -452,14 +455,16 @@ same one to a different service later, which is why it relocates
 credential file in `/etc` is not one of them.
 
 **The config directory has to stay writable.** The server writes back into
-`config.toml` — the 2FA `failed_attempts` / `locked_until` counters, an enrolled
-device's secret and its `last_used` — and writes `config.toml.admin-token`
-beside it the first time it starts. On the very first start it writes there too,
-adding `[iroh] secret_key` when the config has none: a deployment that never
-enrolls a client still needs the directory writable, or the Node ID changes on
-every restart. `ReadWritePaths` is that one directory and nothing wider.
-`NEXAPIPE_NO_PERSIST_IDENTITY=1` is the way to run without a writable config, at
-the cost of a Node ID that does not survive a restart.
+`config.toml` — an enrolled device's secret — and writes `config.toml.admin-token`
+beside it the first time it starts. The 2FA counters (`failed_attempts`,
+`locked_until`, `last_used`) go into `state.toml` beside it, and the state file
+is the server's own: the configuration is not rewritten for them. On the very
+first start it writes there too, adding `[iroh] secret_key` when the config has
+none: a deployment that never enrolls a client still needs the directory
+writable, or the Node ID changes on every restart. `ReadWritePaths` is that one
+directory and nothing wider. `NEXAPIPE_NO_PERSIST_IDENTITY=1` is the way to run
+without a writable config, at the cost of a Node ID that does not survive a
+restart.
 
 **Keep it `0600` and owned by `nexapipe`, after every edit — recommended, not
 enforced.** Config file permissions are no longer checked, so a `0644` config
@@ -596,6 +601,39 @@ Two changes are deliberately one-way on a running server: `[auth] enabled = true
 is picked up by the watcher, but turning 2FA *off* is refused (restart to
 disable it), and `enabled = true` together with an exposed plaintext listener is
 refused outright.
+
+### The configuration and the state are two files
+
+`config.toml` is the operator's file: what they wrote, what they read, what they
+keep in version control. The things a running server learns — how many times a
+client mistyped a code, until when it is locked out, when it was last seen —
+are not that, so they live in `state.toml` **beside** the configuration, in the
+same shape and with the same client and device names.
+
+```
+/etc/nexapipe/
+├── config.toml     the operator's file
+├── state.toml      the server's counters (0600, written by the server)
+└── config.toml.admin-token
+```
+
+The state file is written by the server and by nobody else, and the
+configuration file is never rewritten for the counters. That separation is not
+only tidiness: the server watches the configuration's modification time, so a
+server that wrote its counters into the configuration turned every mistyped code
+into a configuration reload — the routes rebuilt and the health checks
+restarted, because a stranger typed a code wrong.
+
+Nothing has to be set up. The state file appears the first time a client
+mistypes a code or authenticates, and it is `0600`. A state file that cannot be
+read stops the server from starting: the lockouts it holds would be unknown, and
+starting anyway would reset every one of them. Delete it to start without the
+lockouts it holds.
+
+A configuration written before the state file existed still works: the three
+counter keys are read from it, so a deployment that was counting there keeps its
+lockouts until the state file has an entry for that client. They are not written
+back there any more.
 
 ### Minimal config
 
@@ -1337,13 +1375,14 @@ once; see `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` under [QUIC tuning](#quic-tuning).
 | Android TUN | any port | any port |
 | Desktop TUN | any port | — |
 
-The TUNs hand the application **one virtual address per domain** (`10.0.1.16+` on
-Android, `10.0.0.2+` on desktop), so the destination *is* the name. Nothing is
-sniffed, which is what makes UDP possible at all. Both families are answered
-(AAAA from `fd00:10:0:1::16+`, a ULA block the VPN routes for itself), so a name
-resolved over IPv6 is as routable as one resolved over IPv4 — except on a desktop
-TUN whose interface refused the IPv6 address, where AAAA is answered with nothing
-and the resolver falls back to A.
+The TUNs hand the application **one virtual address per domain** (`198.18.0.16+`
+on Android, `198.18.0.2+` on desktop — the block the tunnel claims decides the
+addresses, and both clients pick that block from the same list), so the
+destination *is* the name. Nothing is sniffed, which is what makes UDP possible
+at all. Both families are answered (AAAA from `fd00:198:18::10+`, a ULA block
+the VPN routes for itself), so a name resolved over IPv6 is as routable as one
+resolved over IPv4 — except on a desktop TUN whose interface refused the IPv6
+address, where AAAA is answered with nothing and the resolver falls back to A.
 
 Note the route mode this implies: traffic a TUN sends to a domain arrives as L4,
 so that domain needs a `tcp` (or `udp`) route — **even for plain HTTP on port
@@ -1794,7 +1833,7 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 | App | Directory | What it does |
 | --- | --- | --- |
 | Android | [`ui-android`](ui-android/README.md) | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
-| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
+| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service; an explicit DNS strategy (`scoped` / `global` / `none`) that is never changed for you. |
 
 <table>
   <tr>

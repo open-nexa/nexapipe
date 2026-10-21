@@ -482,6 +482,9 @@ async function start(): Promise<void> {
       localAddr: config.localAddr,
       dnsAddr: config.dnsAddr,
       upstreamDns: config.upstreamDns,
+      // What the machine's DNS is asked to do. Sent by name so the backend can refuse a
+      // spelling it does not know, rather than quietly picking one.
+      dnsStrategy: config.dnsStrategy,
       loadBalancing: config.loadBalancing,
       tunName: config.tunName,
       useService: config.useService,

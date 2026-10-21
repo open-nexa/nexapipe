@@ -133,6 +133,7 @@ impl std::fmt::Debug for StartProxyRequest {
             .field("local_addr", &self.local_addr)
             .field("dns_addr", &self.dns_addr)
             .field("upstream_dns", &self.upstream_dns)
+            .field("dns_strategy", &self.dns_strategy)
             .field("load_balancing", &self.load_balancing)
             .field("tun_name", &self.tun_name)
             .field("use_tun", &self.use_tun)
@@ -150,6 +151,14 @@ pub struct StartProxyRequest {
     pub local_addr: Option<String>,
     pub dns_addr: Option<String>,
     pub upstream_dns: Option<String>,
+    /// What the machine's DNS is asked to do: `scoped` (only the configured
+    /// domains go through the tunnel), `global` (every query does) or `none`
+    /// (the machine's DNS is not touched). Absent means `scoped`.
+    ///
+    /// Optional for the same reason `use_tun` is: an older service binary
+    /// ignores it, and an older client that does not send it gets the default.
+    #[serde(default)]
+    pub dns_strategy: Option<String>,
     pub load_balancing: Option<String>,
     pub tun_name: Option<String>,
     /// Requested forwarding mode. Optional so an older client (or an older service binary, which

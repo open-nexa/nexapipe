@@ -40,6 +40,7 @@
 //! - macOS:   the name must be utunN; if omitted the system assigns one automatically
 
 use crate::proxy::dns::{self, DnsServer, DnsServerConfig};
+use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::{dns_config, routing};
 use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
@@ -63,29 +64,25 @@ use tun::AbstractDevice;
 /// exactly what the virtual IPs below are. The old `10.0.0.0` block stays at the tail so
 /// configurations saved against it remain valid (and get retargeted into whichever block
 /// actually took, see [`retarget`]).
-pub const TUN_BASE_CANDIDATES: [Ipv4Addr; 6] = [
-    Ipv4Addr::new(198, 18, 0, 0), // RFC 2544 benchmarking — the fake-IP convention
-    Ipv4Addr::new(198, 19, 0, 0), // second half of the same /15
-    Ipv4Addr::new(100, 100, 0, 0), // RFC 6598 CGNAT shared space — never a LAN subnet
-    Ipv4Addr::new(172, 26, 0, 0), // private-space fallback, rarely used by routers
-    Ipv4Addr::new(10, 200, 0, 0), // private-space fallback
-    Ipv4Addr::new(10, 0, 0, 0),   // legacy default, kept last for old saved configs
-];
+///
+/// The list itself lives in the client library, because Android walks the same one — one
+/// address space on both clients, and a list that could drift would be a list that drifted.
+pub use nexapipe_client::virtual_block::TUN_BASE_CANDIDATES;
 
 /// Netmask of the TUN block — every candidate is a /24.
 pub const TUN_NETMASK: &str = "255.255.255.0";
 
-/// The block actually in use, as recorded by `routing::configure_interface`.
-static TUN_BASE: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
-
 /// The base of the block in use. Falls back to the configured one until the interface is up.
+///
+/// The block is the client library's, so the desktop and Android are looking at one value
+/// rather than two that happen to agree today.
 pub fn tun_base() -> Ipv4Addr {
-    *TUN_BASE.get_or_init(|| TUN_BASE_CANDIDATES[0])
+    nexapipe_client::virtual_block::current()
 }
 
 /// Records the block `routing::configure_interface` actually managed to configure.
 pub fn set_tun_base(base: Ipv4Addr) {
-    let _ = TUN_BASE.set(base);
+    nexapipe_client::virtual_block::set(base);
 }
 
 /// The TUN device address: the last usable host address of the block in use (…254).
@@ -206,6 +203,10 @@ pub struct TunProxyConfig {
     pub dns_ip: String,
     /// Local DNS server configuration (DNS hijacking)
     pub dns: DnsServerConfig,
+    /// What the machine's DNS is asked to do: only the configured domains, every
+    /// query, or none of them. The user's decision — see
+    /// [`crate::proxy::dns_config::DnsStrategy`].
+    pub dns_strategy: DnsStrategy,
 }
 
 pub struct TunProxy {
@@ -463,10 +464,17 @@ impl TunProxy {
         // tunnel that starts anyway looks like a working one: the UI reports
         // running while the domains the proxy exists for resolve at their real
         // addresses and leave in the clear. Wind down instead, and say why.
+        // Said out loud, because the strategy is the operator's decision and the
+        // machine's DNS is not the app's to change quietly. A run that falls
+        // back from scoped to global behind the user's back is the thing this
+        // setting exists to prevent.
+        tracing::info!("the DNS strategy is {}", self.config.dns_strategy.name());
+
         let hijack = match dns_config::set_system_dns(
             &interface,
             &dns_ip,
             &self.config.dns.proxy_domains,
+            self.config.dns_strategy,
         ) {
             Ok(hijack) => hijack,
             Err(e) => {
@@ -701,8 +709,8 @@ mod tests {
     /// use, host part and port preserved — this is what keeps an old config (saved against the
     /// legacy 10.0.0.x default) working after the TUN moved.
     ///
-    /// `TUN_BASE` is a `OnceLock`, i.e. set at most once per process, so the expectations are
-    /// derived from [`tun_base`] instead of assuming which block a test managed to register.
+    /// The block is a value the client library holds, so the expectations are derived from
+    /// [`tun_base`] instead of assuming which block a test managed to register.
     #[test]
     fn retarget_moves_candidate_block_addresses_into_the_block_in_use() {
         set_tun_base(TUN_BASE_CANDIDATES[0]);

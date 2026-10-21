@@ -1,22 +1,29 @@
 //! System DNS configuration — points system DNS at the TUN virtual IP so that queries reach
 //! the local DNS server.
 //!
-//! Two ways of doing it, tried in this order:
+//! Three ways of doing it, and **which one is done is the operator's decision**, spelled by
+//! [`DnsStrategy`]:
 //!
 //! - **Scoped** (per-domain): only the proxied domains resolve through the TUN, and
 //!   everything else keeps resolving wherever the machine was resolving it. This is
 //!   what makes running alongside another tunnel possible — the other app's names,
-//!   and the machine's own internal ones, are none of our business.
+//!   and the machine's own internal ones, are none of our business. The default.
 //!   - macOS:   a file per domain under `/etc/resolver`
 //!   - Linux:   `resolvectl` routing domains on the TUN link
 //!   - Windows: NRPT rules (PowerShell `Add-DnsClientNrptRule`), read back afterwards
-//! - **Global**: every query on the machine goes to the TUN resolver. The fallback,
-//!   for a platform with no per-domain mechanism and for one where the scoped attempt
-//!   could not be installed.
+//! - **Global**: every query on the machine goes to the TUN resolver.
 //!   - Windows: PowerShell Set-DnsClientServerAddress (netsh fallback), verified afterwards
 //!   - Linux:   overwriting /etc/resolv.conf (with a backup, which the restore puts back)
 //!   - macOS:   networksetup (iterating over every network service), with the pre-hijack
 //!     servers kept on file so a restore can put them back
+//! - **None**: the machine's DNS is left exactly as it is. The local DNS server still
+//!   runs, so a PAC file or a hosts entry can point at it.
+//!
+//! The strategy is never quietly downgraded. A machine that cannot be scoped — one
+//! whose domain policy overrides the local NRPT rules, or one whose configured domain
+//! list cannot be named to the operating system at all — **fails** under the scoped
+//! strategy and says so, rather than having its whole DNS replaced behind the user's
+//! back. The global strategy is one click away for the machine that needs it.
 //!
 //! Which one a run ended up with is returned by [`set_system_dns`] and has to be handed
 //! back to [`restore_system_dns`]: each is undone where it was done, and a scoped
@@ -85,6 +92,55 @@ use std::net::IpAddr;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
 
+/// What the operator asked the machine's DNS to do.
+///
+/// The strategy is chosen by the person who set the app up, not by whatever the
+/// platform happened to allow. Two machines that could both be scoped, one
+/// choosing the global strategy and one not, differ in ways nobody can see
+/// afterwards — so the choice is made where it can be seen, and it is not
+/// changed afterwards by the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsStrategy {
+    /// Only the configured domains resolve through the TUN. Everything else
+    /// keeps resolving where it always did. The default, and the one that
+    /// leaves the machine's own names alone.
+    #[default]
+    Scoped,
+    /// Every query on the machine goes to the TUN resolver.
+    Global,
+    /// The machine's DNS is not touched at all. The local DNS server still
+    /// runs, so a PAC file or a hosts entry can point at it.
+    None,
+}
+
+impl DnsStrategy {
+    /// The spelling in the configuration and in the settings page.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DnsStrategy::Scoped => "scoped",
+            DnsStrategy::Global => "global",
+            DnsStrategy::None => "none",
+        }
+    }
+
+    /// Reads the spelling.
+    ///
+    /// A value that is present but unknown is **refused**, the way the rest of
+    /// the settings are: this one says what happens to the machine's DNS, and
+    /// a typo must not be read as "leave it alone" or "replace all of it" —
+    /// those are two very different machines.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scoped" => Ok(DnsStrategy::Scoped),
+            "global" => Ok(DnsStrategy::Global),
+            "none" => Ok(DnsStrategy::None),
+            other => anyhow::bail!(
+                "unknown DNS strategy {other:?}; expected \"scoped\", \"global\" or \"none\""
+            ),
+        }
+    }
+}
+
 /// How a run pointed system DNS at the TUN resolver.
 ///
 /// Handed back to [`restore_system_dns`], which undoes each where it was done:
@@ -98,63 +154,161 @@ pub enum DnsHijack {
     Scoped,
     /// Every query on the machine goes to the TUN resolver.
     Global,
+    /// The machine's DNS was not touched, so there is nothing to undo.
+    None,
 }
 
-/// Points system DNS at the TUN virtual IP, and reports which kind of hijack
-/// ended up in place.
+/// Points system DNS at the TUN virtual IP the way `strategy` says, and reports
+/// which kind of hijack ended up in place.
 ///
-/// Scoped where the platform can express it and the configuration can be
-/// spelled as a set of domains; the global hijack otherwise. A best effort
-/// either way: a run that could not install either is reported, and the caller
-/// goes on without name resolution rather than refusing to start.
+/// The strategy is the operator's decision and it is the only one: a machine
+/// that cannot be scoped **fails** under the scoped strategy, and the error
+/// says what to do about it. It used to fall through to the global hijack
+/// instead, which meant the machine's whole DNS was replaced whenever the
+/// per-domain mechanism was unavailable or the configured list could not be
+/// named — and nobody was told.
+///
+/// An empty domain list is not a failure: there is nothing to scope, so
+/// nothing is installed and the machine's DNS stays where it was. A proxy that
+/// proxies no domain resolves nothing either way.
 pub fn set_system_dns(
     interface: &str,
     dns_ip: &str,
     proxy_domains: &[String],
+    strategy: DnsStrategy,
 ) -> Result<DnsHijack> {
-    // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`
+    // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`,
+    // and only the three platform branches need `dns_ip`. The other platforms are a
+    // compilation check, not a deployment target — but they have to compile.
     #[cfg(not(any(windows, target_os = "linux")))]
     let _ = interface;
-
-    #[cfg(windows)]
-    {
-        // Per-domain first, like the other two platforms: the NRPT names a
-        // resolver for a namespace, and a name that matches no rule is resolved
-        // against the adapters — which still carry the DNS this machine was
-        // using, so nothing outside the configured domains moves. Rules are
-        // verified by reading them back, because a machine that takes its NRPT
-        // from a domain policy ignores the local ones entirely, and that is not
-        // something to discover by having the proxy resolve nothing.
-        if set_scoped_dns_windows(dns_ip, proxy_domains)? {
-            return Ok(DnsHijack::Scoped);
-        }
-        set_system_dns_windows(interface, dns_ip)?;
-        Ok(DnsHijack::Global)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if set_scoped_dns_linux(interface, dns_ip, proxy_domains)? {
-            return Ok(DnsHijack::Scoped);
-        }
-        set_system_dns_linux(interface, dns_ip)?;
-        Ok(DnsHijack::Global)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if set_scoped_dns_macos(dns_ip, proxy_domains)? {
-            return Ok(DnsHijack::Scoped);
-        }
-        set_system_dns_macos(dns_ip)?;
-        Ok(DnsHijack::Global)
-    }
-
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        let _ = proxy_domains;
-        Ok(DnsHijack::Global)
+    let _ = dns_ip;
+
+    match strategy {
+        // The machine's DNS is not the app's to change. The local DNS server
+        // still runs, so a PAC file or a hosts entry can point at it.
+        DnsStrategy::None => Ok(DnsHijack::None),
+
+        // Asked for by name: every query on the machine goes to the TUN.
+        DnsStrategy::Global => {
+            #[cfg(windows)]
+            {
+                set_system_dns_windows(interface, dns_ip)?;
+                Ok(DnsHijack::Global)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                set_system_dns_linux(interface, dns_ip)?;
+                Ok(DnsHijack::Global)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                set_system_dns_macos(dns_ip)?;
+                Ok(DnsHijack::Global)
+            }
+            #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+            {
+                Ok(DnsHijack::Global)
+            }
+        }
+
+        // Asked for by name, and never quietly downgraded.
+        DnsStrategy::Scoped => {
+            // Nothing to scope: there is no domain to name to the operating
+            // system, so nothing is installed and the machine's DNS stays
+            // where it was. A proxy that proxies no domain resolves nothing
+            // either way — and the tunnel still runs.
+            if proxy_domains.is_empty() {
+                return Ok(DnsHijack::None);
+            }
+
+            // The list has to be nameable before anything is tried: a
+            // configuration the operating system cannot be told about is not a
+            // platform failure, and the two need different answers.
+            if crate::proxy::dns::scoped_domains(proxy_domains).is_none() {
+                return Err(anyhow::anyhow!(
+                    "the scoped DNS strategy has nothing to install: {} cannot each be named \
+                     to the operating system. A bare \"*\" means every domain and is what the \
+                     global strategy is for, and a name without a dot is a host rather than a \
+                     domain. The machine's DNS was left alone.",
+                    describe_domains(proxy_domains)
+                ));
+            }
+
+            #[cfg(windows)]
+            {
+                // Per-domain first, like the other two platforms: the NRPT names a
+                // resolver for a namespace, and a name that matches no rule is resolved
+                // against the adapters — which still carry the DNS this machine was
+                // using, so nothing outside the configured domains moves. Rules are
+                // verified by reading them back, because a machine that takes its NRPT
+                // from a domain policy ignores the local ones entirely, and that is not
+                // something to discover by having the proxy resolve nothing.
+                if set_scoped_dns_windows(dns_ip, proxy_domains)? {
+                    return Ok(DnsHijack::Scoped);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if set_scoped_dns_linux(interface, dns_ip, proxy_domains)? {
+                    return Ok(DnsHijack::Scoped);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if set_scoped_dns_macos(dns_ip, proxy_domains)? {
+                    return Ok(DnsHijack::Scoped);
+                }
+            }
+            Err(anyhow::anyhow!(
+                "the scoped DNS strategy could not be installed on this machine: {}. The \
+                 machine's DNS was left alone; the global strategy is what replaces it, and it \
+                 is a setting away.",
+                scoped_failure_reason()
+            ))
+        }
     }
+}
+
+/// The configured domains, as short a list as says it.
+fn describe_domains(domains: &[String]) -> String {
+    let shown: Vec<&str> = domains.iter().map(|d| d.as_str()).take(5).collect();
+    if domains.len() > shown.len() {
+        format!(
+            "{} of the {} configured domains (\"{}\", …)",
+            shown.len(),
+            domains.len(),
+            shown.join("\", \"")
+        )
+    } else {
+        format!("the configured domains (\"{}\")", shown.join("\", \""))
+    }
+}
+
+/// Why the per-domain mechanism did not take, per platform.
+///
+/// The installers have already said what they saw; this says what it means
+/// here, so the message a user reads names the thing they would have to
+/// change.
+#[cfg(windows)]
+fn scoped_failure_reason() -> &'static str {
+    "the NRPT rules could not be installed, or were read back as not in force — a machine that takes its rules from a domain policy ignores the local ones"
+}
+
+#[cfg(target_os = "linux")]
+fn scoped_failure_reason() -> &'static str {
+    "systemd-resolved could not route the configured domains to the tunnel's link"
+}
+
+#[cfg(target_os = "macos")]
+fn scoped_failure_reason() -> &'static str {
+    "the per-domain resolver files could not be written under /etc/resolver"
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn scoped_failure_reason() -> &'static str {
+    "this platform has no per-domain DNS mechanism"
 }
 
 /// Whether anything still resolves against the address this run hijacked.
@@ -181,14 +335,20 @@ fn hijack_is_in_effect(observed: &[Vec<String>], dns_ip: &str) -> bool {
 /// Restores the system DNS configuration (best effort), undoing the kind of
 /// hijack [`set_system_dns`] reported it had installed.
 pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> Result<()> {
-    // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`
+    // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`,
+    // and only the three platform branches need `dns_ip`. The other platforms are a
+    // compilation check, not a deployment target — but they have to compile.
     #[cfg(not(any(windows, target_os = "linux")))]
     let _ = interface;
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let _ = dns_ip;
 
     #[cfg(windows)]
     {
         match hijack {
             DnsHijack::Scoped => remove_nrpt_rules(dns_ip),
+            // The machine's DNS was not touched, so there is nothing to undo.
+            DnsHijack::None => Ok(()),
             // Rules are taken back here too, and not only in the branch above:
             // a run that installed rules and then fell through to the global
             // hijack — or one that inherited rules a process left behind before
@@ -211,6 +371,7 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     {
         match hijack {
             DnsHijack::Scoped => restore_scoped_dns_linux(interface),
+            DnsHijack::None => Ok(()),
             DnsHijack::Global => {
                 let observed = [
                     resolvectl_dns_for(interface).unwrap_or_default(),
@@ -236,6 +397,7 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     {
         match hijack {
             DnsHijack::Scoped => restore_scoped_dns_macos(),
+            DnsHijack::None => Ok(()),
             DnsHijack::Global => {
                 let observed: Vec<Vec<String>> = network_services()
                     .unwrap_or_default()
@@ -2499,6 +2661,84 @@ fn parse_network_services(output: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{DnsHijack, DnsStrategy};
+
+    /// The three spellings there are, and nothing else.
+    ///
+    /// A strategy that is not known must not be read as one of them: the
+    /// setting says what happens to the machine's name resolution, and "leave
+    /// it alone" and "replace all of it" are two very different machines.
+    #[test]
+    fn a_dns_strategy_is_read_from_its_spelling() {
+        assert_eq!(DnsStrategy::parse("scoped").unwrap(), DnsStrategy::Scoped);
+        assert_eq!(DnsStrategy::parse("global").unwrap(), DnsStrategy::Global);
+        assert_eq!(DnsStrategy::parse("none").unwrap(), DnsStrategy::None);
+        // Case and surrounding space are the reader's business, not the user's.
+        assert_eq!(
+            DnsStrategy::parse("  Scoped ").unwrap(),
+            DnsStrategy::Scoped
+        );
+    }
+
+    /// A spelling nobody knows is refused, and the message says what there is.
+    #[test]
+    fn an_unknown_dns_strategy_is_refused() {
+        let error = DnsStrategy::parse("everything").expect_err("a typo is refused");
+        let message = error.to_string();
+        assert!(message.contains("everything"), "{message}");
+        assert!(message.contains("scoped"), "{message}");
+        assert!(message.contains("global"), "{message}");
+        assert!(message.contains("none"), "{message}");
+    }
+
+    /// The default is the strategy that leaves the machine's own names alone.
+    #[test]
+    fn the_default_dns_strategy_is_scoped() {
+        assert_eq!(DnsStrategy::default(), DnsStrategy::Scoped);
+    }
+
+    /// Each strategy spells itself back the way it is written.
+    #[test]
+    fn a_dns_strategy_spells_itself_back() {
+        assert_eq!(DnsStrategy::Scoped.name(), "scoped");
+        assert_eq!(DnsStrategy::Global.name(), "global");
+        assert_eq!(DnsStrategy::None.name(), "none");
+    }
+
+    /// "None" means the machine's DNS was not touched, and there is nothing to
+    /// undo — which is what the restore path has to know.
+    ///
+    /// Exercised on every platform, because the point of the strategy is that
+    /// it does not reach the platform at all: no scoped rules, no global
+    /// hijack, nothing to restore.
+    #[test]
+    fn the_none_strategy_installs_nothing() {
+        let hijack = super::set_system_dns(
+            "does-not-matter",
+            "198.18.0.254",
+            &["example.com".to_string()],
+            DnsStrategy::None,
+        )
+        .expect("the none strategy cannot fail");
+        assert_eq!(hijack, DnsHijack::None);
+    }
+
+    /// An empty domain list is not a failure: there is nothing to scope, so
+    /// nothing is installed and the machine's DNS stays where it was.
+    ///
+    /// The scoped strategy is the default, and a proxy with no domain
+    /// configured is a proxy that resolves nothing — the tunnel still runs.
+    /// What it must not do is fail the run: the scoped attempt has nothing to
+    /// install, and a run that says "it could not be installed" is a run that
+    /// refuses a tunnel over a domain list that was empty to begin with.
+    #[test]
+    fn the_scoped_strategy_with_no_domains_installs_nothing() {
+        let hijack =
+            super::set_system_dns("does-not-matter", "198.18.0.254", &[], DnsStrategy::Scoped)
+                .expect("an empty domain list is not a failure");
+        assert_eq!(hijack, DnsHijack::None);
+    }
+
     #[cfg(target_os = "macos")]
     use super::{backup_is_spent, parse_getdnsservers, parse_network_services, NO_DNS_SERVERS};
 

@@ -1,4 +1,5 @@
 use crate::proxy::dns::DnsServerConfig;
+use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::local_proxy::LocalProxyWrapper;
 use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
@@ -222,6 +223,10 @@ pub struct ProxyManagerConfig {
     pub local_proxy_addr: String,
     pub dns_listen_addr: String,
     pub upstream_dns: String,
+    /// What the machine's DNS is asked to do. The user's decision, carried
+    /// through untouched: a machine that cannot honour it says so rather than
+    /// having its whole DNS replaced.
+    pub dns_strategy: DnsStrategy,
     pub load_balancing: ProxyLoadBalancingStrategy,
     pub tun_name: String,
     /// Forwarding mode, chosen by the user, not probed: `true` requests TUN (and fails if the
@@ -388,8 +393,8 @@ impl ProxyManager {
         // An empty value means nothing was configured, which falls back to the
         // default — the same reading the JNI gives it. Only a value that
         // names a mode wrongly is an error.
-        let discovery =
-            DiscoveryMode::parse_or_default(&self.config.discovery_mode).map_err(StartError::Other)?;
+        let discovery = DiscoveryMode::parse_or_default(&self.config.discovery_mode)
+            .map_err(StartError::Other)?;
         tracing::info!("Discovery: {}", discovery.describe());
         // Which relay a *peer* may be dialled through. `custom` says this
         // endpoint uses one relay and no other, and that has to hold for the
@@ -657,6 +662,7 @@ impl ProxyManager {
                     upstream_dns: self.config.upstream_dns.clone(),
                     proxy_domains: all_domains.clone(),
                 },
+                dns_strategy: self.config.dns_strategy,
             };
             let tun_proxy = Arc::new(TunProxy::new(tun_config, endpoint_group.clone()));
 

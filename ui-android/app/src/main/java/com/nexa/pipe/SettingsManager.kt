@@ -102,6 +102,26 @@ class SettingsManager(context: Context) {
         private const val KEY_PLAINTEXT_CONSENT = "plaintext_credential_consent"
 
         /**
+         * Whether the tunnel should come back on its own after a restart.
+         *
+         * Off by default: an app that reconnects without being asked is an app
+         * that forwards traffic without being asked, and the user who wants
+         * that has to say so.
+         */
+        const val KEY_AUTO_CONNECT_ON_BOOT = "auto_connect_on_boot"
+
+        /**
+         * Whether the VPN permission was found to be missing at boot.
+         *
+         * Android does not promise that the permission a VPN app was given
+         * survives a restart, so the boot path asks rather than assumes. When
+         * it finds the permission gone it records that here, and the app says
+         * so — a tunnel that did not come back needs a reason the user can act
+         * on, and "the machine forgot" is not one.
+         */
+        const val KEY_VPN_CONSENT_MISSING = "vpn_consent_missing"
+
+        /**
          * The saved language tag, or "" for "follow the system".
          *
          * A static read on purpose: `attachBaseContext` needs it before a
@@ -593,5 +613,33 @@ class SettingsManager(context: Context) {
         val stored = prefs.getString(KEY_VPN_TAKEOVER_CHOICE, null) ?: return VpnTakeoverChoice.Ask
         return runCatching { VpnTakeoverChoice.valueOf(stored) }
             .getOrDefault(VpnTakeoverChoice.Ask)
+    }
+
+    /**
+     * Whether the tunnel should come back on its own after a restart.
+     *
+     * Off until the user says otherwise: a proxy that reconnects on its own
+     * forwards traffic on its own.
+     */
+    fun autoConnectOnBoot(): Boolean = prefs.getBoolean(KEY_AUTO_CONNECT_ON_BOOT, false)
+
+    /** Records whether the tunnel should come back after a restart. */
+    fun saveAutoConnectOnBoot(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_AUTO_CONNECT_ON_BOOT, enabled) }
+    }
+
+    /**
+     * Whether the VPN permission was missing when the boot path last looked.
+     *
+     * Read by the settings page, which has to tell the user that the tunnel
+     * will not come back until the permission is granted again — otherwise the
+     * switch says "on" and nothing happens, which is the same silence the
+     * setting had before it was wired to anything.
+     */
+    fun vpnConsentMissing(): Boolean = prefs.getBoolean(KEY_VPN_CONSENT_MISSING, false)
+
+    /** Records that the VPN permission was missing at boot, or that it was not. */
+    fun saveVpnConsentMissing(missing: Boolean) {
+        prefs.edit { putBoolean(KEY_VPN_CONSENT_MISSING, missing) }
     }
 }

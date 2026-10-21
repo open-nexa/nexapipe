@@ -355,6 +355,7 @@ impl ServiceRunner {
                         req.local_addr,
                         req.dns_addr,
                         req.upstream_dns,
+                        req.dns_strategy,
                         req.load_balancing,
                         req.tun_name,
                         req.use_tun,
@@ -478,6 +479,7 @@ impl ServiceRunner {
         local_addr: Option<String>,
         dns_addr: Option<String>,
         upstream_dns: Option<String>,
+        dns_strategy: Option<String>,
         load_balancing: Option<String>,
         tun_name: Option<String>,
         use_tun: Option<bool>,
@@ -557,6 +559,23 @@ impl ServiceRunner {
 
         let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
 
+        // What the machine's DNS is asked to do. Read here rather than deeper
+        // down, so a spelling nobody knows is refused before anything is
+        // changed: a strategy that is not known must not be read as "leave the
+        // machine's DNS alone" or "replace all of it".
+        let dns_strategy = match dns_strategy.as_deref() {
+            Some(value) => match crate::proxy::dns_config::DnsStrategy::parse(value) {
+                Ok(strategy) => strategy,
+                Err(e) => {
+                    return IpcResponse::Error(AppError::cause(
+                        codes::PROXY_INVALID_DNS_STRATEGY,
+                        e.to_string(),
+                    ));
+                }
+            },
+            None => crate::proxy::dns_config::DnsStrategy::default(),
+        };
+
         let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
 
         // Explicit forwarding mode, same contract as process mode: requested TUN is honoured or
@@ -573,6 +592,7 @@ impl ServiceRunner {
             local_proxy_addr: local_addr,
             dns_listen_addr: dns_addr,
             upstream_dns,
+            dns_strategy,
             load_balancing,
             tun_name,
             use_tun,
