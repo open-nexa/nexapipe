@@ -450,6 +450,16 @@ lookup, which is what a config written before the key existed does.
   lookup leaves from the same source port and the NAT mapping the router
   keeps for it is the one that stays. The chain, the order and the windows
   are unchanged.
+- **A response is not forwarded with the backend's own hop headers.** The
+  tunnel dropped only `transfer-encoding` and `x-request-id`, so
+  `connection`, `keep-alive`, `upgrade` and the `proxy-*` headers reached the
+  client as the backend wrote them — and a `connection: keep-alive` from the
+  backend is about the backend's link to the server, not the client's link to
+  it. The whole hop-by-hop set of RFC 9110 §7.6.1 is dropped now.
+  A bodyless response is no longer framed either: `204` and `304` were given
+  `transfer-encoding: chunked` and a terminating chunk, which RFC 9110 §6.1
+  forbids and which leaves a client waiting for the end of a body that is not
+  there.
 - **The config file's permission rule is said once, and it is a warning.**
   The comment beside the first-run config claimed that the server refuses to
   start over a world-readable config, and that the check was keyed off 2FA

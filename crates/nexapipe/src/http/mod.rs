@@ -541,6 +541,35 @@ fn forwards_request_header(name: &str) -> bool {
     .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
+/// Whether a response header may be forwarded to the client.
+///
+/// The same rule as the request direction, and for the same reason: a
+/// hop-by-hop header describes one connection, not the message (RFC 9110
+/// §7.6.1). A `connection: keep-alive` from the backend is about the
+/// backend's link to this process, and forwarding it tells the client to keep
+/// *its* link open for a response that arrived over a different one.
+///
+/// `transfer-encoding` is in the same group and has to go: the body is framed
+/// below, and a leftover `chunked` would disagree with the framing on the wire.
+///
+/// The list is the RFC's, which is not the request direction's list: a request
+/// carries `expect` and `proxy-connection`, which are not response headers,
+/// and the two directions carry the proxy authentication headers, which are.
+fn forwards_response_header(name: &str) -> bool {
+    ![
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
+}
+
 ///
 /// The request body is a parameter rather than `Incoming` so that the path can
 /// be driven by something other than a live connection — a test, mostly. The
@@ -1466,7 +1495,10 @@ pub async fn proxy_to_backend_streaming(
 
     for (name, value) in parts.headers.iter() {
         let name_lower = name.as_str().to_lowercase();
-        if name_lower == "transfer-encoding" {
+        // A header that belongs to the hop between the backend and this
+        // process does not belong on the hop between this process and the
+        // client.
+        if !forwards_response_header(&name_lower) {
             continue;
         }
         // Dropped, not duplicated: the id we write below is the one our own
@@ -1491,7 +1523,19 @@ pub async fn proxy_to_backend_streaming(
     // all — the stream carries the end — so a response from an h2 backend is
     // exactly the case that has to be framed here. A backend that sent no
     // length over HTTP/1.1 means the same thing, and is framed the same way.
-    let use_chunked = !has_content_length && !other_transfer_coding;
+    //
+    // A bodyless response has no body to frame. RFC 9110 §6.1 forbids a
+    // `transfer-encoding` on a 204 or a 304, and a client told "chunked"
+    // waits for the terminator of a body that is not there. A `HEAD` request
+    // asks for the head of a response whose body is not sent, whatever the
+    // status says — so it is not framed either.
+    let status_allows_a_body = !status.is_informational()
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED;
+    let use_chunked = status_allows_a_body
+        && !has_content_length
+        && !other_transfer_coding
+        && *req.method() != Method::HEAD;
     if use_chunked {
         response_buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }

@@ -127,6 +127,36 @@ async fn spawn_backend(reply_body: &'static str) -> Backend {
     Backend { url, seen }
 }
 
+/// A backend that answers with a reply of its own.
+///
+/// The proxy's job includes not passing on what belongs to the hop between
+/// the backend and it, so a test needs a backend that says the awkward things
+/// to see that they do not arrive.
+async fn spawn_backend_answering(reply: &'static str) -> Backend {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let url = format!("http://{}", listener.local_addr().expect("backend address"));
+
+    let sink = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let Some(request) = read_request(&mut sock).await else {
+                    return;
+                };
+                sink.lock().unwrap().push(request);
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+
+    Backend { url, seen }
+}
+
 /// Reads one HTTP/1.1 request: the head, then a body if `content-length` asks
 /// for one. A backend that read only the head would make every test with a body
 /// look like a proxy bug.
@@ -553,6 +583,129 @@ fn status_of(reply: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A response does not arrive with the backend's own hop headers.
+///
+/// `connection: keep-alive` describes the backend's link to the proxy, and
+/// forwarding it tells the client to keep *its* link open for a response that
+/// arrived over a different one.
+///
+/// And a 204 has no body, so it is not framed: RFC 9110 §6.1 forbids a
+/// `transfer-encoding` on a bodyless status, and a client told "chunked"
+/// waits for the terminator of a body that is not there.
+#[tokio::test]
+async fn a_response_is_not_forwarded_with_the_backends_own_hop_headers() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 204 No Content\r\nconnection: keep-alive\r\nkeep-alive: timeout=5\r\n\r\n",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        !text.contains("keep-alive"),
+        "the hop header arrived: {text}"
+    );
+    assert!(
+        !text.contains("connection"),
+        "the hop header arrived: {text}"
+    );
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a bodyless response was framed: {text}"
+    );
+}
+
+/// A response with a body is still framed for the client.
+///
+/// The hop-by-hop headers are dropped, but the body still needs a length or a
+/// framing: the client speaks HTTP/1.1, which has no way to say "the body
+/// ends when this stream ends", so a body with no length has to be chunked.
+#[tokio::test]
+async fn a_response_with_a_body_is_still_framed() {
+    let backend = spawn_backend_answering(
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        text.contains("transfer-encoding: chunked"),
+        "the body was not framed: {text}"
+    );
+    assert!(
+        reply_body(&reply).contains("hello"),
+        "the body did not arrive: {text}"
+    );
+}
+
+/// A `304` is bodyless as well, and equally unframed.
+///
+/// Its headers still travel: only the hop-by-hop ones are dropped, and an
+/// `etag` is what makes a conditional request worth making.
+#[tokio::test]
+async fn a_304_is_not_framed() {
+    let backend =
+        spawn_backend_answering("HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\n\r\n").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\nIf-None-Match: \"v1\"\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a bodyless response was framed: {text}"
+    );
+    assert!(
+        text.contains("etag: \"v1\""),
+        "a header was dropped: {text}"
+    );
+    assert!(
+        reply_body(&reply).is_empty(),
+        "a 304 carried a body: {text}"
+    );
+}
+
+/// A `HEAD` response is not framed either: the client asked for the head of a
+/// response whose body is not sent, whatever the status says.
+#[tokio::test]
+async fn a_head_response_is_not_framed() {
+    let backend = spawn_backend_answering("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"HEAD /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a HEAD response was framed: {text}"
+    );
+    assert!(
+        text.contains("content-length: 5"),
+        "the length of the body that would have been sent was dropped: {text}"
+    );
+    assert!(
+        reply_body(&reply).is_empty(),
+        "a HEAD response carried a body: {text}"
+    );
+}
 
 /// A request for a host no route serves is answered **before** its body is
 /// read.
