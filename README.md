@@ -1877,6 +1877,23 @@ RTT. `TransportTuning` raises it and can be overridden without a rebuild:
 Never override iroh's multipath or NAT-traversal knobs — doing so breaks hole
 punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 
+### TUN tuning
+
+The **TCP window** of the userspace stack is two things at once: the
+throughput ceiling of every flow that goes through the TUN, and the memory
+each of them costs — the stack gives every socket four buffers of it. The
+default is 128 KiB, which suits the request-and-response traffic a TUN mostly
+carries. A path that moves bulk data wants a bigger one:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NEXAPIPE_TUN_TCP_WINDOW` | `131072` | Per-socket TCP window, bytes. |
+
+The steady speed of a single flow is the window divided by the round-trip
+time: 128 KiB is 1.25 MB/s at 100 ms and 2.5 MB/s at 50 ms, and 320 KiB is
+three times that. The value is read once, when the stack is built. Android
+has no useful environment, so it always runs the default.
+
 ---
 
 ## Client apps

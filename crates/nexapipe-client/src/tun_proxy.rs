@@ -54,7 +54,9 @@ use crate::ClientError;
 use crate::EndpointGroup;
 use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
-use crate::local_proxy::{handle_local_connection, report_domain_patterns, should_proxy_domain};
+use crate::local_proxy::{
+    handle_local_connection, report_domain_patterns, should_proxy_domain, warn,
+};
 use crate::virtual_ip::IpMapping;
 
 #[cfg(feature = "jni")]
@@ -174,16 +176,70 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 /// **The window is the flow's memory.** The stack gives every socket four
 /// buffers of this size — two for the protocol and two for the application
 /// side of the tunnel — so a flow costs four times this whether it is
-/// carrying anything or not.
+/// carrying anything or not. Measured (see the `tun_flow_memory` example): at
+/// 320 KiB a flow is 1,280 KiB of address space, at 128 KiB it is 512 KiB.
 ///
-/// It is also the flow's throughput: steady single-flow speed is the window
-/// divided by the round-trip time, so 128 KiB over a 100 ms path is
-/// 1.25 MB/s and over a 50 ms path is 2.5 MB/s.
+/// **It is also the flow's throughput.** Steady single-flow speed is the
+/// window divided by the round-trip time:
 ///
-/// The value the stack used before the client had a say in it was
-/// `0x3FFF * 20` — 320 KiB, twenty AEAD packets — and it is written down
-/// here so that the number is the client's rather than the dependency's.
-pub const DEFAULT_TCP_WINDOW: u32 = 0x3FFF * 20;
+/// | round trip | 128 KiB | 320 KiB |
+/// |---|---|---|
+/// | 20 ms | 6.25 MB/s | 15.6 MB/s |
+/// | 50 ms | 2.5 MB/s | 6.25 MB/s |
+/// | 100 ms | 1.25 MB/s | 3.1 MB/s |
+///
+/// 128 KiB is the default because the traffic through a TUN is mostly
+/// request-and-response, where a flow never reaches its window, and because
+/// the memory is paid by every flow at once. A path that carries bulk data
+/// wants the other number: `NEXAPIPE_TUN_TCP_WINDOW` sets it without a
+/// rebuild, and [`TunStackConfig::tcp_window`] sets it for a library user.
+pub const DEFAULT_TCP_WINDOW: u32 = 128 * 1024;
+
+/// The smallest window the stack is given.
+///
+/// A window below this cannot carry a segment and a half, so a flow on it
+/// would crawl rather than fail — which is worse than a refused value,
+/// because nothing says why. A value under the floor is ignored and the
+/// default is used instead.
+pub const MIN_TCP_WINDOW: u32 = 16 * 1024;
+
+/// Overrides [`DEFAULT_TCP_WINDOW`] for the TUN stack, in bytes.
+///
+/// The desktop can set it; Android has no useful environment and runs the
+/// compiled-in default.
+pub const ENV_TCP_WINDOW: &str = "NEXAPIPE_TUN_TCP_WINDOW";
+
+/// The window the stack is built with.
+///
+/// The caller's own value if it has one, then the environment's, then the
+/// default. A value that cannot work is ignored with a warning rather than
+/// obeyed: the same rule the other environment variables follow.
+fn resolve_tcp_window(requested: Option<u32>, from_env: Option<&str>) -> u32 {
+    if let Some(window) = requested {
+        if window < MIN_TCP_WINDOW {
+            warn(&format!(
+                "a TCP window of {window} bytes is below the {MIN_TCP_WINDOW} byte floor, \
+                 using the default instead"
+            ));
+            return DEFAULT_TCP_WINDOW;
+        }
+        return window;
+    }
+
+    let Some(raw) = from_env else {
+        return DEFAULT_TCP_WINDOW;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(window) if window >= MIN_TCP_WINDOW => window,
+        _ => {
+            warn(&format!(
+                "{ENV_TCP_WINDOW}={raw} is not a number of at least {MIN_TCP_WINDOW} bytes, \
+                 ignoring it"
+            ));
+            DEFAULT_TCP_WINDOW
+        }
+    }
+}
 
 /// How long a UDP flow may stay silent before this side closes it.
 ///
@@ -309,6 +365,12 @@ pub struct TunStackConfig {
     /// answers are handed out from — on the desktop the local DNS server and the
     /// stack share it, so an address allocated by either is routable by both.
     pub ip_mapping: Arc<IpMapping>,
+    /// The per-socket TCP window, in bytes.
+    ///
+    /// `None` takes the client's default — or the environment's, when it names
+    /// one. See [`DEFAULT_TCP_WINDOW`] for what the number costs and what it
+    /// buys.
+    pub tcp_window: Option<u32>,
 }
 
 /// The stack's packet halves: IP packets in (from the TUN) and out (to the TUN).
@@ -330,16 +392,19 @@ fn start_stack_services(
     stopped: Arc<AtomicBool>,
     tasks: &mut Vec<JoinHandle<()>>,
 ) -> Result<(StackSink, StackStream), ClientError> {
-    let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
-        .enable_tcp(true)
-        .enable_udp(true)
-        .mtu(TUN_MTU)
-        // The window the client asks for, rather than the stack's own default:
-        // it is the client's memory, and the client is the one that has to live
-        // with it. See [`DEFAULT_TCP_WINDOW`].
-        .tcp_recv_buffer_size(DEFAULT_TCP_WINDOW)
-        .tcp_send_buffer_size(DEFAULT_TCP_WINDOW)
-        .build()?;
+    let (stack, runner, udp_socket, tcp_listener) = {
+        // The window is the client's to choose, with the environment as the
+        // operator's way of choosing it. See [`DEFAULT_TCP_WINDOW`].
+        let from_env = std::env::var(ENV_TCP_WINDOW).ok();
+        let window = resolve_tcp_window(net.tcp_window, from_env.as_deref());
+        StackBuilder::default()
+            .enable_tcp(true)
+            .enable_udp(true)
+            .mtu(TUN_MTU)
+            .tcp_recv_buffer_size(window)
+            .tcp_send_buffer_size(window)
+            .build()?
+    };
 
     // What the list of names is worth saying, once, before anything asks it a
     // question. Both TUN entry points come through here.
@@ -652,6 +717,9 @@ impl TunProxy {
                 ip_mapping: Arc::new(
                     IpMapping::new().with_ipv6(virtual_ipv6_first(), virtual_ipv6_last()),
                 ),
+                // Android has no useful environment, so the window is the
+                // compiled-in default.
+                tcp_window: None,
             },
             stopped.clone(),
             &mut tasks,
@@ -2293,10 +2361,11 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, CacheKey, CachedAnswer, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, IpMapping,
-        answer_matches_query, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
-        cached_answer_at, handle_dns_query, lock_cache, next_activity, parse_dns_query, read_u32,
-        remember_answer, resolver_scope, set_answer_ttls, wait_for_stop,
+        Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
+        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, answer_matches_query, answer_ttl,
+        answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at, handle_dns_query,
+        lock_cache, next_activity, parse_dns_query, read_u32, remember_answer, resolve_tcp_window,
+        resolver_scope, set_answer_ttls, wait_for_stop,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2769,6 +2838,61 @@ mod tests {
         assert_eq!(rtype_aaaa, DNS_TYPE_AAAA);
         assert_ne!(rdata_a.len(), rdata_aaaa.len());
         assert_eq!(mapping.len(), 2, "one mapping per family for one name");
+    }
+
+    /// The caller's own window is the one the stack gets: a library user
+    /// knows what it is doing, and the environment is for the operator.
+    #[test]
+    fn the_callers_window_wins() {
+        assert_eq!(
+            resolve_tcp_window(Some(256 * 1024), Some("1024")),
+            256 * 1024
+        );
+    }
+
+    /// With no window of its own, the stack gets the client's default.
+    #[test]
+    fn the_window_falls_back_to_the_default() {
+        assert_eq!(resolve_tcp_window(None, None), DEFAULT_TCP_WINDOW);
+    }
+
+    /// The environment is the operator's way of choosing the window.
+    #[test]
+    fn the_environment_chooses_the_window() {
+        assert_eq!(resolve_tcp_window(None, Some("262144")), 262_144);
+        assert_eq!(
+            resolve_tcp_window(None, Some(" 262144 ")),
+            262_144,
+            "a value with whitespace around it is still a number"
+        );
+    }
+
+    /// A window that cannot work is ignored rather than obeyed: the flow on
+    /// it would crawl instead of failing, and nothing would say why.
+    #[test]
+    fn a_window_that_cannot_work_is_ignored() {
+        for bad in ["0", "-1", "lots", "", "1024"] {
+            assert_eq!(
+                resolve_tcp_window(None, Some(bad)),
+                DEFAULT_TCP_WINDOW,
+                "{bad:?} is not a window"
+            );
+        }
+        assert_eq!(
+            resolve_tcp_window(Some(1024), None),
+            DEFAULT_TCP_WINDOW,
+            "a caller's window is held to the same floor"
+        );
+    }
+
+    /// The floor is the point: a window below it cannot carry a segment and
+    /// a half.
+    #[test]
+    fn a_window_at_the_floor_is_used() {
+        assert_eq!(
+            resolve_tcp_window(Some(MIN_TCP_WINDOW), None),
+            MIN_TCP_WINDOW
+        );
     }
 
     /// A UDP flow ends when the proxy stops.

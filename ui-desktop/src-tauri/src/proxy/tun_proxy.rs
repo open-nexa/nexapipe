@@ -528,6 +528,9 @@ impl TunProxy {
                 // legacy payload-sniffing path — every flow goes by its own virtual IP.
                 legacy_proxy_ip: None,
                 ip_mapping,
+                // The window is the client's default, or the one the environment
+                // names: `NEXAPIPE_TUN_TCP_WINDOW`.
+                tcp_window: None,
             },
         );
 
