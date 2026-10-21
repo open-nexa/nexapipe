@@ -359,6 +359,7 @@ async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
                 "has_secret": !client.secret.expose_secret().is_empty(),
                 "created_at": client.created_at,
                 "allow_hosts": client.allow_hosts,
+                "allow_ports": client.allow_ports,
                 "last_used": client.last_used,
                 "failed_attempts": client.failed_attempts,
                 "locked_until": client.locked_until,

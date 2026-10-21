@@ -6,6 +6,7 @@ use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinB
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use nexapipe_proto::{host_matches, normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -600,11 +601,11 @@ impl EndpointGroup {
         );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
-            let domain_lower = mapping.domain.to_lowercase();
+            let domain_key = normalize_pattern(&mapping.domain);
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
                 i,
-                domain_lower,
+                domain_key,
                 key
             );
 
@@ -619,12 +620,12 @@ impl EndpointGroup {
             }
 
             domain_to_keys
-                .entry(domain_lower.clone())
+                .entry(domain_key.clone())
                 .or_default()
                 .push(key.clone());
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'",
-                domain_lower,
+                domain_key,
                 key
             );
         }
@@ -725,11 +726,11 @@ impl EndpointGroup {
         );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
-            let domain_lower = mapping.domain.to_lowercase();
+            let domain_key = normalize_pattern(&mapping.domain);
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
                 i,
-                domain_lower,
+                domain_key,
                 key
             );
 
@@ -744,12 +745,12 @@ impl EndpointGroup {
             }
 
             domain_to_keys
-                .entry(domain_lower.clone())
+                .entry(domain_key.clone())
                 .or_default()
                 .push(key.clone());
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'",
-                domain_lower,
+                domain_key,
                 key
             );
         }
@@ -939,49 +940,60 @@ impl EndpointGroup {
         None
     }
 
-    pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {
-        let domain_lower = domain.to_lowercase();
-        jni_log!(
-            "[DEBUG:endpoint-group] Looking up connection for domain: '{}'",
-            domain_lower
-        );
+    /// The mapping that serves `host`, by the one rule the proxy uses.
+    ///
+    /// The same question the membership check asks, asked the same way: the
+    /// client tunnels `www.example.com` because `*.example.com` covers it, and
+    /// the backend it is sent to is named by that same list. A lookup that
+    /// knew only exact names and parent labels would not find the
+    /// `*.example.com` mapping at all — the request would go to the default
+    /// backend or to none, which is the two halves of one client disagreeing
+    /// about a pattern the configuration spells once.
+    ///
+    /// The exact name comes first, and a wildcard only after it: a bare
+    /// pattern is that name and nothing else, so `example.com` never answers
+    /// for `www.example.com`. Where more than one wildcard covers the host,
+    /// the most specific one answers — the longest suffix, the way DNS reads
+    /// a name.
+    fn pools_for(&self, host: &str) -> Option<&Arc<DomainPools>> {
+        let host = normalize_host(host);
 
-        if let Some(pools) = self.domains.get(&domain_lower) {
-            jni_log!(
-                "[DEBUG:endpoint-group] Found exact match for domain: '{}'",
-                domain_lower
-            );
-            return pools.get_connection().await;
+        if let Some(pools) = self.domains.get(&host) {
+            return Some(pools);
         }
 
-        let mut parts: Vec<&str> = domain_lower.split('.').collect();
-        while parts.len() > 1 {
-            parts.remove(0);
-            let parent_domain = parts.join(".");
+        self.domains
+            .iter()
+            .filter(|(pattern, _)| host_matches(pattern, &host))
+            .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+            .map(|(_, pools)| pools)
+    }
+
+    pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {
+        jni_log!(
+            "[DEBUG:endpoint-group] Looking up connection for domain: '{}'",
+            domain
+        );
+
+        if let Some(pools) = self.pools_for(domain) {
             jni_log!(
-                "[DEBUG:endpoint-group] Trying parent domain: '{}'",
-                parent_domain
+                "[DEBUG:endpoint-group] Found mapping for domain: '{}'",
+                domain
             );
-            if let Some(pools) = self.domains.get(&parent_domain) {
-                jni_log!(
-                    "[DEBUG:endpoint-group] Found parent domain match: '{}'",
-                    parent_domain
-                );
-                return pools.get_connection().await;
-            }
+            return pools.get_connection().await;
         }
 
         if let Some(default) = &self.default_pools {
             jni_log!(
                 "[DEBUG:endpoint-group] Using default pools for domain: '{}'",
-                domain_lower
+                domain
             );
             return default.get_connection().await;
         }
 
         jni_log!(
             "[DEBUG:endpoint-group] No endpoint configured for domain: '{}'",
-            domain_lower
+            domain
         );
         Err(ClientError::InvalidConfig(format!(
             "No endpoint configured for domain: {}",
@@ -990,21 +1002,11 @@ impl EndpointGroup {
     }
 
     pub async fn return_connection(&self, domain: &str, pooled_conn: PooledConnection) {
-        let domain_lower = domain.to_lowercase();
-
-        if let Some(pools) = self.domains.get(&domain_lower) {
+        // The same lookup the connection came from, or the connection would be
+        // handed back to a pool it was never taken out of.
+        if let Some(pools) = self.pools_for(domain) {
             pools.return_connection(pooled_conn).await;
             return;
-        }
-
-        let mut parts: Vec<&str> = domain_lower.split('.').collect();
-        while parts.len() > 1 {
-            parts.remove(0);
-            let parent_domain = parts.join(".");
-            if let Some(pools) = self.domains.get(&parent_domain) {
-                pools.return_connection(pooled_conn).await;
-                return;
-            }
         }
 
         if let Some(default) = &self.default_pools {
@@ -1613,6 +1615,177 @@ mod tests {
                 .expect("the domain must have a pool");
             assert_eq!(pools.pools.len(), 1, "{domain} should map to one pool");
             assert_eq!(pools.pools[0].backend_id(), expected);
+        }
+    }
+
+    /// The backend a host is sent to, or `None` when the group has none for it.
+    fn served_by(&self, host: &str) -> Option<EndpointId> {
+        self.pools_for(host)
+            .map(|pools| pools.pools[0].backend_id())
+    }
+
+    /// A wildcard mapping has to serve the names it covers.
+    ///
+    /// The client decides `www.example.com` belongs in the tunnel because
+    /// `*.example.com` covers it, and the backend it is sent to is named by
+    /// that same list. A lookup that knew only exact names would not find the
+    /// wildcard mapping, and the request would go to the default backend or
+    /// to none.
+    #[tokio::test]
+    async fn a_wildcard_mapping_serves_the_names_it_covers() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend, "*.example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group.served_by("www.example.com"), Some(backend));
+        assert_eq!(group.served_by("a.b.example.com"), Some(backend));
+        // The apex is not under its own wildcard, the way DNS reads it.
+        assert_eq!(group.served_by("example.com"), None);
+    }
+
+    /// A bare mapping is that name and nothing else.
+    ///
+    /// The lookup used to walk up the labels, so `example.com` answered for
+    /// `www.example.com` as well. That is the rule the client used before the
+    /// patterns were unified, and it is the rule the server never had.
+    #[tokio::test]
+    async fn a_bare_mapping_does_not_serve_a_subdomain() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend, "example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group.served_by("example.com"), Some(backend));
+        assert_eq!(group.served_by("www.example.com"), None);
+    }
+
+    /// A wildcard and the apex it sits next to are two mappings, and the
+    /// wildcard is the one that serves the subdomain.
+    ///
+    /// The old lookup answered with the apex, because it walked up the labels
+    /// — the request went to a backend that was not the one the pattern named.
+    #[tokio::test]
+    async fn a_wildcard_serves_the_subdomain_rather_than_the_apex() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let apex_backend = unused_backend_id();
+        let wildcard_backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![
+                node(apex_backend, "example.com"),
+                node(wildcard_backend, "*.example.com"),
+            ],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group.served_by("example.com"), Some(apex_backend));
+        assert_eq!(group.served_by("www.example.com"), Some(wildcard_backend));
+    }
+
+    /// Where two wildcards cover the same name, the more specific one answers.
+    #[tokio::test]
+    async fn the_most_specific_wildcard_serves_the_name() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let broad_backend = unused_backend_id();
+        let narrow_backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![
+                node(broad_backend, "*.example.com"),
+                node(narrow_backend, "*.www.example.com"),
+            ],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group.served_by("a.example.com"), Some(broad_backend));
+        assert_eq!(
+            group.served_by("a.www.example.com"),
+            Some(narrow_backend)
+        );
+    }
+
+    /// A name written the way DNS writes it — with the trailing dot — is the
+    /// same name, and finds the same backend.
+    #[tokio::test]
+    async fn a_name_with_a_trailing_dot_finds_its_mapping() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let backend = unused_backend_id();
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            vec![node(backend, "example.com")],
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group.served_by("example.com."), Some(backend));
+        assert_eq!(group.served_by("EXAMPLE.com"), Some(backend));
+    }
+
+    /// The two answers have to be the same answer.
+    ///
+    /// Whether a name belongs in the tunnel and which backend serves it are
+    /// two halves of one question, and the configuration spells the pattern
+    /// once. A name the rule covers but the lookup cannot find is a name the
+    /// client carries and the server has no route for — the failure this
+    /// whole change is about.
+    #[tokio::test]
+    async fn the_backend_lookup_agrees_with_the_membership_rule() {
+        let ep = Endpoint::builder(presets::N0).bind().await.unwrap();
+        let backend = unused_backend_id();
+        let patterns = ["example.com", "*.wild.test"];
+
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            patterns
+                .iter()
+                .map(|pattern| node(backend, pattern))
+                .collect(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .unwrap();
+
+        let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        for host in [
+            "example.com",
+            "www.example.com",
+            "a.wild.test",
+            "wild.test",
+            "notexample.com",
+        ] {
+            let proxied = crate::domains::should_proxy_domain(host, &patterns);
+            let served = group.pools_for(host).is_some();
+            assert_eq!(
+                proxied, served,
+                "{host}: the membership rule and the backend lookup disagree"
+            );
         }
     }
 

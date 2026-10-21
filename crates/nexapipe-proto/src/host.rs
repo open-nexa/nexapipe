@@ -158,16 +158,18 @@ pub fn pattern_error(pattern: &str) -> Option<String> {
     // configuration said something narrower is the one mistake this rule must
     // not make — it is refused here, where an operator can see it, and matched
     // as nothing there.
+    //
+    // This refusal comes first, ahead of the wildcard's own shape: a spelling
+    // that folds into the catch-all is refused for that reason whichever way
+    // it is written, and the catch-all is the reason an operator can act on.
     let folds_to_catch_all =
         pattern.contains('*') && pattern != "*" && normalize_host(pattern) == "*";
+    if folds_to_catch_all {
+        return Some(catch_all_message(pattern));
+    }
 
     // Not a wildcard at all, so there is nothing a `*` could get wrong.
-    let Some(rest) = pattern.strip_prefix('*') else {
-        if folds_to_catch_all {
-            return Some(catch_all_message(pattern));
-        }
-        return None;
-    };
+    let rest = pattern.strip_prefix('*')?;
     match rest.strip_prefix('.') {
         None if rest.is_empty() => {}
         Some(suffix) if !suffix.is_empty() => {}
@@ -178,9 +180,6 @@ pub fn pattern_error(pattern: &str) -> Option<String> {
                  ends in the same letters"
             ));
         }
-    }
-    if folds_to_catch_all {
-        return Some(catch_all_message(pattern));
     }
     None
 }

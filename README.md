@@ -1691,12 +1691,20 @@ question:
   connection's nonce followed by its timestamp in little-endian bytes, keyed by
   the client's secret — or an Ed25519 signature over those same bytes, for a
   device registered with a public key.
-- `allow_hosts` — *what may it touch once it is here*, folded into a `ClientAcl`
-  at the handshake.
+- `allow_hosts` and `allow_ports` — *what may it touch once it is here*, folded
+  into a `ClientAcl` at the handshake: which names it may reach, and which
+  services on them. A host is a name; a port is a service on that name, and the
+  port list is what keeps a client off the services of a name it may have.
+  It is honoured where the client names the port it wants, which the tunnel
+  preface always does. The HTTP path routes by host alone, so there it refuses
+  a request that names a port off the list — and a request that names no port
+  is not held against it. Two services of one host are separated by the
+  tunnel, not by the list.
 
 The limits that remain are deliberate: a revocation (a deleted client, a rotated
-secret, an edited `allow_hosts`) takes effect on *new* connections only, because
-a connection snapshots its authorization when it authenticates; 2FA is a
+secret, an edited `allow_hosts` or `allow_ports`) takes effect on *new*
+connections only, because a connection snapshots its authorization when it
+authenticates; 2FA is a
 symmetric shared secret, so anyone who scans an invite becomes a legitimate
 client; and turning 2FA *off* is refused on a running server — restart to
 disable it.
