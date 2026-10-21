@@ -439,7 +439,10 @@ impl MasterKey {
     /// [`Self::from_file`], which reads the same file and refuses it there, so
     /// the load fails either way — only this way says which file and why.
     #[cfg(not(target_os = "macos"))]
-    fn adopt_file_key(entry: &keyring::Entry, dir: &Path) -> Result<Option<[u8; KEY_LEN]>, AppError> {
+    fn adopt_file_key(
+        entry: &keyring::Entry,
+        dir: &Path,
+    ) -> Result<Option<[u8; KEY_LEN]>, AppError> {
         let Some(key) = Self::file_key(dir)? else {
             return Ok(None);
         };
@@ -1177,11 +1180,10 @@ mod tests {
         let key = random_bytes::<KEY_LEN>().expect("a key");
         let path = dir.join(super::FALLBACK_KEY_FILE);
         write_file_key(&dir, &key);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("loosened");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosened");
 
-        let error = super::MasterKey::file_key(&dir)
-            .expect_err("a world-readable master key is not read");
+        let error =
+            super::MasterKey::file_key(&dir).expect_err("a world-readable master key is not read");
 
         assert!(
             error.to_string().contains("chmod 600"),
@@ -1218,8 +1220,7 @@ mod tests {
         let dir = scratch("group-key-file");
         let path = dir.join(super::FALLBACK_KEY_FILE);
         write_file_key(&dir, &random_bytes::<KEY_LEN>().expect("a key"));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
-            .expect("loosened");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("loosened");
 
         assert!(super::MasterKey::file_key(&dir).is_err());
     }
