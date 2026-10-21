@@ -18,7 +18,7 @@ use nexapipe::conn;
 use nexapipe::http;
 use nexapipe::l4::FlowLimiter;
 use nexapipe::lb::LoadBalancingStrategy;
-use nexapipe::routes::{Route, RouteConfig};
+use nexapipe::routes::{Route, RoutingTable};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -337,7 +337,7 @@ async fn spawn_proxy_with(
     let ep = bind().await;
     let addr = dial_address(&ep);
 
-    let config = Arc::new(RouteConfig::with_settings(
+    let config = Arc::new(RoutingTable::with_settings(
         routes,
         Timeouts::default(),
         retry,

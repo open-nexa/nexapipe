@@ -15,7 +15,7 @@ use nexapipe::admin;
 use nexapipe::config::{ProxyConfig, RouteMode};
 use nexapipe::conn::peers::PeerRegistry;
 use nexapipe::lb::LoadBalancingStrategy;
-use nexapipe::routes::{Route, RouteConfig};
+use nexapipe::routes::{Route, RoutingTable};
 use nexapipe::shutdown::{InFlight, ShutdownSignal};
 use nexapipe_proto::secret::SecretString;
 use std::net::SocketAddr;
@@ -52,7 +52,7 @@ async fn spawn_admin_with_clients(
     let addr = listener.local_addr().expect("listener address");
     let shutdown = Arc::new(ShutdownSignal::new());
 
-    let config = Arc::new(RouteConfig::new(routes));
+    let config = Arc::new(RoutingTable::new(routes));
     let in_flight = Arc::new(InFlight::new());
     let peers = Arc::new(PeerRegistry::new());
     let state = Arc::new(admin::AdminState::new(

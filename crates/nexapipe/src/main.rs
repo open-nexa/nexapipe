@@ -6,7 +6,7 @@ use nexapipe::config::{
     ServerConfig,
 };
 use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
-use nexapipe::routes::RouteConfig;
+use nexapipe::routes::RoutingTable;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_proto::secret::SecretString;
@@ -498,7 +498,7 @@ async fn run_server_mode(
     // The `[timeouts]` values ride along here rather than being read where they
     // are used: they were validated above, and being handed to the table is what
     // keeps every handler agreeing on one value for "too long to wait".
-    let route_config = Arc::new(RouteConfig::with_settings(
+    let route_config = Arc::new(RoutingTable::with_settings(
         routes,
         proxy_config.timeouts(),
         proxy_config.retry(),
@@ -532,6 +532,18 @@ async fn run_server_mode(
             std::process::exit(1);
         }
     };
+
+    // The config file's own permission is not a gate (ROADMAP §3.5), but a
+    // credential in a file anybody can read is worth saying out loud once.
+    //
+    // Called whether or not the file has an `[auth]` section: the `[iroh]`
+    // half is a credential on its own, and `config.toml.example` — like the
+    // generated first-run template — has no `[auth]` at all.
+    nexapipe::config::warn_about_readable_credentials(
+        std::path::Path::new(config_path),
+        proxy_config,
+        auth_config.as_ref(),
+    );
 
     // The `[peers]` allow-list. A malformed entry is fatal rather than dropped:
     // a list whose whole purpose is to refuse strangers must not silently come

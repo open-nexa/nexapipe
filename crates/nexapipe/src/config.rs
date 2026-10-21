@@ -307,7 +307,7 @@ pub fn get_backend_protocol(value: &Option<String>) -> anyhow::Result<BackendPro
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct RouteConfig {
+pub struct RouteSpec {
     pub host_pattern: String,
     /// Defaults to `/`. Ignored when `mode = "passthrough"`.
     #[serde(default = "default_path_pattern")]
@@ -677,7 +677,7 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub default_backend: Option<toml::Value>,
     pub debug: Option<bool>,
-    pub routes: Option<Vec<RouteConfig>>,
+    pub routes: Option<Vec<RouteSpec>>,
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,
     pub local_proxy: Option<LocalProxyConfig>,
@@ -1157,130 +1157,25 @@ impl ProxyConfig {
 
         let mut routes = Vec::new();
 
-        for route_config in self.routes.iter().flatten() {
-            let strategy = get_strategy(&route_config.strategy);
-            let modes = get_route_modes(&route_config.mode, &route_config.modes);
-            let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
-            let backends_count = route_config.backends.len();
-            let host_pattern = route_config.host_pattern.clone();
-            let path_pattern = route_config.path_pattern.clone();
-            let label = format!("route {host_pattern}");
-
-            // Refused rather than matched loosely: a wildcard without its dot
-            // silently covers hosts that merely end in the same letters, so a
-            // config using one is a config that routes more than it says.
-            if let Some(why) = crate::routes::pattern_error(&host_pattern) {
-                anyhow::bail!("{label}: host_pattern {why}");
-            }
-
-            // A route with no backends matches and then has nothing to send
-            // the request to: `select_backend` answers with an empty string and
-            // the client gets a 502 that looks like a backend being down.
-            if route_config.backends.is_empty() {
-                anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
-            }
-
-            // A port no flow can arrive on, or an empty list that says "every
-            // port" by accident: either one is a route that never matches, and
-            // the operator has no way to notice — the client just gets refused.
-            if let Some(ports) = &route_config.client_ports {
-                if ports.is_empty() {
-                    anyhow::bail!(
-                        "{label}: client_ports is empty; leave it out to match every port"
-                    );
-                }
-                if ports.contains(&0) {
-                    anyhow::bail!(
-                        "{label}: client_ports contains port 0; no flow ever arrives from \
-                         port 0, so that entry can never match"
-                    );
-                }
-            }
-
-            // A UDP flow with a zero idle timeout is closed as soon as it is
-            // opened: the tunnel is set up and torn down before the first
-            // datagram crosses it. Leave it out for the server default.
-            if route_config.idle_timeout_secs == Some(0) {
-                anyhow::bail!(
-                    "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
-                     is opened; leave it out for the default"
-                );
-            }
-
-            // Same reasoning for the whole-flow bound: zero would close every flow
-            // the instant it opened, which is never what a zero here means.
-            if route_config.flow_timeout_secs == Some(0) {
-                anyhow::bail!(
-                    "{label}: flow_timeout_secs is 0, which closes a flow the moment it is \
-                     opened; leave it out for the default"
-                );
-            }
-
-            // Every declared mode has to be able to dial these backends, so each
-            // one is checked: the `http` rules and the L4 rules disagree (a URL
-            // to fetch versus an address to dial, and only the L4 one insists on
-            // a port), and a route serving both has to satisfy both.
-            for backend in &route_config.backends {
-                for mode in &modes {
-                    let label = format!("{label} (mode {mode:?})");
-                    validate_backend(&label, *mode, backend)?;
-                }
-            }
-
-            // `h2c` is HTTP/2 in the clear, and an `https://` backend is spoken
-            // to over TLS — so the two cannot be combined: the client would
-            // start h2 in the clear at a port that expects TLS. Refused here
-            // rather than at the first request, because every request to that
-            // route would fail the same way.
-            let backend_protocol = get_backend_protocol(&route_config.backend_protocol)
-                .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-            if backend_protocol == BackendProtocol::H2c && modes.contains(&RouteMode::Http) {
-                for backend in &route_config.backends {
-                    if url::Url::parse(backend)
-                        .map(|url| url.scheme() == "https")
-                        .unwrap_or(false)
-                    {
-                        anyhow::bail!(
-                            "{label}: backend_protocol = \"h2c\" speaks HTTP/2 in the clear, but \
-                             backend \"{backend}\" is https://. An https backend speaks HTTP/2 \
-                             through the TLS handshake, which is what backend_protocol = \
-                             \"http1\" already does; drop the key."
-                        );
-                    }
-                }
-            }
-
-            // Only meaningful for `tcp` / `udp`, where they are harmless defaults
-            // otherwise; the other modes never read them.
-            let l4_options = L4Options {
-                client_ports: route_config.client_ports.clone(),
-                idle_timeout: route_config
-                    .idle_timeout_secs
-                    .map(std::time::Duration::from_secs),
-                flow_timeout: route_config
-                    .flow_timeout_secs
-                    .map(std::time::Duration::from_secs),
-            };
-            let client_ports = route_config.client_ports.clone();
-            let idle_timeout_secs = route_config.idle_timeout_secs;
-
-            routes.push(
-                Route::new(
-                    &host_pattern,
-                    &path_pattern,
-                    path_is_prefix,
-                    route_config.backends.clone(),
-                    strategy,
-                    // The first mode only seeds the constructor; `with_modes`
-                    // then puts the whole set on the route.
-                    modes[0],
-                    route_config.path_rewrite.clone(),
-                )
-                .with_l4_options(l4_options)
-                .with_modes(modes.clone())
-                .with_backend_protocol(backend_protocol)
-                .with_circuit_breaker(self.circuit_breaker()),
-            );
+        for spec in self.routes.iter().flatten() {
+            // The translation from the configuration's spelling of a route to
+            // the route the server serves is a `TryFrom`, and it takes the
+            // spec apart with a pattern that names every field — see
+            // `impl TryFrom<RouteSpec> for Route`.
+            //
+            // The spec is copied because the configuration is shared and this
+            // is a read of it; the copy happens once per route, when the
+            // configuration is loaded.
+            let route = crate::routes::Route::try_from(spec.clone())?;
+            // Copied out for the log line below, so that the route itself can
+            // be moved into the table.
+            let host_pattern = route.host_pattern().to_string();
+            let path_pattern = route.path_pattern().to_string();
+            let path_is_prefix = route.path_is_prefix();
+            let modes = route.modes().to_vec();
+            let strategy = route.backend_pool().strategy();
+            let backends_count = route.backend_pool().len();
+            routes.push(route.with_circuit_breaker(self.circuit_breaker()));
 
             tracing::info!(
                 "Loaded route: host={}, path={} (prefix={}), modes={:?}, backends={}, strategy={:?}",
@@ -1299,13 +1194,163 @@ impl ProxyConfig {
                     "  L4 route {}: client_ports={:?} (absent = every port matches; the port never \
                      decides where the connection goes), idle_timeout_secs={:?}",
                     host_pattern,
-                    client_ports,
-                    idle_timeout_secs
+                    spec.client_ports,
+                    spec.idle_timeout_secs
                 );
             }
         }
 
         Ok(routes)
+    }
+}
+
+impl TryFrom<RouteSpec> for crate::routes::Route {
+    type Error = anyhow::Error;
+
+    /// The translation from the configuration's spelling of a route to the
+    /// route the server serves.
+    ///
+    /// **The pattern the spec is taken apart with is the point.** It names
+    /// every field, so a field the schema grows and this does not is a
+    /// **compile error** — not a field that is quietly dropped.
+    ///
+    /// Before this, adding an option to `[proxy.routes]` and forgetting to
+    /// read it in the translation compiled fine and did nothing at all: the
+    /// operator set it, the server ignored it, and nothing said so. The
+    /// compiler could not have caught it, because the translation read the
+    /// fields it knew about and the field it did not know about was simply
+    /// not there.
+    fn try_from(spec: RouteSpec) -> Result<Self, Self::Error> {
+        let RouteSpec {
+            host_pattern,
+            path_pattern,
+            path_is_prefix,
+            strategy,
+            backends,
+            backend_protocol,
+            mode,
+            modes,
+            path_rewrite,
+            client_ports,
+            idle_timeout_secs,
+            flow_timeout_secs,
+            // Keys that are no longer read. They stay in the schema so that a
+            // configuration carrying one is told about it rather than having
+            // it ignored — see `ServerConfig`.
+            cert_path: _,
+            key_path: _,
+            redirect_to_https: _,
+        } = spec;
+
+        let strategy = get_strategy(&strategy);
+        let modes = get_route_modes(&mode, &modes);
+        let path_is_prefix = path_is_prefix.unwrap_or(true);
+        let label = format!("route {host_pattern}");
+
+        // Refused rather than matched loosely: a wildcard without its dot
+        // silently covers hosts that merely end in the same letters, so a
+        // config using one is a config that routes more than it says.
+        if let Some(why) = crate::routes::pattern_error(&host_pattern) {
+            anyhow::bail!("{label}: host_pattern {why}");
+        }
+
+        // A route with no backends matches and then has nothing to send
+        // the request to: `select_backend` answers with an empty string and
+        // the client gets a 502 that looks like a backend being down.
+        if backends.is_empty() {
+            anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
+        }
+
+        // A port no flow can arrive on, or an empty list that says "every
+        // port" by accident: either one is a route that never matches, and
+        // the operator has no way to notice — the client just gets refused.
+        if let Some(ports) = &client_ports {
+            if ports.is_empty() {
+                anyhow::bail!("{label}: client_ports is empty; leave it out to match every port");
+            }
+            if ports.contains(&0) {
+                anyhow::bail!(
+                    "{label}: client_ports contains port 0; no flow ever arrives from \
+                         port 0, so that entry can never match"
+                );
+            }
+        }
+
+        // A UDP flow with a zero idle timeout is closed as soon as it is
+        // opened: the tunnel is set up and torn down before the first
+        // datagram crosses it. Leave it out for the server default.
+        if idle_timeout_secs == Some(0) {
+            anyhow::bail!(
+                "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
+                     is opened; leave it out for the default"
+            );
+        }
+
+        // Same reasoning for the whole-flow bound: zero would close every flow
+        // the instant it opened, which is never what a zero here means.
+        if flow_timeout_secs == Some(0) {
+            anyhow::bail!(
+                "{label}: flow_timeout_secs is 0, which closes a flow the moment it is \
+                     opened; leave it out for the default"
+            );
+        }
+
+        // Every declared mode has to be able to dial these backends, so each
+        // one is checked: the `http` rules and the L4 rules disagree (a URL
+        // to fetch versus an address to dial, and only the L4 one insists on
+        // a port), and a route serving both has to satisfy both.
+        for backend in &backends {
+            for mode in &modes {
+                let label = format!("{label} (mode {mode:?})");
+                validate_backend(&label, *mode, backend)?;
+            }
+        }
+
+        // `h2c` is HTTP/2 in the clear, and an `https://` backend is spoken
+        // to over TLS — so the two cannot be combined: the client would
+        // start h2 in the clear at a port that expects TLS. Refused here
+        // rather than at the first request, because every request to that
+        // route would fail the same way.
+        let backend_protocol =
+            get_backend_protocol(&backend_protocol).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        if backend_protocol == BackendProtocol::H2c && modes.contains(&RouteMode::Http) {
+            for backend in &backends {
+                if url::Url::parse(backend)
+                    .map(|url| url.scheme() == "https")
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!(
+                        "{label}: backend_protocol = \"h2c\" speaks HTTP/2 in the clear, but \
+                             backend \"{backend}\" is https://. An https backend speaks HTTP/2 \
+                             through the TLS handshake, which is what backend_protocol = \
+                             \"http1\" already does; drop the key."
+                    );
+                }
+            }
+        }
+
+        // Only meaningful for `tcp` / `udp`, where they are harmless defaults
+        // otherwise; the other modes never read them.
+        let l4_options = L4Options {
+            client_ports,
+            idle_timeout: idle_timeout_secs.map(std::time::Duration::from_secs),
+            flow_timeout: flow_timeout_secs.map(std::time::Duration::from_secs),
+        };
+
+        Ok(crate::routes::Route::new(
+            &host_pattern,
+            &path_pattern,
+            path_is_prefix,
+            backends,
+            strategy,
+            // The first mode only seeds the constructor; `with_modes` then
+            // puts the whole set on the route.
+            modes[0],
+            path_rewrite,
+        )
+        .with_l4_options(l4_options)
+        .with_modes(modes)
+        .with_backend_protocol(backend_protocol))
     }
 }
 
@@ -1337,6 +1382,95 @@ impl ProxyConfig {
     }
 }
 
+/// Warns when the config file holds a credential and lets somebody other than
+/// its owner read it.
+///
+/// **A warning, not a refusal.** The check that used to stop the server from
+/// starting over a readable config was removed on purpose (ROADMAP §3.5), so
+/// that a `0644` bind mount starts. Putting it back would undo that decision.
+///
+/// Silence is the part that is wrong: a TOTP seed in a file the whole machine
+/// can read is a credential anybody can use to generate a valid code, and
+/// nothing about it is visible. One line at startup and one after a reload is
+/// enough to say it.
+///
+/// Unix only, and it says so by doing nothing elsewhere: the permission bits
+/// are a Unix idea, and on Windows the file's ACL decides, which this does not
+/// read.
+///
+/// `auth` is the `[auth]` half of the same file, and it is `None` when the file
+/// has no such section — which is not the same as "no credential". A config
+/// that names an inline `[iroh]` key and no `[auth]` at all is a credential in
+/// the open, and it is the common case: the generated first-run template and
+/// `config.toml.example` both leave `[auth]` out. A warning that needed an
+/// `AuthConfig` to exist would be silent for exactly that file.
+pub fn warn_about_readable_credentials(
+    path: &std::path::Path,
+    proxy: &ProxyConfig,
+    auth: Option<&crate::auth::AuthConfig>,
+) {
+    if !should_warn_about_permissions(path, proxy, auth) {
+        return;
+    }
+    tracing::warn!(
+        "{} holds a credential and is readable by others (mode {:04o}); anyone who can read it \
+         can use it — `chmod 600`, or move the secret into a 0600 file of its own",
+        path.display(),
+        file_mode(path),
+    );
+}
+
+/// Whether the loaded config should be warned about: it holds a credential,
+/// and the file it came from is readable by somebody other than its owner.
+///
+/// The decision on its own, so that it can be tested without a log
+/// subscriber: the warning is a line of text, and what matters is the
+/// question it answers.
+pub fn should_warn_about_permissions(
+    path: &std::path::Path,
+    proxy: &ProxyConfig,
+    auth: Option<&crate::auth::AuthConfig>,
+) -> bool {
+    // A credential the file holds in the clear: an inline `[iroh]` key or
+    // token, or a 2FA seed. One that lives in a sidecar file of its own is
+    // not in this file, and that file is held to the `0600` rule in the
+    // config's place — see `read_credential_file`.
+    let holds_a_seed = auth.is_some_and(|auth| auth.holds_inline_secrets());
+    if !proxy.holds_credentials() && !holds_a_seed {
+        return false;
+    }
+    readable_by_others(path)
+}
+
+/// The permission bits of the file, or 0 when they cannot be read.
+#[cfg(unix)]
+fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &std::path::Path) -> u32 {
+    0
+}
+
+/// Whether somebody other than the owner can read the file.
+#[cfg(unix)]
+fn readable_by_others(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o077 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn readable_by_others(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// The config written when there is none: 2FA on, nothing else.
 ///
 /// Deliberately small, and deliberately **not** a working proxy: it carries no
@@ -1347,12 +1481,21 @@ impl ProxyConfig {
 ///
 /// `[auth] enabled = true` is the one setting that is not the operator's to
 /// infer: a config with no `[auth.clients]` refuses every connection, which is
-/// the correct state for a file nobody has written yet. With 2FA on, the
-/// startup permission check refuses to start over a world-readable config —
-/// `run_server_mode` keys the refusal off `auth_cfg.enabled ||
-/// proxy_config.holds_credentials()` — so the file has to be `0600` on Unix,
-/// which is why this goes out through [`write_config_file`] rather than
-/// `fs::write`.
+/// the correct state for a file nobody has written yet.
+///
+/// **The file's own permission is not checked, and that is deliberate.** A
+/// startup check that refused to run over a world-readable config was removed
+/// on purpose (ROADMAP §3.5) so that a `0644` bind mount starts — a config
+/// that is a bind mount of a secret store is readable by design, and a server
+/// that refused to start over it would be a server nobody could run that way.
+///
+/// What is left is a **warning**: when the config itself holds a credential —
+/// an inline `[iroh]` key, or a 2FA seed — and the file is readable by
+/// others, the server says so once, naming the path and the mode. See
+/// [`warn_about_readable_credentials`].
+///
+/// The file still goes out through [`write_config_file`] rather than
+/// `fs::write`, so that the one it writes is `0600` from the start.
 ///
 /// No `[iroh] secret_key`: the endpoint identity is generated and written back
 /// on first start (see `ensure_iroh_secret_key`), so writing one here would be
@@ -3379,8 +3522,244 @@ fn sub_table<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every field of the spec reaches the route.
+    ///
+    /// The conversion takes the spec apart with a pattern that names every
+    /// field, so a field the schema grows and the conversion does not know
+    /// about is a **compile error**. This test is the other half of that: it
+    /// says that a field the conversion *does* know about is not quietly
+    /// dropped on the way to the route.
+    ///
+    /// Every field is set to something distinctive, so a field that stopped
+    /// being read would show up as a default rather than as a coincidence.
+    #[test]
+    fn every_field_of_the_spec_reaches_the_route() {
+        let spec = RouteSpec {
+            host_pattern: "*.example.com".to_string(),
+            path_pattern: "/api".to_string(),
+            path_is_prefix: Some(false),
+            strategy: Some("least_conn".to_string()),
+            backends: vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()],
+            backend_protocol: Some("h2c".to_string()),
+            mode: Some("tcp".to_string()),
+            modes: Some(vec!["udp".to_string()]),
+            path_rewrite: Some("/rewritten".to_string()),
+            client_ports: Some(vec![8443]),
+            idle_timeout_secs: Some(11),
+            flow_timeout_secs: Some(22),
+            cert_path: None,
+            key_path: None,
+            redirect_to_https: None,
+        };
+
+        let route = crate::routes::Route::try_from(spec).expect("the route is built");
+
+        assert_eq!(route.host_pattern(), "*.example.com");
+        assert_eq!(route.path_pattern(), "/api");
+        assert!(!route.path_is_prefix(), "path_is_prefix was set to false");
+        assert_eq!(
+            route.backend_pool().len(),
+            2,
+            "both backends are on the route"
+        );
+        assert!(
+            matches!(
+                route.backend_pool().strategy(),
+                crate::lb::LoadBalancingStrategy::LeastConn
+            ),
+            "the strategy was carried over"
+        );
+        assert_eq!(
+            route.backend_protocol(),
+            BackendProtocol::H2c,
+            "the backend protocol was carried over"
+        );
+        assert_eq!(
+            route.path_rewrite().as_deref(),
+            Some("/rewritten"),
+            "the path rewrite was carried over"
+        );
+        assert_eq!(
+            route.idle_timeout(),
+            Some(std::time::Duration::from_secs(11))
+        );
+        assert_eq!(
+            route.flow_timeout(),
+            Some(std::time::Duration::from_secs(22))
+        );
+        assert!(
+            route.modes().contains(&RouteMode::Tcp),
+            "the mode was carried over: {:?}",
+            route.modes()
+        );
+        assert!(
+            route.modes().contains(&RouteMode::Udp),
+            "the modes list was carried over: {:?}",
+            route.modes()
+        );
+        assert!(
+            route.matches_l4("a.example.com", 8443),
+            "the client port was carried over"
+        );
+        assert!(
+            !route.matches_l4("a.example.com", 9999),
+            "a port the spec did not name does not match"
+        );
+    }
     use super::*;
     use crate::auth::DeviceMaterial;
+
+    /// A credential in a file others can read is worth a warning; one in a
+    /// file only its owner can read is not.
+    ///
+    /// The permission gate itself was removed on purpose (ROADMAP §3.5) — a
+    /// `0644` bind mount has to start — so this line is the only thing that
+    /// says a 2FA seed is sitting in a file the whole machine can read.
+    ///
+    /// Unix only: the permission bits are a Unix idea.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_in_a_readable_file_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_seed = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+        let without_a_seed = crate::auth::AuthConfig::default();
+        let proxy = parse("");
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the mode is set");
+        assert!(
+            !should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a file only its owner can read is not worth a warning"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is set");
+        assert!(
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a seed in a file others can read is worth a warning"
+        );
+        assert!(
+            !should_warn_about_permissions(&path, &proxy, Some(&without_a_seed)),
+            "a file with no credential in it is not worth a warning"
+        );
+    }
+
+    /// A file with no `[auth]` section is not a file with no credential.
+    ///
+    /// An inline `[iroh]` key is a credential on its own, and the files this
+    /// server actually ships — `config.toml.example`, the generated first-run
+    /// template — have no `[auth]` at all. A warning that only ran when an
+    /// `AuthConfig` existed was silent for exactly those.
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_key_without_an_auth_section_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_key = parse("[iroh]\nsecret_key = \"00\"\n");
+        assert!(with_a_key.holds_credentials());
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is set");
+
+        assert!(
+            should_warn_about_permissions(&path, &with_a_key, None),
+            "an inline key in a readable file is worth a warning, [auth] or not"
+        );
+        assert!(
+            !should_warn_about_permissions(&path, &parse(""), None),
+            "a file with neither half holding a credential is not"
+        );
+    }
+
+    /// Group-readable is enough. A file the owner's group can read is a file
+    /// somebody else on the machine can read.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_file_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_seed = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+        let proxy = parse("");
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("the mode is set");
+
+        assert!(
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a group-readable file is readable by others"
+        );
+    }
+
+    /// A device that proves itself with a signature holds no seed, so it is
+    /// not one of these.
+    #[test]
+    fn a_key_based_device_holds_no_seed() {
+        let auth = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = ""
+
+[clients.client-001.devices.laptop]
+public_key = "0011"
+"#,
+        )
+        .expect("the auth config parses");
+
+        assert!(
+            !auth.holds_inline_secrets(),
+            "a key-based device has nothing to steal"
+        );
+    }
+
+    /// A device that was issued a seed is one of these, even when its client
+    /// has none.
+    #[test]
+    fn a_device_with_a_seed_holds_one() {
+        let auth = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = ""
+
+[clients.client-001.devices.laptop]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+
+        assert!(auth.holds_inline_secrets(), "a device's seed is a seed");
+    }
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")

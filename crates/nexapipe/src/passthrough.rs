@@ -12,7 +12,7 @@
 //! an HTTP request can never start with it.
 
 use crate::auth::ClientAcl;
-use crate::routes::RouteConfig;
+use crate::routes::RoutingTable;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
 use std::time::Duration;
@@ -47,7 +47,7 @@ pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     initial: Vec<u8>,
-    config: &RouteConfig,
+    config: &RoutingTable,
     acl: Option<&ClientAcl>,
 ) -> anyhow::Result<()> {
     // A phase deadline over the ClientHello read: the record header arrives
@@ -95,7 +95,7 @@ pub async fn handle_iroh_stream(
 pub async fn handle_tcp_stream(
     mut client: tokio::net::TcpStream,
     initial: Vec<u8>,
-    config: &RouteConfig,
+    config: &RoutingTable,
 ) -> anyhow::Result<()> {
     // Same deadline as the iroh path above: `[timeouts] tls_hello_secs`.
     let handshake =
@@ -232,7 +232,7 @@ fn first_record_end(buf: &[u8]) -> Option<usize> {
 /// are copying: see [`crate::lb::BackendLease`]. Dropping it early tells the
 /// balancer this session is over while the bytes are still flowing.
 async fn resolve_backend(
-    config: &RouteConfig,
+    config: &RoutingTable,
     handshake: &[u8],
     acl: Option<&ClientAcl>,
 ) -> Option<(String, u16, crate::lb::BackendLease)> {
@@ -528,7 +528,7 @@ mod tests {
 
         let mut timeouts = Timeouts::resolve(TimeoutsConfig::default());
         timeouts.deadlines.tls_hello = std::time::Duration::from_secs(1);
-        let config = RouteConfig::with_timeouts(
+        let config = RoutingTable::with_timeouts(
             vec![Route::new(
                 "app.test",
                 "/",
@@ -738,9 +738,9 @@ mod tests {
         use crate::auth::ClientAcl;
         use crate::config::RouteMode;
         use crate::lb::LoadBalancingStrategy;
-        use crate::routes::{Route, RouteConfig};
+        use crate::routes::{Route, RoutingTable};
 
-        let config = RouteConfig::new(vec![Route::new(
+        let config = RoutingTable::new(vec![Route::new(
             "fn.iroh.iakl.top",
             "/",
             true,

@@ -4,7 +4,7 @@ use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
 use crate::health::HealthProbes;
 use crate::proxy::{BackendClients, sync_health_checks};
-use crate::routes::RouteConfig;
+use crate::routes::RoutingTable;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 /// startup — kept serving the old table. An edit to `[[routes]]` only took
 /// effect after a restart, which is exactly how a freshly added route came to
 /// look like it had never been added. The watcher
-/// now owns what applying one takes: the `RouteConfig` to update and the HTTP
+/// now owns what applying one takes: the `RoutingTable` to update and the HTTP
 /// client any new health check needs.
 ///
 /// The same edit usually carries an `[auth]` change the running server also
@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 /// *off*. See [`ConfigWatcher::apply_auth_enabled`].
 pub struct ConfigWatcher {
     config_path: String,
-    route_config: Arc<RouteConfig>,
+    route_config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     /// Health probes already running, and the pool each one is watching, so a
     /// reload can tell a route that was rebuilt from one that is still here.
@@ -82,7 +82,7 @@ pub struct PlaintextListener {
 impl ConfigWatcher {
     pub fn new(
         config_path: String,
-        route_config: Arc<RouteConfig>,
+        route_config: Arc<RoutingTable>,
         clients: Arc<BackendClients>,
         health_probes: Arc<Mutex<HealthProbes>>,
         health_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -250,20 +250,36 @@ impl ConfigWatcher {
         let config_path = self.config_path.clone();
         let loaded =
             tokio::task::spawn_blocking(move || ProxyConfig::load_with_auth(&config_path)).await;
-        let new_auth = match loaded {
-            Ok(Ok((_, auth))) => auth,
+        // The proxy half of the file comes back with the auth half — the same
+        // read, the same parse — and it is kept for the permission warning
+        // below: a reload can bring in a credential the file did not have
+        // before, or a permission that has been loosened since.
+        let (new_proxy, new_auth) = match loaded {
+            Ok(Ok((proxy, auth))) => (Some(proxy), auth),
             Ok(Err(e)) => {
                 tracing::error!("2FA clients not reloaded, keeping the current ones: {}", e);
-                None
+                (None, None)
             }
             Err(e) => {
                 tracing::error!(
                     "2FA clients not reloaded, keeping the current ones: the read did not run: {}",
                     e
                 );
-                None
+                (None, None)
             }
         };
+        // The same warning the startup path gives. It does not need the auth
+        // half to exist: a reload can bring in an inline `[iroh]` credential
+        // on a file with no `[auth]` section at all, and that is a credential
+        // in the open just the same.
+        if let Some(proxy) = new_proxy.as_ref() {
+            crate::config::warn_about_readable_credentials(
+                std::path::Path::new(&self.config_path),
+                proxy,
+                new_auth.as_ref(),
+            );
+        }
+
         let Some(new_auth) = new_auth else {
             // The section is gone while 2FA is live: treat that as a bad edit,
             // not as "disable everything", the same way an unparsable route
@@ -751,7 +767,7 @@ mod tests {
         let state = AuthState::new(AuthConfig::default(), &path);
         let watcher = ConfigWatcher::new(
             path,
-            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(RoutingTable::new(Vec::new())),
             Arc::new(
                 crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
                     .expect("the default trust store is always usable"),
@@ -1011,7 +1027,7 @@ mod tests {
 
         let watcher = ConfigWatcher::new(
             path_str,
-            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(RoutingTable::new(Vec::new())),
             Arc::new(
                 crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
                     .expect("the default trust store is always usable"),
@@ -1092,7 +1108,7 @@ mod tests {
         let peers = Arc::new(PeerRegistry::new());
         let watcher = ConfigWatcher::new(
             path_str,
-            Arc::new(RouteConfig::new(Vec::new())),
+            Arc::new(RoutingTable::new(Vec::new())),
             Arc::new(
                 crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
                     .expect("the default trust store is always usable"),

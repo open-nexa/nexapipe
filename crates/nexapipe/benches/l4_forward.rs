@@ -16,7 +16,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use nexapipe::config::RouteMode;
 use nexapipe::l4::{DEFAULT_MAX_FLOWS_PER_CONNECTION, FlowLimiter, serve_stream};
 use nexapipe::lb::LoadBalancingStrategy;
-use nexapipe::routes::{Route, RouteConfig};
+use nexapipe::routes::{Route, RoutingTable};
 use nexapipe_proto::{L4Proto, Preface};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -58,8 +58,8 @@ async fn echo_backend(listener: TcpListener) {
 }
 
 /// The route table the flow is served from: one TCP route to the echo.
-fn config_with(backend: &str) -> RouteConfig {
-    RouteConfig::new(vec![Route::new(
+fn config_with(backend: &str) -> RoutingTable {
+    RoutingTable::new(vec![Route::new(
         HOST,
         "/",
         true,

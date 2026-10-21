@@ -11,7 +11,7 @@
 //! # Who picks the backend
 //!
 //! The client sends a host name and a port; **the route decides the address that is
-//! actually dialled** ([`RouteConfig::get_l4_backend`]). A client holding 2FA
+//! actually dialled** ([`RoutingTable::get_l4_backend`]). A client holding 2FA
 //! credentials therefore cannot use the server as an open relay. A host with no
 //! `mode = "tcp"` / `mode = "udp"` route gets [`Status::NoRoute`] and the stream ends:
 //! there is no fallback, because that is how a mistyped domain ends up quietly
@@ -43,7 +43,7 @@ use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
 use crate::l4::sniff::{FlowSniffer, Side, SniffReader};
 use crate::metrics;
-use crate::routes::{BackendLookup, RouteConfig};
+use crate::routes::{BackendLookup, RoutingTable};
 use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
@@ -155,7 +155,7 @@ pub async fn handle_iroh_stream(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     initial: Vec<u8>,
-    config: &RouteConfig,
+    config: &RoutingTable,
     limiter: &Arc<FlowLimiter>,
     peer: &str,
     acl: Option<&ClientAcl>,
@@ -190,7 +190,7 @@ pub async fn handle_iroh_stream(
 pub async fn serve_stream<S>(
     stream: S,
     initial: Vec<u8>,
-    config: &RouteConfig,
+    config: &RoutingTable,
     limiter: &Arc<FlowLimiter>,
     peer: &str,
     acl: Option<&ClientAcl>,
@@ -821,8 +821,8 @@ mod tests {
         })
     }
 
-    fn config_with(tcp_backend: &str, udp_backend: &str) -> RouteConfig {
-        RouteConfig::new(vec![
+    fn config_with(tcp_backend: &str, udp_backend: &str) -> RoutingTable {
+        RoutingTable::new(vec![
             tcp_route("db.test", tcp_backend),
             udp_route("turn.test", udp_backend, None),
         ])
@@ -1169,7 +1169,7 @@ mod tests {
         let mut timeouts =
             crate::config::Timeouts::resolve(crate::config::TimeoutsConfig::default());
         timeouts.deadlines.l4_idle = Duration::from_secs(1);
-        let config = RouteConfig::with_timeouts(
+        let config = RoutingTable::with_timeouts(
             vec![udp_route("turn.test", &udp_addr.to_string(), None)],
             timeouts,
         );
@@ -1346,7 +1346,7 @@ mod tests {
         let backend_addr = backend.local_addr().unwrap();
 
         let idle = Duration::from_millis(150);
-        let config = RouteConfig::new(vec![udp_route(
+        let config = RoutingTable::new(vec![udp_route(
             "turn.test",
             &backend_addr.to_string(),
             Some(idle),
@@ -1398,7 +1398,7 @@ mod tests {
 
         let idle = Duration::from_secs(30);
         let flow = Duration::from_millis(300);
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             Route::new(
                 "turn.test",
                 "/",

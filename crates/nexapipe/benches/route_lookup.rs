@@ -15,7 +15,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use nexapipe::config::RouteMode;
 use nexapipe::lb::LoadBalancingStrategy;
-use nexapipe::routes::{Route, RouteConfig};
+use nexapipe::routes::{Route, RoutingTable};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -33,7 +33,7 @@ const HOST: &str = "target.test";
 const PATH: &str = "/api/v1/things";
 
 /// A table of routes, the one that matches last.
-fn table() -> RouteConfig {
+fn table() -> RoutingTable {
     let mut routes: Vec<Route> = (0..ROUTES)
         .map(|i| {
             Route::new(
@@ -56,7 +56,7 @@ fn table() -> RouteConfig {
         RouteMode::Http,
         None,
     ));
-    RouteConfig::new(routes)
+    RoutingTable::new(routes)
 }
 
 fn route_lookup(c: &mut Criterion) {
