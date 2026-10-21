@@ -9,7 +9,7 @@ use crate::http::BackendClients;
 use crate::l4;
 use crate::metrics;
 use crate::passthrough;
-use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
@@ -315,7 +315,7 @@ where
 pub async fn handle_bidi_stream(
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
-    config: &RouteConfig,
+    config: &RoutingTable,
     clients: &BackendClients,
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
@@ -2270,7 +2270,7 @@ async fn read_bytes(recv: &mut iroh::endpoint::RecvStream, len: usize) -> Result
 
 pub async fn handle_connection(
     conn: Connection,
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     auth_state: Option<AuthState>,
     peers: Arc<PeerRegistry>,
@@ -2565,7 +2565,7 @@ pub async fn handle_connection(
 /// cut off the moment the process decided to stop.
 pub async fn handle_incoming(
     incoming: Incoming,
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     auth_state: Option<AuthState>,
     limiters: Limiters,
@@ -3243,7 +3243,7 @@ mod tests {
     fn route_table_with_rewrite(
         pattern: &str,
         rewrite: &str,
-    ) -> std::sync::Arc<crate::routes::RouteConfig> {
+    ) -> std::sync::Arc<crate::routes::RoutingTable> {
         let timeouts = crate::config::Timeouts {
             connect: std::time::Duration::from_secs(1),
             response: std::time::Duration::from_secs(1),
@@ -3258,7 +3258,7 @@ mod tests {
             crate::config::RouteMode::Http,
             Some(rewrite.to_string()),
         );
-        std::sync::Arc::new(crate::routes::RouteConfig::with_settings(
+        std::sync::Arc::new(crate::routes::RoutingTable::with_settings(
             vec![route],
             timeouts,
             crate::config::Retry {

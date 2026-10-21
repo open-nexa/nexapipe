@@ -1,5 +1,5 @@
 use crate::config::BackendProtocol;
-use crate::routes::{BackendInfo, BackendLookup, RouteConfig};
+use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 use ::http::{Method, Request, Response, StatusCode};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -549,7 +549,7 @@ fn forwards_request_header(name: &str) -> bool {
 pub async fn proxy_request<B>(
     clients: &BackendClients,
     req: Request<B>,
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
 ) -> Result<Response<ProxyBody>, anyhow::Error>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
@@ -741,7 +741,7 @@ where
 /// attempt, because the backend it goes to may be a different one.
 async fn attempt_backend(
     clients: &BackendClients,
-    config: &RouteConfig,
+    config: &RoutingTable,
     backend_info: &BackendInfo,
     method: &Method,
     headers: &::http::HeaderMap,
@@ -3217,7 +3217,7 @@ mod transport {
     }
 
     /// A route table with the given backends, and a retry that tries again.
-    fn route_table(backends: Vec<String>, attempts: u32) -> Arc<crate::routes::RouteConfig> {
+    fn route_table(backends: Vec<String>, attempts: u32) -> Arc<crate::routes::RoutingTable> {
         let timeouts = crate::config::Timeouts {
             connect: std::time::Duration::from_secs(1),
             response: std::time::Duration::from_secs(1),
@@ -3232,7 +3232,7 @@ mod transport {
             crate::config::RouteMode::Http,
             None,
         );
-        Arc::new(crate::routes::RouteConfig::with_settings(
+        Arc::new(crate::routes::RoutingTable::with_settings(
             vec![route],
             timeouts,
             crate::config::Retry {
@@ -3266,7 +3266,7 @@ mod transport {
         backend: String,
         pattern: &str,
         rewrite: &str,
-    ) -> Arc<crate::routes::RouteConfig> {
+    ) -> Arc<crate::routes::RoutingTable> {
         let timeouts = crate::config::Timeouts {
             connect: std::time::Duration::from_secs(1),
             response: std::time::Duration::from_secs(1),
@@ -3281,7 +3281,7 @@ mod transport {
             crate::config::RouteMode::Http,
             Some(rewrite.to_string()),
         );
-        Arc::new(crate::routes::RouteConfig::with_settings(
+        Arc::new(crate::routes::RoutingTable::with_settings(
             vec![route],
             timeouts,
             crate::config::Retry {
@@ -3398,7 +3398,7 @@ mod transport {
             crate::config::RouteMode::Http,
             Some("/internal/status".to_string()),
         );
-        let config = Arc::new(crate::routes::RouteConfig::with_settings(
+        let config = Arc::new(crate::routes::RoutingTable::with_settings(
             vec![route],
             timeouts,
             crate::config::Retry {
@@ -3523,7 +3523,7 @@ mod transport {
             failure_threshold: 2,
             reset: std::time::Duration::from_secs(60),
         });
-        let config = Arc::new(crate::routes::RouteConfig::with_settings(
+        let config = Arc::new(crate::routes::RoutingTable::with_settings(
             vec![route],
             timeouts,
             crate::config::Retry::default(),
@@ -3571,7 +3571,7 @@ mod transport {
             crate::config::RouteMode::Http,
             None,
         );
-        let config = Arc::new(crate::routes::RouteConfig::new(vec![route]));
+        let config = Arc::new(crate::routes::RoutingTable::new(vec![route]));
         let pool = config.routes().await[0].backend_pool().clone();
         let clients =
             BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");

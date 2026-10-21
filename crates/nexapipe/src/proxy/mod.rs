@@ -13,7 +13,7 @@ use crate::health::{HealthChecker, HealthProbes, ProbeKind, ProbeTarget};
 use crate::http;
 use crate::log;
 use crate::passthrough;
-use crate::routes::RouteConfig;
+use crate::routes::RoutingTable;
 use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
 use anyhow::Context;
 use hyper::{body::Incoming, service::service_fn};
@@ -46,7 +46,7 @@ pub use crate::http::BackendClients;
 /// live one — which is what keeps a reload from silently unhooking health
 /// checks from the pool traffic actually uses.
 pub async fn sync_health_checks(
-    config: &Arc<RouteConfig>,
+    config: &Arc<RoutingTable>,
     clients: &Arc<BackendClients>,
     probes: &tokio::sync::Mutex<HealthProbes>,
     health: &HealthCheckConfig,
@@ -154,7 +154,7 @@ pub struct ProxyOptions {
 }
 
 pub async fn run_proxy(
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
     config_path: &str,
     shutdown_signal: Arc<ShutdownSignal>,
     options: ProxyOptions,
@@ -710,7 +710,7 @@ pub async fn run_proxy(
 
 async fn start_http_server(
     listener: TcpListener,
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     shutdown_signal: Arc<ShutdownSignal>,
     in_flight: Arc<InFlight>,
@@ -928,7 +928,7 @@ fn with_request_id<T>(mut response: hyper::Response<T>, request_id: &str) -> hyp
 
 async fn proxy_handler(
     req: hyper::Request<Incoming>,
-    config: Arc<RouteConfig>,
+    config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     remote_addr: String,
     request_id: String,

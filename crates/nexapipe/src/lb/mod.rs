@@ -336,7 +336,7 @@ impl BackendPool {
     /// `None` from a **pool of one** therefore never happens, and from a pool of
     /// several it is not routeable — which is why callers must not collapse it
     /// into their own "no route" answer. See each caller in
-    /// `crate::routes::RouteConfig`.
+    /// `crate::routes::RoutingTable`.
     pub async fn select_backend(&self) -> Option<BackendLease> {
         self.select_backend_excluding(&[]).await
     }
