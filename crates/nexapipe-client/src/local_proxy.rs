@@ -911,6 +911,17 @@ where
                     }
                 }
             }
+            // The server is done sending. That is a half-close, and the client
+            // has to hear it: the write side towards the client is shut down,
+            // so the client sees an end of stream the way it would see it
+            // from a socket.
+            //
+            // Without this the client waits for an answer that is not coming.
+            // Joining the two directions is right, but joining them is not the
+            // same as leaving the client hanging: the direction that ended has
+            // to be handed on to the peer. The read side stays open, so a
+            // client that still has something to say can say it.
+            let _ = client_write.shutdown().await;
         });
 
         // Lives until this handler returns, and dies with it if it is aborted
@@ -1860,6 +1871,46 @@ mod tests {
         }
     }
 
+    /// The far side of a tunnel that closes: the server accepts, answers the
+    /// preface, and then ends the conversation without waiting for anything
+    /// from the client.
+    ///
+    /// This is the shape of a server that has nothing more to say — an origin
+    /// that closed the connection, or a tunnel whose budget ran out. The
+    /// client has to learn that, the way it learns it from a socket.
+    async fn serve_a_tunnel_that_closes(endpoint: Endpoint) {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+
+                // The L4 preface, then the status byte the client waits for.
+                let mut header = [0u8; 4];
+                if recv.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let mut rest = vec![0u8; usize::from(header[3]) + 2];
+                if recv.read_exact(&mut rest).await.is_err() {
+                    return;
+                }
+                if send.write_all(&[0x00]).await.is_err() {
+                    return;
+                }
+
+                // And then the conversation is over: a FIN, not a reset.
+                let _ = send.finish();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            });
+        }
+    }
+
     /// A client that half-closes still receives the reply.
     ///
     /// A TCP half-close is a request, not an ending: a client that writes its
@@ -1950,6 +2001,97 @@ mod tests {
         assert_eq!(
             reply, b"the reply",
             "the reply did not survive the half-close"
+        );
+
+        proxy.stop();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+    }
+
+    /// A tunnel the server closes is closed for the client too.
+    ///
+    /// The other half of the half-close: a server that ends the conversation
+    /// says so with a FIN, and the client has to see it the way it would see
+    /// it from a socket — as an end of stream, not as a hang and not as a
+    /// reset.
+    ///
+    /// Joining the two directions is right, but joining them is not the same
+    /// as leaving the client waiting: the direction that ended has to be
+    /// handed on to the peer, or the peer is left waiting for an answer that
+    /// is not coming. The write side towards the client is shut down when
+    /// the server's side ends, which is what turns "the server is gone" into
+    /// the EOF the client is waiting for — and the read side stays open, so
+    /// a client that still has something to say can say it.
+    #[tokio::test]
+    async fn a_tunnel_the_server_closes_is_closed_for_the_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // The far side: it closes the tunnel.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_a_tunnel_that_closes(server));
+
+        // This side: an endpoint, a pool over it, and the proxy.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+            .await
+            .expect("the proxy binds");
+        let proxy_addr = proxy.local_addr().expect("the proxy's address");
+        let runner = spawn_run(&proxy);
+
+        // The application: a tunnel, and then it waits for the other end.
+        let mut stream = TcpStream::connect(proxy_addr)
+            .await
+            .expect("the proxy accepts");
+        stream
+            .write_all(format!("CONNECT {HOST}:{PORT} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .expect("the CONNECT goes out");
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("the answer comes");
+            answer.push(byte[0]);
+            if answer.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            answer.starts_with(b"HTTP/1.1 200"),
+            "the tunnel should be established: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        // The far side closes. The client has to be told.
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "the client was never told that the tunnel closed: it is still waiting"
+        );
+        assert!(
+            read.is_ok_and(|r| r.is_ok()),
+            "the client saw a reset rather than an end of stream"
         );
 
         proxy.stop();
