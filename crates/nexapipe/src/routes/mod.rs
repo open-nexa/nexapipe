@@ -515,7 +515,14 @@ impl std::fmt::Debug for L4RouteInfo {
 
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
-    routes: Arc<RwLock<Vec<Route>>>,
+    /// The routing table.
+    ///
+    /// **The routes are shared.** A lookup that found a route used to copy it
+    /// out of the table — three strings and a vector, so four or five heap
+    /// allocations for every request that matched — and the copy was thrown
+    /// away as soon as the backend was picked. A reference count is the whole
+    /// of what a table entry needs to be passed around.
+    routes: Arc<RwLock<Vec<Arc<Route>>>>,
     /// How long to wait on a backend, resolved once at startup.
     ///
     /// Held here rather than threaded down to each stream handler because this
@@ -538,7 +545,7 @@ pub struct RouteConfig {
 impl RouteConfig {
     pub fn new(routes: Vec<Route>) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts: Timeouts::default(),
             retry: Retry::default(),
         }
@@ -551,7 +558,7 @@ impl RouteConfig {
     /// as it did before this field existed.
     pub fn with_timeouts(routes: Vec<Route>, timeouts: Timeouts) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts,
             retry: Retry::default(),
         }
@@ -564,7 +571,7 @@ impl RouteConfig {
     /// as it did before this field existed.
     pub fn with_settings(routes: Vec<Route>, timeouts: Timeouts, retry: Retry) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts,
             retry,
         }
@@ -795,8 +802,18 @@ impl RouteConfig {
         })
     }
 
+    /// The whole table, copied out.
+    ///
+    /// For the admin API and the startup log, not for the request path: a copy
+    /// of a route is four or five allocations, and a listing wants the routes
+    /// themselves rather than the table's references to them.
     pub async fn routes(&self) -> Vec<Route> {
-        self.routes.read().await.clone()
+        self.routes
+            .read()
+            .await
+            .iter()
+            .map(|route| (**route).clone())
+            .collect()
     }
 
     /// Swaps the routing table, keeping the pool of every route that is still
@@ -833,12 +850,20 @@ impl RouteConfig {
             if let Some(pool) = previous.remove(&key) {
                 route.backend_pool = pool;
             }
-            updated.push(route);
+            updated.push(Arc::new(route));
         }
 
         *routes = updated;
         tracing::info!("Routes updated successfully");
     }
+}
+
+/// The routes of a table, shared.
+///
+/// A table hands out references to its routes rather than copies of them, so
+/// this is where a list of routes becomes a list of references.
+fn shared(routes: Vec<Route>) -> Vec<Arc<Route>> {
+    routes.into_iter().map(Arc::new).collect()
 }
 
 /// Highest-priority route of `mode` that `matches` accepts.
@@ -849,11 +874,11 @@ impl RouteConfig {
 /// to `Tcp` or `Udp`, anything else to `Http`. One route may declare several
 /// modes; a connection still takes exactly one path.
 fn best_match(
-    routes: &[Route],
+    routes: &[Arc<Route>],
     mode: RouteMode,
     matches: impl Fn(&Route) -> bool,
-) -> Option<Route> {
-    let mut best: Option<(Route, u32)> = None;
+) -> Option<Arc<Route>> {
+    let mut best: Option<(Arc<Route>, u32)> = None;
 
     for route in routes.iter() {
         if !route.serves(mode) || !matches(route) {

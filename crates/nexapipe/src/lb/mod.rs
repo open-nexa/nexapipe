@@ -249,7 +249,16 @@ impl Drop for BackendLease {
 pub struct BackendPool {
     backends: Vec<Arc<BackendEntry>>,
     strategy: LoadBalancingStrategy,
-    round_robin_index: Arc<RwLock<usize>>,
+    /// Where the rotation is, so that two requests do not pick the same
+    /// backend.
+    ///
+    /// **An atomic, not a lock.** The whole of the round-robin's work is one
+    /// increment, and it stood under an exclusive write lock — so every
+    /// request to this route queued behind every other one for the sake of a
+    /// counter, and the queue was an async one. The increment is the only
+    /// thing that has to be exclusive, and an atomic increment is exclusive by
+    /// itself.
+    round_robin_index: Arc<AtomicUsize>,
 }
 
 impl BackendPool {
@@ -262,7 +271,7 @@ impl BackendPool {
         BackendPool {
             backends: backend_statuses,
             strategy,
-            round_robin_index: Arc::new(RwLock::new(0)),
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -425,10 +434,12 @@ impl BackendPool {
 
         let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {
-                let mut index = self.round_robin_index.write().await;
-                let idx = healthy_backends[*index % healthy_backends.len()];
-                *index = (*index + 1) % healthy_backends.len();
-                idx
+                // The counter is the whole of the state, and an atomic
+                // increment is the whole of the work: two requests that arrive
+                // together get two different numbers, and neither waits for
+                // the other.
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed);
+                healthy_backends[index % healthy_backends.len()]
             }
             LoadBalancingStrategy::Random => {
                 let rand_idx = (rand::random::<u64>() % healthy_backends.len() as u64) as usize;
@@ -463,9 +474,17 @@ impl BackendPool {
                     .map(|i| (i, self.backends[i].in_flight.load(Ordering::Relaxed)))
                     .collect();
 
-                let mut index = self.round_robin_index.write().await;
-                let (idx, tied) = Self::least_conn_pick(&counts, *index);
-                *index = (*index + 1) % tied;
+                // The tie is broken by the rotation, so that a pool of equal
+                // backends does not send everything to the first one. The
+                // counter is read and written rather than incremented, because
+                // the tie's own size decides where the rotation continues; a
+                // request that slips in between loses one step of the
+                // rotation and nothing else — the backends it could have
+                // chosen are tied.
+                let index = self.round_robin_index.load(Ordering::Relaxed);
+                let (idx, tied) = Self::least_conn_pick(&counts, index);
+                self.round_robin_index
+                    .store((index + 1) % tied, Ordering::Relaxed);
                 idx
             }
         };
