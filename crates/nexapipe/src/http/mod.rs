@@ -1205,7 +1205,17 @@ impl ProxyFailure {
 /// would wait for bytes that are never coming.
 pub struct RequestBody {
     /// The bytes, whole.
-    pub bytes: Vec<u8>,
+    ///
+    /// **Shared, not owned twice.** The body is read into a buffer, and the
+    /// request that goes to the backend used to be handed a *copy* of it: the
+    /// buffer stayed alive for the retry, and the copy was thrown away with
+    /// the attempt. So the process held the body twice over for as long as
+    /// the request lived, while the byte budget counted it once.
+    ///
+    /// A [`Bytes`] is the same buffer with a reference count, so the retry
+    /// takes another reference to the same bytes rather than a second copy of
+    /// them, and the peak is what the budget says it is.
+    pub bytes: bytes::Bytes,
     /// The length to declare to the backend, when the client declared none.
     ///
     /// A chunked request has no length of its own; the proxy reads the chunks
@@ -1279,7 +1289,10 @@ pub async fn read_request_body(
     crate::metrics::METRICS.record_bytes_received(full_body.len() as u64);
 
     Ok(RequestBody {
-        bytes: full_body,
+        // The buffer is handed over rather than copied: the body is read into
+        // it once, and the request that goes to the backend takes a reference
+        // to the same bytes.
+        bytes: bytes::Bytes::from(full_body),
         content_length,
         reservation,
     })
@@ -1352,7 +1365,10 @@ fn build_backend_request(
         builder = builder.header("content-length", content_length);
     }
 
-    Ok(builder.body(Full::new(body.bytes.clone().into()))?)
+    // The body is shared, not copied: the request that goes to the backend
+    // takes a reference to the same bytes the retry would use, so a body is
+    // in memory once however many attempts are made.
+    Ok(builder.body(Full::new(body.bytes.clone()))?)
 }
 
 // One more argument than clippy allows: the alternative is a struct bundling the
@@ -3119,7 +3135,7 @@ mod transport {
             .body(())
             .expect("a request");
         let body = RequestBody {
-            bytes: Vec::new(),
+            bytes: bytes::Bytes::new(),
             content_length: None,
             reservation: crate::conn::limits::ByteReservation::empty(),
         };
@@ -3131,6 +3147,52 @@ mod transport {
             forwarded.uri().path(),
             "/v2/users",
             "the tunnel path did not apply the route's rewrite"
+        );
+    }
+
+    /// The body that goes to the backend is the body the client sent, not a
+    /// copy of it.
+    ///
+    /// It used to be a copy: the buffer stayed alive for the retry, and the
+    /// request that went out carried a second, byte-for-byte copy of it. So a
+    /// 64 MiB upload was 128 MiB of memory for as long as the request lived —
+    /// and the byte budget, which counts the reservation once, said 64 MiB.
+    #[tokio::test]
+    async fn the_forwarded_body_is_the_body_the_client_sent() {
+        let config = route_table_with_rewrite("http://127.0.0.1:9".to_string(), "/api", "/v2{}");
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/users", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://rewrite.test/api/users")
+            .header("host", "rewrite.test")
+            .body(())
+            .expect("a request");
+        let body = RequestBody {
+            bytes: bytes::Bytes::from_static(b"the body the client sent"),
+            content_length: None,
+            reservation: crate::conn::limits::ByteReservation::empty(),
+        };
+
+        let forwarded = build_backend_request(&request, &backend_info, &body)
+            .expect("a request for the backend");
+        let forwarded_body = forwarded
+            .body()
+            .clone()
+            .into_inner()
+            .expect("the request carries a body");
+
+        assert_eq!(forwarded_body, body.bytes, "the body is the same body");
+        assert_eq!(
+            forwarded_body.as_ptr(),
+            body.bytes.as_ptr(),
+            "and it is the same memory: a body that was copied would be in the \
+             process twice, while the byte budget counts it once"
         );
     }
 
@@ -3177,7 +3239,7 @@ mod transport {
             .body(())
             .expect("a request");
         let body = RequestBody {
-            bytes: Vec::new(),
+            bytes: bytes::Bytes::new(),
             content_length: None,
             reservation: crate::conn::limits::ByteReservation::empty(),
         };
