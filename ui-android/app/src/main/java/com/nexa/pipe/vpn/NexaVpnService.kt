@@ -241,43 +241,73 @@ class NexaVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent != null) {
-            when (intent.action) {
-                ACTION_START -> {
-                    val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
-                    // Whether the UI asked and was told to take the slot from
-                    // another VPN app. Absent means no: a start that carries no
-                    // such answer must not revoke anything.
-                    val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
-                    startVPN(domains.toSet(), takeover)
-                }
-                ACTION_STOP -> {
-                    stopVPN()
-                }
-                ACTION_BOOT_CONNECT -> {
-                    // The machine asked for the tunnel to come back.
-                    //
-                    // Android gives a service started with
-                    // startForegroundService() five seconds to call
-                    // startForeground(), and the wait for a network below can
-                    // take longer than that, so the obligation is met here —
-                    // with the text that says what is happening rather than
-                    // the one that says the tunnel is up, because it is not
-                    // yet.
-                    runCatching {
-                        createNotificationChannel()
-                        startForeground(
-                            NOTIFICATION_ID,
-                            createNotification(getString(R.string.notification_text_connecting))
-                        )
-                    }
-                    bootConnectJob = serviceScope.launch {
-                        bootConnect()
-                    }
+        if (intent == null) {
+            // A sticky restart: the system brought the service back without an
+            // intent, and a service started with startForegroundService() has
+            // five seconds to call startForeground() or the system takes the
+            // app down with it.
+            //
+            // What the machine asks for when it wants the tunnel back is the
+            // boot path, and that path ends the service when it cannot bring
+            // a tunnel up — so nothing is left running over a tunnel that is
+            // not there.
+            startForegroundForBoot()
+            bootConnectJob = serviceScope.launch {
+                bootConnect()
+            }
+            return START_STICKY
+        }
+
+        when (intent.action) {
+            ACTION_START -> {
+                val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
+                // Whether the UI asked and was told to take the slot from
+                // another VPN app. Absent means no: a start that carries no
+                // such answer must not revoke anything.
+                val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
+                startVPN(domains.toSet(), takeover)
+            }
+            ACTION_STOP -> {
+                stopVPN()
+            }
+            ACTION_BOOT_CONNECT -> {
+                // The machine asked for the tunnel to come back.
+                //
+                // Android gives a service started with
+                // startForegroundService() five seconds to call
+                // startForeground(), and the wait for a network below can
+                // take longer than that, so the obligation is met here —
+                // with the text that says what is happening rather than
+                // the one that says the tunnel is up, because it is not
+                // yet.
+                startForegroundForBoot()
+                bootConnectJob = serviceScope.launch {
+                    bootConnect()
                 }
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * Meets the obligation a service started with `startForegroundService()`
+     * has: it has five seconds to call `startForeground()`, and the system
+     * takes the app down when it does not.
+     *
+     * The text says what is true: the tunnel is not up yet. A refusal is not
+     * swallowed — the service never enters the foreground state that way, and
+     * the log is what says why.
+     */
+    private fun startForegroundForBoot() {
+        runCatching {
+            createNotificationChannel()
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(getString(R.string.notification_text_connecting))
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "boot: the foreground was refused: ${error.message}")
+        }
     }
 
     /**
