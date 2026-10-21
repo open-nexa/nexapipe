@@ -55,6 +55,40 @@ pub fn is_enabled() -> Result<bool, AppError> {
     platform::is_enabled()
 }
 
+/// What the answers of `reg query` mean about the start-at-login entry.
+///
+/// `reg query` exits 1 both when the value is not there and when the key
+/// cannot be read, and the text that says which is localized, so it is not
+/// read. The key and the key above it are asked as well, and what they
+/// answered is what tells the two apart.
+///
+/// The answers are, in order: the value, the key, and the key's parent.
+///
+/// Not a Windows-only rule — it is about what `reg query` answers, and the
+/// rule is the same wherever it is asked — but only Windows asks it, so the
+/// dead-code lint is silenced elsewhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn registry_answers(value: bool, key: bool, parent: bool) -> Result<bool, AppError> {
+    if value {
+        return Ok(true);
+    }
+    // The key can be read and holds no such value: the entry is not there.
+    if key {
+        return Ok(false);
+    }
+    // The key is not there either: there is nowhere for the entry to be.
+    if parent {
+        return Ok(false);
+    }
+    // Nothing could be read. A failure to read is not "off": a switch that
+    // claims to be off while the entry is there is the same silent lie the
+    // switch used to tell.
+    Err(AppError::with_detail(
+        codes::AUTOSTART_READ_FAILED,
+        "the registry could not be read".to_string(),
+    ))
+}
+
 /// Arranges for this app to start when the machine starts, or not.
 ///
 /// Turning it off removes the entry. Turning it on writes one that points at
@@ -156,6 +190,9 @@ mod platform {
     /// Where Windows looks for what to run at login.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
+    /// The key above it, asked when the Run key cannot be read.
+    const RUN_KEY_PARENT: &str = r"Software\Microsoft\Windows\CurrentVersion";
+
     /// `reg.exe`, which is in `System32` on every Windows that has ever run.
     ///
     /// Named by path rather than by bare name: an app launched from a service
@@ -168,21 +205,31 @@ mod platform {
             .unwrap_or_else(|_| "reg.exe".to_string())
     }
 
-    pub fn is_enabled() -> Result<bool, AppError> {
-        let output = Command::new(reg())
-            .args(["query", RUN_KEY, "/v", ENTRY_NAME])
+    /// Runs `reg query` and reports whether it succeeded.
+    ///
+    /// The exit code is what is read; the text is localized, so it is not.
+    fn query(args: &[&str]) -> Result<bool, AppError> {
+        Command::new(reg())
+            .args(args)
             .output()
+            .map(|output| output.status.success())
             .map_err(|e| {
                 AppError::with_detail(
                     codes::AUTOSTART_READ_FAILED,
                     format!("reg query could not be run: {e}"),
                 )
-            })?;
+            })
+    }
 
-        // The exit code is the answer; the text is localized, so it is not read.
-        // `reg query` exits 1 when the value is not there, which is the
-        // ordinary answer before the entry has ever been written.
-        Ok(output.status.success())
+    pub fn is_enabled() -> Result<bool, AppError> {
+        // Three questions, because `reg query` cannot tell "the value is not
+        // there" from "the key cannot be read" on its own: the value itself,
+        // the key it would be in, and the key above that one.
+        super::registry_answers(
+            query(&["query", RUN_KEY, "/v", ENTRY_NAME])?,
+            query(&["query", RUN_KEY])?,
+            query(&["query", RUN_KEY_PARENT])?,
+        )
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
@@ -540,6 +587,27 @@ mod tests {
         // The same name appears in a registry value, a file name and a plist
         // label; a space in it would need quoting in two of the three.
         assert!(!ENTRY_NAME.contains(' '));
+    }
+
+    /// `reg query` cannot tell "the value is not there" from "the key cannot
+    /// be read", so the key and its parent are asked as well.
+    #[test]
+    fn a_registry_that_answers_tells_whether_the_entry_is_there() {
+        // The value is there: the entry is on.
+        assert!(registry_answers(true, true, true).unwrap());
+
+        // The value is not there, and the key can be read: the entry is not
+        // on. This is the ordinary answer before the entry was ever written.
+        assert!(!registry_answers(false, true, true).unwrap());
+
+        // The key is not there either, but its parent is: there is nowhere
+        // for the entry to be, so "off" is the truth.
+        assert!(!registry_answers(false, false, true).unwrap());
+
+        // Nothing could be read: a failure to read is not "off", because the
+        // entry may well be there.
+        let error = registry_answers(false, false, false).unwrap_err();
+        assert_eq!(error.code, crate::error::codes::AUTOSTART_READ_FAILED);
     }
 
     /// How the `Exec` line of a desktop entry carries a path.
