@@ -34,7 +34,7 @@ use iroh::endpoint::{BeforeConnectOutcome, EndpointHooks};
 use iroh::{EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl};
 
 use crate::discovery::DiscoveryMode;
-use crate::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 
 /// The relay we pin to by default: aps1-1, Singapore.
 ///

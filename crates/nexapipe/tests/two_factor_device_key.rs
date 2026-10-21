@@ -45,7 +45,7 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
     config.clients.insert(
         "client-001".to_string(),
         ClientAuth {
-            secret: nexapipe_client::secret::SecretString::new(SECRET.to_string()),
+            secret: nexapipe_proto::secret::SecretString::new(SECRET.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
@@ -54,7 +54,7 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
             devices: HashMap::from([(
                 "phone".to_string(),
                 DeviceAuth {
-                    secret: nexapipe_client::secret::SecretString::default(),
+                    secret: nexapipe_proto::secret::SecretString::default(),
                     public_key: Some(nexapipe::auth::public_key_hex(&key.public())),
                     created_at: "0".to_string(),
                     last_used: None,
@@ -266,7 +266,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
         client.devices.insert(
             "broken".to_string(),
             DeviceAuth {
-                secret: nexapipe_client::secret::SecretString::default(),
+                secret: nexapipe_proto::secret::SecretString::default(),
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
@@ -275,7 +275,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
         client.devices.insert(
             "garbled".to_string(),
             DeviceAuth {
-                secret: nexapipe_client::secret::SecretString::default(),
+                secret: nexapipe_proto::secret::SecretString::default(),
                 public_key: Some("not a key".to_string()),
                 created_at: "0".to_string(),
                 last_used: None,

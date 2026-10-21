@@ -251,7 +251,7 @@ mod tests {
         last_used: Option<u64>,
     ) -> ClientAuth {
         ClientAuth {
-            secret: nexapipe_client::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,

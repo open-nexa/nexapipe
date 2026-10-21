@@ -3,7 +3,7 @@ name = 'nexapipe-proto'
 version.workspace = true
 edition = '2024'
 rust-version.workspace = true
-description = 'Wire format of the nexapipe L4 (TCP/UDP) tunnel'
+description = 'The wire formats the nexapipe client and server share'
 license.workspace = true
 publish = false
 
@@ -16,5 +16,19 @@ publish = false
 [lib]
 bench = false
 
-# Deliberately dependency-free: both the server and every client build link this,
-# and it must stay cheap to compile for the Android target.
+[dependencies]
+# Two dependencies, and both of them are already in every build that links
+# this crate: the handshake is JSON, and the credential it carries is wiped
+# from memory when it goes out of scope.
+#
+# The crate used to be dependency-free, and the reason it was is still the
+# reason — it must stay cheap to compile for the Android target — but the two
+# crates that link it, the server and every client, pull in serde and zeroize
+# for themselves, so the marginal cost of naming them here is zero. The
+# alternative was a feature nobody would ever leave switched off.
+serde = { version = "1.0.228", features = ["derive"] }
+# The handshake is JSON, and the error a bad message produces is a
+# `serde_json::Error` — it is part of the signature of `AuthMessage::from_bytes`,
+# so it is a dependency rather than a test-only one.
+serde_json = "1.0"
+zeroize.workspace = true

@@ -1,4 +1,19 @@
-//! Authentication protocol for client-server handshake.
+//! The authentication handshake, as it travels between a client and the server.
+//!
+//! # Why this is here and not in either of them
+//!
+//! The handshake used to be written down twice — once in the server and once in
+//! the client — and the two copies were kept in step by a comment in each
+//! saying "keep in sync with the other one". That is the whole failure mode of
+//! a protocol written down twice: a field added on one side and forgotten on
+//! the other is a handshake that dies on its first message, and the comment
+//! that was supposed to prevent it is the only thing standing between the two
+//! copies.
+//!
+//! So there is one copy, and both sides link it. A change to the protocol is a
+//! change here, and there is nowhere else for it to be forgotten.
+//!
+//! # The messages
 //!
 //! Protocol flow:
 //! 1. Client -> Server: AUTH_START { client_id, timestamp }
@@ -19,8 +34,8 @@
 //! being a credential the moment it has been used once. The exchange runs on
 //! the same stream, ahead of AUTH_START.
 //!
-//! The response is proven in one of two ways, and which one depends on what
-//! the server holds for the device that answered — never on anything the
+//! The response is proven in one of two ways, and which one depends on what the
+//! server holds for the device that answered — never on anything the
 //! response itself says.
 //!
 //! The first is a secret: `signature` is
@@ -45,9 +60,16 @@
 //! existed before per-device credentials — and a peer that does not know the
 //! field ignores it rather than failing, so a client and a server built either
 //! side of the change still complete a handshake.
+//!
+//! # The wire format does not change
+//!
+//! This is a move, not a redesign. Every tag, every field name, every field
+//! type and every `serde` attribute is the one that was on the wire before,
+//! and the tests below are the ones that were watching it — they came with it.
 
-use nexapipe_client::secret::SecretString;
 use serde::{Deserialize, Serialize};
+
+use crate::secret::SecretString;
 
 /// Messages exchanged during authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +224,122 @@ impl AuthMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire format, byte for byte.
+    ///
+    /// The handshake used to be written down twice, and these strings are what
+    /// the other copy produced — dumped from the code as it was before the
+    /// move, not from the code as it is now. A message that came out
+    /// differently would be a handshake that dies on its first message, and
+    /// the only thing that would notice is a peer built against the old
+    /// format.
+    ///
+    /// So this is the whole contract, in one list.
+    #[test]
+    fn every_message_keeps_its_wire_format() {
+        let messages = vec![
+            (
+                AuthMessage::Start {
+                    client_id: "c".to_string(),
+                    timestamp: 7,
+                    device_id: None,
+                },
+                r#"{"type":"AUTH_START","client_id":"c","timestamp":7}"#,
+            ),
+            (
+                AuthMessage::Start {
+                    client_id: "c".to_string(),
+                    timestamp: 7,
+                    device_id: Some("laptop".to_string()),
+                },
+                r#"{"type":"AUTH_START","client_id":"c","timestamp":7,"device_id":"laptop"}"#,
+            ),
+            (
+                AuthMessage::Challenge {
+                    nonce: vec![1, 2, 3],
+                },
+                r#"{"type":"AUTH_CHALLENGE","nonce":[1,2,3]}"#,
+            ),
+            (
+                AuthMessage::Response {
+                    client_id: "c".to_string(),
+                    timestamp: 7,
+                    totp_code: "123456".to_string(),
+                    signature: vec![9],
+                    device_id: None,
+                },
+                r#"{"type":"AUTH_RESPONSE","client_id":"c","timestamp":7,"totp_code":"123456","signature":[9]}"#,
+            ),
+            (
+                AuthMessage::Response {
+                    client_id: "c".to_string(),
+                    timestamp: 7,
+                    totp_code: "123456".to_string(),
+                    signature: vec![9],
+                    device_id: Some("laptop".to_string()),
+                },
+                r#"{"type":"AUTH_RESPONSE","client_id":"c","timestamp":7,"totp_code":"123456","signature":[9],"device_id":"laptop"}"#,
+            ),
+            (AuthMessage::Ok, r#"{"type":"AUTH_OK"}"#),
+            (
+                AuthMessage::Failed {
+                    reason: "no".to_string(),
+                },
+                r#"{"type":"AUTH_FAILED","reason":"no"}"#,
+            ),
+            (
+                AuthMessage::EnrollStart {
+                    client_id: "c".to_string(),
+                    token: SecretString::new("tok".to_string()),
+                    device_id: None,
+                    public_key: None,
+                },
+                r#"{"type":"ENROLL_START","client_id":"c","token":"tok"}"#,
+            ),
+            (
+                AuthMessage::EnrollStart {
+                    client_id: "c".to_string(),
+                    token: SecretString::new("tok".to_string()),
+                    device_id: Some("laptop".to_string()),
+                    public_key: Some("abcd".to_string()),
+                },
+                r#"{"type":"ENROLL_START","client_id":"c","token":"tok","device_id":"laptop","public_key":"abcd"}"#,
+            ),
+            (
+                AuthMessage::EnrollIssue {
+                    client_id: "c".to_string(),
+                    secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                    algorithm: "SHA1".to_string(),
+                    digits: 6,
+                    period: 30,
+                    device_id: None,
+                },
+                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30}"#,
+            ),
+            (
+                AuthMessage::EnrollIssue {
+                    client_id: "c".to_string(),
+                    secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                    algorithm: "SHA1".to_string(),
+                    digits: 6,
+                    period: 30,
+                    device_id: Some("laptop".to_string()),
+                },
+                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30,"device_id":"laptop"}"#,
+            ),
+            (
+                AuthMessage::EnrollFailed {
+                    reason: "no".to_string(),
+                },
+                r#"{"type":"ENROLL_FAILED","reason":"no"}"#,
+            ),
+        ];
+
+        for (message, wire) in messages {
+            let json = String::from_utf8(message.to_bytes().expect("serializable")).expect("utf-8");
+            assert_eq!(json, wire, "the wire format of {message:?} changed");
+        }
+    }
 
     /// The tag is what the other side switches on, so the names are part of the
     /// contract with `crates/nexapipe-client/src/auth.rs`, which spells them

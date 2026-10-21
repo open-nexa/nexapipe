@@ -2,7 +2,7 @@
 
 use super::config::{AuthConfig, TotpAlgorithm};
 use hmac::{Hmac, KeyInit, Mac};
-use nexapipe_client::secret::SecretBytes;
+use nexapipe_proto::secret::SecretBytes;
 use sha2::Sha256;
 use totp_rs::{Algorithm, Builder, Secret};
 
@@ -369,7 +369,7 @@ impl std::error::Error for AuthError {}
 mod tests {
     use super::*;
     use crate::auth::config::ClientAuth;
-    use nexapipe_client::secret::SecretString;
+    use nexapipe_proto::secret::SecretString;
     use std::collections::HashMap;
 
     fn config_with_one_client() -> AuthConfig {

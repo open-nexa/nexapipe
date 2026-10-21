@@ -1,6 +1,6 @@
 //! Configuration structures for 2FA authentication.
 
-use nexapipe_client::secret::{SecretBytes, SecretString};
+use nexapipe_proto::secret::{SecretBytes, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};

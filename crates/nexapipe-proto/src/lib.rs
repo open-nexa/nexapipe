@@ -1,4 +1,9 @@
-//! Wire format of the nexapipe L4 tunnel.
+//! The wire formats the nexapipe client and the server share.
+//!
+//! Two of them live here: the L4 tunnel's, and the authentication handshake's.
+//! The second one used to be written down twice — once in the server and once
+//! in the client — which is the kind of duplication that costs a handshake
+//! when one side grows a field and the other does not. See [`auth`].
 //!
 //! # Where this fits
 //!
@@ -59,15 +64,22 @@
 //! produced an empty path, matched no route and was forwarded to `default_backend`.
 //! A preface that fails to decode is now a loud error instead of a silent default.
 
+pub mod auth;
 mod host;
 mod preface;
+pub mod secret;
 mod udp;
 
+pub use auth::{
+    AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, is_presentable_client_id,
+    is_presentable_device_id,
+};
 pub use host::{host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error};
 pub use preface::{
     L4Proto, MAX_HOST_LEN, MAX_PREFACE_LEN, PREFACE_MAGIC, PREFACE_VERSION, Preface, Status,
     is_l4_preface,
 };
+pub use secret::{Secret, SecretBytes, SecretString};
 pub use udp::{
     FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame, encode_frame_to_vec,
 };
