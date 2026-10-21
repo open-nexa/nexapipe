@@ -584,9 +584,8 @@ async fn a_refused_request_is_answered_without_its_body() {
     let mut reply = Vec::new();
     let mut chunk = [0u8; 4096];
     let read = tokio::time::timeout(Duration::from_secs(2), recv.read(&mut chunk)).await;
-    match read {
-        Ok(Ok(Some(n))) => reply.extend_from_slice(&chunk[..n]),
-        _ => {}
+    if let Ok(Ok(Some(n))) = read {
+        reply.extend_from_slice(&chunk[..n]);
     }
     drop(send);
 
