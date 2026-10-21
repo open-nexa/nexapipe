@@ -700,6 +700,23 @@ function clearConfig() {
               />
             </div>
           </div>
+
+          <div class="form-group">
+            <label for="dnsStrategy" class="form-label">{{ t('config.dnsStrategy') }}</label>
+            <!-- No leading icon, like the relay select: a native select paints its own
+                 control, so an icon laid over one sits on top of it. -->
+            <select
+              id="dnsStrategy"
+              v-model="config.dnsStrategy"
+              class="form-select"
+              @change="updateConfig({ dnsStrategy: config.dnsStrategy })"
+            >
+              <option value="scoped">{{ t('config.dnsStrategyScoped') }}</option>
+              <option value="global">{{ t('config.dnsStrategyGlobal') }}</option>
+              <option value="none">{{ t('config.dnsStrategyNone') }}</option>
+            </select>
+            <p class="hint">{{ t('config.dnsStrategyHint') }}</p>
+          </div>
         </div>
       </div>
 

@@ -40,6 +40,7 @@
 //! - macOS:   the name must be utunN; if omitted the system assigns one automatically
 
 use crate::proxy::dns::{self, DnsServer, DnsServerConfig};
+use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::{dns_config, routing};
 use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
@@ -206,6 +207,10 @@ pub struct TunProxyConfig {
     pub dns_ip: String,
     /// Local DNS server configuration (DNS hijacking)
     pub dns: DnsServerConfig,
+    /// What the machine's DNS is asked to do: only the configured domains, every
+    /// query, or none of them. The user's decision — see
+    /// [`crate::proxy::dns_config::DnsStrategy`].
+    pub dns_strategy: DnsStrategy,
 }
 
 pub struct TunProxy {
@@ -463,10 +468,17 @@ impl TunProxy {
         // tunnel that starts anyway looks like a working one: the UI reports
         // running while the domains the proxy exists for resolve at their real
         // addresses and leave in the clear. Wind down instead, and say why.
+        // Said out loud, because the strategy is the operator's decision and the
+        // machine's DNS is not the app's to change quietly. A run that falls
+        // back from scoped to global behind the user's back is the thing this
+        // setting exists to prevent.
+        tracing::info!("the DNS strategy is {}", self.config.dns_strategy.name());
+
         let hijack = match dns_config::set_system_dns(
             &interface,
             &dns_ip,
             &self.config.dns.proxy_domains,
+            self.config.dns_strategy,
         ) {
             Ok(hijack) => hijack,
             Err(e) => {

@@ -1550,7 +1550,7 @@ Cargo feature：
 | 应用 | 目录 | 功能 |
 | --- | --- | --- |
 | Android | [`ui-android`](ui-android/README.md) | VpnService TUN，带 DNS 劫持 + TCP/UDP 重定向；Compose UI；二维码 2FA 导入。 |
-| 桌面端 | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3；本地 HTTP 代理或经可选提权服务的系统 TUN（WinTun）。 |
+| 桌面端 | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3；本地 HTTP 代理或经可选提权服务的系统 TUN（WinTun）；显式的 DNS 策略（`scoped` / `global` / `none`），不会被程序替你改。 |
 
 <table>
   <tr>

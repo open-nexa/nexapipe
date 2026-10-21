@@ -1794,7 +1794,7 @@ punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
 | App | Directory | What it does |
 | --- | --- | --- |
 | Android | [`ui-android`](ui-android/README.md) | VpnService TUN with DNS hijack + TCP/UDP redirect; Compose UI; QR-code 2FA import. |
-| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service. |
+| Desktop | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3; local HTTP proxy or system TUN (WinTun) through an optional elevated service; an explicit DNS strategy (`scoped` / `global` / `none`) that is never changed for you. |
 
 <table>
   <tr>
