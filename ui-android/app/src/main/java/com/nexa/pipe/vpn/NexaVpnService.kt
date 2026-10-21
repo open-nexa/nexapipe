@@ -649,17 +649,25 @@ class NexaVpnService : VpnService() {
             // close of a number the process may already have handed to
             // something else closes that instead, and the failure is silent.
             //
-            // It is only ours again if the native method was never entered at
-            // all, which is what the catch below covers.
+            // The one case where it is still ours is a native method that was
+            // never entered at all, and that is what a `LinkageError` means:
+            // the library or the method is not there. Anything else that
+            // comes out of the call means the native method ran — it took the
+            // descriptor and closed it on its way out — so closing it here
+            // would be the second close this whole change is about.
             val result = try {
                 IrohProxy.nativeStartTunProxy(
                     fd, proxyDomainsStr
                 )
-            } catch (e: Exception) {
-                Log.e(TAG, "nativeStartTunProxy threw before taking the fd", e)
-                try {
-                    ParcelFileDescriptor.adoptFd(fd).close()
-                } catch (_: Exception) {}
+            } catch (e: Throwable) {
+                if (e is LinkageError) {
+                    Log.e(TAG, "nativeStartTunProxy could not be called at all", e)
+                    try {
+                        ParcelFileDescriptor.adoptFd(fd).close()
+                    } catch (_: Exception) {}
+                } else {
+                    Log.e(TAG, "nativeStartTunProxy threw after taking the fd", e)
+                }
                 throw e
             }
 
