@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Fourteen things land in this cycle so far: the device credential can be a **key**
+Fifteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
