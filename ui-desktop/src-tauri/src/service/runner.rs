@@ -361,6 +361,7 @@ impl ServiceRunner {
                         req.relay_mode,
                         req.relay_url,
                         req.relay_auth_token,
+                        req.discovery_mode,
                         &proxy_manager,
                     )
                     .await
@@ -483,6 +484,7 @@ impl ServiceRunner {
         relay_mode: Option<String>,
         relay_url: Option<String>,
         relay_auth_token: Option<String>,
+        discovery_mode: Option<String>,
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
         // A new start owns the slot: whatever the previous one recorded is history, and a caller
@@ -577,6 +579,7 @@ impl ServiceRunner {
             relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
             relay_url: relay_url.unwrap_or_default(),
             relay_auth_token: relay_auth_token.unwrap_or_default(),
+            discovery_mode: discovery_mode.unwrap_or_else(|| "n0".to_string()),
         };
 
         let manager = Arc::new(ProxyManager::new(config));
