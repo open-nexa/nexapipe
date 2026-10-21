@@ -201,6 +201,7 @@ async fn start_proxy(
     relay_mode: Option<String>,
     relay_url: Option<String>,
     relay_auth_token: Option<String>,
+    discovery_mode: Option<String>,
 ) -> Result<(), AppError> {
     let use_service = use_service.unwrap_or(false);
     let use_tun = use_tun.unwrap_or(false);
@@ -269,6 +270,7 @@ async fn start_proxy(
             relay_mode: relay_mode.clone(),
             relay_url: relay_url.clone(),
             relay_auth_token: relay_auth_token.clone(),
+            discovery_mode: discovery_mode.clone(),
         })
         .await
         {
@@ -364,6 +366,7 @@ async fn start_proxy(
         relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
         relay_url: relay_url.unwrap_or_default(),
         relay_auth_token: relay_auth_token.unwrap_or_default(),
+        discovery_mode: discovery_mode.unwrap_or_else(|| "n0".to_string()),
     };
 
     let manager = Arc::new(ProxyManager::new(config));
