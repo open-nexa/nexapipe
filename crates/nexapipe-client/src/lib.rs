@@ -20,6 +20,13 @@ pub mod transport;
 
 // L4 tunnel: TCP and UDP to a server route's backend. Shares the local proxy's
 // connection-pool plumbing (`open_stream_with_retry`), hence the same feature gate.
+// The upstream DNS resolvers and the sockets they are asked through. The TUN
+// hands every name the device looks up to these, and they keep one socket per
+// resolver so a query does not cost a new source port every time.
+// Not platform-gated so its tests run everywhere, including Windows.
+#[cfg(feature = "tun-proxy")]
+pub mod dns;
+
 #[cfg(feature = "local-proxy")]
 pub mod l4;
 

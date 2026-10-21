@@ -20,6 +20,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use nexapipe_client::EndpointGroup;
+use nexapipe_client::dns::UpstreamResolvers;
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::tun_proxy::{TunProxy, TunStackConfig, handle_dns_query};
 use nexapipe_client::virtual_ip::IpMapping;
@@ -105,10 +106,16 @@ fn tun_pump(c: &mut Criterion) {
                 let mapping = IpMapping::new();
                 let domains = vec![DOMAIN.to_string()];
                 let query = dns_query();
+                // No upstream: a proxied name is never forwarded, so the
+                // benchmark measures the hijack and not the network.
+                let resolvers = UpstreamResolvers::new(
+                    &[],
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
 
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let answer = handle_dns_query(&query, &domains, &[], &mapping).await;
+                    let answer = handle_dns_query(&query, &domains, &resolvers, &mapping).await;
                     black_box(answer);
                 }
                 start.elapsed()
