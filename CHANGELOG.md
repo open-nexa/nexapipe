@@ -34,8 +34,9 @@ after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
 the configuration instead of inside it, the desktop says what it does to the
 machine's DNS instead of deciding for itself, the access log says what a
-tunnelled flow was instead of only what the tunnel did with it, and the paths
-that carry the traffic can be measured instead of assumed.
+tunnelled flow was instead of only what the tunnel did with it, an app that
+is not written in Rust can configure a client through the UniFFI surface, and
+the paths that carry the traffic can be measured instead of assumed.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -53,6 +54,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The UniFFI surface can configure a client.** The `uniffi` feature used to
+  export five functions around one server and no credentials, which is not a
+  surface an app can build a client on: a real deployment has several servers,
+  each with its own `[auth.clients]` entry, and a server with 2FA on refuses a
+  client that cannot authenticate. The surface is now one object — servers with
+  their domains, their TOTP secret or their one-time enrollment token, the load
+  balancing strategy and the relay mode — and it answers what the tunnel is
+  doing: the path and round-trip time of every server, what each has carried,
+  and the flows that are open. The local proxy is there too, because a socket,
+  a port and a domain list cross a language boundary and a packet stream does
+  not: **the TUN is not part of it**, and an app that wants the tunnel itself
+  has to reach for the C ABI.
 - **The access log says what an L4 flow was.** A tunnelled flow carries bytes,
   so its line used to record only what the tunnel did with them — the
   protocol, the target, the outcome, and nothing else. The first bytes of a

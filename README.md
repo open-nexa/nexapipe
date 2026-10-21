@@ -1820,6 +1820,33 @@ proxy.run().await?;   // run() blocks; call stop() from elsewhere to end it
 The same `EndpointGroup` is shared by the local proxy and the TUN proxy, so a
 single connection pool serves both.
 
+### The UniFFI surface
+
+The `uniffi` feature builds the same client for an app that is not written in
+Rust — Swift, Kotlin, Python. It is one object and a local proxy:
+
+```text
+ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, ... })
+    .node_id() .server_ids() .preconnect()
+    .link_statuses() .traffic() .flows() .close_flow()
+    .send_request(HttpRequest) .send_raw(host, bytes)
+    .drop_connections() .close()
+LocalProxy::new(client, "127.0.0.1:8081", domains)  ->  .stop()
+```
+
+Each server carries its own credentials — a node id or a ticket, the domains it
+serves, and either a TOTP secret or a one-time enrollment token — because each
+server keeps its own `[auth.clients]` entry, and one client may talk to a
+server that wants 2FA and one that does not. `link_statuses()` answers with
+the same path and round-trip time the desktop and Android apps show.
+
+**The TUN is not part of it.** A TUN needs a packet source and a packet sink — a
+file descriptor on Android, a `NEPacketTunnelFlow` on iOS — and neither crosses
+a UniFFI boundary: UniFFI moves values, and a live packet stream is not a
+value. An app that wants the tunnel itself has to reach for the C ABI, which
+this crate builds as well. The local proxy is the half that does cross, because
+it is a socket, a port and a domain list.
+
 Cargo features:
 
 | Feature | Purpose |
