@@ -117,9 +117,12 @@ object VirtualBlockSurvey {
     /**
      * The prefix a route claims, or null when it claims none.
      *
-     * Before API 29 the destination is not exposed; the route's own text is
-     * the prefix then (`198.18.0.0/15`), and the default route's text is
-     * `default` — which is not a prefix, and is read as no claim at all.
+     * The destination is read where the framework hands it over as a prefix,
+     * and the route's own text is read where it does not: that text is the
+     * prefix with the next hop appended (`198.18.0.0/15 -> 192.168.1.1`), so
+     * the prefix is what is in front of the arrow. The default route's text
+     * is `0.0.0.0/0` — a prefix of length zero, which claims no block in
+     * particular.
      */
     @Suppress("DEPRECATION")
     private fun routePrefix(route: RouteInfo): VirtualBlockSelector.Prefix? {
@@ -136,9 +139,15 @@ object VirtualBlockSurvey {
         return parsePrefix(text)
     }
 
-    /** Reads `198.18.0.0/15` into a prefix; anything else is not a prefix. */
-    private fun parsePrefix(text: String): VirtualBlockSelector.Prefix? {
-        val parts = text.trim().split('/')
+    /**
+     * Reads `198.18.0.0/15` into a prefix; anything else is not a prefix.
+     *
+     * A route's own text carries its next hop with it (`198.18.0.0/15 ->
+     * 192.168.1.1`), so what is in front of the arrow is what is read: the
+     * rest is not a prefix.
+     */
+    internal fun parsePrefix(text: String): VirtualBlockSelector.Prefix? {
+        val parts = text.substringBefore(" ->").trim().split('/')
         if (parts.size != 2) return null
         val bits = Ipv4.parse(parts[0]) ?: return null
         val length = parts[1].toIntOrNull() ?: return null
