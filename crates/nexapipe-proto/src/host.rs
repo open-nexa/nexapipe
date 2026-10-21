@@ -55,6 +55,8 @@
 //! query, with the rule below, and a name outside it is forwarded to the real
 //! resolver and resolves for real.
 
+use std::borrow::Cow;
+
 /// Compares host names the way DNS does: case-insensitively, without a
 /// trailing dot.
 ///
@@ -64,7 +66,13 @@
 /// slip past its route and reach a different service entirely. Both the
 /// pattern and every input go through here, so a config written with
 /// uppercase letters keeps working too.
-pub fn normalize_host(host: &str) -> String {
+///
+/// **The result borrows when it can.** A name that is already folded — and
+/// that is nearly every name a request carries — is handed back as it came
+/// in, and the only copy this makes is the one a name with a capital letter
+/// needs. The trimming was always a borrow; the lower-casing was not, and it
+/// was the whole of the cost.
+pub fn normalize_host(host: &str) -> Cow<'_, str> {
     // Every trailing dot, not just one: a name may arrive carrying more than
     // the single dot of a fully-qualified spelling, and leaving one behind
     // makes it a different string than the pattern it names.
@@ -74,7 +82,11 @@ pub fn normalize_host(host: &str) -> String {
     // config. The brackets are not part of the name, so both sides lose them
     // here and a pattern spelled `[::1]` matches a request for `[::1]:8080`.
     let host = host.trim_matches(|c| c == '[' || c == ']');
-    host.to_ascii_lowercase()
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
+    }
 }
 
 /// The folded form of a *pattern*.
@@ -85,11 +97,14 @@ pub fn normalize_host(host: &str) -> String {
 /// host" where the configuration said something narrower is the one mistake
 /// this rule must not make: such a pattern keeps its own shape here, and so
 /// matches nothing rather than everything.
-pub fn normalize_pattern(pattern: &str) -> String {
+///
+/// Borrows when there is nothing to fold, for the reason
+/// [`normalize_host`] gives.
+pub fn normalize_pattern(pattern: &str) -> Cow<'_, str> {
     let folded = normalize_host(pattern);
     if folded == "*" && pattern != "*" {
         // The fold would have widened it into the catch-all.
-        pattern.to_ascii_lowercase()
+        Cow::Owned(pattern.to_ascii_lowercase())
     } else {
         folded
     }
@@ -195,18 +210,20 @@ fn catch_all_message(pattern: &str) -> String {
 /// Whether `host` matches any of `patterns`.
 ///
 /// The list is held as it was configured — a pattern may still carry its `*` —
-/// and the host is folded once. Each pattern is folded as it is examined, so
-/// a caller that asks this per request pays for one allocation for the host
-/// and one per pattern.
+/// and the host is folded once. Each pattern is folded as it is examined, and
+/// **a pattern that is already folded costs nothing to examine**: the fold
+/// borrows it rather than copying it. That is the whole cost of this call
+/// for a list of names written the way names are usually written.
 ///
 /// A pattern that [`pattern_error`] would refuse matches nothing here, which
 /// is the safe direction: a configuration that was never meant to be loaded
 /// cannot widen what a client proxies.
 pub fn host_matches_any(patterns: &[String], host: &str) -> bool {
     let host = normalize_host(host);
-    patterns
-        .iter()
-        .any(|pattern| host_matches(&normalize_pattern(pattern), &host))
+    patterns.iter().any(|pattern| {
+        let folded = normalize_pattern(pattern);
+        host_matches(&folded, &host)
+    })
 }
 
 #[cfg(test)]
@@ -214,7 +231,33 @@ mod tests {
     use super::*;
 
     fn pattern(p: &str) -> String {
-        normalize_host(p)
+        normalize_host(p).into_owned()
+    }
+
+    /// A name that is already folded is borrowed, not copied.
+    ///
+    /// This is the whole point of the fold returning a [`Cow`]: a request
+    /// carries a name that is already in the shape a pattern is written in,
+    /// and asking whether it matches used to allocate for every pattern it
+    /// was compared against.
+    #[test]
+    fn a_folded_name_is_borrowed_rather_than_copied() {
+        assert!(
+            matches!(normalize_host("example.com"), Cow::Borrowed(_)),
+            "a name with nothing to fold is handed back as it came in"
+        );
+        assert!(
+            matches!(normalize_pattern("*.example.com"), Cow::Borrowed(_)),
+            "and so is a pattern"
+        );
+        assert!(
+            matches!(normalize_host("Example.com"), Cow::Owned(_)),
+            "a name with a capital letter needs a copy"
+        );
+        assert!(
+            matches!(normalize_pattern("*.Example.com"), Cow::Owned(_)),
+            "and so does a pattern"
+        );
     }
 
     #[test]

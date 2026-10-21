@@ -244,8 +244,11 @@ where
     // request, so what goes in them is what the access log records for one:
     // the protocol where a method would be, and the target where a URI would.
     let span = tracing::Span::current();
-    span.record("method", preface.proto.name());
-    span.record("uri", target.as_str());
+    // A tunnel's target is a host and a port rather than a URI, so there is
+    // nothing to redact in it today; the same redaction is applied anyway,
+    // because the day the target grows a query string it should not grow one
+    // in the log with it.
+    crate::log::record_request_on_span(&span, preface.proto.name(), &target);
 
     let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)

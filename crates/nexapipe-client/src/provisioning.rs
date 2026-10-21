@@ -736,8 +736,11 @@ fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
         {
             bail!("{domain:?} is not a valid domain");
         }
-        if !out.contains(&domain) {
-            out.push(domain);
+        if !out
+            .iter()
+            .any(|existing: &String| existing.as_str() == domain.as_ref())
+        {
+            out.push(domain.into_owned());
         }
     }
     Ok(out)

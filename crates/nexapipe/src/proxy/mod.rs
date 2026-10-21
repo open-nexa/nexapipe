@@ -940,8 +940,51 @@ async fn proxy_handler(
     // Filled in on the span the caller opened around this handler, which was
     // created before the request was read and so could not know these.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", uri.as_str());
+    crate::log::record_request_on_span(&span, &method, &uri);
+
+    // A request that names more than one host has two destinations, and the
+    // two halves of this proxy would resolve them differently: the route and
+    // the access check read the first one, and the backend is handed all of
+    // them. hyper accepts two `Host` headers and passes them both on, so
+    // this is the only place the plaintext listener can catch it.
+    //
+    // RFC 9110 §7.2 asks for a 400, and that is what this is.
+    if http::names_more_than_one_host(req.headers()) {
+        tracing::warn!(
+            "Refusing a request from {} that carries more than one Host header",
+            remote_addr
+        );
+        span.record("status", 400u64);
+        let duration = start.elapsed();
+        crate::metrics::METRICS.record_request(
+            hyper::StatusCode::BAD_REQUEST.as_u16(),
+            duration.as_millis() as u64,
+        );
+        // The refusal is a line in the access log, the way every other answer
+        // this handler gives is. A request that was turned away is exactly the
+        // line an operator goes looking for, and the tunnel path already logs
+        // its own 400 for the same request; leaving this one out of the log
+        // would make the same client's probe visible on one listener and
+        // invisible on the other.
+        log::log_access(
+            &request_id,
+            &remote_addr,
+            &method,
+            &uri,
+            hyper::StatusCode::BAD_REQUEST.as_u16(),
+            duration.as_millis() as u64,
+            0,
+            // No handshake on this listener, so no identity to name.
+            None,
+        );
+        return Ok(with_request_id(
+            http::create_error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "a request may carry only one Host header",
+            ),
+            &request_id,
+        ));
+    }
 
     if http::is_websocket_request(&req) {
         tracing::debug!("WebSocket request detected");
