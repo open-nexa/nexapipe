@@ -2403,10 +2403,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// The mapping the Android TUN runs with: an IPv4 pool and an IPv6 one.
+    ///
+    /// Both pools are the ones of the block in use — the Android TUN takes
+    /// them from the shared block — so a helper that wrote them down would
+    /// test a layout the TUN does not run with. The lock is the block's own,
+    /// or another test could move the block between the two.
     fn dual_stack_mapping() -> IpMapping {
+        let _guard = crate::virtual_block::test_lock();
         IpMapping::new().with_ipv6(
-            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x10),
-            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x20),
+            crate::virtual_block::ipv6_pool_first(),
+            crate::virtual_block::ipv6_pool_last(),
         )
     }
 

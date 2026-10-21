@@ -462,12 +462,21 @@ mod tests {
     // IPv6
     // ------------------------------------------------------------------
 
-    /// The pool the Android TUN uses for AAAA answers.
-    fn ipv6_mapping() -> IpMapping {
-        IpMapping::new().with_ipv6(
-            Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x10),
-            Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0xfffe),
-        )
+    /// The pool the Android TUN uses for AAAA answers, and the IPv6 half of
+    /// the block in use it comes from.
+    ///
+    /// The IPv6 half follows the block, which the host decides, so a helper
+    /// that wrote it down would test a layout the TUN does not run with. The
+    /// lock is the block's own, or another test could move the block between
+    /// the two pools — and the two are read together for the same reason.
+    fn ipv6_mapping() -> (IpMapping, Ipv6Addr) {
+        let _guard = crate::virtual_block::test_lock();
+        let block = crate::virtual_block::ipv6_block();
+        let mapping = IpMapping::new().with_ipv6(
+            crate::virtual_block::ipv6_pool_first(),
+            crate::virtual_block::ipv6_pool_last(),
+        );
+        (mapping, block)
     }
 
     #[test]
@@ -483,7 +492,7 @@ mod tests {
 
     #[test]
     fn the_two_families_do_not_share_addresses() {
-        let mapping = ipv6_mapping();
+        let (mapping, _) = ipv6_mapping();
         assert!(mapping.has_ipv6());
 
         let v4 = mapping.allocate("a.test");
@@ -499,7 +508,10 @@ mod tests {
 
     #[test]
     fn ipv6_addresses_stay_inside_the_tun_route() {
-        let mapping = ipv6_mapping();
+        // The route the VPN installs is the IPv6 half of the block in use, so
+        // the addresses have to be inside that half — and the half follows
+        // the block, which the host decides.
+        let (mapping, block) = ipv6_mapping();
         let mut seen = HashSet::new();
         for i in 0..1000 {
             let ip = mapping.allocate_v6(&format!("host{i}.test")).unwrap();
@@ -507,8 +519,8 @@ mod tests {
             // through the physical network instead of coming back to us.
             assert_eq!(
                 &ip.octets()[..8],
-                &[0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0x01],
-                "{ip} is outside fd00:10:0:1::/64"
+                &block.octets()[..8],
+                "{ip} is outside the IPv6 half of the block in use"
             );
             assert!(seen.insert(ip), "{ip} was handed out twice");
         }
