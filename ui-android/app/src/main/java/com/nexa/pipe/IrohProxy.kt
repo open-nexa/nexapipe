@@ -359,4 +359,30 @@ object IrohProxy {
      * closed.
      */
     external fun nativeStopTunProxy(): Int
+
+    /**
+     * The blocks the tunnel may claim, comma-separated: "198.18.0.0,198.19.0.0,…".
+     *
+     * The list lives in the native side so both clients walk the same one: the
+     * desktop walks it to find a block the host will let it bind, and Android
+     * walks it to find a block the network the phone is on will let it claim.
+     *
+     * @return the candidate blocks, or null when the answer could not be built.
+     */
+    external fun nativeVirtualBlockCandidates(): String?
+
+    /**
+     * Sets the block the tunnel claims and reports the addresses inside it.
+     *
+     * The answer is a `key=value;key=value` list — the shape the other answers
+     * here use — naming the block, the interface address, the DNS server, the
+     * legacy proxy address and the IPv6 half. Kotlin configures the VPN's
+     * addresses and routes from it, and the native side hands out the
+     * per-domain addresses from the same block, so the two halves of the
+     * tunnel cannot disagree about which addresses they are.
+     *
+     * @param base the block's network address, e.g. "198.18.0.0"
+     * @return the encoded addresses, or null when the answer could not be built.
+     */
+    external fun nativeVirtualBlock(base: String): String?
 }

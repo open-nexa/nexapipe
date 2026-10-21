@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Brings the tunnel back after the machine is restarted. The broadcast
+         that asks for it is a protected one, so no other app can send it. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Needed only to scan a 2FA provisioning QR code, so the app stays
          installable on devices without a camera and no permission is requested
          until the user opens the scanner. -->
@@ -53,6 +56,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Brings the tunnel back after the machine is restarted, when the
+             user has asked for that. Exported because a receiver of a system
+             broadcast has to be, and safe because BOOT_COMPLETED is a
+             protected broadcast: no other app can send one. -->
+        <receiver
+            android:name=".vpn.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
