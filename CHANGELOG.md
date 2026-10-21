@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Eleven things land in this cycle so far: the device credential can be a **key**
+Thirteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -30,8 +30,10 @@ can be held to the ports it may reach and not only to the names, both clients
 can say how far away the path carrying the traffic is, the desktop app can
 stay in the tray instead of ending with its window, the third-party boundary
 is two settings now rather than one, the Android app can bring the tunnel back
-after a restart, and the Android client picks its address block instead of
-hard-coding one.
+after a restart, the Android client picks its address block instead of
+hard-coding one, the server's runtime state lives in a file of its own beside
+the configuration instead of inside it, and the desktop says what it does to
+the machine's DNS instead of deciding for itself.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
