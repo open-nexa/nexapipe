@@ -1266,8 +1266,13 @@ pub async fn read_request_body(
         // head — and `transfer-encoding` is not forwarded, so the backend was
         // handed a body with no framing at all and no way to know it was
         // truncated. Decode the chunks and send one buffer with a length.
-        let reservation =
-            read_chunked_request_body(recv, &mut full_body, timeouts.deadlines.body).await?;
+        let reservation = read_chunked_request_body(
+            recv,
+            &mut full_body,
+            timeouts.deadlines.body,
+            crate::conn::limits::body_budget(),
+        )
+        .await?;
         (reservation, Some(full_body.len()))
     } else {
         (crate::conn::limits::ByteReservation::empty(), None)
@@ -1696,18 +1701,31 @@ fn parse_chunk_size(header: &[u8]) -> Result<usize, anyhow::Error> {
 /// Whatever arrived with the head is already the start of the chunk stream, so
 /// it is handed to the decoder first and only then is more read.
 ///
-/// A chunked body declares no length, so the reservation grows as the frames
-/// decode rather than being taken up front — there is no honest moment at which
+/// A chunked body declares no length, so the reservation grows as the bytes
+/// arrive rather than being taken up front — there is no honest moment at which
 /// this knows how much it wants. Returns the reservation, which the caller keeps
 /// for the lifetime of the body.
-async fn read_chunked_request_body(
-    recv: &mut iroh::endpoint::RecvStream,
+///
+/// Generic over the reader so the accounting can be tested without an endpoint;
+/// callers pass an iroh receive stream. The budget is a parameter for the same
+/// reason: the accounting is only observable against a budget of the test's
+/// own, because the process-wide one is shared with every other test in this
+/// binary.
+async fn read_chunked_request_body<R>(
+    recv: &mut R,
     body: &mut Vec<u8>,
     body_deadline: std::time::Duration,
-) -> Result<crate::conn::limits::ByteReservation, anyhow::Error> {
+    budget: &std::sync::Arc<crate::conn::limits::ByteBudget>,
+) -> Result<crate::conn::limits::ByteReservation, anyhow::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut pending = std::mem::take(body);
     let mut buf = [0u8; 8192];
-    let mut reservation = crate::conn::limits::ByteReservation::empty();
+    // The bytes that came with the head are the beginning of the chunk stream,
+    // so they are held the same way the rest of it is: charged while they wait
+    // to be decoded.
+    let mut reservation = crate::conn::limits::ByteReservation::take_from(budget, pending.len())?;
 
     // A phase deadline, not a per-read one: a peer sending one chunk before
     // each expiry renews a per-read bound forever, and this holds a stream slot
@@ -1718,16 +1736,23 @@ async fn read_chunked_request_body(
     loop {
         let (decoded, used, complete) =
             decode_chunks(&pending, MAX_REQUEST_BODY.saturating_sub(body.len()))?;
-        // Before the bytes are appended, so a refused reservation leaves the
-        // buffer and the budget agreeing about what is held.
-        reservation.grow(decoded.len())?;
+        // The framing of the chunks that just decoded is gone: only the
+        // payload is left, and it was already charged as part of the raw bytes
+        // it came from. So the difference goes back to the budget, and the
+        // reservation keeps meaning "the bytes held right now" — the raw
+        // bytes still waiting for their chunk, plus the body decoded so far.
+        reservation.shrink(used.saturating_sub(decoded.len()));
         body.extend_from_slice(&decoded);
         pending.drain(..used);
         if complete {
+            // Whatever is left in `pending` is the trailer section, which is
+            // not forwarded and is dropped with this function. Those bytes are
+            // given back rather than counted for as long as the body lives.
+            reservation.shrink(pending.len());
             return Ok(reservation);
         }
 
-        let read = match tokio::time::timeout_at(deadline_at, recv.read(&mut buf)).await {
+        let n = match tokio::time::timeout_at(deadline_at, recv.read(&mut buf)).await {
             Ok(result) => result
                 .map_err(|e| anyhow::anyhow!("failed to read request body from iroh: {}", e))?,
             Err(_) => {
@@ -1737,9 +1762,20 @@ async fn read_chunked_request_body(
                 ));
             }
         };
-        let n = read.filter(|n| *n > 0).ok_or_else(|| {
-            anyhow::anyhow!("chunked request body ended before its terminating chunk")
-        })?;
+        // A read of zero is the end of the stream: the peer stopped before the
+        // terminating chunk, so the body is truncated.
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "chunked request body ended before its terminating chunk"
+            ));
+        }
+        // The raw bytes are held while they wait for their chunk to complete,
+        // so they are charged while they are held. A peer that declares a
+        // 64 MiB chunk and then trickles the data into it holds those bytes
+        // for as long as it takes, and the budget has to see them: it is the
+        // difference between "this process holds 64 MiB" and "this process
+        // holds nothing", and the budget is about the first one.
+        reservation.grow(n)?;
         pending.extend_from_slice(&buf[..n]);
     }
 }
@@ -2129,6 +2165,151 @@ mod tests {
         let raw = chunked(&["hello"]);
         let err = decode_chunks(&raw, 4).unwrap_err();
         assert!(err.to_string().contains("over the 4 byte limit"));
+    }
+
+    /// Hands out the pieces it was given, and records what the budget held
+    /// each time it was asked for more.
+    ///
+    /// The samples are the point: they are the moments *between* reads, which
+    /// is when the bytes that have arrived but have not decoded yet are held.
+    struct SamplingReader {
+        pieces: std::collections::VecDeque<Vec<u8>>,
+        budget: std::sync::Arc<crate::conn::limits::ByteBudget>,
+        samples: Vec<usize>,
+    }
+
+    impl SamplingReader {
+        fn new(budget: &std::sync::Arc<crate::conn::limits::ByteBudget>, pieces: &[&[u8]]) -> Self {
+            Self {
+                pieces: pieces.iter().map(|p| p.to_vec()).collect(),
+                budget: budget.clone(),
+                samples: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for SamplingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let held = self.budget.held();
+            self.samples.push(held);
+            match self.pieces.pop_front() {
+                Some(chunk) => {
+                    buf.put_slice(&chunk);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                None => std::task::Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    /// `read_chunked_request_body` against a budget of the test's own.
+    ///
+    /// The process-wide one is shared with every other test in this binary,
+    /// which run concurrently, so a total read from it would mostly be
+    /// measuring the other tests.
+    async fn read_chunked<R>(
+        recv: &mut R,
+        body: &mut Vec<u8>,
+        budget: &std::sync::Arc<crate::conn::limits::ByteBudget>,
+    ) -> Result<crate::conn::limits::ByteReservation, anyhow::Error>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        read_chunked_request_body(recv, body, Deadlines::default().body, budget).await
+    }
+
+    /// A chunked body is charged for the bytes that are still in flight.
+    ///
+    /// The bytes of a chunk that has not decoded yet are held: the peer sent
+    /// them and the process has them in memory. It used to charge only what a
+    /// chunk decoded, which left every byte of an unfinished chunk outside
+    /// the budget — a peer that declares a 64 MiB chunk and then trickles the
+    /// data into it was invisible to the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_charges_the_bytes_that_are_still_in_flight() {
+        let budget = std::sync::Arc::new(crate::conn::limits::ByteBudget::new(1024 * 1024));
+        // A chunk header and the first two bytes of its data: the chunk
+        // cannot decode yet, so these five bytes wait for the rest of it.
+        let mut reader = SamplingReader::new(&budget, &[b"5\r\nhe", b"llo\r\n", b"0\r\n\r\n"]);
+        let mut body = Vec::new();
+
+        let reservation = read_chunked(&mut reader, &mut body, &budget)
+            .await
+            .expect("the body is read");
+
+        assert_eq!(body, b"hello");
+        assert_eq!(
+            reader.samples,
+            vec![0, 5, 5],
+            "the five bytes of the unfinished chunk are charged while they wait, and the \
+             framing of the decoded one is given back"
+        );
+
+        // And the accounting ends where it should: the decoded body is held
+        // and nothing else — the framing is gone and the terminator was never
+        // part of the body.
+        assert_eq!(reservation.bytes(), body.len());
+        assert_eq!(budget.held(), reservation.bytes());
+
+        drop(reservation);
+        assert_eq!(
+            budget.held(),
+            0,
+            "a dropped reservation gives its bytes back"
+        );
+    }
+
+    /// A chunked body that outgrows the budget is refused while it arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_that_outgrows_the_budget_is_refused() {
+        let budget = std::sync::Arc::new(crate::conn::limits::ByteBudget::new(8));
+        let mut reader = SamplingReader::new(&budget, &[b"5\r\nhello\r\n0\r\n\r\n"]);
+        let mut body = Vec::new();
+
+        let err = read_chunked(&mut reader, &mut body, &budget)
+            .await
+            .expect_err("the body does not fit");
+
+        assert!(err.to_string().contains("does not fit"), "{err}");
+        assert_eq!(
+            budget.held(),
+            0,
+            "a refused body hands its reservation back"
+        );
+    }
+
+    /// The trailer of a chunked body is not held.
+    ///
+    /// It is not forwarded and it is dropped with the read, so the budget must
+    /// not keep counting it for as long as the body lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_holds_its_body_and_nothing_else() {
+        let budget = std::sync::Arc::new(crate::conn::limits::ByteBudget::new(1024 * 1024));
+        let mut reader = SamplingReader::new(
+            &budget,
+            &[b"5\r\nhello\r\n0\r\n\r\nX-Trailer: done\r\n\r\n"],
+        );
+        let mut body = Vec::new();
+
+        let reservation = read_chunked(&mut reader, &mut body, &budget)
+            .await
+            .expect("the body is read");
+
+        assert_eq!(body, b"hello");
+        assert_eq!(
+            reservation.bytes(),
+            5,
+            "the trailer is not part of the body"
+        );
+        assert_eq!(
+            budget.held(),
+            5,
+            "and it is not held for the body's lifetime"
+        );
     }
 
     #[test]
