@@ -183,6 +183,10 @@
     <string name="relay_mode_default">Default (all N0 relays)</string>
     <string name="relay_mode_disabled">Disabled (no relay at all)</string>
     <string name="relay_mode_custom">Custom URL (exclusive)</string>
+    <string name="discovery_mode_title">Endpoint discovery</string>
+    <string name="discovery_mode_note">Turning discovery off means this device never asks n0 where a peer is. A peer is then reachable only by an address you were given — a ticket — and not by a Node ID alone.</string>
+    <string name="discovery_mode_n0">Ask n0 (a Node ID is looked up)</string>
+    <string name="discovery_mode_none">Ask nobody (tickets only)</string>
     <string name="relay_url_label">Relay URL</string>
     <string name="relay_url_placeholder">https://relay.example.com</string>
     <string name="relay_token_label">Relay auth token (optional)</string>

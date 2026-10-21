@@ -569,7 +569,11 @@ async fn run_server_mode(
     )
     .await
     {
-        tracing::error!("Proxy failed: {}", e);
+        // The alternate form prints the whole chain, so the cause reaches the
+        // log and not only the outermost context — an operator who wrote
+        // `discovery = "off"` has to see which value was wrong, not just that
+        // something about the iroh configuration was.
+        tracing::error!("Proxy failed: {e:#}");
         std::process::exit(1);
     }
 }

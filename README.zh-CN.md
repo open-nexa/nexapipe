@@ -621,6 +621,7 @@ domains = ["app.example.com"]
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`。缺省即 `default`。 |
 | `relay_url` | `relay_mode = "custom"` 时使用的中继；只设置它而不设 `relay_mode` 等同于 `custom`。 |
 | `relay_auth_token` | 需要鉴权的 `custom` 中继所用的可选 bearer token。 |
+| `discovery` | `n0` / `none`。不写即 `n0`。`none` 关掉"把 Node ID 变成地址"的那次查询，于是本端点不会有任何东西到达 `dns.iroh.link` —— 代价是单凭 Node ID 不再能连到它（地址要靠票据带过来）。写了却拼不出来会直接拒绝启动。 |
 
 中继模式：
 
@@ -639,10 +640,14 @@ domains = ["app.example.com"]
 阻止启动，而不是悄悄回落。在不接受 `relay_url` 的模式旁写了 `relay_url` 会被忽略
 并记日志。
 
-**任何 `relay_mode` 都无法改变的**：Endpoint ID 发现仍然会查询 `dns.iroh.link`，
-而 `custom` 约束的是**本**端点 —— 广播了 N0 中继的对端仍会经由该中继被拨号。发现服务没有 NexaPipe
-暴露出来的开关 —— iroh 1.2.0 本身有 `clear_address_lookup()`，但 NexaPipe 没有调用它。[仍然依赖第三方基础设施的部分](docs/iroh-boundaries.md)
-完整写明了这条边界，包括 `custom` 买到了什么、没买到什么。
+**还有两个开关把这事做完。** `relay_mode` 管的是中继；Endpoint ID 发现 —— 也就是
+把 Node ID 变成"该往哪儿发 QUIC 包"的那次查询 —— 是另一个开关 `discovery = "none"`，
+它才是让查询不去 `dns.iroh.link` 的东西。`custom` 客户端还会拒绝经由别人的中继
+去拨号对端，所以带着地址的对端只会经由你自己的中继被找到。只凭 Node ID 的对端仍然
+需要那次查询才能被找到，所以只要端点仍可能向 n0 询问它在哪里，它就会被拨号 ——
+而一旦关掉查询，它会被直接拒绝。
+[仍然依赖第三方基础设施的部分](docs/iroh-boundaries.md)
+完整写明了这条边界，包括这两个开关各自买到了什么、没买到什么。
 
 ### `[[routes]]` —— 路由
 

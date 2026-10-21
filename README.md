@@ -701,6 +701,7 @@ startup — delete them and see [TLS](#tls).
 | `relay_mode` | `pinned` / `default` / `disabled` / `custom`. Absent means `default`. |
 | `relay_url` | The relay to use with `relay_mode = "custom"`; setting it without a `relay_mode` means `custom`. |
 | `relay_auth_token` | Optional bearer token for a `custom` relay that requires one. |
+| `discovery` | `n0` / `none`. Absent means `n0`. `none` switches off the address lookup that turns a Node ID into an address, so nothing about this endpoint reaches `dns.iroh.link` — at the price of a Node ID no longer being enough to reach it (a ticket carries an address). A value that is present but unknown refuses the start. |
 
 Relay modes:
 
@@ -720,12 +721,17 @@ A `relay_mode` that is present but unusable — `custom` with no URL, an
 unrecognised spelling — stops startup instead of quietly falling back. A
 `relay_url` next to a mode that does not take one is ignored and logged.
 
-**What no `relay_mode` changes:** Endpoint ID discovery still queries
-`dns.iroh.link`, and `custom` constrains this endpoint only — a peer advertising
-an N0 relay is still dialled through it. Discovery has no switch NexaPipe
-exposes, though iroh 1.2.0 itself has `clear_address_lookup()`.
+**Two settings finish the job.** `relay_mode` covers the relay; Endpoint ID
+discovery — the lookup that turns a Node ID into "where do I send QUIC
+packets" — is a separate switch, `discovery = "none"`, and it is what keeps a
+lookup from going to `dns.iroh.link`. A `custom` client also refuses to dial a
+peer through anybody else's relay, so a peer that carries an address is
+reached through your relay and nothing else. A peer named only by a Node ID
+still needs the lookup to be found at all, so it is dialled while the endpoint
+may ask n0 where it is — and refused outright once the lookup is off.
 [What still depends on third-party infrastructure](docs/iroh-boundaries.md)
-states the boundary in full, including what `custom` does and does not buy.
+states the boundary in full, including what each of these does and does not
+buy.
 
 ### `[[routes]]` — routing
 
