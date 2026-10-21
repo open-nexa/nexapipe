@@ -233,10 +233,18 @@ const MAX_UDP_FLOWS: usize = 32;
 /// when the pool has nothing free. On Android the TUN is system-wide, so any
 /// installed application reaches this.
 ///
-/// The same ceiling the local HTTP proxy
-/// uses, which is what the numbers here are being compared against rather
-/// than derived from.
-const MAX_TCP_FLOWS: usize = 256;
+/// **Sixty-four, and the number is about memory.** A flow owns four buffers of
+/// the TCP window ([`DEFAULT_TCP_WINDOW`]), so at the window the stack used
+/// before the client had a say in it a flow was 1.25 MiB of address space
+/// before it had carried a byte: 256 of them were 320 MiB. A phone running a
+/// browser, a music player and a messaging app holds a few dozen flows open
+/// at a time rather than hundreds, and a flow past the cap is refused with a
+/// log line — which is the answer an application that wants more has to act
+/// on.
+///
+/// The local HTTP proxy's own ceiling is higher, and rightly so: its
+/// connections cost a buffer each rather than four.
+const MAX_TCP_FLOWS: usize = 64;
 
 /// How many bytes one UDP flow may hold of a frame that has not arrived yet.
 ///
