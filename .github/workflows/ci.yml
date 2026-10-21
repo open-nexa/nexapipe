@@ -173,12 +173,11 @@ jobs:
       # what `local-proxy` needs; without it cargo skips those two targets
       # rather than failing, which would quietly leave them unmeasured.
       #
-      # No `-- --noplot` here: everything after the `--` goes to every target
-      # `cargo bench` runs, and that includes the unit tests, whose harness
-      # refuses an option it does not know and exits 101 — the job failed on
-      # `nexapipe --lib` before a single benchmark ran. Criterion's own
+      # No `-- --noplot` here: the crates turn their default harness off
+      # (`bench = false`), so the arguments after `--` reach criterion alone —
+      # but `--noplot` would leave the artifact below empty. Criterion's own
       # plotting is left at its default: gnuplot is not on the runner, so it
-      # falls back to the HTML report, which is what the artifact below is for.
+      # falls back to the HTML report, which is what the artifact is for.
       - name: cargo bench
         run: cargo bench --workspace --features nexapipe-client/tun-proxy --locked
       - name: Upload the criterion report
