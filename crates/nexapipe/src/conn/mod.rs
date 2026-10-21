@@ -464,28 +464,17 @@ pub async fn handle_bidi_stream(
         None => BackendLookup::NoRoute,
     };
 
-    // The body is read once, before the first attempt: the bytes come off the
-    // client's stream, and that stream has them only once. A retry sends the
-    // same bytes again, which is only possible because they were kept.
+    // The verdict comes **before** the body is read.
     //
-    // A WebSocket upgrade has no body to read: the session starts where the
-    // head ends, and the bytes after it are frames.
-    let body = if http::is_websocket_request_static(&request) {
-        None
-    } else {
-        match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
-            Ok(body) => Some(body),
-            Err(failure) => {
-                // The request never went anywhere: there is no backend to
-                // blame and no answer to give but the refusal.
-                tracing::error!("Could not read the request body: {}", failure.error);
-                let mut send = send;
-                let _ = send.finish();
-                return Err(failure.error);
-            }
-        }
-    };
-
+    // A request for a host no route serves has nothing to forward to, and
+    // reading its body first is work nobody asked for: up to
+    // `MAX_REQUEST_BODY` (64 MiB) per stream, held in memory, for a request
+    // that is going to be refused. The bytes that arrived with the head are
+    // dropped along with it.
+    //
+    // The plaintext listener already does it this way round — the lookup,
+    // then the body — so the two paths now agree.
+    //
     // Which refusal it is decides the status, and nothing else — the writing
     // and the logging below are the same either way. 404: nothing serves this
     // name. 503: the route is there and every backend behind it is down, which
@@ -543,6 +532,28 @@ pub async fn handle_bidi_stream(
             }
         }
         return Ok(());
+    };
+
+    // The body is read once, before the first attempt: the bytes come off the
+    // client's stream, and that stream has them only once. A retry sends the
+    // same bytes again, which is only possible because they were kept.
+    //
+    // A WebSocket upgrade has no body to read: the session starts where the
+    // head ends, and the bytes after it are frames.
+    let body = if http::is_websocket_request_static(&request) {
+        None
+    } else {
+        match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
+            Ok(body) => Some(body),
+            Err(failure) => {
+                // The request never went anywhere: there is no backend to
+                // blame and no answer to give but the refusal.
+                tracing::error!("Could not read the request body: {}", failure.error);
+                let mut send = send;
+                let _ = send.finish();
+                return Err(failure.error);
+            }
+        }
     };
 
     tracing::debug!(
