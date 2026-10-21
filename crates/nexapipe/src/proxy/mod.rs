@@ -943,6 +943,29 @@ async fn proxy_handler(
     span.record("method", method.as_str());
     span.record("uri", uri.as_str());
 
+    // A request that names more than one host has two destinations, and the
+    // two halves of this proxy would resolve them differently: the route and
+    // the access check read the first one, and the backend is handed all of
+    // them. hyper accepts two `Host` headers and passes them both on, so
+    // this is the only place the plaintext listener can catch it.
+    //
+    // RFC 9110 §7.2 asks for a 400, and that is what this is.
+    if http::names_more_than_one_host(req.headers()) {
+        tracing::warn!(
+            "Refusing a request from {} that carries more than one Host header",
+            remote_addr
+        );
+        span.record("status", 400u64);
+        crate::metrics::METRICS.record_request(400, start.elapsed().as_millis() as u64);
+        return Ok(with_request_id(
+            http::create_error_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "a request may carry only one Host header",
+            ),
+            &request_id,
+        ));
+    }
+
     if http::is_websocket_request(&req) {
         tracing::debug!("WebSocket request detected");
         span.record("status", 426u64);

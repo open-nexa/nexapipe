@@ -810,14 +810,50 @@ async fn a_head_past_the_limit_is_answered_without_a_backend() {
     head.extend_from_slice(&vec![b'x'; HEAD_LIMIT * 2]);
     let reply = tunnel.exchange(&head).await;
 
+    // 431, and not the 404 this used to answer. The 404 was an accident: the
+    // head this sends has no `Host` in it, so the truncated head that used to
+    // be parsed here had no route and fell out as a 404. The status a head
+    // that is too large deserves is 431 (RFC 9110 15.5.29), and the test
+    // below is the one that shows what the old accident cost.
     assert!(
-        status_of(&reply).contains("404"),
-        "an unusable head should be answered with 404, got {:?}",
+        status_of(&reply).contains("431"),
+        "a head past the limit should be answered with 431, got {:?}",
         status_of(&reply)
     );
     assert!(
         backend.seen().is_empty(),
         "a head that was never completed must not reach a backend"
+    );
+}
+
+/// A head past the limit that *does* name a host is the case the test above
+/// cannot see.
+///
+/// The head is truncated by the limit, and the truncated head used to be
+/// parsed as if it were the whole request. With no `Host` in it that fell out
+/// as a 404 and nothing reached a backend, so the test above passed. With a
+/// `Host` in it the request was routed, and the backend was asked to serve a
+/// head whose last line had been cut in half.
+#[tokio::test]
+async fn a_head_past_the_limit_with_a_host_never_reaches_a_backend() {
+    let backend = spawn_backend("never").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // A `Host` that names a route, and then a head that never ends.
+    let mut head = Vec::new();
+    head.extend_from_slice(b"GET / HTTP/1.1\r\nHost: app.test\r\n");
+    head.extend_from_slice(&vec![b'x'; HEAD_LIMIT * 2]);
+    let reply = tunnel.exchange(&head).await;
+
+    assert!(
+        status_of(&reply).contains("431"),
+        "a head past the limit should be answered with 431, got {:?}",
+        status_of(&reply)
+    );
+    assert!(
+        backend.seen().is_empty(),
+        "a head that was never completed must not reach a backend, even with a Host in it"
     );
 }
 
