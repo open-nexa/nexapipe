@@ -41,7 +41,7 @@ use crate::config::RouteMode;
 use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
 use crate::metrics::{InstanceView, METRICS};
-use crate::routes::RouteConfig;
+use crate::routes::RoutingTable;
 use crate::shutdown::{InFlight, ShutdownSignal};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -94,7 +94,7 @@ pub fn non_loopback_refusal(bound: SocketAddr) -> String {
 /// All of it is the live object rather than a snapshot taken at startup, so a
 /// reload is visible on the next request without anything being notified.
 pub struct AdminState {
-    routes: Arc<RouteConfig>,
+    routes: Arc<RoutingTable>,
     in_flight: Arc<InFlight>,
     peers: Arc<PeerRegistry>,
     auth: Option<AuthState>,
@@ -107,7 +107,7 @@ pub struct AdminState {
 impl AdminState {
     /// Builds the state from the objects the proxy already owns.
     pub fn new(
-        routes: Arc<RouteConfig>,
+        routes: Arc<RoutingTable>,
         in_flight: Arc<InFlight>,
         peers: Arc<PeerRegistry>,
         auth: Option<AuthState>,
@@ -308,7 +308,7 @@ async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
 }
 
 /// `GET /v1/routes`: the table as it is now, including what a reload changed.
-async fn routes_json(routes: &Arc<RouteConfig>) -> serde_json::Value {
+async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
 
     for route in routes.routes().await {
@@ -418,7 +418,7 @@ fn connections_json(peers: &Arc<PeerRegistry>) -> serde_json::Value {
 /// Restricted to the routes whose backends are probed, for the same reason
 /// [`backend_view`] is: the others are never marked down, so listing them
 /// would report every one of them as up.
-async fn health_json(routes: &Arc<RouteConfig>) -> serde_json::Value {
+async fn health_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
     let mut up = HashSet::new();
     let mut down = HashSet::new();

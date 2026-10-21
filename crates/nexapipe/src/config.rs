@@ -307,7 +307,7 @@ pub fn get_backend_protocol(value: &Option<String>) -> anyhow::Result<BackendPro
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct RouteConfig {
+pub struct RouteSpec {
     pub host_pattern: String,
     /// Defaults to `/`. Ignored when `mode = "passthrough"`.
     #[serde(default = "default_path_pattern")]
@@ -677,7 +677,7 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub default_backend: Option<toml::Value>,
     pub debug: Option<bool>,
-    pub routes: Option<Vec<RouteConfig>>,
+    pub routes: Option<Vec<RouteSpec>>,
     pub server: Option<ServerConfig>,
     pub iroh: Option<IrohConfig>,
     pub local_proxy: Option<LocalProxyConfig>,
@@ -1157,130 +1157,25 @@ impl ProxyConfig {
 
         let mut routes = Vec::new();
 
-        for route_config in self.routes.iter().flatten() {
-            let strategy = get_strategy(&route_config.strategy);
-            let modes = get_route_modes(&route_config.mode, &route_config.modes);
-            let path_is_prefix = route_config.path_is_prefix.unwrap_or(true);
-            let backends_count = route_config.backends.len();
-            let host_pattern = route_config.host_pattern.clone();
-            let path_pattern = route_config.path_pattern.clone();
-            let label = format!("route {host_pattern}");
-
-            // Refused rather than matched loosely: a wildcard without its dot
-            // silently covers hosts that merely end in the same letters, so a
-            // config using one is a config that routes more than it says.
-            if let Some(why) = crate::routes::pattern_error(&host_pattern) {
-                anyhow::bail!("{label}: host_pattern {why}");
-            }
-
-            // A route with no backends matches and then has nothing to send
-            // the request to: `select_backend` answers with an empty string and
-            // the client gets a 502 that looks like a backend being down.
-            if route_config.backends.is_empty() {
-                anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
-            }
-
-            // A port no flow can arrive on, or an empty list that says "every
-            // port" by accident: either one is a route that never matches, and
-            // the operator has no way to notice — the client just gets refused.
-            if let Some(ports) = &route_config.client_ports {
-                if ports.is_empty() {
-                    anyhow::bail!(
-                        "{label}: client_ports is empty; leave it out to match every port"
-                    );
-                }
-                if ports.contains(&0) {
-                    anyhow::bail!(
-                        "{label}: client_ports contains port 0; no flow ever arrives from \
-                         port 0, so that entry can never match"
-                    );
-                }
-            }
-
-            // A UDP flow with a zero idle timeout is closed as soon as it is
-            // opened: the tunnel is set up and torn down before the first
-            // datagram crosses it. Leave it out for the server default.
-            if route_config.idle_timeout_secs == Some(0) {
-                anyhow::bail!(
-                    "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
-                     is opened; leave it out for the default"
-                );
-            }
-
-            // Same reasoning for the whole-flow bound: zero would close every flow
-            // the instant it opened, which is never what a zero here means.
-            if route_config.flow_timeout_secs == Some(0) {
-                anyhow::bail!(
-                    "{label}: flow_timeout_secs is 0, which closes a flow the moment it is \
-                     opened; leave it out for the default"
-                );
-            }
-
-            // Every declared mode has to be able to dial these backends, so each
-            // one is checked: the `http` rules and the L4 rules disagree (a URL
-            // to fetch versus an address to dial, and only the L4 one insists on
-            // a port), and a route serving both has to satisfy both.
-            for backend in &route_config.backends {
-                for mode in &modes {
-                    let label = format!("{label} (mode {mode:?})");
-                    validate_backend(&label, *mode, backend)?;
-                }
-            }
-
-            // `h2c` is HTTP/2 in the clear, and an `https://` backend is spoken
-            // to over TLS — so the two cannot be combined: the client would
-            // start h2 in the clear at a port that expects TLS. Refused here
-            // rather than at the first request, because every request to that
-            // route would fail the same way.
-            let backend_protocol = get_backend_protocol(&route_config.backend_protocol)
-                .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-            if backend_protocol == BackendProtocol::H2c && modes.contains(&RouteMode::Http) {
-                for backend in &route_config.backends {
-                    if url::Url::parse(backend)
-                        .map(|url| url.scheme() == "https")
-                        .unwrap_or(false)
-                    {
-                        anyhow::bail!(
-                            "{label}: backend_protocol = \"h2c\" speaks HTTP/2 in the clear, but \
-                             backend \"{backend}\" is https://. An https backend speaks HTTP/2 \
-                             through the TLS handshake, which is what backend_protocol = \
-                             \"http1\" already does; drop the key."
-                        );
-                    }
-                }
-            }
-
-            // Only meaningful for `tcp` / `udp`, where they are harmless defaults
-            // otherwise; the other modes never read them.
-            let l4_options = L4Options {
-                client_ports: route_config.client_ports.clone(),
-                idle_timeout: route_config
-                    .idle_timeout_secs
-                    .map(std::time::Duration::from_secs),
-                flow_timeout: route_config
-                    .flow_timeout_secs
-                    .map(std::time::Duration::from_secs),
-            };
-            let client_ports = route_config.client_ports.clone();
-            let idle_timeout_secs = route_config.idle_timeout_secs;
-
-            routes.push(
-                Route::new(
-                    &host_pattern,
-                    &path_pattern,
-                    path_is_prefix,
-                    route_config.backends.clone(),
-                    strategy,
-                    // The first mode only seeds the constructor; `with_modes`
-                    // then puts the whole set on the route.
-                    modes[0],
-                    route_config.path_rewrite.clone(),
-                )
-                .with_l4_options(l4_options)
-                .with_modes(modes.clone())
-                .with_backend_protocol(backend_protocol)
-                .with_circuit_breaker(self.circuit_breaker()),
-            );
+        for spec in self.routes.iter().flatten() {
+            // The translation from the configuration's spelling of a route to
+            // the route the server serves is a `TryFrom`, and it takes the
+            // spec apart with a pattern that names every field — see
+            // `impl TryFrom<RouteSpec> for Route`.
+            //
+            // The spec is copied because the configuration is shared and this
+            // is a read of it; the copy happens once per route, when the
+            // configuration is loaded.
+            let route = crate::routes::Route::try_from(spec.clone())?;
+            // Copied out for the log line below, so that the route itself can
+            // be moved into the table.
+            let host_pattern = route.host_pattern().to_string();
+            let path_pattern = route.path_pattern().to_string();
+            let path_is_prefix = route.path_is_prefix();
+            let modes = route.modes().to_vec();
+            let strategy = route.backend_pool().strategy();
+            let backends_count = route.backend_pool().len();
+            routes.push(route.with_circuit_breaker(self.circuit_breaker()));
 
             tracing::info!(
                 "Loaded route: host={}, path={} (prefix={}), modes={:?}, backends={}, strategy={:?}",
@@ -1299,13 +1194,163 @@ impl ProxyConfig {
                     "  L4 route {}: client_ports={:?} (absent = every port matches; the port never \
                      decides where the connection goes), idle_timeout_secs={:?}",
                     host_pattern,
-                    client_ports,
-                    idle_timeout_secs
+                    spec.client_ports,
+                    spec.idle_timeout_secs
                 );
             }
         }
 
         Ok(routes)
+    }
+}
+
+impl TryFrom<RouteSpec> for crate::routes::Route {
+    type Error = anyhow::Error;
+
+    /// The translation from the configuration's spelling of a route to the
+    /// route the server serves.
+    ///
+    /// **The pattern the spec is taken apart with is the point.** It names
+    /// every field, so a field the schema grows and this does not is a
+    /// **compile error** — not a field that is quietly dropped.
+    ///
+    /// Before this, adding an option to `[proxy.routes]` and forgetting to
+    /// read it in the translation compiled fine and did nothing at all: the
+    /// operator set it, the server ignored it, and nothing said so. The
+    /// compiler could not have caught it, because the translation read the
+    /// fields it knew about and the field it did not know about was simply
+    /// not there.
+    fn try_from(spec: RouteSpec) -> Result<Self, Self::Error> {
+        let RouteSpec {
+            host_pattern,
+            path_pattern,
+            path_is_prefix,
+            strategy,
+            backends,
+            backend_protocol,
+            mode,
+            modes,
+            path_rewrite,
+            client_ports,
+            idle_timeout_secs,
+            flow_timeout_secs,
+            // Keys that are no longer read. They stay in the schema so that a
+            // configuration carrying one is told about it rather than having
+            // it ignored — see `ServerConfig`.
+            cert_path: _,
+            key_path: _,
+            redirect_to_https: _,
+        } = spec;
+
+        let strategy = get_strategy(&strategy);
+        let modes = get_route_modes(&mode, &modes);
+        let path_is_prefix = path_is_prefix.unwrap_or(true);
+        let label = format!("route {host_pattern}");
+
+        // Refused rather than matched loosely: a wildcard without its dot
+        // silently covers hosts that merely end in the same letters, so a
+        // config using one is a config that routes more than it says.
+        if let Some(why) = crate::routes::pattern_error(&host_pattern) {
+            anyhow::bail!("{label}: host_pattern {why}");
+        }
+
+        // A route with no backends matches and then has nothing to send
+        // the request to: `select_backend` answers with an empty string and
+        // the client gets a 502 that looks like a backend being down.
+        if backends.is_empty() {
+            anyhow::bail!("{label}: has no backends; a route needs at least one to forward to");
+        }
+
+        // A port no flow can arrive on, or an empty list that says "every
+        // port" by accident: either one is a route that never matches, and
+        // the operator has no way to notice — the client just gets refused.
+        if let Some(ports) = &client_ports {
+            if ports.is_empty() {
+                anyhow::bail!("{label}: client_ports is empty; leave it out to match every port");
+            }
+            if ports.contains(&0) {
+                anyhow::bail!(
+                    "{label}: client_ports contains port 0; no flow ever arrives from \
+                         port 0, so that entry can never match"
+                );
+            }
+        }
+
+        // A UDP flow with a zero idle timeout is closed as soon as it is
+        // opened: the tunnel is set up and torn down before the first
+        // datagram crosses it. Leave it out for the server default.
+        if idle_timeout_secs == Some(0) {
+            anyhow::bail!(
+                "{label}: idle_timeout_secs is 0, which closes a UDP flow the moment it \
+                     is opened; leave it out for the default"
+            );
+        }
+
+        // Same reasoning for the whole-flow bound: zero would close every flow
+        // the instant it opened, which is never what a zero here means.
+        if flow_timeout_secs == Some(0) {
+            anyhow::bail!(
+                "{label}: flow_timeout_secs is 0, which closes a flow the moment it is \
+                     opened; leave it out for the default"
+            );
+        }
+
+        // Every declared mode has to be able to dial these backends, so each
+        // one is checked: the `http` rules and the L4 rules disagree (a URL
+        // to fetch versus an address to dial, and only the L4 one insists on
+        // a port), and a route serving both has to satisfy both.
+        for backend in &backends {
+            for mode in &modes {
+                let label = format!("{label} (mode {mode:?})");
+                validate_backend(&label, *mode, backend)?;
+            }
+        }
+
+        // `h2c` is HTTP/2 in the clear, and an `https://` backend is spoken
+        // to over TLS — so the two cannot be combined: the client would
+        // start h2 in the clear at a port that expects TLS. Refused here
+        // rather than at the first request, because every request to that
+        // route would fail the same way.
+        let backend_protocol =
+            get_backend_protocol(&backend_protocol).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        if backend_protocol == BackendProtocol::H2c && modes.contains(&RouteMode::Http) {
+            for backend in &backends {
+                if url::Url::parse(backend)
+                    .map(|url| url.scheme() == "https")
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!(
+                        "{label}: backend_protocol = \"h2c\" speaks HTTP/2 in the clear, but \
+                             backend \"{backend}\" is https://. An https backend speaks HTTP/2 \
+                             through the TLS handshake, which is what backend_protocol = \
+                             \"http1\" already does; drop the key."
+                    );
+                }
+            }
+        }
+
+        // Only meaningful for `tcp` / `udp`, where they are harmless defaults
+        // otherwise; the other modes never read them.
+        let l4_options = L4Options {
+            client_ports,
+            idle_timeout: idle_timeout_secs.map(std::time::Duration::from_secs),
+            flow_timeout: flow_timeout_secs.map(std::time::Duration::from_secs),
+        };
+
+        Ok(crate::routes::Route::new(
+            &host_pattern,
+            &path_pattern,
+            path_is_prefix,
+            backends,
+            strategy,
+            // The first mode only seeds the constructor; `with_modes` then
+            // puts the whole set on the route.
+            modes[0],
+            path_rewrite,
+        )
+        .with_l4_options(l4_options)
+        .with_modes(modes)
+        .with_backend_protocol(backend_protocol))
     }
 }
 
@@ -3379,6 +3424,91 @@ fn sub_table<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every field of the spec reaches the route.
+    ///
+    /// The conversion takes the spec apart with a pattern that names every
+    /// field, so a field the schema grows and the conversion does not know
+    /// about is a **compile error**. This test is the other half of that: it
+    /// says that a field the conversion *does* know about is not quietly
+    /// dropped on the way to the route.
+    ///
+    /// Every field is set to something distinctive, so a field that stopped
+    /// being read would show up as a default rather than as a coincidence.
+    #[test]
+    fn every_field_of_the_spec_reaches_the_route() {
+        let spec = RouteSpec {
+            host_pattern: "*.example.com".to_string(),
+            path_pattern: "/api".to_string(),
+            path_is_prefix: Some(false),
+            strategy: Some("least_conn".to_string()),
+            backends: vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()],
+            backend_protocol: Some("h2c".to_string()),
+            mode: Some("tcp".to_string()),
+            modes: Some(vec!["udp".to_string()]),
+            path_rewrite: Some("/rewritten".to_string()),
+            client_ports: Some(vec![8443]),
+            idle_timeout_secs: Some(11),
+            flow_timeout_secs: Some(22),
+            cert_path: None,
+            key_path: None,
+            redirect_to_https: None,
+        };
+
+        let route = crate::routes::Route::try_from(spec).expect("the route is built");
+
+        assert_eq!(route.host_pattern(), "*.example.com");
+        assert_eq!(route.path_pattern(), "/api");
+        assert!(!route.path_is_prefix(), "path_is_prefix was set to false");
+        assert_eq!(
+            route.backend_pool().len(),
+            2,
+            "both backends are on the route"
+        );
+        assert!(
+            matches!(
+                route.backend_pool().strategy(),
+                crate::lb::LoadBalancingStrategy::LeastConn
+            ),
+            "the strategy was carried over"
+        );
+        assert_eq!(
+            route.backend_protocol(),
+            BackendProtocol::H2c,
+            "the backend protocol was carried over"
+        );
+        assert_eq!(
+            route.path_rewrite().as_deref(),
+            Some("/rewritten"),
+            "the path rewrite was carried over"
+        );
+        assert_eq!(
+            route.idle_timeout(),
+            Some(std::time::Duration::from_secs(11))
+        );
+        assert_eq!(
+            route.flow_timeout(),
+            Some(std::time::Duration::from_secs(22))
+        );
+        assert!(
+            route.modes().contains(&RouteMode::Tcp),
+            "the mode was carried over: {:?}",
+            route.modes()
+        );
+        assert!(
+            route.modes().contains(&RouteMode::Udp),
+            "the modes list was carried over: {:?}",
+            route.modes()
+        );
+        assert!(
+            route.matches_l4("a.example.com", 8443),
+            "the client port was carried over"
+        );
+        assert!(
+            !route.matches_l4("a.example.com", 9999),
+            "a port the spec did not name does not match"
+        );
+    }
     use super::*;
     use crate::auth::DeviceMaterial;
 

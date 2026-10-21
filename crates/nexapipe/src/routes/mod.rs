@@ -485,7 +485,7 @@ impl BackendInfo {
 /// What the L4 tunnel needs in order to serve one flow.
 pub struct L4RouteInfo {
     /// The address to dial, and the only address involved: the route decides
-    /// it, the client cannot. See [`RouteConfig::get_l4_backend`].
+    /// it, the client cannot. See [`RoutingTable::get_l4_backend`].
     pub backend: String,
     /// `udp` routes only; `None` means the caller's own default.
     pub idle_timeout: Option<Duration>,
@@ -514,7 +514,7 @@ impl std::fmt::Debug for L4RouteInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct RouteConfig {
+pub struct RoutingTable {
     /// The routing table.
     ///
     /// **The routes are shared.** A lookup that found a route used to copy it
@@ -542,7 +542,7 @@ pub struct RouteConfig {
     retry: Retry,
 }
 
-impl RouteConfig {
+impl RoutingTable {
     pub fn new(routes: Vec<Route>) -> Self {
         Self {
             routes: Arc::new(RwLock::new(shared(routes))),
@@ -988,7 +988,7 @@ mod tests {
         use crate::auth::ClientAcl;
 
         let route = http_route("api.iakl.top", &["http://10.0.0.5:18080"]);
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
 
         // The client may reach 443, and the route's backend is on 18080.
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443])).with_strict_ports(true);
@@ -1010,7 +1010,7 @@ mod tests {
         use crate::auth::ClientAcl;
 
         let route = http_route("api.iakl.top", &["http://10.0.0.5:443"]);
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
 
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443])).with_strict_ports(true);
 
@@ -1035,7 +1035,7 @@ mod tests {
         use crate::auth::ClientAcl;
 
         let route = http_route("api.iakl.top", &["http://10.0.0.5:18080"]);
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
 
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
 
@@ -1059,7 +1059,7 @@ mod tests {
             .backend_pool()
             .set_backend_health("http://10.0.0.5:8080", false)
             .await;
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
 
         assert!(
             config.get_backend("api.iakl.top", "/").await.is_found(),
@@ -1080,7 +1080,7 @@ mod tests {
         let pool = route.backend_pool().clone();
         pool.set_backend_health("http://10.0.0.5:8080", false).await;
         pool.set_backend_health("http://10.0.0.6:8080", false).await;
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
 
         assert!(
             matches!(
@@ -1112,7 +1112,7 @@ mod tests {
             RouteMode::Tcp,
         ]);
         let pool = route.backend_pool().clone();
-        let config = RouteConfig::new(vec![route]);
+        let config = RoutingTable::new(vec![route]);
         pool.set_backend_health("caddy:443", false).await;
         pool.set_backend_health("caddy2:443", false).await;
 
@@ -1157,7 +1157,7 @@ mod tests {
     /// share a host name.
     #[tokio::test]
     async fn each_mode_only_sees_its_own_routes() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
             http_route("fn.iroh.iakl.top", &["http://10.0.0.5:8080"]),
             http_route("mt.iroh.iakl.top", &["http://10.0.0.6:9000"]),
@@ -1206,7 +1206,7 @@ mod tests {
     /// entries, where forgetting the second one cost a runtime `NoRoute`.
     #[tokio::test]
     async fn one_route_may_serve_both_a_request_and_a_tunnel() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             http_route("fn.iroh.iakl.top", &["http://host.docker.internal:15666"])
                 .with_modes(vec![RouteMode::Http, RouteMode::Tcp]),
         ]);
@@ -1250,7 +1250,7 @@ mod tests {
     /// `passthrough`, even though both point at the same backend here.
     #[tokio::test]
     async fn one_config_serves_http_https_tcp_and_udp_at_once() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             // https:// reaching the server as raw TLS, routed by SNI.
             passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
             // http:// reaching it as a request, routed by Host.
@@ -1328,7 +1328,7 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_catch_all_and_exact_host_priority() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             passthrough_route("*", &["caddy:443"]),
             passthrough_route("other.iakl.top", &["caddy-alt:443"]),
         ]);
@@ -1371,7 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn l4_lookups_only_see_their_own_mode() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
             http_route("web.iroh.iakl.top", &["http://10.0.0.5:8080"]),
         ]);
@@ -1420,7 +1420,7 @@ mod tests {
         // The other route's backend is a real, working address here. If the
         // lookup served a host it has no route for, a mistyped domain would
         // quietly reach it instead of being refused.
-        let config = RouteConfig::new(vec![l4_route(
+        let config = RoutingTable::new(vec![l4_route(
             "db.iroh.iakl.top",
             RouteMode::Tcp,
             "10.0.0.50:5432",
@@ -1443,7 +1443,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_ports_pick_a_route_without_changing_its_target() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             l4_route(
                 "db.iroh.iakl.top",
                 RouteMode::Tcp,
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_client_ports_every_port_matches() {
-        let config = RouteConfig::new(vec![l4_route(
+        let config = RoutingTable::new(vec![l4_route(
             "db.iroh.iakl.top",
             RouteMode::Tcp,
             "10.0.0.50:5432",
@@ -1558,7 +1558,7 @@ mod tests {
     /// quietly reaching whatever service happened to be listed.
     #[tokio::test]
     async fn an_unrouted_host_is_answered_404() {
-        let config = RouteConfig::new(vec![http_route(
+        let config = RoutingTable::new(vec![http_route(
             "fn.iroh.iakl.top",
             &["http://10.0.0.5:8080"],
         )]);
@@ -1588,7 +1588,7 @@ mod tests {
     /// anything else: an SNI or L4 lookup cannot reach it.
     #[tokio::test]
     async fn a_catch_all_route_serves_every_unrouted_host() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
             http_route("*", &["http://10.0.0.9:9000"]),
         ]);
@@ -1634,7 +1634,7 @@ mod tests {
     async fn a_restricted_client_reaches_only_its_allowed_hosts() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
             http_route("admin.iakl.top", &["http://10.0.0.9:9090"]),
         ]);
@@ -1674,7 +1674,7 @@ mod tests {
     async fn a_restricted_client_needs_a_route_and_not_just_a_host() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             http_route("api.iakl.top", &["http://10.0.0.5:8080"]),
             http_route("*", &["http://10.0.0.9:9000"]),
         ]);
@@ -1725,7 +1725,7 @@ mod tests {
     /// neither may slip past it and reach a different service entirely.
     #[tokio::test]
     async fn a_differently_spelled_host_still_reaches_its_route() {
-        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
+        let config = RoutingTable::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
 
         for host in ["API.IAKL.TOP", "Api.Iakl.Top", "api.iakl.top."] {
             assert_eq!(
@@ -1743,7 +1743,7 @@ mod tests {
         // The pattern side is folded the same way, so a config written with
         // uppercase letters answers the lowercase request.
         let uppercase =
-            RouteConfig::new(vec![http_route("API.Iakl.Top", &["http://10.0.0.7:8080"])]);
+            RoutingTable::new(vec![http_route("API.Iakl.Top", &["http://10.0.0.7:8080"])]);
         assert_eq!(
             uppercase
                 .get_backend("api.iakl.top", "/")
@@ -1759,7 +1759,7 @@ mod tests {
     /// `matches_host`, so both are folded.
     #[tokio::test]
     async fn sni_and_l4_hosts_are_folded_the_same_way() {
-        let config = RouteConfig::new(vec![
+        let config = RoutingTable::new(vec![
             passthrough_route("fn.iroh.iakl.top", &["caddy:443"]),
             l4_route("db.iroh.iakl.top", RouteMode::Tcp, "10.0.0.50:5432", None),
         ]);
@@ -1788,7 +1788,7 @@ mod tests {
     /// actually goes through.
     #[tokio::test]
     async fn a_reload_keeps_the_pool_of_a_route_that_did_not_change() {
-        let config = RouteConfig::new(vec![http_route(
+        let config = RoutingTable::new(vec![http_route(
             "fn.iroh.iakl.top",
             &["http://10.0.0.5:8080"],
         )]);
@@ -1827,7 +1827,7 @@ mod tests {
     /// because a pool *is* the backends it dials.
     #[tokio::test]
     async fn a_route_that_changed_backends_gets_a_new_pool() {
-        let config = RouteConfig::new(vec![http_route(
+        let config = RoutingTable::new(vec![http_route(
             "fn.iroh.iakl.top",
             &["http://10.0.0.5:8080"],
         )]);
@@ -2030,7 +2030,7 @@ mod tests {
             flow_timeout: None,
         });
 
-        let config = RouteConfig::new(vec![every_port, only_443]);
+        let config = RoutingTable::new(vec![every_port, only_443]);
 
         assert_eq!(
             config
@@ -2062,7 +2062,7 @@ mod tests {
         let catch_all = http_route("*", &["http://10.0.0.1:8080"]);
         let wildcard = http_route("*.example.com", &["http://10.0.0.2:8080"]);
 
-        let catch_all_first = RouteConfig::new(vec![catch_all.clone(), wildcard.clone()]);
+        let catch_all_first = RoutingTable::new(vec![catch_all.clone(), wildcard.clone()]);
         assert_eq!(
             catch_all_first
                 .get_backend("api.example.com", "/")
@@ -2073,7 +2073,7 @@ mod tests {
             "http://10.0.0.2:8080"
         );
 
-        let wildcard_first = RouteConfig::new(vec![wildcard, catch_all]);
+        let wildcard_first = RoutingTable::new(vec![wildcard, catch_all]);
         assert_eq!(
             wildcard_first
                 .get_backend("api.example.com", "/")
@@ -2100,7 +2100,7 @@ mod tests {
     /// reaches the route written for that address.
     #[tokio::test]
     async fn a_request_for_an_ipv6_literal_reaches_its_route() {
-        let config = RouteConfig::new(vec![http_route("::1", &["http://10.0.0.5:8080"])]);
+        let config = RoutingTable::new(vec![http_route("::1", &["http://10.0.0.5:8080"])]);
 
         assert_eq!(
             config
@@ -2166,7 +2166,7 @@ mod tests {
     async fn a_port_the_acl_does_not_list_is_refused_the_way_a_host_is() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
+        let config = RoutingTable::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
 
         assert_eq!(
@@ -2193,7 +2193,7 @@ mod tests {
     async fn a_request_that_names_no_port_is_not_held_against_the_port_list() {
         use crate::auth::ClientAcl;
 
-        let config = RouteConfig::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
+        let config = RoutingTable::new(vec![http_route("api.iakl.top", &["http://10.0.0.5:8080"])]);
         let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
 
         assert_eq!(
