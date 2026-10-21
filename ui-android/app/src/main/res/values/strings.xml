@@ -237,6 +237,7 @@
     <string name="notification_channel_name">Nexa</string>
     <string name="notification_channel_description">Nexa Service</string>
     <string name="notification_title">Nexa</string>
+    <string name="notification_text_connecting">Connecting…</string>
     <string name="notification_text">Connected</string>
     <!-- The same line once throughput is known: up and down rates in KiB/s or MiB/s. -->
     <string name="notification_text_rate">Connected · ↑ %1$s · ↓ %2$s</string>
@@ -244,6 +245,9 @@
     <string name="notify_tunnel_rebuild_failed">The tunnel could not be rebuilt after the network changed. Please reconnect.</string>
 
     <!-- Taking the single VPN slot from another VPN app -->
+    <string name="auto_connect_on_boot_title">Reconnect after a restart</string>
+    <string name="auto_connect_on_boot_subtitle">Bring the tunnel back by itself when this phone is switched on</string>
+    <string name="auto_connect_on_boot_consent_missing">The VPN permission has to be granted again before the tunnel can come back. Open the app to grant it.</string>
     <string name="vpn_takeover_title">Another VPN is already active</string>
     <string name="vpn_takeover_body">Android allows only one VPN at a time, so continuing will disconnect it.</string>
     <string name="vpn_takeover_confirm">Take over</string>
