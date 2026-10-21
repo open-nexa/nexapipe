@@ -187,12 +187,17 @@ max_size_mb = 0
 max_files = 14
 # Also write to stdout. Default true.
 console = true
-# Replace query-string values with <redacted> in the access log, keeping the
+# Replace query-string values with <redacted> in the log, keeping the
 # names. Default true.
 #   /api/items?token=hunter2&page=2 -> /api/items?token=<redacted>&page=<redacted>
 # Tokens, signatures and one-time codes travel in query values, and a log file
 # gets rotated, archived and handed around - so values are dropped and the names
 # that make the line worth reading stay. Set false to log URIs verbatim.
+#
+# This covers every place a URI is written down: the access log and the
+# general log, including the request line a tracing span carries. A URI that
+# reached the span used to reach the general log file unredacted, while the
+# access log's copy of the same URI was clean.
 redact_query = true
 
 # ============================================================
