@@ -18,7 +18,7 @@ use iroh::EndpointId;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// The `[limits]` section: the ceilings the whole process runs under.
 ///
@@ -480,8 +480,11 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 /// the one with a `content-length` takes the whole declared size before its
 /// first read, because QUIC is a byte stream and a peer decides how much body
 /// rides along with the head, so the declared size is the only honest number;
-/// the chunked one grows per decoded frame, because a chunked body declares no
-/// length and there is no moment at which the total is knowable.
+/// the chunked one charges the raw bytes as they arrive, because a chunked
+/// body declares no length and there is no moment at which the total is
+/// knowable — and a peer that declares a 64 MiB chunk and then trickles the
+/// data into it holds those bytes for as long as it takes, so the budget has
+/// to see them.
 ///
 /// Every reader returns its reservation to its caller rather than dropping it:
 /// the bytes are still held after the read, right up to when the body goes to
@@ -491,7 +494,9 @@ const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 /// A process-wide static rather than something threaded through every call: the
 /// bodies are read deep inside the HTTP path, and the alternative is a parameter
 /// on every function between the accept loop and the readers. The same trade
-/// [`config_write_gate`](crate::conn::config_write_gate) makes.
+/// [`config_write_gate`](crate::conn::config_write_gate) makes. A reader that
+/// needs a budget of its own takes it as a parameter — that is how the chunked
+/// reader is tested without touching the shared one.
 #[derive(Debug)]
 pub struct ByteBudget {
     held: AtomicUsize,
@@ -550,13 +555,27 @@ impl ByteBudget {
         }
     }
 
-    /// Gives back a reservation. Saturating, so a double release cannot wrap the
-    /// counter and make the budget look permanently full.
+    /// Gives back a reservation.
+    ///
+    /// Saturating, in one step: a double release cannot wrap the counter and
+    /// make the budget look permanently full, and two releases that race
+    /// cannot both subtract from the same total. A load followed by a separate
+    /// `fetch_sub` does both — it reads a total, then subtracts from whatever
+    /// the counter says by then, which is not the total it read.
     pub fn release(&self, bytes: usize) {
-        self.held.fetch_sub(
-            bytes.min(self.held.load(Ordering::Acquire)),
-            Ordering::AcqRel,
-        );
+        let mut current = self.held.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.held.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Bytes currently reserved, for metrics and diagnostics.
@@ -571,17 +590,22 @@ impl ByteBudget {
 
 /// The process-wide body budget.
 ///
-/// A `static` rather than a `OnceLock`, because the ceiling it enforces is
+/// A `LazyLock` rather than a `OnceLock`, because the ceiling it enforces is
 /// written into it after it exists: the budget has to be reachable from the
 /// body readers, which are deep inside the HTTP path and hold no config, and
 /// the ceiling comes from the configuration, which is read at startup.
 ///
-/// The ceiling it starts with is the default one, and
-/// [`init_body_budget`] replaces it before the first request is served.
-static BUDGET: ByteBudget = ByteBudget::new(DEFAULT_MAX_BODY_BYTES_GLOBAL);
+/// Behind an [`Arc`] because a reservation holds on to the budget it was taken
+/// from, and a reader that is given a budget of its own — a test that must
+/// not touch the shared one — has to be able to hand the same budget to it.
+static BUDGET: LazyLock<Arc<ByteBudget>> =
+    LazyLock::new(|| Arc::new(ByteBudget::new(DEFAULT_MAX_BODY_BYTES_GLOBAL)));
 
 /// The process-wide body budget.
-pub fn body_budget() -> &'static ByteBudget {
+///
+/// The one every request is charged against. A caller with a budget of its own
+/// names it where the budget is taken rather than reaching for this one.
+pub fn body_budget() -> &'static Arc<ByteBudget> {
     &BUDGET
 }
 
@@ -613,16 +637,28 @@ pub fn init_body_budget(max: usize) {
 /// holding a reservation on something it never sends.
 #[derive(Debug)]
 pub struct ByteReservation {
-    budget: &'static ByteBudget,
+    budget: Arc<ByteBudget>,
     bytes: usize,
 }
 
 impl ByteReservation {
-    /// Reserves `bytes`, or explains that the process is full.
+    /// Reserves `bytes` from the process-wide budget, or explains that the
+    /// process is full.
     pub fn take(bytes: usize) -> anyhow::Result<Self> {
-        let budget = body_budget();
+        Self::take_from(body_budget(), bytes)
+    }
+
+    /// Reserves `bytes` from a named budget, or explains that it is full.
+    ///
+    /// The process-wide one is what the request path uses. A caller with a
+    /// budget of its own — a test that must not disturb the shared one, or a
+    /// future path that is accounted separately — names it here.
+    pub(crate) fn take_from(budget: &Arc<ByteBudget>, bytes: usize) -> anyhow::Result<Self> {
         match budget.try_reserve(bytes) {
-            Ok(()) => Ok(Self { budget, bytes }),
+            Ok(()) => Ok(Self {
+                budget: budget.clone(),
+                bytes,
+            }),
             Err(held) => Err(anyhow::anyhow!(
                 "the server is holding {held} of {} bytes of request bodies, so this {} byte \
                  body does not fit",
@@ -637,7 +673,7 @@ impl ByteReservation {
     /// Called once per body frame as it arrives. On failure nothing is added,
     /// so the caller's `Drop` still gives back exactly what was taken.
     pub fn grow(&mut self, bytes: usize) -> anyhow::Result<()> {
-        let budget = self.budget;
+        let budget = &self.budget;
         match budget.try_reserve(bytes) {
             Ok(()) => {
                 self.bytes += bytes;
@@ -652,6 +688,22 @@ impl ByteReservation {
         }
     }
 
+    /// Gives back `bytes` that are no longer held.
+    ///
+    /// A body read as raw chunks holds the raw bytes until each chunk decodes,
+    /// and then holds the decoded ones instead — fewer bytes, but a different
+    /// set of them. This is how the difference is returned to the budget, so
+    /// the total keeps meaning "bytes held right now".
+    ///
+    /// More than the reservation holds is not returned: the counter never
+    /// goes below zero, so a caller that gives back too much leaves the
+    /// budget as it was rather than making it look emptier than it is.
+    pub fn shrink(&mut self, bytes: usize) {
+        let released = bytes.min(self.bytes);
+        self.bytes -= released;
+        self.budget.release(released);
+    }
+
     /// Bytes this reservation is holding.
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -663,7 +715,7 @@ impl ByteReservation {
     /// cannot forget to release in one branch and not the other.
     pub fn empty() -> Self {
         Self {
-            budget: body_budget(),
+            budget: body_budget().clone(),
             bytes: 0,
         }
     }
@@ -944,6 +996,88 @@ mod tests {
         assert!(
             ByteReservation::take(1).is_ok(),
             "a released budget admits the next body"
+        );
+    }
+
+    #[test]
+    fn a_reservation_gives_back_the_bytes_it_no_longer_holds() {
+        let budget = Arc::new(ByteBudget::new(1000));
+
+        let mut reservation =
+            ByteReservation::take_from(&budget, 100).expect("the body fits the budget");
+        assert_eq!(budget.held(), 100);
+
+        reservation.grow(50).expect("the body grows");
+        assert_eq!(budget.held(), 150);
+        assert_eq!(reservation.bytes(), 150);
+
+        // The framing of a decoded chunk is gone: the bytes it used are given
+        // back, and what the reservation holds is what is still in memory.
+        reservation.shrink(30);
+        assert_eq!(budget.held(), 120);
+        assert_eq!(reservation.bytes(), 120);
+
+        // More than it holds is not given back: the counter never goes below
+        // zero, so a caller that gives back too much leaves the budget as it
+        // was rather than making it look emptier than it is.
+        reservation.shrink(1000);
+        assert_eq!(budget.held(), 0);
+        assert_eq!(reservation.bytes(), 0);
+
+        drop(reservation);
+        assert_eq!(
+            budget.held(),
+            0,
+            "a reservation that holds nothing gives nothing back"
+        );
+    }
+
+    #[test]
+    fn concurrent_releases_never_take_the_counter_below_zero() {
+        // A release that reads the total and subtracts from it in a second
+        // step subtracts from whatever the counter says by then, which is not
+        // the total it read: two releases that race can both take the same
+        // bytes, and the counter wraps around to near its maximum. A budget
+        // that reads as permanently full refuses every body from then on, so
+        // this is worth a test that races it on purpose.
+        //
+        // The shape is what makes the race reachable: the counter holds one
+        // chunk, and every thread gives that same chunk back at the same
+        // time. A release that subtracts what it read takes the chunk twice,
+        // and the counter goes below zero — which is where the wrap is.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 1_000;
+        const CHUNK: usize = 64;
+
+        let budget = Arc::new(ByteBudget::new(usize::MAX));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let budget = budget.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        // The counter is one chunk: one thread takes it, and
+                        // then every thread gives it back at the same time.
+                        if thread == 0 {
+                            budget.try_reserve(CHUNK).expect("the budget has room");
+                        }
+                        barrier.wait();
+                        budget.release(CHUNK);
+                        barrier.wait();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no release panicked");
+        }
+
+        assert_eq!(
+            budget.held(),
+            0,
+            "every released byte is gone, and none of them went past zero"
         );
     }
 

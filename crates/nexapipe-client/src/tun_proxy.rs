@@ -177,7 +177,7 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 /// first.
 const UDP_FLOW_IDLE: Duration = Duration::from_secs(50);
 
-/// How often a TCP flow looks at the stop flag while it is copying bytes.
+/// How often a flow looks at the stop flag while it is running.
 ///
 /// A flow is not one of the tasks `stop()` aborts, so this is how it finds out
 /// the proxy is gone — and it has to, because it is holding a pooled connection
@@ -530,6 +530,22 @@ fn stop_started_tasks(tasks: &[JoinHandle<()>], stopped: &AtomicBool) {
     stopped.store(true, Ordering::Release);
     for task in tasks {
         task.abort();
+    }
+}
+
+/// Resolves once the proxy has been told to stop.
+///
+/// Polled, because there is nothing to await on a bool, and a wake-up per flow
+/// is far cheaper than a connection stuck until the app gives up on it.
+///
+/// **Every flow needs this.** A flow is not one of the tasks `stop()` aborts:
+/// it is spawned by the demultiplexer or the acceptor, and aborting the
+/// demultiplexer does not abort the flows it started. A flow that outlives the
+/// proxy keeps a pooled connection checked out of a group nobody can close,
+/// and the only thing that gives it back is the flow itself ending.
+async fn wait_for_stop(stopped: Arc<AtomicBool>) {
+    while !stopped.load(Ordering::Acquire) {
+        tokio::time::sleep(STOP_POLL_INTERVAL).await;
     }
 }
 
@@ -1028,7 +1044,15 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
 ///
 /// Nothing is sniffed: the domain came from the destination address, so a raw
 /// binary protocol on any port works as well as TLS on 443.
-async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, port: u16) {
+///
+/// The domain is the shared name the address mapping handed out, so a flow
+/// that starts costs a reference count rather than a copy of the name.
+async fn serve_tcp_flow(
+    stream: SmolTcpStream,
+    ctx: TunContext,
+    domain: std::sync::Arc<str>,
+    port: u16,
+) {
     // The tunnel is opened before any payload is read, so the application sees
     // the connection go quiet rather than being told a connection exists that
     // the server has no route for.
@@ -1120,19 +1144,39 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
     // No idle timeout on top of that, unlike the UDP flows: a TCP connection
     // may legitimately sit quiet for minutes, and only the applications at
     // either end can say when it is finished.
+    //
+    // **Both halves, not whichever ends first.** A TCP half-close is a
+    // request, not an ending: an application that writes its request and then
+    // shuts down its write side is saying "I am done sending", and the
+    // backend's reply still has to arrive. Racing the two halves and dropping
+    // the loser cut that reply off — the FIN above was propagated correctly
+    // and then the select ended the flow before the reply could come back.
+    //
+    // The total bound is the one the copy loop was always meant to have:
+    // `STREAM_SECS`, an hour. It matches the server's own `l4_flow` default,
+    // so the two ends of the tunnel give up at about the same moment, and it
+    // is what keeps a half-closed flow from holding its resources for the
+    // life of the process.
+    let stream_budget = crate::deadline::Deadlines::default().stream;
+    let both_halves = async {
+        tokio::join!(app_to_tunnel, tunnel_to_app);
+    };
     tokio::select! {
-        _ = app_to_tunnel => (),
-        _ = tunnel_to_app => (),
-        _ = async {
-            while !ctx.stopped.load(Ordering::Acquire) {
-                tokio::time::sleep(STOP_POLL_INTERVAL).await;
-            }
-        } => (),
+        _ = both_halves => (),
+        _ = wait_for_stop(ctx.stopped.clone()) => (),
         // Asked to end, which is the fourth way out and the only one that is
         // somebody's decision rather than something that happened to the socket.
         // It lands here rather than anywhere else because this select is the
         // only thing that owns both halves.
         _ = flow.cancelled() => (),
+        _ = tokio::time::sleep(stream_budget) => {
+            jni_log!(
+                "[tun-proxy] TCP {}:{} ran for {:?} and was abandoned",
+                domain,
+                port,
+                stream_budget
+            );
+        }
     }
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,
@@ -1162,6 +1206,7 @@ type FlowKey = (SocketAddr, SocketAddr);
 type FlowTable = Arc<Mutex<HashMap<FlowKey, mpsc::Sender<Vec<u8>>>>>;
 
 /// Which side of a UDP flow spoke.
+#[derive(Debug)]
 enum Activity {
     /// A datagram from the application; `None` means the flow was replaced.
     Application(Option<Vec<u8>>),
@@ -1169,6 +1214,40 @@ enum Activity {
     Tunnel(Result<Option<usize>, String>),
     /// Somebody asked for this flow to end. Neither side spoke.
     Cancelled,
+    /// The proxy is stopping. Neither side spoke.
+    Stopped,
+}
+
+/// Waits for the next thing a UDP flow has to react to.
+///
+/// Four ways out: the application sent a datagram, the tunnel sent bytes, the
+/// flow was asked to end, or the proxy is stopping.
+///
+/// **The last one is the reason this is here.** A flow is spawned by the
+/// demultiplexer, and aborting the demultiplexer does not abort the flows it
+/// started — the channel that feeds them stays open, so `datagrams.recv()`
+/// never returns `None` and the flow has no reason to end on its own. A flow
+/// that outlives the proxy keeps a pooled connection checked out of a group
+/// nobody can close, and it sits on a tunnel until the server's idle timeout
+/// closes it: fifty seconds after the proxy is gone.
+///
+/// The futures are taken as arguments so that the choice between the four can
+/// be tested without a tunnel: a test hands in ones that never resolve, and
+/// one that does.
+async fn next_activity<D, T, C, S, E>(datagram: D, tunnel: T, cancelled: C, stopping: S) -> Activity
+where
+    D: std::future::Future<Output = Option<Vec<u8>>>,
+    T: std::future::Future<Output = Result<Option<usize>, E>>,
+    E: std::fmt::Display,
+    C: std::future::Future<Output = ()>,
+    S: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        datagram = datagram => Activity::Application(datagram),
+        read = tunnel => Activity::Tunnel(read.map_err(|e| e.to_string())),
+        _ = cancelled => Activity::Cancelled,
+        _ = stopping => Activity::Stopped,
+    }
 }
 
 /// Write every datagram the proxy has for the application back into the stack.
@@ -1325,7 +1404,7 @@ async fn run_udp_flow(
     key: FlowKey,
     mine: mpsc::Sender<Vec<u8>>,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
-    domain: String,
+    domain: std::sync::Arc<str>,
 ) {
     let (client_addr, virtual_dst) = key;
     let port = virtual_dst.port();
@@ -1368,18 +1447,15 @@ async fn run_udp_flow(
     loop {
         // Silence in *either* direction is what ends a flow, so the timer wraps
         // the whole step rather than just the tunnel read.
-        let activity = match tokio::time::timeout(UDP_FLOW_IDLE, async {
-            tokio::select! {
-                datagram = datagrams.recv() => Activity::Application(datagram),
-                read = tunnel_recv.read(&mut read_buf) => {
-                    Activity::Tunnel(read.map_err(|e| e.to_string()))
-                }
-                // Asked to end. Inside the idle timeout with the other two,
-                // because silence in either direction is what ends a flow and a
-                // request to end one is just a third way of going quiet.
-                _ = flow.cancelled() => Activity::Cancelled,
-            }
-        })
+        let activity = match tokio::time::timeout(
+            UDP_FLOW_IDLE,
+            next_activity(
+                datagrams.recv(),
+                tunnel_recv.read(&mut read_buf),
+                flow.cancelled(),
+                wait_for_stop(ctx.stopped.clone()),
+            ),
+        )
         .await
         {
             Ok(activity) => activity,
@@ -1490,6 +1566,18 @@ async fn run_udp_flow(
             Activity::Cancelled => {
                 jni_log!(
                     "[tun-proxy] UDP flow {} -> {}:{} closed by request",
+                    client_addr,
+                    domain,
+                    port
+                );
+                break;
+            }
+            // The proxy is going away. Without this the flow sits on its tunnel
+            // until the server's idle timeout closes it, holding a pooled
+            // connection the whole time.
+            Activity::Stopped => {
+                jni_log!(
+                    "[tun-proxy] UDP flow {} -> {}:{} ended: the proxy is stopping",
                     client_addr,
                     domain,
                     port
@@ -2174,11 +2262,13 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheKey, CachedAnswer, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, IpMapping,
+        Activity, CacheKey, CachedAnswer, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, IpMapping,
         answer_matches_query, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
-        cached_answer_at, handle_dns_query, lock_cache, parse_dns_query, read_u32, remember_answer,
-        resolver_scope, set_answer_ttls,
+        cached_answer_at, handle_dns_query, lock_cache, next_activity, parse_dns_query, read_u32,
+        remember_answer, resolver_scope, set_answer_ttls, wait_for_stop,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// The resolvers every test answer claims to have come from. What matters
@@ -2592,7 +2682,7 @@ mod tests {
             mapping.lookup_domain(&std::net::Ipv4Addr::new(
                 rdata[0], rdata[1], rdata[2], rdata[3]
             )),
-            Some("example.com".to_string()),
+            Some(std::sync::Arc::from("example.com")),
             "the answer has to route: the stack looks the destination up here"
         );
     }
@@ -2611,7 +2701,7 @@ mod tests {
         let address = std::net::Ipv6Addr::from(octets);
         assert_eq!(
             mapping.lookup_domain_v6(&address),
-            Some("example.com".to_string()),
+            Some(std::sync::Arc::from("example.com")),
             "the same reverse lookup the packet path uses"
         );
     }
@@ -2648,5 +2738,85 @@ mod tests {
         assert_eq!(rtype_aaaa, DNS_TYPE_AAAA);
         assert_ne!(rdata_a.len(), rdata_aaaa.len());
         assert_eq!(mapping.len(), 2, "one mapping per family for one name");
+    }
+
+    /// A UDP flow ends when the proxy stops.
+    ///
+    /// A flow is spawned by the demultiplexer, and aborting the demultiplexer
+    /// does not abort the flows it started: the channel that feeds them stays
+    /// open, so `datagrams.recv()` never returns `None` and the flow has no
+    /// reason to end on its own. It used to sit on its tunnel until the
+    /// server's idle timeout closed it — fifty seconds after the proxy was
+    /// gone — holding a pooled connection the whole time.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_flow_notices_that_the_proxy_is_stopping() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, Ordering::Release);
+        });
+
+        let activity = tokio::time::timeout(
+            Duration::from_secs(30),
+            next_activity(
+                std::future::pending::<Option<Vec<u8>>>(),
+                std::future::pending::<Result<Option<usize>, String>>(),
+                std::future::pending::<()>(),
+                wait_for_stop(stopped),
+            ),
+        )
+        .await
+        .expect("the flow notices that the proxy is stopping");
+
+        assert!(matches!(activity, Activity::Stopped));
+    }
+
+    /// The stop branch does not take the datagram away.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_flow_still_reports_the_datagram_it_received() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        sender
+            .send(b"hello".to_vec())
+            .await
+            .expect("the datagram is queued");
+
+        let activity = next_activity(
+            receiver.recv(),
+            std::future::pending::<Result<Option<usize>, String>>(),
+            std::future::pending::<()>(),
+            wait_for_stop(Arc::new(AtomicBool::new(false))),
+        )
+        .await;
+
+        match activity {
+            Activity::Application(Some(datagram)) => assert_eq!(datagram, b"hello"),
+            other => panic!("expected the datagram, got {other:?}"),
+        }
+    }
+
+    /// The stop branch does not take the tunnel's bytes away either.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_flow_still_reports_the_bytes_the_tunnel_sent() {
+        let activity = next_activity(
+            std::future::pending::<Option<Vec<u8>>>(),
+            std::future::ready(Ok::<Option<usize>, String>(Some(7))),
+            std::future::pending::<()>(),
+            wait_for_stop(Arc::new(AtomicBool::new(false))),
+        )
+        .await;
+
+        assert!(matches!(activity, Activity::Tunnel(Ok(Some(7)))));
+    }
+
+    /// The watch does not sit out a poll interval for a flag that is already
+    /// set: a flow that starts after the proxy stopped should end at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_watch_returns_at_once_when_the_proxy_is_already_stopped() {
+        let stopped = Arc::new(AtomicBool::new(true));
+
+        tokio::time::timeout(Duration::from_secs(5), wait_for_stop(stopped))
+            .await
+            .expect("the watch does not wait for a flag that is already set");
     }
 }

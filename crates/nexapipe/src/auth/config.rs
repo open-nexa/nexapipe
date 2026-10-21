@@ -604,7 +604,7 @@ impl ClientAcl {
                     // Folded as a pattern, not as a host: a spelling that
                     // would fold into the catch-all keeps its own shape, so an
                     // allow-list can never end up authorizing every host.
-                    .map(|h| crate::routes::normalize_pattern(h))
+                    .map(|h| crate::routes::normalize_pattern(h).into_owned())
                     .collect()
             }),
             ports: ports.map(|ports| ports.to_vec()),

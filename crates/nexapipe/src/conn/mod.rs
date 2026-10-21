@@ -195,6 +195,117 @@ impl StreamBudgets {
     fn identify_budget(&self) -> std::time::Duration {
         self.identify - self.open
     }
+
+    /// How long the head may take, from the moment the stream opened.
+    fn head_budget(&self) -> std::time::Duration {
+        self.head - self.open
+    }
+}
+
+/// What the first bytes of a stream turned out to be.
+#[derive(Debug)]
+enum StreamHead {
+    /// An HTTP request head, and the bytes that arrived with it.
+    Request { head: Vec<u8>, body: Vec<u8> },
+    /// Not an HTTP request: an L4 preface or a TLS ClientHello. The bytes are
+    /// handed on unconsumed, because the client may have sent its first
+    /// payload in the same segment.
+    Other(Vec<u8>),
+    /// The head was over the limit, and this is how large it had grown.
+    TooLarge(usize),
+    /// The peer went away before the head was finished.
+    Incomplete,
+}
+
+/// Reads the head of a request off a stream.
+///
+/// Generic over the reader so that the whole path can be driven from a test
+/// with a `duplex` pair, the way the L4 preface is: the rules decided here are
+/// worth more than the I/O around them, and the I/O is the part that is hard
+/// to reproduce on demand.
+///
+/// The rules are three, and each of them used to be a different accident:
+///
+/// * a head over the limit is **refused** — it used to be parsed anyway, with
+///   its last line truncated into a header that looked valid;
+/// * a head the peer abandoned is **not a request** — it used to be parsed and
+///   forwarded, so half a request line became a header;
+/// * a head that finished is a request, and the bytes after it are kept.
+async fn read_stream_head<R>(
+    recv: &mut R,
+    budgets: &StreamBudgets,
+) -> Result<StreamHead, anyhow::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // Doubling on demand, so a head that fits in one read never pays for a
+    // bigger buffer while a large one still gets there in a few reallocs.
+    // Pre-allocating the 64 KB limit would take that much from every stream.
+    let mut buf = Vec::with_capacity(8192);
+    let mut read_buf = [0u8; 8192];
+    let mut body_data = Vec::new();
+    // How much of `buf` has already been scanned for the end of the headers.
+    let mut searched = 0usize;
+
+    let header_secs = budgets.head_budget().as_secs();
+    let identify_secs = budgets.identify_budget().as_secs();
+
+    // The first read identifies the protocol and is bounded by the budget
+    // above; every read after it is part of the head and is bounded by the
+    // head's own deadline.
+    let mut identifying = true;
+    loop {
+        let (deadline, secs, what) = if identifying {
+            identifying = false;
+            (budgets.identify, identify_secs, "first byte")
+        } else {
+            (budgets.head, header_secs, "request head")
+        };
+        let read = tokio::time::timeout_at(deadline, recv.read(&mut read_buf)).await;
+        match read {
+            // Zero bytes is the end of the stream, which is the reader's way of
+            // saying the peer is gone.
+            Ok(Ok(0)) => return Ok(StreamHead::Incomplete),
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&read_buf[..n]);
+
+                // An L4 tunnel says so in its first byte, so it is recognised
+                // rather than sniffed, and a TLS session is not a request at
+                // all. Both are handed on with the bytes they came with.
+                if buf
+                    .first()
+                    .is_some_and(|b| l4::is_l4_stream(*b) || passthrough::is_tls_handshake(*b))
+                {
+                    return Ok(StreamHead::Other(buf));
+                }
+
+                if let Some(pos) = find_headers_end(&buf, searched) {
+                    let headers_end = pos + 4;
+                    if buf.len() > headers_end {
+                        body_data.extend_from_slice(&buf[headers_end..]);
+                    }
+                    buf.truncate(headers_end);
+                    return Ok(StreamHead::Request {
+                        head: buf,
+                        body: body_data,
+                    });
+                }
+
+                // The marker can straddle two reads, so the last three bytes
+                // are looked at again; everything before them cannot start a
+                // marker that was not already ruled out.
+                searched = buf.len().saturating_sub(3);
+
+                if buf.len() > 64 * 1024 {
+                    return Ok(StreamHead::TooLarge(buf.len()));
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(anyhow::anyhow!("no {} within {}s", what, secs));
+            }
+        }
+    }
 }
 
 // One more argument than clippy allows, and bundling them into a struct would
@@ -216,14 +327,6 @@ pub async fn handle_bidi_stream(
     who: PeerIdentity,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
-    // Doubling on demand, so a head that fits in one read never pays for a
-    // bigger buffer while a large one still gets there in a few reallocs.
-    // Pre-allocating the 64 KB limit would take that much from every stream.
-    let mut buf = Vec::with_capacity(8192);
-    let mut read_buf = [0u8; 8192];
-    let mut body_data = Vec::new();
-    // How much of `buf` has already been scanned for the end of the headers.
-    let mut searched = 0usize;
 
     // A phase deadline over the whole head, taken once and never renewed: a
     // peer that drips one byte before each expiry renews nothing. The bound is
@@ -231,96 +334,102 @@ pub async fn handle_bidi_stream(
     let timeouts = config.timeouts();
     let open = tokio::time::Instant::now();
     let budgets = StreamBudgets::new(&timeouts.deadlines, open);
-    let header_secs = timeouts.deadlines.header.as_secs();
-    let identify_secs = budgets.identify_budget().as_secs();
 
-    // The first read identifies the protocol and is bounded by the budget
-    // above; every read after it is part of the head and is bounded by the
-    // head's own deadline.
-    let mut identifying = true;
-    loop {
-        let (deadline, secs, what) = if identifying {
-            identifying = false;
-            (budgets.identify, identify_secs, "first byte")
-        } else {
-            (budgets.head, header_secs, "request head")
-        };
-        let read = tokio::time::timeout_at(deadline, recv.read(&mut read_buf)).await;
-        match read {
-            Ok(Ok(None)) => break,
-            Ok(Ok(Some(n))) => {
-                buf.extend_from_slice(&read_buf[..n]);
+    let (buf, body_data) = match read_stream_head(&mut recv, &budgets).await {
+        Ok(StreamHead::Request { head, body }) => (head, body),
 
-                // An L4 tunnel says so in its first byte, so it is recognised
-                // rather than sniffed. This has to happen before the HTTP header
-                // loop below: a preface is not a request line, and the client may
-                // send its first payload in the same segment, which `buf` already
-                // holds and must hand over intact.
-                if buf.first().is_some_and(|b| l4::is_l4_stream(*b)) {
-                    return l4::handle_iroh_stream(
-                        send,
-                        recv,
-                        buf,
-                        config,
-                        limiter,
-                        peer,
-                        acl.as_deref(),
-                        request_id,
-                        Some(&who),
-                    )
-                    .await;
-                }
-
-                // TLS is terminated by the backend, so a ClientHello is not a
-                // request: hand the raw bytes (and both halves of the stream)
-                // to the passthrough path, which routes on SNI.
-                if buf
-                    .first()
-                    .is_some_and(|b| passthrough::is_tls_handshake(*b))
-                {
-                    return passthrough::handle_iroh_stream(
-                        send,
-                        recv,
-                        buf,
-                        config,
-                        acl.as_deref(),
-                    )
-                    .await;
-                }
-
-                if let Some(pos) = find_headers_end(&buf, searched) {
-                    let headers_end = pos + 4;
-                    if buf.len() > headers_end {
-                        body_data.extend_from_slice(&buf[headers_end..]);
-                    }
-                    buf.truncate(headers_end);
-                    break;
-                }
-
-                // The marker can straddle two reads, so the last three bytes
-                // are looked at again; everything before them cannot start a
-                // marker that was not already ruled out.
-                searched = buf.len().saturating_sub(3);
-
-                if buf.len() > 64 * 1024 {
-                    tracing::warn!("Request headers too large");
-                    break;
-                }
+        Ok(StreamHead::Other(bytes)) => {
+            // An L4 tunnel says so in its first byte, so it is recognised
+            // rather than sniffed. This has to happen before the HTTP header
+            // loop: a preface is not a request line, and the client may send
+            // its first payload in the same segment, which the bytes already
+            // hold and must hand over intact.
+            if bytes.first().is_some_and(|b| l4::is_l4_stream(*b)) {
+                return l4::handle_iroh_stream(
+                    send,
+                    recv,
+                    bytes,
+                    config,
+                    limiter,
+                    peer,
+                    acl.as_deref(),
+                    request_id,
+                    Some(&who),
+                )
+                .await;
             }
-            Ok(Err(e)) => {
-                tracing::debug!("Failed to read from iroh stream: {}", e);
-                return Err(e.into());
-            }
-            Err(_) => {
-                tracing::warn!("No {} from {} within {}s", what, peer, secs);
-                return Err(anyhow::anyhow!("no {} within {}s", what, secs));
-            }
+            // TLS is terminated by the backend, so a ClientHello is not a
+            // request: hand the raw bytes (and both halves of the stream) to
+            // the passthrough path, which routes on SNI.
+            return passthrough::handle_iroh_stream(send, recv, bytes, config, acl.as_deref())
+                .await;
         }
-    }
+
+        Ok(StreamHead::TooLarge(size)) => {
+            // Refused, not served. This used to `break` out of the read loop
+            // with a head that was never finished, and the parser below read
+            // that as a request: every line of it became a header, the last
+            // one with a truncated value, and the request was forwarded to a
+            // backend. The log said "headers too large" and the backend was
+            // asked anyway.
+            tracing::warn!("Request headers too large: {} bytes, refusing", size);
+            let mut send = send;
+            let written = send
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = send.finish();
+            if written.is_ok() {
+                metrics::METRICS.record_request(431, 0);
+                crate::log::log_access(request_id, peer, "-", "-", 431, 0, 0, Some(&who));
+            }
+            return Ok(());
+        }
+
+        Ok(StreamHead::Incomplete) => {
+            // The peer went away before the head was finished. There is nobody
+            // to answer, and what arrived is not a request: the parser would
+            // read the lines of a half-written head as headers and forward
+            // them.
+            tracing::debug!(
+                "Stream from {} ended before the request head was complete",
+                peer
+            );
+            return Ok(());
+        }
+
+        Err(e) => {
+            tracing::warn!("No request head from {}: {}", peer, e);
+            return Err(e);
+        }
+    };
 
     tracing::debug!("Iroh stream data received - bytes_read: {}", buf.len());
 
-    let request = http::parse_http_request_legacy(&buf)?;
+    // A request that does not parse is refused with a status the client can
+    // read, rather than a stream that is dropped under it. A malformed
+    // request — and a request that names more than one host, which the parser
+    // refuses for the same reason — used to leave the client with a reset and
+    // nothing in the access log.
+    let request = match http::parse_http_request_legacy(&buf) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!("Refusing a malformed request from {}: {}", peer, e);
+            let mut send = send;
+            let written = send
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = send.finish();
+            if written.is_ok() {
+                metrics::METRICS.record_request(400, 0);
+                crate::log::log_access(request_id, peer, "-", "-", 400, 0, 0, Some(&who));
+            }
+            return Ok(());
+        }
+    };
 
     // Everything before the blank line is bytes the client sent, and it is the
     // only place the request head exists as bytes: from here on it is a parsed
@@ -442,21 +551,29 @@ pub async fn handle_bidi_stream(
         path,
         backend_info.url
     );
-    tracing::debug!("Received request: {} {}", request.method(), request.uri());
-
     // The access log has to be fed from here: this is the path every client
     // takes, and the HTTP server on the plaintext listener logs its own.
     let started = std::time::Instant::now();
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
+    // The same string the access log and the span use, redacted the same way.
+    // This line reaches the general log file, which is the same file the span's
+    // fields are rendered into — so a URI logged here unredacted is a query
+    // value in that file, and redacting only the span would leave this door
+    // open next to it.
+    tracing::debug!(
+        "Received request: {} {}",
+        request.method(),
+        crate::log::uri_for_log(&request_target)
+    );
+
     // Filled in on the span the caller opened, which was created before the
     // head was read and so could not know these. `Span::current()` is that
     // span because the caller instruments this future with it; when no
     // subscriber cares, recording is a no-op rather than a cost.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", request_target.as_str());
+    crate::log::record_request_on_span(&span, &method, &request_target);
 
     // A WebSocket upgrade is a conversation, and half of it cannot be taken
     // back: it is never retried, and it does not go through the loop below.
@@ -1952,6 +2069,30 @@ async fn perform_authentication(
                 AuthError::LockedOut => {
                     tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
                 }
+                AuthError::WrongSignature => {
+                    // Not counted, and worth saying why: a key cannot be
+                    // guessed, so there is nothing for the counter to protect
+                    // on this path — counting it would only let a peer that
+                    // knows the client id and the device name deny the
+                    // device's owner service.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that does not match \
+                         the challenge",
+                        peer,
+                        client_id
+                    );
+                }
+                AuthError::MalformedSignature => {
+                    // Not counted, and worth saying why: the peer sent noise
+                    // rather than a wrong credential, so this is not an
+                    // attempt at the device.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that is not a \
+                         signature",
+                        peer,
+                        client_id
+                    );
+                }
                 AuthError::UnnamedDeviceNotAllowed => {
                     // The one refusal that is a configuration the operator can
                     // change, so it is the one that says which knob.
@@ -2448,13 +2589,129 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, blocking_config_write,
-        build_websocket_upgrade_request, constant_time_eq, enrollment_verdict, find_headers_end,
-        issue_enrolled_secret, undo_enrolled_secret,
+        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
+        blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, read_stream_head,
+        undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_client::secret::SecretString;
     use std::collections::HashMap;
+
+    /// The budgets a head is read under, loose enough that no test runs into
+    /// them by accident.
+    fn generous_budgets() -> StreamBudgets {
+        let deadlines = crate::deadline::Deadlines {
+            header: std::time::Duration::from_secs(30),
+            tls_hello: std::time::Duration::from_secs(30),
+            ..crate::deadline::Deadlines::default()
+        };
+        StreamBudgets::new(&deadlines, tokio::time::Instant::now())
+    }
+
+    /// A head that is finished, and the bytes that came with it.
+    #[tokio::test]
+    async fn a_finished_head_is_a_request() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client
+                .write_all(b"GET /x HTTP/1.1\r\nHost: a.example\r\n\r\nBODY")
+                .await;
+        });
+
+        let head = read_stream_head(&mut server, &generous_budgets())
+            .await
+            .expect("the head");
+
+        match head {
+            StreamHead::Request { head, body } => {
+                assert!(head.ends_with(b"\r\n\r\n"), "the head is not finished");
+                assert_eq!(body, b"BODY", "the bytes after the head were lost");
+            }
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    /// A head over the limit is refused, not parsed.
+    ///
+    /// It used to be parsed: the read loop broke out of it with a head that
+    /// was never finished, and the parser read every line of that as a header
+    /// — the last one truncated — and the request was forwarded to a backend.
+    /// The log said "headers too large" and the backend was asked anyway.
+    #[tokio::test]
+    async fn a_head_over_the_limit_is_refused() {
+        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // A request line and then headers that never end.
+            let mut bytes = b"GET /x HTTP/1.1\r\n".to_vec();
+            while bytes.len() < 128 * 1024 {
+                bytes.extend_from_slice(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+            }
+            let _ = client.write_all(&bytes).await;
+        });
+
+        let head = read_stream_head(&mut server, &generous_budgets())
+            .await
+            .expect("the head");
+
+        match head {
+            StreamHead::TooLarge(size) => assert!(size > 64 * 1024),
+            other => panic!("expected the head to be refused, got {other:?}"),
+        }
+    }
+
+    /// A peer that goes away before the head is finished did not send a
+    /// request. It used to be parsed and forwarded anyway, so half a request
+    /// line became a header.
+    #[tokio::test]
+    async fn a_head_the_peer_abandoned_is_not_a_request() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client
+                .write_all(b"GET /x HTTP/1.1\r\nHost: a.example\r\n")
+                .await;
+            drop(client);
+        });
+
+        let head = read_stream_head(&mut server, &generous_budgets())
+            .await
+            .expect("the head");
+
+        match head {
+            StreamHead::Incomplete => {}
+            other => panic!("expected no request, got {other:?}"),
+        }
+    }
+
+    /// The first byte says which protocol a stream carries, and it says it
+    /// before any head is looked for. An L4 tunnel never sends a request head,
+    /// so waiting for one would hang it.
+    #[tokio::test]
+    async fn an_l4_preface_is_handed_on_without_waiting_for_a_head() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(&[0x05, 0x01, 0x01, 0x00]).await;
+        });
+
+        let head = read_stream_head(&mut server, &generous_budgets())
+            .await
+            .expect("the head");
+
+        match head {
+            StreamHead::Other(bytes) => {
+                assert_eq!(
+                    bytes,
+                    vec![0x05, 0x01, 0x01, 0x00],
+                    "the bytes were changed"
+                );
+            }
+            other => panic!("expected the preface to be handed on, got {other:?}"),
+        }
+    }
 
     #[test]
     fn a_short_head_budget_does_not_cut_off_a_tls_or_l4_client() {

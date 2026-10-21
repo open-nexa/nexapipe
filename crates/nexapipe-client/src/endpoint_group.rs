@@ -601,7 +601,7 @@ impl EndpointGroup {
         );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
-            let domain_key = normalize_pattern(&mapping.domain);
+            let domain_key = normalize_pattern(&mapping.domain).into_owned();
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
                 i,
@@ -726,7 +726,7 @@ impl EndpointGroup {
         );
         for (i, mapping) in domain_mappings.iter().enumerate() {
             let key = mapping.key();
-            let domain_key = normalize_pattern(&mapping.domain);
+            let domain_key = normalize_pattern(&mapping.domain).into_owned();
             jni_log!(
                 "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
                 i,
@@ -958,7 +958,7 @@ impl EndpointGroup {
     fn pools_for(&self, host: &str) -> Option<&Arc<DomainPools>> {
         let host = normalize_host(host);
 
-        if let Some(pools) = self.domains.get(&host) {
+        if let Some(pools) = self.domains.get(host.as_ref()) {
             return Some(pools);
         }
 
