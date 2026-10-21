@@ -49,6 +49,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
@@ -96,17 +97,20 @@ struct Inner {
 /// and the eviction scan in one place rather than written twice.
 #[derive(Debug)]
 struct Pool {
-    /// The direction the packet path needs.
-    ip_to_domain: HashMap<u128, String>,
+    /// The direction the packet path needs: the domain an address was handed
+    /// out for, and when it was last used.
+    ///
+    /// **One map, not two.** The clock used to live in a map of its own, and
+    /// the eviction scan then had to look every address up in it — a hash
+    /// lookup per address, for a scan that runs on every allocation once the
+    /// pool is full. With the clock beside the name, the scan is a walk over
+    /// values that are already in hand.
+    ip_to_domain: HashMap<u128, (Arc<str>, u64)>,
     /// The direction that keeps a domain's address stable across queries.
-    domain_to_ip: HashMap<String, u128>,
-    /// When each address was last asked for, on a clock that only ever moves
-    /// forward. Every flow that reaches an address goes through
-    /// [`Pool::lookup`], so "not asked for in a long time" is the closest thing
-    /// this mapping has to "nothing is using it".
-    used_at: HashMap<u128, u64>,
-    /// The clock behind [`Self::used_at`]. Per pool: it only ever orders
-    /// addresses against each other, and those are always in the same pool.
+    domain_to_ip: HashMap<Arc<str>, u128>,
+    /// The clock behind the "last used" in [`Self::ip_to_domain`]. Per pool: it
+    /// only ever orders addresses against each other, and those are always in
+    /// the same pool.
     clock: u64,
     /// Next address to hand out; wraps around the pool.
     next: u128,
@@ -121,7 +125,6 @@ impl Pool {
         Self {
             ip_to_domain: HashMap::new(),
             domain_to_ip: HashMap::new(),
-            used_at: HashMap::new(),
             clock: 0,
             next: first,
             first,
@@ -137,7 +140,9 @@ impl Pool {
     /// Records that `ip` is being used right now.
     fn touch(&mut self, ip: u128) {
         self.clock += 1;
-        self.used_at.insert(ip, self.clock);
+        if let Some(entry) = self.ip_to_domain.get_mut(&ip) {
+            entry.1 = self.clock;
+        }
     }
 
     /// The address that has been quiet for the longest.
@@ -147,9 +152,9 @@ impl Pool {
     /// the addresses sorted.
     fn quietest_address(&self) -> u128 {
         self.ip_to_domain
-            .keys()
-            .copied()
-            .min_by_key(|ip| self.used_at.get(ip).copied().unwrap_or(0))
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(ip, _)| *ip)
             .unwrap_or(self.first)
     }
 
@@ -160,7 +165,7 @@ impl Pool {
         // A domain that already has an address keeps it: the application may be
         // holding a connection open against it, and moving the address would
         // break that connection's replies.
-        if let Some(&ip) = self.domain_to_ip.get(&key) {
+        if let Some(&ip) = self.domain_to_ip.get(key.as_str()) {
             self.touch(ip);
             return ip;
         }
@@ -179,7 +184,10 @@ impl Pool {
             self.quietest_address()
         };
 
-        if let Some(previous) = self.ip_to_domain.insert(ip, key.clone()) {
+        // The name is shared rather than copied: a lookup hands out a reference
+        // to it, and the reference count is what the copy used to be.
+        let key: Arc<str> = Arc::from(key.as_str());
+        if let Some((previous, _)) = self.ip_to_domain.insert(ip, (key.clone(), 0)) {
             self.domain_to_ip.remove(&previous);
         }
         self.domain_to_ip.insert(key, ip);
@@ -190,12 +198,11 @@ impl Pool {
 
     /// The domain `ip` was handed out for, or `None` for an address this pool
     /// never issued.
-    fn lookup(&mut self, ip: u128) -> Option<String> {
-        let domain = self.ip_to_domain.get(&ip).cloned();
-        if domain.is_some() {
-            self.touch(ip);
-        }
-        domain
+    fn lookup(&mut self, ip: u128) -> Option<Arc<str>> {
+        let (domain, used) = self.ip_to_domain.get_mut(&ip)?;
+        self.clock += 1;
+        *used = self.clock;
+        Some(domain.clone())
     }
 
     fn len(&self) -> usize {
@@ -270,12 +277,17 @@ impl IpMapping {
     /// Also what marks the address as still in use: every flow has to look its
     /// destination up here, so an address that keeps being asked for is not one
     /// to hand to somebody else.
-    pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<String> {
+    ///
+    /// **The name is shared, not copied.** A lookup happens for every datagram
+    /// a flow sends, and a copy of the name is a heap allocation each time.
+    /// The [`Arc`] is what the mapping hands out instead: the name is written
+    /// once, and a lookup is a reference count.
+    pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<Arc<str>> {
         self.locked().v4.lookup(u32::from(*ip) as u128)
     }
 
     /// The IPv6 twin of [`Self::lookup_domain`].
-    pub fn lookup_domain_v6(&self, ip: &Ipv6Addr) -> Option<String> {
+    pub fn lookup_domain_v6(&self, ip: &Ipv6Addr) -> Option<Arc<str>> {
         let mut inner = self.locked();
         let pool = inner.v6.as_mut()?;
         pool.lookup(u128::from(*ip))
@@ -342,6 +354,28 @@ mod tests {
             let ip = mapping.allocate(name);
             assert_eq!(mapping.lookup_domain(&ip).as_deref(), Some(name));
         }
+    }
+
+    /// The name is shared, not copied.
+    ///
+    /// A lookup happens for every datagram a flow sends, so a copy of the name
+    /// is a heap allocation each time. What the mapping hands out instead is a
+    /// reference to the one name it wrote — and this is what says so: two
+    /// lookups of the same address are the same name, not two names that
+    /// happen to be equal.
+    #[test]
+    fn a_name_is_shared_rather_than_copied() {
+        let mapping = IpMapping::new();
+        let ip = mapping.allocate("shared.test");
+
+        let first = mapping.lookup_domain(&ip).expect("the address is ours");
+        let second = mapping.lookup_domain(&ip).expect("the address is ours");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the two lookups hand out the same name"
+        );
+        assert_eq!(first.as_ref(), "shared.test");
     }
 
     #[test]

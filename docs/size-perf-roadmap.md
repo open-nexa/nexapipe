@@ -326,6 +326,14 @@ so every allocation takes the eviction path, which a steady-state packet does
 not. Only the reverse lookup runs on every packet, and it is a `String` clone
 and a write to a second `HashMap`.
 
+**And the hotspot is gone.** `ip_mapping` is **291 ns** now, against the
+2,274 ns in the table above, and the difference is two things: the mapping
+shares a name instead of copying it out of the table on every lookup, and the
+eviction scan walks the values it already has instead of looking every address
+up in a second map to find the quietest one. The bench holds more names than
+the pool has addresses, so every allocation takes that scan — which is why it
+was most of the number.
+
 **What the numbers do not cover**, and therefore what is still an expectation
 rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
 passes an empty resolver list and a proxied domain, so it exercises the
@@ -346,6 +354,9 @@ items the numbers pointed at.
 2. **Allocation on the per-packet path.** **Confirmed, and quantified**:
    `ip_mapping` at 2.3 µs is 30% of `tun_packet`, and the part of it that runs
    per packet is a `String` clone plus a second `HashMap` write.
+   **Done**: the mapping shares its names instead of copying them, and keeps
+   the "last used" clock beside the name it belongs to, so the eviction scan
+   is a walk over values it already has. The bench is at **291 ns**.
 3. **`hyper-util` feature flags.** Not measured, and not a throughput item —
    it stays a size lever (S1/S2).
 4. **Nothing else.** **No longer true.** The numbers, and a reading of the

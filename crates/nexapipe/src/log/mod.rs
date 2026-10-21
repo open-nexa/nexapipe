@@ -631,6 +631,39 @@ fn redacting() -> bool {
     REDACT_QUERY.load(Ordering::Relaxed)
 }
 
+/// The URI as a log line should carry it.
+///
+/// The same redaction the access log applies, and for the same reason: the
+/// access log is not the only place a URI ends up. A tracing span's fields
+/// are rendered into the general log file by every event inside the span, so
+/// a query value recorded there has been rotated, archived and handed to
+/// someone else exactly as a value in the access log has.
+///
+/// The access log redacts once and hands the same string to both of its sinks
+/// — "or redacting the file only moves the leak next door". This is that
+/// string, for the sinks the access log does not own.
+pub(crate) fn uri_for_log(uri: &str) -> String {
+    if redacting() {
+        redact_query(uri)
+    } else {
+        uri.to_string()
+    }
+}
+
+/// Records a request's method and URI on the current span.
+///
+/// The URI recorded is the redacted one. A span's fields are rendered into
+/// the general log file by every event inside the span — not only by the
+/// access line — so a query value written here is a query value in a file
+/// that gets rotated, archived and handed to someone else.
+///
+/// Every call site goes through this, rather than recording a URI of its own,
+/// because the rule is one rule and the call sites are four.
+pub(crate) fn record_request_on_span(span: &tracing::Span, method: &str, uri: &str) {
+    span.record("method", method);
+    span.record("uri", uri_for_log(uri).as_str());
+}
+
 /// Replaces the values in a URI's query string, keeping the parameter names.
 ///
 /// `?token=abc&page=2` becomes `?token=<redacted>&page=<redacted>`. Names stay
@@ -998,6 +1031,7 @@ fn write_access_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn redacts_every_query_value() {
@@ -1032,6 +1066,77 @@ mod tests {
         assert_eq!(
             redact_query("/x?token=&ok=1"),
             "/x?token=<redacted>&ok=<redacted>"
+        );
+    }
+
+    /// A span layer that remembers what was recorded into its `uri` field.
+    ///
+    /// A span's fields are rendered into the general log file by every event
+    /// inside the span, so what lands in a span is what lands in that file.
+    /// This is how the test sees it.
+    #[derive(Clone, Default)]
+    struct CapturedUri(Arc<Mutex<Option<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedUri {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = UriVisitor(None);
+            values.record(&mut visitor);
+            if let Some(uri) = visitor.0 {
+                *self.0.lock().unwrap() = Some(uri);
+            }
+        }
+    }
+
+    /// Picks the `uri` field out of a recorded span.
+    struct UriVisitor(Option<String>);
+
+    impl tracing::field::Visit for UriVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "uri" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "uri" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// A query value recorded into a span is redacted.
+    ///
+    /// The span is the other way a URI reaches a log file. The access log
+    /// redacts its own copy, but a span's fields are rendered into the
+    /// *general* log file by every event inside the span — so a query value
+    /// written there was a query value in a file that gets rotated, archived
+    /// and handed to someone else, with the access log's redaction nowhere
+    /// near it.
+    #[test]
+    fn a_uri_recorded_into_a_span_is_redacted() {
+        let captured = CapturedUri::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request", uri = tracing::field::Empty);
+            let _guard = span.enter();
+            super::record_request_on_span(&span, "GET", "/api/v1/items?token=hunter2&page=2");
+        });
+
+        let recorded = captured
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the span recorded a uri");
+        assert_eq!(
+            recorded, "/api/v1/items?token=<redacted>&page=<redacted>",
+            "a query value reached the span, and the span is rendered into the log file"
         );
     }
 

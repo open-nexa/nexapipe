@@ -1673,12 +1673,7 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
         let line_end = start + pos;
         let line = &header_bytes[start..line_end];
 
-        let is_cache_header = line.len() >= 18 && {
-            let lower = line.to_ascii_lowercase();
-            lower.starts_with(b"if-modified-since:") || lower.starts_with(b"if-none-match:")
-        };
-
-        if !is_cache_header {
+        if !is_cache_validation_header(line) {
             result.extend_from_slice(line);
             result.extend_from_slice(b"\r\n");
         }
@@ -1688,6 +1683,28 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
 
     // Loop already preserved the \r\n\r\n terminator — don't add an extra one
     result
+}
+
+/// Whether a header line is one of the two cache-validation headers.
+///
+/// **The two names are checked separately**, each against its own length.
+/// They are four bytes apart — `if-modified-since:` is eighteen, `if-none-match:`
+/// is fourteen — so a single length guard for both would be the length of the
+/// longer one, and the shorter header's smallest forms would fall through it:
+/// `If-None-Match: *` is sixteen bytes and `If-None-Match: ""` is seventeen.
+/// Those are exactly the requests the origin answers with a 304 and an empty
+/// body, which is what this is here to prevent.
+fn is_cache_validation_header(line: &[u8]) -> bool {
+    starts_with_ignore_case(line, b"if-modified-since:")
+        || starts_with_ignore_case(line, b"if-none-match:")
+}
+
+/// Whether `line` starts with `prefix`, ignoring ASCII case.
+///
+/// Without allocating: the header name is ASCII, and the comparison is
+/// against a fixed prefix.
+fn starts_with_ignore_case(line: &[u8], prefix: &[u8]) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// Answer a `CONNECT` that cannot be served.
@@ -2377,5 +2394,86 @@ mod tests {
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .map(|pos| pos + 4)
+    }
+
+    /// The headers a request keeps, as one string.
+    fn kept_headers(request: &[u8]) -> String {
+        String::from_utf8(remove_cache_validation_headers(request)).expect("the headers are ASCII")
+    }
+
+    /// A conditional request loses the headers that would make the origin
+    /// answer with a 304 and an empty body.
+    #[test]
+    fn a_conditional_request_loses_its_cache_headers() {
+        let request = b"GET / HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        If-Modified-Since: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+                        If-None-Match: \"a-long-etag-value\"\r\n\
+                        Accept: */*\r\n\r\n";
+
+        let kept = kept_headers(request);
+
+        assert!(
+            !kept.to_ascii_lowercase().contains("if-modified-since"),
+            "{kept}"
+        );
+        assert!(
+            !kept.to_ascii_lowercase().contains("if-none-match"),
+            "{kept}"
+        );
+        assert!(kept.contains("Host: example.com"), "{kept}");
+        assert!(kept.contains("Accept: */*"), "{kept}");
+    }
+
+    /// The shortest forms of `If-None-Match` are the ones a length guard for
+    /// the *longer* header name lets through — and they are exactly the
+    /// requests the origin answers with a 304 and an empty body.
+    #[test]
+    fn the_shortest_if_none_match_is_stripped() {
+        for value in ["*", "\"\"", "\"e\""] {
+            let request =
+                format!("GET / HTTP/1.1\r\nHost: example.com\r\nIf-None-Match: {value}\r\n\r\n");
+
+            let kept = kept_headers(request.as_bytes());
+
+            assert!(
+                !kept.to_ascii_lowercase().contains("if-none-match"),
+                "`If-None-Match: {value}` is {value:?} — {kept}"
+            );
+            assert!(kept.contains("Host: example.com"), "{kept}");
+        }
+    }
+
+    /// The header name is a name, not a string to match exactly: a client that
+    /// spells it in another case is still asking for a conditional response.
+    #[test]
+    fn the_cache_header_is_stripped_whatever_its_case() {
+        for name in ["if-none-match", "IF-NONE-MATCH", "If-None-Match"] {
+            let request = format!("GET / HTTP/1.1\r\n{name}: *\r\n\r\n");
+
+            let kept = kept_headers(request.as_bytes());
+
+            assert!(
+                !kept
+                    .to_ascii_lowercase()
+                    .contains(name.to_ascii_lowercase().as_str()),
+                "{name} was kept: {kept}"
+            );
+            assert!(kept.starts_with("GET / HTTP/1.1"), "{kept}");
+        }
+    }
+
+    /// Only the two cache-validation headers are stripped: a header that
+    /// merely starts with the same letters is somebody else's.
+    #[test]
+    fn a_header_that_merely_looks_like_one_is_kept() {
+        let request = b"GET / HTTP/1.1\r\n\
+                        X-If-None-Match: *\r\n\
+                        If-None-Match-Extra: *\r\n\r\n";
+
+        let kept = kept_headers(request);
+
+        assert!(kept.contains("X-If-None-Match: *"), "{kept}");
+        assert!(kept.contains("If-None-Match-Extra: *"), "{kept}");
     }
 }

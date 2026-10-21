@@ -940,8 +940,7 @@ async fn proxy_handler(
     // Filled in on the span the caller opened around this handler, which was
     // created before the request was read and so could not know these.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", uri.as_str());
+    crate::log::record_request_on_span(&span, &method, &uri);
 
     // A request that names more than one host has two destinations, and the
     // two halves of this proxy would resolve them differently: the route and
