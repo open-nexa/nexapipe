@@ -74,6 +74,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
+    val discoveryMode by viewModel.discoveryMode.collectAsState()
     val relayAuthToken by viewModel.relayAuthToken.collectAsState()
     val credentialProtection by viewModel.credentialProtection.collectAsState()
     val plaintextConsentPending by viewModel.plaintextConsentPending.collectAsState()
@@ -877,6 +878,41 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                                 viewModel.updateRelayConfig(mode, relayUrl)
                                             }
                                         }
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        stringResource(label),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                stringResource(R.string.discovery_mode_title),
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            Text(
+                                stringResource(R.string.discovery_mode_note),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            val discoveryModes = listOf(
+                                "n0" to R.string.discovery_mode_n0,
+                                "none" to R.string.discovery_mode_none
+                            )
+                            discoveryModes.forEach { (mode, label) ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp)
+                                ) {
+                                    RadioButton(
+                                        selected = discoveryMode == mode,
+                                        onClick = { viewModel.updateDiscoveryMode(mode) }
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(

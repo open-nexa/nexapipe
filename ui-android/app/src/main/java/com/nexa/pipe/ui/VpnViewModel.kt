@@ -132,6 +132,10 @@ class VpnViewModel : ViewModel() {
     // claimed to would be a lie.
     val relayMode = kotlinx.coroutines.flow.MutableStateFlow("pinned") // "pinned", "default", "disabled", "custom"
     val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
+    // Whether this device may ask n0 where a peer is. "n0" (the default) or
+    // "none" — the second one costs the ability to reach a peer by Node ID
+    // alone, because a ticket is what carries an address.
+    val discoveryMode = kotlinx.coroutines.flow.MutableStateFlow("n0")
     // Bearer token for a custom relay that asks for one. Never logged.
     val relayAuthToken = kotlinx.coroutines.flow.MutableStateFlow("")
 
@@ -453,6 +457,7 @@ class VpnViewModel : ViewModel() {
             nodes.value = loadedNodes
             relayMode.value = manager.loadRelayMode()
             relayUrl.value = manager.loadRelayUrl()
+            discoveryMode.value = manager.loadDiscoveryMode()
             relayAuthToken.value = manager.loadRelayAuthToken()
             vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
             deviceId.value = manager.deviceId()
@@ -481,6 +486,7 @@ class VpnViewModel : ViewModel() {
         val relayMode: String,
         val relayUrl: String,
         val relayToken: String,
+        val discoveryMode: String,
         /**
          * Set when the user has just answered the consent question, so the
          * re-queued write is the one thing allowed to store a credential in the
@@ -544,7 +550,8 @@ class VpnViewModel : ViewModel() {
                 nodes = nodes.value,
                 relayMode = relayMode.value,
                 relayUrl = relayUrl.value,
-                relayToken = relayAuthToken.value
+                relayToken = relayAuthToken.value,
+                discoveryMode = discoveryMode.value
             )
         )
     }
@@ -597,6 +604,7 @@ class VpnViewModel : ViewModel() {
         val relaySealed = manager.saveRelayConfig(
             write.relayMode, write.relayUrl, write.relayToken, allowPlaintext
         )
+        manager.saveDiscoveryMode(write.discoveryMode)
         credentialProtection.value = manager.credentialProtection()
         if (!(sealed && relaySealed) && !allowPlaintext) {
             pendingCredentialWrite = write
@@ -674,6 +682,19 @@ class VpnViewModel : ViewModel() {
         pendingConnect = null
         plaintextConsentPending.value = false
         addLog("Credential not stored: this device cannot encrypt it")
+    }
+
+    /**
+     * Switches n0's address lookup on or off for this device.
+     *
+     * Turning it off means a peer is only reachable by an address this device
+     * was given — a ticket — and not by a Node ID alone, because finding the
+     * address behind a Node ID is the lookup itself.
+     */
+    fun updateDiscoveryMode(mode: String) {
+        discoveryMode.value = mode
+        saveSettings()
+        addLog("Discovery mode updated: $mode")
     }
 
     fun updateRelayConfig(mode: String, url: String, authToken: String = relayAuthToken.value) {
@@ -945,7 +966,16 @@ class VpnViewModel : ViewModel() {
             isIrohStarted.value = true
             addLog("Iroh started: $id")
         } else {
-            throw Exception(AppStrings.get(R.string.error_start_iroh))
+            // The native side says why when it can — a relay URL or a discovery
+            // mode it could not read — and the reason is the part the user has
+            // to act on. Without it the app says "failed to start iroh" and
+            // nothing else, and the reason sits in the log behind the debug
+            // level.
+            val reason = nativeFailureReason()
+            throw Exception(
+                AppStrings.get(R.string.error_start_iroh) +
+                    if (reason != null) ": $reason" else ""
+            )
         }
     }
 
@@ -1006,13 +1036,27 @@ class VpnViewModel : ViewModel() {
      */
     private suspend fun resolveIrohDnsOverrides(): String {
         // DNS origin and default relay servers used by iroh presets::N0.
-        val domains = listOf(
-            "dns.iroh.link",
-            "use1-1.relay.n0.iroh.link",
-            "usw1-1.relay.n0.iroh.link",
-            "euc1-1.relay.n0.iroh.link",
-            "aps1-1.relay.n0.iroh.link",
-        )
+        //
+        // Only the ones this configuration actually uses. The lookup's own
+        // host is asked about nothing when the lookup is off, and the n0
+        // relays are dialled by nobody when the relay is the operator's own
+        // or when there is none. Resolving a host the endpoint will never
+        // talk to is a question asked for nothing — and with the lookup off
+        // it is a question about n0 that the operator said not to ask.
+        val domains = mutableListOf<String>()
+        if (discoveryMode.value != "none") {
+            domains.add("dns.iroh.link")
+        }
+        if (relayMode.value != "custom" && relayMode.value != "disabled") {
+            domains.add("use1-1.relay.n0.iroh.link")
+            domains.add("usw1-1.relay.n0.iroh.link")
+            domains.add("euc1-1.relay.n0.iroh.link")
+            domains.add("aps1-1.relay.n0.iroh.link")
+        }
+        if (domains.isEmpty()) {
+            addLog("No iroh domain to pre-resolve: neither the lookup nor the n0 relays are in play")
+            return ""
+        }
 
         val overrides = kotlinx.coroutines.coroutineScope {
             domains.map { domain ->
@@ -1379,16 +1423,23 @@ class VpnViewModel : ViewModel() {
                             // (dns.iroh.link + relays) to work around the GFW
                             // dropping iroh.link UDP DNS responses. Re-resolved
                             // on every retry.
+                            //
+                            // Always handed over, empty included: the table on
+                            // the native side is replaced by the call, so a
+                            // configuration that resolves nothing has to say
+                            // so rather than keep what the last attempt left
+                            // behind.
                             val dnsOverrides = resolveIrohDnsOverrides()
-                            if (dnsOverrides.isNotEmpty()) {
-                                IrohProxy.nativeSetDnsOverride(dnsOverrides)
-                            }
+                            IrohProxy.nativeSetDnsOverride(dnsOverrides)
                             // Configure the relay mode
                             IrohProxy.nativeSetRelayConfig(
                                 relayMode.value,
                                 relayUrl.value,
                                 relayAuthToken.value
                             )
+                            // Configure whether this device may ask n0 where a
+                            // peer is
+                            IrohProxy.nativeSetDiscoveryMode(discoveryMode.value)
                             // Configure the 2FA credentials (must be injected
                             // before nativeStartProxy). Every endpoint carries
                             // its own pair, so the native table is cleared
