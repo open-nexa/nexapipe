@@ -650,6 +650,105 @@ async fn a_response_with_a_body_is_still_framed() {
     );
 }
 
+/// A `304` is bodyless as well, and equally unframed.
+///
+/// Its headers still travel: only the hop-by-hop ones are dropped, and an
+/// `etag` is what makes a conditional request worth making.
+#[tokio::test]
+async fn a_304_is_not_framed() {
+    let backend =
+        spawn_backend_answering("HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\n\r\n").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET /x HTTP/1.1\r\nHost: app.test\r\nIf-None-Match: \"v1\"\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a bodyless response was framed: {text}"
+    );
+    assert!(
+        text.contains("etag: \"v1\""),
+        "a header was dropped: {text}"
+    );
+    assert!(
+        reply_body(&reply).is_empty(),
+        "a 304 carried a body: {text}"
+    );
+}
+
+/// A `HEAD` response is not framed either: the client asked for the head of a
+/// response whose body is not sent, whatever the status says.
+#[tokio::test]
+async fn a_head_response_is_not_framed() {
+    let backend = spawn_backend_answering("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"HEAD /x HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+    let text = String::from_utf8_lossy(&reply).to_lowercase();
+
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a HEAD response was framed: {text}"
+    );
+    assert!(
+        text.contains("content-length: 5"),
+        "the length of the body that would have been sent was dropped: {text}"
+    );
+    assert!(
+        reply_body(&reply).is_empty(),
+        "a HEAD response carried a body: {text}"
+    );
+}
+
+/// A request for a host no route serves is answered **before** its body is
+/// read.
+///
+/// The body of a request that is going to be refused is work nobody asked
+/// for: up to `MAX_REQUEST_BODY` (64 MiB) per stream, held in memory, for a
+/// request that has no backend to go to.
+///
+/// And the client waits for the refusal until the body arrives — so a client
+/// that has no body to send waits for the body deadline (60 s) instead of
+/// being told there is nowhere to send it.
+///
+/// The plaintext listener already answers first — the lookup, then the body —
+/// so the two paths now agree.
+#[tokio::test]
+async fn a_refused_request_is_answered_without_its_body() {
+    let backend = spawn_backend("hello from the backend").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let (mut send, mut recv) = tunnel.conn.open_bi().await.expect("open_bi");
+    // A host no route serves, and a body that never arrives.
+    send.write_all(b"GET /x HTTP/1.1\r\nHost: unserved.test\r\ncontent-length: 1048576\r\n\r\n")
+        .await
+        .expect("write the head");
+
+    // The stream stays open: finishing it would end the body, and the test
+    // is about a body that does not arrive.
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(2), recv.read(&mut chunk)).await;
+    if let Ok(Ok(Some(n))) = read {
+        reply.extend_from_slice(&chunk[..n]);
+    }
+    drop(send);
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 404"),
+        "the refusal arrives without waiting for the body, got {:?}",
+        status_of(&reply)
+    );
+}
+
 #[tokio::test]
 async fn a_get_reaches_the_backend_and_the_reply_comes_back() {
     let backend = spawn_backend("hello from the backend").await;

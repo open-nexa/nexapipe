@@ -285,6 +285,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A route's `path_pattern` is a prefix in the path sense.**
+  `path_pattern = "/api"` used to match `/apifoo` as well as `/api/x`: the
+  rule was `starts_with`, and a prefix that is not a prefix is a routing
+  surprise — whether it matters depends on the deployment, and it is never
+  what the pattern says. It now ends at a segment boundary: `/api` covers
+  `/api` and `/api/x`, and not `/apifoo`. A trailing slash on the pattern
+  (`/api/`) names the same place as `/api`.
+  The rewrite follows the same rule, so the suffix it computes is the suffix
+  that matched. One consequence worth naming: a rewrite on the root pattern
+  (`path_pattern = "/"` with `path_rewrite = "/v2{}"`) used to produce
+  `/v2api/users` — the separator was dropped — and produces `/v2/api/users`
+  now.
 - **The configuration and the runtime state are two files.** `config.toml` is
   the operator's file — what they wrote, what they read, what they keep in
   version control — and it no longer carries what a running server learns.
@@ -431,6 +443,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The desktop's DNS server keeps its sockets.** The desktop had a second
+  DNS implementation — its own resolver chain, its own timeouts, its own
+  socket handling — and like the client's it built **a new UDP socket for
+  every query** it forwarded. It now uses the same shared resolvers, so every
+  lookup leaves from the same source port and the NAT mapping the router
+  keeps for it is the one that stays. The chain, the order and the windows
+  are unchanged.
 - **A response is not forwarded with the backend's own hop headers.** The
   tunnel dropped only `transfer-encoding` and `x-request-id`, so
   `connection`, `keep-alive`, `upgrade` and the `proxy-*` headers reached the
@@ -453,6 +472,25 @@ lookup, which is what a config written before the key existed does.
   The server now says so once, at startup and after a reload, when the config
   holds a credential and the file is readable by anyone but its owner. It
   names the path and the mode. It does not refuse to start.
+- **A config that could not be loaded is tried again.** The watcher noticed a
+  changed file by its modification time alone, and only a *newer* one: a file
+  restored from a backup, checked out by `git`, or written twice inside one
+  second was never reloaded. The stamp was also advanced before the reload
+  ran, so a file that was read while it was half-written — the common case,
+  since the config is saved on every change — was never tried again and the
+  server kept the routes it had for ever. The watcher now compares the file's
+  time *and* its length, reloads a file that is older as well as a newer one,
+  and only remembers a file once it has been loaded successfully. A failed
+  load is retried, with a wait that grows so a file that is simply wrong does
+  not fill the log.
+- **The tunnel answers a request it cannot route before reading its body.**
+  A request for a host no route serves had its body read and buffered first —
+  up to 64 MiB per stream, held in memory, for a request with no backend to
+  go to. Worse, the client waited for the refusal until the body arrived, so
+  a client with no body to send waited out the body deadline (60 s) instead
+  of being told there was nowhere to send it. The lookup now comes first and
+  the body is read only for a request that is going somewhere. The plaintext
+  listener already did it this way round.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks
