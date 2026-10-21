@@ -21,6 +21,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+// The TUN descriptor's ownership is taken in `start_tun_proxy`, which is the
+// Android half of the tunnel. Gated to match that function: an ungated
+// import is an unused-import warning on every other build, which is what the
+// release archives are.
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+use std::os::fd::FromRawFd;
 use std::panic;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2901,6 +2907,23 @@ fn start_tun_proxy(
     tun_fd: jint,
     proxy_domains: JString,
 ) -> jint {
+    // The descriptor is ours from this line on. The JNI boundary is where the
+    // ownership transfers, and it transfers exactly once: the Kotlin side has
+    // detached the descriptor from its `ParcelFileDescriptor` and handed the
+    // number over, so this side closes it — on the failure paths, by dropping
+    // it; on the success path, by duplicating it and letting the original go.
+    //
+    // It has to be taken **here**, before the first `return`: every early
+    // return below would otherwise leak it, and the Kotlin side must not close
+    // it either, because by the time it sees a failure code this function has
+    // already taken it.
+    if tun_fd < 0 {
+        jni_log!("[tun-proxy] nativeStartTunProxy was given an invalid descriptor");
+        return -1;
+    }
+    let tun_fd_raw = tun_fd;
+    let tun_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) };
+
     if env.exception_check() {
         jni_log!("JNI exception pending before nativeStartTunProxy");
         env.exception_clear();
@@ -2923,7 +2946,7 @@ fn start_tun_proxy(
 
     jni_log!(
         "[DEBUG:jni] nativeStartTunProxy: fd={}, proxy_domains={} items",
-        tun_fd,
+        tun_fd_raw,
         proxy_domains_list.len()
     );
 
@@ -2990,7 +3013,7 @@ fn start_tun_proxy(
     let _enter_guard = runtime.enter();
 
     let tun_proxy = match TunProxy::new(
-        tun_fd as std::os::fd::RawFd,
+        tun_fd,
         endpoint_group,
         proxy_domains_list,
         custom_dns_servers,

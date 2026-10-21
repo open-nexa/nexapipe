@@ -100,8 +100,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 // virtual block from are matched against the Kotlin side's.
 #[cfg(target_os = "android")]
 use std::net::Ipv6Addr;
+#[cfg(any(target_os = "android", test))]
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "android")]
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -372,18 +374,148 @@ fn start_stack_services(
 /// both dups still open — leaked for the life of the process, and the VPN
 /// cannot be brought up again while they are. Each half is taken out as it is
 /// handed to a pump; whatever is left here when this drops is closed.
+///
+/// Held as [`OwnedFd`] rather than as raw numbers, so that "closed exactly
+/// once" is a property of the type rather than of every call site remembering
+/// to close. The raw numbers come back out at the point where a descriptor
+/// becomes a `File`, and that `File` takes the ownership over from there.
 #[cfg(target_os = "android")]
 struct TunFds {
-    read: Option<RawFd>,
-    write: Option<RawFd>,
+    read: Option<OwnedFd>,
+    write: Option<OwnedFd>,
 }
 
-#[cfg(target_os = "android")]
-impl Drop for TunFds {
-    fn drop(&mut self) {
-        for fd in [self.read.take(), self.write.take()].into_iter().flatten() {
-            unsafe { libc::close(fd) };
-        }
+/// Duplicates a TUN descriptor into the read/write pair the stack needs.
+///
+/// The original is closed by this function, exactly once, on every path — the
+/// successful one and the failing ones alike. That is the contract the caller
+/// relies on: the descriptor has been handed over, so the caller must not
+/// close it again, whether this returned the pair or an error.
+///
+/// The contract is worth stating because a descriptor closed twice is not a
+/// harmless error. Between the two closes the number can be handed to
+/// something else — a socket, a file, another TUN — and the second close then
+/// closes that instead. On a phone that is an unrelated file in the process,
+/// and the failure is silent.
+///
+/// Ownership is taken by type rather than by a call: the parameter is an
+/// [`OwnedFd`], so it is closed when this returns, whichever way it returns,
+/// with nothing left to remember.
+#[cfg(any(target_os = "android", test))]
+fn dup_tun_fds(tun_fd: OwnedFd) -> Result<(OwnedFd, OwnedFd), ClientError> {
+    dup_tun_fds_with(tun_fd, OwnedFd::try_clone)
+}
+
+/// [`dup_tun_fds`], with the duplication step passed in.
+///
+/// The duplication is the only thing here that can fail, and the failure is
+/// the path that matters: it is where the original used to be left open for
+/// the caller to close — and the caller closed it, which is the double close
+/// this whole change is about. Passing the step in is what makes that path
+/// testable, because there is no portable way to make `dup(2)` fail on
+/// demand.
+#[cfg(any(target_os = "android", test))]
+fn dup_tun_fds_with<F>(tun_fd: OwnedFd, mut duplicate: F) -> Result<(OwnedFd, OwnedFd), ClientError>
+where
+    F: FnMut(&OwnedFd) -> std::io::Result<OwnedFd>,
+{
+    let read = duplicate(&tun_fd)?;
+    let write = duplicate(&tun_fd)?;
+    Ok((read, write))
+}
+
+#[cfg(test)]
+mod fd_tests {
+    use super::{dup_tun_fds, dup_tun_fds_with};
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    /// A descriptor to hand over. A socket pair stands in for the TUN
+    /// descriptor: it is a real descriptor, and closing it is observable.
+    fn a_descriptor() -> OwnedFd {
+        let (one, _other) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        one.into()
+    }
+
+    /// Whether a descriptor number is still a live descriptor.
+    ///
+    /// `fcntl` on a closed descriptor fails with `EBADF`, which is the
+    /// cheapest way to ask the question without touching whatever the
+    /// number points at — and after a close the number may point at
+    /// something else entirely.
+    fn is_open(fd: std::os::fd::RawFd) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+    }
+
+    /// The whole point of the change: the descriptor that was handed over is
+    /// closed by the takeover, so the caller must not close it again.
+    ///
+    /// It used to be closed twice — once by the takeover and once by the
+    /// caller, on the failure path — and a descriptor closed twice is not a
+    /// harmless error: between the two closes the number can be handed to
+    /// something else, and the second close then closes that instead.
+    #[test]
+    fn the_takeover_closes_the_original_descriptor() {
+        let original = a_descriptor();
+        let original_fd = original.as_raw_fd();
+
+        let (read, write) = dup_tun_fds(original).expect("the takeover");
+
+        assert!(
+            !is_open(original_fd),
+            "the original descriptor is still open, so the caller would close it a second time"
+        );
+        assert!(is_open(read.as_raw_fd()), "the read duplicate is not open");
+        assert!(
+            is_open(write.as_raw_fd()),
+            "the write duplicate is not open"
+        );
+    }
+
+    /// The two duplicates have to be two different descriptors, or the read
+    /// end and the write end of the TUN would be the same number.
+    #[test]
+    fn the_takeover_hands_back_two_distinct_descriptors() {
+        let original = a_descriptor();
+        let original_fd = original.as_raw_fd();
+
+        let (read, write) = dup_tun_fds(original).expect("the takeover");
+
+        assert_ne!(read.as_raw_fd(), write.as_raw_fd());
+        assert_ne!(read.as_raw_fd(), original_fd);
+        assert_ne!(write.as_raw_fd(), original_fd);
+    }
+
+    /// A takeover that fails still closes the original.
+    ///
+    /// This is the regression test for the double close. The original used to
+    /// be closed by an explicit `close(2)` that only ran once both
+    /// duplications had succeeded, so a failure left it open — and the caller
+    /// closed it, on the assumption that it still owned it. Two closes of one
+    /// number, and between them the number can be handed to something else.
+    ///
+    /// The duplication is the only step that can fail, so it is the one that
+    /// is faked here: the second one is made to fail, which is the path the
+    /// old code got wrong.
+    #[test]
+    fn a_failed_takeover_still_closes_the_original() {
+        let original = a_descriptor();
+        let original_fd = original.as_raw_fd();
+
+        let mut calls = 0;
+        let result = dup_tun_fds_with(original, |fd| {
+            calls += 1;
+            if calls == 2 {
+                return Err(std::io::Error::other("no descriptors left"));
+            }
+            fd.try_clone()
+        });
+
+        assert!(result.is_err(), "the takeover was supposed to fail");
+        assert!(
+            !is_open(original_fd),
+            "the original descriptor is still open after a failed takeover, so the caller \
+             would close it a second time"
+        );
     }
 }
 
@@ -404,8 +536,11 @@ fn stop_started_tasks(tasks: &[JoinHandle<()>], stopped: &AtomicBool) {
 impl TunProxy {
     /// Create and start the TUN proxy (Android).
     ///
-    /// - `tun_fd`: the raw fd returned by Kotlin's `ParcelFileDescriptor.detachFd()`.
-    ///   This function `dup`s it twice (read/write) and closes the original fd.
+    /// - `tun_fd`: the descriptor Kotlin's `ParcelFileDescriptor.detachFd()`
+    ///   handed over. **This function owns it**: it duplicates it into a
+    ///   read/write pair and closes the original, on every path including the
+    ///   ones that fail. The caller must not close it again — see
+    ///   [`dup_tun_fds`].
     /// - `endpoint_group`: the `Arc<EndpointGroup>` cloned from `ProxyState`, used for iroh connections.
     /// - `proxy_domains`: the list of domains to proxy (already split from comma-separated input).
     /// - `custom_dns_servers`: the system DNS server list (read from `CUSTOM_DNS_SERVERS`).
@@ -413,35 +548,30 @@ impl TunProxy {
     /// All tasks are started via `runtime.spawn()` internally — **no block_on**.
     #[cfg(target_os = "android")]
     pub fn new(
-        tun_fd: RawFd,
+        tun_fd: OwnedFd,
         endpoint_group: Arc<EndpointGroup>,
         proxy_domains: Vec<String>,
         custom_dns_servers: Vec<SocketAddr>,
     ) -> Result<Self, ClientError> {
-        // 1. dup the fd twice (read/write) and close the original fd.
-        let fd_read = unsafe { libc::dup(tun_fd) };
-        if fd_read < 0 {
-            let e = std::io::Error::last_os_error();
-            jni_log!("[tun-proxy] dup(read) failed: {}", e);
-            return Err(e.into());
-        }
-        let fd_write = unsafe { libc::dup(tun_fd) };
-        if fd_write < 0 {
-            let e = std::io::Error::last_os_error();
-            jni_log!("[tun-proxy] dup(write) failed: {}", e);
-            unsafe { libc::close(fd_read) };
-            return Err(e.into());
-        }
-        // Close the original fd — we now hold two dups.
-        unsafe { libc::close(tun_fd) };
+        // 1. dup the fd into the read/write pair. The original is closed by
+        //    this call, whichever way it ends: `tun_fd` is an `OwnedFd`, and it
+        //    is dropped when this scope ends.
+        let (fd_read, fd_write) = match dup_tun_fds(tun_fd) {
+            Ok(pair) => pair,
+            Err(e) => {
+                jni_log!("[tun-proxy] dup of the TUN fd failed: {}", e);
+                return Err(e);
+            }
+        };
+        let (fd_read, fd_write) = (fd_read.into_raw_fd(), fd_write.into_raw_fd());
 
         // From here the dups are ours to lose: the original is already closed,
         // so every remaining step that can fail would leak both for the life of
         // the process — and with them the VPN, which cannot be brought up
         // again on a device whose TUN fd is still open.
         let mut fds = TunFds {
-            read: Some(fd_read),
-            write: Some(fd_write),
+            read: Some(unsafe { OwnedFd::from_raw_fd(fd_read) }),
+            write: Some(unsafe { OwnedFd::from_raw_fd(fd_write) }),
         };
 
         set_nonblocking(fd_read)?;
@@ -491,7 +621,9 @@ impl TunProxy {
 
         // 3. TUN → Stack pump (read fd → Stack Sink).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fds.read.take().expect("still held")) };
+            let file = unsafe {
+                std::fs::File::from_raw_fd(fds.read.take().expect("still held").into_raw_fd())
+            };
             // A failure here has to stop what `start_stack_services` already
             // spawned: dropping a `JoinHandle` detaches its task rather than
             // cancelling it, and `stopped` is the only signal those tasks hear.
@@ -550,7 +682,9 @@ impl TunProxy {
 
         // 4. Stack → TUN pump (Stack Stream → write fd).
         {
-            let file = unsafe { std::fs::File::from_raw_fd(fds.write.take().expect("still held")) };
+            let file = unsafe {
+                std::fs::File::from_raw_fd(fds.write.take().expect("still held").into_raw_fd())
+            };
             let async_fd = match AsyncFd::new(file) {
                 Ok(async_fd) => async_fd,
                 Err(e) => {
