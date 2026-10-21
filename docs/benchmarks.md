@@ -11,6 +11,25 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 
+## The most recent result
+
+**[`size-perf-roadmap.md`](size-perf-roadmap.md) §F1 has the table.** Measured on
+2026-10-21 at `7d24761` on an Apple M4 (16 GB, macOS 27.0.1), `rustc 1.99.1`:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `tun_pump/dns_query` | 174 ns | the cache path is fast |
+| `tun_pump/ip_mapping` | **2,274 ns** | **a hotspot**: 30% of the per-packet path, for what should be a hash lookup |
+| `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
+| `l4_forward/tcp_flow` | 42,059 ns | the copy loop is not where the time is |
+| `forwarding_path/connect_tunnel` | 834,955 ns | a fixed cost per connection, not a rate |
+
+Those numbers are what F2's candidate list is checked against, and the same
+section lists the paths the numbers do **not** cover — the DNS forward branch,
+the idle wake-up rate, the per-flow memory, and both crates' HTTP request
+paths — so that what is a measurement and what is still an expectation stays
+visible.
+
 None of them needs a network. The backends are loopback TCP echoes, the TUN
 device is a `tokio::io::duplex` pair standing in for the fd, and the two iroh
 endpoints the forwarding path needs talk to each other over the loopback
@@ -105,3 +124,14 @@ A roadmap that only ever adds benchmarks is a plan to feel better without
 knowing anything. **"We measured and it is already fast enough" is a
 successful outcome** — and it is a result, because it is the first thing in
 this repository that says so with numbers behind it.
+
+**2026-10-21:** that first result has been written down. The table at the top
+of this page and F1's table in
+[`size-perf-roadmap.md`](size-perf-roadmap.md) are it — one documented hotspot
+(`ip_mapping`), one documented decision that the copy loops are not a problem
+(`l4_forward`), and a list of the paths the numbers do not reach.
+
+Which is the shape of the rule, now that it has been applied once: **a bench
+that runs in CI and whose output nobody reads is not a measurement.** The number
+has to be written down somewhere, with the machine it was measured on, or the
+roadmap item it justifies stays an expectation.

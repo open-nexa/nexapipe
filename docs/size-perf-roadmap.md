@@ -7,9 +7,9 @@ helped.
 
 | | |
 |---|---|
-| Last updated | 2026-10-10 |
+| Last updated | 2026-10-21 |
 | Scope | the desktop app bundle, the Android APK, the server archives, the web assets |
-| Status | Nothing here has been done. Every number below was measured on this working tree, and each carries the command that produced it. |
+| Status | The size half (§4) has not been done. The performance half (§5) has its three benchmarks, and — since 2026-10-21 — a written result: the measurements are in F1's table, and F2's candidate list has been checked against them. |
 
 Nothing in this document has a date or an owner. It is a statement of what we
 intend to change and what we refuse to trade away for it, in the same terms
@@ -261,7 +261,8 @@ how to run it, and what it deliberately does not measure.
 
 Until F1 lands, every performance claim in this document — including the ones
 above — is an expectation, not a result, and we have no way to tell whether a
-change helped.
+change helped. F1 has landed since, and its result is the table below; the
+claims above that it does not cover are still expectations, and §F1 says which.
 
 Three benches, chosen because they are on the paths that carry user traffic:
 
@@ -275,24 +276,82 @@ Three benches, chosen because they are on the paths that carry user traffic:
 *Testing Guidelines*). F1 adds throughput and latency percentiles next to it,
 with `criterion`, run in CI on the same runners.
 
+#### The result
+
+F1's deliverable was never only the benches. §6 asks for "a written result:
+either a documented hotspot, or a documented decision that there is not one",
+and until this table existed, neither had been written down. The benches had
+been running in CI and their output had been going into an artifact nobody
+opened. This is that table.
+
+Measured on 2026-10-21, at `7d24761`, on an Apple M4 (16 GB, macOS 27.0.1) with
+`rustc 1.99.1`, over a loopback-only setup (no network needed — see
+[`benchmarks.md`](benchmarks.md)). Reproduce with:
+
+```bash
+cargo bench --workspace --features nexapipe-client/tun-proxy --locked
+```
+
+Criterion's numbers are only meaningful on the machine that produced them, so
+the machine is part of the result. `slope` is the regression-based estimate and
+the one to trust; `mean` and `median` are given beside it because they say how
+much variance there was, and here there is very little.
+
+| Bench | mean | median | slope | What the number says |
+|---|---|---|---|---|
+| `tun_pump/dns_query` | 174 ns | 172 ns | **174 ns** | A DNS query answered from the virtual address pool is **fast**. The cache path is not a problem |
+| `tun_pump/ip_mapping` | 2,217 ns | 2,226 ns | **2,274 ns** | **A hotspot.** 30% of the whole per-packet path, for what should be a hash lookup |
+| `tun_pump/tun_packet` | 7,308 ns | 7,244 ns | **7,348 ns** | The whole TUN path: a packet in, an answer out. The per-packet cost on the platform with the least headroom |
+| `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | The L4 copy loop plus flow setup. **The copy loop itself is not the problem** |
+| `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | End-to-end through the local proxy and a real iroh connection. A fixed cost per connection, not a rate |
+
+#### What the numbers say, and what they do not
+
+Two things are worth writing down, because "we measured and it is already fast
+enough" is a result only when it is specific about *which* part.
+
+**The copy loops are fine.** `l4_forward` at 42 µs is a flow's whole life —
+setup, handshake, copy, teardown — and the copy itself is a fraction of it.
+The hot loop is a `read` → `write_all` → `fetch_add` with a reused buffer. The
+candidate list's first item ("buffer sizes in the copy loops") is the one the
+numbers do **not** support, and it would have been the wrong first move.
+
+**The per-packet path on a phone is where the work is.** `tun_packet` at 7.3 µs
+is the number that decides how much battery the tunnel costs, and
+`ip_mapping` at 2.3 µs is 30% of it. That is a hash lookup that clones a
+`String` and writes to a second `HashMap` on every packet.
+
+**What the numbers do not cover**, and therefore what is still an expectation
+rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
+passes an empty resolver list and a proxied domain, so it exercises the
+hijack branch and never the forward branch), the idle wake-up rate, the
+per-TCP-flow memory, the client's HTTP request path, the server's request
+path, and every part of the server crate's own request handling — `l4_forward`
+stops at a `duplex` and never crosses an iroh hop.
+
 ### F2 — Optimize what the benchmarks show (P2)
 
-**Not started, and not scheduled, because F1 has not run.** The candidate list,
-in the order we expect it to matter — an expectation, to be confirmed or thrown
-away by measurement:
+**Scheduled, and the schedule is F1's table.** The candidate list below was
+written as an expectation, to be confirmed or thrown away by measurement. Two
+of its four items are now confirmed, one is refuted, and the list has grown
+items the numbers pointed at.
 
-1. **Buffer sizes in the copy loops.** `crates/nexapipe/src/stream_util.rs` and
-   the client equivalents. Cheap to change, and a 8 KB buffer where 64 KB fits
-   is a real cost at high throughput. Equally likely to turn out to be
-   irrelevant.
-2. **Allocation on the per-packet path.** The TUN pump runs per packet; if it
-   allocates, that is visible on a phone long before it is visible on a server.
-3. **`hyper-util` feature flags.** `hyper` is pulled with `features = ["full"]`
-   (`crates/nexapipe-client/Cargo.toml:24`). This is primarily an S1/S2 size
-   lever; if it costs measurable throughput it becomes one here too.
-4. **Nothing else.** Not the QUIC or rustls internals — those are the vendored,
-   audited, already-`opt-level = 3` layers, and nobody in this project is going
-   to out-tune `ring` by hand.
+1. **Buffer sizes in the copy loops.** **Refuted by `l4_forward`.** The copy
+   loop is not where the time is. Left alone.
+2. **Allocation on the per-packet path.** **Confirmed, and quantified**:
+   `ip_mapping` at 2.3 µs is 30% of `tun_packet`, and the reason is a `String`
+   clone plus a second `HashMap` write per packet.
+3. **`hyper-util` feature flags.** Not measured, and not a throughput item —
+   it stays a size lever (S1/S2).
+4. **Nothing else.** **No longer true.** The numbers, and a reading of the
+   code, added: the per-TCP-flow memory of the smoltcp stack (four 320 KiB
+   buffers per flow, and the client never lowers the default); the client's
+   per-connection buffer footprint; the server's per-request allocations; and
+   the body copy that makes the process-wide byte budget count half of what
+   the process actually holds.
+5. **Not the QUIC or rustls internals** — those are the vendored, audited,
+   already-`opt-level = 3` layers, and nobody in this project is going to
+   out-tune `ring` by hand. That one still stands.
 
 ### F3 — A performance budget (P2, after F1)
 
@@ -312,7 +371,7 @@ not a stated goal.
 | Android APK size | 16.5 MB unminified debug, release never shrunk | measured on the release artifact, and substantially under today's |
 | Android `.so` size | never measured; unstripped | measured, stripped, with a `-g` artifact kept |
 | Size regressions | invisible | reported on every PR; failing the build only after a clean release |
-| Throughput / latency | three benches in CI, and no result written down yet | a written result: either a documented hotspot, or a documented decision that there is not one |
+| Throughput / latency | three benches in CI, and a result written down on 2026-10-21: one documented hotspot (`ip_mapping`, 2.3 µs, 30% of the per-packet path), one documented decision that there is not one (the copy loops), and the gaps the numbers do not cover listed in F1 | F2's list checked against the numbers, and the gaps closed by benches that do not exist yet |
 
 The last row is the one that matters. A roadmap that only ever adds benchmarks
 is a plan to feel better without knowing anything. **"We measured and it is
@@ -323,7 +382,8 @@ one on purpose.
 
 ## 7. Evidence index
 
-Every claim above was checked against this working tree on 2026-10-10.
+Every claim above was checked against this working tree on 2026-10-10, and the
+performance half again on 2026-10-21.
 Line numbers drift; the command that reproduces each row is given with it.
 
 | Claim | Where |
@@ -338,6 +398,8 @@ Line numbers drift; the command that reproduces each row is given with it.
 | The JNI surface is fourteen functions, asserted in CI | `release.yml:794-816` |
 | Nothing in CI measures size | no `size`/`bytes`/`MiB` in `release.yml`; the 16 jobs in `ci.yml:55-628` plus `codeql.yml`, `pages.yml` and `dependency-report.yml` all do something else |
 | Benchmarks exist (as of 2026-10-21) | `crates/nexapipe/benches/l4_forward.rs`, `crates/nexapipe-client/benches/tun_pump.rs`, `crates/nexapipe-client/benches/forwarding_path.rs`; `criterion` in `Cargo.lock`; the `bench` job in `ci.yml` |
+| The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source |
+| `ip_mapping` is 30% of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |
 | The local bundle is stale | `ui-desktop/src-tauri/target/release/bundle/dmg/nexa_0.1.0_aarch64.dmg` (dated 2026-10-07, 22 MB) against `version = "0.6.0"` |
