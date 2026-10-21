@@ -16,7 +16,7 @@ use crate::routes::RouteConfig;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// TLS record content type: handshake (a `ClientHello` starts with this).
 pub const TLS_HANDSHAKE: u8 = 0x16;
@@ -82,7 +82,7 @@ pub async fn handle_iroh_stream(
     // would cap every passthrough session at the default hour, which is a
     // budget this path never asked for and a behaviour change the half-close
     // fix does not need: the lingering bound is what keeps the wait finite.
-    copy_both_ways(client, backend, "TLS passthrough").await?;
+    copy_tls_session(client, backend).await?;
     Ok(())
 }
 
@@ -114,8 +114,36 @@ pub async fn handle_tcp_stream(
     // The same copy as the iroh path above, with the same reasoning: the wait
     // after a half-close is bounded by `LINGERING`, and a whole-flow deadline
     // is not imposed on a path whose sessions are meant to be long-lived.
-    copy_both_ways(client, backend, "TLS passthrough").await?;
+    copy_tls_session(client, backend).await?;
     Ok(())
+}
+
+/// The copy both TLS paths make, with the one outcome that is not a failure.
+///
+/// `copy_both_ways` reports `TimedOut` when the direction that outlived the
+/// first one does not finish within `LINGERING`. On this path that is a session
+/// that half-closed and then went quiet — a normal end, not a broken
+/// connection — and the L4 path reads the same error the same way.
+///
+/// It can only mean that here: this path passes no whole-flow deadline, so the
+/// copy's own `TimedOut` is the only one it can produce. Reporting it as an
+/// error would put a line in the log, at `error`, for every session that ended
+/// the way a half-closed one is supposed to.
+async fn copy_tls_session<A, B>(client: A, backend: B) -> anyhow::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    match copy_both_ways(client, backend, "TLS passthrough").await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            tracing::debug!(
+                "TLS passthrough: the other direction did not finish after a half-close, closing"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// One TCP dial toward one backend, under `[timeouts] connect_secs`.

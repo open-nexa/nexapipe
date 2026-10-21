@@ -89,18 +89,25 @@ impl AsyncWrite for DuplexIroh {
     }
 }
 
-/// Copies bytes in both directions until either side stops.
+/// Copies bytes in both directions until **both** of them have ended.
 ///
-/// First EOF wins rather than waiting for both: a tunnel is finished when either end
-/// is, and waiting would pin a half-open connection. Both ends are then half-closed,
-/// so the peers see a clean EOF instead of a dropped connection.
+/// A half-close is a request, not an ending: a peer that shut its write side
+/// down is done sending, and the reply that follows still has to arrive. So the
+/// copy ends when the second direction ends, not when the first one does — and
+/// each direction shuts its own write side down as it finishes, so the peer
+/// sees a clean EOF instead of a dropped connection.
 ///
-/// The result is the one from the direction that finished first. A clean EOF on
-/// either side is `Ok`, so this only reports a transport failure — which is the
-/// difference between a tunnel that ended and one that broke, and the caller needs
-/// it to log the right thing. A deadline that expires comes back as `TimedOut`, so
-/// the caller can tell "this one was cut" from "this one broke"; either way the
-/// half-close below has already run.
+/// That wait is bounded. A peer that vanished and a peer that half-closed
+/// arrive the same way, as a clean end of stream, so once one direction has
+/// ended the other is given `LINGERING` to finish before the copy gives up on
+/// it.
+///
+/// The result is `Ok` when both directions ended cleanly. A transport failure
+/// is reported as it happened — there is nothing left to wait for once the
+/// connection is broken. A copy that gave up on the direction which outlived
+/// the first one comes back as `TimedOut`, and a deadline that expires comes
+/// back the same way, so the caller can tell "this one was cut" from "this one
+/// broke"; either way the half-closes have already run.
 ///
 /// `label` only ever reaches a debug log — it exists so an operator can tell the TLS
 /// path from the L4 path when both are in play.
