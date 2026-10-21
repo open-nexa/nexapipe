@@ -275,10 +275,12 @@ answered its last probe and how much it has carried. **The latency buckets
 shipped in v0.6.0.** Request duration is a histogram —
 `nexapipe_request_duration_ms_bucket{le="…"}` beside `_sum` and `_count`, over
 fixed boundaries from 1 ms to 10 s plus `+Inf` — so a p99 is read off the scrape
-rather than divided out by hand. What is still missing is an OpenTelemetry
-exporter, and latency on either client: neither the desktop nor Android shows
-how long a request took, and `/metrics` is still the only place that does. The
-exporter, and client-side latency, are not planned for this release.
+rather than divided out by hand. **Client-side latency ships in v1.0.0:** the
+probe already runs every 30 s, and the round trip it measures now reaches the
+UI on both the desktop and Android, so a person reads how long a request took
+without reading the scrape. What is still missing is an OpenTelemetry exporter:
+the numbers are still only reachable through `/metrics`, and the exporter is
+not planned for this release.
 
 ### 4.3 Identity and authorization (P1)
 
