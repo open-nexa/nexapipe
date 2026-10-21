@@ -13,7 +13,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
+use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -70,7 +70,17 @@ pub async fn handle_iroh_stream(
     crate::metrics::METRICS.record_bytes_received(handshake.len() as u64);
 
     let client = DuplexIroh::new(send, recv);
-    copy_both_ways(client, backend, "TLS passthrough").await?;
+    // The copy waits for **both** directions now, because a half-close is a
+    // request and not an ending — so it needs a bound of its own. The L4 path
+    // has had one all along (`l4_flow`, overridable per route); the
+    // passthrough had none, and a copy that waits for both ends needs one.
+    copy_both_ways_until(
+        client,
+        backend,
+        "TLS passthrough",
+        Some(config.timeouts().deadlines.l4_flow),
+    )
+    .await?;
     Ok(())
 }
 
@@ -99,7 +109,13 @@ pub async fn handle_tcp_stream(
     let mut backend = connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
 
-    copy_both_ways(client, backend, "TLS passthrough").await?;
+    copy_both_ways_until(
+        client,
+        backend,
+        "TLS passthrough",
+        Some(config.timeouts().deadlines.l4_flow),
+    )
+    .await?;
     Ok(())
 }
 

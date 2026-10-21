@@ -475,7 +475,9 @@ where
             // — the default is meant to be generous, not invisible.
             tracing::warn!(
                 "L4 TCP: closing the flow to {host}:{port} after {flow_timeout:?}, which is the \
-                 whole-flow bound; raise flow_timeout_secs on the route for longer sessions"
+                 whole-flow bound; raise flow_timeout_secs on the route for longer sessions. \
+                 The other end of the copy may also have stopped without finishing, which is \
+                 what the copy gives up on after a half-close"
             );
         }
         // A real transport failure, which is what the other paths report too.
