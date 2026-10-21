@@ -81,13 +81,20 @@ pub fn init(config: Option<&LogConfig>, debug: bool) {
     }
 
     let registry = tracing_subscriber::registry().with(filter);
+    // Whether the access line has a file of its own. It is the operator's
+    // setting rather than the sink, so a failure to open the file does not
+    // silently move the line back into the server's log — the access logger
+    // already falls back to stdout for that case.
+    let access_has_a_file = settings.access_log;
     let installed = match (console, log_sink.clone()) {
         (true, Some(sink)) => registry
             .with(console_layer())
-            .with(file_layer(sink))
+            .with(file_layer(sink, access_has_a_file))
             .try_init(),
         (true, None) => registry.with(console_layer()).try_init(),
-        (false, Some(sink)) => registry.with(file_layer(sink)).try_init(),
+        (false, Some(sink)) => registry
+            .with(file_layer(sink, access_has_a_file))
+            .try_init(),
         // Unreachable: `console` is forced on when there is no file to write to.
         (false, None) => registry.with(console_layer()).try_init(),
     };
@@ -126,7 +133,19 @@ where
         .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
 }
 
-fn file_layer<S>(sink: FileSink) -> impl Layer<S>
+/// The server's own log file.
+///
+/// `access_has_a_file` says whether the access line has a file of its own to go
+/// to. When it does, the line is left out of this one: the access log has it,
+/// and it is written on a thread of its own — a request that also wrote the
+/// line here would pay for a second synchronous write, under this sink's lock,
+/// to put the same line in another file.
+///
+/// When it does **not** — `[log] access_log = false` — this file is the only
+/// place the line can reach besides the console, which is where it was before
+/// the filter existed. Dropping it here as well would take access lines away
+/// from a server that was configured to keep them in its one log file.
+fn file_layer<S>(sink: FileSink, access_has_a_file: bool) -> impl Layer<S>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
@@ -136,11 +155,9 @@ where
         .with_ansi(false)
         .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
         .with_writer(sink)
-        // The access line is not repeated here. It has a file of its own, and
-        // the access log is written on a thread of its own — a request that
-        // also wrote the line here would pay for a second synchronous write,
-        // under this sink's lock, to put the same line in another file.
-        .with_filter(filter_fn(|metadata| metadata.target() != ACCESS_TARGET))
+        .with_filter(filter_fn(move |metadata| {
+            !access_has_a_file || metadata.target() != ACCESS_TARGET
+        }))
 }
 
 /// Open one of the log files, reporting a failure on stderr instead of aborting.
@@ -1050,7 +1067,7 @@ mod tests {
         let path = sink.path();
         let subscriber = tracing_subscriber::registry()
             .with(env_filter(false))
-            .with(file_layer(sink));
+            .with(file_layer(sink, true));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: ACCESS_TARGET, "Access: 1.2.3.4 GET / 200");
@@ -1065,6 +1082,33 @@ mod tests {
         assert!(
             !written.contains("Access:"),
             "the access line is in the file as well: {written}"
+        );
+    }
+
+    /// With no access log of its own, the line stays in the server's log file.
+    ///
+    /// `[log] access_log = false` is a server that keeps one file, and the
+    /// access line was in that file before the filter existed. A filter that
+    /// dropped it here as well would answer a configuration that asked for no
+    /// *separate* access log with no access lines at all.
+    #[test]
+    fn the_access_line_stays_in_the_server_log_when_it_has_nowhere_else_to_go() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sink =
+            FileSink::new(dir.path(), "server.log", Rotation::Never, 0, 0).expect("a log file");
+        let path = sink.path();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter(false))
+            .with(file_layer(sink, false));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: ACCESS_TARGET, "Access: 1.2.3.4 GET / 200");
+        });
+
+        let written = std::fs::read_to_string(path).expect("the log file");
+        assert!(
+            written.contains("Access:"),
+            "the line has no other file to go to: {written}"
         );
     }
 
