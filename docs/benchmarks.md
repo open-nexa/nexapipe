@@ -10,6 +10,7 @@ rather than a result — the reasoning behind that is in
 | `l4_forward` | `crates/nexapipe/benches/l4_forward.rs` | the copy loop of an L4 flow: bytes from the tunnel to the backend and back |
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
+| `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
 And one measurement that is not a bench, because what it measures is memory
@@ -26,6 +27,7 @@ have changed since are marked:
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
+| `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
@@ -58,6 +60,7 @@ cargo bench --workspace --features nexapipe-client/tun-proxy -- --noplot
 cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
+cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe-client --bench domain_match
 ```
 
@@ -109,6 +112,10 @@ and the tests cover what it does.
 question every `CONNECT` and every DNS query asks, answered by walking the
 list of names the client was configured with. It is a bench of its own because
 that list is the one thing in the client whose length a request pays for.
+
+**`route_lookup`** is the server's routing table: every request asks it which
+route serves the request, and the answer is a walk over the routes until one
+matches. The backends are never dialled — the bench measures the lookup.
 
 **`forwarding_path`** is the only bench that reflects what a user experiences:
 the request crosses the proxy's accept loop, the tunnel handshake, the tunnel
