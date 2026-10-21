@@ -90,3 +90,9 @@ required-features = ["tun-proxy"]
 name = "forwarding_path"
 harness = false
 required-features = ["local-proxy"]
+
+# The client asking whether a name is one of its own. It is a bench of its own
+# because it is the only place a long list of names is walked on every request.
+[[bench]]
+name = "domain_match"
+harness = false

@@ -68,11 +68,20 @@ impl<'a> TotpValidator<'a> {
     /// device with a public key proves itself with an Ed25519 signature over
     /// the same bytes, and has no code to offer: `totp_code` is empty.
     ///
-    /// `Ok(false)` is the credential being wrong — a wrong code for a secret
-    /// device, a signature that is not this key's for a key device — and the
-    /// caller counts it toward the lockout, which for a key device is the only
-    /// wrong-credential signal there is. Every `Err` is a refusal the caller
-    /// logs instead of counting.
+    /// `Ok(false)` is the credential being wrong, and the caller counts it
+    /// toward the lockout. Today that is one case: a wrong TOTP code for a
+    /// secret device. Every `Err` is a refusal the caller logs instead of
+    /// counting.
+    ///
+    /// A key device's wrong signature is a refusal and not a count, and the
+    /// difference is the difference between the two proofs. A code is
+    /// guessable, so the counter that stops the guessing is the point of it —
+    /// and the counter there is only reachable by a peer that already holds
+    /// the secret, because the HMAC has to verify before the code is
+    /// checked. A key is not guessable, so a counter on that path protects
+    /// nothing, and what it does instead is hand anyone who knows a client
+    /// id and the name of a key device a way to lock a legitimate device
+    /// out — over and over, and without holding any credential at all.
     ///
     /// `device_id` says which credential under that client is being proven:
     /// `None` is the device that has no name and answers with the client's own
@@ -164,9 +173,30 @@ impl<'a> TotpValidator<'a> {
             // code, so this is the only wrong-credential signal there is, and
             // leaving it uncounted would let the device be hammered without
             // limit.
-            Proof::Key(key) => Ok(super::device_key::ed25519_verify(
-                &key, nonce, timestamp, signature,
-            )),
+            Proof::Key(key) => {
+                // Refused, never counted.
+                //
+                // The secret path counts a wrong code because the code is
+                // guessable and the counter is what stops the guessing — and
+                // the counter there is only reachable by a peer that already
+                // holds the secret, because the HMAC has to verify first.
+                //
+                // A key is not guessable. There is nothing for a counter to
+                // protect on this path, so the only thing counting does is
+                // let anyone who knows a client id and the name of a key
+                // device lock a legitimate device out — over and over, and
+                // for as long as they care to.
+                //
+                // The malformed case is told apart from the merely-wrong one
+                // so the log can say which it was.
+                if iroh::Signature::try_from(signature).is_err() {
+                    return Err(AuthError::MalformedSignature);
+                }
+                if !super::device_key::ed25519_verify(&key, nonce, timestamp, signature) {
+                    return Err(AuthError::WrongSignature);
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -282,6 +312,22 @@ pub enum AuthError {
     /// The response names no device and this client has been configured to
     /// answer only named ones, so the shared `secret` is not a credential here.
     UnnamedDeviceNotAllowed,
+    /// The response's signature does not match the challenge.
+    ///
+    /// Refused rather than counted, and the reason is the difference between
+    /// the two proofs. A wrong TOTP code is a guess at a credential, and the
+    /// counter that stops the guesses is the point of it. A wrong signature is
+    /// not a guess: a 256-bit key cannot be brute-forced, so there is nothing
+    /// for the counter to protect. What it does instead is hand anyone who
+    /// knows a client id and a device name a way to lock a legitimate device
+    /// out — repeatedly, and for as long as they like — without holding any
+    /// credential at all.
+    WrongSignature,
+    /// The response's signature is not a signature: the wrong length.
+    ///
+    /// The same refusal as [`AuthError::WrongSignature`], and the same
+    /// reason: this is a malformed message, not an attempt at the credential.
+    MalformedSignature,
     ProtocolError(String),
 }
 
@@ -305,6 +351,12 @@ impl std::fmt::Display for AuthError {
             }
             AuthError::UnnamedDeviceNotAllowed => {
                 write!(f, "This client answers only to a named device")
+            }
+            AuthError::WrongSignature => {
+                write!(f, "The response signature does not match the challenge")
+            }
+            AuthError::MalformedSignature => {
+                write!(f, "The response signature is malformed")
             }
             AuthError::ProtocolError(msg) => write!(f, "Protocol error: {}", msg),
         }
@@ -640,7 +692,7 @@ mod tests {
     /// not an `Err`. If it were an `Err`, the counter would never move and the
     /// device could be tried without limit.
     #[test]
-    fn a_wrong_signature_is_a_wrong_credential_not_an_error() {
+    fn a_wrong_signature_is_refused_and_not_a_fallback() {
         let (config, _) = config_with_a_key_device();
         let validator = TotpValidator::new(&config);
         let nonce = fresh_nonce();
@@ -657,7 +709,66 @@ mod tests {
             &signature.to_bytes(),
             "",
         );
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(AuthError::WrongSignature)),
+            "a wrong signature is refused, and not counted: {outcome:?}"
+        );
+    }
+
+    /// A signature that is not a signature is a malformed message, not a
+    /// wrong credential.
+    ///
+    /// The two have to be told apart, because the caller counts a wrong
+    /// credential and does not count a malformed one. A peer that knows a
+    /// client id and the name of a key device could otherwise send noise
+    /// five times and lock that client out — over and over, and without
+    /// holding any credential at all.
+    #[test]
+    fn a_malformed_signature_is_refused_rather_than_counted() {
+        let (config, _) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        // Not a signature: too short.
+        let outcome =
+            validator.verify_response("alice", Some("phone"), &nonce, timestamp, b"noise", "");
+
+        assert!(
+            matches!(outcome, Err(AuthError::MalformedSignature)),
+            "a malformed signature is refused, not counted: {outcome:?}"
+        );
+    }
+
+    /// A signature that is well formed and wrong is refused too — and is not
+    /// counted.
+    ///
+    /// This is the change that closes the door. A 256-bit key cannot be
+    /// guessed, so a counter on this path protects nothing; what it does is
+    /// let anyone who knows a client id and the name of a key device lock a
+    /// legitimate device out, over and over.
+    #[test]
+    fn a_wrong_signature_is_refused_and_not_counted() {
+        let (config, _) = config_with_a_key_device();
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+
+        let stranger = iroh::SecretKey::generate();
+        let signature = stranger.sign(&crate::auth::device_key::sign_message(&nonce, timestamp));
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("phone"),
+            &nonce,
+            timestamp,
+            &signature.to_bytes(),
+            "",
+        );
+        assert!(
+            matches!(outcome, Err(AuthError::WrongSignature)),
+            "a wrong signature is refused, not counted: {outcome:?}"
+        );
     }
 
     /// The freshness bound is the same for both proofs: a signature is proof
@@ -705,10 +816,15 @@ mod tests {
         .unwrap();
 
         // An HMAC is not a signature, and nothing on the key path reads it as
-        // one: the verdict is a wrong credential, not a fallback to the
-        // client's secret.
+        // one: the verdict is a refusal, not a fallback to the client's
+        // secret. The HMAC is 32 bytes and a signature is 64, so this is the
+        // malformed case rather than the merely-wrong one — the log says
+        // which it was.
         let outcome =
             validator.verify_response("alice", Some("phone"), &nonce, timestamp, &clients_own, "");
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(AuthError::MalformedSignature)),
+            "an HMAC is not a signature, and the key path does not read it as one: {outcome:?}"
+        );
     }
 }

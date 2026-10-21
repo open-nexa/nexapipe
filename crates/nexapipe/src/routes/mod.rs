@@ -127,7 +127,7 @@ impl Route {
             // The pattern is folded as a pattern, not as a host: a spelling
             // that would fold into the catch-all keeps its own shape, so a
             // route can never end up serving every host.
-            host_pattern: normalize_pattern(host_pattern),
+            host_pattern: normalize_pattern(host_pattern).into_owned(),
             path_pattern: path_pattern.to_string(),
             path_is_prefix,
             modes: vec![mode],
