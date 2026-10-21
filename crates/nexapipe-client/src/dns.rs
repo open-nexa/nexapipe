@@ -101,7 +101,7 @@ struct Inner {
 }
 
 impl UpstreamResolvers {
-    /// Binds one socket per server, in the order given.
+    /// Binds one socket per server, IPv4 servers first.
     ///
     /// A server whose socket cannot be bound is **skipped**, not fatal: today
     /// the same thing happens per query (the bind fails, the server is tried
@@ -114,28 +114,34 @@ impl UpstreamResolvers {
     /// Needs a runtime context: the sockets are registered with it, and the
     /// readers are tasks of it.
     pub fn new(servers: &[SocketAddr], stopped: Arc<AtomicBool>) -> Self {
-        Self::with_timeouts(servers, stopped, PER_SERVER_TIMEOUT, OVERALL_TIMEOUT)
+        // IPv4 first: a phone's IPv6 path is the one more likely to be a
+        // dead end, and asking it first would spend a timeout on it.
+        let mut ordered: Vec<SocketAddr> = servers.to_vec();
+        ordered.sort_by_key(|server| !server.is_ipv4() as u8);
+        Self::with_timeouts(&ordered, stopped, PER_SERVER_TIMEOUT, OVERALL_TIMEOUT)
     }
 
-    /// [`UpstreamResolvers::new`] with the timeouts the caller wants.
+    /// [`UpstreamResolvers::new`] with the timeouts the caller wants, and the
+    /// order the caller gave.
     ///
     /// The two windows are the ones the chain has always had: how long one
     /// resolver may take before the next is tried, and how long the whole
     /// chain may take. A caller whose chain is longer, or whose resolvers are
     /// further away, needs different numbers.
+    ///
+    /// The order is left alone: a chain is ordered for a reason. The desktop
+    /// asks the machine's own resolvers first, then its configured one, then
+    /// the public fallbacks, because only the machine's own resolver knows its
+    /// split-horizon and internal names. Sorting it by address family would
+    /// put a public IPv4 fallback ahead of an IPv6 resolver that knows them.
     pub fn with_timeouts(
         servers: &[SocketAddr],
         stopped: Arc<AtomicBool>,
         per_server: Duration,
         overall: Duration,
     ) -> Self {
-        // IPv4 first: a phone's IPv6 path is the one more likely to be a
-        // dead end, and asking it first would spend a timeout on it.
-        let mut ordered: Vec<SocketAddr> = servers.to_vec();
-        ordered.sort_by_key(|server| !server.is_ipv4() as u8);
-
         let mut resolvers = Vec::new();
-        for server in ordered {
+        for &server in servers {
             match Resolver::bind(server) {
                 Ok(resolver) => {
                     let resolver = Arc::new(resolver);
@@ -516,6 +522,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
     use tokio::net::UdpSocket;
 
     /// `example.com` in wire form: one length byte per label, then the
@@ -813,5 +820,46 @@ mod tests {
         let resolvers = UpstreamResolvers::new(&[], Arc::new(AtomicBool::new(false)));
         assert!(resolvers.is_empty());
         assert_eq!(resolvers.len(), 0);
+    }
+
+    /// The order a caller gives is the order it is asked in, family and all:
+    /// the desktop's chain puts the machine's own resolvers before the public
+    /// fallbacks because only the former know its internal names.
+    #[tokio::test]
+    async fn with_timeouts_keeps_the_order_it_is_given() {
+        let servers: Vec<SocketAddr> =
+            vec!["[::1]:53".parse().unwrap(), "127.0.0.1:53".parse().unwrap()];
+        let resolvers = UpstreamResolvers::with_timeouts(
+            &servers,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        let asked: Vec<SocketAddr> = resolvers
+            .inner
+            .resolvers
+            .iter()
+            .map(|resolver| resolver.server)
+            .collect();
+        assert_eq!(asked, servers);
+    }
+
+    /// The local proxy's own entry point still asks IPv4 first: a phone's IPv6
+    /// path is the one more likely to be a dead end.
+    #[tokio::test]
+    async fn new_asks_ipv4_servers_first() {
+        let servers: Vec<SocketAddr> =
+            vec!["[::1]:53".parse().unwrap(), "127.0.0.1:53".parse().unwrap()];
+        let resolvers = UpstreamResolvers::new(&servers, Arc::new(AtomicBool::new(false)));
+        let asked: Vec<SocketAddr> = resolvers
+            .inner
+            .resolvers
+            .iter()
+            .map(|resolver| resolver.server)
+            .collect();
+        assert_eq!(
+            asked,
+            vec!["127.0.0.1:53".parse().unwrap(), "[::1]:53".parse().unwrap()]
+        );
     }
 }
