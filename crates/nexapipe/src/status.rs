@@ -279,7 +279,7 @@ fn print_clients(body: &Value) {
 
     for client in clients {
         println!(
-            "  {}  secret: {}  hosts: {}",
+            "  {}  secret: {}  hosts: {}  ports: {}",
             text(client, "id"),
             if client["has_secret"].as_bool().unwrap_or(false) {
                 "enrolled"
@@ -296,6 +296,18 @@ fn print_clients(body: &Value) {
                 // same if this is shortened to "no restriction".
                 Some(_) => "none, every host is denied".to_string(),
                 None => "every route".to_string(),
+            },
+            // The same question asked of ports rather than of names, and the
+            // same three answers: every port, none of them, or the list.
+            match client["allow_ports"].as_array() {
+                Some(ports) if !ports.is_empty() => ports
+                    .iter()
+                    .filter_map(|port| port.as_u64())
+                    .map(|port| port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Some(_) => "none, every port is denied".to_string(),
+                None => "every port".to_string(),
             },
         );
         if client["locked_until"].is_number() {

@@ -73,6 +73,17 @@ object IrohProxy {
     external fun nativeSetRelayConfig(relayMode: String, relayUrl: String, authToken: String): Int
 
     /**
+     * Configures whether this endpoint may use n0's address lookup.
+     *
+     * discoveryMode: "n0" (the default — a Node ID is looked up through
+     *                dns.iroh.link) or "none" (no lookup at all; a peer then
+     *                has to bring an address of its own, which is what a
+     *                ticket carries).
+     * Must be called before nativeStartIroh.
+     */
+    external fun nativeSetDiscoveryMode(discoveryMode: String): Int
+
+    /**
      * Names this device, once, for every **enrollment** it spends.
      *
      * deviceId: printable ASCII without spaces, as
@@ -260,8 +271,10 @@ object IrohProxy {
     external fun nativePreconnect(): Int
 
     /**
-     * How each configured backend is currently reached: one `<endpointId>=<kind>` pair per
-     * backend, joined with `;`, where `kind` is `direct`, `relay` or `unknown`.
+     * How each configured backend is currently reached and how far away it is: one
+     * `<endpointId>=<kind>/<rttMs>` entry per backend, joined with `;`, where `kind` is
+     * `direct`, `relay` or `unknown` and `rttMs` is the round-trip time in milliseconds, or
+     * `-` when iroh has no sample yet.
      *
      * This is the runtime answer, read off the path iroh actually selected — not the
      * configured relay URL, which only names a relay that may be used. A backend that has

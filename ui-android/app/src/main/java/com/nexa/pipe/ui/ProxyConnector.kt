@@ -55,6 +55,15 @@ class ProxyConnector(private val log: ConnectionLog) {
         val relayMode: String,
         val relayUrl: String,
         val relayAuthToken: String,
+        /**
+         * Whether this device may ask n0 where a peer is: "n0" (the default)
+         * or "none".
+         *
+         * With the lookup off, a peer is only reachable by an address this
+         * device was given — a ticket — and not by a Node ID alone, because
+         * finding the address behind a Node ID is the lookup itself.
+         */
+        val discoveryMode: String,
         /** The name this install answers as. */
         val deviceId: String,
         /**
@@ -137,13 +146,18 @@ class ProxyConnector(private val log: ConnectionLog) {
 
         // Pre-resolve the iroh infrastructure domains to work around the GFW
         // dropping iroh.link UDP DNS responses. Re-resolved on every attempt.
-        val dnsOverrides = resolveIrohDnsOverrides()
-        if (dnsOverrides.isNotEmpty()) {
-            IrohProxy.nativeSetDnsOverride(dnsOverrides)
-        }
+        //
+        // Always handed over, empty included: the table on the native side is
+        // replaced by the call, so a configuration that resolves nothing has
+        // to say so rather than keep what the last attempt left behind.
+        val dnsOverrides = resolveIrohDnsOverrides(plan)
+        IrohProxy.nativeSetDnsOverride(dnsOverrides)
 
         // Configure the relay mode.
         IrohProxy.nativeSetRelayConfig(plan.relayMode, plan.relayUrl, plan.relayAuthToken)
+
+        // Configure whether this device may ask n0 where a peer is.
+        IrohProxy.nativeSetDiscoveryMode(plan.discoveryMode)
 
         // Configure the 2FA credentials (must be injected before
         // nativeStartProxy). Every endpoint carries its own pair, so the
@@ -328,15 +342,29 @@ class ProxyConnector(private val log: ConnectionLog) {
      * pre-resolved IPs directly for these domains, so pkarr resolve (HTTPS to
      * dns.iroh.link/pkarr/<z32>) and the relay connection succeed.
      */
-    private suspend fun resolveIrohDnsOverrides(): String {
+    private suspend fun resolveIrohDnsOverrides(plan: Plan): String {
         // DNS origin and default relay servers used by iroh presets::N0.
-        val domains = listOf(
-            "dns.iroh.link",
-            "use1-1.relay.n0.iroh.link",
-            "usw1-1.relay.n0.iroh.link",
-            "euc1-1.relay.n0.iroh.link",
-            "aps1-1.relay.n0.iroh.link",
-        )
+        //
+        // Only the ones this configuration actually uses. The lookup's own
+        // host is asked about nothing when the lookup is off, and the n0
+        // relays are dialled by nobody when the relay is the operator's own
+        // or when there is none. Resolving a host the endpoint will never
+        // talk to is a question asked for nothing — and with the lookup off
+        // it is a question about n0 that the operator said not to ask.
+        val domains = mutableListOf<String>()
+        if (plan.discoveryMode != "none") {
+            domains.add("dns.iroh.link")
+        }
+        if (plan.relayMode != "custom" && plan.relayMode != "disabled") {
+            domains.add("use1-1.relay.n0.iroh.link")
+            domains.add("usw1-1.relay.n0.iroh.link")
+            domains.add("euc1-1.relay.n0.iroh.link")
+            domains.add("aps1-1.relay.n0.iroh.link")
+        }
+        if (domains.isEmpty()) {
+            log.log("No iroh domain to pre-resolve: neither the lookup nor the n0 relays are in use")
+            return ""
+        }
 
         val overrides = kotlinx.coroutines.coroutineScope {
             domains.map { domain ->

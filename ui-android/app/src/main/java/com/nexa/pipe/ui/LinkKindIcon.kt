@@ -61,18 +61,6 @@ private fun linkKindTint(kind: LinkKind): Color = when (kind) {
 }
 
 /**
- * The link type of [nodeId] in the map the ViewModel publishes, or null when it says nothing
- * about that backend.
- *
- * Callers must read this from a *collected* map, not from `StateFlow.value`, or the UI will
- * never recompose when the link changes. The case-insensitive fallback costs nothing at this
- * size and covers an endpoint ID that came back in a different case than the one configured.
- */
-fun linkKindOf(kinds: Map<String, LinkKind>, nodeId: String): LinkKind? =
-    kinds[nodeId]
-        ?: kinds.entries.firstOrNull { it.key.equals(nodeId, ignoreCase = true) }?.value
-
-/**
  * The icon with its name beside it.
  *
  * The glyph alone is easy to misread at a glance — "one hop" and "two hops with something in

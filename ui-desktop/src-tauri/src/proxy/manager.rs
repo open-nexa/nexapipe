@@ -8,11 +8,12 @@ use nexapipe_client::auth::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
 use nexapipe_client::connection_pool::parse_endpoint_addr;
+use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
-use nexapipe_client::LinkKind;
+use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -233,6 +234,11 @@ pub struct ProxyManagerConfig {
     /// Bearer token for a `custom` relay that requires one. Only ever read together with
     /// `relay_url`, and never logged.
     pub relay_auth_token: String,
+    /// Whether this endpoint may use n0's address lookup — the DNS and pkarr
+    /// queries that turn a Node ID into an address. `"n0"` (the default) keeps
+    /// it; `"none"` switches it off, and a peer then has to bring an address
+    /// of its own (a ticket) to be reachable.
+    pub discovery_mode: String,
 }
 
 struct ProxyInstance {
@@ -312,6 +318,24 @@ impl ProxyManager {
             .flat_map(|node| node.domains.iter().cloned())
             .collect();
 
+        // What the list is worth saying, once, before anything is started.
+        //
+        // A pattern that matches nothing is a warning: the domain is not
+        // proxied, and the name resolves for real instead — so a spelling the
+        // rule refuses has to be said out loud, because the scope the
+        // operating system is given still covers it. The client library has
+        // the notes; the desktop never asked for them.
+        let notes = nexapipe_client::domain_notes(&all_domains);
+        for (pattern, why) in &notes.unusable {
+            tracing::warn!("The proxy-domain pattern \"{pattern}\" matches nothing: {why}");
+        }
+        for pattern in &notes.narrowed {
+            tracing::info!(
+                "The proxy-domain pattern \"{pattern}\" names that host only; \"*.{pattern}\" \
+                 covers its subdomains"
+            );
+        }
+
         let nodes: Vec<NodeConfig> = self
             .config
             .nodes
@@ -358,18 +382,41 @@ impl ProxyManager {
             );
         }
         tracing::info!("Relay: {}", relay.describe());
+        // Whether this endpoint may ask n0 where a peer is. It is the one piece
+        // of n0's infrastructure a relay setting does not reach, so it gets a
+        // setting of its own.
+        // An empty value means nothing was configured, which falls back to the
+        // default — the same reading the JNI gives it. Only a value that
+        // names a mode wrongly is an error.
+        let discovery =
+            DiscoveryMode::parse_or_default(&self.config.discovery_mode).map_err(StartError::Other)?;
+        tracing::info!("Discovery: {}", discovery.describe());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it. A peer named only by a Node ID is
+        // dialled while the lookup above is on, and refused once it is off.
+        let restriction = relay.dial_restriction(discovery);
+        if let Some(restriction) = &restriction {
+            tracing::info!("Peers are dialled through {}", restriction.describe());
+        }
         // Bind IPv4 only. On hosts where IPv6 exists but cannot carry full-size QUIC
         // datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big" filtered), iroh's net
         // report calls v6 usable, relay dials and path migration move traffic onto v6 —
         // where every datagram above the real MTU fails (sendmsg 10040), which reads as a
         // connection that dies a few seconds in. With no v6 socket the net report stays
         // v4-only and relay dials stop preferring v6. The TUN is IPv4-only anyway.
-        let ep_builder = Endpoint::builder(presets::N0)
+        let mut ep_builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .bind_addr("0.0.0.0:0")
             .map_err(|e| anyhow::anyhow!("Failed to configure the IPv4-only socket: {}", e))?
             .transport_config(transport_tuning.transport_config())
             .relay_mode(relay.relay_mode());
+        ep_builder = discovery.apply(ep_builder);
+        if let Some(restriction) = restriction {
+            ep_builder = ep_builder.hooks(restriction);
+        }
 
         let iroh_endpoint = ep_builder
             .bind()
@@ -739,7 +786,8 @@ impl ProxyManager {
             return Vec::new();
         };
 
-        let kinds: HashMap<EndpointId, LinkKind> = group.link_kinds().await.into_iter().collect();
+        let statuses: HashMap<EndpointId, LinkStatus> =
+            group.link_statuses().await.into_iter().collect();
 
         self.config
             .nodes
@@ -752,10 +800,12 @@ impl ProxyManager {
                 // A node the group could not parse never got a pool, so there is nothing to
                 // report for it; dropping it keeps the list aligned with what actually dialed.
                 let addr = backend_addr(&node.connection)?;
+                let status = statuses.get(&addr.id).copied().unwrap_or_default();
                 Some(EndpointLink {
                     connection,
                     endpoint_id: addr.id.to_string(),
-                    link: kinds.get(&addr.id).copied().unwrap_or(LinkKind::Unknown),
+                    link: status.kind,
+                    rtt_ms: status.rtt.map(|rtt| rtt.as_millis() as u64),
                 })
             })
             .collect()

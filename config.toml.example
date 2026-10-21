@@ -151,6 +151,19 @@ relay_mode = "default"
 # token.
 # relay_auth_token_file = ""
 
+# Whether this endpoint may use n0's address lookup — the DNS and pkarr
+# queries that turn a Node ID into "where do I send QUIC packets". It is the
+# one piece of n0's infrastructure that relay_mode does not reach, so it has a
+# setting of its own. Unset means n0.
+#   n0    - the endpoint publishes its address there and resolves other
+#           endpoints' addresses through it
+#   none  - no lookup at all. Nothing about this endpoint reaches n0's lookup
+#           service, and a Node ID alone no longer reaches this endpoint: a
+#           client has to bring an address of its own, which is what the
+#           ticket the server prints at start-up carries
+# A value that is present but unknown refuses the start.
+# discovery = "n0"
+
 # ============================================================
 # [log] - logging and rotation
 # ============================================================
@@ -534,6 +547,19 @@ enabled = false
 listen_addr = "127.0.0.1:8081"
 # Domains to tunnel; --generate-invite without --invite-domains takes its
 # domains from here too.
+#
+# The same spelling a route's `host_pattern` uses, so a pattern can be copied
+# from one list to the other:
+#
+#   app.example.com    that name, exactly
+#   *.example.com      its subdomains, and not the name itself
+#   *                  every name
+#
+# A bare domain meant the name and every subdomain on the client while the
+# server read it as the name alone, so a subdomain the client put in the
+# tunnel was a name the server had no route for. It means the name alone now,
+# on both sides: write "*.example.com" for the subdomains. A client that
+# carries an older list says so in its log, once, at startup.
 proxy_domains = ["app.example.com", "web.example.com"]
 strategy = "round_robin"
 
@@ -619,3 +645,4 @@ domains = ["app.example.com"]
 # secret = "JBSWY3DPEHPK3PXP"
 # created_at = "1723756800"
 # allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route
+# allow_ports = [443, 8443]                                # unset = every port

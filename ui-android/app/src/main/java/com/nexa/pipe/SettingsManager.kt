@@ -36,6 +36,11 @@ class SettingsManager(context: Context) {
         const val KEY_NODES = "nodes"
         const val KEY_RELAY_MODE = "relay_mode"
         const val KEY_RELAY_URL = "relay_url"
+        // Whether this endpoint may use n0's address lookup — the DNS and pkarr
+        // queries that turn a Node ID into an address. "n0" (the default) keeps
+        // it; "none" switches it off, and a peer then has to bring an address of
+        // its own (a ticket) to be reachable.
+        const val KEY_DISCOVERY_MODE = "discovery_mode"
         // The relay bearer token. Kept in `secretPrefs`, not `prefs`: the relay
         // is handed it verbatim, so it is a credential like the TOTP seeds, and
         // only the secrets file is excluded from cloud backup and device
@@ -559,6 +564,22 @@ class SettingsManager(context: Context) {
     /** Loads the relay mode; defaults to "pinned" (pinned to aps1-1). */
     fun loadRelayMode(): String {
         return prefs.getString(KEY_RELAY_MODE, "pinned") ?: "pinned"
+    }
+
+    /**
+     * Saves the discovery mode.
+     *
+     * Not a credential, so it needs none of the sealing the relay token gets:
+     * it says whether this device asks n0 where a peer is, and that is a
+     * preference like any other.
+     */
+    fun saveDiscoveryMode(mode: String) {
+        prefs.edit { putString(KEY_DISCOVERY_MODE, mode) }
+    }
+
+    /** Loads the discovery mode; defaults to "n0". */
+    fun loadDiscoveryMode(): String {
+        return prefs.getString(KEY_DISCOVERY_MODE, "n0") ?: "n0"
     }
 
     /** Loads the custom relay URL. */

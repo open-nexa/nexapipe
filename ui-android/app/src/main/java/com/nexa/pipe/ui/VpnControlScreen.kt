@@ -66,7 +66,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val isVpnRunning by viewModel.isVpnRunning.collectAsState()
     val isConnecting by viewModel.isConnecting.collectAsState()
     val nodes by viewModel.nodes.collectAsState()
-    val linkKinds by viewModel.linkKinds.collectAsState()
+    val linkReadings by viewModel.linkReadings.collectAsState()
     val traffic by viewModel.traffic.collectAsState()
     val totalTraffic by viewModel.totalTraffic.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
@@ -74,6 +74,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
+    val discoveryMode by viewModel.discoveryMode.collectAsState()
     val relayAuthToken by viewModel.relayAuthToken.collectAsState()
     val credentialProtection by viewModel.credentialProtection.collectAsState()
     val plaintextConsentPending by viewModel.plaintextConsentPending.collectAsState()
@@ -88,7 +89,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // is using. Empty until the native side reports a connection, which is also what hides the
     // card: an endpoint nothing is connected to has no link kind to show.
     val connectedEndpoints = nodes.mapNotNull { node ->
-        linkKindOf(linkKinds, node.nodeId)?.let { node to it }
+        linkKindOf(linkReadings.kinds, node.nodeId)?.let { node to it }
     }
 
     var showLogs by remember { mutableStateOf(false) }
@@ -887,6 +888,41 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                                 viewModel.updateRelayConfig(mode, relayUrl)
                                             }
                                         }
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        stringResource(label),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                stringResource(R.string.discovery_mode_title),
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            Text(
+                                stringResource(R.string.discovery_mode_note),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            val discoveryModes = listOf(
+                                "n0" to R.string.discovery_mode_n0,
+                                "none" to R.string.discovery_mode_none
+                            )
+                            discoveryModes.forEach { (mode, label) ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp)
+                                ) {
+                                    RadioButton(
+                                        selected = discoveryMode == mode,
+                                        onClick = { viewModel.updateDiscoveryMode(mode) }
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(

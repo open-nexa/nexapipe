@@ -48,6 +48,7 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
             secret: nexapipe_client::secret::SecretString::new(SECRET.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
+            allow_ports: None,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "phone".to_string(),
