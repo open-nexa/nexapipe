@@ -551,21 +551,29 @@ pub async fn handle_bidi_stream(
         path,
         backend_info.url
     );
-    tracing::debug!("Received request: {} {}", request.method(), request.uri());
-
     // The access log has to be fed from here: this is the path every client
     // takes, and the HTTP server on the plaintext listener logs its own.
     let started = std::time::Instant::now();
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
+    // The same string the access log and the span use, redacted the same way.
+    // This line reaches the general log file, which is the same file the span's
+    // fields are rendered into — so a URI logged here unredacted is a query
+    // value in that file, and redacting only the span would leave this door
+    // open next to it.
+    tracing::debug!(
+        "Received request: {} {}",
+        request.method(),
+        crate::log::uri_for_log(&request_target)
+    );
+
     // Filled in on the span the caller opened, which was created before the
     // head was read and so could not know these. `Span::current()` is that
     // span because the caller instruments this future with it; when no
     // subscriber cares, recording is a no-op rather than a cost.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", request_target.as_str());
+    crate::log::record_request_on_span(&span, &method, &request_target);
 
     // A WebSocket upgrade is a conversation, and half of it cannot be taken
     // back: it is never retried, and it does not go through the loop below.
