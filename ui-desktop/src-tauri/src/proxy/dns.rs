@@ -90,8 +90,10 @@ impl DnsServer {
         // build a NAT mapping for it — and tear it down again as soon as the
         // answer was in.
         let upstreams = resolver_chain(&self.previous_resolvers, &self.config.upstream_dns);
-        let addresses: Vec<std::net::SocketAddr> =
-            upstreams.iter().filter_map(|server| server.parse().ok()).collect();
+        let addresses: Vec<std::net::SocketAddr> = upstreams
+            .iter()
+            .filter_map(|server| server.parse().ok())
+            .collect();
         // The chain is tried in turn, and each one is given a window, so the
         // whole chain is given one window per member and a little over.
         let overall = UPSTREAM_TIMEOUT * addresses.len() as u32 + std::time::Duration::from_secs(1);
@@ -689,7 +691,9 @@ mod tests {
     /// A DNS query for `example.com`.
     fn a_query() -> Vec<u8> {
         let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        packet.extend_from_slice(&[0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00]);
+        packet.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+        ]);
         packet.extend_from_slice(&1u16.to_be_bytes());
         packet.extend_from_slice(&1u16.to_be_bytes());
         packet
@@ -704,7 +708,8 @@ mod tests {
     #[tokio::test]
     async fn every_query_leaves_from_the_same_socket() {
         let upstream = FakeUpstream::start().await;
-        let resolvers = UpstreamResolvers::new(&[upstream.address], Arc::new(AtomicBool::new(false)));
+        let resolvers =
+            UpstreamResolvers::new(&[upstream.address], Arc::new(AtomicBool::new(false)));
 
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
