@@ -455,8 +455,7 @@ pub async fn handle_bidi_stream(
     // span because the caller instruments this future with it; when no
     // subscriber cares, recording is a no-op rather than a cost.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", request_target.as_str());
+    crate::log::record_request_on_span(&span, &method, &request_target);
 
     // A WebSocket upgrade is a conversation, and half of it cannot be taken
     // back: it is never retried, and it does not go through the loop below.
