@@ -271,12 +271,13 @@ lookup, which is what a config written before the key existed does.
   machine they were measured on, because a criterion number only means
   something on the machine that produced it.
   The result is one hotspot and one decision that there is no hotspot. The
-  virtual-address bookkeeping is 30% of the TUN's per-packet path — 2.3 µs
-  of 7.3 µs — for what should be a hash lookup, and the reason is a `String`
-  clone and a second `HashMap` write on every packet. The L4 copy loop is not
-  where the time is: a whole flow's life is 42 µs, and the copy inside it is
-  a fraction of that, so the candidate list's first item — bigger buffers in
-  the copy loops — was the wrong first move and is not made.
+  virtual-address bookkeeping measures 2.3 µs against the 7.3 µs the whole
+  per-packet path takes — a third of it — for what should be a hash lookup,
+  and the part of it that runs on every packet is a `String` clone and a
+  write to a second `HashMap`. The L4 copy loop is not where the time is: a
+  64 KiB payload's round trip through it takes 42 µs, so the candidate list's
+  first item — bigger buffers in the copy loops — was the wrong first move
+  and is not made.
   The list of what the numbers do **not** cover is written down next to them:
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
