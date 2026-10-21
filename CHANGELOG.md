@@ -10,18 +10,32 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+**The next release is v1.0.0.** The v0.7.0 release planned for this cycle was
+cancelled after a review of the project against comparable products; the scope
+that replaced it, and the items that were deliberately dropped from it, are
+recorded in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
+Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
+and its meaning.
+
 ## [Unreleased]
 
-Five things land in this cycle so far: the device credential can be a **key**
+Eleven things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
 circuit-broken — the ceilings the process runs under are now something a
-config file can say rather than only an environment variable can, and a name is
-spelled the same way in a client's list and in the server's routes. No existing
-configuration key is removed or renamed, and the ones this cycle adds —
-`public_key` under a device entry, the six `[timeouts]` phase keys, `[limits]`,
-`[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so a
+config file can say rather than only an environment variable can, a name is
+spelled the same way in a client's list and in the server's routes, a client
+can be held to the ports it may reach and not only to the names, both clients
+can say how far away the path carrying the traffic is, the desktop app can
+stay in the tray instead of ending with its window, the third-party boundary
+is two settings now rather than one, the Android app can bring the tunnel back
+after a restart, and the Android client picks its address block instead of
+hard-coding one.
+No existing configuration key is removed or renamed, and the ones this cycle
+adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
+`[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
+`allow_ports` under a client entry and `[iroh] discovery` — are optional, so a
 `config.toml` that works on 0.6.1 still loads and behaves as it did: a device
 entry that carries a `secret` is checked exactly as before, a `[timeouts]`
 section that names none of the new keys leaves every deadline at its default,
@@ -29,7 +43,9 @@ and a config with no `[limits]` section runs with the ceilings it always ran
 with.
 Leaving `[retry]` out keeps one try and no second chance, leaving `[backends]`
 out uses the machine's own trust store, and leaving `[circuit_breaker]` out uses
-its defaults — which are on.
+its defaults — which are on. Leaving `allow_ports` out leaves a client with
+every port it had, and leaving `[iroh] discovery` out keeps n0's address
+lookup, which is what a config written before the key existed does.
 
 ### Added
 
