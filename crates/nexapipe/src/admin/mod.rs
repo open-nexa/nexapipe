@@ -48,7 +48,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;

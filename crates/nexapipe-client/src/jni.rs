@@ -1,7 +1,6 @@
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::discovery::DiscoveryMode;
 use crate::relay::RelayModeSpec;
-use crate::secret::SecretString;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 use crate::tun_proxy::TunProxy;
 use crate::{DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrategy, NodeConfig};
@@ -11,6 +10,7 @@ use iroh::endpoint::presets;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
 use jni::{Env, EnvUnowned, Outcome};
+use nexapipe_proto::secret::SecretString;
 // Only `native_init` reads the Android context, and only on Android. Gated to
 // match: an ungated import is an unused-import warning on every other `jni`
 // build, which is what the release archives are.

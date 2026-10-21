@@ -14,7 +14,7 @@ use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, Incoming};
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -2632,7 +2632,7 @@ mod tests {
         read_stream_head, undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
-    use nexapipe_client::secret::SecretString;
+    use nexapipe_proto::secret::SecretString;
     use std::collections::HashMap;
 
     /// The state file carries the counters as of the write, not as of an

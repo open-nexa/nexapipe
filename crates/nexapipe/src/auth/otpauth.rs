@@ -20,7 +20,7 @@
 
 use super::config::AuthConfig;
 use anyhow::{Result, bail};
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 
 /// Scheme of the key URI format.
 pub const SCHEME: &str = "otpauth";
