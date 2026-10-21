@@ -542,6 +542,37 @@ mod fd_tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
     }
 
+    /// What a descriptor number points at: the device and inode of the file
+    /// behind it.
+    ///
+    /// `None` when the number is not a live descriptor.
+    fn identity(fd: std::os::fd::RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+            return None;
+        }
+        let stat = unsafe { stat.assume_init() };
+        Some((stat.st_dev, stat.st_ino))
+    }
+
+    /// Whether `fd` is still the descriptor it was when it was `was`.
+    ///
+    /// "Is this number still open" is not the same question. A closed
+    /// descriptor's number is handed to the next `open`, so by the time the
+    /// question is asked another thread may have taken the number — and then
+    /// the number *is* open, pointing at something else entirely.
+    ///
+    /// That is not a failure of the code under test; it is the hazard the code
+    /// under test is about, happening to the test itself. It is what made
+    /// these tests fail at random when the test binary ran its tests side by
+    /// side — every other test that opens a file or a socket is a candidate to
+    /// take the number.
+    ///
+    /// What tells the two apart is *what* the number points at.
+    fn is_the_same_descriptor(fd: std::os::fd::RawFd, was: (libc::dev_t, libc::ino_t)) -> bool {
+        identity(fd) == Some(was)
+    }
+
     /// The whole point of the change: the descriptor that was handed over is
     /// closed by the takeover, so the caller must not close it again.
     ///
@@ -553,11 +584,12 @@ mod fd_tests {
     fn the_takeover_closes_the_original_descriptor() {
         let original = a_descriptor();
         let original_fd = original.as_raw_fd();
+        let original_identity = identity(original_fd).expect("the descriptor is open");
 
         let (read, write) = dup_tun_fds(original).expect("the takeover");
 
         assert!(
-            !is_open(original_fd),
+            !is_the_same_descriptor(original_fd, original_identity),
             "the original descriptor is still open, so the caller would close it a second time"
         );
         assert!(is_open(read.as_raw_fd()), "the read duplicate is not open");
@@ -596,6 +628,7 @@ mod fd_tests {
     fn a_failed_takeover_still_closes_the_original() {
         let original = a_descriptor();
         let original_fd = original.as_raw_fd();
+        let original_identity = identity(original_fd).expect("the descriptor is open");
 
         let mut calls = 0;
         let result = dup_tun_fds_with(original, |fd| {
@@ -608,7 +641,7 @@ mod fd_tests {
 
         assert!(result.is_err(), "the takeover was supposed to fail");
         assert!(
-            !is_open(original_fd),
+            !is_the_same_descriptor(original_fd, original_identity),
             "the original descriptor is still open after a failed takeover, so the caller \
              would close it a second time"
         );
