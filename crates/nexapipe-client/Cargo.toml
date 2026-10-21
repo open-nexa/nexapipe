@@ -96,3 +96,9 @@ required-features = ["local-proxy"]
 [[bench]]
 name = "domain_match"
 harness = false
+
+# What one TCP flow costs in the TUN stack. It is an example rather than a
+# benchmark because what it measures is memory, not time: see the file itself.
+[[example]]
+name = "tun_flow_memory"
+required-features = ["tun-proxy"]
