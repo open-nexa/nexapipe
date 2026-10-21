@@ -16,12 +16,12 @@
  * Runtime proxy state is deliberately last and not awaited: it needs the backend, and the shell
  * renders `stopped` until the first status arrives.
  */
-import { createApp } from 'vue';
+import { createApp, watch } from 'vue';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App.vue';
 import router from './router';
-import i18n, { resolveLocale, setI18nLocale, translate } from './i18n';
+import i18n, { currentLocale, resolveLocale, setI18nLocale, translate } from './i18n';
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
@@ -204,6 +204,14 @@ async function bootstrap(): Promise<void> {
 
   // The tray menu is written in the user's language, which is only known now.
   void setTrayLabels();
+
+  // The tray menu is a native menu and not a template, so a language change does
+  // not reach it on its own: the labels have to be written again, or the tray
+  // keeps the language the app started in while everything else has changed.
+  watch(
+    () => currentLocale(),
+    () => void setTrayLabels(),
+  );
 
   // Everything from here on is a projection no first screen renders, so it must not sit between
   // the mount and the paint: the display masks cost two IPC round-trips per configured node.
