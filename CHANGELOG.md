@@ -145,6 +145,26 @@ its defaults — which are on.
   using the health probe rather than a request counter. The HTTP request paths,
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
+- **The Android app can bring the tunnel back after a restart.** A proxy that
+  has to be switched on by hand every time the phone is switched on is not an
+  always-on proxy, and on a phone that is the difference between a machine
+  that is protected and a machine that is not. "Reconnect after a restart"
+  brings it back by itself: a `BOOT_COMPLETED` receiver starts the VPN
+  service, which waits for a network, builds the tunnel with the same sequence
+  a connection the user asked for uses, and establishes it.
+  The switch is off until the user turns it on — a proxy that reconnects
+  without being asked forwards traffic without being asked.
+  Two things it does not do, on purpose. It does not take the VPN slot from
+  another app: the boot path never answers the takeover question, because a
+  tunnel that quietly revoked somebody else's VPN at seven in the morning
+  would be a surprise nobody could prepare for. And it does not enrol an
+  endpoint: enrolling spends a token and answers with a credential that has
+  to be stored, and a boot has nobody to ask about a device that cannot
+  protect one — an endpoint waiting for that waits for the user.
+  Android does not promise that the permission a VPN app was given survives a
+  restart, so the boot path asks rather than assumes. When the permission is
+  gone the tunnel stays down and the settings page says so, rather than
+  leaving a switch that is on and nothing that happened.
 - **The desktop app can stay in the tray.** Closing the window used to end the
   process, so a proxy that had to be started by hand every time the machine woke
   was not the always-on proxy the settings page promised. The app now has a tray

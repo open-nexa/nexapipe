@@ -21,6 +21,7 @@ import com.nexa.pipe.R
 import com.nexa.pipe.formatByteRate
 import com.nexa.pipe.locale.AppLocale
 import com.nexa.pipe.parseNodeTraffic
+import com.nexa.pipe.ui.BootConnector
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -96,6 +97,9 @@ class NexaVpnService : VpnService() {
     // native stop, which has to finish whether or not the service is still
     // alive to hear about it.
     private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // The boot connection, while it runs. Kept so it can be cancelled with
+    // the service rather than left behind holding a native call.
+    private var bootConnectJob: Job? = null
     @Volatile private var isUserStarted = false
 
     // Reconnect on network switch: keeps the reconnect job. The mutex serializes the rebuilds
@@ -183,8 +187,10 @@ class NexaVpnService : VpnService() {
         this.allowTakeover = allowTakeover
         isUserStarted = true
         // A new session begins: clear the stale "revoked" marker from a
-        // previous session (consumed by VpnViewModel.syncVpnServiceState()).
+        // previous session (consumed by VpnViewModel.syncVpnServiceState()),
+        // and the reason that came with it.
         wasRevoked = false
+        lastRevokeReason = null
 
         // A new session clears the teardown marker: the same service instance
         // is reused when the user stops and starts again without the process
@@ -194,6 +200,20 @@ class NexaVpnService : VpnService() {
         val prepareIntent = prepare(this)
         if (prepareIntent != null) {
             Log.d(TAG, "VPN permission not granted")
+            // The service goes away with it: a foreground service with no
+            // tunnel behind it is a notification that says the tunnel is up
+            // over a tunnel that is not there, and there is nothing else this
+            // start was going to do. The boot path reaches this when the
+            // consent was withdrawn between its own check and this one.
+            //
+            // The native side goes with it: this start was handed a proxy that
+            // is already up — the boot path brings the native side up before
+            // it asks the service to establish, and so does the screen — and
+            // that side is process-global, so a service that goes away with it
+            // still running leaves a live connection to the relay behind
+            // nothing that the user can see or stop.
+            releaseNativeResources()
+            shutdownService()
             return
         }
 
@@ -221,22 +241,173 @@ class NexaVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent != null) {
-            when (intent.action) {
-                ACTION_START -> {
-                    val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
-                    // Whether the UI asked and was told to take the slot from
-                    // another VPN app. Absent means no: a start that carries no
-                    // such answer must not revoke anything.
-                    val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
-                    startVPN(domains.toSet(), takeover)
-                }
-                ACTION_STOP -> {
-                    stopVPN()
+        if (intent == null) {
+            // A sticky restart: the system brought the service back without an
+            // intent, and a service started with startForegroundService() has
+            // five seconds to call startForeground() or the system takes the
+            // app down with it.
+            //
+            // What the machine asks for when it wants the tunnel back is the
+            // boot path, and that path ends the service when it cannot bring
+            // a tunnel up — so nothing is left running over a tunnel that is
+            // not there.
+            startForegroundForBoot()
+            bootConnectJob = serviceScope.launch {
+                bootConnect()
+            }
+            return START_STICKY
+        }
+
+        when (intent.action) {
+            ACTION_START -> {
+                val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
+                // Whether the UI asked and was told to take the slot from
+                // another VPN app. Absent means no: a start that carries no
+                // such answer must not revoke anything.
+                val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
+                startVPN(domains.toSet(), takeover)
+            }
+            ACTION_STOP -> {
+                stopVPN()
+            }
+            ACTION_BOOT_CONNECT -> {
+                // The machine asked for the tunnel to come back.
+                //
+                // Android gives a service started with
+                // startForegroundService() five seconds to call
+                // startForeground(), and the wait for a network below can
+                // take longer than that, so the obligation is met here —
+                // with the text that says what is happening rather than
+                // the one that says the tunnel is up, because it is not
+                // yet.
+                startForegroundForBoot()
+                bootConnectJob = serviceScope.launch {
+                    bootConnect()
                 }
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * Meets the obligation a service started with `startForegroundService()`
+     * has: it has five seconds to call `startForeground()`, and the system
+     * takes the app down when it does not.
+     *
+     * The text says what is true: the tunnel is not up yet. A refusal is not
+     * swallowed — the service never enters the foreground state that way, and
+     * the log is what says why.
+     */
+    private fun startForegroundForBoot() {
+        runCatching {
+            createNotificationChannel()
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(getString(R.string.notification_text_connecting))
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "boot: the foreground was refused: ${error.message}")
+        }
+    }
+
+    /**
+     * Brings the tunnel back after a restart.
+     *
+     * The work is the same as a connection the user asked for — see
+     * [com.nexa.pipe.ui.BootConnector] — and it runs here rather than in the
+     * broadcast receiver because this service outlives the broadcast and can
+     * wait for a network.
+     */
+    private suspend fun bootConnect() {
+        if (!awaitNetwork(BOOT_NETWORK_TIMEOUT_MS)) {
+            Log.w(TAG, "boot: no network came up in time, so the tunnel stays down")
+            shutdownService()
+            return
+        }
+
+        when (val outcome = BootConnector.connectIfWanted(this@NexaVpnService) { Log.i(TAG, it) }) {
+            is BootConnector.BootOutcome.Established -> {
+                // The tunnel itself is the service's to establish, and it does
+                // that after this returns.
+            }
+            is BootConnector.BootOutcome.Failed -> {
+                Log.w(TAG, "boot connect failed: ${outcome.cause.message}")
+                // The attempt may have brought the native side up before it
+                // failed, and that side is process-global: the iroh endpoint
+                // and the endpoint group with their warm backend connections
+                // outlive the service that started them, so a failed attempt
+                // would leave a live QUIC connection to the relay behind
+                // nothing that the user can see or stop. They are taken down
+                // here as well; the user's path does the same through
+                // releaseAllResources().
+                releaseNativeResources()
+                shutdownService()
+            }
+            is BootConnector.BootOutcome.Skipped -> {
+                // Nothing was started, so nothing is left behind to take
+                // down: the native side is process-global, and what is running
+                // in it may belong to a session that is not this one's to end.
+                shutdownService()
+            }
+        }
+    }
+
+    /**
+     * Takes down the native side of a start that is not going to happen.
+     *
+     * The iroh endpoint and the endpoint group are process-global and outlive
+     * the service: the service owns the TUN and the notification, and the
+     * native side owns the connection to the relay and the warm backend
+     * connections behind it. A start that is refused after the native side was
+     * brought up — a boot attempt that failed, a tunnel that could not be
+     * established because the consent was withdrawn — leaves all of it behind,
+     * with no service and no notification and nothing the user can stop.
+     *
+     * The teardown is process-global, so it takes down whatever else is
+     * running in the process as well. It is therefore only for a start that
+     * brought the native side up: an attempt that started nothing must not
+     * call it, or it ends a session that belongs to somebody else.
+     *
+     * It runs on the teardown scope and not on the caller's thread: the
+     * native stop closes the endpoint and the warm connections behind it, and
+     * that blocks for as long as they take — long enough to be the system's
+     * "the app is not responding" on the main thread.
+     */
+    private fun releaseNativeResources() {
+        teardownScope.launch {
+            // The library may not be there at all, and the call would raise an
+            // UnsatisfiedLinkError — an Error, not an Exception — which would
+            // escape the catch below and take the process with it.
+            if (!IrohProxy.isNativeLoaded()) return@launch
+            try {
+                IrohProxy.nativeDestroy()
+            } catch (e: Exception) {
+                Log.e(TAG, "nativeDestroy failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Waits for a network to come up.
+     *
+     * A boot broadcast arrives while the phone is still finding its way onto
+     * a network, and a tunnel built on no network reaches no backend. Polling
+     * is enough here: what is being waited for is a fact about the radio, and
+     * the radio does not offer a better signal than "there is a network now".
+     *
+     * Bounded, because waiting forever is the same as not trying: the phone
+     * may never get a network, and a foreground service waiting for one it
+     * will never have is a notification nobody asked for.
+     */
+    private suspend fun awaitNetwork(timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (connectivityManager?.activeNetwork != null) {
+                return true
+            }
+            delay(BOOT_NETWORK_POLL_MS)
+        }
+        return false
     }
 
     /**
@@ -612,7 +783,14 @@ class NexaVpnService : VpnService() {
     private fun shutdownService() {
         runCatching {
             createNotificationChannel()
-            startForeground(NOTIFICATION_ID, createNotification())
+            // The text says what is true: the tunnel is not up. The default
+            // says "Connected", and this notification is posted rather than
+            // skipped — so for as long as the removal takes, the shade would
+            // claim a tunnel that was never there.
+            startForeground(
+                NOTIFICATION_ID,
+                createNotification(getString(R.string.notification_text_connecting))
+            )
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -994,6 +1172,14 @@ class NexaVpnService : VpnService() {
         private const val TRAFFIC_POLL_INTERVAL_MS = 1_000L
         const val ACTION_START = "com.nexa.pipe.vpn.ACTION_START"
         const val ACTION_STOP = "com.nexa.pipe.vpn.ACTION_STOP"
+        /**
+         * Bring the tunnel back after a restart.
+         *
+         * Sent by [BootReceiver] rather than by the screen: the user asked
+         * for the tunnel to come back when the machine starts, and there is no
+         * screen to ask at that point.
+         */
+        const val ACTION_BOOT_CONNECT = "com.nexa.pipe.vpn.ACTION_BOOT_CONNECT"
         const val EXTRA_DOMAINS = "com.nexa.pipe.vpn.EXTRA_DOMAINS"
         // Whether the user agreed that Nexa may take the slot from another VPN
         // app. Carried by ACTION_START; absent (or false) means the service
@@ -1006,6 +1192,15 @@ class NexaVpnService : VpnService() {
         // starting.
         private const val OWN_NETWORK_POLL_ATTEMPTS = 5
         private const val OWN_NETWORK_POLL_MS = 100L
+
+        // How long the boot path waits for a network, and how often it looks.
+        //
+        // Generous, because a phone that has just been switched on has to find
+        // a network first, and a tunnel built on no network reaches no
+        // backend — but bounded, because a phone that never finds one must not
+        // leave a foreground service waiting for it.
+        private const val BOOT_NETWORK_TIMEOUT_MS = 60_000L
+        private const val BOOT_NETWORK_POLL_MS = 1_000L
 
         // Network-switch reconnect parameters
         private const val RECONNECT_DEBOUNCE_MS = 1_500L
@@ -1042,6 +1237,17 @@ class NexaVpnService : VpnService() {
         var wasRevoked: Boolean = false
             private set
 
+        /**
+         * Why the slot was lost, kept because the event that carries the reason
+         * may reach no listener at all: a boot connection is refused with no
+         * screen to report to, and the reason is what the user needs then.
+         * Cleared with [wasRevoked] when a new session starts.
+         */
+        @Volatile
+        @JvmStatic
+        var lastRevokeReason: String? = null
+            private set
+
         // Push channel for the "VPN slot lost" event so a foreground UI
         // updates immediately instead of waiting for the next resume-time
         // syncVpnServiceState() call. The reason is the message to show: the
@@ -1056,6 +1262,10 @@ class NexaVpnService : VpnService() {
         }
 
         private fun notifyVpnRevoked(reason: String) {
+            // Kept whether or not anyone is listening: a boot connection is
+            // refused with no screen to report to, and the reason is what the
+            // user is told when the app is opened afterwards.
+            lastRevokeReason = reason
             revokedListener?.invoke(reason)
         }
 
