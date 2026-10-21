@@ -285,6 +285,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A route's `path_pattern` is a prefix in the path sense.**
+  `path_pattern = "/api"` used to match `/apifoo` as well as `/api/x`: the
+  rule was `starts_with`, and a prefix that is not a prefix is a routing
+  surprise — whether it matters depends on the deployment, and it is never
+  what the pattern says. It now ends at a segment boundary: `/api` covers
+  `/api` and `/api/x`, and not `/apifoo`. A trailing slash on the pattern
+  (`/api/`) names the same place as `/api`.
+  The rewrite follows the same rule, so the suffix it computes is the suffix
+  that matched. One consequence worth naming: a rewrite on the root pattern
+  (`path_pattern = "/"` with `path_rewrite = "/v2{}"`) used to produce
+  `/v2api/users` — the separator was dropped — and produces `/v2/api/users`
+  now.
 - **The configuration and the runtime state are two files.** `config.toml` is
   the operator's file — what they wrote, what they read, what they keep in
   version control — and it no longer carries what a running server learns.
@@ -431,6 +443,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The config file's permission rule is said once, and it is a warning.**
+  The comment beside the first-run config claimed that the server refuses to
+  start over a world-readable config, and that the check was keyed off 2FA
+  being on or the file holding a credential. No such check exists: it was
+  removed on purpose (ROADMAP §3.5) so that a `0644` bind mount starts, and
+  putting it back would undo that decision.
+  What was left was a comment that described a gate that is not there, and a
+  credential nobody could see: `[auth.clients.*].secret` is a TOTP seed in
+  the clear, and anybody who can read the file can generate a valid code.
+  The server now says so once, at startup and after a reload, when the config
+  holds a credential and the file is readable by anyone but its owner. It
+  names the path and the mode. It does not refuse to start.
 - **A config that could not be loaded is tried again.** The watcher noticed a
   changed file by its modification time alone, and only a *newer* one: a file
   restored from a backup, checked out by `git`, or written twice inside one

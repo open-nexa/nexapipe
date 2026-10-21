@@ -1382,6 +1382,95 @@ impl ProxyConfig {
     }
 }
 
+/// Warns when the config file holds a credential and lets somebody other than
+/// its owner read it.
+///
+/// **A warning, not a refusal.** The check that used to stop the server from
+/// starting over a readable config was removed on purpose (ROADMAP §3.5), so
+/// that a `0644` bind mount starts. Putting it back would undo that decision.
+///
+/// Silence is the part that is wrong: a TOTP seed in a file the whole machine
+/// can read is a credential anybody can use to generate a valid code, and
+/// nothing about it is visible. One line at startup and one after a reload is
+/// enough to say it.
+///
+/// Unix only, and it says so by doing nothing elsewhere: the permission bits
+/// are a Unix idea, and on Windows the file's ACL decides, which this does not
+/// read.
+///
+/// `auth` is the `[auth]` half of the same file, and it is `None` when the file
+/// has no such section — which is not the same as "no credential". A config
+/// that names an inline `[iroh]` key and no `[auth]` at all is a credential in
+/// the open, and it is the common case: the generated first-run template and
+/// `config.toml.example` both leave `[auth]` out. A warning that needed an
+/// `AuthConfig` to exist would be silent for exactly that file.
+pub fn warn_about_readable_credentials(
+    path: &std::path::Path,
+    proxy: &ProxyConfig,
+    auth: Option<&crate::auth::AuthConfig>,
+) {
+    if !should_warn_about_permissions(path, proxy, auth) {
+        return;
+    }
+    tracing::warn!(
+        "{} holds a credential and is readable by others (mode {:04o}); anyone who can read it \
+         can use it — `chmod 600`, or move the secret into a 0600 file of its own",
+        path.display(),
+        file_mode(path),
+    );
+}
+
+/// Whether the loaded config should be warned about: it holds a credential,
+/// and the file it came from is readable by somebody other than its owner.
+///
+/// The decision on its own, so that it can be tested without a log
+/// subscriber: the warning is a line of text, and what matters is the
+/// question it answers.
+pub fn should_warn_about_permissions(
+    path: &std::path::Path,
+    proxy: &ProxyConfig,
+    auth: Option<&crate::auth::AuthConfig>,
+) -> bool {
+    // A credential the file holds in the clear: an inline `[iroh]` key or
+    // token, or a 2FA seed. One that lives in a sidecar file of its own is
+    // not in this file, and that file is held to the `0600` rule in the
+    // config's place — see `read_credential_file`.
+    let holds_a_seed = auth.is_some_and(|auth| auth.holds_inline_secrets());
+    if !proxy.holds_credentials() && !holds_a_seed {
+        return false;
+    }
+    readable_by_others(path)
+}
+
+/// The permission bits of the file, or 0 when they cannot be read.
+#[cfg(unix)]
+fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &std::path::Path) -> u32 {
+    0
+}
+
+/// Whether somebody other than the owner can read the file.
+#[cfg(unix)]
+fn readable_by_others(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o077 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn readable_by_others(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// The config written when there is none: 2FA on, nothing else.
 ///
 /// Deliberately small, and deliberately **not** a working proxy: it carries no
@@ -1392,12 +1481,21 @@ impl ProxyConfig {
 ///
 /// `[auth] enabled = true` is the one setting that is not the operator's to
 /// infer: a config with no `[auth.clients]` refuses every connection, which is
-/// the correct state for a file nobody has written yet. With 2FA on, the
-/// startup permission check refuses to start over a world-readable config —
-/// `run_server_mode` keys the refusal off `auth_cfg.enabled ||
-/// proxy_config.holds_credentials()` — so the file has to be `0600` on Unix,
-/// which is why this goes out through [`write_config_file`] rather than
-/// `fs::write`.
+/// the correct state for a file nobody has written yet.
+///
+/// **The file's own permission is not checked, and that is deliberate.** A
+/// startup check that refused to run over a world-readable config was removed
+/// on purpose (ROADMAP §3.5) so that a `0644` bind mount starts — a config
+/// that is a bind mount of a secret store is readable by design, and a server
+/// that refused to start over it would be a server nobody could run that way.
+///
+/// What is left is a **warning**: when the config itself holds a credential —
+/// an inline `[iroh]` key, or a 2FA seed — and the file is readable by
+/// others, the server says so once, naming the path and the mode. See
+/// [`warn_about_readable_credentials`].
+///
+/// The file still goes out through [`write_config_file`] rather than
+/// `fs::write`, so that the one it writes is `0600` from the start.
 ///
 /// No `[iroh] secret_key`: the endpoint identity is generated and written back
 /// on first start (see `ensure_iroh_secret_key`), so writing one here would be
@@ -3511,6 +3609,157 @@ mod tests {
     }
     use super::*;
     use crate::auth::DeviceMaterial;
+
+    /// A credential in a file others can read is worth a warning; one in a
+    /// file only its owner can read is not.
+    ///
+    /// The permission gate itself was removed on purpose (ROADMAP §3.5) — a
+    /// `0644` bind mount has to start — so this line is the only thing that
+    /// says a 2FA seed is sitting in a file the whole machine can read.
+    ///
+    /// Unix only: the permission bits are a Unix idea.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_in_a_readable_file_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_seed = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+        let without_a_seed = crate::auth::AuthConfig::default();
+        let proxy = parse("");
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the mode is set");
+        assert!(
+            !should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a file only its owner can read is not worth a warning"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is set");
+        assert!(
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a seed in a file others can read is worth a warning"
+        );
+        assert!(
+            !should_warn_about_permissions(&path, &proxy, Some(&without_a_seed)),
+            "a file with no credential in it is not worth a warning"
+        );
+    }
+
+    /// A file with no `[auth]` section is not a file with no credential.
+    ///
+    /// An inline `[iroh]` key is a credential on its own, and the files this
+    /// server actually ships — `config.toml.example`, the generated first-run
+    /// template — have no `[auth]` at all. A warning that only ran when an
+    /// `AuthConfig` existed was silent for exactly those.
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_key_without_an_auth_section_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_key = parse("[iroh]\nsecret_key = \"00\"\n");
+        assert!(with_a_key.holds_credentials());
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is set");
+
+        assert!(
+            should_warn_about_permissions(&path, &with_a_key, None),
+            "an inline key in a readable file is worth a warning, [auth] or not"
+        );
+        assert!(
+            !should_warn_about_permissions(&path, &parse(""), None),
+            "a file with neither half holding a credential is not"
+        );
+    }
+
+    /// Group-readable is enough. A file the owner's group can read is a file
+    /// somebody else on the machine can read.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_file_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_seed = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+        let proxy = parse("");
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("the mode is set");
+
+        assert!(
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
+            "a group-readable file is readable by others"
+        );
+    }
+
+    /// A device that proves itself with a signature holds no seed, so it is
+    /// not one of these.
+    #[test]
+    fn a_key_based_device_holds_no_seed() {
+        let auth = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = ""
+
+[clients.client-001.devices.laptop]
+public_key = "0011"
+"#,
+        )
+        .expect("the auth config parses");
+
+        assert!(
+            !auth.holds_inline_secrets(),
+            "a key-based device has nothing to steal"
+        );
+    }
+
+    /// A device that was issued a seed is one of these, even when its client
+    /// has none.
+    #[test]
+    fn a_device_with_a_seed_holds_one() {
+        let auth = toml::from_str::<crate::auth::AuthConfig>(
+            r#"
+enabled = true
+
+[clients.client-001]
+secret = ""
+
+[clients.client-001.devices.laptop]
+secret = "JBSWY3DPEHPK3PXP"
+"#,
+        )
+        .expect("the auth config parses");
+
+        assert!(auth.holds_inline_secrets(), "a device's seed is a seed");
+    }
 
     fn parse(source: &str) -> ProxyConfig {
         toml::from_str(source).expect("config should parse")
