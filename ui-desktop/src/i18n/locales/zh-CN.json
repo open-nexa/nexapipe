@@ -29,6 +29,10 @@
     "keep": "保持代理",
     "kept": "代理仍在运行，应用已保持打开。"
   },
+  "tray": {
+    "show": "打开 Nexa",
+    "quit": "退出"
+  },
   "common": {
     "save": "保存",
     "cancel": "取消",
@@ -86,7 +90,8 @@
   "link": {
     "direct": "直连",
     "relay": "中继",
-    "connecting": "连接中"
+    "connecting": "连接中",
+    "rtt": "{count} 毫秒"
   },
   "health": {
     "up": "有响应",
@@ -254,6 +259,7 @@
     "launchAtStartupHint": "应用启动时自动运行代理",
     "minimizeOnClose": "关闭时最小化",
     "minimizeOnCloseHint": "点击关闭按钮时最小化到系统托盘",
+    "minimizeOnCloseUnavailable": "当前桌面没有系统托盘，关闭窗口仍会退出应用",
     "logLevel": "日志级别",
     "logLevelHint": "控制日志输出的详细程度",
     "about": "关于",
@@ -391,6 +397,12 @@
     "logs": {
       "dir_unreadable": "无法读取日志目录。",
       "read_failed": "无法读取日志文件。"
+    },
+    "autostart": {
+      "read_failed": "无法读取本应用是否开机自启。详情见日志。",
+      "write_failed": "无法修改开机自启设置。详情见日志。",
+      "exe_path": "无法确定本应用的可执行文件路径，没有可启动的目标。",
+      "unsupported_platform": "当前平台不支持开机自启。"
     }
   }
 }

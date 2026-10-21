@@ -47,6 +47,7 @@ use std::fmt;
 use anyhow::{Result, bail};
 use iroh::EndpointId;
 use iroh_tickets::endpoint::EndpointTicket;
+use nexapipe_proto::normalize_pattern;
 
 use crate::auth::TotpAlgorithm;
 use crate::secret::SecretString;
@@ -707,12 +708,25 @@ fn comma_list(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Lower cases, trims trailing dots and deduplicates, keeping the order, which
-/// matters because the first matching domain usually wins elsewhere.
+/// Folds the domain list into the patterns the client matches with, keeping
+/// the order, which matters because the first matching domain usually wins
+/// elsewhere.
+///
+/// The list is a list of *patterns*, not a list of names: the server's route
+/// patterns are what ends up in an invite, and the client matches them with
+/// the rule in `nexapipe-proto`. So the fold is that rule's fold
+/// ([`normalize_pattern`]) and not the host fold.
+///
+/// The difference is the catch-all. `*.`, `*..` and `[*]` all fold to `*`, and
+/// a pattern that means "every host" where the invite said something narrower
+/// is the one mistake this must not make: folded into `*`, such a pattern
+/// hands the client the catch-all and the client proxies every host. Kept in
+/// its own shape, it matches nothing — which is what the shared rule says a
+/// pattern that folds into the catch-all does.
 fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(domains.len());
     for raw in domains {
-        let domain = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+        let domain = normalize_pattern(raw.trim());
         if domain.is_empty() {
             bail!("the domain list contains an empty entry");
         }
@@ -1028,6 +1042,30 @@ mod tests {
             invite.domains,
             vec!["a.example".to_string(), "b.example".to_string()]
         );
+    }
+
+    /// The domain list is a list of patterns, and the server's route patterns
+    /// are what ends up in an invite.
+    ///
+    /// `*.` is the catch-all in another spelling: folded into `*`, it would
+    /// hand the client the catch-all — every host — for a spelling that asked
+    /// for something narrower. It keeps its own shape instead, and a pattern
+    /// in that shape matches nothing.
+    #[test]
+    fn a_pattern_that_folds_into_the_catch_all_keeps_its_shape() {
+        let invite = EndpointInvite::new(
+            EndpointTarget::NodeId(node_id().to_string()),
+            &["*.example.com".to_string(), "*.".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            invite.domains,
+            vec!["*.example.com".to_string(), "*.".to_string()]
+        );
+        // And so the client does not proxy every host on the strength of a
+        // spelling that never asked for it.
+        let proxied = crate::domains::should_proxy_domain("example.com", &invite.domains);
+        assert!(!proxied);
     }
 
     #[test]

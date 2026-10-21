@@ -547,6 +547,19 @@ enabled = false
 listen_addr = "127.0.0.1:8081"
 # Domains to tunnel; --generate-invite without --invite-domains takes its
 # domains from here too.
+#
+# The same spelling a route's `host_pattern` uses, so a pattern can be copied
+# from one list to the other:
+#
+#   app.example.com    that name, exactly
+#   *.example.com      its subdomains, and not the name itself
+#   *                  every name
+#
+# A bare domain meant the name and every subdomain on the client while the
+# server read it as the name alone, so a subdomain the client put in the
+# tunnel was a name the server had no route for. It means the name alone now,
+# on both sides: write "*.example.com" for the subdomains. A client that
+# carries an older list says so in its log, once, at startup.
 proxy_domains = ["app.example.com", "web.example.com"]
 strategy = "round_robin"
 
@@ -632,3 +645,4 @@ domains = ["app.example.com"]
 # secret = "JBSWY3DPEHPK3PXP"
 # created_at = "1723756800"
 # allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route
+# allow_ports = [443, 8443]                                # unset = every port

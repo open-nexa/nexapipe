@@ -501,15 +501,20 @@ fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: std::net::IpAddr) 
     response
 }
 
-/// A configured proxy domain reduced to the bare suffix it matches: no leading
+/// A configured proxy domain reduced to the bare suffix it covers: no leading
 /// `*`, no leading or trailing dot, lower case.
 ///
-/// Shared with the per-domain DNS hijack, which has to spell the same suffix in
-/// a place the operating system reads it — a file under `/etc/resolver`, a
-/// systemd-resolved routing domain. The two halves only work as long as they
-/// mean the same thing: a suffix this server matches but no resolver routes is
-/// a domain that silently is not proxied, and one a resolver routes but this
-/// server does not match is a domain the machine can no longer resolve at all.
+/// This is the **scope** the per-domain DNS hijack hands to the operating
+/// system, not the pattern the per-query decision is made with: a file under
+/// `/etc/resolver`, a systemd-resolved routing domain and an NRPT suffix rule
+/// all name a *domain*, and a domain covers the name and its subdomains.
+///
+/// So the scope is the wider of the two, and the question "is this particular
+/// name one to hand a virtual address for" is answered per query, with the
+/// server's rule. A name the scope covers but the rule does not is forwarded
+/// to the real resolver and resolves for real; a name the rule covers but the
+/// scope does not would never arrive here, which is why the scope is derived
+/// from the pattern rather than the other way round.
 pub fn normalize_domain(domain: &str) -> String {
     domain
         .trim()
@@ -565,18 +570,19 @@ fn is_scoped_domain(domain: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
-/// Checks whether a domain should be proxied (DOMAIN-SUFFIX semantics):
-/// - `example.com` matches `example.com` and all of its subdomains (e.g. `fn.example.com`)
-/// - the `*.example.com` / `.example.com` spellings are accepted with the same meaning
+/// Checks whether a domain should be proxied.
+///
+/// The one rule, and it is the server's: a name (`example.com`), a dotted
+/// wildcard (`*.example.com`, its subdomains and not the apex) or the
+/// catch-all (`*`). The same rule decides which routes the server serves and
+/// which names a client puts in the tunnel, so a name this answers with a
+/// virtual address is a name the server can have a route for.
+///
+/// It used to be DOMAIN-SUFFIX here — a bare `example.com` meant the name and
+/// every subdomain — which is why this file and the client's own copy of the
+/// question could answer differently for the same config.
 fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
-    let host_lower = host.to_lowercase();
-    for domain in proxy_domains {
-        let domain_lower = normalize_domain(domain);
-        if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower)) {
-            return true;
-        }
-    }
-    false
+    nexapipe_client::should_proxy_domain(host, proxy_domains)
 }
 
 /// Builds an empty NOERROR reply (for non-A queries such as AAAA on hijacked domains)
@@ -762,20 +768,34 @@ mod tests {
         }
     }
 
-    /// The two halves of the hijack have to agree: whatever the resolver is told
-    /// to route is exactly what this server answers for, and vice versa.
+    /// The per-query decision follows the server's rule, so a name this
+    /// answers with a virtual address is a name the server can route.
     #[test]
-    fn a_scoped_domain_is_the_same_suffix_the_server_matches() {
+    fn a_name_is_proxied_by_the_rule_the_server_routes_by() {
+        // A name is that name.
+        let name = vec!["example.com".to_string()];
+        assert!(should_proxy_domain("example.com", &name));
+        assert!(!should_proxy_domain("www.example.com", &name));
+
+        // A dotted wildcard is the subdomains, and not the apex.
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(should_proxy_domain("a.b.example.com", &wildcard));
+        assert!(!should_proxy_domain("example.com", &wildcard));
+
+        // And a host that merely ends in the same letters is nobody's.
+        assert!(!should_proxy_domain("notexample.com", &wildcard));
+    }
+
+    /// The scope the operating system is told about is the suffix behind the
+    /// pattern, because no resolver mechanism can say "the subdomains and not
+    /// the apex": a resolver file for `example.com` covers both. The scope is
+    /// therefore the wider of the two, and the per-query decision above is what
+    /// narrows it — a name outside the pattern is forwarded to the real
+    /// resolver and resolves for real.
+    #[test]
+    fn the_scope_is_the_suffix_behind_the_pattern() {
         for spelling in ["example.com", "*.example.com", ".example.com"] {
-            assert!(should_proxy_domain(
-                "a.b.example.com",
-                &[spelling.to_string()]
-            ));
-            assert!(should_proxy_domain("example.com", &[spelling.to_string()]));
-            assert!(!should_proxy_domain(
-                "notexample.com",
-                &[spelling.to_string()]
-            ));
+            assert_eq!(normalize_domain(spelling), "example.com");
         }
     }
 

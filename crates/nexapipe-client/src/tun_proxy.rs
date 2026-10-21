@@ -53,7 +53,7 @@ use crate::ClientError;
 use crate::EndpointGroup;
 use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
-use crate::local_proxy::{handle_local_connection, should_proxy_domain};
+use crate::local_proxy::{handle_local_connection, report_domain_patterns, should_proxy_domain};
 use crate::virtual_ip::IpMapping;
 
 #[cfg(feature = "jni")]
@@ -301,6 +301,10 @@ fn start_stack_services(
         .enable_udp(true)
         .mtu(TUN_MTU)
         .build()?;
+
+    // What the list of names is worth saying, once, before anything asks it a
+    // question. Both TUN entry points come through here.
+    report_domain_patterns(&proxy_domains);
 
     // The Runner drives smoltcp's internal processing: retransmits, timeouts, etc.
     if let Some(runner) = runner {
