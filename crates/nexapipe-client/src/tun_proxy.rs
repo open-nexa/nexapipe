@@ -30,9 +30,9 @@
 //!
 //! # The destination address is the destination
 //!
-//! `10.0.1.3` used to be the single virtual proxy address: every connection went
-//! there and the far side worked out where it was going from the payload — SNI
-//! out of a TLS `ClientHello`, `Host` out of an HTTP request — and the port was
+//! `.3` of the block used to be the single virtual proxy address: every connection
+//! went there and the far side worked out where it was going from the payload —
+//! SNI out of a TLS `ClientHello`, `Host` out of an HTTP request — and the port was
 //! thrown away, so a flow to `example.com:8080` arrived looking like a flow to
 //! 443. UDP cannot work that way at all: a datagram carries no host name.
 //!
@@ -40,14 +40,15 @@
 //! (see [`IpMapping`]), and the address *is* the destination:
 //!
 //! ```text
-//! dns.example.com   → 10.0.1.16:53    → l4::open_udp("dns.example.com", 53)
-//! db.example.com    → 10.0.1.17:5432  → l4::open_tcp("db.example.com", 5432)
+//! dns.example.com   → 198.18.0.16:53    → l4::open_udp("dns.example.com", 53)
+//! db.example.com    → 198.18.0.17:5432  → l4::open_tcp("db.example.com", 5432)
 //! ```
 //!
-//! On Android, `10.0.1.3` is still accepted **for TCP only**, so applications
-//! that cached the address before the per-domain change keep working; it goes
-//! down the old payload-sniffing path ([`handle_local_connection`]). The desktop
-//! never handed out a fixed proxy address, so it passes no legacy IP.
+//! On Android, the legacy proxy address is still accepted **for TCP only**, so
+//! applications that cached the address before the per-domain change keep
+//! working; it goes down the old payload-sniffing path
+//! ([`handle_local_connection`]). The desktop never handed out a fixed proxy
+//! address, so it passes no legacy IP.
 
 use crate::ClientError;
 use crate::EndpointGroup;
@@ -111,41 +112,45 @@ use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
-// Virtual IP constants — must match the TUN config in the Kotlin-side NexaVpnService.
-// 10.0.1.1 = the TUN interface
-// 10.0.1.2 = DNS server (smoltcp UdpSocket receives DNS queries)
-// 10.0.1.3 = legacy proxy IP (TCP only; payload sniffing, kept for stale caches)
-// 10.0.1.16+ = per-domain addresses handed out by `IpMapping`
-/// Virtual DNS server IP — matches Kotlin-side NexaVpnService.virtualDNSIP, which
-/// the system resolver is pointed at (`addDnsServer`). The query's dst_addr is this
-/// IP, and it is used as-is as the src_addr in the response.
-#[cfg(target_os = "android")]
-const VIRTUAL_DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
-/// The address every proxied domain used to resolve to. See the module docs.
-#[cfg(target_os = "android")]
-const VIRTUAL_PROXY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 3);
+// Virtual IP addresses — must match the TUN config in the Kotlin-side NexaVpnService.
+// They are derived from the block the tunnel claims, so the two sides cannot
+// disagree about which addresses they are:
+//
+//   .1  = the TUN interface
+//   .2  = DNS server (smoltcp UdpSocket receives DNS queries)
+//   .3  = legacy proxy IP (TCP only; payload sniffing, kept for stale caches)
+//   .16+ = per-domain addresses handed out by `IpMapping`
+//
+// See `crate::virtual_block` for the block and the rules behind it.
 
 /// The virtual IPv6 block — must match the TUN config in the Kotlin-side
 /// NexaVpnService, which assigns `::1` to the interface and routes the whole
 /// /64 into the TUN.
 ///
-/// A ULA (`fd00::/8`) rather than a global address: it is never routed on the
-/// public internet, so a leak of one of these addresses — a DNS answer that
-/// escapes the tunnel, a log line — is a dead end. `10.0.1.0/24` with a `fd00:`
-/// prefix in front of it, so the two families read as one block.
+/// Derived from the IPv4 block: `fd00:{b0}:{b1}:{b2}::/64`, so the two
+/// families read as one block and the v6 half follows the v4 half wherever it
+/// goes. A ULA (`fd00::/8`) rather than a global address: it is never routed
+/// on the public internet, so a leak of one of these addresses — a DNS answer
+/// that escapes the tunnel, a log line — is a dead end.
 #[cfg(target_os = "android")]
-const VIRTUAL_IPV6_NET: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0);
-/// First address handed out of [`VIRTUAL_IPV6_NET`]: `::10`, mirroring the
-/// IPv4 pool's `.16` — the sixteenth address, written in hexadecimal as IPv6
+fn virtual_ipv6_net() -> Ipv6Addr {
+    crate::virtual_block::ipv6_block()
+}
+/// First address handed out of the IPv6 block: `::10`, mirroring the IPv4
+/// pool's `.16` — the sixteenth address, written in hexadecimal as IPv6
 /// notation has it.
 #[cfg(target_os = "android")]
-const VIRTUAL_IPV6_FIRST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0x10);
+fn virtual_ipv6_first() -> Ipv6Addr {
+    crate::virtual_block::ipv6_pool_first()
+}
 /// Last address handed out: `::fffe`. The top of the /64 is left alone the same
 /// way `.255` is — the interface's own address is at the bottom, and a pool
 /// that could hand out the block's own solicited-node or anycast addresses is
 /// asking for confusion.
 #[cfg(target_os = "android")]
-const VIRTUAL_IPV6_LAST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0010, 0, 1, 0, 0, 0, 0xfffe);
+fn virtual_ipv6_last() -> Ipv6Addr {
+    crate::virtual_block::ipv6_pool_last()
+}
 
 /// The only port the DNS hijack answers on. A datagram to any other port is a flow.
 const DNS_PORT: u16 = 53;
@@ -244,8 +249,9 @@ struct TunContext {
     proxy_domains: Arc<Vec<String>>,
     ip_mapping: Arc<IpMapping>,
     /// The address the system resolver is pointed at: a UDP datagram to this
-    /// address on port 53 is a DNS query (Android: 10.0.1.2, assigned to nothing
-    /// so the packets traverse the TUN; the desktop: the interface's own address).
+    /// address on port 53 is a DNS query (Android: `.2` of the block the tunnel
+    /// claims, assigned to nothing so the packets traverse the TUN; the desktop:
+    /// the interface's own address).
     dns_ip: Ipv4Addr,
     /// The legacy single virtual proxy address (payload sniffing for stale DNS
     /// caches) or `None` where none was ever handed out (the desktop).
@@ -447,8 +453,9 @@ impl TunProxy {
             fd_write
         );
         jni_log!(
-            "[tun-proxy] virtual blocks: 10.0.1.0/24 and {}/64",
-            VIRTUAL_IPV6_NET
+            "[tun-proxy] virtual blocks: {} and {}/64",
+            crate::virtual_block::network(),
+            virtual_ipv6_net()
         );
 
         let stopped = Arc::new(AtomicBool::new(false));
@@ -460,13 +467,13 @@ impl TunProxy {
             proxy_domains,
             custom_dns_servers,
             TunStackConfig {
-                dns_ip: VIRTUAL_DNS_IP,
-                legacy_proxy_ip: Some(VIRTUAL_PROXY_IP),
-                // IPv6 as well as IPv4: the Kotlin side routes
-                // `fd00:10:0:1::/64` into the TUN, so an AAAA answer inside it
-                // comes back to us the same way an A answer does.
+                dns_ip: crate::virtual_block::dns_ip(),
+                legacy_proxy_ip: Some(crate::virtual_block::legacy_proxy_ip()),
+                // IPv6 as well as IPv4: the Kotlin side routes the IPv6 half
+                // of the block into the TUN, so an AAAA answer inside it comes
+                // back to us the same way an A answer does.
                 ip_mapping: Arc::new(
-                    IpMapping::new().with_ipv6(VIRTUAL_IPV6_FIRST, VIRTUAL_IPV6_LAST),
+                    IpMapping::new().with_ipv6(virtual_ipv6_first(), virtual_ipv6_last()),
                 ),
             },
             stopped.clone(),
@@ -837,9 +844,10 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
         };
 
         // Legacy address: applications that cached a DNS answer from before the
-        // per-domain addresses existed still connect to 10.0.1.3, so those
-        // connections keep the payload-sniffing path (SNI / Host header) instead
-        // of being dropped. DNS answers only live 60 s, so this is a short tail.
+        // per-domain addresses existed still connect to the legacy proxy
+        // address, so those connections keep the payload-sniffing path
+        // (SNI / Host header) instead of being dropped. DNS answers only live
+        // 60 s, so this is a short tail.
         // (Android only — the desktop never handed out a fixed proxy address.)
         if ctx.legacy_proxy_ip == Some(dest_ip) {
             let Some(slot) = take_tcp_slot(&ctx, &warned_full) else {
@@ -2399,10 +2407,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// The mapping the Android TUN runs with: an IPv4 pool and an IPv6 one.
+    ///
+    /// Both pools are the ones of the block in use — the Android TUN takes
+    /// them from the shared block — so a helper that wrote them down would
+    /// test a layout the TUN does not run with. The lock is the block's own,
+    /// or another test could move the block between the two.
     fn dual_stack_mapping() -> IpMapping {
+        let _guard = crate::virtual_block::test_lock();
         IpMapping::new().with_ipv6(
-            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x10),
-            std::net::Ipv6Addr::new(0xfd00, 0x10, 0, 1, 0, 0, 0, 0x20),
+            crate::virtual_block::ipv6_pool_first(),
+            crate::virtual_block::ipv6_pool_last(),
         )
     }
 

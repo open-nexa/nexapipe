@@ -145,6 +145,26 @@ its defaults — which are on.
   using the health probe rather than a request counter. The HTTP request paths,
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
+- **The Android app can bring the tunnel back after a restart.** A proxy that
+  has to be switched on by hand every time the phone is switched on is not an
+  always-on proxy, and on a phone that is the difference between a machine
+  that is protected and a machine that is not. "Reconnect after a restart"
+  brings it back by itself: a `BOOT_COMPLETED` receiver starts the VPN
+  service, which waits for a network, builds the tunnel with the same sequence
+  a connection the user asked for uses, and establishes it.
+  The switch is off until the user turns it on — a proxy that reconnects
+  without being asked forwards traffic without being asked.
+  Two things it does not do, on purpose. It does not take the VPN slot from
+  another app: the boot path never answers the takeover question, because a
+  tunnel that quietly revoked somebody else's VPN at seven in the morning
+  would be a surprise nobody could prepare for. And it does not enrol an
+  endpoint: enrolling spends a token and answers with a credential that has
+  to be stored, and a boot has nobody to ask about a device that cannot
+  protect one — an endpoint waiting for that waits for the user.
+  Android does not promise that the permission a VPN app was given survives a
+  restart, so the boot path asks rather than assumes. When the permission is
+  gone the tunnel stays down and the settings page says so, rather than
+  leaving a switch that is on and nothing that happened.
 - **The desktop app can stay in the tray.** Closing the window used to end the
   process, so a proxy that had to be started by hand every time the machine woke
   was not the always-on proxy the settings page promised. The app now has a tray
@@ -198,6 +218,18 @@ its defaults — which are on.
   without a dot). Now it refuses the tunnel and says why, and the global
   strategy is one setting away for the machine that needs it. A machine that
   could be scoped is unaffected: it was already scoped.
+- **The Android client picks its address block instead of hard-coding one.**
+  The TUN used to claim `10.0.1.0/24` whatever network it was on, and that is
+  the block a great many home routers hand out — on those networks the tunnel
+  swallowed the router's own addresses and the device could not reach the
+  machine that was serving it. The app now walks the same list of candidate
+  blocks the desktop has always used (`198.18.0.0/24` first) and takes the
+  first one nothing on the device has claimed, and every address inside it —
+  the DNS server, the per-domain answers, the IPv6 half — is derived from that
+  block rather than written down on both sides. The list itself now lives in
+  the client library, so the two clients cannot drift apart. The desktop's
+  layout is untouched: it keeps its own addresses inside the block and its own
+  fixed ULA, and only the block and the list are shared.
 - **"Launch at startup" writes a real entry.** The switch has been on the
   settings page since the page existed, calling two commands that were never
   registered — so it read `false` and wrote nothing, and looked like a setting

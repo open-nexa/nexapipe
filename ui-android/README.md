@@ -20,8 +20,8 @@ The app is deliberately **not** a full-tunnel VPN:
  app (browser, …)
       │  DNS query for a proxied domain
       ▼
- VpnService TUN            Builder: setMtu(1400), addRoute("10.0.1.0", 24),
-      │                    addRoute("fd00:10:0:1::", 64), addDnsServer(<virtual DNS>)
+ VpnService TUN            Builder: setMtu(1400), addRoute(<virtual block>, 24),
+      │                    addRoute(<virtual block v6>, 64), addDnsServer(<virtual DNS>)
       ▼
  Rust: smoltcp userspace TCP/IP stack   (crates/nexapipe-client, feature tun-proxy)
       │  · DNS answers point the domain at the fake proxy IP
@@ -33,6 +33,12 @@ The app is deliberately **not** a full-tunnel VPN:
 Only the domains you configure are hijacked; everything else keeps using the
 normal network. `UnderlyingNetworkSelector` keeps the TUN on a validated network
 so the tunnel survives Wi-Fi ↔ cellular switches.
+
+The block of addresses the TUN claims is chosen per session, not written down:
+the app walks the same list of candidate blocks the desktop does and takes the
+first one nothing on the device has claimed, so the tunnel does not land on top
+of the network the phone is on — `10.0.1.0/24`, which a great many home routers
+use, used to be exactly that.
 
 ---
 
