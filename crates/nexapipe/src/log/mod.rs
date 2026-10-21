@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::ChronoLocal;
@@ -30,6 +31,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::LogConfig;
 use crate::conn::peers::PeerIdentity;
+
+/// The filter every layer is under.
+///
+/// **It names the access target as well as the crate's own.** The access line
+/// is logged under a target of its own, so that the layer writing the server's
+/// log file can leave it out — and a filter that named only `nexapipe` would
+/// drop the line altogether, rather than let it through to the console alone.
+fn env_filter(debug: bool) -> EnvFilter {
+    EnvFilter::new(format!(
+        "nexapipe={},access=info",
+        if debug { "debug" } else { "info" }
+    ))
+}
 
 /// Timestamp format of every log line, in local time.
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
@@ -47,7 +61,10 @@ pub fn init(config: Option<&LogConfig>, debug: bool) {
     // Set before anything can return early: an access line must not be written
     // verbatim just because the global logger could not be installed.
     set_redact_query(settings.redact_query);
-    let filter = EnvFilter::new(format!("nexapipe={}", if debug { "debug" } else { "info" }));
+    // The access line has a target of its own, so the filter has to name it:
+    // a filter that names only the crate's own target would drop the line
+    // altogether rather than let it through to the console alone.
+    let filter = env_filter(debug);
 
     let log_sink = open_sink(&settings, &settings.file_name);
     let access_sink = if settings.access_log {
@@ -119,6 +136,11 @@ where
         .with_ansi(false)
         .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
         .with_writer(sink)
+        // The access line is not repeated here. It has a file of its own, and
+        // the access log is written on a thread of its own — a request that
+        // also wrote the line here would pay for a second synchronous write,
+        // under this sink's lock, to put the same line in another file.
+        .with_filter(filter_fn(|metadata| metadata.target() != ACCESS_TARGET))
 }
 
 /// Open one of the log files, reporting a failure on stderr instead of aborting.
@@ -984,7 +1006,14 @@ fn write_access_line(
     // The same facts as the line above, and the same redacted detail: the
     // event and the file have to agree, or redacting the file only moves the
     // leak next door.
+    //
+    // **Its own target, so the server's log file does not carry it.** The
+    // access log has the line already, and the file layer writes every event
+    // it is given — synchronously, in the request's own task, under the sink's
+    // lock. So the line was written to a file, and then written again to
+    // another file, and the request paid for both.
     tracing::info!(
+        target: ACCESS_TARGET,
         "Access: {} {} {} {} {}ms{}",
         remote_addr,
         method,
@@ -995,9 +1024,63 @@ fn write_access_line(
     );
 }
 
+/// The target the access line is logged under.
+///
+/// Its own, so that the layer writing the server's log file can leave it out:
+/// the access log has the line, and a file that has it twice is a file with
+/// every request in it twice.
+const ACCESS_TARGET: &str = "access";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The access line goes to the console and to the access log, and not to
+    /// the server's log file.
+    ///
+    /// The file layer writes every event it is given — synchronously, in the
+    /// request's own task, under the sink's lock — so an access line that
+    /// reached it as well was a second write of the same line, into a second
+    /// file, on the path of every request.
+    #[test]
+    fn the_access_line_is_not_written_to_the_server_log_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sink =
+            FileSink::new(dir.path(), "server.log", Rotation::Never, 0, 0).expect("a log file");
+        let path = sink.path();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter(false))
+            .with(file_layer(sink));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: ACCESS_TARGET, "Access: 1.2.3.4 GET / 200");
+            tracing::info!("a server event");
+        });
+
+        let written = std::fs::read_to_string(path).expect("the log file");
+        assert!(
+            written.contains("a server event"),
+            "the server's own events are in the file: {written}"
+        );
+        assert!(
+            !written.contains("Access:"),
+            "the access line is in the file as well: {written}"
+        );
+    }
+
+    /// The access line's own target has to be named by the filter the server
+    /// installs, or the line is dropped altogether — and the console is where
+    /// it is supposed to be.
+    #[test]
+    fn the_filter_names_the_access_target() {
+        for debug in [false, true] {
+            let filter = format!("{:?}", env_filter(debug));
+            assert!(
+                filter.contains("access"),
+                "the filter drops the access line: {filter}"
+            );
+        }
+    }
 
     #[test]
     fn redacts_every_query_value() {
