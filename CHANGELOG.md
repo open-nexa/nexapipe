@@ -218,6 +218,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **The configuration and the runtime state are two files.** `config.toml` is
+  the operator's file — what they wrote, what they read, what they keep in
+  version control — and it no longer carries what a running server learns.
+  The 2FA counters (`failed_attempts`, `locked_until`, `last_used`) move to
+  `state.toml` beside it, in the same shape and with the same client and
+  device names, and the server writes that file and nobody else does. The
+  separation is not only tidiness: the server watches the configuration's
+  modification time, so a server that wrote its counters into the
+  configuration turned every mistyped code into a configuration reload — the
+  routes rebuilt and the health checks restarted, because a stranger typed a
+  code wrong. The counters are now written where nothing is watching them.
+  Nothing has to be set up: the state file appears the first time a client
+  authenticates or mistypes a code, it is `0600`, and a state file that cannot
+  be read stops the server from starting — the lockouts it holds would be
+  unknown, and starting anyway would reset every one of them. A configuration
+  written before the state file existed still works: the three counter keys are
+  read from it, so a deployment that was counting there keeps its lockouts
+  until the state file has an entry for that client. They are not written back
+  there any more, and `config.toml` is never rewritten for them.
 - **The Android client picks its address block instead of hard-coding one.**
   The TUN used to claim `10.0.1.0/24` whatever network it was on, and that is
   the block a great many home routers hand out — on those networks the tunnel
