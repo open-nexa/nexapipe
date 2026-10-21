@@ -105,6 +105,35 @@ pub struct ServerConfig {
     pub enrollment: Option<EnrollmentToken>,
 }
 
+/// Which credential one server is configured with.
+enum Credential<'a> {
+    /// A one-time token, spent on the first connection.
+    Enrollment(&'a EnrollmentToken),
+    /// A shared secret, answered on every connection.
+    TwoFactor(&'a TwoFactorCredentials),
+}
+
+/// What one server authenticates with.
+///
+/// A server that holds a secret authenticates with it and **never** enrolls:
+/// enrolling rotates the server-side secret, so an app that kept the invite it
+/// scanned next to the credential it got would invalidate every other device
+/// on that client id on every start. The token is for a server that has no
+/// secret yet.
+///
+/// `None` for a server with neither: it opens no auth stream at all.
+fn credential_for(server: &ServerConfig) -> Option<Credential<'_>> {
+    // A secret that is blank is a field nobody filled in, not a secret.
+    let has_secret = server
+        .two_factor
+        .as_ref()
+        .is_some_and(|two_factor| !two_factor.secret.trim().is_empty());
+    if has_secret {
+        return server.two_factor.as_ref().map(Credential::TwoFactor);
+    }
+    server.enrollment.as_ref().map(Credential::Enrollment)
+}
+
 /// How the client is set up.
 #[derive(uniffi::Record)]
 pub struct ClientConfig {
@@ -473,29 +502,30 @@ impl ProxyClient {
             // enrolls: enrolling rotates the server-side secret, so doing it on
             // every start would invalidate every other device that already
             // scanned the same invite.
-            if let Some(enrollment) = &server.enrollment {
-                let token = Enrollment::new(&enrollment.client_id, &enrollment.token);
-                let token = match enrollment.device.as_deref().map(str::trim) {
-                    Some(device) if !device.is_empty() => token.with_device(device),
-                    _ => token,
-                };
-                group.set_enrollment_for(&backend_id, Some(token)).await;
-                continue;
+            match credential_for(server) {
+                Some(Credential::Enrollment(enrollment)) => {
+                    let token = Enrollment::new(&enrollment.client_id, &enrollment.token);
+                    let token = match enrollment.device.as_deref().map(str::trim) {
+                        Some(device) if !device.is_empty() => token.with_device(device),
+                        _ => token,
+                    };
+                    group.set_enrollment_for(&backend_id, Some(token)).await;
+                }
+                Some(Credential::TwoFactor(two_factor)) => {
+                    let auth = TwoFactorAuth::new(
+                        &two_factor.client_id,
+                        &two_factor.secret,
+                        TotpAlgorithm::from_name(two_factor.algorithm.as_deref().unwrap_or("sha1")),
+                    )?;
+                    let auth = match two_factor.device.as_deref().map(str::trim) {
+                        Some(device) if !device.is_empty() => auth.with_device(device),
+                        _ => auth,
+                    };
+                    group.set_two_factor_for(&backend_id, Some(auth)).await;
+                }
+                // A server with neither opens no auth stream.
+                None => {}
             }
-
-            let Some(two_factor) = &server.two_factor else {
-                continue;
-            };
-            let auth = TwoFactorAuth::new(
-                &two_factor.client_id,
-                &two_factor.secret,
-                TotpAlgorithm::from_name(two_factor.algorithm.as_deref().unwrap_or("sha1")),
-            )?;
-            let auth = match two_factor.device.as_deref().map(str::trim) {
-                Some(device) if !device.is_empty() => auth.with_device(device),
-                _ => auth,
-            };
-            group.set_two_factor_for(&backend_id, Some(auth)).await;
         }
 
         // From here on the backends are asked whether they still answer, on a
@@ -623,5 +653,79 @@ mod tests {
             Err(_) => {}
             Ok(_) => panic!("a server with no address is not a server"),
         }
+    }
+
+    /// The 2FA credentials of one server.
+    fn two_factor(secret: &str) -> TwoFactorCredentials {
+        TwoFactorCredentials {
+            client_id: "client-001".to_string(),
+            secret: secret.to_string(),
+            algorithm: None,
+            device: None,
+        }
+    }
+
+    /// The one-time enrollment token of one server.
+    fn enrollment() -> EnrollmentToken {
+        EnrollmentToken {
+            client_id: "client-001".to_string(),
+            token: "an-enrollment-token".to_string(),
+            device: None,
+        }
+    }
+
+    /// A server that holds a secret authenticates with it and never enrolls.
+    ///
+    /// Enrolling rotates the server-side secret, so an app that kept the
+    /// invite it scanned next to the credential it got would invalidate every
+    /// other device on that client id on every start — and its own stored
+    /// secret with it.
+    #[test]
+    fn a_server_with_a_secret_never_enrolls() {
+        let mut server = server(unused_backend_id(), vec!["example.test".to_string()]);
+        server.two_factor = Some(two_factor("JBSWY3DPEHPK3PXP"));
+        server.enrollment = Some(enrollment());
+
+        assert!(
+            matches!(credential_for(&server), Some(Credential::TwoFactor(_))),
+            "a server with a secret answers with the secret"
+        );
+    }
+
+    /// A server with no secret spends the token instead.
+    #[test]
+    fn a_server_with_only_a_token_enrolls() {
+        let mut server = server(unused_backend_id(), vec!["example.test".to_string()]);
+        server.enrollment = Some(enrollment());
+
+        assert!(
+            matches!(credential_for(&server), Some(Credential::Enrollment(_))),
+            "a server with no secret spends the token"
+        );
+    }
+
+    /// A blank secret is a field nobody filled in, not a secret: the token is
+    /// still what there is to spend.
+    #[test]
+    fn a_server_with_a_blank_secret_enrolls() {
+        let mut server = server(unused_backend_id(), vec!["example.test".to_string()]);
+        server.two_factor = Some(two_factor("   "));
+        server.enrollment = Some(enrollment());
+
+        assert!(
+            matches!(credential_for(&server), Some(Credential::Enrollment(_))),
+            "a blank secret is not a secret"
+        );
+    }
+
+    /// A server with neither opens no auth stream at all.
+    #[test]
+    fn a_server_with_no_credential_has_none() {
+        let server = server(unused_backend_id(), vec!["example.test".to_string()]);
+
+        assert!(
+            credential_for(&server).is_none(),
+            "a server with no credential answers with nothing"
+        );
     }
 }
