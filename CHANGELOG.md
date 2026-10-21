@@ -33,6 +33,20 @@ its defaults — which are on.
 
 ### Added
 
+- **The access log says what an L4 flow was.** A tunnelled flow carries bytes,
+  so its line used to record only what the tunnel did with them — the
+  protocol, the target, the outcome, and nothing else. The first bytes of a
+  flow usually say more than that: a `ClientHello` names the host it is going
+  to, and a plaintext HTTP exchange says what was asked for and what came
+  back. The server now reads those bytes as they go past and appends what
+  they said to the line — `sni=www.example.com` for a TLS handshake,
+  `http="GET /v1/items HTTP/1.1" http_status=404` for a plaintext HTTP one.
+  It is a reading and nothing more: the route was chosen by the preface
+  before a payload byte arrived, so nothing in the log can name a different
+  backend than the one that served the flow, and the status column still holds
+  the outcome of the tunnel rather than the answer of the origin behind it. A
+  flow that says nothing recognizable gets no field rather than a guess, and a
+  query string in a sniffed target is redacted like any other.
 - **The latency of the tunnel, on both clients.** A client already reported
   *how* traffic reaches a backend — directly or through a relay — and now
   reports how far away that path is as well: the round-trip time iroh

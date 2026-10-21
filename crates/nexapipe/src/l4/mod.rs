@@ -27,9 +27,21 @@
 //!
 //! The status byte is sent before any payload, so a client can tell "no route" from
 //! "backend down" from "connection full" without heuristics.
+//!
+//! # What the access log says about a flow
+//!
+//! A flow carries bytes, so the line for one used to say only what the tunnel
+//! did with them. The first bytes of a flow usually say more than that — a TLS
+//! handshake names the host it wants, a plaintext HTTP exchange says what was
+//! asked for and what came back — and [`sniff`] reads them as they go past, so
+//! the line can say it. It reads and does not act: the route was chosen by the
+//! preface before a single payload byte arrived.
+
+mod sniff;
 
 use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
+use crate::l4::sniff::{FlowSniffer, Side, SniffReader};
 use crate::metrics;
 use crate::routes::{BackendLookup, RouteConfig};
 use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
@@ -271,7 +283,7 @@ where
         // two different things.
         metrics::METRICS.record_l4_flow(preface.proto.name(), logged_as);
         span.record("status", logged_as as u64);
-        crate::log::log_access(
+        crate::log::log_access_flow(
             request_id,
             peer,
             preface.proto.name(),
@@ -280,6 +292,8 @@ where
             0,
             0,
             who,
+            // The flow never started, so there is nothing it could have said.
+            None,
         );
         return Ok(());
     };
@@ -297,7 +311,7 @@ where
         );
         metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
         span.record("status", 429u64);
-        crate::log::log_access(
+        crate::log::log_access_flow(
             request_id,
             peer,
             preface.proto.name(),
@@ -306,6 +320,8 @@ where
             0,
             0,
             who,
+            // The flow never started, so there is nothing it could have said.
+            None,
         );
         return Ok(());
     };
@@ -325,6 +341,9 @@ where
     // defaults come from `[timeouts]` (`l4_flow_secs`, `l4_idle_secs`) through
     // the config the connection arrived under, not from here.
     let deadlines = config.timeouts().deadlines;
+    // One sniffer for the whole flow, shared by its two ends: what the client
+    // said and what the origin answered are one answer between them.
+    let sniffer = Arc::new(FlowSniffer::new());
     let result = match preface.proto {
         L4Proto::Tcp => {
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
@@ -334,6 +353,7 @@ where
                 leftover,
                 connect_timeout,
                 flow_timeout,
+                &sniffer,
             )
             .await
         }
@@ -344,11 +364,15 @@ where
         }
     };
 
+    // What the flow said about itself, now that it has said it. `None` for a
+    // flow that said nothing this proxy can read, which is most of them.
+    let detail = sniffer.verdict();
+
     match &result {
         Ok(()) => {
             metrics::METRICS.record_l4_flow(preface.proto.name(), 200);
             span.record("status", 200u64);
-            crate::log::log_access(
+            crate::log::log_access_flow(
                 request_id,
                 peer,
                 preface.proto.name(),
@@ -357,13 +381,14 @@ where
                 started.elapsed().as_millis() as u64,
                 0,
                 who,
+                detail.as_ref(),
             )
         }
         Err(e) => {
             tracing::debug!("L4 {} {} ended: {}", preface.proto.name(), target, e);
             metrics::METRICS.record_l4_flow(preface.proto.name(), 502);
             span.record("status", 502u64);
-            crate::log::log_access(
+            crate::log::log_access_flow(
                 request_id,
                 peer,
                 preface.proto.name(),
@@ -372,6 +397,7 @@ where
                 started.elapsed().as_millis() as u64,
                 0,
                 who,
+                detail.as_ref(),
             );
         }
     }
@@ -380,6 +406,9 @@ where
 }
 
 /// TCP: dial the backend, hand the client its status byte, then copy raw bytes.
+///
+/// `sniffer` watches the two ends of the flow as the bytes go past, so the
+/// access log can say what the flow was; it changes nothing about the flow.
 ///
 /// `flow_timeout` bounds the whole flow rather than the gap between packets: a
 /// TCP connection that is being used and one that is being held open by a peer
@@ -393,6 +422,7 @@ async fn serve_tcp<S>(
     leftover: Vec<u8>,
     connect_timeout: Duration,
     flow_timeout: Duration,
+    sniffer: &Arc<FlowSniffer>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -422,11 +452,21 @@ where
         crate::metrics::METRICS.record_bytes_received(leftover.len() as u64);
     }
 
+    // And they are the client's first bytes, so the sniffer has to see them
+    // like any other: a client that pipelines the preface and its first
+    // request is the normal case, not the rare one.
+    sniffer.feed(Side::Client, &leftover);
+
+    // The readers below watch what goes through them and hand the same bytes
+    // on, so the flow is the same flow with or without the watching.
+    let client = SniffReader::new(stream, Arc::clone(sniffer), Side::Client);
+    let backend = SniffReader::new(backend_stream, Arc::clone(sniffer), Side::Backend);
+
     // Bounded as a whole, not only on silence: see `serve_tcp`. The deadline is
     // handed to the copy rather than wrapped around it, so the helper's own
     // half-close still runs when it fires and the client sees an EOF rather than
     // a reset.
-    match copy_both_ways_until(stream, backend_stream, "L4 TCP", Some(flow_timeout)).await {
+    match copy_both_ways_until(client, backend, "L4 TCP", Some(flow_timeout)).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             // `warn`, not `debug`: this fires on a session that was working and
