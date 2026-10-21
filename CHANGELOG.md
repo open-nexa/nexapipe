@@ -202,6 +202,18 @@ its defaults — which are on.
 
 ### Changed
 
+- **The Android client picks its address block instead of hard-coding one.**
+  The TUN used to claim `10.0.1.0/24` whatever network it was on, and that is
+  the block a great many home routers hand out — on those networks the tunnel
+  swallowed the router's own addresses and the device could not reach the
+  machine that was serving it. The app now walks the same list of candidate
+  blocks the desktop has always used (`198.18.0.0/24` first) and takes the
+  first one nothing on the device has claimed, and every address inside it —
+  the DNS server, the per-domain answers, the IPv6 half — is derived from that
+  block rather than written down on both sides. The list itself now lives in
+  the client library, so the two clients cannot drift apart. The desktop's
+  layout is untouched: it keeps its own addresses inside the block and its own
+  fixed ULA, and only the block and the list are shared.
 - **"Launch at startup" writes a real entry.** The switch has been on the
   settings page since the page existed, calling two commands that were never
   registered — so it read `false` and wrote nothing, and looked like a setting
