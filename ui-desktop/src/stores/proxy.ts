@@ -329,6 +329,21 @@ function linkKindFor(node: NodeConfig): LinkKind | null {
 }
 
 /**
+ * The round-trip time of the path carrying a node's traffic, in milliseconds, or null when
+ * iroh has no sample — a path that has just opened, or one it cannot measure.
+ *
+ * Null is not zero: a node whose latency has not been measured yet says so, rather than
+ * claiming to be instantaneous.
+ *
+ * Keyed on the connection string, the same key `linkKindFor` looks its own answer up by.
+ */
+function rttFor(node: NodeConfig): number | null {
+  const connection = node.connectionType === 'ticket' ? node.ticket : node.endpointId;
+  if (!connection) return null;
+  return endpointLinks.value.find((link) => link.connection === connection)?.rttMs ?? null;
+}
+
+/**
  * What the last probe of a node found, or null when nothing has probed it — the normal answer
  * before the proxy is started, and for the first probe interval after it is.
  *
@@ -755,6 +770,7 @@ export function useProxyStore() {
     refreshServiceRunning,
     setUseTun,
     linkKindFor,
+    rttFor,
     healthFor,
     trafficFor,
     startPolling,

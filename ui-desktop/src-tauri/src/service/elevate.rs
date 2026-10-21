@@ -331,7 +331,9 @@ fn write_result_file(path: &Path, line: &str) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
 
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("the result path is not a regular file"));
+        return Err(std::io::Error::other(
+            "the result path is not a regular file",
+        ));
     }
     file.set_len(0)?;
     file.write_all(line.as_bytes())
@@ -692,10 +694,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nexapipe-elevate-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nexapipe-elevate-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the scratch directory is created");
         dir
@@ -730,7 +730,10 @@ mod tests {
 
         create_result_file(&path).expect("created");
 
-        let mode = std::fs::metadata(&path).expect("there").permissions().mode();
+        let mode = std::fs::metadata(&path)
+            .expect("there")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     }
 

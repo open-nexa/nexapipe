@@ -6,6 +6,7 @@ pub mod client;
 pub mod connection_pool;
 pub mod deadline;
 pub mod discovery;
+pub mod domains;
 pub mod endpoint_group;
 pub mod error;
 pub mod flow;
@@ -47,8 +48,9 @@ pub mod uniffi_bindings;
 pub mod jni;
 
 pub use client::IrohProxyClient;
-pub use connection_pool::{IrohConnectionPool, LinkKind};
+pub use connection_pool::{IrohConnectionPool, LinkKind, LinkStatus};
 pub use discovery::DiscoveryMode;
+pub use domains::{DomainNotes, domain_notes, should_proxy_domain};
 pub use endpoint_group::{
     DomainMapping, EndpointGroup, NodeConfig, PooledConnection, PreconnectReport,
 };

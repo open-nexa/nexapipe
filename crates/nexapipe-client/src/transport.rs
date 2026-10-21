@@ -80,6 +80,18 @@ pub const DEFAULT_SEND_WINDOW: u64 = 16 * 1024 * 1024;
 /// this number into memory pressure.
 pub const DEFAULT_MAX_BIDI_STREAMS: u64 = 1024;
 
+/// The round-trip time quinn assumes until it has measured one.
+///
+/// quinn's RTT estimator starts at this value for every path and replaces it once
+/// the path has something to say — a path validation, an acknowledgement on that
+/// path, or an estimate inherited from a validated path on the same network path —
+/// so a path that was opened a moment ago reads as this guess rather than as a
+/// measurement. iroh does not override it, so this is quinn's own default; it is
+/// set on the transport config explicitly so that the number here and the number
+/// quinn uses cannot drift apart. [`crate::connection_pool`] relies on that to
+/// tell a measurement from a guess.
+pub const INITIAL_RTT: Duration = Duration::from_millis(333);
+
 /// Fallback used when an override is nonsense (e.g. a varint that is too large).
 const FALLBACK_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 
@@ -176,6 +188,7 @@ impl TransportTuning {
     /// above keeps iroh's value.
     pub fn transport_config(&self) -> QuicTransportConfig {
         let mut builder = QuicTransportConfig::builder()
+            .initial_rtt(INITIAL_RTT)
             .stream_receive_window(varint(
                 self.stream_receive_window,
                 ENV_STREAM_WINDOW,
@@ -293,5 +306,18 @@ mod tests {
         let text = TransportTuning::default().describe();
         assert!(text.contains("stream_receive_window=4194304B"), "{text}");
         assert!(text.contains("initial_mtu=iroh-default"), "{text}");
+    }
+
+    /// The reader tells a measurement from quinn's guess by comparing against
+    /// [`INITIAL_RTT`], so the transport config has to carry exactly that
+    /// number — set explicitly, rather than left to quinn's default, which
+    /// could change underneath the comparison.
+    #[test]
+    fn the_transport_config_carries_the_initial_rtt_the_reader_recognises() {
+        let text = format!("{:?}", TransportTuning::default().transport_config());
+        assert!(
+            text.contains(&format!("initial_rtt: {INITIAL_RTT:?}")),
+            "{text}"
+        );
     }
 }

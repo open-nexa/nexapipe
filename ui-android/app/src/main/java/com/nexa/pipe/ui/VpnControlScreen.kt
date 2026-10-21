@@ -66,7 +66,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val isVpnRunning by viewModel.isVpnRunning.collectAsState()
     val isConnecting by viewModel.isConnecting.collectAsState()
     val nodes by viewModel.nodes.collectAsState()
-    val linkKinds by viewModel.linkKinds.collectAsState()
+    val linkReadings by viewModel.linkReadings.collectAsState()
     val traffic by viewModel.traffic.collectAsState()
     val totalTraffic by viewModel.totalTraffic.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
@@ -87,7 +87,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // is using. Empty until the native side reports a connection, which is also what hides the
     // card: an endpoint nothing is connected to has no link kind to show.
     val connectedEndpoints = nodes.mapNotNull { node ->
-        linkKindOf(linkKinds, node.nodeId)?.let { node to it }
+        linkKindOf(linkReadings.kinds, node.nodeId)?.let { node to it }
     }
 
     var showLogs by remember { mutableStateOf(false) }

@@ -12,12 +12,13 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Four things land in this cycle so far: the device credential can be a **key**
+Five things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
-circuit-broken — and the ceilings the process runs under are now something a
-config file can say rather than only an environment variable can. No existing
+circuit-broken — the ceilings the process runs under are now something a
+config file can say rather than only an environment variable can, and a name is
+spelled the same way in a client's list and in the server's routes. No existing
 configuration key is removed or renamed, and the ones this cycle adds —
 `public_key` under a device entry, the six `[timeouts]` phase keys, `[limits]`,
 `[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so a
@@ -44,6 +45,14 @@ its defaults — which are on.
   worse: a number that gates a build before anyone trusts it gets deleted.
   What each bench measures, and what it deliberately does not, is written down
   in [`docs/benchmarks.md`](docs/benchmarks.md).
+- **The latency of the tunnel, on both clients.** A client already reported
+  *how* traffic reaches a backend — directly or through a relay — and now
+  reports how far away that path is as well: the round-trip time iroh
+  measures for the path carrying the traffic, shown beside the path badge
+  on the desktop dashboard and on the Android endpoint screen. The two are
+  read from one answer, so they cannot describe different paths, and a path
+  iroh has not measured yet shows nothing at all rather than "0 ms" — a
+  number nobody measured is not a number.
 - **The endpoint's address lookup can be switched off.** `[iroh] discovery` on
   the server — `n0` (the default) or `none` — and the same choice on both
   clients. `none` takes n0's DNS and pkarr lookups off the endpoint, so
@@ -148,9 +157,85 @@ its defaults — which are on.
   using the health probe rather than a request counter. The HTTP request paths,
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
+- **The desktop app can stay in the tray.** Closing the window used to end the
+  process, so a proxy that had to be started by hand every time the machine woke
+  was not the always-on proxy the settings page promised. The app now has a tray
+  icon: the window goes there instead of ending the app, and the icon brings it
+  back. "Minimize on close" is on by default, and the switch that was there for
+  it now works — on a desktop with no tray it says so and the close button
+  keeps ending the app, because a hidden window with nowhere to come back from
+  is an app nobody can reach.
+
+- **`allow_ports` limits a client to the services it may reach.** `allow_hosts`
+  says which *names* a client may reach, and a name is not a service: a host
+  that answers on three ports is one name and three things to reach. The new
+  key is the other half of the same question — `allow_ports = [443, 8443]` —
+  and the two are independent: a client may be limited to one host and every
+  port, or every host and one port.
+  Checked where the client names a port. The tunnel preface always names one,
+  and an HTTP request's `Host` header may; a request that names no port is not
+  checked, because there is no port to hold against it. A TLS passthrough is
+  not checked either: the route picks the port and the client never names one.
+  What the list separates is the tunnel: the preface names the service the
+  client wants, and the route decides where that service is answered from —
+  `client_ports` only picks the route, it never decides where the connection
+  goes. So the port the preface names is the service the client reached, and
+  that is the port the list is held against. The HTTP path routes by host
+  alone, so a port named in a `Host` header is checked but is not the port the
+  request is served from — two services of one host are told apart by the
+  tunnel, not by this list.
+  A refusal looks exactly like "no route" — a 404, a `NoRoute`, a hang-up —
+  so it cannot be used to probe what is open behind the proxy. Left unset, a
+  client keeps the reach it had; an empty list denies every port that is
+  checked. The reading `allow_hosts = []` has is the stricter of the two: it
+  denies every name, with no path around it, while a port is only denied
+  where one is checked.
+  A port of zero is refused at startup, because no client ever asks for it.
 
 ### Changed
 
+- **"Launch at startup" writes a real entry.** The switch has been on the
+  settings page since the page existed, calling two commands that were never
+  registered — so it read `false` and wrote nothing, and looked like a setting
+  while behaving like a decoration. It now writes an entry for the platform: a
+  value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows, a
+  LaunchAgent in `~/Library/LaunchAgents` on macOS, a `.desktop` file in
+  `~/.config/autostart` on Linux. All three are per-user and need no elevation,
+  and none of them starts anything at the moment the switch is flipped — the
+  platform's own login mechanism reads the entry at the next login, so turning it
+  on does not put a second copy of the app on the machine mid-session. The entry
+  starts the app with `--background`, which means no window: the app comes up in
+  the tray instead of putting a window over whatever the user was doing at
+  login.
+- **The client's list of names and the server's routes are spelled the same
+  way.** A pattern is a name (`app.example.com`), a dotted wildcard
+  (`*.example.com` — its subdomains, and not the name itself) or the
+  catch-all (`*`), on both sides. Three places used to answer "is this name
+  mine?" differently: the server matched a request or a preface against a
+  route's `host_pattern` strictly, the client read a bare domain as the name
+  *and* every subdomain, and the desktop carried a second copy of the
+  client's rule that only applied on some platforms — on Windows a query is
+  local-delivered to the app's own DNS server and on macOS and Linux it
+  reaches the library's, so the same config answered differently depending on
+  the machine. The rule now lives in `nexapipe-proto`, which both sides
+  already link.
+
+  **This changes what a bare domain means in a client's list.** `example.com`
+  used to mean the name and every subdomain on the client; it means the name
+  alone now, which is what the server always read it as. A client that wants
+  the subdomains writes `*.example.com`, and a client carrying an older list
+  says so in its log, once, at startup. A wildcard without the dot
+  (`*example.com`) used to be a bare `ends_with` on the client and matched
+  `notexample.com` with it; it matches nothing now, and the server has always
+  refused the spelling. The dot-prefixed spelling (`.example.com`) is refused
+  as well: it is the suffix form a resolver uses, not a pattern here.
+  The client's own lookup of the backend that serves a name follows the same
+  rule now: a wildcard mapping serves the names it covers, a bare mapping
+  serves its own name alone, and a name written the way DNS writes it — with
+  the trailing dot — finds the same backend. A client that configured
+  `*.example.com` used to decide that `www.example.com` belonged in the
+  tunnel and then fail to find the backend for it, so the request went to the
+  default backend or to none.
 - **`relay_mode = "custom"` now means it for the peer as well.** A custom
   client dials its peer through the relay you run and nothing else: a peer
   whose address names a different relay is refused, and the refusal says which

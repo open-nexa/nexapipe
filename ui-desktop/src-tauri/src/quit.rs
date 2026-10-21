@@ -12,6 +12,7 @@
 //! "quit". The window itself needs no such replacement: Tauri holds a window open as soon as the
 //! renderer listens for its close request, so that path already asks.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::AppHandle;
 
 // macOS only: `tauri::menu` is a desktop crate, and it is macOS whose Quit item needs replacing.
@@ -26,6 +27,26 @@ pub const QUIT_ITEM_ID: &str = "quit";
 
 /// Emitted when that item is activated, for the renderer to answer.
 pub const QUIT_REQUESTED_EVENT: &str = "nexa://quit-requested";
+
+/// Whether the renderer is listening for the quit question.
+///
+/// Tauri does not report a failed emit when nobody is listening: the event is
+/// delivered to the webviews that have a listener for it and the ones that do
+/// not are not mentioned, so an emit to nobody still succeeds. The emit
+/// therefore cannot be asked whether the question arrived — the renderer says
+/// so itself, through [`quit_guard_ready`].
+static QUIT_GUARD_READY: AtomicBool = AtomicBool::new(false);
+
+/// Announces that the renderer is listening for the quit question.
+///
+/// Called by the renderer once it has registered its listener — see
+/// [`QUIT_REQUESTED_EVENT`]. Until it has, a quit is answered by exiting:
+/// there is nobody to ask, and asking anyway would hang on an answer that
+/// cannot come.
+#[tauri::command]
+pub fn quit_guard_ready() {
+    QUIT_GUARD_READY.store(true, Ordering::Relaxed);
+}
 
 /// The menu bar, with Quit wired to us instead of to `NSApp`.
 ///
@@ -87,6 +108,37 @@ pub fn menu_bar(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&view_submenu)
         .item(&window_submenu)
         .build()
+}
+
+/// Asks the renderer whether the app may quit.
+///
+/// The question is asked in the window, so the window comes back first: a
+/// hidden window has no dialog in it, and a question the user cannot see is a
+/// question that was never asked. Every path that asks asks this way — the
+/// tray's Quit item and the macOS menu bar's alike.
+///
+/// The answer comes back as [`finish_quit`], which is what ends the process.
+pub fn ask(app: &AppHandle) {
+    // Nobody is listening: the renderer has not mounted yet, or it is not
+    // there. The emit below cannot be asked whether the question arrived — a
+    // failed emit means a renderer that was there could not be reached, not
+    // that there is none — so the renderer announces itself instead, and
+    // until it has, a quit is answered by exiting. Exiting is what was asked
+    // for, and asking anyway would hang on an answer that cannot come.
+    if !QUIT_GUARD_READY.load(Ordering::Relaxed) {
+        tracing::warn!("no renderer is listening for the quit question; exiting as asked");
+        app.exit(0);
+        return;
+    }
+
+    crate::tray::show_window(app);
+    if let Err(error) = tauri::Emitter::emit(app, QUIT_REQUESTED_EVENT, ()) {
+        // The renderer was there and cannot be reached now. Exiting is what
+        // was asked for, and asking again would hang on an answer that
+        // cannot come.
+        tracing::warn!("could not ask about quitting ({error}); exiting as asked");
+        app.exit(0);
+    }
 }
 
 /// Ends the process once the question has been answered.
