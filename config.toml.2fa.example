@@ -194,9 +194,10 @@ created_at = "1723756800"
 # that names no port is not checked, because there is no port to hold against
 # it. An empty list denies every port that is checked.
 # The tunnel is where the list separates services: the preface names the port
-# the client wants, and that is the port the proxy dials. The HTTP path routes
-# by host alone, so there the list refuses a request that names a port off it
-# and nothing more.
+# the client wants, and the route decides where that service is answered from
+# (client_ports only picks the route, it never decides where the connection
+# goes). The HTTP path routes by host alone, so there the list refuses a
+# request that names a port off it and nothing more.
 # allow_ports = [443, 8443]
 # The server also writes `failed_attempts`, `locked_until` and `last_used` back
 # into a client that has failed a handshake, so a lockout survives a restart.
