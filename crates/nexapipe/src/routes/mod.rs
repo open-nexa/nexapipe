@@ -859,13 +859,45 @@ impl RouteConfig {
     }
 }
 
-/// The port a backend URL is reached on.
+/// The port a backend is reached on.
 ///
-/// `None` when the URL does not say, and when it does not say, the port is
+/// `None` when the backend does not say, and when it does not say, the port is
 /// the scheme's default — which is what the URL itself would use.
+///
+/// **Both spellings are read.** A backend is written as a URL
+/// (`http://10.0.0.5:18080`) for an HTTP route, and as a bare `host:port`
+/// (`127.0.0.1:443`) for a TLS passthrough — and a bare `host:port` is not a
+/// URL at all: `Url::parse` reads `host.docker.internal:8443` as a scheme
+/// with no port, and refuses `127.0.0.1:443` outright. So the passthrough's own
+/// parser is the one that answers, and it knows both.
 pub(crate) fn backend_port(url: &str) -> Option<u16> {
-    let parsed = url::Url::parse(url).ok()?;
-    parsed.port_or_known_default()
+    crate::passthrough::parse_backend_addr(url).map(|(_host, port)| port)
+}
+
+/// The port a backend is reached on, in either spelling.
+///
+/// The two spellings are not the same thing to a URL parser: `http://host:8443`
+/// is a URL, and `host:8443` is not one at all — `Url::parse` reads it as a
+/// scheme and finds no port, and refuses `127.0.0.1:8443` outright. A TLS
+/// passthrough backend is written the second way, so a check that only read
+/// URLs would never fire on one.
+#[cfg(test)]
+mod backend_port_tests {
+    use super::backend_port;
+
+    #[test]
+    fn a_url_backend_is_read() {
+        assert_eq!(backend_port("http://10.0.0.5:18080"), Some(18080));
+        assert_eq!(backend_port("https://example.com"), Some(443));
+    }
+
+    #[test]
+    fn a_bare_host_and_port_is_read() {
+        // The spelling a TLS passthrough backend is written in.
+        assert_eq!(backend_port("127.0.0.1:8443"), Some(8443));
+        assert_eq!(backend_port("host.docker.internal:8443"), Some(8443));
+        assert_eq!(backend_port("[::1]:8443"), Some(8443));
+    }
 }
 
 /// Highest-priority route of `mode` that `matches` accepts.

@@ -166,6 +166,13 @@ pub struct ClientAuth {
     /// is not the answer a deployed configuration was written against — so an
     /// operator opts in, having looked at where their backends actually
     /// listen.
+    ///
+    /// **The port checked is the one the request is served from** — the
+    /// backend the pool picked, not the route it came from. A route with two
+    /// backends on two ports is therefore half usable by such a client: the
+    /// requests that land on the allowed port are served and the ones that
+    /// land on the other are refused. That is the rule this flag states, and
+    /// it is the one an allow-list of ports is written for.
     #[serde(default)]
     pub allow_ports_strict: bool,
     /// A one-time enrollment token waiting to be exchanged for a new secret.
