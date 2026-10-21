@@ -24,6 +24,11 @@ runner without it, and a bench that fails is a bench nobody runs.
 # is also what `local-proxy` needs.
 cargo bench --workspace --features nexapipe-client/tun-proxy
 
+# The same, without the plots and the HTML report. The flag reaches criterion
+# alone now, so it is worth knowing about: a run that only wants the numbers
+# does not have to write a report to do it.
+cargo bench --workspace --features nexapipe-client/tun-proxy -- --noplot
+
 # One of them.
 cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
@@ -32,6 +37,17 @@ cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 
 The release profile of the root workspace is `opt-level = 3` with LTO, so the
 first build takes a while and every run after it is fast.
+
+`cargo bench --workspace` runs the criterion targets and nothing else: the
+crates carry no `#[bench]` function, and cargo's default bench target for a
+crate is a harness with nothing in it — built and *run* in the release profile,
+which is the slowest profile there is. Each crate says so with `bench = false`
+on its library and binary targets.
+
+It also means the arguments after `--` reach criterion alone. `--noplot` is a
+criterion flag, and the default harness refuses an option it does not know and
+exits 101 — which is how the CI job used to fail, on `nexapipe --lib`, before
+a single benchmark had run.
 
 Criterion writes its report to `target/criterion/<group>/<bench>/` and prints
 the numbers it found. The useful parts are the time per iteration, the

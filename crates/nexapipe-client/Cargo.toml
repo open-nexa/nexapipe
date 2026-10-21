@@ -12,6 +12,13 @@ publish = false
 [lib]
 crate-type = ["lib", "cdylib"]
 
+# No `#[bench]` function lives in this crate, so cargo's default bench target
+# for it is a harness with nothing to run — and it is built and *run* in the
+# release profile by `cargo bench`, which is the slowest profile there is.
+# Turning it off says so, and leaves `cargo bench` to the criterion targets
+# below, which are the ones there are numbers for.
+bench = false
+
 [dependencies]
 iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
 ndk-context = "0.1"

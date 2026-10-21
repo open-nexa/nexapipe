@@ -6,6 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# No `#[bench]` function lives in this crate, so cargo's default bench target
+# for it is a harness with nothing to run — and it is built and *run* in the
+# release profile by `cargo bench`, which is the slowest profile there is.
+# Turning it off says so, and leaves `cargo bench` to the criterion targets
+# below, which are the ones there are numbers for.
+[lib]
+bench = false
+
+[[bin]]
+name = 'nexapipe'
+path = 'src/main.rs'
+bench = false
+
 [dependencies]
 clap = { version = '4.6.1', features = ['derive'] }
 iroh.workspace = true
