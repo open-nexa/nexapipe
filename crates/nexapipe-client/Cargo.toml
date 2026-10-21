@@ -90,3 +90,9 @@ required-features = ["tun-proxy"]
 name = "forwarding_path"
 harness = false
 required-features = ["local-proxy"]
+
+# What one TCP flow costs in the TUN stack. It is an example rather than a
+# benchmark because what it measures is memory, not time: see the file itself.
+[[example]]
+name = "tun_flow_memory"
+required-features = ["tun-proxy"]

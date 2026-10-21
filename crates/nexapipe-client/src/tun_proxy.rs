@@ -169,6 +169,22 @@ const DNS_PORT: u16 = 53;
 const TUN_MTU: usize = 1400;
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The per-socket TCP window the TUN stack uses, in bytes.
+///
+/// **The window is the flow's memory.** The stack gives every socket four
+/// buffers of this size — two for the protocol and two for the application
+/// side of the tunnel — so a flow costs four times this whether it is
+/// carrying anything or not.
+///
+/// It is also the flow's throughput: steady single-flow speed is the window
+/// divided by the round-trip time, so 128 KiB over a 100 ms path is
+/// 1.25 MB/s and over a 50 ms path is 2.5 MB/s.
+///
+/// The value the stack used before the client had a say in it was
+/// `0x3FFF * 20` — 320 KiB, twenty AEAD packets — and it is written down
+/// here so that the number is the client's rather than the dependency's.
+pub const DEFAULT_TCP_WINDOW: u32 = 0x3FFF * 20;
+
 /// How long a UDP flow may stay silent before this side closes it.
 ///
 /// Deliberately under the server's own 60 s UDP idle timeout: if the server closes
@@ -215,7 +231,9 @@ const MAX_UDP_FLOWS: usize = 32;
 /// application could start: the stack's socket set grows as connections
 /// arrive, and a flow whose tunnel has to be dialled opens a new connection
 /// when the pool has nothing free. On Android the TUN is system-wide, so any
-/// installed application reaches this. The same ceiling the local HTTP proxy
+/// installed application reaches this.
+///
+/// The same ceiling the local HTTP proxy
 /// uses, which is what the numbers here are being compared against rather
 /// than derived from.
 const MAX_TCP_FLOWS: usize = 256;
@@ -308,6 +326,11 @@ fn start_stack_services(
         .enable_tcp(true)
         .enable_udp(true)
         .mtu(TUN_MTU)
+        // The window the client asks for, rather than the stack's own default:
+        // it is the client's memory, and the client is the one that has to live
+        // with it. See [`DEFAULT_TCP_WINDOW`].
+        .tcp_recv_buffer_size(DEFAULT_TCP_WINDOW)
+        .tcp_send_buffer_size(DEFAULT_TCP_WINDOW)
         .build()?;
 
     // What the list of names is worth saying, once, before anything asks it a
