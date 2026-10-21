@@ -102,6 +102,7 @@
     <string name="link_direct_body">流量直达该端点</string>
     <string name="link_relay_body">流量经由中继服务器转发</string>
     <string name="link_connecting_body">正在选择最佳路径</string>
+    <string name="link_rtt">延迟 %1$d 毫秒</string>
 
     <!-- 域名 -->
     <string name="domains_title">域名</string>
@@ -167,6 +168,10 @@
     <string name="relay_mode_default">默认（全部 N0 中继）</string>
     <string name="relay_mode_disabled">停用（完全不使用中继）</string>
     <string name="relay_mode_custom">自定义 URL（独占）</string>
+    <string name="discovery_mode_title">节点发现</string>
+    <string name="discovery_mode_note">关掉发现后，本机不再向 n0 查询对端地址。对端只能通过别人给它的地址（邀请票据）访问，单凭 Node ID 不行。</string>
+    <string name="discovery_mode_n0">向 n0 查询（按 Node ID 找地址）</string>
+    <string name="discovery_mode_none">不查询任何人（只能用票据）</string>
     <string name="relay_url_label">中继 URL</string>
     <string name="relay_url_placeholder">https://relay.example.com</string>
     <string name="relay_token_label">中继鉴权令牌（可选）</string>

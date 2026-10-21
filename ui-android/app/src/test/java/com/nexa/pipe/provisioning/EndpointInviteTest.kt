@@ -114,6 +114,21 @@ class EndpointInviteTest {
         assertEquals(listOf("a.example", "b.example"), invite.domains)
     }
 
+    /**
+     * The domain list is a list of patterns, and the server's route patterns
+     * are what ends up in an invite.
+     *
+     * `*.` is the catch-all in another spelling: folded into `*`, it would hand
+     * the client the catch-all — every host — for a spelling that asked for
+     * something narrower. It keeps its own shape instead, and a pattern in
+     * that shape matches nothing.
+     */
+    @Test
+    fun a_pattern_that_folds_into_the_catch_all_keeps_its_shape() {
+        val invite = success("nexapipe://endpoint/$nodeId?v=1&domains=%2A.example.com,%2A.")
+        assertEquals(listOf("*.example.com", "*."), invite.domains)
+    }
+
     @Test
     fun rejects_broken_domain_lists() {
         assertTrue(failure("nexapipe://endpoint/$nodeId?v=1&domains=a,,b").contains("invalid"))

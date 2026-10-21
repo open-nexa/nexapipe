@@ -1,4 +1,5 @@
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::discovery::DiscoveryMode;
 use crate::relay::RelayModeSpec;
 use crate::secret::SecretString;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
@@ -154,6 +155,12 @@ static CUSTOM_RELAY_URL: Mutex<String> = Mutex::new(String::new());
 // entry is replaced or the process ends.
 static RELAY_AUTH_TOKEN: Lazy<Mutex<SecretString>> =
     Lazy::new(|| Mutex::new(SecretString::default()));
+
+// Whether this endpoint may use n0's address lookup, from Kotlin settings.
+// "n0" = the default (a Node ID is looked up through dns.iroh.link), "none" =
+// no lookup at all, and a peer then has to bring an address of its own.
+// An empty value means nothing has been injected yet, which falls back to "n0".
+static DISCOVERY_MODE: Mutex<String> = Mutex::new(String::new());
 
 // Reason behind the last failed native call, so Kotlin can read it back.
 //
@@ -322,6 +329,24 @@ pub fn debug_log(msg: &str) {
     android_log(log::Level::Debug, msg);
 }
 
+/// A warning the Android build can show.
+///
+/// The Android logger is installed at `Info`, so a `Debug` line is dropped
+/// before it is ever formatted — and the Android build has no tracing
+/// subscriber to fall back on. A warning nobody can read is not a warning,
+/// so this one goes through the `log` crate at `Warn`.
+#[cfg(feature = "jni")]
+pub(crate) fn warn_log(msg: &str) {
+    android_log(log::Level::Warn, msg);
+}
+
+/// A line of information the Android build can show, on the same terms as
+/// [`warn_log`].
+#[cfg(feature = "jni")]
+pub(crate) fn info_log(msg: &str) {
+    android_log(log::Level::Info, msg);
+}
+
 /// Debug log that is a no-op when the `log` level filter is below `Debug`.
 ///
 /// The guard matters: without it every call site formatted its arguments into a `String`
@@ -401,6 +426,25 @@ impl OverrideResolver {
             nameservers,
         }
     }
+
+    /// The addresses an override holds for `host`, if it holds any.
+    ///
+    /// The name is folded before the lookup: iroh asks for the fully-qualified
+    /// spelling — every relay hostname it dials ends in a dot — and an override
+    /// stored without the dot would otherwise never be found, and the query
+    /// would fall through to the resolver the override exists to avoid.
+    fn override_for(&self, host: &str) -> Option<&Vec<IpAddr>> {
+        self.overrides.get(&override_key(host))
+    }
+}
+
+/// The key a domain is stored and looked up under.
+///
+/// A name and the same name with a trailing dot are the same name, and DNS
+/// names are case-insensitive, so both are folded away on the way in and on
+/// the way out.
+fn override_key(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_lowercase()
 }
 
 impl fmt::Debug for OverrideResolver {
@@ -417,7 +461,7 @@ impl fmt::Debug for OverrideResolver {
 
 impl Resolver for OverrideResolver {
     fn lookup_ipv4(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv4Addr>, DnsError>> {
-        if let Some(ips) = self.overrides.get(&host) {
+        if let Some(ips) = self.override_for(&host) {
             let ipv4s: Vec<Ipv4Addr> = ips
                 .iter()
                 .filter_map(|ip| match ip {
@@ -450,7 +494,7 @@ impl Resolver for OverrideResolver {
     }
 
     fn lookup_ipv6(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv6Addr>, DnsError>> {
-        if let Some(ips) = self.overrides.get(&host) {
+        if let Some(ips) = self.override_for(&host) {
             let ipv6s: Vec<Ipv6Addr> = ips
                 .iter()
                 .filter_map(|ip| match ip {
@@ -701,7 +745,7 @@ fn set_dns_override(env: &mut Env<'_>, overrides: JString) -> jint {
         }
         let mut parts = entry.splitn(2, '=');
         let domain = match parts.next() {
-            Some(d) => d.trim().to_lowercase(),
+            Some(d) => override_key(d),
             None => continue,
         };
         if domain.is_empty() {
@@ -765,6 +809,43 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetRelayConfig(
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| {
         set_relay_config(env, relay_mode, relay_url, relay_auth_token)
+    })
+}
+
+/// Configure whether this endpoint may use n0's address lookup.
+///
+/// discovery_mode: "n0" (the default — a Node ID is looked up through
+/// dns.iroh.link) or "none" (no lookup at all; a peer then has to bring an
+/// address of its own, which is what a ticket carries).
+///
+/// Must be called before nativeStartIroh.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDiscoveryMode(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    discovery_mode: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        if env.exception_check() {
+            jni_log!("JNI exception pending before nativeSetDiscoveryMode");
+            env.exception_clear();
+            return -1;
+        }
+
+        let mode_str = match discovery_mode.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => {
+                jni_log!("Failed to get discovery_mode string from JNI");
+                return -1;
+            }
+        };
+
+        jni_log!("[DEBUG:jni] nativeSetDiscoveryMode: mode='{mode_str}'");
+
+        if let Ok(mut mode) = DISCOVERY_MODE.lock() {
+            *mode = mode_str;
+        }
+        0
     })
 }
 
@@ -1450,6 +1531,12 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
         return std::ptr::null_mut();
     }
 
+    // The reason left behind by an earlier failure is not the reason for this
+    // one: the caller reads it after a failed start, and a stale one is a
+    // reason for something that did not happen. The attempt below writes its
+    // own.
+    clear_last_error();
+
     let runtime = match get_runtime() {
         Some(r) => r,
         None => return std::ptr::null_mut(),
@@ -1498,6 +1585,10 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             match RelayModeSpec::parse(Some(&cfg_mode), Some(&cfg_url), Some(cfg_token.as_str())) {
                 Ok(spec) => spec.unwrap_or(RelayModeSpec::Pinned),
                 Err(e) => {
+                    // The reason is what the user has to act on, and the log
+                    // line is behind the debug level: without this the app
+                    // says "could not start iroh" and nothing else.
+                    set_last_error(format!("invalid relay configuration: {e}"));
                     jni_log!("[iroh] invalid relay configuration: {e}");
                     return Err(());
                 }
@@ -1510,7 +1601,42 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             );
         }
         jni_log!("[iroh] relay: {}", relay.describe());
-        let builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
+        // Whether this endpoint may ask n0 where a peer is. It is the one piece
+        // of n0's infrastructure a relay setting does not reach, so it gets a
+        // setting of its own.
+        let cfg_discovery = DISCOVERY_MODE.lock().map(|g| g.clone()).unwrap_or_default();
+        // An empty value means nothing has been injected yet, which falls back to "n0" —
+        // the same reading an unset setting gets everywhere else. Only a value that
+        // names a mode wrongly is an error.
+        let discovery = match DiscoveryMode::parse_or_default(&cfg_discovery) {
+            Ok(mode) => mode,
+            Err(e) => {
+                // The reason is what the user has to act on, and the log
+                // line is behind the debug level: without this the app says
+                // "could not start iroh" and nothing else.
+                set_last_error(format!("invalid discovery configuration: {e}"));
+                jni_log!("[iroh] invalid discovery configuration: {e}");
+                return Err(());
+            }
+        };
+        jni_log!("[iroh] discovery: {}", discovery.describe());
+        // Which relay a *peer* may be dialled through. `custom` says this
+        // endpoint uses one relay and no other, and that has to hold for the
+        // peer too — iroh's `relay_mode` only bounds the relay this endpoint
+        // registers with, so a peer naming somebody else's relay would
+        // otherwise be dialled through it. A peer named only by a Node ID is
+        // dialled while the lookup above is on — the Android app names every
+        // peer that way — and refused once the lookup is off.
+        let restriction = relay.dial_restriction(discovery);
+        if let Some(restriction) = &restriction {
+            let covered = restriction.describe();
+            jni_log!("[iroh] peers are dialled through {covered}");
+        }
+        let mut builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
+        builder = discovery.apply(builder);
+        if let Some(restriction) = restriction {
+            builder = builder.hooks(restriction);
+        }
         // Always wrap hickory with OverrideResolver:
         // - For iroh infrastructure domains in DNS_OVERRIDES (dns.iroh.link, *.relay.n0.iroh.link),
         //   return Kotlin's pre-resolved IPs directly, bypassing the GFW's blocking of iroh.link
@@ -1539,10 +1665,17 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
         match tokio::time::timeout(IROH_BIND_TIMEOUT, builder.bind()).await {
             Ok(Ok(ep)) => Ok(ep),
             Ok(Err(e)) => {
+                // The reason the caller shows the user: "could not start iroh"
+                // on its own names nothing they can act on.
+                set_last_error(format!("failed to start the iroh endpoint: {e}"));
                 jni_log!("Failed to start iroh endpoint: {}", e);
                 Err(())
             }
             Err(_) => {
+                set_last_error(format!(
+                    "the iroh endpoint did not start within {}s",
+                    IROH_BIND_TIMEOUT.as_secs()
+                ));
                 jni_log!(
                     "iroh endpoint bind timed out after {}s",
                     IROH_BIND_TIMEOUT.as_secs()
@@ -2003,8 +2136,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
     }
 }
 
-/// How each configured backend is currently reached: one `<endpointId>=<kind>` pair per
-/// backend, joined with `;`, where `kind` is `direct`, `relay` or `unknown`.
+/// How each configured backend is currently reached, and how far away it is: one
+/// `<endpointId>=<kind>/<rttMs>` entry per backend, joined with `;`, where `kind` is `direct`,
+/// `relay` or `unknown` and `rttMs` is the round-trip time in milliseconds, or `-` when iroh has
+/// no sample yet.
 ///
 /// This is the *runtime* answer, read off the paths iroh actually selected — not the relay URL
 /// from the configuration, which only names a relay that may be used. A backend that has never
@@ -2044,20 +2179,20 @@ fn link_kinds(env: &mut Env<'_>) -> jstring {
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.link_kinds().await })
+        runtime.block_on(async move { endpoint_group.link_statuses().await })
     }));
 
-    let kinds = match result {
-        Ok(kinds) => kinds,
+    let statuses = match result {
+        Ok(statuses) => statuses,
         Err(_) => {
             jni_log!("[DEBUG:jni] Panic occurred during nativeLinkKinds");
             return std::ptr::null_mut();
         }
     };
 
-    let encoded = kinds
+    let encoded = statuses
         .iter()
-        .map(|(id, kind)| format!("{}={}", id, kind.as_str()))
+        .map(|(id, status)| crate::connection_pool::encode_link_status(id, status))
         .collect::<Vec<_>>()
         .join(";");
 
@@ -2867,6 +3002,53 @@ fn stop_tun_proxy() -> jint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An override is stored and looked up under the same name, whatever
+    /// spelling either side uses: a name and the same name with a trailing
+    /// dot are the same name, and so is the same name in another case.
+    ///
+    /// The trailing dot is not a corner case: every relay hostname iroh dials
+    /// is fully qualified, and it is iroh that asks the resolver for it.
+    #[test]
+    fn an_override_is_found_however_the_name_is_spelled() {
+        assert_eq!(
+            override_key("APS1-1.relay.n0.iroh.link."),
+            override_key("aps1-1.relay.n0.iroh.link")
+        );
+        assert_eq!(
+            override_key("aps1-1.relay.n0.iroh.link."),
+            "aps1-1.relay.n0.iroh.link"
+        );
+        assert_eq!(override_key(" dns.iroh.link. "), "dns.iroh.link");
+    }
+
+    /// The lookup finds an override that was stored under the name without the
+    /// dot, when the query carries it: iroh asks for the fully-qualified
+    /// spelling, and an override that is not found is an override that does
+    /// not exist.
+    #[test]
+    fn an_override_stored_without_the_dot_is_found_with_it() {
+        let mut overrides: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        overrides.insert(
+            override_key("aps1-1.relay.n0.iroh.link"),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))],
+        );
+        let resolver = OverrideResolver::new(Vec::new(), overrides);
+
+        let qualified = resolver.override_for("aps1-1.relay.n0.iroh.link.");
+        let plain = resolver.override_for("aps1-1.relay.n0.iroh.link");
+        let other = resolver.override_for("other.example.com");
+
+        assert!(
+            qualified.is_some(),
+            "the fully-qualified spelling finds the override"
+        );
+        assert!(plain.is_some(), "the plain spelling finds it too");
+        assert!(
+            other.is_none(),
+            "a name that was never overridden is not overridden"
+        );
+    }
 
     /// A key is the credential for a node that has one: the node stores no
     /// secret at all, so the TOTP path would find nothing to build from and

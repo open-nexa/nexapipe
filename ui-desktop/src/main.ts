@@ -16,11 +16,12 @@
  * Runtime proxy state is deliberately last and not awaited: it needs the backend, and the shell
  * renders `stopped` until the first status arrives.
  */
-import { createApp } from 'vue';
+import { createApp, watch } from 'vue';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import App from './App.vue';
 import router from './router';
-import i18n, { resolveLocale, setI18nLocale } from './i18n';
+import i18n, { currentLocale, resolveLocale, setI18nLocale, translate } from './i18n';
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale } from './stores/prefs';
@@ -105,6 +106,19 @@ function firstFrame(limit: number): Promise<boolean> {
 
 async function showWindow(): Promise<void> {
   try {
+    // A launch the machine asked for comes up in the tray instead: a window
+    // appearing over whatever the user was doing at login is exactly what the
+    // background flag exists to prevent. The backend's own fallback knows the
+    // same thing and does not show it either.
+    //
+    // Unless there is no tray to come up in. The tray is built on a best-effort
+    // basis and can fail — a bare session, a container, a Linux host without a
+    // StatusNotifier — and an app with no window and no tray icon is an app
+    // nobody can reach again.
+    if ((await isBackgroundLaunch()) && (await isTrayAvailable())) {
+      mark('background');
+      return;
+    }
     await getCurrentWindow().show();
     mark('shown');
     // Marked only when a frame really arrived: a start-up that produced none is one the log
@@ -116,6 +130,53 @@ async function showWindow(): Promise<void> {
     console.warn('[window] could not show the window:', error);
   } finally {
     void flushStartupTiming();
+  }
+}
+
+/**
+ * Whether the tray icon exists.
+ *
+ * A failure is a "no": a tray that cannot be reached cannot be come back to,
+ * and the window has to be shown instead.
+ */
+async function isTrayAvailable(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('is_tray_available');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the machine started this app rather than a person.
+ *
+ * True when the start-up entry launched it: the window stays hidden and the app waits in the
+ * tray. The answer is a failure by default — a launch that cannot tell is a launch that shows
+ * its window, which is the ordinary case.
+ */
+async function isBackgroundLaunch(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('is_background_launch');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes the tray menu in the user's language.
+ *
+ * The translations live here and the tray lives in the backend, so the words are handed over
+ * once the locale is known. Best effort: a tray whose menu is in the wrong language is still a
+ * working tray, and the backend keeps English until it hears otherwise.
+ */
+async function setTrayLabels(): Promise<void> {
+  try {
+    await invoke('set_tray_labels', {
+      showLabel: translate('tray.show'),
+      quitLabel: translate('tray.quit'),
+    });
+  } catch (error) {
+    console.debug('[tray] the menu labels could not be set:', error);
   }
 }
 
@@ -140,6 +201,17 @@ async function bootstrap(): Promise<void> {
 
   // The window exists from the start but is not shown until there is something in it.
   void showWindow();
+
+  // The tray menu is written in the user's language, which is only known now.
+  void setTrayLabels();
+
+  // The tray menu is a native menu and not a template, so a language change does
+  // not reach it on its own: the labels have to be written again, or the tray
+  // keeps the language the app started in while everything else has changed.
+  watch(
+    () => currentLocale(),
+    () => void setTrayLabels(),
+  );
 
   // Everything from here on is a projection no first screen renders, so it must not sit between
   // the mount and the paint: the display masks cost two IPC round-trips per configured node.

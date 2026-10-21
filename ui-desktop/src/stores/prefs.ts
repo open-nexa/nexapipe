@@ -13,6 +13,14 @@ export interface Prefs {
   /** Resolved locale tag, e.g. `en` or `zh-CN`. */
   locale: string;
   sidebarCollapsed: boolean;
+  /**
+   * Whether closing the window hides it to the tray instead of ending the app.
+   *
+   * True by default: the app has a tray icon, so the window is one of two ways
+   * into it rather than the only one, and a proxy that stops when the window
+   * closes is not the always-on proxy the setting promises.
+   */
+  minimizeOnClose: boolean;
 }
 
 const STORAGE_KEY = 'nexapipe.prefs';
@@ -21,6 +29,7 @@ const defaultPrefs: Prefs = {
   theme: 'system',
   locale: '',
   sidebarCollapsed: false,
+  minimizeOnClose: true,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -46,6 +55,10 @@ function loadPrefs(): Prefs {
         typeof parsed.sidebarCollapsed === 'boolean'
           ? parsed.sidebarCollapsed
           : defaultPrefs.sidebarCollapsed,
+      minimizeOnClose:
+        typeof parsed.minimizeOnClose === 'boolean'
+          ? parsed.minimizeOnClose
+          : defaultPrefs.minimizeOnClose,
     };
   } catch (error) {
     console.error('[prefs] failed to load:', error);
@@ -80,6 +93,10 @@ export function usePrefsStore() {
     prefs.sidebarCollapsed = collapsed;
   }
 
+  function setMinimizeOnClose(minimize: boolean): void {
+    prefs.minimizeOnClose = minimize;
+  }
+
   function toggleSidebar(): void {
     prefs.sidebarCollapsed = !prefs.sidebarCollapsed;
   }
@@ -89,6 +106,7 @@ export function usePrefsStore() {
     setTheme,
     setLocale,
     setSidebarCollapsed,
+    setMinimizeOnClose,
     toggleSidebar,
   };
 }

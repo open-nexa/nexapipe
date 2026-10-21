@@ -117,9 +117,24 @@ description = "Enables the install_service command without any pre-configured sc
 commands.allow = ["install_service"]
 
 [[permission]]
+identifier = "allow-is-auto-start-enabled"
+description = "Enables the is_auto_start_enabled command without any pre-configured scope."
+commands.allow = ["is_auto_start_enabled"]
+
+[[permission]]
+identifier = "allow-is-background-launch"
+description = "Enables the is_background_launch command without any pre-configured scope."
+commands.allow = ["is_background_launch"]
+
+[[permission]]
 identifier = "allow-is-service-running"
 description = "Enables the is_service_running command without any pre-configured scope."
 commands.allow = ["is_service_running"]
+
+[[permission]]
+identifier = "allow-is-tray-available"
+description = "Enables the is_tray_available command without any pre-configured scope."
+commands.allow = ["is_tray_available"]
 
 [[permission]]
 identifier = "allow-log-startup-timing"
@@ -142,6 +157,11 @@ description = "Enables the put_credential command without any pre-configured sco
 commands.allow = ["put_credential"]
 
 [[permission]]
+identifier = "allow-quit-guard-ready"
+description = "Enables the quit_guard_ready command without any pre-configured scope."
+commands.allow = ["quit_guard_ready"]
+
+[[permission]]
 identifier = "allow-reveal-credential"
 description = "Enables the reveal_credential command without any pre-configured scope."
 commands.allow = ["reveal_credential"]
@@ -150,6 +170,16 @@ commands.allow = ["reveal_credential"]
 identifier = "allow-reveal-node-id"
 description = "Enables the reveal_node_id command without any pre-configured scope."
 commands.allow = ["reveal_node_id"]
+
+[[permission]]
+identifier = "allow-set-auto-start"
+description = "Enables the set_auto_start command without any pre-configured scope."
+commands.allow = ["set_auto_start"]
+
+[[permission]]
+identifier = "allow-set-tray-labels"
+description = "Enables the set_tray_labels command without any pre-configured scope."
+commands.allow = ["set_tray_labels"]
 
 [[permission]]
 identifier = "allow-start-proxy"

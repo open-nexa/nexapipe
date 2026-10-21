@@ -162,6 +162,10 @@ pub struct StartProxyRequest {
     /// Bearer token for a custom relay that requires one.
     #[serde(default)]
     pub relay_auth_token: Option<String>,
+    /// Whether this endpoint may use n0's address lookup. Absent means "n0",
+    /// which is what the endpoint did before the setting existed.
+    #[serde(default)]
+    pub discovery_mode: Option<String>,
 }
 
 /// Largest line [`IPC_SOCKET_PATH`] accepts.

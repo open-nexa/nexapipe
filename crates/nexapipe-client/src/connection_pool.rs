@@ -3,6 +3,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -21,6 +22,11 @@ const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 /// Interval of the background watcher that removes closed/stale connections from the pool.
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+/// How often the round-trip time is re-read.
+///
+/// A second is quick enough for a figure that reads as "now" and slow enough
+/// to be free: iroh keeps the estimate in memory and reading it is a lookup.
+const RTT_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 /// Budget for the connect half of a preconnect.
 ///
 /// Deliberately shorter than [`PRECONNECT_TIMEOUT`]: the caller cancels the whole
@@ -159,6 +165,120 @@ impl LinkKind {
     }
 }
 
+/// How a backend is reached right now, and how long a round trip takes.
+///
+/// The two belong together: the round trip is only meaningful for the path
+/// that is carrying the traffic, and the path can change under the reading —
+/// a direct path that opens replaces a relay one, and with it the latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkStatus {
+    /// Whether traffic goes straight to the peer or through a relay.
+    pub kind: LinkKind,
+    /// The round-trip time of the path carrying the traffic.
+    ///
+    /// `None` means "not measured": a connection that has just opened has no
+    /// sample yet, a closed one has none either, and a path iroh cannot
+    /// measure — a relay that does not report — has none at all. It is not a
+    /// zero, and a UI must not draw it as one.
+    ///
+    /// The reading is also `None` while the path still carries quinn's initial
+    /// guess rather than a measurement — see [`rtt_of`].
+    pub rtt: Option<std::time::Duration>,
+}
+
+impl LinkStatus {
+    /// Reads both halves off a live connection.
+    ///
+    /// A closed connection has no path left to report, so the caller gets
+    /// [`LinkStatus::default`] rather than a stale answer.
+    pub fn of(conn: &Connection) -> Self {
+        let kind = LinkKind::of(conn);
+        if kind == LinkKind::Unknown {
+            return Self::default();
+        }
+        Self {
+            kind,
+            rtt: rtt_of(conn),
+        }
+    }
+}
+
+/// The wire form of one link reading: `<endpoint id>=<kind>/<rtt in ms>`.
+///
+/// The JNI boundary carries the readings in this form and the Kotlin side reads
+/// them back: the id, the kind, and the round trip in whole milliseconds.
+/// `-` stands for a reading with no sample, so that an unmeasured path is not
+/// read as a round trip of zero milliseconds.
+///
+/// A function of its own so that the form is testable without an endpoint:
+/// the Kotlin decoder has its own tests, and the two halves of a contract
+/// that only one side tests can drift apart without anything failing.
+pub fn encode_link_status(id: &EndpointId, status: &LinkStatus) -> String {
+    let rtt = match status.rtt {
+        Some(rtt) => rtt.as_millis().to_string(),
+        None => "-".to_string(),
+    };
+    format!("{}={}/{}", id, status.kind.as_str(), rtt)
+}
+
+/// The round-trip time of the path carrying the traffic, if it can be read.
+///
+/// The selected path is the one the traffic takes, so that is the one whose
+/// latency is worth showing.
+///
+/// Two readings are not measurements, and are reported as `None` rather than
+/// as a number:
+///
+/// - **quinn's guess.** The RTT estimator of a path starts at the transport's
+///   [`INITIAL_RTT`](crate::transport::INITIAL_RTT) and holds it until the
+///   path has something to say. A path selected a moment ago — a direct path
+///   that just won hole punching, a relay path that just became the selected
+///   one — therefore reads as the guess, which is a number nobody measured.
+/// - **anything below a millisecond.** The UI draws whole milliseconds, and a
+///   reading that rounds to zero is drawn as a number nobody made.
+///
+/// The guess is recognised by its value, and quinn leaves it in more than one
+/// way. A path validation measures the round trip of its challenge and puts
+/// that in its place, which is a measurement of its own and is reported as
+/// one; a path opened for the same peer address while another validated path
+/// to that address exists starts from that path's conservative estimate rather
+/// than from the initial RTT — quinn looks for a validated path on the same
+/// network path, so a direct path and a relay path do not seed each other. A
+/// round trip that happens to land exactly on the initial RTT is reported as
+/// no measurement at all.
+fn rtt_of(conn: &Connection) -> Option<std::time::Duration> {
+    let paths = conn.paths();
+    for path in paths.iter() {
+        if path.is_selected() {
+            let rtt = conn.rtt(path.id())?;
+            return measured_rtt(rtt);
+        }
+    }
+    None
+}
+
+/// The round trip of a path, when it is a measurement rather than a guess.
+///
+/// Split out of [`rtt_of`] so that a reading can be taken off a path the
+/// caller names rather than off whichever one is selected now: the two halves
+/// of a reading describe one path, and the selection can move under the
+/// reading.
+fn measured_rtt(rtt: std::time::Duration) -> Option<std::time::Duration> {
+    is_measured_rtt(rtt).then_some(rtt)
+}
+
+/// Whether `rtt` is a measured round-trip time rather than a guess.
+///
+/// Split out from [`rtt_of`] so the rule can be tested without a live
+/// connection: reading it off a connection needs an endpoint, and the rule is
+/// the part that has to be right.
+///
+/// The rule is the value, so it is exact in one direction only: a round trip
+/// that lands exactly on the initial RTT is reported as no measurement.
+fn is_measured_rtt(rtt: std::time::Duration) -> bool {
+    rtt != crate::transport::INITIAL_RTT && rtt >= std::time::Duration::from_millis(1)
+}
+
 struct PooledConnection {
     conn: Connection,
     created_at: std::time::Instant,
@@ -177,16 +297,43 @@ impl PooledConnection {
     }
 }
 
+/// Drops the connections that are closed or idle, closing the idle ones.
+///
+/// A connection that is only dropped stays open as far as QUIC is concerned:
+/// quinn closes a connection when its *last* handle goes away, and the path
+/// watcher still holds one, so the socket and the NAT mapping on both sides
+/// live on — and the watcher keeps reporting a route for a connection the pool
+/// has abandoned.
+///
+/// The idle ones are closed with a reason, so the peer sees a connection that
+/// went away on purpose rather than one that vanished.
+fn drop_stale_connections(connections: &mut Vec<PooledConnection>) {
+    let mut idle = Vec::new();
+    connections.retain(|pooled| {
+        if !pooled.is_live() {
+            return false;
+        }
+        if pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT) {
+            idle.push(pooled.conn.clone());
+            return false;
+        }
+        true
+    });
+    for conn in idle {
+        conn.close(0u32.into(), b"idle");
+    }
+}
+
 #[derive(Clone)]
 pub struct IrohConnectionPool {
     inner: Arc<IrohConnectionPoolInner>,
 }
 
-/// Lock order, observed everywhere: `connections`, then `link_kind`, then
+/// Lock order, observed everywhere: `connections`, then `link_status`, then
 /// `ep` — and never nested.
 ///
 /// Nesting is what makes a pool that dials while another task shuts it down
-/// deadlock-prone: `link_kind` is also taken by the per-connection path
+/// deadlock-prone: `link_status` is also taken by the per-connection path
 /// watcher, and `ep` by every dial, so holding one while waiting for another
 /// turns a slow shutdown into a stall for every request.
 struct IrohConnectionPoolInner {
@@ -221,14 +368,36 @@ struct IrohConnectionPoolInner {
     /// next `nativeStartProxy`/`nativePreconnect` with "Endpoint is closed"
     /// and tear down a running tunnel on proxy restart / reconnect.
     owns_endpoint: bool,
-    /// The last observed [`LinkKind`] for this backend.
+    /// The last observed [`LinkStatus`] for this backend, and the connection it describes.
     ///
     /// A pool hands its connections out to whoever is proxying traffic, so at any moment the
-    /// pool itself may hold none — and a UI asking "direct or relay?" every few seconds must
-    /// not be answered with "unknown" just because a request is in flight. The path watcher
-    /// writes here; [`IrohConnectionPool::link_kind`] reads it whenever no pooled connection
-    /// can be asked directly.
-    link_kind: Mutex<LinkKind>,
+    /// pool itself may hold none — and a UI asking "direct or relay, and how far?" every few
+    /// seconds must not be answered with "unknown" just because a request is in flight. The path
+    /// watcher writes here; [`IrohConnectionPool::link_status`] reads it whenever no pooled
+    /// connection can be asked directly.
+    ///
+    /// The connection is part of the reading because the reading is about it: a status recorded
+    /// for a connection that has since died describes no path at all, and a UI that keeps showing
+    /// it shows a route to a backend it cannot reach.
+    link_status: Mutex<CachedLinkStatus>,
+    /// Which network generation the pool is on.
+    ///
+    /// Moved by [`IrohConnectionPool::drop_connections`], which is what a
+    /// network switch calls. A connection that was out on loan when the
+    /// switch happened is neither in the pool nor closed by the drop, so its
+    /// watcher keeps running — and the reading it would publish is the one
+    /// of the network that is gone. A watcher that notices the generation
+    /// moved stops publishing, and closes the connection on its way out.
+    epoch: AtomicU64,
+}
+
+/// A recorded [`LinkStatus`] and the connection it was recorded for.
+#[derive(Default)]
+struct CachedLinkStatus {
+    /// The connection the status describes, if there is one.
+    conn: Option<Connection>,
+    /// What the path watcher saw on that connection.
+    status: LinkStatus,
 }
 
 impl IrohConnectionPool {
@@ -254,7 +423,8 @@ impl IrohConnectionPool {
             issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: true,
-            link_kind: Mutex::new(LinkKind::Unknown),
+            link_status: Mutex::new(CachedLinkStatus::default()),
+            epoch: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -270,7 +440,8 @@ impl IrohConnectionPool {
             issued: Mutex::new(None),
             auth_required: Mutex::new(None),
             owns_endpoint: false,
-            link_kind: Mutex::new(LinkKind::Unknown),
+            link_status: Mutex::new(CachedLinkStatus::default()),
+            epoch: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
@@ -483,8 +654,7 @@ impl IrohConnectionPool {
 
         // Drop stale connections before handing one out: anything already closed
         // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
-        connections
-            .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
+        drop_stale_connections(&mut connections);
 
         if let Some(pooled) = connections.pop() {
             return Ok(pooled.conn);
@@ -502,25 +672,39 @@ impl IrohConnectionPool {
         Ok(conn)
     }
 
-    /// How traffic to this backend is currently routed.
+    /// How traffic to this backend is currently routed, and how far away it is.
     ///
     /// A pooled connection is asked directly when there is one, because its path list is the
     /// truth right now; otherwise the last value the path watcher recorded is used. Without
     /// that fallback a UI polling while requests are in flight — the pool empty, every
     /// connection out on loan — would read "unknown" and flap.
-    pub async fn link_kind(&self) -> LinkKind {
+    pub async fn link_status(&self) -> LinkStatus {
         let connections = self.inner.connections.lock().await;
         for pooled in connections.iter().rev() {
             if pooled.is_live() {
-                let kind = LinkKind::of(&pooled.conn);
-                if kind != LinkKind::Unknown {
-                    return kind;
+                let status = LinkStatus::of(&pooled.conn);
+                if status.kind != LinkKind::Unknown {
+                    return status;
                 }
             }
         }
         drop(connections);
 
-        *self.inner.link_kind.lock().await
+        // The cached reading describes the connection it was recorded for: one
+        // that has since died describes no path at all, and the UI would keep
+        // showing a route to a backend it cannot reach.
+        let cached = self.inner.link_status.lock().await;
+        match &cached.conn {
+            Some(conn) if conn.close_reason().is_none() => cached.status,
+            _ => LinkStatus::default(),
+        }
+    }
+
+    /// How traffic to this backend is currently routed, without the latency.
+    ///
+    /// The kind on its own, for the callers that only draw an icon.
+    pub async fn link_kind(&self) -> LinkKind {
+        self.link_status().await.kind
     }
 
     /// Ensure at least one live connection to the backend is cached in the
@@ -633,11 +817,27 @@ impl IrohConnectionPool {
         // endpoint's goodbye.
         {
             let mut connections = self.inner.connections.lock().await;
+            // Close before clearing: a connection that is only dropped stays
+            // open, and the path watcher that still holds it keeps writing the
+            // status of a connection this call says is gone — which undoes
+            // the reset below within a second.
+            for pooled in connections.iter() {
+                pooled.conn.close(0u32.into(), b"pool closed");
+            }
             connections.clear();
         }
         // Every connection is gone, so the last observed kind describes nothing any more.
         // Leaving it would let the UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_kind.lock().await = LinkKind::Unknown;
+        //
+        // The generation moves with it, under the same lock: a watcher that
+        // is about to publish takes this lock too, so the two cannot
+        // interleave — a reading of a connection this call says is gone cannot
+        // land after the reading was cleared.
+        {
+            let mut cached = self.inner.link_status.lock().await;
+            self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+            *cached = CachedLinkStatus::default();
+        }
 
         // Only close the endpoint if this pool owns it (created via `new()`).
         // Pools created via `new_with_endpoint()` share a caller-owned endpoint
@@ -681,7 +881,16 @@ impl IrohConnectionPool {
         }
         // Nothing is connected any more, so the last observed kind describes nothing.
         // Leaving it would let a UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_kind.lock().await = LinkKind::Unknown;
+        //
+        // The generation moves with it, under the same lock: a watcher that is
+        // about to publish takes this lock too, so the two cannot interleave —
+        // a reading of the network that is gone cannot land after the reading
+        // was cleared.
+        {
+            let mut cached = self.inner.link_status.lock().await;
+            self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+            *cached = CachedLinkStatus::default();
+        }
     }
 }
 
@@ -729,6 +938,15 @@ fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<Strin
     }
     Some(String::from_utf8_lossy(&close.reason).into_owned())
 }
+/// Whether a watcher that started in `generation` may still publish.
+///
+/// The pool's generation moves when the network changes, and a watcher whose
+/// generation is behind describes a network that is gone: the round trip it
+/// would publish is the one of a path that no longer carries anything.
+fn may_publish(current: u64, generation: u64) -> bool {
+    current == generation
+}
+
 /// Watches one connection's paths and records which kind is carrying traffic.
 ///
 /// The initial snapshot matters: right after the handshake iroh has already selected a path
@@ -736,35 +954,127 @@ fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<Strin
 /// event would leave the answer at [`LinkKind::Unknown`] for as long as the connection stays
 /// on its first path — which, for a backend behind a symmetric NAT, is forever.
 fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
-    let kind = LinkKind::of(&conn);
+    let status = LinkStatus::of(&conn);
+    // The generation this connection belongs to. A watcher that outlives its
+    // generation has a reading that describes a network that is gone, so it
+    // stops publishing when the generation moves.
+    let generation = inner
+        .upgrade()
+        .map(|inner| inner.epoch.load(Ordering::Acquire))
+        .unwrap_or_default();
     // `try_lock`, not `lock`: this runs on the caller's task, and a lock held elsewhere must
     // not stall a connection being handed out. Losing the race only costs one stale reading.
     if let Some(inner) = inner.upgrade()
-        && let Ok(mut slot) = inner.link_kind.try_lock()
+        && let Ok(mut slot) = inner.link_status.try_lock()
     {
-        *slot = kind;
+        *slot = CachedLinkStatus {
+            conn: Some(conn.clone()),
+            status,
+        };
     }
 
     tokio::spawn(async move {
         let mut path_events = conn.path_events();
-        while let Some(event) = path_events.next().await {
-            let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event else {
-                continue;
-            };
+        // The round-trip time moves on its own: iroh re-estimates it from every
+        // acknowledgement, and says nothing when it does. A path event is rare —
+        // the connection may sit on one path for hours — so the latency is
+        // refreshed on a tick instead, or the reading a user sees would be the
+        // one the connection happened to have when it opened.
+        let mut ticker = tokio::time::interval(RTT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = path_events.next() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let iroh::endpoint::PathEvent::Selected { id, remote_addr, .. } = event else {
+                        continue;
+                    };
 
-            let kind = if remote_addr.is_ip() {
-                LinkKind::Direct
-            } else if remote_addr.is_relay() {
-                LinkKind::Relay
-            } else {
-                LinkKind::Unknown
-            };
+                    let kind = if remote_addr.is_ip() {
+                        LinkKind::Direct
+                    } else if remote_addr.is_relay() {
+                        LinkKind::Relay
+                    } else {
+                        LinkKind::Unknown
+                    };
 
-            let Some(inner) = inner.upgrade() else {
-                // Pool dropped; nobody is left to tell.
-                break;
-            };
-            *inner.link_kind.lock().await = kind;
+                    let Some(inner) = inner.upgrade() else {
+                        // Pool dropped; nobody is left to tell.
+                        break;
+                    };
+                    // The pool moved to another network: this connection is
+                    // from the one that is gone, and the reading it would
+                    // publish is that network's — the round trip of a path
+                    // that no longer carries anything. The connection is
+                    // closed on the way out, because the drop could not close
+                    // it — it was out on loan when the drop happened — and a
+                    // closed connection is not pooled again.
+                    //
+                    // The check is under the lock the reading is written
+                    // with, and the drop moves the generation under that
+                    // same lock: so the two cannot interleave, and a reading
+                    // of the network that is gone cannot land after the
+                    // reading was cleared.
+                    let mut cached = inner.link_status.lock().await;
+                    if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
+                        conn.close(0u32.into(), b"network changed");
+                        break;
+                    }
+                    *cached = CachedLinkStatus {
+                        conn: Some(conn.clone()),
+                        status: LinkStatus {
+                            kind,
+                            // The round trip is read off the path the event
+                            // named, not off whichever path is selected at the
+                            // moment of the read: the two halves of a reading
+                            // describe one path, and the selection can move
+                            // between the event and the read.
+                            //
+                            // An unknown kind has no path to measure, which
+                            // is how [`LinkStatus::of`] reads it too.
+                            rtt: if kind == LinkKind::Unknown {
+                                None
+                            } else {
+                                conn.rtt(id).and_then(measured_rtt)
+                            },
+                        },
+                    };
+                }
+                _ = ticker.tick() => {
+                    let Some(inner) = inner.upgrade() else {
+                        // Pool dropped; nobody is left to tell.
+                        break;
+                    };
+                    let status = LinkStatus::of(&conn);
+                    if status.kind == LinkKind::Unknown {
+                        continue;
+                    }
+                    // The pool moved to another network: this connection is
+                    // from the one that is gone, and the reading it would
+                    // publish is that network's — the round trip of a path
+                    // that no longer carries anything. The connection is
+                    // closed on the way out, because the drop could not close
+                    // it — it was out on loan when the drop happened — and a
+                    // closed connection is not pooled again.
+                    //
+                    // The check is under the lock the reading is written
+                    // with, and the drop moves the generation under that
+                    // same lock: so the two cannot interleave, and a reading
+                    // of the network that is gone cannot land after the
+                    // reading was cleared.
+                    let mut cached = inner.link_status.lock().await;
+                    if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
+                        conn.close(0u32.into(), b"network changed");
+                        break;
+                    }
+                    *cached = CachedLinkStatus {
+                        conn: Some(conn.clone()),
+                        status,
+                    };
+                }
+            }
         }
     });
 }
@@ -788,8 +1098,7 @@ fn spawn_cleanup_task(inner: Weak<IrohConnectionPoolInner>) {
             // entries before handing one out, but nothing else ever ran, so a
             // pool that stopped being used kept its connections — and the
             // sockets, and the NAT mappings on both sides — until then.
-            connections
-                .retain(|pooled| pooled.is_live() && !pooled.is_idle_for(CONNECTION_IDLE_TIMEOUT));
+            drop_stale_connections(&mut connections);
             let removed = before - connections.len();
             if removed > 0 {
                 #[cfg(feature = "tracing")]
@@ -832,7 +1141,44 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::LinkKind;
+    use super::{LinkKind, LinkStatus, encode_link_status, is_measured_rtt, may_publish};
+    use std::time::Duration;
+
+    /// A watcher that started before the network changed must not publish: the
+    /// reading it holds is the round trip of the network that is gone.
+    #[test]
+    fn a_watcher_from_an_older_generation_does_not_publish() {
+        assert!(
+            may_publish(3, 3),
+            "the generation the watcher started in may publish"
+        );
+        assert!(
+            !may_publish(4, 3),
+            "a generation that moved on may not publish"
+        );
+    }
+
+    /// quinn's estimator starts every path at the transport's initial RTT and
+    /// replaces it once the path has something to say, so a path that was
+    /// selected a moment ago reads as that guess. It is a number nobody
+    /// measured, and the UI has to be able to say so.
+    #[test]
+    fn quinns_initial_guess_is_not_a_measurement() {
+        // The guess itself is not a measurement.
+        assert!(!is_measured_rtt(crate::transport::INITIAL_RTT));
+        // A reading that differs from the guess is one.
+        assert!(is_measured_rtt(Duration::from_millis(334)));
+        assert!(is_measured_rtt(Duration::from_millis(20)));
+    }
+
+    /// The UI draws whole milliseconds: a reading that would be drawn as zero
+    /// is not a number anybody made either.
+    #[test]
+    fn a_reading_below_a_millisecond_is_not_drawn_as_zero() {
+        assert!(!is_measured_rtt(Duration::from_micros(0)));
+        assert!(!is_measured_rtt(Duration::from_micros(999)));
+        assert!(is_measured_rtt(Duration::from_millis(1)));
+    }
 
     /// The name crosses the JNI and Tauri boundaries, so the two sides can only stay in sync
     /// if `as_str` and `parse` agree — and an unfamiliar spelling must degrade to `Unknown`
@@ -860,5 +1206,43 @@ mod tests {
             serde_json::to_string(&LinkKind::Unknown).unwrap(),
             "\"unknown\""
         );
+    }
+
+    /// A link with no path is nothing at all — not a direct link with no
+    /// latency, which is what a caller would draw as "0 ms".
+    #[test]
+    fn a_link_with_no_path_has_neither_a_kind_nor_a_latency() {
+        let status = LinkStatus::default();
+        assert_eq!(status.kind, LinkKind::Unknown);
+        assert_eq!(status.rtt, None);
+    }
+
+    /// The reading crosses the JNI boundary as `<id>=<kind>/<rtt>`, and the
+    /// Kotlin side reads it back. The form is a contract between the two
+    /// halves, so it is pinned here: the Kotlin decoder has its own tests,
+    /// and a form only one side tests can drift apart without anything
+    /// failing.
+    #[test]
+    fn a_link_reading_carries_the_kind_and_the_round_trip() {
+        let id = iroh::SecretKey::generate().public();
+        let status = LinkStatus {
+            kind: LinkKind::Relay,
+            rtt: Some(Duration::from_millis(15)),
+        };
+
+        assert_eq!(encode_link_status(&id, &status), format!("{}=relay/15", id));
+    }
+
+    /// A reading with no sample says so, rather than saying zero — a zero
+    /// would be drawn as a round trip of no time at all.
+    #[test]
+    fn a_link_reading_without_a_sample_says_so() {
+        let id = iroh::SecretKey::generate().public();
+        let status = LinkStatus {
+            kind: LinkKind::Direct,
+            rtt: None,
+        };
+
+        assert_eq!(encode_link_status(&id, &status), format!("{}=direct/-", id));
     }
 }

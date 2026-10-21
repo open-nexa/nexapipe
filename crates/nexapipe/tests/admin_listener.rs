@@ -431,6 +431,43 @@ async fn clients_are_listed_without_their_secrets() {
     admin.stop();
 }
 
+/// The port ACL is listed with the clients: the management surface is where an
+/// operator looks to find out what a client may reach.
+#[tokio::test]
+async fn the_port_acl_is_listed_with_the_clients() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[auth]\nenabled = true\n\n[auth.clients.alice]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
+         created_at = \"2026-09-29T00:00:00Z\"\nallow_ports = [443, 8443]\n",
+    )
+    .expect("write the config");
+    let path = path.to_string_lossy().into_owned();
+    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let auth = auth.expect("[auth] is present");
+
+    let admin = spawn_admin_with_clients(
+        Vec::new(),
+        false,
+        Some("s3cr3t"),
+        Some(nexapipe::conn::AuthState::new(auth, path)),
+    )
+    .await;
+
+    let reply = admin.get_with("/v1/clients", Some("s3cr3t")).await;
+    assert_eq!(reply.status, 200, "{}", reply.head);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
+    let clients = body["clients"].as_array().expect("a clients array");
+    assert_eq!(
+        clients[0]["allow_ports"],
+        serde_json::json!([443, 8443]),
+        "{body}"
+    );
+
+    admin.stop();
+}
+
 /// `/v1/health` is about the pools, not the routes: it counts what is in
 /// rotation and what is not, read now rather than remembered.
 #[tokio::test]

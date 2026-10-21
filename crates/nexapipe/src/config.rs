@@ -94,6 +94,18 @@ pub struct IrohConfig {
     ///
     /// A [`SecretString`], for the same reason the key above is one.
     pub relay_auth_token: Option<SecretString>,
+    /// Whether this endpoint may use n0's address lookup — the DNS and pkarr
+    /// queries that turn a Node ID into "where do I send QUIC packets".
+    ///
+    /// `"n0"` (the default) keeps it: the endpoint publishes its own address
+    /// there and resolves other endpoints' addresses through it. `"none"`
+    /// switches it off, and nothing this endpoint sends reaches n0's lookup
+    /// service — at the price of a Node ID no longer being enough to reach
+    /// this endpoint: a peer has to bring an address of its own (a ticket).
+    ///
+    /// A value that is present but unknown refuses the start, the same rule
+    /// the relay modes follow.
+    pub discovery: Option<String>,
     pub bind_port: Option<u16>,
     /// Also bind the IPv6 wildcard (`[::]`) on the same port.
     ///
@@ -184,6 +196,7 @@ impl std::fmt::Debug for IrohConfig {
             .field("relay_url", &self.relay_url)
             .field("relay_mode", &self.relay_mode)
             .field("relay_auth_token", &redacted(&self.relay_auth_token))
+            .field("discovery", &self.discovery)
             .field("bind_port", &self.bind_port)
             .field("bind_ipv6", &self.bind_ipv6)
             .field("secret_key", &redacted(&self.secret_key))
@@ -1156,7 +1169,7 @@ impl ProxyConfig {
             // Refused rather than matched loosely: a wildcard without its dot
             // silently covers hosts that merely end in the same letters, so a
             // config using one is a config that routes more than it says.
-            if let Some(why) = crate::routes::host_pattern_error(&host_pattern) {
+            if let Some(why) = crate::routes::pattern_error(&host_pattern) {
                 anyhow::bail!("{label}: host_pattern {why}");
             }
 
@@ -1683,6 +1696,12 @@ pub struct ClientAuthToml {
     /// into the client's [`crate::auth::ClientAcl`] when a connection
     /// authenticates.
     pub allow_hosts: Option<Vec<String>>,
+    /// Ports this client may reach; `None` means every port.
+    ///
+    /// The other half of `allow_hosts`: a host is a name, a port is a service
+    /// on that name, and a client that may have the name does not
+    /// automatically get every service on it.
+    pub allow_ports: Option<Vec<u16>>,
     /// A one-time enrollment token outstanding for this client, written by
     /// `--generate-invite --registration` and cleared by whoever spends it. Not
     /// written back by `save_auth_state`: it belongs to the operator, not to
@@ -1824,11 +1843,23 @@ impl ProxyConfig {
                             // loose one authorizes more than it names: the same
                             // refusal a route's `host_pattern` gets.
                             for host in client_toml.allow_hosts.iter().flatten() {
-                                if let Some(why) = crate::routes::host_pattern_error(host) {
+                                if let Some(why) = crate::routes::pattern_error(host) {
                                     anyhow::bail!(
                                         "[auth.clients.{id}]: allow_hosts entry {host:?} {why}"
                                     );
                                 }
+                            }
+                            // A port of zero is not a port a client can ask
+                            // for: no flow arrives from it and no request names
+                            // it, so an entry that lists it authorizes nothing
+                            // and looks like it authorizes something.
+                            if let Some(ports) = &client_toml.allow_ports
+                                && ports.contains(&0)
+                            {
+                                anyhow::bail!(
+                                    "[auth.clients.{id}]: allow_ports contains port 0; no client \
+                                     ever asks for it, so that entry can never match"
+                                );
                             }
                             // A name in this table is a credential's whole
                             // identity: it is what the device sends, what the
@@ -1914,6 +1945,7 @@ impl ProxyConfig {
                                         .created_at
                                         .unwrap_or_else(crate::auth::config::default_created_at),
                                     allow_hosts: client_toml.allow_hosts,
+                                    allow_ports: client_toml.allow_ports,
                                     pending_enrollment: client_toml.pending_enrollment,
                                     devices,
                                     unnamed_device_allowed: client_toml
@@ -5111,6 +5143,7 @@ pending_enrollment = "TOKEN"
             relay_url: Some("https://relay.example".to_string()),
             relay_mode: Some("custom".to_string()),
             relay_auth_token: Some(SecretString::new("bearer-secret".to_string())),
+            discovery: Some("none".to_string()),
             bind_port: Some(1234),
             bind_ipv6: Some(true),
             secret_key: Some(SecretString::new("ed25519-private-key".to_string())),
@@ -5654,6 +5687,31 @@ allow_hosts = ["*iakl.top"]
         let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
             .expect_err("the pattern has to be refused");
         assert!(err.to_string().contains("label boundary"), "{err}");
+    }
+
+    /// A pattern that folds into the catch-all is not the catch-all: `*..`
+    /// and `[*]` both do. A client that may reach every host — or a route that
+    /// serves every host — because of a spelling nobody meant is the one thing
+    /// the shared rule must not do.
+    #[test]
+    fn a_pattern_that_folds_into_the_catch_all_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[auth]
+
+[auth.clients.device]
+secret = "JBSWY3DPEHPK3PXP"
+allow_hosts = ["*.."]
+"#,
+        )
+        .expect("write the config");
+
+        let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+            .expect_err("the pattern has to be refused");
+        assert!(err.to_string().contains("catch-all"), "{err}");
     }
 
     /// `window` is handed to the TOTP library as a `u8`, so 300 was truncated

@@ -181,6 +181,11 @@ export interface EndpointLink {
   /** The backend's endpoint ID; a ticket resolves to the node it names. */
   endpointId: string;
   link: LinkKind;
+  /**
+   * The round-trip time of the path carrying the traffic, in milliseconds. `null` while iroh has
+   * no sample — which is not a round trip of zero.
+   */
+  rttMs: number | null;
 }
 
 /** How one configured node answered its last probe. Mirrors `NodeHealthStatus` in `src-tauri/src/status.rs`. */

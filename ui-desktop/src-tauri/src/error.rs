@@ -141,6 +141,19 @@ pub mod codes {
     /// host", ...), so it travels as `detail`; the headline stays a single localized line.
     pub const INVITE_PARSE_FAILED: &str = "invite.parse_failed";
 
+    // -- autostart -------------------------------------------------------------------------
+    /// The autostart entry could not be read, so whether it is there is unknown.
+    ///
+    /// Not "off": a switch that claims to be off while the entry is there is
+    /// the same silent lie this whole change is about.
+    pub const AUTOSTART_READ_FAILED: &str = "autostart.read_failed";
+    /// The autostart entry could not be written or removed.
+    pub const AUTOSTART_WRITE_FAILED: &str = "autostart.write_failed";
+    /// The running executable could not be resolved, so there is nothing to point an entry at.
+    pub const AUTOSTART_EXE_PATH: &str = "autostart.exe_path";
+    /// Starting at login is not implemented for this platform.
+    pub const AUTOSTART_UNSUPPORTED_PLATFORM: &str = "autostart.unsupported_platform";
+
     // -- logs -------------------------------------------------------------------------------
     /// The log directory could not be listed.
     pub const LOGS_DIR_UNREADABLE: &str = "logs.dir_unreadable";

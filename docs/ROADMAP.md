@@ -380,8 +380,9 @@ already holds a TOTP secret keeps it. The library API (`Enrollment::with_key`,
 
 The iroh dependency boundaries used to belong on this list — discovery via
 `dns.iroh.link`, far-side n0 relays. They are documented in
-`docs/iroh-boundaries.md` as of v0.3.0, so what remains is the exposure itself,
-not the absence of a description of it.
+`docs/iroh-boundaries.md` as of v0.3.0, and both of them are now settings
+rather than facts: `discovery = "none"` switches the lookup off, and
+`relay_mode = "custom"` refuses to dial a peer through anybody else's relay.
 
 ### 4.6 Client resilience (P1)
 
