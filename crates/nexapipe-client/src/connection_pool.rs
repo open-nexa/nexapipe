@@ -3,6 +3,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -379,6 +380,15 @@ struct IrohConnectionPoolInner {
     /// for a connection that has since died describes no path at all, and a UI that keeps showing
     /// it shows a route to a backend it cannot reach.
     link_status: Mutex<CachedLinkStatus>,
+    /// Which network generation the pool is on.
+    ///
+    /// Moved by [`IrohConnectionPool::drop_connections`], which is what a
+    /// network switch calls. A connection that was out on loan when the
+    /// switch happened is neither in the pool nor closed by the drop, so its
+    /// watcher keeps running — and the reading it would publish is the one
+    /// of the network that is gone. A watcher that notices the generation
+    /// moved stops publishing, and closes the connection on its way out.
+    epoch: AtomicU64,
 }
 
 /// A recorded [`LinkStatus`] and the connection it was recorded for.
@@ -414,6 +424,7 @@ impl IrohConnectionPool {
             auth_required: Mutex::new(None),
             owns_endpoint: true,
             link_status: Mutex::new(CachedLinkStatus::default()),
+            epoch: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -430,6 +441,7 @@ impl IrohConnectionPool {
             auth_required: Mutex::new(None),
             owns_endpoint: false,
             link_status: Mutex::new(CachedLinkStatus::default()),
+            epoch: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
@@ -816,7 +828,16 @@ impl IrohConnectionPool {
         }
         // Every connection is gone, so the last observed kind describes nothing any more.
         // Leaving it would let the UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_status.lock().await = CachedLinkStatus::default();
+        //
+        // The generation moves with it, under the same lock: a watcher that
+        // is about to publish takes this lock too, so the two cannot
+        // interleave — a reading of a connection this call says is gone cannot
+        // land after the reading was cleared.
+        {
+            let mut cached = self.inner.link_status.lock().await;
+            self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+            *cached = CachedLinkStatus::default();
+        }
 
         // Only close the endpoint if this pool owns it (created via `new()`).
         // Pools created via `new_with_endpoint()` share a caller-owned endpoint
@@ -860,7 +881,16 @@ impl IrohConnectionPool {
         }
         // Nothing is connected any more, so the last observed kind describes nothing.
         // Leaving it would let a UI keep showing "direct" for a backend it cannot reach.
-        *self.inner.link_status.lock().await = CachedLinkStatus::default();
+        //
+        // The generation moves with it, under the same lock: a watcher that is
+        // about to publish takes this lock too, so the two cannot interleave —
+        // a reading of the network that is gone cannot land after the reading
+        // was cleared.
+        {
+            let mut cached = self.inner.link_status.lock().await;
+            self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+            *cached = CachedLinkStatus::default();
+        }
     }
 }
 
@@ -908,6 +938,15 @@ fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<Strin
     }
     Some(String::from_utf8_lossy(&close.reason).into_owned())
 }
+/// Whether a watcher that started in `generation` may still publish.
+///
+/// The pool's generation moves when the network changes, and a watcher whose
+/// generation is behind describes a network that is gone: the round trip it
+/// would publish is the one of a path that no longer carries anything.
+fn may_publish(current: u64, generation: u64) -> bool {
+    current == generation
+}
+
 /// Watches one connection's paths and records which kind is carrying traffic.
 ///
 /// The initial snapshot matters: right after the handshake iroh has already selected a path
@@ -916,6 +955,13 @@ fn peer_not_allowed_reason(error: &iroh::endpoint::ConnectError) -> Option<Strin
 /// on its first path — which, for a backend behind a symmetric NAT, is forever.
 fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
     let status = LinkStatus::of(&conn);
+    // The generation this connection belongs to. A watcher that outlives its
+    // generation has a reading that describes a network that is gone, so it
+    // stops publishing when the generation moves.
+    let generation = inner
+        .upgrade()
+        .map(|inner| inner.epoch.load(Ordering::Acquire))
+        .unwrap_or_default();
     // `try_lock`, not `lock`: this runs on the caller's task, and a lock held elsewhere must
     // not stall a connection being handed out. Losing the race only costs one stale reading.
     if let Some(inner) = inner.upgrade()
@@ -958,7 +1004,25 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                         // Pool dropped; nobody is left to tell.
                         break;
                     };
-                    *inner.link_status.lock().await = CachedLinkStatus {
+                    // The pool moved to another network: this connection is
+                    // from the one that is gone, and the reading it would
+                    // publish is that network's — the round trip of a path
+                    // that no longer carries anything. The connection is
+                    // closed on the way out, because the drop could not close
+                    // it — it was out on loan when the drop happened — and a
+                    // closed connection is not pooled again.
+                    //
+                    // The check is under the lock the reading is written
+                    // with, and the drop moves the generation under that
+                    // same lock: so the two cannot interleave, and a reading
+                    // of the network that is gone cannot land after the
+                    // reading was cleared.
+                    let mut cached = inner.link_status.lock().await;
+                    if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
+                        conn.close(0u32.into(), b"network changed");
+                        break;
+                    }
+                    *cached = CachedLinkStatus {
                         conn: Some(conn.clone()),
                         status: LinkStatus {
                             kind,
@@ -987,7 +1051,25 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                     if status.kind == LinkKind::Unknown {
                         continue;
                     }
-                    *inner.link_status.lock().await = CachedLinkStatus {
+                    // The pool moved to another network: this connection is
+                    // from the one that is gone, and the reading it would
+                    // publish is that network's — the round trip of a path
+                    // that no longer carries anything. The connection is
+                    // closed on the way out, because the drop could not close
+                    // it — it was out on loan when the drop happened — and a
+                    // closed connection is not pooled again.
+                    //
+                    // The check is under the lock the reading is written
+                    // with, and the drop moves the generation under that
+                    // same lock: so the two cannot interleave, and a reading
+                    // of the network that is gone cannot land after the
+                    // reading was cleared.
+                    let mut cached = inner.link_status.lock().await;
+                    if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
+                        conn.close(0u32.into(), b"network changed");
+                        break;
+                    }
+                    *cached = CachedLinkStatus {
                         conn: Some(conn.clone()),
                         status,
                     };
@@ -1059,8 +1141,22 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkKind, LinkStatus, encode_link_status, is_measured_rtt};
+    use super::{LinkKind, LinkStatus, encode_link_status, is_measured_rtt, may_publish};
     use std::time::Duration;
+
+    /// A watcher that started before the network changed must not publish: the
+    /// reading it holds is the round trip of the network that is gone.
+    #[test]
+    fn a_watcher_from_an_older_generation_does_not_publish() {
+        assert!(
+            may_publish(3, 3),
+            "the generation the watcher started in may publish"
+        );
+        assert!(
+            !may_publish(4, 3),
+            "a generation that moved on may not publish"
+        );
+    }
 
     /// quinn's estimator starts every path at the transport's initial RTT and
     /// replaces it once the path has something to say, so a path that was
