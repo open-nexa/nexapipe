@@ -298,8 +298,9 @@ already holds a TOTP secret keeps it. The library API (`Enrollment::with_key`,
 - **IPv6 inside the TUN shipped in v0.4.0** — R10, on both clients. An AAAA
   query in the Internet class now gets a real answer, 16 bytes of RDATA out of
   a virtual pool (`crates/nexapipe-client/src/tun_proxy.rs:1324-1340`,
-  `:1472-1475`). Android routes `fd00:10:0:1::/64` into the TUN and always has
-  a pool (`:135-146`, `:430-438`). The desktop is best effort: `configure_ipv6`
+  `:1472-1475`). Android routes the IPv6 half of the block it claims into the
+  TUN and always has a pool (`crates/nexapipe-client/src/virtual_block.rs`).
+  The desktop is best effort: `configure_ipv6`
   has to set the address per platform and may be refused, and when it is, AAAA
   is answered with nothing — which a resolver reads as "use A", not as an
   address no route leads to

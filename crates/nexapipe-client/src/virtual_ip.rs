@@ -6,28 +6,31 @@
 //! recover the destination from the payload: SNI out of a TLS `ClientHello`,
 //! `Host` out of an HTTP request. That only works while the first bytes of a
 //! connection are one of those two things, and it never worked for UDP at all —
-//! a datagram to `10.0.1.3:3478` says nothing about whose traffic it is. A raw
-//! TCP protocol (a database wire protocol, MQTT, a game) has no host name in it
-//! either. And the port was never on the wire, so every flow looked like 443.
+//! a datagram to the legacy proxy address says nothing about whose traffic it
+//! is. A raw TCP protocol (a database wire protocol, MQTT, a game) has no host
+//! name in it either. And the port was never on the wire, so every flow looked
+//! like 443.
 //!
 //! So the DNS answers handed to the application carry a distinct address per
 //! domain instead:
 //!
 //! ```text
-//! dns.example.com   -> 10.0.1.16          (A)
-//! dns.example.com   -> fd00:10:0:1::10    (AAAA)
+//! dns.example.com   -> 198.18.0.16          (A)
+//! dns.example.com   -> fd00:198:18::10      (AAAA)
 //! ```
 //!
-//! The address is inside the TUN route (`10.0.1.0/24`, `fd00:10:0:1::/64`), so
-//! the packets come back to us, and the reverse lookup answers "which domain" —
-//! which is what picks the route on the server. The port is then carried by the
-//! flow's own packet rather than guessed.
+//! The address is inside the TUN route — the block the tunnel claims, and the
+//! IPv6 half that follows it — so the packets come back to us, and the reverse
+//! lookup answers "which domain" — which is what picks the route on the
+//! server. The port is then carried by the flow's own packet rather than
+//! guessed.
 //!
 //! # The address range
 //!
-//! IPv4: `.16` … `.254`. The addresses below `.16` belong to the Kotlin side of
-//! the VPN: `.1` is the TUN interface, `.2` the DNS server the system resolver
-//! points at, `.3` the legacy virtual proxy address.
+//! IPv4: `.16` … `.254` of the block in use. The addresses below `.16` belong
+//! to the Kotlin side of the VPN: `.1` is the TUN interface, `.2` the DNS server
+//! the system resolver points at, `.3` the legacy virtual proxy address. The
+//! block itself is the host's decision — see [`crate::virtual_block`].
 //!
 //! IPv6: `::10` … `::fffe` in the block the TUN holds, with `::1` left to the
 //! interface for the same reason. `::10` is the sixteenth address, the same one
@@ -50,10 +53,18 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 /// First address handed out.
-const VIRTUAL_IP_FIRST: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 16);
+///
+/// Derived from the block in use rather than written down: the pool has to be
+/// inside the block the tunnel claims, and the block is the host's decision.
+/// See [`crate::virtual_block`].
+fn virtual_ip_first() -> Ipv4Addr {
+    crate::virtual_block::pool_first()
+}
 
-/// Last address handed out — the top of `10.0.1.0/24`.
-const VIRTUAL_IP_LAST: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 254);
+/// Last address handed out — the top of the block in use.
+fn virtual_ip_last() -> Ipv4Addr {
+    crate::virtual_block::pool_last()
+}
 
 /// Size of the address pool (`.16` … `.254` inclusive).
 pub const VIRTUAL_IP_COUNT: usize = 239;
@@ -199,10 +210,10 @@ impl Default for IpMapping {
 }
 
 impl IpMapping {
-    /// The Android layout: `10.0.1.16` … `10.0.1.254` (see the module docs),
+    /// The pool of the block in use: `.16` … `.254` (see the module docs),
     /// with no IPv6 pool until one is added by [`Self::with_ipv6`].
     pub fn new() -> Self {
-        Self::with_range(VIRTUAL_IP_FIRST, VIRTUAL_IP_LAST)
+        Self::with_range(virtual_ip_first(), virtual_ip_last())
     }
 
     /// A pool between `first` and `last` (inclusive).
@@ -351,15 +362,24 @@ mod tests {
 
     #[test]
     fn every_address_stays_inside_the_tun_route() {
-        // The VPN installs exactly one route (10.0.1.0/24). An address outside
-        // it would be sent to the physical network instead of to us, so the
-        // whole pool has to be inside it.
+        // The VPN installs exactly one route — the block in use. An address
+        // outside it would be sent to the physical network instead of to us,
+        // so the whole pool has to be inside it.
+        //
+        // The lock is the block's own: it is process-wide, and another test
+        // that changes it would otherwise be read here.
+        let _guard = crate::virtual_block::test_lock();
+        let block = crate::virtual_block::current().octets();
         let mapping = IpMapping::new();
         let mut seen = HashSet::new();
         for i in 0..VIRTUAL_IP_COUNT {
             let ip = mapping.allocate(&format!("host{i}.test"));
             let octets = ip.octets();
-            assert_eq!(&octets[..3], &[10, 0, 1], "{ip} is outside 10.0.1.0/24");
+            assert_eq!(
+                &octets[..3],
+                &block[..3],
+                "{ip} is outside the block in use"
+            );
             assert!(
                 (16..=254).contains(&octets[3]),
                 "{ip} does not belong to the pool"

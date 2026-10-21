@@ -2638,6 +2638,99 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 }
 
 // ============================================================
+// The virtual block — the addresses the tunnel claims
+// ============================================================
+
+/// The blocks the tunnel may claim, comma-separated: `198.18.0.0,198.19.0.0,…`.
+///
+/// The list lives in the client library so both clients walk the same one: the
+/// desktop walks it to find a block the host will let it bind, and Android
+/// walks it to find a block the network the phone is on will let it claim.
+/// Two lists would drift, and a drift here is a tunnel whose two halves claim
+/// different addresses.
+///
+/// Returns null when the answer could not be built, which Kotlin reads as "no
+/// list" rather than as an empty one.
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeVirtualBlockCandidates(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        let list = crate::virtual_block::TUN_BASE_CANDIDATES
+            .iter()
+            .map(|base| base.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        jni_log!("[DEBUG:jni] nativeVirtualBlockCandidates: {list}");
+        match env.new_string(list) {
+            Ok(encoded) => encoded.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Sets the block the tunnel claims and reports the addresses inside it.
+///
+/// `base` is the block's network address (`198.18.0.0`). The answer is a
+/// `key=value;key=value` list — the shape the other answers in this file use —
+/// naming the block, the interface address, the DNS server, the legacy proxy
+/// address and the IPv6 half:
+///
+/// ```text
+/// base=198.18.0.0;network=198.18.0.0/24;interface=198.18.0.1;dns=198.18.0.2;proxy=198.18.0.3;ipv6=fd00:198:18:0::;ipv6Interface=fd00:198:18:0::1
+/// ```
+///
+/// Kotlin configures the VPN's addresses and routes from it, and the Rust side
+/// hands out the per-domain addresses from the same block, so the two cannot
+/// disagree about which addresses the tunnel claims — a disagreement being a
+/// tunnel that comes up and carries nothing.
+///
+/// A `base` that is not an address is ignored rather than fatal: the block is
+/// the caller's decision, and a caller that got it wrong is answered with the
+/// block that is actually in use, which is the answer it needs either way.
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeVirtualBlock(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    base: JString,
+) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        virtual_block(env, base)
+    })
+}
+
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
+fn virtual_block(env: &mut Env<'_>, base: JString) -> jstring {
+    if env.exception_check() {
+        jni_log!("JNI exception pending before nativeVirtualBlock");
+        env.exception_clear();
+        return std::ptr::null_mut();
+    }
+
+    match base.try_to_string(env) {
+        Ok(text) => match text.trim().parse::<Ipv4Addr>() {
+            Ok(address) => crate::virtual_block::set(address),
+            Err(e) => jni_log!("[WARN:jni] nativeVirtualBlock: '{text}' is not an address: {e}"),
+        },
+        Err(e) => {
+            jni_log!("[WARN:jni] nativeVirtualBlock: could not read the block: {e}");
+            return std::ptr::null_mut();
+        }
+    }
+
+    let encoded = crate::virtual_block::encoded();
+    jni_log!("[DEBUG:jni] nativeVirtualBlock: {encoded}");
+
+    match env.new_string(encoded) {
+        Ok(encoded) => encoded.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ============================================================
 // TUN proxy (smoltcp user-space TCP/IP stack) — Android tun-proxy feature only
 // ============================================================
 
