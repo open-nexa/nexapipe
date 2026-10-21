@@ -300,26 +300,31 @@ much variance there was, and here there is very little.
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
 | `tun_pump/dns_query` | 174 ns | 172 ns | **174 ns** | A DNS query answered from the virtual address pool is **fast**. The cache path is not a problem |
-| `tun_pump/ip_mapping` | 2,217 ns | 2,226 ns | **2,274 ns** | **A hotspot.** 30% of the whole per-packet path, for what should be a hash lookup |
+| `tun_pump/ip_mapping` | 2,217 ns | 2,226 ns | **2,274 ns** | **A hotspot.** The mapping's whole job — an allocation and a reverse lookup — measured against the 7,348 ns per-packet path, for what should be a hash lookup |
 | `tun_pump/tun_packet` | 7,308 ns | 7,244 ns | **7,348 ns** | The whole TUN path: a packet in, an answer out. The per-packet cost on the platform with the least headroom |
-| `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | The L4 copy loop plus flow setup. **The copy loop itself is not the problem** |
-| `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | End-to-end through the local proxy and a real iroh connection. A fixed cost per connection, not a rate |
+| `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | One 64 KiB payload's round trip through the copy loop. **The copy loop itself is not the problem** |
+| `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | The same 64 KiB over an established tunnel, through the local proxy and a real iroh connection. The rate it moves at, not the cost of opening it |
 
 #### What the numbers say, and what they do not
 
 Two things are worth writing down, because "we measured and it is already fast
 enough" is a result only when it is specific about *which* part.
 
-**The copy loops are fine.** `l4_forward` at 42 µs is a flow's whole life —
-setup, handshake, copy, teardown — and the copy itself is a fraction of it.
+**The copy loops are fine.** `l4_forward` at 42 µs is one 64 KiB payload's
+round trip through the copy loop — the flow is established before the clock
+starts, so the copy is all that is measured, and 64 KiB through it takes 42 µs.
 The hot loop is a `read` → `write_all` → `fetch_add` with a reused buffer. The
 candidate list's first item ("buffer sizes in the copy loops") is the one the
 numbers do **not** support, and it would have been the wrong first move.
 
 **The per-packet path on a phone is where the work is.** `tun_packet` at 7.3 µs
 is the number that decides how much battery the tunnel costs, and
-`ip_mapping` at 2.3 µs is 30% of it. That is a hash lookup that clones a
-`String` and writes to a second `HashMap` on every packet.
+`ip_mapping` at 2.3 µs is 30% of it. That bench measures the mapping's whole
+job — an address allocation *and* a reverse lookup — and the allocation is the
+expensive half of it: the bench holds more names than the pool has addresses,
+so every allocation takes the eviction path, which a steady-state packet does
+not. Only the reverse lookup runs on every packet, and it is a `String` clone
+and a write to a second `HashMap`.
 
 **What the numbers do not cover**, and therefore what is still an expectation
 rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
@@ -337,10 +342,10 @@ of its four items are now confirmed, one is refuted, and the list has grown
 items the numbers pointed at.
 
 1. **Buffer sizes in the copy loops.** **Refuted by `l4_forward`.** The copy
-   loop is not where the time is. Left alone.
+   loop moves 64 KiB in 42 µs, so it is not where the time is. Left alone.
 2. **Allocation on the per-packet path.** **Confirmed, and quantified**:
-   `ip_mapping` at 2.3 µs is 30% of `tun_packet`, and the reason is a `String`
-   clone plus a second `HashMap` write per packet.
+   `ip_mapping` at 2.3 µs is 30% of `tun_packet`, and the part of it that runs
+   per packet is a `String` clone plus a second `HashMap` write.
 3. **`hyper-util` feature flags.** Not measured, and not a throughput item —
    it stays a size lever (S1/S2).
 4. **Nothing else.** **No longer true.** The numbers, and a reading of the
@@ -371,7 +376,7 @@ not a stated goal.
 | Android APK size | 16.5 MB unminified debug, release never shrunk | measured on the release artifact, and substantially under today's |
 | Android `.so` size | never measured; unstripped | measured, stripped, with a `-g` artifact kept |
 | Size regressions | invisible | reported on every PR; failing the build only after a clean release |
-| Throughput / latency | three benches in CI, and a result written down on 2026-10-21: one documented hotspot (`ip_mapping`, 2.3 µs, 30% of the per-packet path), one documented decision that there is not one (the copy loops), and the gaps the numbers do not cover listed in F1 | F2's list checked against the numbers, and the gaps closed by benches that do not exist yet |
+| Throughput / latency | three benches in CI, and a result written down on 2026-10-21: one documented hotspot (`ip_mapping`, 2.3 µs, measured against the 7.3 µs per-packet path), one documented decision that there is not one (the copy loops), and the gaps the numbers do not cover listed in F1 | F2's list checked against the numbers, and the gaps closed by benches that do not exist yet |
 
 The last row is the one that matters. A roadmap that only ever adds benchmarks
 is a plan to feel better without knowing anything. **"We measured and it is
@@ -399,7 +404,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 | Nothing in CI measures size | no `size`/`bytes`/`MiB` in `release.yml`; the 16 jobs in `ci.yml:55-628` plus `codeql.yml`, `pages.yml` and `dependency-report.yml` all do something else |
 | Benchmarks exist (as of 2026-10-21) | `crates/nexapipe/benches/l4_forward.rs`, `crates/nexapipe-client/benches/tun_pump.rs`, `crates/nexapipe-client/benches/forwarding_path.rs`; `criterion` in `Cargo.lock`; the `bench` job in `ci.yml` |
 | The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source |
-| `ip_mapping` is 30% of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns |
+| `ip_mapping` is a third of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns — the first bench measures an allocation and a reverse lookup, and only the lookup runs on every packet |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |
 | The local bundle is stale | `ui-desktop/src-tauri/target/release/bundle/dmg/nexa_0.1.0_aarch64.dmg` (dated 2026-10-07, 22 MB) against `version = "0.6.0"` |

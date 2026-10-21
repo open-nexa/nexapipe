@@ -19,10 +19,10 @@ rather than a result — the reasoning behind that is in
 | Bench | slope | The one-line reading |
 |---|---|---|
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
-| `tun_pump/ip_mapping` | **2,274 ns** | **a hotspot**: 30% of the per-packet path, for what should be a hash lookup |
+| `tun_pump/ip_mapping` | **2,274 ns** | **a hotspot**: the mapping's whole job, measured against the 7,348 ns per-packet path |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
-| `l4_forward/tcp_flow` | 42,059 ns | the copy loop is not where the time is |
-| `forwarding_path/connect_tunnel` | 834,955 ns | a fixed cost per connection, not a rate |
+| `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
+| `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
 
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
@@ -100,7 +100,9 @@ and the tests cover what it does.
 
 **`forwarding_path`** is the only bench that reflects what a user experiences:
 the request crosses the proxy's accept loop, the tunnel handshake, the tunnel
-itself and the copy loop on the way back. The far side is an iroh endpoint on
+itself and the copy loop on the way back. As with `l4_forward`, the tunnel is
+established before the clock starts, so the number is about the traffic over
+it rather than the price of opening it. The far side is an iroh endpoint on
 the same host that speaks the L4 framing and echoes.
 
 ## What this is not
