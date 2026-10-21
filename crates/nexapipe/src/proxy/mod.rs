@@ -609,6 +609,9 @@ pub async fn run_proxy(
         let clients_clone = clients.clone();
         let shutdown_signal_clone = shutdown_signal.clone();
         let in_flight_clone = in_flight.clone();
+        // The same limiters the tunnel counts against: one process, one
+        // ceiling, whatever the connection arrived on.
+        let limiters_clone = limiters.clone();
 
         http_server = Some(tokio::spawn(async move {
             if let Err(e) = start_http_server(
@@ -617,6 +620,7 @@ pub async fn run_proxy(
                 clients_clone,
                 shutdown_signal_clone,
                 in_flight_clone,
+                limiters_clone,
             )
             .await
             {
@@ -714,6 +718,7 @@ async fn start_http_server(
     clients: Arc<BackendClients>,
     shutdown_signal: Arc<ShutdownSignal>,
     in_flight: Arc<InFlight>,
+    limiters: conn::limits::Limiters,
 ) -> anyhow::Result<()> {
     // Refusals since the last accepted connection. A listener that has run out
     // of file descriptors fails again the moment it is asked, so without a
@@ -745,6 +750,29 @@ async fn start_http_server(
                 };
                 tracing::debug!("New connection on the plaintext listener from: {}", addr);
 
+                // One process-wide slot per connection, taken as soon as the
+                // connection is accepted.
+                //
+                // The per-peer cap cannot apply here: a plain TCP connection has
+                // no `EndpointId`, and a cap keyed on the source address would
+                // be a different design — NAT puts many clients behind one
+                // address, and IPv6 hands a client an address of its own.
+                //
+                // The refusal is a close and nothing else. A listener that is
+                // over its ceiling has nobody to send a status to, and writing
+                // one would be work for a connection that is about to go.
+                let Some(slot) = limiters.connections.try_acquire_global() else {
+                    let limiter = &limiters.connections;
+                    tracing::warn!(
+                        "Refusing a connection on the plaintext listener from {addr}, the server is \
+                         at {} of {} concurrent connections",
+                        limiter.total(),
+                        limiter.max_global()
+                    );
+                    drop(stream);
+                    continue;
+                };
+
                 let config_clone = config.clone();
                 let clients_clone = clients.clone();
                 let remote_addr_str = addr.to_string();
@@ -755,6 +783,10 @@ async fn start_http_server(
                 let guard = in_flight_clone.enter();
 
                 tokio::spawn(async move {
+                    // The slot is held for as long as the connection is served,
+                    // and given back by the guard's Drop however this task
+                    // ends — the same way the in-flight count is.
+                    let _slot = slot;
                     let _connection = guard;
                     // One budget for the whole exchange, taken when the
                     // connection is accepted: the wait to tell a TLS session
