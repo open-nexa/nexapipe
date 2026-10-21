@@ -853,7 +853,7 @@ feature behind it.
 
 | ID | Deliverable | Notes |
 |---|---|---|
-| S1 | **Size and benchmark reporting in CI** | A `size-report` job recording every shipped artifact — server archives per target, desktop bundles, both APKs, the `.so` per ABI, `dist` — with `cargo bloat` attribution beside it, plus criterion baselines for the L4 forward, the TUN pump and the end-to-end forwarding path. Nothing is optimized until this lands: the desktop alone is an unknown, because `ui-desktop/src-tauri` is excluded from the root workspace and therefore builds with cargo's default profile, where `opt-level = 3`, LTO and `strip` are set. Full detail and the reasoning behind the ordering is in [`size-perf-roadmap.md`](size-perf-roadmap.md) |
+| S1 | **Size and benchmark reporting in CI** | *The benchmark half has landed:* three criterion benches — the L4 forward, the TUN pump and the end-to-end forwarding path — run in CI on the same runners as the tests, with what each one measures written down in [`benchmarks.md`](benchmarks.md). The size-report half is still to do: a job recording every shipped artifact — server archives per target, desktop bundles, both APKs, the `.so` per ABI, `dist` — with `cargo bloat` attribution beside it. Nothing is optimized until this lands: the desktop alone is an unknown, because `ui-desktop/src-tauri` is excluded from the root workspace and therefore builds with cargo's default profile, where `opt-level = 3`, LTO and `strip` are set. Full detail and the reasoning behind the ordering is in [`size-perf-roadmap.md`](size-perf-roadmap.md) |
 
 S2 (the desktop release profile), S3 (Android R8) and F2 (optimizing whatever
 the benchmarks find) all follow this, and deliberately not in the same release:

@@ -146,6 +146,49 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked
 
+  # The benchmarks. They exist so that a performance claim in this repository
+  # is a measurement rather than an expectation — see docs/benchmarks.md.
+  #
+  # They run on the same runner as the tests, so that two runs can be compared
+  # with each other. Nothing here fails the build when a number gets worse: a
+  # number that gates a build before anyone trusts it gets deleted, and the
+  # budget that would gate it belongs to whoever has run these enough times to
+  # know what normal variance looks like.
+  bench:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    # 45 like the other jobs, but this one links the whole tree with LTO
+    # before it measures anything, which is the slowest step in it.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: bench
+      # The client's benches are behind its `tun-proxy` feature, which is also
+      # what `local-proxy` needs; without it cargo skips those two targets
+      # rather than failing, which would quietly leave them unmeasured.
+      #
+      # No `-- --noplot` here: the crates turn their default harness off
+      # (`bench = false`), so the arguments after `--` reach criterion alone —
+      # but `--noplot` would leave the artifact below empty. Criterion's own
+      # plotting is left at its default: gnuplot is not on the runner, so it
+      # falls back to the HTML report, which is what the artifact is for.
+      - name: cargo bench
+        run: cargo bench --workspace --features nexapipe-client/tun-proxy --locked
+      - name: Upload the criterion report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
+        with:
+          name: criterion-report
+          # upload-artifact paths are relative to the workspace root and ignore defaults.run.
+          path: target/criterion
+          if-no-files-found: ignore
+
   # The root workspace's only Windows coverage. release.yml does build Windows
   # binaries, but only from a tag, so this is what tells a PR that the crates
   # still work there — and `cargo test` is what tells it: the integration tests
@@ -169,7 +212,8 @@ jobs:
       # The same command the Linux and macOS runners run, so the three agree on
       # what "the tests pass" means. `--all-targets` is gone because `cargo
       # test` already compiles the test targets that used to be the reason for
-      # it; there is no bench target in this workspace to add back.
+      # it; the bench targets are compiled by the clippy job and measured by
+      # the bench job, neither of which is a test.
       - name: cargo test
         run: cargo test --workspace --locked
 

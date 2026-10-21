@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Fifteen things land in this cycle so far: the device credential can be a **key**
+Sixteen things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -34,8 +34,9 @@ after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
 the configuration instead of inside it, the desktop says what it does to the
 machine's DNS instead of deciding for itself, the access log says what a
-tunnelled flow was instead of only what the tunnel did with it, and an app that
-is not written in Rust can configure a client through the UniFFI surface.
+tunnelled flow was instead of only what the tunnel did with it, an app that
+is not written in Rust can configure a client through the UniFFI surface, and
+the paths that carry the traffic can be measured instead of assumed.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -79,6 +80,18 @@ lookup, which is what a config written before the key existed does.
   the outcome of the tunnel rather than the answer of the origin behind it. A
   flow that says nothing recognizable gets no field rather than a guess, and a
   query string in a sniffed target is redacted like any other.
+- **There are benchmarks.** Three of them, on the paths that carry user
+  traffic: the L4 copy loop, the TUN's per-packet cost (the DNS path, the
+  virtual-address bookkeeping, and the whole path with a packet in and an
+  answer out), and the end-to-end forwarding path through the local proxy.
+  None of them needs a network — the backends are loopback echoes, the TUN
+  device is a duplex pair standing in for the fd, and the two iroh endpoints
+  the forwarding path needs talk to each other over the loopback interface —
+  and they run in CI on the same runners as the tests, so two runs can be
+  compared with each other. Nothing fails the build when a number gets
+  worse: a number that gates a build before anyone trusts it gets deleted.
+  What each bench measures, and what it deliberately does not, is written down
+  in [`docs/benchmarks.md`](docs/benchmarks.md).
 - **The latency of the tunnel, on both clients.** A client already reported
   *how* traffic reaches a backend — directly or through a relay — and now
   reports how far away that path is as well: the round-trip time iroh
