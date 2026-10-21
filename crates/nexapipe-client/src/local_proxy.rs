@@ -1757,18 +1757,21 @@ pub(crate) fn report_domain_patterns(patterns: &[String]) {
 /// The Android build installs the `log` logger at `Info` and no tracing
 /// subscriber, so a `Debug` line never reaches the log and a `tracing` line
 /// goes nowhere.
+///
+/// Crate-wide rather than private to this module: the TUN stack has warnings
+/// of its own, and there is no reason for two of them.
 #[cfg(feature = "jni")]
-fn warn(message: &str) {
+pub(crate) fn warn(message: &str) {
     crate::jni::warn_log(message);
 }
 
 #[cfg(all(not(feature = "jni"), feature = "tracing"))]
-fn warn(message: &str) {
+pub(crate) fn warn(message: &str) {
     tracing::warn!("{message}");
 }
 
 #[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
-fn warn(_message: &str) {}
+pub(crate) fn warn(_message: &str) {}
 
 /// A line of information the user can read, on the same terms as [`warn`].
 #[cfg(feature = "jni")]

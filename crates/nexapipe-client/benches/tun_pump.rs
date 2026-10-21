@@ -178,6 +178,7 @@ fn tun_pump(c: &mut Criterion) {
                         dns_ip: DNS_IP,
                         legacy_proxy_ip: None,
                         ip_mapping: mapping,
+                        tcp_window: None,
                     },
                 )
                 .expect("the TUN proxy starts on a duplex pair");
