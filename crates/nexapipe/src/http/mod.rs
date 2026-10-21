@@ -1877,6 +1877,38 @@ pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, 
     Ok(builder.body(body)?)
 }
 
+/// Whether the request names more than one host.
+///
+/// RFC 9110 §7.2: *"A server MUST respond with a 400 (Bad Request) status code
+/// to any HTTP/1.1 request message that contains more than one Host header
+/// field."*
+///
+/// This is not pedantry. A request with two `Host` headers is a request whose
+/// destination is ambiguous, and the two halves of this proxy used to resolve
+/// that ambiguity differently: the route and the access check read the **first**
+/// one, and the backend was handed **both**. A client that was allowed for
+/// `allowed.example.com` could therefore send that name first and a second
+/// name behind it, and a backend that picks the last one would serve the
+/// second name's vhost to a request that was authorised for the first.
+///
+/// Neither of the two listeners this server has can lean on its HTTP parser to
+/// catch it: the plaintext one uses hyper, which accepts two `Host` headers
+/// and passes them both on, and the tunnel one parses the head by hand. So
+/// both check here, and both answer 400.
+pub fn names_more_than_one_host(headers: &::http::HeaderMap) -> bool {
+    headers.get_all("host").iter().count() > 1
+}
+
+/// The request as it arrived, parsed out of the bytes.
+///
+/// The head only, because the body is read separately and this is the only
+/// place the head exists as bytes.
+///
+/// A request that names more than one host is refused here rather than
+/// downstream: the route and the access check read the first `Host` header,
+/// and the backend would be handed all of them, so the request that is
+/// authorised and the request that is served would be two different requests.
+/// See [`names_more_than_one_host`].
 pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Error> {
     let request_str = String::from_utf8_lossy(buf);
     let mut lines = request_str.split("\r\n");
@@ -1895,13 +1927,23 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
     let uri = http::Uri::try_from(parts[1]).map_err(|e| anyhow::anyhow!("invalid URI: {}", e))?;
 
     let mut builder = Request::builder().method(method).uri(uri);
+    let mut hosts = 0usize;
 
     for line in lines {
         if line.is_empty() {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
-            builder = builder.header(name.trim(), value.trim());
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("host") {
+                hosts += 1;
+                if hosts > 1 {
+                    return Err(anyhow::anyhow!(
+                        "the request carries more than one Host header"
+                    ));
+                }
+            }
+            builder = builder.header(name, value.trim());
         }
     }
 
@@ -1912,6 +1954,54 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
 mod tests {
     use super::*;
     use crate::deadline::Deadlines;
+
+    /// A request that names more than one host is refused.
+    ///
+    /// The route and the access check read the **first** `Host` header and the
+    /// backend was handed **all** of them, so a request that was authorised for
+    /// one host could be served as another. RFC 9110 §7.2 asks for a 400.
+    #[test]
+    fn a_request_with_more_than_one_host_is_refused() {
+        let head = b"GET /x HTTP/1.1\r\nHost: allowed.example\r\nHost: internal.example\r\n\r\n";
+        let err = parse_http_request_legacy(head).expect_err("two hosts are not one host");
+        assert!(
+            err.to_string().contains("more than one Host"),
+            "the refusal does not say why: {err}"
+        );
+    }
+
+    /// One host is one host.
+    #[test]
+    fn a_request_with_one_host_is_accepted() {
+        let head = b"GET /x HTTP/1.1\r\nHost: allowed.example\r\n\r\n";
+        let request = parse_http_request_legacy(head).expect("one host is fine");
+        assert_eq!(request.headers().get("host").unwrap(), "allowed.example");
+    }
+
+    /// The check the plaintext listener uses, on the headers hyper hands it.
+    ///
+    /// hyper accepts two `Host` headers and passes both on, so the plaintext
+    /// path has to make this check itself.
+    #[test]
+    fn the_host_count_is_seen_in_the_headers() {
+        let mut headers = ::http::HeaderMap::new();
+        assert!(
+            !names_more_than_one_host(&headers),
+            "no host is not two hosts"
+        );
+
+        headers.append("host", "a.example".parse().unwrap());
+        assert!(
+            !names_more_than_one_host(&headers),
+            "one host is not two hosts"
+        );
+
+        headers.append("host", "b.example".parse().unwrap());
+        assert!(
+            names_more_than_one_host(&headers),
+            "two hosts are two hosts"
+        );
+    }
 
     /// A body of `len` bytes, which is what the limit has to be checked against.
     fn body_of(len: usize) -> Full<bytes::Bytes> {

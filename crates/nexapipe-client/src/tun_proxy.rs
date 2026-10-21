@@ -1120,9 +1120,25 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
     // No idle timeout on top of that, unlike the UDP flows: a TCP connection
     // may legitimately sit quiet for minutes, and only the applications at
     // either end can say when it is finished.
+    //
+    // **Both halves, not whichever ends first.** A TCP half-close is a
+    // request, not an ending: an application that writes its request and then
+    // shuts down its write side is saying "I am done sending", and the
+    // backend's reply still has to arrive. Racing the two halves and dropping
+    // the loser cut that reply off — the FIN above was propagated correctly
+    // and then the select ended the flow before the reply could come back.
+    //
+    // The total bound is the one the copy loop was always meant to have:
+    // `STREAM_SECS`, an hour. It matches the server's own `l4_flow` default,
+    // so the two ends of the tunnel give up at about the same moment, and it
+    // is what keeps a half-closed flow from holding its resources for the
+    // life of the process.
+    let stream_budget = crate::deadline::Deadlines::default().stream;
+    let both_halves = async {
+        tokio::join!(app_to_tunnel, tunnel_to_app);
+    };
     tokio::select! {
-        _ = app_to_tunnel => (),
-        _ = tunnel_to_app => (),
+        _ = both_halves => (),
         _ = async {
             while !ctx.stopped.load(Ordering::Acquire) {
                 tokio::time::sleep(STOP_POLL_INTERVAL).await;
@@ -1133,6 +1149,14 @@ async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, 
         // It lands here rather than anywhere else because this select is the
         // only thing that owns both halves.
         _ = flow.cancelled() => (),
+        _ = tokio::time::sleep(stream_budget) => {
+            jni_log!(
+                "[tun-proxy] TCP {}:{} ran for {:?} and was abandoned",
+                domain,
+                port,
+                stream_budget
+            );
+        }
     }
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,
