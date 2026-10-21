@@ -346,14 +346,18 @@ mod tests {
 
     #[test]
     fn an_address_we_never_handed_out_maps_to_nothing() {
+        // The block is the host's decision, so the fixed addresses the Kotlin
+        // side owns are the ones of the block in use — and the lock is the
+        // block's own, or another test could change it under this one.
+        let _guard = crate::virtual_block::test_lock();
         let mapping = IpMapping::new();
         mapping.allocate("a.test");
         // The three fixed addresses the Kotlin side owns, plus a free slot.
         for ip in [
-            Ipv4Addr::new(10, 0, 1, 1),
-            Ipv4Addr::new(10, 0, 1, 2),
-            Ipv4Addr::new(10, 0, 1, 3),
-            Ipv4Addr::new(10, 0, 1, 200),
+            crate::virtual_block::interface_ip(),
+            crate::virtual_block::dns_ip(),
+            crate::virtual_block::legacy_proxy_ip(),
+            crate::virtual_block::pool_last(),
             Ipv4Addr::new(8, 8, 8, 8),
         ] {
             assert_eq!(mapping.lookup_domain(&ip), None, "{ip}");
