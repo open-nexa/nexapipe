@@ -108,7 +108,11 @@ impl ConfigWatcher {
     }
 
     pub async fn start_watch(&self) {
-        let mut last_modified = std::fs::metadata(&self.config_path)
+        // The asynchronous one, like the check below: a synchronous
+        // `std::fs::metadata` in an async function blocks the runtime's
+        // thread, and the runtime has few of them.
+        let mut last_modified = fs::metadata(&self.config_path)
+            .await
             .map(|m| m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
