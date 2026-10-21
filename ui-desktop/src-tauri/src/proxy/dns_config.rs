@@ -215,14 +215,23 @@ pub fn set_system_dns(
 
         // Asked for by name, and never quietly downgraded.
         DnsStrategy::Scoped => {
+            // Nothing to scope: there is no domain to name to the operating
+            // system, so nothing is installed and the machine's DNS stays
+            // where it was. A proxy that proxies no domain resolves nothing
+            // either way — and the tunnel still runs.
+            if proxy_domains.is_empty() {
+                return Ok(DnsHijack::None);
+            }
+
             // The list has to be nameable before anything is tried: a
             // configuration the operating system cannot be told about is not a
             // platform failure, and the two need different answers.
-            if !proxy_domains.is_empty()
-                && crate::proxy::dns::scoped_domains(proxy_domains).is_none()
-            {
+            if crate::proxy::dns::scoped_domains(proxy_domains).is_none() {
                 return Err(anyhow::anyhow!(
-                    "the scoped DNS strategy has nothing to install: {} cannot each be named                      to the operating system. A bare \"*\" means every domain and is what the                      global strategy is for, and a name without a dot is a host rather than a                      domain. The machine's DNS was left alone.",
+                    "the scoped DNS strategy has nothing to install: {} cannot each be named \
+                     to the operating system. A bare \"*\" means every domain and is what the \
+                     global strategy is for, and a name without a dot is a host rather than a \
+                     domain. The machine's DNS was left alone.",
                     describe_domains(proxy_domains)
                 ));
             }
@@ -2711,6 +2720,22 @@ mod tests {
             DnsStrategy::None,
         )
         .expect("the none strategy cannot fail");
+        assert_eq!(hijack, DnsHijack::None);
+    }
+
+    /// An empty domain list is not a failure: there is nothing to scope, so
+    /// nothing is installed and the machine's DNS stays where it was.
+    ///
+    /// The scoped strategy is the default, and a proxy with no domain
+    /// configured is a proxy that resolves nothing — the tunnel still runs.
+    /// What it must not do is fail the run: the scoped attempt has nothing to
+    /// install, and a run that says "it could not be installed" is a run that
+    /// refuses a tunnel over a domain list that was empty to begin with.
+    #[test]
+    fn the_scoped_strategy_with_no_domains_installs_nothing() {
+        let hijack =
+            super::set_system_dns("does-not-matter", "198.18.0.254", &[], DnsStrategy::Scoped)
+                .expect("an empty domain list is not a failure");
         assert_eq!(hijack, DnsHijack::None);
     }
 
