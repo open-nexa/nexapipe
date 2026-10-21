@@ -49,6 +49,7 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "phone".to_string(),

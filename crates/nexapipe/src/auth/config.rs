@@ -150,6 +150,31 @@ pub struct ClientAuth {
     /// "no restriction".
     #[serde(default)]
     pub allow_ports: Option<Vec<u16>>,
+    /// Whether `allow_ports` is checked against the port the request is
+    /// *served from*, rather than the one the client names.
+    ///
+    /// The two are different ports, and the difference is the whole point.
+    /// A client asks for `https://api.example.com` and the proxy serves it
+    /// from `http://127.0.0.1:18080`; the port the client names is a virtual
+    /// one, the port the request goes to is the backend's. Checking the
+    /// client's port checked a number the request never reaches — and a
+    /// request that named no port at all was not checked on any port.
+    ///
+    /// Off by default, because turning it on changes what an existing
+    /// configuration allows: a client limited to port 443 whose route's
+    /// backend listens on 18080 is refused. That is the correct answer, and it
+    /// is not the answer a deployed configuration was written against — so an
+    /// operator opts in, having looked at where their backends actually
+    /// listen.
+    ///
+    /// **The port checked is the one the request is served from** — the
+    /// backend the pool picked, not the route it came from. A route with two
+    /// backends on two ports is therefore half usable by such a client: the
+    /// requests that land on the allowed port are served and the ones that
+    /// land on the other are refused. That is the rule this flag states, and
+    /// it is the one an allow-list of ports is written for.
+    #[serde(default)]
+    pub allow_ports_strict: bool,
     /// A one-time enrollment token waiting to be exchanged for a new secret.
     ///
     /// `None` means no enrollment is outstanding, so a client with no token
@@ -214,6 +239,7 @@ impl std::fmt::Debug for ClientAuth {
             .field("created_at", &self.created_at)
             .field("allow_hosts", &self.allow_hosts)
             .field("allow_ports", &self.allow_ports)
+            .field("allow_ports_strict", &self.allow_ports_strict)
             .field(
                 "pending_enrollment",
                 &crate::config::redacted(&self.pending_enrollment),
@@ -336,6 +362,7 @@ impl AuthConfig {
                             created_at: String::new(),
                             allow_hosts: None,
                             allow_ports: None,
+                            allow_ports_strict: false,
                             pending_enrollment: None,
                             // Names and stamps only. A snapshot exists so a
                             // wrong code does not copy a credential, and every
@@ -514,6 +541,7 @@ impl ClientAuth {
     /// connection already holding its credentials may reach.
     pub fn acl(&self) -> ClientAcl {
         ClientAcl::from_hosts_and_ports(self.allow_hosts.as_deref(), self.allow_ports.as_deref())
+            .with_strict_ports(self.allow_ports_strict)
     }
 }
 
@@ -556,6 +584,13 @@ pub struct ClientAcl {
     hosts: Option<Vec<String>>,
     /// The ports this client may reach. `None` means every port.
     ports: Option<Vec<u16>>,
+    /// Whether the port list is also checked against the port a request is
+    /// actually served from.
+    ///
+    /// See [`ClientAuth::allow_ports_strict`]. Off means the historical
+    /// behaviour: the port list is checked against the port the client
+    /// *named*, and a request that named none is not checked at all.
+    strict_ports: bool,
 }
 
 impl ClientAcl {
@@ -590,7 +625,32 @@ impl ClientAcl {
                     .collect()
             }),
             ports: ports.map(|ports| ports.to_vec()),
+            strict_ports: false,
         }
+    }
+
+    /// Whether the port list is also checked against the port a request is
+    /// served from.
+    ///
+    /// A builder rather than a constructor argument, because the flag is
+    /// about *how* the list is applied rather than about what it contains —
+    /// and every existing caller wants the historical answer.
+    pub fn with_strict_ports(mut self, strict: bool) -> Self {
+        self.strict_ports = strict;
+        self
+    }
+
+    /// Whether the client may reach a service on `port`.
+    ///
+    /// The port here is the one the request is **served from** — the
+    /// backend's — not the one the client named. Only asked when the ACL is
+    /// strict; otherwise the port list is checked where the client names a
+    /// port, and this has nothing to add.
+    pub fn allows_backend_port(&self, port: u16) -> bool {
+        if !self.strict_ports {
+            return true;
+        }
+        self.allows_port(port)
     }
 
     /// Whether `host` may be reached by a client governed by this ACL.
@@ -651,6 +711,7 @@ mod tests {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,

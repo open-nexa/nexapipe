@@ -1702,6 +1702,12 @@ pub struct ClientAuthToml {
     /// on that name, and a client that may have the name does not
     /// automatically get every service on it.
     pub allow_ports: Option<Vec<u16>>,
+    /// Whether `allow_ports` is checked against the port the request is served
+    /// from rather than the one the client names.
+    ///
+    /// Off by default: turning it on changes what an existing configuration
+    /// allows, so an operator opts in.
+    pub allow_ports_strict: Option<bool>,
     /// A one-time enrollment token outstanding for this client, written by
     /// `--generate-invite --registration` and cleared by whoever spends it. Not
     /// written back by `save_auth_state`: it belongs to the operator, not to
@@ -1952,6 +1958,9 @@ impl ProxyConfig {
                                         .unwrap_or_else(crate::auth::config::default_created_at),
                                     allow_hosts: client_toml.allow_hosts,
                                     allow_ports: client_toml.allow_ports,
+                                    allow_ports_strict: client_toml
+                                        .allow_ports_strict
+                                        .unwrap_or(false),
                                     pending_enrollment: client_toml.pending_enrollment,
                                     devices,
                                     unnamed_device_allowed: client_toml

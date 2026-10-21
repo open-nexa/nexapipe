@@ -44,6 +44,57 @@ fn an_allow_ports_list_reaches_the_acl() {
     );
 }
 
+/// `allow_ports_strict` reaches the ACL, so the port list is checked against
+/// the port a request is served from and not only against the one the client
+/// names.
+#[test]
+fn the_strict_flag_reaches_the_acl() {
+    let auth = load_with_client_body(
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443]\n\
+         allow_ports_strict = true\n",
+    )
+    .expect("the config has to load");
+
+    let acl = auth.clients["client-001"].acl();
+
+    assert!(
+        acl.allows_backend_port(443),
+        "a port the client may reach is still reachable"
+    );
+    assert!(
+        !acl.allows_backend_port(18080),
+        "a port the request is served from and the client may not reach is refused"
+    );
+}
+
+/// Without the flag, the port list is not consulted about the port a request
+/// is served from: that is the historical behaviour, and the flag is how an
+/// operator asks for the check above.
+#[test]
+fn the_strict_flag_is_off_by_default() {
+    let auth = load_with_client_body(
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443]\n",
+    )
+    .expect("the config has to load");
+
+    let acl = auth.clients["client-001"].acl();
+
+    assert!(
+        acl.allows_backend_port(18080),
+        "the historical reach is kept until the flag says otherwise"
+    );
+}
+
 /// A client with no `allow_ports` keeps the reach it always had: every port.
 #[test]
 fn a_client_without_allow_ports_is_not_limited_by_ports() {

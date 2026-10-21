@@ -378,6 +378,7 @@ mod tests {
             created_at: String::new(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
@@ -402,6 +403,7 @@ mod tests {
             created_at: String::new(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::from([(
                 "laptop".to_string(),

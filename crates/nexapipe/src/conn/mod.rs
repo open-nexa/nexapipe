@@ -2848,6 +2848,7 @@ mod tests {
                 created_at: "0".to_string(),
                 allow_hosts: None,
                 allow_ports: None,
+                allow_ports_strict: false,
                 pending_enrollment: token.map(|t| SecretString::new(t.to_string())),
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,
