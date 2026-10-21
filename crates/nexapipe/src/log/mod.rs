@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::ChronoLocal;
@@ -30,6 +31,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::LogConfig;
 use crate::conn::peers::PeerIdentity;
+
+/// The filter every layer is under.
+///
+/// **It names the access target as well as the crate's own.** The access line
+/// is logged under a target of its own, so that the layer writing the server's
+/// log file can leave it out — and a filter that named only `nexapipe` would
+/// drop the line altogether, rather than let it through to the console alone.
+fn env_filter(debug: bool) -> EnvFilter {
+    EnvFilter::new(format!(
+        "nexapipe={},access=info",
+        if debug { "debug" } else { "info" }
+    ))
+}
 
 /// Timestamp format of every log line, in local time.
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
@@ -47,7 +61,10 @@ pub fn init(config: Option<&LogConfig>, debug: bool) {
     // Set before anything can return early: an access line must not be written
     // verbatim just because the global logger could not be installed.
     set_redact_query(settings.redact_query);
-    let filter = EnvFilter::new(format!("nexapipe={}", if debug { "debug" } else { "info" }));
+    // The access line has a target of its own, so the filter has to name it:
+    // a filter that names only the crate's own target would drop the line
+    // altogether rather than let it through to the console alone.
+    let filter = env_filter(debug);
 
     let log_sink = open_sink(&settings, &settings.file_name);
     let access_sink = if settings.access_log {
@@ -64,13 +81,20 @@ pub fn init(config: Option<&LogConfig>, debug: bool) {
     }
 
     let registry = tracing_subscriber::registry().with(filter);
+    // Whether the access line has a file of its own. It is the operator's
+    // setting rather than the sink, so a failure to open the file does not
+    // silently move the line back into the server's log — the access logger
+    // already falls back to stdout for that case.
+    let access_has_a_file = settings.access_log;
     let installed = match (console, log_sink.clone()) {
         (true, Some(sink)) => registry
             .with(console_layer())
-            .with(file_layer(sink))
+            .with(file_layer(sink, access_has_a_file))
             .try_init(),
         (true, None) => registry.with(console_layer()).try_init(),
-        (false, Some(sink)) => registry.with(file_layer(sink)).try_init(),
+        (false, Some(sink)) => registry
+            .with(file_layer(sink, access_has_a_file))
+            .try_init(),
         // Unreachable: `console` is forced on when there is no file to write to.
         (false, None) => registry.with(console_layer()).try_init(),
     };
@@ -109,7 +133,19 @@ where
         .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
 }
 
-fn file_layer<S>(sink: FileSink) -> impl Layer<S>
+/// The server's own log file.
+///
+/// `access_has_a_file` says whether the access line has a file of its own to go
+/// to. When it does, the line is left out of this one: the access log has it,
+/// and it is written on a thread of its own — a request that also wrote the
+/// line here would pay for a second synchronous write, under this sink's lock,
+/// to put the same line in another file.
+///
+/// When it does **not** — `[log] access_log = false` — this file is the only
+/// place the line can reach besides the console, which is where it was before
+/// the filter existed. Dropping it here as well would take access lines away
+/// from a server that was configured to keep them in its one log file.
+fn file_layer<S>(sink: FileSink, access_has_a_file: bool) -> impl Layer<S>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
@@ -119,6 +155,9 @@ where
         .with_ansi(false)
         .with_timer(ChronoLocal::new(TIME_FORMAT.to_string()))
         .with_writer(sink)
+        .with_filter(filter_fn(move |metadata| {
+            !access_has_a_file || metadata.target() != ACCESS_TARGET
+        }))
 }
 
 /// Open one of the log files, reporting a failure on stderr instead of aborting.
@@ -631,6 +670,39 @@ fn redacting() -> bool {
     REDACT_QUERY.load(Ordering::Relaxed)
 }
 
+/// The URI as a log line should carry it.
+///
+/// The same redaction the access log applies, and for the same reason: the
+/// access log is not the only place a URI ends up. A tracing span's fields
+/// are rendered into the general log file by every event inside the span, so
+/// a query value recorded there has been rotated, archived and handed to
+/// someone else exactly as a value in the access log has.
+///
+/// The access log redacts once and hands the same string to both of its sinks
+/// — "or redacting the file only moves the leak next door". This is that
+/// string, for the sinks the access log does not own.
+pub(crate) fn uri_for_log(uri: &str) -> String {
+    if redacting() {
+        redact_query(uri)
+    } else {
+        uri.to_string()
+    }
+}
+
+/// Records a request's method and URI on the current span.
+///
+/// The URI recorded is the redacted one. A span's fields are rendered into
+/// the general log file by every event inside the span — not only by the
+/// access line — so a query value written here is a query value in a file
+/// that gets rotated, archived and handed to someone else.
+///
+/// Every call site goes through this, rather than recording a URI of its own,
+/// because the rule is one rule and the call sites are four.
+pub(crate) fn record_request_on_span(span: &tracing::Span, method: &str, uri: &str) {
+    span.record("method", method);
+    span.record("uri", uri_for_log(uri).as_str());
+}
+
 /// Replaces the values in a URI's query string, keeping the parameter names.
 ///
 /// `?token=abc&page=2` becomes `?token=<redacted>&page=<redacted>`. Names stay
@@ -984,7 +1056,14 @@ fn write_access_line(
     // The same facts as the line above, and the same redacted detail: the
     // event and the file have to agree, or redacting the file only moves the
     // leak next door.
+    //
+    // **Its own target, so the server's log file does not carry it.** The
+    // access log has the line already, and the file layer writes every event
+    // it is given — synchronously, in the request's own task, under the sink's
+    // lock. So the line was written to a file, and then written again to
+    // another file, and the request paid for both.
     tracing::info!(
+        target: ACCESS_TARGET,
         "Access: {} {} {} {} {}ms{}",
         remote_addr,
         method,
@@ -995,9 +1074,91 @@ fn write_access_line(
     );
 }
 
+/// The target the access line is logged under.
+///
+/// Its own, so that the layer writing the server's log file can leave it out:
+/// the access log has the line, and a file that has it twice is a file with
+/// every request in it twice.
+const ACCESS_TARGET: &str = "access";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// The access line goes to the console and to the access log, and not to
+    /// the server's log file.
+    ///
+    /// The file layer writes every event it is given — synchronously, in the
+    /// request's own task, under the sink's lock — so an access line that
+    /// reached it as well was a second write of the same line, into a second
+    /// file, on the path of every request.
+    #[test]
+    fn the_access_line_is_not_written_to_the_server_log_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sink =
+            FileSink::new(dir.path(), "server.log", Rotation::Never, 0, 0).expect("a log file");
+        let path = sink.path();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter(false))
+            .with(file_layer(sink, true));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: ACCESS_TARGET, "Access: 1.2.3.4 GET / 200");
+            tracing::info!("a server event");
+        });
+
+        let written = std::fs::read_to_string(path).expect("the log file");
+        assert!(
+            written.contains("a server event"),
+            "the server's own events are in the file: {written}"
+        );
+        assert!(
+            !written.contains("Access:"),
+            "the access line is in the file as well: {written}"
+        );
+    }
+
+    /// With no access log of its own, the line stays in the server's log file.
+    ///
+    /// `[log] access_log = false` is a server that keeps one file, and the
+    /// access line was in that file before the filter existed. A filter that
+    /// dropped it here as well would answer a configuration that asked for no
+    /// *separate* access log with no access lines at all.
+    #[test]
+    fn the_access_line_stays_in_the_server_log_when_it_has_nowhere_else_to_go() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sink =
+            FileSink::new(dir.path(), "server.log", Rotation::Never, 0, 0).expect("a log file");
+        let path = sink.path();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter(false))
+            .with(file_layer(sink, false));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: ACCESS_TARGET, "Access: 1.2.3.4 GET / 200");
+        });
+
+        let written = std::fs::read_to_string(path).expect("the log file");
+        assert!(
+            written.contains("Access:"),
+            "the line has no other file to go to: {written}"
+        );
+    }
+
+    /// The access line's own target has to be named by the filter the server
+    /// installs, or the line is dropped altogether — and the console is where
+    /// it is supposed to be.
+    #[test]
+    fn the_filter_names_the_access_target() {
+        for debug in [false, true] {
+            let filter = format!("{:?}", env_filter(debug));
+            assert!(
+                filter.contains("access"),
+                "the filter drops the access line: {filter}"
+            );
+        }
+    }
 
     #[test]
     fn redacts_every_query_value() {
@@ -1032,6 +1193,77 @@ mod tests {
         assert_eq!(
             redact_query("/x?token=&ok=1"),
             "/x?token=<redacted>&ok=<redacted>"
+        );
+    }
+
+    /// A span layer that remembers what was recorded into its `uri` field.
+    ///
+    /// A span's fields are rendered into the general log file by every event
+    /// inside the span, so what lands in a span is what lands in that file.
+    /// This is how the test sees it.
+    #[derive(Clone, Default)]
+    struct CapturedUri(Arc<Mutex<Option<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedUri {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = UriVisitor(None);
+            values.record(&mut visitor);
+            if let Some(uri) = visitor.0 {
+                *self.0.lock().unwrap() = Some(uri);
+            }
+        }
+    }
+
+    /// Picks the `uri` field out of a recorded span.
+    struct UriVisitor(Option<String>);
+
+    impl tracing::field::Visit for UriVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "uri" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "uri" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// A query value recorded into a span is redacted.
+    ///
+    /// The span is the other way a URI reaches a log file. The access log
+    /// redacts its own copy, but a span's fields are rendered into the
+    /// *general* log file by every event inside the span — so a query value
+    /// written there was a query value in a file that gets rotated, archived
+    /// and handed to someone else, with the access log's redaction nowhere
+    /// near it.
+    #[test]
+    fn a_uri_recorded_into_a_span_is_redacted() {
+        let captured = CapturedUri::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request", uri = tracing::field::Empty);
+            let _guard = span.enter();
+            super::record_request_on_span(&span, "GET", "/api/v1/items?token=hunter2&page=2");
+        });
+
+        let recorded = captured
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the span recorded a uri");
+        assert_eq!(
+            recorded, "/api/v1/items?token=<redacted>&page=<redacted>",
+            "a query value reached the span, and the span is rendered into the log file"
         );
     }
 

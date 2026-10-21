@@ -551,21 +551,29 @@ pub async fn handle_bidi_stream(
         path,
         backend_info.url
     );
-    tracing::debug!("Received request: {} {}", request.method(), request.uri());
-
     // The access log has to be fed from here: this is the path every client
     // takes, and the HTTP server on the plaintext listener logs its own.
     let started = std::time::Instant::now();
     let method = request.method().to_string();
     let request_target = request.uri().to_string();
 
+    // The same string the access log and the span use, redacted the same way.
+    // This line reaches the general log file, which is the same file the span's
+    // fields are rendered into — so a URI logged here unredacted is a query
+    // value in that file, and redacting only the span would leave this door
+    // open next to it.
+    tracing::debug!(
+        "Received request: {} {}",
+        request.method(),
+        crate::log::uri_for_log(&request_target)
+    );
+
     // Filled in on the span the caller opened, which was created before the
     // head was read and so could not know these. `Span::current()` is that
     // span because the caller instruments this future with it; when no
     // subscriber cares, recording is a no-op rather than a cost.
     let span = tracing::Span::current();
-    span.record("method", method.as_str());
-    span.record("uri", request_target.as_str());
+    crate::log::record_request_on_span(&span, &method, &request_target);
 
     // A WebSocket upgrade is a conversation, and half of it cannot be taken
     // back: it is never retried, and it does not go through the loop below.
@@ -1652,6 +1660,49 @@ fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
     diff == 0
 }
 
+/// Persists the runtime counters to the state file, without the auth lock.
+///
+/// The counters are read **at write time** and the file is written with the
+/// auth lock released: a write lock held across a disk write stalls every
+/// connection that is authenticating, not only the one whose counters are
+/// being written.
+///
+/// The gate orders the writes, so the file always carries the count as of the
+/// write that reached it last. Because the counters are read here rather than
+/// by the caller, a handshake that counted a failure in between is counted
+/// too — the file can lag the in-memory count by the moment between a read
+/// and the write, and the in-memory count is the one that decides.
+///
+/// The lock order is the auth lock and **then** the gate, which is the order
+/// the writers that hold the auth lock take them in: [`blocking_config_write`]
+/// is called from under the auth write lock, and takes the gate inside it. A
+/// writer that took them the other way round would deadlock against one of
+/// those — this task holding the gate and waiting for the read lock, that one
+/// holding the write lock and waiting for the gate, and neither ever letting
+/// go. The read guard is dropped before the disk write, so the lock is held
+/// for the snapshot and not for the write.
+async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
+    let path = auth.state_path().to_string();
+    let config = auth.config().clone();
+    let (done, wait) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let cfg = config.read().await;
+        let gate = config_write_gate().lock().await;
+        let snapshot = cfg.counter_snapshot();
+        // The snapshot is what the write needs; the lock it was taken under is
+        // not, and a writer should not wait for the disk on top of the gate.
+        drop(cfg);
+        let result = tokio::task::spawn_blocking(move || save_auth_state(&path, &snapshot)).await;
+        drop(gate);
+        let _ = done.send(result);
+    });
+
+    wait.await
+        .map_err(|_| anyhow::anyhow!("the auth state write was abandoned"))?
+        .map_err(|e| anyhow::anyhow!("the auth state write did not run: {e}"))?
+}
+
 /// Runs a write against the config file without occupying a worker.
 ///
 /// These writes happen while the auth write lock is held, and that is not
@@ -1961,6 +2012,9 @@ async fn perform_authentication(
     // counter up to the lockout and, from the change in the reply, learn that
     // the id they guessed exists. The real reason goes to the log instead.
     let mut verified_acl = ClientAcl::unrestricted();
+    // Whether the counters changed and the state file has to be written. The
+    // write itself happens after the lock is released.
+    let mut state_dirty = false;
     let is_valid = match outcome {
         Ok(true) => {
             // Which device this was, if it named one, recorded under the same
@@ -1990,19 +2044,9 @@ async fn perform_authentication(
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
                 }
-                let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-                    save_auth_state(path, &snapshot)
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "2FA: failed to persist auth state for '{}' to {}: {}",
-                        client_id,
-                        auth.state_path(),
-                        e
-                    );
-                }
+                // The write happens after the lock is released; see
+                // `persist_auth_state`.
+                state_dirty = true;
             }
             // Snapshot the host authorization while the same lock that verified
             // the credentials still holds: the entry cannot vanish between the
@@ -2018,20 +2062,10 @@ async fn perform_authentication(
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
-                let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-                    save_auth_state(path, &snapshot)
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "2FA: failed to persist lockout for '{}' to {}: {}",
-                        client_id,
-                        auth.state_path(),
-                        e
-                    );
-                }
             }
+            // The write happens after the lock is released; see
+            // `persist_auth_state`.
+            state_dirty = true;
             false
         }
         Err(e) => {
@@ -2060,6 +2094,30 @@ async fn perform_authentication(
                 }
                 AuthError::LockedOut => {
                     tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
+                }
+                AuthError::WrongSignature => {
+                    // Not counted, and worth saying why: a key cannot be
+                    // guessed, so there is nothing for the counter to protect
+                    // on this path — counting it would only let a peer that
+                    // knows the client id and the device name deny the
+                    // device's owner service.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that does not match \
+                         the challenge",
+                        peer,
+                        client_id
+                    );
+                }
+                AuthError::MalformedSignature => {
+                    // Not counted, and worth saying why: the peer sent noise
+                    // rather than a wrong credential, so this is not an
+                    // attempt at the device.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that is not a \
+                         signature",
+                        peer,
+                        client_id
+                    );
                 }
                 AuthError::UnnamedDeviceNotAllowed => {
                     // The one refusal that is a configuration the operator can
@@ -2100,6 +2158,17 @@ async fn perform_authentication(
     });
 
     drop(cfg);
+
+    // The state file is written with the auth lock released. The counters it
+    // carries are read at write time, so they are the ones as of now.
+    if state_dirty && let Err(e) = persist_auth_state(auth).await {
+        tracing::warn!(
+            "2FA: failed to persist the auth counters for '{}' to {}: {}",
+            client_id,
+            auth.state_path(),
+            e
+        );
+    }
 
     // One fixed string for every refusal, logged apart but sent identically: see
     // the note above the match.
@@ -2557,14 +2626,62 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
+        AuthState, EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
         blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
-        enrollment_verdict, find_headers_end, issue_enrolled_secret, read_stream_head,
-        undo_enrolled_secret,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, persist_auth_state,
+        read_stream_head, undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_client::secret::SecretString;
     use std::collections::HashMap;
+
+    /// The state file carries the counters as of the write, not as of an
+    /// earlier moment.
+    ///
+    /// The write happens with the auth lock released — a lock held across a
+    /// disk write stalls every connection that is authenticating, not only the
+    /// one whose counters are being written — so the counters are read at
+    /// write time. A failure counted between the record and the write is
+    /// counted too, which is what "as of the write" means.
+    #[tokio::test]
+    async fn the_state_file_carries_the_counters_as_of_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\nenabled = true\n\
+             [auth.clients.client-001]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        )
+        .unwrap();
+
+        let (_, config) = crate::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
+            .expect("the config loads");
+        let auth = AuthState::new(
+            config.expect("the config declares an [auth] section"),
+            path.to_str().unwrap(),
+        );
+
+        // Two failures, recorded in two separate critical sections — the
+        // second one after the first has already been counted.
+        for _ in 0..2 {
+            let mut cfg = auth.config().write().await;
+            cfg.clients
+                .get_mut("client-001")
+                .expect("the client is there")
+                .record_failure(3, 60);
+        }
+
+        persist_auth_state(&auth)
+            .await
+            .expect("the state is written");
+
+        let state = std::fs::read_to_string(dir.path().join("state.toml")).unwrap();
+        assert!(
+            state.contains("failed_attempts = 2"),
+            "the file carries the count as of the write, not as of an earlier moment: {state}"
+        );
+    }
 
     /// The budgets a head is read under, loose enough that no test runs into
     /// them by accident.
@@ -2816,6 +2933,7 @@ mod tests {
                 created_at: "0".to_string(),
                 allow_hosts: None,
                 allow_ports: None,
+                allow_ports_strict: false,
                 pending_enrollment: token.map(|t| SecretString::new(t.to_string())),
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,

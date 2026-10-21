@@ -17,6 +17,34 @@ use crate::metrics::CopyLeg;
 /// needs two syscalls, small enough to stay off the allocator's slow path.
 pub const COPY_BUF_SIZE: usize = 16 * 1024;
 
+/// How long the copy waits for the other direction after one of them ends.
+///
+/// A half-close is a request, not an ending: the peer that shut down its write
+/// side is done sending, and the reply that follows still has to arrive. So
+/// the copy does not end when the first direction does — it ends when the
+/// second one does.
+///
+/// The bound is what keeps an abandoned connection from holding its slot. A
+/// peer that vanished is indistinguishable from one that half-closed — both
+/// arrive as a clean end of stream — and without a bound the copy would wait
+/// for a reply that is never coming, holding a stream slot and a backend
+/// connection for as long as the whole-flow deadline allows.
+///
+/// Thirty seconds is the same order nginx uses for the same problem
+/// (`lingering_time`), and long enough for a backend that is thinking about
+/// its answer.
+const LINGERING: Duration = Duration::from_secs(30);
+
+/// How one direction of a copy ended.
+enum DirectionEnd {
+    /// The peer's write side closed. A half-close, or a peer that vanished —
+    /// the two arrive the same way, and the copy cannot tell them apart.
+    Clean,
+    /// The transport failed. The kind is carried along, so the caller can
+    /// still tell a timeout from a broken connection.
+    Failed(io::ErrorKind, String),
+}
+
 /// An iroh bi-stream seen as one duplex stream, so it can be piped like a socket.
 ///
 /// The iroh streams also carry inherent `poll_*` methods with their own error type,
@@ -61,18 +89,25 @@ impl AsyncWrite for DuplexIroh {
     }
 }
 
-/// Copies bytes in both directions until either side stops.
+/// Copies bytes in both directions until **both** of them have ended.
 ///
-/// First EOF wins rather than waiting for both: a tunnel is finished when either end
-/// is, and waiting would pin a half-open connection. Both ends are then half-closed,
-/// so the peers see a clean EOF instead of a dropped connection.
+/// A half-close is a request, not an ending: a peer that shut its write side
+/// down is done sending, and the reply that follows still has to arrive. So the
+/// copy ends when the second direction ends, not when the first one does — and
+/// each direction shuts its own write side down as it finishes, so the peer
+/// sees a clean EOF instead of a dropped connection.
 ///
-/// The result is the one from the direction that finished first. A clean EOF on
-/// either side is `Ok`, so this only reports a transport failure — which is the
-/// difference between a tunnel that ended and one that broke, and the caller needs
-/// it to log the right thing. A deadline that expires comes back as `TimedOut`, so
-/// the caller can tell "this one was cut" from "this one broke"; either way the
-/// half-close below has already run.
+/// That wait is bounded. A peer that vanished and a peer that half-closed
+/// arrive the same way, as a clean end of stream, so once one direction has
+/// ended the other is given `LINGERING` to finish before the copy gives up on
+/// it.
+///
+/// The result is `Ok` when both directions ended cleanly. A transport failure
+/// is reported as it happened — there is nothing left to wait for once the
+/// connection is broken. A copy that gave up on the direction which outlived
+/// the first one comes back as `TimedOut`, and a deadline that expires comes
+/// back the same way, so the caller can tell "this one was cut" from "this one
+/// broke"; either way the half-closes have already run.
 ///
 /// `label` only ever reaches a debug log — it exists so an operator can tell the TLS
 /// path from the L4 path when both are in play.
@@ -104,12 +139,117 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut backend_read, mut backend_write) = tokio::io::split(backend);
 
-    // The halves are borrowed, not moved, because the direction that loses the race
-    // is dropped mid-flight and a shutdown written inside it would never run. Shutting
-    // both write halves down out here is what makes the half-close reach both peers.
+    // Each direction, and the half-close that goes with it.
+    //
+    // A half-close is a **request**, not an ending: a peer that shut down its
+    // write side is done sending, and the other side has to hear that, or it
+    // waits for input that is never coming. So the FIN is sent as soon as the
+    // direction ends — not when the whole copy does.
+    //
+    // The two directions are **joined**, not raced. Racing them meant that
+    // whichever ended first won and the other was dropped, so a client that
+    // wrote its request and then shut down its write side never got the
+    // reply: the direction carrying it was killed a microsecond after the
+    // half-close, and the connection was reset under the client.
+    //
+    // The halves are borrowed, not moved, because the shutdown written inside
+    // each direction has to run when that direction ends. Shutting them down
+    // out here instead would mean waiting for the other direction first,
+    // which is the deadlock this arrangement exists to avoid.
+    let client_to_backend = async {
+        let result =
+            copy_one_way(&mut client_read, &mut backend_write, label, CopyLeg::Client).await;
+        // The client is done sending. The backend has to hear that.
+        let _ = backend_write.shutdown().await;
+        result
+    };
+    let backend_to_client = async {
+        let result = copy_one_way(
+            &mut backend_read,
+            &mut client_write,
+            label,
+            CopyLeg::Backend,
+        )
+        .await;
+        // The backend is done sending. The client has to hear that.
+        let _ = client_write.shutdown().await;
+        result
+    };
+
+    // The first direction to end starts the clock on the second one.
+    //
+    // This is what makes the wait bounded. The copy ends when both directions
+    // have ended, but a direction that never ends — the one whose peer
+    // vanished rather than half-closed — is only given `LINGERING` to finish
+    // before the copy gives up on it. A peer that vanished and a peer that
+    // half-closed arrive the same way, and this is what tells them apart.
+    //
+    // The shorter of the two bounds wins: a copy with a deadline of its own
+    // does not wait longer than that after the first direction ended.
+    let lingering = match deadline {
+        Some(limit) => limit.min(LINGERING),
+        None => LINGERING,
+    };
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<DirectionEnd>();
+    let client_to_backend = {
+        let ended_tx = ended_tx.clone();
+        async move {
+            let result = client_to_backend.await;
+            let end = match &result {
+                Ok(()) => DirectionEnd::Clean,
+                Err(e) => DirectionEnd::Failed(e.kind(), e.to_string()),
+            };
+            let _ = ended_tx.send(end);
+            result
+        }
+    };
+    let backend_to_client = {
+        let ended_tx = ended_tx.clone();
+        async move {
+            let result = backend_to_client.await;
+            let end = match &result {
+                Ok(()) => DirectionEnd::Clean,
+                Err(e) => DirectionEnd::Failed(e.kind(), e.to_string()),
+            };
+            let _ = ended_tx.send(end);
+            result
+        }
+    };
+    drop(ended_tx);
+
     let finished = tokio::select! {
-        result = copy_one_way(&mut client_read, &mut backend_write, label, CopyLeg::Client) => result,
-        result = copy_one_way(&mut backend_read, &mut client_write, label, CopyLeg::Backend) => result,
+        (client_result, backend_result) = async {
+            tokio::join!(client_to_backend, backend_to_client)
+        } => {
+            // The first failure, in the order the two were joined. A clean
+            // end in either direction is not a failure: the other one may
+            // still be delivering, and it will say so when it is done.
+            client_result.and(backend_result)
+        }
+        // One direction ended on its own.
+        //
+        // A **failure** ends the copy at once: the transport is broken, and
+        // there is nothing to wait for. A **clean end** is a half-close — or
+        // a peer that vanished, which arrives the same way — and the other
+        // direction may still be delivering, so it is given `lingering` to
+        // finish before the copy gives up on it.
+        ended = async {
+            match ended_rx.recv().await {
+                Some(DirectionEnd::Failed(kind, message)) => Err(io::Error::new(kind, message)),
+                _ => {
+                    tokio::time::sleep(lingering).await;
+                    tracing::debug!(
+                        "{}: the other direction did not finish within {:?} of the first one ending",
+                        label,
+                        lingering
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the other direction did not finish in time",
+                    ))
+                }
+            }
+        } => ended,
         // `Some` when a deadline was given, and `pending` forever when it was not:
         // a disabled arm that can still win the race is how this becomes a bug
         // rather than a no-op.
@@ -127,6 +267,7 @@ where
         }
     };
 
+    // Both write halves, whatever happened: the copy is over either way.
     let _ = backend_write.shutdown().await;
     let _ = client_write.shutdown().await;
 
@@ -266,7 +407,14 @@ mod tests {
     #[tokio::test]
     async fn half_closes_the_backend_when_the_client_stops() {
         let (mut client_end, mut backend_end, client_side, backend_side) = pair();
-        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+        // Bounded: the copy now waits for the other direction, and here it is
+        // the backend that never finishes.
+        let copy = tokio::spawn(copy_both_ways_until(
+            client_side,
+            backend_side,
+            "test",
+            Some(Duration::from_millis(500)),
+        ));
 
         client_end.write_all(b"hello").await.unwrap();
         drop(client_end);
@@ -277,7 +425,69 @@ mod tests {
         backend_end.read_to_end(&mut seen).await.unwrap();
         assert_eq!(seen, b"hello");
 
-        copy.await.unwrap().unwrap();
+        // The copy gives up on the silent side rather than waiting for it.
+        let returned = tokio::time::timeout(Duration::from_secs(5), copy).await;
+        assert!(returned.is_ok(), "the copy never returned");
+    }
+
+    /// A half-close reaches the other side, and the reply that follows it
+    /// still arrives.
+    ///
+    /// A TCP half-close is a **request**, not an ending: the peer that shut
+    /// down its write side is done sending, and the reply still has to come
+    /// back. The two directions used to be raced, so the one carrying the
+    /// reply was dropped a microsecond after the half-close, and the
+    /// connection was reset under the client.
+    ///
+    /// This is the shape of a request/response protocol carried over a
+    /// connection the client may half-close: the server reads until the
+    /// client is done sending, and only then answers.
+    #[tokio::test]
+    async fn a_half_closed_client_still_receives_the_reply() {
+        let (mut client_end, mut backend_end, client_side, backend_side) = pair();
+
+        // The application: writes its request, then half-closes, then reads
+        // whatever comes back.
+        let application = async {
+            client_end
+                .write_all(b"the request")
+                .await
+                .expect("the request goes out");
+            client_end.shutdown().await.expect("the write side closes");
+            let mut buf = Vec::new();
+            client_end
+                .read_to_end(&mut buf)
+                .await
+                .expect("the reply arrives");
+            buf
+        };
+
+        // The backend: reads until the client is done, then answers.
+        let backend = async {
+            let mut buf = Vec::new();
+            backend_end
+                .read_to_end(&mut buf)
+                .await
+                .expect("the request arrives");
+            assert_eq!(buf, b"the request", "the backend did not see the request");
+            backend_end
+                .write_all(b"the reply")
+                .await
+                .expect("the reply goes out");
+            backend_end.shutdown().await.expect("the backend closes");
+        };
+
+        let (copied, (), received) = tokio::join!(
+            copy_both_ways_until(client_side, backend_side, "test", None),
+            backend,
+            application,
+        );
+
+        copied.expect("the copy ends cleanly");
+        assert_eq!(
+            received, b"the reply",
+            "the reply did not survive the half-close"
+        );
     }
 
     /// A stream that fails the first read and swallows everything written to it.
@@ -337,8 +547,15 @@ mod tests {
     #[tokio::test]
     async fn half_closes_the_client_when_the_backend_stops() {
         let (mut client_end, mut backend_end, client_side, backend_side) = pair();
-        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
-
+        // Bounded: the copy waits for the other direction, and here it is the
+        // client that never finishes. A peer that vanished is indistinguishable
+        // from one that half-closed, so the bound is what tells them apart.
+        let copy = tokio::spawn(copy_both_ways_until(
+            client_side,
+            backend_side,
+            "test",
+            Some(Duration::from_millis(500)),
+        ));
         backend_end.write_all(b"bye").await.unwrap();
         drop(backend_end);
 
@@ -346,20 +563,30 @@ mod tests {
         client_end.read_to_end(&mut seen).await.unwrap();
         assert_eq!(seen, b"bye");
 
-        copy.await.unwrap().unwrap();
+        // The copy gives up on the silent side rather than waiting for it.
+        let returned = tokio::time::timeout(Duration::from_secs(5), copy).await;
+        assert!(returned.is_ok(), "the copy never returned");
     }
 
     #[tokio::test]
     async fn returns_when_the_far_end_disappears() {
         let (mut client_end, _backend_end, client_side, backend_side) = pair();
-        let copy = tokio::spawn(copy_both_ways(client_side, backend_side, "test"));
+        // Bounded: the copy waits for the other direction, and a peer that
+        // vanished is indistinguishable from one that half-closed. The
+        // deadline is what tells the two apart.
+        let copy = tokio::spawn(copy_both_ways_until(
+            client_side,
+            backend_side,
+            "test",
+            Some(Duration::from_millis(500)),
+        ));
 
         // The backend is gone mid-flow. What matters is that the copy comes
         // back: a tunnel that keeps a task (and its stream) alive after the far
         // end vanished would leak one per abandoned connection.
         drop(_backend_end);
         let returned = tokio::time::timeout(Duration::from_secs(5), copy).await;
-        assert!(returned.is_ok(), "copy_both_ways never returned");
+        assert!(returned.is_ok(), "copy_both_ways_until never returned");
 
         let mut rest = Vec::new();
         let _ = client_end.read_to_end(&mut rest).await;

@@ -102,3 +102,8 @@ criterion = { workspace = true }
 [[bench]]
 name = "l4_forward"
 harness = false
+
+# The routing table's lookup, which every request makes.
+[[bench]]
+name = "route_lookup"
+harness = false

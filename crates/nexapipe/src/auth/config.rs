@@ -150,6 +150,31 @@ pub struct ClientAuth {
     /// "no restriction".
     #[serde(default)]
     pub allow_ports: Option<Vec<u16>>,
+    /// Whether `allow_ports` is checked against the port the request is
+    /// *served from*, rather than the one the client names.
+    ///
+    /// The two are different ports, and the difference is the whole point.
+    /// A client asks for `https://api.example.com` and the proxy serves it
+    /// from `http://127.0.0.1:18080`; the port the client names is a virtual
+    /// one, the port the request goes to is the backend's. Checking the
+    /// client's port checked a number the request never reaches — and a
+    /// request that named no port at all was not checked on any port.
+    ///
+    /// Off by default, because turning it on changes what an existing
+    /// configuration allows: a client limited to port 443 whose route's
+    /// backend listens on 18080 is refused. That is the correct answer, and it
+    /// is not the answer a deployed configuration was written against — so an
+    /// operator opts in, having looked at where their backends actually
+    /// listen.
+    ///
+    /// **The port checked is the one the request is served from** — the
+    /// backend the pool picked, not the route it came from. A route with two
+    /// backends on two ports is therefore half usable by such a client: the
+    /// requests that land on the allowed port are served and the ones that
+    /// land on the other are refused. That is the rule this flag states, and
+    /// it is the one an allow-list of ports is written for.
+    #[serde(default)]
+    pub allow_ports_strict: bool,
     /// A one-time enrollment token waiting to be exchanged for a new secret.
     ///
     /// `None` means no enrollment is outstanding, so a client with no token
@@ -214,6 +239,7 @@ impl std::fmt::Debug for ClientAuth {
             .field("created_at", &self.created_at)
             .field("allow_hosts", &self.allow_hosts)
             .field("allow_ports", &self.allow_ports)
+            .field("allow_ports_strict", &self.allow_ports_strict)
             .field(
                 "pending_enrollment",
                 &crate::config::redacted(&self.pending_enrollment),
@@ -336,6 +362,7 @@ impl AuthConfig {
                             created_at: String::new(),
                             allow_hosts: None,
                             allow_ports: None,
+                            allow_ports_strict: false,
                             pending_enrollment: None,
                             // Names and stamps only. A snapshot exists so a
                             // wrong code does not copy a credential, and every
@@ -477,7 +504,17 @@ impl ClientAuth {
     /// `unix_now` is whole seconds, so a device reconnecting inside the same
     /// second costs nothing.
     pub fn record_device_success(&mut self, device: &str) -> bool {
-        let now = unix_now();
+        self.record_device_success_at(device, unix_now())
+    }
+
+    /// The same, with the second handed in.
+    ///
+    /// Split out so that a test can ask about a second of its own choosing:
+    /// the rule is "a whole second", and a test that asks the wall clock for
+    /// it is a test that fails whenever the two calls land either side of a
+    /// second boundary — which is exactly what happened under a full test
+    /// run, where the process is descheduled between them.
+    fn record_device_success_at(&mut self, device: &str, now: u64) -> bool {
         let Some(entry) = self.devices.get_mut(device) else {
             return false;
         };
@@ -504,6 +541,7 @@ impl ClientAuth {
     /// connection already holding its credentials may reach.
     pub fn acl(&self) -> ClientAcl {
         ClientAcl::from_hosts_and_ports(self.allow_hosts.as_deref(), self.allow_ports.as_deref())
+            .with_strict_ports(self.allow_ports_strict)
     }
 }
 
@@ -546,6 +584,13 @@ pub struct ClientAcl {
     hosts: Option<Vec<String>>,
     /// The ports this client may reach. `None` means every port.
     ports: Option<Vec<u16>>,
+    /// Whether the port list is also checked against the port a request is
+    /// actually served from.
+    ///
+    /// See [`ClientAuth::allow_ports_strict`]. Off means the historical
+    /// behaviour: the port list is checked against the port the client
+    /// *named*, and a request that named none is not checked at all.
+    strict_ports: bool,
 }
 
 impl ClientAcl {
@@ -576,11 +621,36 @@ impl ClientAcl {
                     // Folded as a pattern, not as a host: a spelling that
                     // would fold into the catch-all keeps its own shape, so an
                     // allow-list can never end up authorizing every host.
-                    .map(|h| crate::routes::normalize_pattern(h))
+                    .map(|h| crate::routes::normalize_pattern(h).into_owned())
                     .collect()
             }),
             ports: ports.map(|ports| ports.to_vec()),
+            strict_ports: false,
         }
+    }
+
+    /// Whether the port list is also checked against the port a request is
+    /// served from.
+    ///
+    /// A builder rather than a constructor argument, because the flag is
+    /// about *how* the list is applied rather than about what it contains —
+    /// and every existing caller wants the historical answer.
+    pub fn with_strict_ports(mut self, strict: bool) -> Self {
+        self.strict_ports = strict;
+        self
+    }
+
+    /// Whether the client may reach a service on `port`.
+    ///
+    /// The port here is the one the request is **served from** — the
+    /// backend's — not the one the client named. Only asked when the ACL is
+    /// strict; otherwise the port list is checked where the client names a
+    /// port, and this has nothing to add.
+    pub fn allows_backend_port(&self, port: u16) -> bool {
+        if !self.strict_ports {
+            return true;
+        }
+        self.allows_port(port)
     }
 
     /// Whether `host` may be reached by a client governed by this ACL.
@@ -641,6 +711,7 @@ mod tests {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
@@ -674,11 +745,11 @@ mod tests {
             .insert("phone".to_string(), device("PHONESECRET"));
 
         assert!(
-            client.record_device_success("laptop"),
+            client.record_device_success_at("laptop", 1_000),
             "the first stamp is a change"
         );
         let stamped = client.devices["laptop"].last_used;
-        assert!(stamped.is_some(), "the device was not stamped");
+        assert_eq!(stamped, Some(1_000), "the device was stamped");
         assert_eq!(
             client.devices["phone"].last_used, None,
             "a sibling device must not be stamped with it"
@@ -687,10 +758,17 @@ mod tests {
         // Whole seconds, so the same second is not a change — which is what
         // keeps a reconnecting device from costing a write every time.
         assert!(
-            !client.record_device_success("laptop"),
+            !client.record_device_success_at("laptop", 1_000),
             "the same second must not count as a new stamp"
         );
         assert_eq!(client.devices["laptop"].last_used, stamped);
+
+        // And the next second is a change, so the stamp does move.
+        assert!(
+            client.record_device_success_at("laptop", 1_001),
+            "the next second is a new stamp"
+        );
+        assert_eq!(client.devices["laptop"].last_used, Some(1_001));
     }
 
     /// A name that is not in the table is not a stamp, and not an error either:

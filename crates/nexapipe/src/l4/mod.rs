@@ -244,8 +244,11 @@ where
     // request, so what goes in them is what the access log records for one:
     // the protocol where a method would be, and the target where a URI would.
     let span = tracing::Span::current();
-    span.record("method", preface.proto.name());
-    span.record("uri", target.as_str());
+    // A tunnel's target is a host and a port rather than a URI, so there is
+    // nothing to redact in it today; the same redaction is applied anyway,
+    // because the day the target grows a query string it should not grow one
+    // in the log with it.
+    crate::log::record_request_on_span(&span, preface.proto.name(), &target);
 
     let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)
@@ -474,8 +477,10 @@ where
             // has to be able to find. `flow_timeout_secs` on the route raises it
             // — the default is meant to be generous, not invisible.
             tracing::warn!(
-                "L4 TCP: closing the flow to {host}:{port} after {flow_timeout:?}, which is the \
-                 whole-flow bound; raise flow_timeout_secs on the route for longer sessions"
+                "L4 TCP: closing the flow to {host}:{port} on a timeout — either the \
+                 whole-flow bound ({flow_timeout:?}) expired, which flow_timeout_secs on the \
+                 route raises, or the other end of the copy stopped without finishing and the \
+                 copy gave up on it. The debug line says which of the two it was"
             );
         }
         // A real transport failure, which is what the other paths report too.

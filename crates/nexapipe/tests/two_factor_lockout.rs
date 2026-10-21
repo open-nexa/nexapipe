@@ -55,6 +55,7 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
@@ -83,6 +84,7 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::from([
                 (
@@ -399,6 +401,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,

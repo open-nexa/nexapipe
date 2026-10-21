@@ -127,7 +127,7 @@ impl Route {
             // The pattern is folded as a pattern, not as a host: a spelling
             // that would fold into the catch-all keeps its own shape, so a
             // route can never end up serving every host.
-            host_pattern: normalize_pattern(host_pattern),
+            host_pattern: normalize_pattern(host_pattern).into_owned(),
             path_pattern: path_pattern.to_string(),
             path_is_prefix,
             modes: vec![mode],
@@ -515,7 +515,14 @@ impl std::fmt::Debug for L4RouteInfo {
 
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
-    routes: Arc<RwLock<Vec<Route>>>,
+    /// The routing table.
+    ///
+    /// **The routes are shared.** A lookup that found a route used to copy it
+    /// out of the table — three strings and a vector, so four or five heap
+    /// allocations for every request that matched — and the copy was thrown
+    /// away as soon as the backend was picked. A reference count is the whole
+    /// of what a table entry needs to be passed around.
+    routes: Arc<RwLock<Vec<Arc<Route>>>>,
     /// How long to wait on a backend, resolved once at startup.
     ///
     /// Held here rather than threaded down to each stream handler because this
@@ -538,7 +545,7 @@ pub struct RouteConfig {
 impl RouteConfig {
     pub fn new(routes: Vec<Route>) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts: Timeouts::default(),
             retry: Retry::default(),
         }
@@ -551,7 +558,7 @@ impl RouteConfig {
     /// as it did before this field existed.
     pub fn with_timeouts(routes: Vec<Route>, timeouts: Timeouts) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts,
             retry: Retry::default(),
         }
@@ -564,7 +571,7 @@ impl RouteConfig {
     /// as it did before this field existed.
     pub fn with_settings(routes: Vec<Route>, timeouts: Timeouts, retry: Retry) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(routes)),
+            routes: Arc::new(RwLock::new(shared(routes))),
             timeouts,
             retry,
         }
@@ -674,6 +681,24 @@ impl RouteConfig {
             );
             return BackendLookup::Unavailable;
         };
+
+        // The port the request is actually **served from** — the backend's,
+        // not the one the client named in its `Host` header. A client asking
+        // for `https://api.example.com` is served from
+        // `http://127.0.0.1:18080`; the port the client named is a virtual
+        // one, and the request never reaches it.
+        //
+        // Only asked when the ACL is strict. Without that, the port list is
+        // checked where the client names a port, and this has nothing to add.
+        if let Some(acl) = acl
+            && let Some(port) = backend_port(lease.url())
+            && !acl.allows_backend_port(port)
+        {
+            tracing::debug!(
+                "Port {port} (the backend for {host}) is not allowed for this client, answering 404"
+            );
+            return BackendLookup::NoRoute;
+        }
 
         tracing::debug!(
             "Selected backend: {} for host={}, path={}",
@@ -795,8 +820,18 @@ impl RouteConfig {
         })
     }
 
+    /// The whole table, copied out.
+    ///
+    /// For the admin API and the startup log, not for the request path: a copy
+    /// of a route is four or five allocations, and a listing wants the routes
+    /// themselves rather than the table's references to them.
     pub async fn routes(&self) -> Vec<Route> {
-        self.routes.read().await.clone()
+        self.routes
+            .read()
+            .await
+            .iter()
+            .map(|route| (**route).clone())
+            .collect()
     }
 
     /// Swaps the routing table, keeping the pool of every route that is still
@@ -818,11 +853,18 @@ impl RouteConfig {
     /// client and into this table, and a reload is a routing change rather than a
     /// restatement of how long a dial may take.
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
-        let mut routes = self.routes.write().await;
-
+        // **The keys are computed before the lock is taken.** Computing one is
+        // an await, and holding the routing table's write lock across an await
+        // stops every request in the process: the table is read on the way to
+        // every backend, and a read lock waits for a write lock. So a reload
+        // that took a moment to work out its keys held the whole server still
+        // while it did.
         let mut previous: HashMap<String, Arc<BackendPool>> = HashMap::new();
-        for route in routes.iter() {
-            previous.insert(route.pool_key().await, route.backend_pool().clone());
+        {
+            let routes = self.routes.read().await;
+            for route in routes.iter() {
+                previous.insert(route.pool_key().await, route.backend_pool().clone());
+            }
         }
 
         let mut updated = Vec::with_capacity(new_routes.len());
@@ -833,11 +875,62 @@ impl RouteConfig {
             if let Some(pool) = previous.remove(&key) {
                 route.backend_pool = pool;
             }
-            updated.push(route);
+            updated.push(Arc::new(route));
         }
 
+        // The write lock is held for the swap and nothing else.
+        let mut routes = self.routes.write().await;
         *routes = updated;
         tracing::info!("Routes updated successfully");
+    }
+}
+
+/// The routes of a table, shared.
+///
+/// A table hands out references to its routes rather than copies of them, so
+/// this is where a list of routes becomes a list of references.
+fn shared(routes: Vec<Route>) -> Vec<Arc<Route>> {
+    routes.into_iter().map(Arc::new).collect()
+}
+
+/// The port a backend is reached on.
+///
+/// `None` when the backend does not say, and when it does not say, the port is
+/// the scheme's default — which is what the URL itself would use.
+///
+/// **Both spellings are read.** A backend is written as a URL
+/// (`http://10.0.0.5:18080`) for an HTTP route, and as a bare `host:port`
+/// (`127.0.0.1:443`) for a TLS passthrough — and a bare `host:port` is not a
+/// URL at all: `Url::parse` reads `host.docker.internal:8443` as a scheme
+/// with no port, and refuses `127.0.0.1:443` outright. So the passthrough's own
+/// parser is the one that answers, and it knows both.
+pub(crate) fn backend_port(url: &str) -> Option<u16> {
+    crate::passthrough::parse_backend_addr(url).map(|(_host, port)| port)
+}
+
+/// The port a backend is reached on, in either spelling.
+///
+/// The two spellings are not the same thing to a URL parser: `http://host:8443`
+/// is a URL, and `host:8443` is not one at all — `Url::parse` reads it as a
+/// scheme and finds no port, and refuses `127.0.0.1:8443` outright. A TLS
+/// passthrough backend is written the second way, so a check that only read
+/// URLs would never fire on one.
+#[cfg(test)]
+mod backend_port_tests {
+    use super::backend_port;
+
+    #[test]
+    fn a_url_backend_is_read() {
+        assert_eq!(backend_port("http://10.0.0.5:18080"), Some(18080));
+        assert_eq!(backend_port("https://example.com"), Some(443));
+    }
+
+    #[test]
+    fn a_bare_host_and_port_is_read() {
+        // The spelling a TLS passthrough backend is written in.
+        assert_eq!(backend_port("127.0.0.1:8443"), Some(8443));
+        assert_eq!(backend_port("host.docker.internal:8443"), Some(8443));
+        assert_eq!(backend_port("[::1]:8443"), Some(8443));
     }
 }
 
@@ -849,11 +942,11 @@ impl RouteConfig {
 /// to `Tcp` or `Udp`, anything else to `Http`. One route may declare several
 /// modes; a connection still takes exactly one path.
 fn best_match(
-    routes: &[Route],
+    routes: &[Arc<Route>],
     mode: RouteMode,
     matches: impl Fn(&Route) -> bool,
-) -> Option<Route> {
-    let mut best: Option<(Route, u32)> = None;
+) -> Option<Arc<Route>> {
+    let mut best: Option<(Arc<Route>, u32)> = None;
 
     for route in routes.iter() {
         if !route.serves(mode) || !matches(route) {
@@ -883,6 +976,77 @@ fn best_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strict client is limited by the port the request is **served from**.
+    ///
+    /// The port the client named is a virtual one: it asked for
+    /// `https://api.example.com` and the proxy serves it from
+    /// `http://10.0.0.5:18080`. The port that decides what a client can
+    /// touch is the backend's, and this is the check that uses it.
+    #[tokio::test]
+    async fn a_strict_client_is_limited_by_the_backends_port() {
+        use crate::auth::ClientAcl;
+
+        let route = http_route("api.iakl.top", &["http://10.0.0.5:18080"]);
+        let config = RouteConfig::new(vec![route]);
+
+        // The client may reach 443, and the route's backend is on 18080.
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443])).with_strict_ports(true);
+
+        assert!(
+            matches!(
+                config
+                    .get_backend_with_acl("api.iakl.top", "/", None, Some(&acl))
+                    .await,
+                BackendLookup::NoRoute
+            ),
+            "the request is served from a port the client may not reach"
+        );
+    }
+
+    /// The same client, the same route, and a backend on a port it may reach.
+    #[tokio::test]
+    async fn a_strict_client_reaches_a_backend_on_a_port_it_may_reach() {
+        use crate::auth::ClientAcl;
+
+        let route = http_route("api.iakl.top", &["http://10.0.0.5:443"]);
+        let config = RouteConfig::new(vec![route]);
+
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443])).with_strict_ports(true);
+
+        assert!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", None, Some(&acl))
+                .await
+                .is_found(),
+            "the backend is on a port the client may reach"
+        );
+    }
+
+    /// Without the strict flag, the historical reach is what happens: the port
+    /// list is checked against the port the client *named*, and a request that
+    /// named none is not checked at all.
+    ///
+    /// This is the behaviour a deployed configuration was written against, so
+    /// it is the default; `allow_ports_strict` is how an operator asks for the
+    /// check above.
+    #[tokio::test]
+    async fn a_client_that_is_not_strict_keeps_its_historical_reach() {
+        use crate::auth::ClientAcl;
+
+        let route = http_route("api.iakl.top", &["http://10.0.0.5:18080"]);
+        let config = RouteConfig::new(vec![route]);
+
+        let acl = ClientAcl::from_hosts_and_ports(None, Some(&[443]));
+
+        assert!(
+            config
+                .get_backend_with_acl("api.iakl.top", "/", None, Some(&acl))
+                .await
+                .is_found(),
+            "the port list is not checked against the backend's port"
+        );
+    }
 
     /// Health says which of several backends to send to, so a pool that has only
     /// one has nothing to decide — and refusing is not "safer" there, it is answering
