@@ -173,6 +173,15 @@ its defaults — which are on.
 
 ### Security
 
+- **The certificate verifier and the bundled roots were patched.** Three new
+  RustSec advisories landed against crates this tree already carried:
+  RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
+  RUSTSEC-2026-0383 (`webpki-root-certs`). All three are about the same thing:
+  the `emSign` intermediates the root programmes distrusted were still
+  accepted, so a certificate chaining to one of them was still trusted. Both
+  lockfiles now pin the patched releases — `rustls-webpki` 0.103.16 and
+  `webpki-roots`/`webpki-root-certs` 1.0.10 — and nothing else in the tree
+  moves.
 - **The published image is signed, and says where it came from.** Every image
   released to GHCR now carries a cosign signature made with a key that is
   minted for the release run through GitHub's OIDC — nothing is stored, so
