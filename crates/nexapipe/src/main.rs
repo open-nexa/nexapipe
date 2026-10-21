@@ -9,7 +9,7 @@ use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RouteConfig;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
 use nexapipe_client::relay::RelayModeSpec;
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use std::sync::Arc;
 
 /// The default config path the binary uses when `--config` is not given.
@@ -1014,7 +1014,7 @@ fn add_client(
             "client id {client_id:?} is printable ASCII of at most {} characters and not empty — \
              it is the key under [auth.clients], the name a device sends in its handshake, and \
              the subject of every log line about it",
-            nexapipe::auth::protocol::MAX_CLIENT_ID_LEN
+            nexapipe::auth::MAX_CLIENT_ID_LEN
         );
     }
     if let Some(device) = device
@@ -1303,7 +1303,7 @@ fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Re
             "client id {client_id:?} is printable ASCII of at most {} characters and not empty — \
              it is the key under [auth.clients], the name a device sends in its handshake, and \
              the subject of every log line about it",
-            nexapipe::auth::protocol::MAX_CLIENT_ID_LEN
+            nexapipe::auth::MAX_CLIENT_ID_LEN
         );
     }
     if let Some(device) = device

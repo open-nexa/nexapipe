@@ -50,7 +50,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe_proto::normalize_pattern;
 
 use crate::auth::TotpAlgorithm;
-use crate::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 
 /// Issuer label used when an invite does not name one.
 pub const DEFAULT_ISSUER: &str = "NexaPipe";

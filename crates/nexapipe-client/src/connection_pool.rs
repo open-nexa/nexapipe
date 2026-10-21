@@ -13,7 +13,7 @@ use tracing;
 
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
 const MAX_CONNECTIONS: usize = 10;

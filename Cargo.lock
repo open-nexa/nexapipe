@@ -2670,6 +2670,11 @@ dependencies = [
 [[package]]
 name = "nexapipe-proto"
 version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "nom"

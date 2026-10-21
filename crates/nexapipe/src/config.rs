@@ -1,7 +1,7 @@
 use crate::conn::limits::LimitsConfig;
 use crate::routes::{L4Options, Route};
 use crate::toml_zeroize::{ZeroizedValue, zeroize_document};
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;

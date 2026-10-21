@@ -529,7 +529,7 @@ mod tests {
     use super::*;
     use crate::auth::{ClientAuth, DeviceAuth};
     use crate::conn::peers::PeerIdentity;
-    use nexapipe_client::secret::SecretString;
+    use nexapipe_proto::secret::SecretString;
 
     fn client(secret: &str) -> ClientAuth {
         ClientAuth {

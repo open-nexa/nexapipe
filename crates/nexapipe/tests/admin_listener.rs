@@ -17,7 +17,7 @@ use nexapipe::conn::peers::PeerRegistry;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RouteConfig};
 use nexapipe::shutdown::{InFlight, ShutdownSignal};
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

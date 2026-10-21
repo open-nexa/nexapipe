@@ -23,7 +23,7 @@
 //! serving without one is the thing the token exists to prevent.
 use crate::auth::totp::constant_time_eq;
 use crate::config::check_credential_file_permissions;
-use nexapipe_client::secret::SecretString;
+use nexapipe_proto::secret::SecretString;
 use std::path::Path;
 
 /// What is appended to the config path to get the token file:

@@ -7,9 +7,10 @@
 // is whatever its enrollment produced.
 
 use crate::ClientError;
-use crate::secret::{SecretBytes, SecretString};
 use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
+use nexapipe_proto::auth::AuthMessage;
+use nexapipe_proto::secret::{SecretBytes, SecretString};
 use sha2::Sha256;
 use std::fmt;
 use totp_rs::{Algorithm, Builder, Secret as TotpSecret};
@@ -525,7 +526,7 @@ impl TwoFactorAuth {
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Result<(), ClientError> {
-        use crate::auth::auth_protocol::AuthMessage;
+        use nexapipe_proto::auth::AuthMessage;
 
         // Step 1: Send AUTH_START
         let timestamp = std::time::SystemTime::now()
@@ -904,7 +905,7 @@ impl Enrollment {
     }
 
     async fn exchange_inner(&self, conn: &Connection) -> Result<TwoFactorAuth, ClientError> {
-        use crate::auth::auth_protocol::AuthMessage;
+        use nexapipe_proto::auth::AuthMessage;
 
         let (mut send, mut recv) = conn
             .open_bi()
@@ -1027,7 +1028,7 @@ impl Enrollment {
 /// Writes one length-prefixed message.
 async fn write_message(
     send: &mut iroh::endpoint::SendStream,
-    message: &auth_protocol::AuthMessage,
+    message: &AuthMessage,
 ) -> Result<(), ClientError> {
     let bytes = message
         .to_bytes()
@@ -1042,9 +1043,7 @@ async fn write_message(
 }
 
 /// Reads one length-prefixed message.
-async fn read_message(
-    recv: &mut iroh::endpoint::RecvStream,
-) -> Result<auth_protocol::AuthMessage, ClientError> {
+async fn read_message(recv: &mut iroh::endpoint::RecvStream) -> Result<AuthMessage, ClientError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.map_err(|e| {
         ClientError::ConnectionFailed(format!("Failed to read message length: {e}"))
@@ -1061,21 +1060,21 @@ async fn read_message(
     recv.read_exact(&mut msg_buf)
         .await
         .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {e}")))?;
-    auth_protocol::AuthMessage::from_bytes(&msg_buf)
+    AuthMessage::from_bytes(&msg_buf)
         .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))
 }
 
 /// The `type` tag of a message, for errors that name what arrived.
-fn message_name(message: &auth_protocol::AuthMessage) -> &'static str {
+fn message_name(message: &AuthMessage) -> &'static str {
     match message {
-        auth_protocol::AuthMessage::Start { .. } => "AUTH_START",
-        auth_protocol::AuthMessage::Challenge { .. } => "AUTH_CHALLENGE",
-        auth_protocol::AuthMessage::Response { .. } => "AUTH_RESPONSE",
-        auth_protocol::AuthMessage::Ok => "AUTH_OK",
-        auth_protocol::AuthMessage::Failed { .. } => "AUTH_FAILED",
-        auth_protocol::AuthMessage::EnrollStart { .. } => "ENROLL_START",
-        auth_protocol::AuthMessage::EnrollIssue { .. } => "ENROLL_ISSUE",
-        auth_protocol::AuthMessage::EnrollFailed { .. } => "ENROLL_FAILED",
+        AuthMessage::Start { .. } => "AUTH_START",
+        AuthMessage::Challenge { .. } => "AUTH_CHALLENGE",
+        AuthMessage::Response { .. } => "AUTH_RESPONSE",
+        AuthMessage::Ok => "AUTH_OK",
+        AuthMessage::Failed { .. } => "AUTH_FAILED",
+        AuthMessage::EnrollStart { .. } => "ENROLL_START",
+        AuthMessage::EnrollIssue { .. } => "ENROLL_ISSUE",
+        AuthMessage::EnrollFailed { .. } => "ENROLL_FAILED",
     }
 }
 
@@ -1103,133 +1102,28 @@ pub fn generate_secret() -> String {
 
 /// Whether a device name the server will accept.
 ///
-/// The rule is the server's, mirrored here so an app can tell before it
-/// enrols rather than after: printable ASCII, space excluded, not empty, and
-/// short enough to sit in a config key and a log line. A hostname is the
-/// obvious thing to name a device after and the obvious way to break this —
-/// "MacBook Pro" has a space in it — so whatever builds a name has to put the
-/// rule somewhere it is applied rather than remembered.
-pub fn device_id_is_usable(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_DEVICE_ID_LEN
-        && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
-}
-
-/// Longest device name the server accepts.
+/// The rule is the server's, and it now lives with the server's: printable
+/// ASCII, space excluded, not empty, and short enough to sit in a config key
+/// and a log line. A hostname is the obvious thing to name a device after and
+/// the obvious way to break this — "MacBook Pro" has a space in it — so
+/// whatever builds a name has to put the rule somewhere it is applied rather
+/// than remembered.
 ///
-/// Mirrors `MAX_DEVICE_ID_LEN` in `crates/nexapipe/src/auth/protocol.rs`, which
-/// is where the refusal actually happens.
-pub const MAX_DEVICE_ID_LEN: usize = 255;
-
-/// Protocol messages for authentication handshake
-pub mod auth_protocol {
-    use serde::{Deserialize, Serialize};
-
-    use crate::secret::SecretString;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(tag = "type")]
-    pub enum AuthMessage {
-        #[serde(rename = "AUTH_START")]
-        Start {
-            client_id: String,
-            timestamp: i64,
-            /// Which of this client's devices is authenticating. Absent is the
-            /// device that was never given a name.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            device_id: Option<String>,
-        },
-        #[serde(rename = "AUTH_CHALLENGE")]
-        Challenge { nonce: Vec<u8> },
-        #[serde(rename = "AUTH_RESPONSE")]
-        Response {
-            client_id: String,
-            timestamp: i64,
-            /// The current TOTP code; empty when the device is known by a key,
-            /// whose proof is the signature alone.
-            totp_code: String,
-            /// HMAC-SHA256(secret, nonce || timestamp_le) over the challenge for
-            /// a secret-based credential, an Ed25519 signature over those same
-            /// bytes for a key-based one.
-            signature: Vec<u8>,
-            /// The device [`AuthMessage::Start`] named. The server picks the
-            /// credential to check this against from here, not from AUTH_START.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            device_id: Option<String>,
-        },
-        #[serde(rename = "AUTH_OK")]
-        Ok,
-        #[serde(rename = "AUTH_FAILED")]
-        Failed { reason: String },
-        /// Offer a one-time enrollment token instead of a secret.
-        ///
-        /// Keep in sync with `AuthMessage::EnrollStart` in
-        /// `crates/nexapipe/src/auth/protocol.rs`.
-        #[serde(rename = "ENROLL_START")]
-        EnrollStart {
-            client_id: String,
-            /// The one-time token, on its way to the server.
-            ///
-            /// A [`SecretString`], so the copy that arrived in this process is
-            /// wiped when the message is dropped; the one that travels is a
-            /// plain string, because the receiver has to compare it.
-            token: SecretString,
-            /// The name the device asking to enroll wants to be issued under.
-            /// Absent keeps the old behaviour: one secret for the client.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            device_id: Option<String>,
-            /// The device key this client is asking to be issued under, as the
-            /// public half of an Ed25519 key pair in lowercase hex.
-            ///
-            /// Absent for a client that has no key to offer. A server that
-            /// predates this field ignores it and issues a secret, so a client
-            /// offering one has to keep working with what it is given.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            public_key: Option<String>,
-        },
-        /// The credential the token stood in for, issued and the token burned.
-        #[serde(rename = "ENROLL_ISSUE")]
-        EnrollIssue {
-            client_id: String,
-            /// Base32 when a secret was issued; empty when the device was
-            /// issued a key instead, which is what the offered key bought.
-            ///
-            /// A [`SecretString`]: a credential that has just been issued is
-            /// the most valuable thing this process holds, and it is wiped
-            /// when the message is dropped.
-            secret: SecretString,
-            algorithm: String,
-            digits: u32,
-            period: u64,
-            /// The device this credential was issued for — the name the client
-            /// has to send back. Absent when the server answered an enrollment
-            /// that named no device.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            device_id: Option<String>,
-        },
-        /// The token was not accepted.
-        #[serde(rename = "ENROLL_FAILED")]
-        EnrollFailed { reason: String },
-    }
-
-    impl AuthMessage {
-        pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-            serde_json::to_vec(self)
-        }
-
-        pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-            serde_json::from_slice(bytes)
-        }
-    }
+/// An app can tell before it enrols rather than after, which is why it is
+/// here at all: [`nexapipe_proto::auth::is_presentable_device_id`] is the same
+/// rule, and this is the name it answers to on the client side.
+pub fn device_id_is_usable(id: &str) -> bool {
+    nexapipe_proto::auth::is_presentable_device_id(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceKey, Enrollment, IssuedCredential, MAX_DEVICE_ID_LEN, TotpAlgorithm, TwoFactorAuth,
-        TwoFactorConfig, auth_protocol::AuthMessage, device_id_is_usable,
+        AuthMessage, DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
+        TwoFactorConfig, device_id_is_usable,
     };
-    use crate::secret::SecretString;
+    use nexapipe_proto::auth::MAX_DEVICE_ID_LEN;
+    use nexapipe_proto::secret::SecretString;
 
     /// A `Debug` that prints a secret turns every log line, panic message and
     /// bug report that touches one into a credential disclosure — and these are

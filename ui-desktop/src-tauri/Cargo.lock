@@ -3600,7 +3600,6 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "libc",
- "ndk-context",
  "netstack-smoltcp",
  "nexapipe-proto",
  "once_cell",
@@ -3620,6 +3619,11 @@ dependencies = [
 [[package]]
 name = "nexapipe-proto"
 version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zeroize",
+]
 
 [[package]]
 name = "nix"
