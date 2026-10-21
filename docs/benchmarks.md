@@ -14,12 +14,13 @@ rather than a result — the reasoning behind that is in
 ## The most recent result
 
 **[`size-perf-roadmap.md`](size-perf-roadmap.md) §F1 has the table.** Measured on
-2026-10-21 at `7d24761` on an Apple M4 (16 GB, macOS 27.0.1), `rustc 1.99.1`:
+2026-10-21 on an Apple M4 (16 GB, macOS 27.0.1), `rustc 1.99.1` — the rows that
+have changed since are marked:
 
 | Bench | slope | The one-line reading |
 |---|---|---|
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
-| `tun_pump/ip_mapping` | **2,274 ns** | **a hotspot**: the mapping's whole job, measured against the 7,348 ns per-packet path |
+| `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |

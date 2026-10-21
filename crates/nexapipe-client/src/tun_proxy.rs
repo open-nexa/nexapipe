@@ -1044,7 +1044,15 @@ async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunContext) {
 ///
 /// Nothing is sniffed: the domain came from the destination address, so a raw
 /// binary protocol on any port works as well as TLS on 443.
-async fn serve_tcp_flow(stream: SmolTcpStream, ctx: TunContext, domain: String, port: u16) {
+///
+/// The domain is the shared name the address mapping handed out, so a flow
+/// that starts costs a reference count rather than a copy of the name.
+async fn serve_tcp_flow(
+    stream: SmolTcpStream,
+    ctx: TunContext,
+    domain: std::sync::Arc<str>,
+    port: u16,
+) {
     // The tunnel is opened before any payload is read, so the application sees
     // the connection go quiet rather than being told a connection exists that
     // the server has no route for.
@@ -1396,7 +1404,7 @@ async fn run_udp_flow(
     key: FlowKey,
     mine: mpsc::Sender<Vec<u8>>,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
-    domain: String,
+    domain: std::sync::Arc<str>,
 ) {
     let (client_addr, virtual_dst) = key;
     let port = virtual_dst.port();
@@ -2674,7 +2682,7 @@ mod tests {
             mapping.lookup_domain(&std::net::Ipv4Addr::new(
                 rdata[0], rdata[1], rdata[2], rdata[3]
             )),
-            Some("example.com".to_string()),
+            Some(std::sync::Arc::from("example.com")),
             "the answer has to route: the stack looks the destination up here"
         );
     }
@@ -2693,7 +2701,7 @@ mod tests {
         let address = std::net::Ipv6Addr::from(octets);
         assert_eq!(
             mapping.lookup_domain_v6(&address),
-            Some("example.com".to_string()),
+            Some(std::sync::Arc::from("example.com")),
             "the same reverse lookup the packet path uses"
         );
     }
