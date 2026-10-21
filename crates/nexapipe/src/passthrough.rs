@@ -13,7 +13,7 @@
 
 use crate::auth::ClientAcl;
 use crate::routes::RouteConfig;
-use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
+use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -71,16 +71,18 @@ pub async fn handle_iroh_stream(
 
     let client = DuplexIroh::new(send, recv);
     // The copy waits for **both** directions now, because a half-close is a
-    // request and not an ending — so it needs a bound of its own. The L4 path
-    // has had one all along (`l4_flow`, overridable per route); the
-    // passthrough had none, and a copy that waits for both ends needs one.
-    copy_both_ways_until(
-        client,
-        backend,
-        "TLS passthrough",
-        Some(config.timeouts().deadlines.l4_flow),
-    )
-    .await?;
+    // request and not an ending. That wait is bounded by the copy itself: once
+    // one direction ends, the other is given `LINGERING` (30 s) to finish, so a
+    // peer that vanished rather than half-closed cannot hold the stream.
+    //
+    // No whole-flow deadline is imposed here, and that is deliberate. A TLS
+    // session is legitimately long-lived — a WebSocket over TLS, an IMAP IDLE
+    // connection, a database session — and a passthrough route has no
+    // `flow_timeout_secs` for an operator to raise. Passing `l4_flow` here
+    // would cap every passthrough session at the default hour, which is a
+    // budget this path never asked for and a behaviour change the half-close
+    // fix does not need: the lingering bound is what keeps the wait finite.
+    copy_both_ways(client, backend, "TLS passthrough").await?;
     Ok(())
 }
 
@@ -109,13 +111,10 @@ pub async fn handle_tcp_stream(
     let mut backend = connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
 
-    copy_both_ways_until(
-        client,
-        backend,
-        "TLS passthrough",
-        Some(config.timeouts().deadlines.l4_flow),
-    )
-    .await?;
+    // The same copy as the iroh path above, with the same reasoning: the wait
+    // after a half-close is bounded by `LINGERING`, and a whole-flow deadline
+    // is not imposed on a path whose sessions are meant to be long-lived.
+    copy_both_ways(client, backend, "TLS passthrough").await?;
     Ok(())
 }
 

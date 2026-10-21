@@ -540,11 +540,9 @@ mod tests {
     #[tokio::test]
     async fn half_closes_the_client_when_the_backend_stops() {
         let (mut client_end, mut backend_end, client_side, backend_side) = pair();
-        // Bounded, for the same reason as the test above: the copy waits for
-        // the other direction, and here it is the client that never finishes.
-        // Bounded: the copy waits for the other direction, and a peer that
-        // vanished is indistinguishable from one that half-closed. The
-        // deadline is what tells the two apart.
+        // Bounded: the copy waits for the other direction, and here it is the
+        // client that never finishes. A peer that vanished is indistinguishable
+        // from one that half-closed, so the bound is what tells them apart.
         let copy = tokio::spawn(copy_both_ways_until(
             client_side,
             backend_side,
