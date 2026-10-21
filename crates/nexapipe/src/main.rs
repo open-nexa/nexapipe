@@ -535,13 +535,15 @@ async fn run_server_mode(
 
     // The config file's own permission is not a gate (ROADMAP §3.5), but a
     // credential in a file anybody can read is worth saying out loud once.
-    if let Some(cfg) = auth_config.as_ref() {
-        nexapipe::config::warn_about_readable_credentials(
-            std::path::Path::new(config_path),
-            proxy_config,
-            cfg,
-        );
-    }
+    //
+    // Called whether or not the file has an `[auth]` section: the `[iroh]`
+    // half is a credential on its own, and `config.toml.example` — like the
+    // generated first-run template — has no `[auth]` at all.
+    nexapipe::config::warn_about_readable_credentials(
+        std::path::Path::new(config_path),
+        proxy_config,
+        auth_config.as_ref(),
+    );
 
     // The `[peers]` allow-list. A malformed entry is fatal rather than dropped:
     // a list whose whole purpose is to refuse strangers must not silently come

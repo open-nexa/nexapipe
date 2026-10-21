@@ -1352,10 +1352,17 @@ impl ProxyConfig {
 /// Unix only, and it says so by doing nothing elsewhere: the permission bits
 /// are a Unix idea, and on Windows the file's ACL decides, which this does not
 /// read.
+///
+/// `auth` is the `[auth]` half of the same file, and it is `None` when the file
+/// has no such section — which is not the same as "no credential". A config
+/// that names an inline `[iroh]` key and no `[auth]` at all is a credential in
+/// the open, and it is the common case: the generated first-run template and
+/// `config.toml.example` both leave `[auth]` out. A warning that needed an
+/// `AuthConfig` to exist would be silent for exactly that file.
 pub fn warn_about_readable_credentials(
     path: &std::path::Path,
     proxy: &ProxyConfig,
-    auth: &crate::auth::AuthConfig,
+    auth: Option<&crate::auth::AuthConfig>,
 ) {
     if !should_warn_about_permissions(path, proxy, auth) {
         return;
@@ -1377,13 +1384,14 @@ pub fn warn_about_readable_credentials(
 pub fn should_warn_about_permissions(
     path: &std::path::Path,
     proxy: &ProxyConfig,
-    auth: &crate::auth::AuthConfig,
+    auth: Option<&crate::auth::AuthConfig>,
 ) -> bool {
     // A credential the file holds in the clear: an inline `[iroh]` key or
     // token, or a 2FA seed. One that lives in a sidecar file of its own is
     // not in this file, and that file is held to the `0600` rule in the
     // config's place — see `read_credential_file`.
-    if !proxy.holds_credentials() && !auth.holds_inline_secrets() {
+    let holds_a_seed = auth.is_some_and(|auth| auth.holds_inline_secrets());
+    if !proxy.holds_credentials() && !holds_a_seed {
         return false;
     }
     readable_by_others(path)
@@ -3504,19 +3512,49 @@ secret = "JBSWY3DPEHPK3PXP"
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("the mode is set");
         assert!(
-            !should_warn_about_permissions(&path, &proxy, &with_a_seed),
+            !should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
             "a file only its owner can read is not worth a warning"
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("the mode is set");
         assert!(
-            should_warn_about_permissions(&path, &proxy, &with_a_seed),
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
             "a seed in a file others can read is worth a warning"
         );
         assert!(
-            !should_warn_about_permissions(&path, &proxy, &without_a_seed),
+            !should_warn_about_permissions(&path, &proxy, Some(&without_a_seed)),
             "a file with no credential in it is not worth a warning"
+        );
+    }
+
+    /// A file with no `[auth]` section is not a file with no credential.
+    ///
+    /// An inline `[iroh]` key is a credential on its own, and the files this
+    /// server actually ships — `config.toml.example`, the generated first-run
+    /// template — have no `[auth]` at all. A warning that only ran when an
+    /// `AuthConfig` existed was silent for exactly those.
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_key_without_an_auth_section_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let with_a_key = parse("[iroh]\nsecret_key = \"00\"\n");
+        assert!(with_a_key.holds_credentials());
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("the file is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the mode is set");
+
+        assert!(
+            should_warn_about_permissions(&path, &with_a_key, None),
+            "an inline key in a readable file is worth a warning, [auth] or not"
+        );
+        assert!(
+            !should_warn_about_permissions(&path, &parse(""), None),
+            "a file with neither half holding a credential is not"
         );
     }
 
@@ -3545,7 +3583,7 @@ secret = "JBSWY3DPEHPK3PXP"
             .expect("the mode is set");
 
         assert!(
-            should_warn_about_permissions(&path, &proxy, &with_a_seed),
+            should_warn_about_permissions(&path, &proxy, Some(&with_a_seed)),
             "a group-readable file is readable by others"
         );
     }

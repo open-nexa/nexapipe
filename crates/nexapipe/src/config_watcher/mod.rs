@@ -268,12 +268,15 @@ impl ConfigWatcher {
                 (None, None)
             }
         };
-        // The same warning the startup path gives.
-        if let (Some(proxy), Some(cfg)) = (new_proxy.as_ref(), new_auth.as_ref()) {
+        // The same warning the startup path gives. It does not need the auth
+        // half to exist: a reload can bring in an inline `[iroh]` credential
+        // on a file with no `[auth]` section at all, and that is a credential
+        // in the open just the same.
+        if let Some(proxy) = new_proxy.as_ref() {
             crate::config::warn_about_readable_credentials(
                 std::path::Path::new(&self.config_path),
                 proxy,
-                cfg,
+                new_auth.as_ref(),
             );
         }
 
