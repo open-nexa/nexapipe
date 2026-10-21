@@ -117,6 +117,7 @@
     <string name="link_direct_body">Traffic goes straight to this endpoint</string>
     <string name="link_relay_body">Traffic goes through a relay server</string>
     <string name="link_connecting_body">Still working out the best path</string>
+    <string name="link_rtt">%1$d ms</string>
 
     <!-- Domains -->
     <string name="domains_title">Domains</string>

@@ -90,7 +90,8 @@
   "link": {
     "direct": "直连",
     "relay": "中继",
-    "connecting": "连接中"
+    "connecting": "连接中",
+    "rtt": "{count} 毫秒"
   },
   "health": {
     "up": "有响应",

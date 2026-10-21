@@ -102,6 +102,7 @@
     <string name="link_direct_body">流量直达该端点</string>
     <string name="link_relay_body">流量经由中继服务器转发</string>
     <string name="link_connecting_body">正在选择最佳路径</string>
+    <string name="link_rtt">延迟 %1$d 毫秒</string>
 
     <!-- 域名 -->
     <string name="domains_title">域名</string>

@@ -10,7 +10,7 @@ import type { LinkKind, NodeConfig, NodeHealth, NodeTraffic } from "../types";
 
 const { t } = useI18n();
 const { config, connectionMask } = useConfigStore();
-const { status, linkKindFor, healthFor, trafficFor } = useProxyStore();
+const { status, linkKindFor, rttFor, healthFor, trafficFor } = useProxyStore();
 
 /**
  * The endpoints traffic is actually going through right now, each with the kind of path it is
@@ -32,10 +32,19 @@ const nodes = computed(() =>
 
 const connected = computed(() =>
   nodes.value
-    .map((node) => ({ node, kind: linkKindFor(node), health: healthFor(node) }))
+    .map((node) => ({
+      node,
+      kind: linkKindFor(node),
+      rtt: rttFor(node),
+      health: healthFor(node),
+    }))
     .filter(
-      (entry): entry is { node: NodeConfig; kind: LinkKind; health: NodeHealth | null } =>
-        entry.kind !== null,
+      (entry): entry is {
+        node: NodeConfig;
+        kind: LinkKind;
+        rtt: number | null;
+        health: NodeHealth | null;
+      } => entry.kind !== null,
     ),
 );
 
@@ -78,6 +87,17 @@ function kindLabel(kind: LinkKind): string {
     : kind === "relay"
       ? t("link.relay")
       : t("link.connecting");
+}
+
+/**
+ * The round-trip time of the path, in the unit people read latency in.
+ *
+ * `null` means iroh has no sample yet — a path that has just opened, or one it cannot measure —
+ * and the row then says nothing at all rather than "0 ms", which would read as a measurement.
+ */
+function rttLabel(rtt: number | null): string | null {
+  if (rtt === null) return null;
+  return t("link.rtt", { count: rtt });
 }
 
 /**
@@ -165,6 +185,9 @@ const uniqueDomains = computed(() => {
           <span class="link-badge" :class="entry.kind">
             <AppIcon :name="kindIcon(entry.kind)" :size="12" />
             <span>{{ kindLabel(entry.kind) }}</span>
+          </span>
+          <span v-if="rttLabel(entry.rtt)" class="rtt-badge">
+            {{ rttLabel(entry.rtt) }}
           </span>
           <span
             v-if="entry.health"
@@ -576,6 +599,19 @@ const uniqueDomains = computed(() => {
 }
 
 .link-badge.unknown {
+  background: var(--surface-3);
+  color: var(--text-muted);
+}
+
+/* The latency of the path carrying the traffic: a reading, not a verdict, so it stays quiet. */
+.rtt-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 8px;
+  flex-shrink: 0;
   background: var(--surface-3);
   color: var(--text-muted);
 }

@@ -322,6 +322,24 @@ pub fn debug_log(msg: &str) {
     android_log(log::Level::Debug, msg);
 }
 
+/// A warning the Android build can show.
+///
+/// The Android logger is installed at `Info`, so a `Debug` line is dropped
+/// before it is ever formatted — and the Android build has no tracing
+/// subscriber to fall back on. A warning nobody can read is not a warning,
+/// so this one goes through the `log` crate at `Warn`.
+#[cfg(feature = "jni")]
+pub(crate) fn warn_log(msg: &str) {
+    android_log(log::Level::Warn, msg);
+}
+
+/// A line of information the Android build can show, on the same terms as
+/// [`warn_log`].
+#[cfg(feature = "jni")]
+pub(crate) fn info_log(msg: &str) {
+    android_log(log::Level::Info, msg);
+}
+
 /// Debug log that is a no-op when the `log` level filter is below `Debug`.
 ///
 /// The guard matters: without it every call site formatted its arguments into a `String`
@@ -2003,8 +2021,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
     }
 }
 
-/// How each configured backend is currently reached: one `<endpointId>=<kind>` pair per
-/// backend, joined with `;`, where `kind` is `direct`, `relay` or `unknown`.
+/// How each configured backend is currently reached, and how far away it is: one
+/// `<endpointId>=<kind>/<rttMs>` entry per backend, joined with `;`, where `kind` is `direct`,
+/// `relay` or `unknown` and `rttMs` is the round-trip time in milliseconds, or `-` when iroh has
+/// no sample yet.
 ///
 /// This is the *runtime* answer, read off the paths iroh actually selected — not the relay URL
 /// from the configuration, which only names a relay that may be used. A backend that has never
@@ -2044,20 +2064,20 @@ fn link_kinds(env: &mut Env<'_>) -> jstring {
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.link_kinds().await })
+        runtime.block_on(async move { endpoint_group.link_statuses().await })
     }));
 
-    let kinds = match result {
-        Ok(kinds) => kinds,
+    let statuses = match result {
+        Ok(statuses) => statuses,
         Err(_) => {
             jni_log!("[DEBUG:jni] Panic occurred during nativeLinkKinds");
             return std::ptr::null_mut();
         }
     };
 
-    let encoded = kinds
+    let encoded = statuses
         .iter()
-        .map(|(id, kind)| format!("{}={}", id, kind.as_str()))
+        .map(|(id, status)| crate::connection_pool::encode_link_status(id, status))
         .collect::<Vec<_>>()
         .join(";");
 
