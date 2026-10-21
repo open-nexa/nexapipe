@@ -323,21 +323,6 @@ impl Route {
     pub fn path_rewrite(&self) -> &Option<String> {
         &self.path_rewrite
     }
-
-    pub fn rewrite_path(&self, original_path: &str) -> String {
-        if let Some(rewrite_pattern) = &self.path_rewrite {
-            if self.path_is_prefix && original_path.starts_with(&self.path_pattern) {
-                let suffix = &original_path[self.path_pattern.len()..];
-                rewrite_pattern.replace("{}", suffix)
-            } else if !self.path_is_prefix && original_path == self.path_pattern {
-                rewrite_pattern.replace("{}", "")
-            } else {
-                original_path.to_string()
-            }
-        } else {
-            original_path.to_string()
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -467,6 +452,32 @@ impl BackendInfo {
     pub fn report_failure(&self) {
         if let Some(lease) = &self._lease {
             lease.record_failure();
+        }
+    }
+
+    /// The path this request is forwarded with, after the route's rewrite.
+    ///
+    /// A route may say "the paths under `/api` are served as `/v2`", by
+    /// pairing a `path_pattern` with a `path_rewrite` that holds a `{}` where
+    /// the matched part goes. A request whose path does not match the pattern
+    /// is forwarded unchanged.
+    ///
+    /// The rule lives here, on the one type that carries the three things it
+    /// needs, because it used to live in two places and be applied in one of
+    /// them. The plaintext listener rewrote the path; the tunnel path did not,
+    /// and a route that named a rewrite looked configured and worked against
+    /// `curl` and did nothing for every real client.
+    pub fn rewritten_path(&self, original_path: &str) -> String {
+        let Some(rewrite_pattern) = &self.path_rewrite else {
+            return original_path.to_string();
+        };
+        if self.path_is_prefix && original_path.starts_with(&self.path_pattern) {
+            let suffix = &original_path[self.path_pattern.len()..];
+            rewrite_pattern.replace("{}", suffix)
+        } else if !self.path_is_prefix && original_path == self.path_pattern {
+            rewrite_pattern.replace("{}", "")
+        } else {
+            original_path.to_string()
         }
     }
 }

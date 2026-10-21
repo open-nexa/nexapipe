@@ -577,8 +577,7 @@ pub async fn handle_bidi_stream(
                 recv,
                 &request,
                 clients,
-                &backend_info.url,
-                backend_info.protocol,
+                &backend_info,
                 config.timeouts(),
             )
             .await
@@ -617,8 +616,7 @@ pub async fn handle_bidi_stream(
                     clients,
                     config.timeouts(),
                     &request,
-                    &backend.url,
-                    backend.protocol,
+                    &backend,
                     body,
                     &mut send,
                     request_id,
@@ -738,60 +736,37 @@ pub async fn handle_bidi_stream(
 // out would make the same two waits configurable for one kind of request and not
 // another, which nobody reading the config could guess.
 
-/// Returns the status the client was answered with: 101 once the tunnel is up,
-/// or whatever the backend answered when it refused the upgrade. Bytes are the
-/// handshake response only — once both directions are piped the session has no
-/// finite length to report.
-async fn handle_websocket_stream(
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+/// The upgrade request as it goes to the backend.
+///
+/// The path is the one the route rewrote it to: a route that names a
+/// `path_rewrite` means it for every request it serves, and an upgrade is a
+/// request too. The plaintext listener answers an upgrade with 426, so this
+/// is the only place a WebSocket is ever served — and it used to forward the
+/// path the client asked for, without the rewrite.
+///
+/// The headers are the client's own, minus the `Host`, which is rewritten to
+/// the one the client asked for — the backend answers on the name the client
+/// used, not on the name it is reached by.
+fn build_websocket_upgrade_request(
     req: &Request<()>,
-    clients: &BackendClients,
-    backend_url: &str,
-    protocol: BackendProtocol,
-    timeouts: Timeouts,
-) -> Result<http::ProxySummary, http::ProxyFailure> {
-    let url =
-        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
-
-    if protocol == BackendProtocol::H2c {
-        // A WebSocket upgrade is HTTP/1.1. A route that speaks h2c has told
-        // the server its backend starts with HTTP/2's connection preface, and
-        // there is no way to carry an HTTP/1.1 upgrade on that connection.
-        return Err(http::ProxyFailure::from(anyhow::anyhow!(
-            "backend {backend_url} is reached with backend_protocol = \"h2c\", which cannot \
-             carry a WebSocket upgrade; use an http:// or https:// backend that speaks HTTP/1.1"
-        )));
-    }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-    let original_host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| host.to_string());
-
-    // Not the pooled HTTP client: a WebSocket holds one dedicated connection
-    // for the whole session, so this dial is its own, with the same deadline.
-    // It is still the same trust store: an https:// backend is reached over a
-    // TLS session this process originates and verifies, exactly as the pooled
-    // clients do.
-    let mut backend_stream = clients
-        .connect_stream(backend_url, timeouts.connect)
-        .await
-        .map_err(|e| http::ProxyFailure::unanswered(e, http::Retryability::Always))?;
-
+    backend_info: &BackendInfo,
+    backend_host: &str,
+) -> Vec<u8> {
     let path = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(req.uri().path());
+    let path = backend_info.rewritten_path(path);
 
     let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
+
+    let original_host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| backend_host.to_string());
 
     let mut request_buf = Vec::new();
     request_buf.extend_from_slice(request_line.as_bytes());
@@ -809,6 +784,53 @@ async fn handle_websocket_stream(
         request_buf.extend_from_slice(b"\r\n");
     }
     request_buf.extend_from_slice(b"\r\n");
+
+    request_buf
+}
+
+/// Returns the status the client was answered with: 101 once the tunnel is up,
+/// or whatever the backend answered when it refused the upgrade. Bytes are the
+/// handshake response only — once both directions are piped the session has no
+/// finite length to report.
+async fn handle_websocket_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    req: &Request<()>,
+    clients: &BackendClients,
+    backend_info: &BackendInfo,
+    timeouts: Timeouts,
+) -> Result<http::ProxySummary, http::ProxyFailure> {
+    let backend_url = backend_info.url.as_str();
+    let protocol = backend_info.protocol;
+    let url =
+        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+
+    if protocol == BackendProtocol::H2c {
+        // A WebSocket upgrade is HTTP/1.1. A route that speaks h2c has told
+        // the server its backend starts with HTTP/2's connection preface, and
+        // there is no way to carry an HTTP/1.1 upgrade on that connection.
+        return Err(http::ProxyFailure::from(anyhow::anyhow!(
+            "backend {backend_url} is reached with backend_protocol = \"h2c\", which cannot \
+             carry a WebSocket upgrade; use an http:// or https:// backend that speaks HTTP/1.1"
+        )));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    // Not the pooled HTTP client: a WebSocket holds one dedicated connection
+    // for the whole session, so this dial is its own, with the same deadline.
+    // It is still the same trust store: an https:// backend is reached over a
+    // TLS session this process originates and verifies, exactly as the pooled
+    // clients do.
+    let mut backend_stream = clients
+        .connect_stream(backend_url, timeouts.connect)
+        .await
+        .map_err(|e| http::ProxyFailure::unanswered(e, http::Retryability::Always))?;
+
+    let request_buf = build_websocket_upgrade_request(req, backend_info, host);
 
     backend_stream.write_all(&request_buf).await.map_err(|e| {
         http::ProxyFailure::unanswered(
@@ -2536,8 +2558,9 @@ pub async fn handle_incoming(
 mod tests {
     use super::{
         EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
-        blocking_config_write, constant_time_eq, enrollment_verdict, find_headers_end,
-        issue_enrolled_secret, read_stream_head, undo_enrolled_secret,
+        blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, read_stream_head,
+        undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_client::secret::SecretString;
@@ -3092,5 +3115,79 @@ mod tests {
             },
         );
         cfg
+    }
+
+    /// A route table whose route rewrites the paths under `pattern`.
+    ///
+    /// The rewrite is what a route pairs a `path_pattern` with: the paths
+    /// that match are served somewhere else, and `{}` in the rewrite is where
+    /// the matched part goes.
+    fn route_table_with_rewrite(
+        pattern: &str,
+        rewrite: &str,
+    ) -> std::sync::Arc<crate::routes::RouteConfig> {
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "rewrite.test",
+            pattern,
+            true,
+            vec!["http://127.0.0.1:9".to_string()],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            Some(rewrite.to_string()),
+        );
+        std::sync::Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry {
+                attempts: 1,
+                backoff: std::time::Duration::ZERO,
+            },
+        ))
+    }
+
+    /// A WebSocket upgrade goes out with the route's rewritten path.
+    ///
+    /// The upgrade is a request like any other, and a route that names a
+    /// `path_rewrite` means it for every request it serves. The plaintext
+    /// listener answers an upgrade with 426 and never gets that far, so the
+    /// tunnel is the only place a WebSocket is served — and it used to
+    /// forward the path the client asked for, without the rewrite. A route
+    /// that named one therefore looked configured and did nothing for every
+    /// WebSocket client.
+    #[tokio::test]
+    async fn a_websocket_upgrade_goes_out_with_the_rewritten_path() {
+        let config = route_table_with_rewrite("/api", "/v2{}");
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/socket", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let request = ::http::Request::builder()
+            .method("GET")
+            .uri("http://rewrite.test/api/socket")
+            .header("host", "rewrite.test")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(())
+            .expect("a request");
+
+        let request_buf = build_websocket_upgrade_request(&request, &backend_info, "127.0.0.1");
+
+        let request_line = String::from_utf8_lossy(&request_buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            request_line, "GET /v2/socket HTTP/1.1",
+            "the upgrade did not go out with the route's rewritten path"
+        );
     }
 }

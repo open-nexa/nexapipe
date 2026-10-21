@@ -642,17 +642,37 @@ class NexaVpnService : VpnService() {
             Log.d(TAG, "Starting TUN proxy: fd=$fd, " +
                     "proxyDomains=${allowedDomains.size} items")
 
-            val result = IrohProxy.nativeStartTunProxy(
-                fd, proxyDomainsStr
-            )
+            // The native side takes ownership of the descriptor: it closes it
+            // on every path, including the ones that fail, because the
+            // ownership transfer happens at the JNI boundary and it happens
+            // once. So this side must not close it after the call — a second
+            // close of a number the process may already have handed to
+            // something else closes that instead, and the failure is silent.
+            //
+            // The one case where it is still ours is a native method that was
+            // never entered at all, and that is what a `LinkageError` means:
+            // the library or the method is not there. Anything else that
+            // comes out of the call means the native method ran — it took the
+            // descriptor and closed it on its way out — so closing it here
+            // would be the second close this whole change is about.
+            val result = try {
+                IrohProxy.nativeStartTunProxy(
+                    fd, proxyDomainsStr
+                )
+            } catch (e: Throwable) {
+                if (e is LinkageError) {
+                    Log.e(TAG, "nativeStartTunProxy could not be called at all", e)
+                    try {
+                        ParcelFileDescriptor.adoptFd(fd).close()
+                    } catch (_: Exception) {}
+                } else {
+                    Log.e(TAG, "nativeStartTunProxy threw after taking the fd", e)
+                }
+                throw e
+            }
 
             if (result != 0) {
-                Log.e(TAG, "Failed to start TUN proxy: $result, closing fd")
-                // When nativeStartTunProxy fails Rust never took ownership of
-                // the fd, so close it here.
-                try {
-                    ParcelFileDescriptor.adoptFd(fd).close()
-                } catch (_: Exception) {}
+                Log.e(TAG, "Failed to start TUN proxy: $result")
                 tunProxyStarted = false
                 return false
             }

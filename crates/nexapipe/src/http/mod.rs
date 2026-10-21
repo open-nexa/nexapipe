@@ -755,18 +755,7 @@ async fn attempt_backend(
     let client = clients.for_protocol(backend_info.protocol);
     let response_deadline = config.timeouts().response;
 
-    let rewritten_path = if let Some(rewrite_pattern) = &backend_info.path_rewrite {
-        if backend_info.path_is_prefix && path.starts_with(&backend_info.path_pattern) {
-            let suffix = &path[backend_info.path_pattern.len()..];
-            rewrite_pattern.replace("{}", suffix)
-        } else if !backend_info.path_is_prefix && path == backend_info.path_pattern {
-            rewrite_pattern.replace("{}", "")
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    };
+    let rewritten_path = backend_info.rewritten_path(path);
 
     let backend_url = url::Url::parse(&backend_info.url)
         .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
@@ -1296,29 +1285,23 @@ pub async fn read_request_body(
     })
 }
 
-// One more argument than clippy allows: the alternative is a struct bundling the
-// client with its deadlines, which every caller would have to build in order to
-// pass the same two things — see the note on `conn::handle_bidi_stream`.
-#[allow(clippy::too_many_arguments)]
-pub async fn proxy_to_backend_streaming(
-    clients: &BackendClients,
-    // How long the backend may take to answer. Not read off the client, because
-    // it is not the client's: the client owns the deadline for every dial, this
-    // is the one for a single answer. See `crate::config::Timeouts`.
-    timeouts: crate::config::Timeouts,
+/// The request as it goes to the backend.
+///
+/// The path is the one the route rewrote it to — a route that pairs a
+/// `path_pattern` with a `path_rewrite` serves the matched paths somewhere
+/// else, and this is where that happens on the tunnel path. It used to happen
+/// only on the plaintext path, so a rewrite looked configured and did nothing
+/// for every real client.
+///
+/// The headers are the client's own, minus the ones that only meant something
+/// for the hop from the client to here.
+fn build_backend_request(
     req: &Request<()>,
-    backend_url: &str,
-    // The protocol this backend is spoken to, which decides the client. It
-    // comes from the route rather than from the URL, because the same URL is
-    // reached differently depending on what the route says.
-    protocol: BackendProtocol,
+    backend_info: &BackendInfo,
     body: &RequestBody,
-    send: &mut iroh::endpoint::SendStream,
-    request_id: &str,
-) -> Result<ProxySummary, ProxyFailure> {
-    let client = clients.for_protocol(protocol);
-    let url =
-        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
+) -> Result<Request<Full<bytes::Bytes>>, anyhow::Error> {
+    let url = url::Url::parse(&backend_info.url)
+        .map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
 
     let host = url
         .host_str()
@@ -1332,7 +1315,9 @@ pub async fn proxy_to_backend_streaming(
         .map(|pq| pq.as_str())
         .unwrap_or(req.uri().path());
 
-    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, path)
+    let rewritten_path = backend_info.rewritten_path(path);
+
+    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, rewritten_path)
         .parse::<http::Uri>()
         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
@@ -1367,7 +1352,34 @@ pub async fn proxy_to_backend_streaming(
         builder = builder.header("content-length", content_length);
     }
 
-    let proxied_req = builder.body(Full::new(body.bytes.clone().into()))?;
+    Ok(builder.body(Full::new(body.bytes.clone().into()))?)
+}
+
+// One more argument than clippy allows: the alternative is a struct bundling the
+// client with its deadlines, which every caller would have to build in order to
+// pass the same two things — see the note on `conn::handle_bidi_stream`.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_to_backend_streaming(
+    clients: &BackendClients,
+    // How long the backend may take to answer. Not read off the client, because
+    // it is not the client's: the client owns the deadline for every dial, this
+    // is the one for a single answer. See `crate::config::Timeouts`.
+    timeouts: crate::config::Timeouts,
+    req: &Request<()>,
+    // Where this request goes, and how it gets there. The route decided both:
+    // the address, the protocol, and the rewrite the path goes through.
+    //
+    // This used to be the URL and the protocol as two separate arguments, with
+    // the rewrite left out — which is how a route that named a `path_rewrite`
+    // looked configured and did nothing here.
+    backend_info: &BackendInfo,
+    body: &RequestBody,
+    send: &mut iroh::endpoint::SendStream,
+    request_id: &str,
+) -> Result<ProxySummary, ProxyFailure> {
+    let client = clients.for_protocol(backend_info.protocol);
+
+    let proxied_req = build_backend_request(req, backend_info, body)?;
 
     tracing::debug!(
         "Proxying request via client (streaming): {} {}",
@@ -3040,6 +3052,140 @@ mod transport {
             .header("host", host)
             .body(Full::new(bytes::Bytes::new()))
             .expect("a request")
+    }
+
+    /// A route table whose route rewrites the paths under `pattern`.
+    ///
+    /// The rewrite is what a route pairs a `path_pattern` with: the paths
+    /// that match are served somewhere else, and `{}` in the rewrite is where
+    /// the matched part goes.
+    ///
+    /// The `{}` holds the part of the path *after* the pattern, separator and
+    /// all — so a rewrite of `/v2{}` turns `/api/users` into `/v2/users`, and
+    /// `/v2/{}` would turn it into `/v2//users`. That is the rule the
+    /// plaintext path has always used, and this change does not alter it; it
+    /// only makes the tunnel path use the same one.
+    fn route_table_with_rewrite(
+        backend: String,
+        pattern: &str,
+        rewrite: &str,
+    ) -> Arc<crate::routes::RouteConfig> {
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "rewrite.test",
+            pattern,
+            true,
+            vec![backend],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            Some(rewrite.to_string()),
+        );
+        Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry {
+                attempts: 1,
+                backoff: std::time::Duration::ZERO,
+            },
+        ))
+    }
+
+    /// The request as the tunnel path puts it on the wire, for a path the
+    /// route rewrites.
+    ///
+    /// The tunnel path is the one that carries real traffic, and it used to
+    /// forward the path the client asked for without the rewrite — so a route
+    /// that named one looked configured and did nothing for every client that
+    /// went through the tunnel. `curl` against the plaintext listener saw the
+    /// rewrite; the app did not.
+    #[tokio::test]
+    async fn the_tunnel_path_forwards_the_rewritten_path() {
+        let config = route_table_with_rewrite("http://127.0.0.1:9".to_string(), "/api", "/v2{}");
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/users", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://rewrite.test/api/users")
+            .header("host", "rewrite.test")
+            .body(())
+            .expect("a request");
+        let body = RequestBody {
+            bytes: Vec::new(),
+            content_length: None,
+            reservation: crate::conn::limits::ByteReservation::empty(),
+        };
+
+        let forwarded = build_backend_request(&request, &backend_info, &body)
+            .expect("a request for the backend");
+
+        assert_eq!(
+            forwarded.uri().path(),
+            "/v2/users",
+            "the tunnel path did not apply the route's rewrite"
+        );
+    }
+
+    /// A route that names one exact path serves it somewhere else entirely.
+    ///
+    /// The other shape a rewrite takes: the route matches one path rather than
+    /// a prefix, and the rewrite has no `{}` to fill — the matched part is
+    /// the whole path, and the suffix is empty.
+    #[tokio::test]
+    async fn an_exact_path_is_rewritten_without_a_suffix() {
+        let timeouts = crate::config::Timeouts {
+            connect: std::time::Duration::from_secs(1),
+            response: std::time::Duration::from_secs(1),
+            deadlines: crate::deadline::Deadlines::default(),
+        };
+        let route = crate::routes::Route::new(
+            "rewrite.test",
+            "/api/status",
+            false,
+            vec!["http://127.0.0.1:9".to_string()],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            Some("/internal/status".to_string()),
+        );
+        let config = Arc::new(crate::routes::RouteConfig::with_settings(
+            vec![route],
+            timeouts,
+            crate::config::Retry {
+                attempts: 1,
+                backoff: std::time::Duration::ZERO,
+            },
+        ));
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/status", None, None)
+            .await
+            .backend()
+            .expect("a route for the path");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://rewrite.test/api/status")
+            .header("host", "rewrite.test")
+            .body(())
+            .expect("a request");
+        let body = RequestBody {
+            bytes: Vec::new(),
+            content_length: None,
+            reservation: crate::conn::limits::ByteReservation::empty(),
+        };
+
+        let forwarded = build_backend_request(&request, &backend_info, &body)
+            .expect("a request for the backend");
+
+        assert_eq!(forwarded.uri().path(), "/internal/status");
     }
 
     /// A request that failed against one backend is tried against the next.
