@@ -322,6 +322,24 @@ pub fn debug_log(msg: &str) {
     android_log(log::Level::Debug, msg);
 }
 
+/// A warning the Android build can show.
+///
+/// The Android logger is installed at `Info`, so a `Debug` line is dropped
+/// before it is ever formatted — and the Android build has no tracing
+/// subscriber to fall back on. A warning nobody can read is not a warning,
+/// so this one goes through the `log` crate at `Warn`.
+#[cfg(feature = "jni")]
+pub(crate) fn warn_log(msg: &str) {
+    android_log(log::Level::Warn, msg);
+}
+
+/// A line of information the Android build can show, on the same terms as
+/// [`warn_log`].
+#[cfg(feature = "jni")]
+pub(crate) fn info_log(msg: &str) {
+    android_log(log::Level::Info, msg);
+}
+
 /// Debug log that is a no-op when the `log` level filter is below `Debug`.
 ///
 /// The guard matters: without it every call site formatted its arguments into a `String`

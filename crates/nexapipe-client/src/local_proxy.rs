@@ -295,6 +295,7 @@ impl LocalProxy {
         endpoint_group: Arc<EndpointGroup>,
         proxy_domains: Vec<String>,
     ) -> Self {
+        report_domain_patterns(&proxy_domains);
         Self {
             listener,
             endpoint_group,
@@ -1642,20 +1643,64 @@ where
 }
 
 pub(crate) fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
-    let host_lower = host.to_lowercase();
-    for domain in proxy_domains {
-        let domain_lower = domain.to_lowercase();
-        if let Some(suffix) = domain_lower.strip_prefix('*') {
-            if host_lower.ends_with(suffix) {
-                return true;
-            }
-        } else if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower))
-        {
-            return true;
-        }
-    }
-    false
+    crate::domains::should_proxy_domain(host, proxy_domains)
 }
+
+/// Say what a list of proxy-domain patterns is worth, once, when a client starts.
+///
+/// Two kinds of note, and they are not the same kind. A pattern that matches
+/// **nothing** is a warning: `*example.com` — a wildcard without the dot —
+/// used to be a bare `ends_with` here, so it matched `notexample.com` as well,
+/// and the server has always refused the spelling. A pattern that means one
+/// name where a reader may expect a whole tree is worth an information line
+/// and no more: a bare `example.com` names that host, and `*.example.com`
+/// names its subdomains.
+pub(crate) fn report_domain_patterns(patterns: &[String]) {
+    let notes = crate::domains::domain_notes(patterns);
+    for (pattern, why) in &notes.unusable {
+        warn(&format!(
+            "the proxy-domain pattern \"{pattern}\" matches nothing: {why}"
+        ));
+    }
+    for pattern in &notes.narrowed {
+        info(&format!(
+            "the proxy-domain pattern \"{pattern}\" names that host only; \"*.{pattern}\" covers \
+             its subdomains"
+        ));
+    }
+}
+
+/// A warning the user can read.
+///
+/// The Android build installs the `log` logger at `Info` and no tracing
+/// subscriber, so a `Debug` line never reaches the log and a `tracing` line
+/// goes nowhere.
+#[cfg(feature = "jni")]
+fn warn(message: &str) {
+    crate::jni::warn_log(message);
+}
+
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+fn warn(message: &str) {
+    tracing::warn!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
+fn warn(_message: &str) {}
+
+/// A line of information the user can read, on the same terms as [`warn`].
+#[cfg(feature = "jni")]
+fn info(message: &str) {
+    crate::jni::info_log(message);
+}
+
+#[cfg(all(not(feature = "jni"), feature = "tracing"))]
+fn info(message: &str) {
+    tracing::info!("{message}");
+}
+
+#[cfg(all(not(feature = "jni"), not(feature = "tracing")))]
+fn info(_message: &str) {}
 
 #[cfg(test)]
 mod tests {

@@ -12,12 +12,13 @@ For what comes next, and for why some things are deliberately not planned, see
 
 ## [Unreleased]
 
-Four things land in this cycle so far: the device credential can be a **key**
+Five things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
-circuit-broken — and the ceilings the process runs under are now something a
-config file can say rather than only an environment variable can. No existing
+circuit-broken — the ceilings the process runs under are now something a
+config file can say rather than only an environment variable can, and a name is
+spelled the same way in a client's list and in the server's routes. No existing
 configuration key is removed or renamed, and the ones this cycle adds —
 `public_key` under a device entry, the six `[timeouts]` phase keys, `[limits]`,
 `[backends] ca_file`, `[retry]` and `[circuit_breaker]` — are optional, so a
@@ -136,8 +137,63 @@ its defaults — which are on.
   the tunnel's streaming path and a WebSocket handshake all feed the counter; a
   session that dies after the upgrade does not.
 
+- **`allow_ports` limits a client to the services it may reach.** `allow_hosts`
+  says which *names* a client may reach, and a name is not a service: a host
+  that answers on three ports is one name and three things to reach. The new
+  key is the other half of the same question — `allow_ports = [443, 8443]` —
+  and the two are independent: a client may be limited to one host and every
+  port, or every host and one port.
+  Checked where the client names a port. The tunnel preface always names one,
+  and an HTTP request's `Host` header may; a request that names no port is not
+  checked, because there is no port to hold against it. A TLS passthrough is
+  not checked either: the route picks the port and the client never names one.
+  What the list separates is the tunnel: the preface names the service the
+  client wants, and the route decides where that service is answered from —
+  `client_ports` only picks the route, it never decides where the connection
+  goes. So the port the preface names is the service the client reached, and
+  that is the port the list is held against. The HTTP path routes by host
+  alone, so a port named in a `Host` header is checked but is not the port the
+  request is served from — two services of one host are told apart by the
+  tunnel, not by this list.
+  A refusal looks exactly like "no route" — a 404, a `NoRoute`, a hang-up —
+  so it cannot be used to probe what is open behind the proxy. Left unset, a
+  client keeps the reach it had; an empty list denies every port that is
+  checked. The reading `allow_hosts = []` has is the stricter of the two: it
+  denies every name, with no path around it, while a port is only denied
+  where one is checked.
+  A port of zero is refused at startup, because no client ever asks for it.
+
 ### Changed
 
+- **The client's list of names and the server's routes are spelled the same
+  way.** A pattern is a name (`app.example.com`), a dotted wildcard
+  (`*.example.com` — its subdomains, and not the name itself) or the
+  catch-all (`*`), on both sides. Three places used to answer "is this name
+  mine?" differently: the server matched a request or a preface against a
+  route's `host_pattern` strictly, the client read a bare domain as the name
+  *and* every subdomain, and the desktop carried a second copy of the
+  client's rule that only applied on some platforms — on Windows a query is
+  local-delivered to the app's own DNS server and on macOS and Linux it
+  reaches the library's, so the same config answered differently depending on
+  the machine. The rule now lives in `nexapipe-proto`, which both sides
+  already link.
+
+  **This changes what a bare domain means in a client's list.** `example.com`
+  used to mean the name and every subdomain on the client; it means the name
+  alone now, which is what the server always read it as. A client that wants
+  the subdomains writes `*.example.com`, and a client carrying an older list
+  says so in its log, once, at startup. A wildcard without the dot
+  (`*example.com`) used to be a bare `ends_with` on the client and matched
+  `notexample.com` with it; it matches nothing now, and the server has always
+  refused the spelling. The dot-prefixed spelling (`.example.com`) is refused
+  as well: it is the suffix form a resolver uses, not a pattern here.
+  The client's own lookup of the backend that serves a name follows the same
+  rule now: a wildcard mapping serves the names it covers, a bare mapping
+  serves its own name alone, and a name written the way DNS writes it — with
+  the trailing dot — finds the same backend. A client that configured
+  `*.example.com` used to decide that `www.example.com` belonged in the
+  tunnel and then fail to find the backend for it, so the request went to the
+  default backend or to none.
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which
   kind of credential a device has comes from the server's own record, not
   from a wire discriminator, so no message variant or scheme field was added,

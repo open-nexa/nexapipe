@@ -564,6 +564,7 @@ mod tests {
             secret: SecretString::new(secret.to_string()),
             created_at: "0".to_string(),
             allow_hosts: None,
+            allow_ports: None,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
