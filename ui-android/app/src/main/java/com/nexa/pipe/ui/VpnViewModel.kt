@@ -1358,6 +1358,10 @@ class VpnViewModel : ViewModel() {
     fun checkVpnPermission(context: Context): Boolean {
         val granted = VpnService.prepare(context) == null
         vpnPermissionGranted.value = granted
+        // The manager is built on demand rather than skipped: the flag below is
+        // what the settings page reads, and a flag that is only written when
+        // the manager happens to be there is a flag that is sometimes missing.
+        val manager = settingsManager ?: SettingsManager(context).also { settingsManager = it }
         if (granted) {
             // The permission is back, so the warning the boot path left behind
             // is no longer true. Nothing else clears it: the boot path only
@@ -1370,11 +1374,17 @@ class VpnViewModel : ViewModel() {
             // not at all: a screen that says there is no warning while the
             // stored flag says there is one is a screen that contradicts
             // itself the next time the settings are read back.
-            val manager = settingsManager
-            if (manager != null) {
-                manager.saveVpnConsentMissing(false)
-                vpnConsentMissing.value = false
-            }
+            manager.saveVpnConsentMissing(false)
+            vpnConsentMissing.value = false
+        } else {
+            // The consent is missing and the app knows it: the flag is what
+            // tells the user the tunnel will not come back at the next
+            // restart. The boot path writes it too, but the consent can be
+            // withdrawn long after the last boot — and a warning that only
+            // arrives with the next boot is a warning the user had no chance
+            // to act on.
+            manager.saveVpnConsentMissing(true)
+            vpnConsentMissing.value = true
         }
         return granted
     }
