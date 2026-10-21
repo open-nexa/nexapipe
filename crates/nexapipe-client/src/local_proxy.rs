@@ -78,7 +78,15 @@ fn redacted_headers(headers: &::http::HeaderMap) -> String {
     out
 }
 
-const STREAM_BUF_SIZE: usize = 128 * 1024;
+/// The buffer one copy of a stream reads into.
+///
+/// **32 KiB**, which is what the server uses for the same job, and about what
+/// a socket read fills anyway. The buffer does not decide how fast a stream
+/// goes — the copy is a pipeline, and the size of the buffer is the size of
+/// one write — but it decides what a connection costs: the local proxy holds
+/// one of these while it reads a request, and a tunnel holds two, one per
+/// direction.
+const STREAM_BUF_SIZE: usize = 32 * 1024;
 
 /// Largest request header the local proxy collects, before it gives up on a
 /// peer that never ends one. Same order as the server's own head limit, and

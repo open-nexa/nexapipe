@@ -108,7 +108,11 @@ impl ConfigWatcher {
     }
 
     pub async fn start_watch(&self) {
-        let mut last_modified = std::fs::metadata(&self.config_path)
+        // The asynchronous one, like the check below: a synchronous
+        // `std::fs::metadata` in an async function blocks the runtime's
+        // thread, and the runtime has few of them.
+        let mut last_modified = fs::metadata(&self.config_path)
+            .await
             .map(|m| m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
@@ -234,10 +238,29 @@ impl ConfigWatcher {
             .map(|(id, client)| (id.clone(), client.devices.keys().cloned().collect()))
             .collect();
 
-        let new_auth = match ProxyConfig::load_with_auth(&self.config_path) {
-            Ok((_, auth)) => auth,
-            Err(e) => {
+        // The read is a file read and a TOML parse, and both of them are
+        // synchronous. Done on a blocking thread, so the worker this runs on is
+        // not parked in `read(2)` while every other task queued behind it
+        // waits for the disk.
+        //
+        // The lock is still held across it, and it has to be: the enrollment
+        // race above is real, and a read outside the lock would put the spent
+        // token and the pre-enrollment secret back. What moves is the *cost* of
+        // the read, not the read.
+        let config_path = self.config_path.clone();
+        let loaded =
+            tokio::task::spawn_blocking(move || ProxyConfig::load_with_auth(&config_path)).await;
+        let new_auth = match loaded {
+            Ok(Ok((_, auth))) => auth,
+            Ok(Err(e)) => {
                 tracing::error!("2FA clients not reloaded, keeping the current ones: {}", e);
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    "2FA clients not reloaded, keeping the current ones: the read did not run: {}",
+                    e
+                );
                 None
             }
         };
@@ -514,6 +537,7 @@ mod tests {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,

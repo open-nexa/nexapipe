@@ -13,6 +13,9 @@ rather than a result — the reasoning behind that is in
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
+And one measurement that is not a bench, because what it measures is memory
+and not time: [`tun_flow_memory`](#what-a-flow-costs).
+
 ## The most recent result
 
 **[`size-perf-roadmap.md`](size-perf-roadmap.md) §F1 has the table.** Measured on
@@ -120,6 +123,49 @@ itself and the copy loop on the way back. As with `l4_forward`, the tunnel is
 established before the clock starts, so the number is about the traffic over
 it rather than the price of opening it. The far side is an iroh endpoint on
 the same host that speaks the L4 framing and echoes.
+
+## What a flow costs
+
+The benches above measure time. One thing they do not measure is **memory**,
+and the per-flow memory was the largest number in the client: a TCP flow in
+the TUN stack owns four buffers of the TCP window, so it cost 1.25 MiB of
+address space before it had carried a byte.
+
+`crates/nexapipe-client/examples/tun_flow_memory.rs` measures it. It opens a
+number of flows through a real stack — one SYN each, which is all it takes
+for the stack to create the socket — and reports what they cost: the bytes
+the heap was asked for, and the peak resident set.
+
+```bash
+cargo run --release -p nexapipe-client --example tun_flow_memory --features tun-proxy
+
+# How many flows, and the window in bytes.
+cargo run --release -p nexapipe-client --example tun_flow_memory --features tun-proxy -- 64 131072
+```
+
+**The heap number is the one to compare, and the resident set is the one to
+be careful with.** The buffers are zeroes, and the pages behind them are not
+resident until something writes to them: an idle flow costs its buffers in
+address space, not in pages. A flow that carries traffic pays for the pages
+it touches, and then the resident set is the honest number.
+
+Measured on 2026-10-21 on an Apple M4 (macOS 27.0.1), with the window the
+client used at the time (320 KiB):
+
+| Flows | Heap | Per flow | Resident growth |
+|---|---|---|---|
+| 32 | 40.1 MiB | 1,280.6 KiB | 256 KiB |
+| 64 | 80.1 MiB | 1,280.9 KiB | 528 KiB |
+| 256 | 320.2 MiB | 1,280.7 KiB | 1,728 KiB |
+
+And with 32 flows, at three windows — the per-flow cost is four times the
+window, which is the whole point:
+
+| Window | Per flow | 32 flows |
+|---|---|---|
+| 320 KiB | 1,280.6 KiB | 40.1 MiB |
+| 128 KiB | 512.7 KiB | 16.1 MiB |
+| 64 KiB | 256.7 KiB | 8.1 MiB |
 
 ## What this is not
 

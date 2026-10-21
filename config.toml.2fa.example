@@ -199,6 +199,23 @@ created_at = "1723756800"
 # goes). The HTTP path routes by host alone, so there the list refuses a
 # request that names a port off it and nothing more.
 # allow_ports = [443, 8443]
+#
+# ...and the port a request is *served from* is a different port from the one
+# the client names. A client asks for https://api.example.com and the proxy
+# serves it from http://127.0.0.1:18080; the port it named is a virtual one
+# and the request never reaches it.
+#
+# allow_ports_strict checks the list against that second port - the backend's -
+# so a client limited to 443 cannot reach a route whose backend listens on
+# 18080, however the request was spelled. It also covers the TLS
+# passthrough, which had no port check at all.
+#
+# Off by default, because it changes what an existing configuration allows: a
+# client limited to 443 whose route's backend listens on 18080 is refused.
+# That is the correct answer, and it is not the answer a deployed
+# configuration was written against. Turn it on having looked at where your
+# backends actually listen.
+# allow_ports_strict = true
 # The server keeps `failed_attempts`, `locked_until` and `last_used` for a
 # client that has failed a handshake, so a lockout survives a restart. Those
 # three live in `state.toml` beside this file, not here — this file is the
