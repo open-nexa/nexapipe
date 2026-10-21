@@ -404,6 +404,24 @@ impl AuthConfig {
             lockout_duration: self.lockout_duration,
         }
     }
+    /// Whether the file holds a 2FA secret that nothing else protects.
+    ///
+    /// A client's seed, or a device's. A device that proves itself with a
+    /// signature has no seed, and its entry holds nothing but a public key —
+    /// so it is not one of these.
+    ///
+    /// This is the credential the config file's own permission is all that
+    /// stands between: anybody who can read the file can generate a valid
+    /// code. See [`crate::config::warn_about_readable_credentials`].
+    pub fn holds_inline_secrets(&self) -> bool {
+        self.clients.values().any(|client| {
+            !client.secret.as_str().is_empty()
+                || client
+                    .devices
+                    .values()
+                    .any(|device| !device.secret.as_str().is_empty())
+        })
+    }
 }
 
 impl DeviceAuth {

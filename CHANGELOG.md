@@ -431,6 +431,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The config file's permission rule is said once, and it is a warning.**
+  The comment beside the first-run config claimed that the server refuses to
+  start over a world-readable config, and that the check was keyed off 2FA
+  being on or the file holding a credential. No such check exists: it was
+  removed on purpose (ROADMAP §3.5) so that a `0644` bind mount starts, and
+  putting it back would undo that decision.
+  What was left was a comment that described a gate that is not there, and a
+  credential nobody could see: `[auth.clients.*].secret` is a TOTP seed in
+  the clear, and anybody who can read the file can generate a valid code.
+  The server now says so once, at startup and after a reload, when the config
+  holds a credential and the file is readable by anyone but its owner. It
+  names the path and the mode. It does not refuse to start.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks
