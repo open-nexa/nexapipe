@@ -533,6 +533,16 @@ async fn run_server_mode(
         }
     };
 
+    // The config file's own permission is not a gate (ROADMAP §3.5), but a
+    // credential in a file anybody can read is worth saying out loud once.
+    if let Some(cfg) = auth_config.as_ref() {
+        nexapipe::config::warn_about_readable_credentials(
+            std::path::Path::new(config_path),
+            proxy_config,
+            cfg,
+        );
+    }
+
     // The `[peers]` allow-list. A malformed entry is fatal rather than dropped:
     // a list whose whole purpose is to refuse strangers must not silently come
     // out shorter than it was written.

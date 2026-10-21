@@ -250,20 +250,33 @@ impl ConfigWatcher {
         let config_path = self.config_path.clone();
         let loaded =
             tokio::task::spawn_blocking(move || ProxyConfig::load_with_auth(&config_path)).await;
-        let new_auth = match loaded {
-            Ok(Ok((_, auth))) => auth,
+        // The proxy half of the file comes back with the auth half — the same
+        // read, the same parse — and it is kept for the permission warning
+        // below: a reload can bring in a credential the file did not have
+        // before, or a permission that has been loosened since.
+        let (new_proxy, new_auth) = match loaded {
+            Ok(Ok((proxy, auth))) => (Some(proxy), auth),
             Ok(Err(e)) => {
                 tracing::error!("2FA clients not reloaded, keeping the current ones: {}", e);
-                None
+                (None, None)
             }
             Err(e) => {
                 tracing::error!(
                     "2FA clients not reloaded, keeping the current ones: the read did not run: {}",
                     e
                 );
-                None
+                (None, None)
             }
         };
+        // The same warning the startup path gives.
+        if let (Some(proxy), Some(cfg)) = (new_proxy.as_ref(), new_auth.as_ref()) {
+            crate::config::warn_about_readable_credentials(
+                std::path::Path::new(&self.config_path),
+                proxy,
+                cfg,
+            );
+        }
+
         let Some(new_auth) = new_auth else {
             // The section is gone while 2FA is live: treat that as a bad edit,
             // not as "disable everything", the same way an unparsable route
