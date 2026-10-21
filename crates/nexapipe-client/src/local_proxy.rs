@@ -856,7 +856,19 @@ where
             let mut buf = vec![0u8; STREAM_BUF_SIZE];
             loop {
                 match client_read.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        // The client is done sending. That is a half-close, not
+                        // the end of the conversation: the server may still
+                        // have a reply on the way, and the reply has to reach
+                        // the client.
+                        //
+                        // Propagated as a FIN, so the server sees what it
+                        // would see from a socket whose write side the client
+                        // had shut down. Dropping the stream instead would
+                        // reset it, and a reset is not a half-close.
+                        let _ = send.finish();
+                        break;
+                    }
                     Ok(n) => {
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             #[cfg(feature = "tracing")]
@@ -910,10 +922,34 @@ where
             backend_task.abort_handle(),
         ]);
 
+        // **Both directions, and each of them for as long as it lasts.**
+        //
+        // A TCP half-close is a request, not an ending: a client that writes
+        // its request and then shuts down its write side is saying "I am done
+        // sending", and the server's reply still has to arrive. Racing the two
+        // directions and aborting the loser dropped that reply on the floor and
+        // reset the connection under the client.
+        //
+        // The bound is the one the copy loop was always meant to have:
+        // `STREAM_SECS`, an hour. It matches the server's own `l4_flow`
+        // default, so the two ends of the tunnel give up at about the same
+        // moment, and it is what keeps a half-closed tunnel from holding its
+        // resources for the life of the process.
+        let stream_budget = crate::deadline::Deadlines::default().stream;
         tokio::select! {
-            _ = &mut client_task => (),
-            _ = &mut backend_task => (),
+            _ = async {
+                let _ = (&mut client_task).await;
+                let _ = (&mut backend_task).await;
+            } => (),
             _ = flow.cancelled() => (),
+            _ = tokio::time::sleep(stream_budget) => {
+                jni_log!(
+                    "[DEBUG:local-proxy] CONNECT tunnel to {}:{} ran for {:?} and was abandoned",
+                    host,
+                    port,
+                    stream_budget
+                );
+            }
         }
 
         // Both, whichever branch won: the half that is still running is the one
@@ -1754,6 +1790,170 @@ mod tests {
     fn spawn_run(proxy: &LocalProxy) -> JoinHandle<Result<(), ClientError>> {
         let proxy = proxy.clone();
         tokio::spawn(async move { proxy.run().await })
+    }
+
+    /// The ALPN the tunnel speaks. The same bytes the client uses.
+    const ALPN: &[u8] = b"\x05nexapipe";
+
+    /// The host the application asks for.
+    const HOST: &str = "db.test";
+
+    /// The port it asks for.
+    const PORT: u16 = 5432;
+
+    /// The far side of the tunnel: a server that waits for the client's
+    /// half-close before it answers.
+    ///
+    /// This is the shape of a request/response protocol carried over a
+    /// connection the client may half-close: the server reads until the client
+    /// is done sending, and only then writes the reply. The reply cannot be
+    /// written before the FIN arrives, because the server does not know the
+    /// request is finished until then.
+    async fn serve_a_tunnel_that_answers_after_the_fin(endpoint: Endpoint) {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+
+                // The L4 preface, then the status byte the client waits for.
+                let mut header = [0u8; 4];
+                if recv.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let mut rest = vec![0u8; usize::from(header[3]) + 2];
+                if recv.read_exact(&mut rest).await.is_err() {
+                    return;
+                }
+                if send.write_all(&[0x00]).await.is_err() {
+                    return;
+                }
+
+                // Read until the client is done sending. This is the half-close
+                // the reply depends on.
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match recv.read(&mut buf).await {
+                        Ok(None) | Err(_) => break,
+                        Ok(Some(n)) => {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Only now the reply.
+                let _ = send.write_all(b"the reply").await;
+                let _ = send.finish();
+                // The connection is held open for a moment. Dropping it here
+                // would close the tunnel, and a close discards whatever the
+                // peer has not read yet -- the reply included.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            });
+        }
+    }
+
+    /// A client that half-closes still receives the reply.
+    ///
+    /// A TCP half-close is a request, not an ending: a client that writes its
+    /// request and then shuts down its write side is saying "I am done
+    /// sending", and the server's reply still has to arrive. The two halves of
+    /// the copy were raced, and whichever lost was aborted — so the reply was
+    /// cut off and the connection reset under the client.
+    ///
+    /// The far side here waits for the FIN before it answers, so the reply
+    /// cannot be out before the half-close: the test fails against the old
+    /// code, and it fails in the way that matters — the client never gets the
+    /// bytes.
+    #[tokio::test]
+    async fn a_half_closed_client_still_receives_the_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // The far side.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_a_tunnel_that_answers_after_the_fin(server));
+
+        // This side: an endpoint, a pool over it, and the proxy.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+            .await
+            .expect("the proxy binds");
+        let proxy_addr = proxy.local_addr().expect("the proxy's address");
+        let runner = spawn_run(&proxy);
+
+        // The application: a tunnel, a request, and then a half-close.
+        let mut stream = TcpStream::connect(proxy_addr)
+            .await
+            .expect("the proxy accepts");
+        stream
+            .write_all(format!("CONNECT {HOST}:{PORT} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .expect("the CONNECT goes out");
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("the answer comes");
+            answer.push(byte[0]);
+            if answer.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            answer.starts_with(b"HTTP/1.1 200"),
+            "the tunnel should be established: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        stream
+            .write_all(b"the request")
+            .await
+            .expect("the request goes out");
+        // The half-close: the client is done sending, and the server has to
+        // hear that.
+        stream.shutdown().await.expect("the write side closes");
+
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut reply),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "the reply never arrived: the tunnel was cut off at the half-close"
+        );
+        assert_eq!(
+            reply, b"the reply",
+            "the reply did not survive the half-close"
+        );
+
+        proxy.stop();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
     }
 
     /// The cap is what turns memory into a bounded quantity: every connection
