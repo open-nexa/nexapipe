@@ -33,8 +33,9 @@ is two settings now rather than one, the Android app can bring the tunnel back
 after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
 the configuration instead of inside it, the desktop says what it does to the
-machine's DNS instead of deciding for itself, and the paths that carry the
-traffic can be measured instead of assumed.
+machine's DNS instead of deciding for itself, the access log says what a
+tunnelled flow was instead of only what the tunnel did with it, and the paths
+that carry the traffic can be measured instead of assumed.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -52,6 +53,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The access log says what an L4 flow was.** A tunnelled flow carries bytes,
+  so its line used to record only what the tunnel did with them — the
+  protocol, the target, the outcome, and nothing else. The first bytes of a
+  flow usually say more than that: a `ClientHello` names the host it is going
+  to, and a plaintext HTTP exchange says what was asked for and what came
+  back. The server now reads those bytes as they go past and appends what
+  they said to the line — `sni=www.example.com` for a TLS handshake,
+  `http="GET /v1/items HTTP/1.1" http_status=404` for a plaintext HTTP one.
+  It is a reading and nothing more: the route was chosen by the preface
+  before a payload byte arrived, so nothing in the log can name a different
+  backend than the one that served the flow, and the status column still holds
+  the outcome of the tunnel rather than the answer of the origin behind it. A
+  flow that says nothing recognizable gets no field rather than a guess, and a
+  query string in a sniffed target is redacted like any other.
 - **There are benchmarks.** Three of them, on the paths that carry user
   traffic: the L4 copy loop, the TUN's per-packet cost (the DNS path, the
   virtual-address bookkeeping, and the whole path with a packet in and an
