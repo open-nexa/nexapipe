@@ -32,6 +32,18 @@ its defaults — which are on.
 
 ### Added
 
+- **There are benchmarks.** Three of them, on the paths that carry user
+  traffic: the L4 copy loop, the TUN's per-packet cost (the DNS path, the
+  virtual-address bookkeeping, and the whole path with a packet in and an
+  answer out), and the end-to-end forwarding path through the local proxy.
+  None of them needs a network — the backends are loopback echoes, the TUN
+  device is a duplex pair standing in for the fd, and the two iroh endpoints
+  the forwarding path needs talk to each other over the loopback interface —
+  and they run in CI on the same runners as the tests, so two runs can be
+  compared with each other. Nothing fails the build when a number gets
+  worse: a number that gates a build before anyone trusts it gets deleted.
+  What each bench measures, and what it deliberately does not, is written down
+  in [`docs/benchmarks.md`](docs/benchmarks.md).
 - **A `[limits]` section for the process-wide ceilings.** The connections one peer
   may hold, the connections the whole process may hold, the streams in flight and
   the bytes of request bodies held at once were reachable only through four

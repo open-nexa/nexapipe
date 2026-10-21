@@ -66,3 +66,20 @@ tun-proxy = ["local-proxy", "dep:netstack-smoltcp", "dep:libc"]
 
 [target.'cfg(target_os = "ios")'.dependencies]
 webpki-roots = "1.0.8"
+
+[dev-dependencies]
+# The benchmarks; see docs/benchmarks.md.
+criterion = { workspace = true }
+
+# Both benches live behind the features the code they measure is behind: the
+# TUN pump is the `tun-proxy` half, and the forwarding path is the
+# `local-proxy` half, which `tun-proxy` already pulls in.
+[[bench]]
+name = "tun_pump"
+harness = false
+required-features = ["tun-proxy"]
+
+[[bench]]
+name = "forwarding_path"
+harness = false
+required-features = ["local-proxy"]

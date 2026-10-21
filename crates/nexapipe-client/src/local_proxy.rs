@@ -5,6 +5,7 @@ use crate::flow::{FlowKind, FlowMeta};
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -304,6 +305,15 @@ impl LocalProxy {
             connections: Arc::new(std::sync::Mutex::new(Vec::new())),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         }
+    }
+
+    /// The address the proxy is listening on.
+    ///
+    /// Only known once the listener is bound, which is why it is an accessor
+    /// rather than a field: a caller that asked for port 0 — the usual way of
+    /// asking for any free port — has to be told which one it got.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
     }
 
     pub async fn run(&self) -> Result<(), ClientError> {

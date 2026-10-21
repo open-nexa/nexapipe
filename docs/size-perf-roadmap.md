@@ -255,9 +255,13 @@ opposite, and bundling them means an R8 regression rolls back the free win too.
 
 ### F1 — Benchmarks before optimizations (P0)
 
-There is no benchmark in this repository. Until F1 lands, every performance
-claim in this document — including the ones above — is an expectation, not a
-result, and we have no way to tell whether a change helped.
+**Landed.** The three benches below exist, run in CI on the same runners, and
+are written down in [`benchmarks.md`](benchmarks.md) — what each one measures,
+how to run it, and what it deliberately does not measure.
+
+Until F1 lands, every performance claim in this document — including the ones
+above — is an expectation, not a result, and we have no way to tell whether a
+change helped.
 
 Three benches, chosen because they are on the paths that carry user traffic:
 
@@ -308,7 +312,7 @@ not a stated goal.
 | Android APK size | 16.5 MB unminified debug, release never shrunk | measured on the release artifact, and substantially under today's |
 | Android `.so` size | never measured; unstripped | measured, stripped, with a `-g` artifact kept |
 | Size regressions | invisible | reported on every PR; failing the build only after a clean release |
-| Throughput / latency | no benchmark exists | three benches in CI; and either a documented hotspot, or a documented decision that there is not one |
+| Throughput / latency | three benches in CI, and no result written down yet | a written result: either a documented hotspot, or a documented decision that there is not one |
 
 The last row is the one that matters. A roadmap that only ever adds benchmarks
 is a plan to feel better without knowing anything. **"We measured and it is
@@ -333,7 +337,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 | The Android `.so` is built with `jni local-proxy tun-proxy` | `release.yml:786` (`--features "jni local-proxy tun-proxy"`), copied into `jniLibs` at `release.yml:789-791` |
 | The JNI surface is fourteen functions, asserted in CI | `release.yml:794-816` |
 | Nothing in CI measures size | no `size`/`bytes`/`MiB` in `release.yml`; the 16 jobs in `ci.yml:55-628` plus `codeql.yml`, `pages.yml` and `dependency-report.yml` all do something else |
-| No benchmarks exist | no `criterion` in `Cargo.lock`, no `benches/` directory, no `#[bench]` |
+| Benchmarks exist (as of 2026-10-21) | `crates/nexapipe/benches/l4_forward.rs`, `crates/nexapipe-client/benches/tun_pump.rs`, `crates/nexapipe-client/benches/forwarding_path.rs`; `criterion` in `Cargo.lock`; the `bench` job in `ci.yml` |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |
 | The local bundle is stale | `ui-desktop/src-tauri/target/release/bundle/dmg/nexa_0.1.0_aarch64.dmg` (dated 2026-10-07, 22 MB) against `version = "0.6.0"` |

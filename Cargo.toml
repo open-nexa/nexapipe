@@ -73,3 +73,6 @@ nexapipe-proto = { path = "crates/nexapipe-proto" }
 # crate the tree already pulls in through rustls, used directly so the server
 # and the client can share one wrapper for it — see `nexapipe_client::secret`.
 zeroize = "1.9"
+# The benchmarks. A dev-dependency of the two crates that carry traffic, so
+# the measured code is the code that ships — see docs/benchmarks.md.
+criterion = "0.8"

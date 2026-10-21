@@ -83,3 +83,9 @@ tempfile = '3.8'
 # A certificate authority and a server certificate of our own, so the tests
 # can run a backend that speaks TLS without shipping a key in the repository.
 rcgen = "0.13"
+# The benchmarks; see docs/benchmarks.md.
+criterion = { workspace = true }
+
+[[bench]]
+name = "l4_forward"
+harness = false
