@@ -667,7 +667,7 @@ What the short forms leave out, and what you get instead:
 | `[iroh] secret_key` | a stable Node ID, written into the config on first start if you leave it out. Set `NEXAPIPE_NO_PERSIST_IDENTITY=1` for the old behaviour (a fresh Node ID every restart, config untouched) |
 | `[iroh] relay_mode` | `default`: N0 relays, home relay picked by latency |
 | `mode` | `http` |
-| `path_pattern` | `/`, prefix match |
+| `path_pattern` | `/`, prefix match — a prefix ends at a segment boundary, so `/api` covers `/api/x` and not `/apifoo` |
 | `strategy` | `round_robin` (or `random`, or `least_conn` — fewest requests outstanding to that backend) |
 | `[health_check]` | enabled: `GET {backend}/health` every 10 s. A backend with no such endpoint is logged as failing, but **traffic still flows to a route with one backend** — there is nothing to choose between — so that is log noise, not an outage. A route with several, all down, answers 503 without dialling. Set `enabled = false` to silence it. |
 | `[log]` | rotating files under `./logs` plus console output, query values redacted |

@@ -210,7 +210,7 @@ impl Route {
 
     pub fn matches(&self, host: &str, path: &str) -> bool {
         let path_matches = if self.path_is_prefix {
-            path.starts_with(&self.path_pattern)
+            path_suffix(&self.path_pattern, path).is_some()
         } else {
             path == self.path_pattern
         };
@@ -471,15 +471,46 @@ impl BackendInfo {
         let Some(rewrite_pattern) = &self.path_rewrite else {
             return original_path.to_string();
         };
-        if self.path_is_prefix && original_path.starts_with(&self.path_pattern) {
-            let suffix = &original_path[self.path_pattern.len()..];
-            rewrite_pattern.replace("{}", suffix)
-        } else if !self.path_is_prefix && original_path == self.path_pattern {
-            rewrite_pattern.replace("{}", "")
-        } else {
-            original_path.to_string()
+        if self.path_is_prefix {
+            // The same predicate the match uses, so the suffix that comes off
+            // the front is the one that matched.
+            if let Some(suffix) = path_suffix(&self.path_pattern, original_path) {
+                return rewrite_pattern.replace("{}", suffix);
+            }
+        } else if original_path == self.path_pattern {
+            return rewrite_pattern.replace("{}", "");
         }
+        original_path.to_string()
     }
+}
+
+/// The part of `path` that `pattern` does not cover, if it covers any of it.
+///
+/// A path prefix in the **path** sense: the pattern covers the path when the
+/// path is the pattern, or when it continues with a `/`. So `/api` covers
+/// `/api` and `/api/x`, and not `/apifoo` — which is what `starts_with` alone
+/// would say, and what a path prefix is not.
+///
+/// The pattern's own trailing slash is normalised away, so `/api/` covers the
+/// same paths as `/api` and the path does not need a second slash to match.
+///
+/// The suffix is what the pattern did not cover, so it is the same string
+/// whether the path matched exactly or continued past the pattern — which is
+/// what makes the rewrite and the match agree.
+///
+/// One function, because the match and the rewrite have to agree: a prefix
+/// that is not a prefix is a routing surprise either way.
+pub(crate) fn path_suffix<'a>(pattern: &str, path: &'a str) -> Option<&'a str> {
+    let pattern = pattern.trim_end_matches('/');
+    if path == pattern {
+        return Some("");
+    }
+    let rest = path.strip_prefix(pattern)?;
+    // Only a segment boundary counts: `/apifoo` is not under `/api`. The
+    // separator stays in the suffix: it is part of what the pattern did not
+    // cover, and a rewrite of `/v2{}` wants `/v2/users`, not `/v2users`.
+    rest.strip_prefix('/')?;
+    Some(rest)
 }
 
 /// What the L4 tunnel needs in order to serve one flow.
@@ -1549,6 +1580,113 @@ mod tests {
 
         // An HTTP route has no L4 knobs, and asking for them must not invent one.
         assert_eq!(http_route("a.test", &["http://b:80"]).idle_timeout(), None);
+    }
+
+    /// A path prefix ends at a segment boundary.
+    ///
+    /// `/api` covers `/api` and `/api/x`. It does not cover `/apifoo`: that
+    /// is a different path that happens to start with the same letters, and a
+    /// route that serves it is a route that serves more than it says.
+    #[test]
+    fn a_path_prefix_ends_at_a_segment_boundary() {
+        let route = Route::new(
+            "app.test",
+            "/api",
+            true,
+            vec!["http://backend:80".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+
+        assert!(route.matches("app.test", "/api"), "the pattern itself");
+        assert!(route.matches("app.test", "/api/x"), "under the pattern");
+        assert!(route.matches("app.test", "/api/x/y"), "under the pattern");
+        assert!(!route.matches("app.test", "/apifoo"), "mid-segment");
+        assert!(!route.matches("app.test", "/apifoo/x"), "mid-segment");
+        assert!(!route.matches("app.test", "/other"), "another path");
+    }
+
+    /// A trailing slash on the pattern is the same pattern.
+    ///
+    /// `/api/` and `/api` name the same place, and the path does not need a
+    /// second slash in it to match either.
+    #[test]
+    fn a_trailing_slash_on_the_pattern_is_the_same_pattern() {
+        let route = Route::new(
+            "app.test",
+            "/api/",
+            true,
+            vec!["http://backend:80".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            None,
+        );
+
+        assert!(route.matches("app.test", "/api"), "the pattern itself");
+        assert!(route.matches("app.test", "/api/"), "with the slash");
+        assert!(route.matches("app.test", "/api/x"), "under the pattern");
+        assert!(
+            route.matches("app.test", "/api//x"),
+            "no second slash needed"
+        );
+        assert!(!route.matches("app.test", "/apifoo"), "mid-segment");
+    }
+
+    /// The rewrite computes the suffix that matched.
+    ///
+    /// The same predicate the match uses, so the two cannot disagree: a path
+    /// the route does not serve is not rewritten either.
+    #[tokio::test]
+    async fn the_rewrite_computes_the_suffix_that_matched() {
+        let config = RoutingTable::new(vec![Route::new(
+            "app.test",
+            "/api",
+            true,
+            vec!["http://backend:80".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            Some("/v2{}".to_string()),
+        )]);
+
+        let backend = config.get_backend("app.test", "/api/x").await;
+        let info = backend.found().expect("the route serves /api/x");
+
+        assert_eq!(
+            info.rewritten_path("/api/x"),
+            "/v2/x",
+            "the suffix is what the pattern did not cover"
+        );
+        assert_eq!(info.rewritten_path("/api"), "/v2", "the pattern itself");
+        assert_eq!(
+            info.rewritten_path("/apifoo"),
+            "/apifoo",
+            "a path this route does not serve is not rewritten"
+        );
+    }
+
+    /// An exact route is unchanged: it matches one path and rewrites it.
+    #[tokio::test]
+    async fn an_exact_route_is_unchanged() {
+        let config = RoutingTable::new(vec![Route::new(
+            "app.test",
+            "/api",
+            false,
+            vec!["http://backend:80".to_string()],
+            LoadBalancingStrategy::RoundRobin,
+            RouteMode::Http,
+            Some("/v2".to_string()),
+        )]);
+
+        let backend = config.get_backend("app.test", "/api").await;
+        let info = backend.found().expect("the route serves /api");
+
+        assert!(info.rewritten_path("/api") == "/v2", "the exact path");
+        assert_eq!(
+            info.rewritten_path("/api/x"),
+            "/api/x",
+            "an exact route rewrites nothing else"
+        );
     }
 
     /// An unrouted host has nowhere to go, and says so.
