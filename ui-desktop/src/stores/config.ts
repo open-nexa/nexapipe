@@ -78,6 +78,10 @@ const defaultConfig: ProxyConfig = {
   localAddr: '127.0.0.1:8080',
   dnsAddr: '198.18.0.254:53',
   upstreamDns: '223.5.5.5:53',
+  // The machine's DNS is left alone except for the configured domains, unless the
+  // user says otherwise. This is the strategy that leaves the machine's own names —
+  // and another tunnel's — resolving where they always did.
+  dnsStrategy: 'scoped',
   loadBalancing: 'round_robin',
   tunName: 'nexa-tun',
   useTun: false,
@@ -263,6 +267,12 @@ function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   config.localAddr = asString(raw.localAddr, config.localAddr);
   config.dnsAddr = asString(raw.dnsAddr, config.dnsAddr);
   config.upstreamDns = asString(raw.upstreamDns, config.upstreamDns);
+  // Only the three spellings there are. A payload carrying anything else falls back to
+  // the default rather than to a strategy nobody chose: this setting says what happens
+  // to the machine's name resolution, and a typo must not be read as "replace all of it".
+  if (raw.dnsStrategy === 'scoped' || raw.dnsStrategy === 'global' || raw.dnsStrategy === 'none') {
+    config.dnsStrategy = raw.dnsStrategy;
+  }
   config.tunName = asString(raw.tunName, config.tunName) || defaultConfig.tunName;
   config.relayUrl = asString(raw.relayUrl, config.relayUrl);
   // Empty is the state before it has been generated, not a name: `ensureDeviceId` fills it

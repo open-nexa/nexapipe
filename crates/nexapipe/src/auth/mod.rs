@@ -8,6 +8,7 @@ pub mod config;
 pub mod device_key;
 pub mod otpauth;
 pub mod protocol;
+pub mod state;
 pub mod totp;
 
 pub use config::{

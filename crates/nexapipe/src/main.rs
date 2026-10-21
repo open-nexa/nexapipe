@@ -799,6 +799,10 @@ fn load_auth_or_none(path: &str) -> anyhow::Result<Option<AuthConfig>> {
 /// client that has never authenticated, and `0` as `created_at` is the value an
 /// entry carries when the file was written by hand. Both mean "never"/"unknown",
 /// and a wall of 1970 dates would say the opposite.
+///
+/// (The state file no longer writes a zero counter at all — it leaves the key
+/// out — but a `created_at` of `0` is still what a hand-written entry
+/// carries.)
 fn stamp(seconds: Option<i64>) -> String {
     let Some(seconds) = seconds.filter(|at| *at > 0) else {
         return "-".to_string();

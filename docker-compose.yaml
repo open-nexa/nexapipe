@@ -27,8 +27,9 @@ services:
       # file.
       #
       # Mounted read-write on purpose: the server writes the 2FA counters
-      # (`failed_attempts`, `locked_until`, `last_used`) back into this file, so
-      # a `:ro` mount costs a lockout its persistence and an error per attempt.
+      # (`failed_attempts`, `locked_until`, `last_used`) into `state.toml` in
+      # this directory, so a `:ro` mount costs a lockout its persistence and an
+      # error per attempt.
       - ./config:/app/config
       # The endpoint identity lives here, not in config.toml: the env var below
       # points `secret_key_file` at `/app/secrets/iroh.key`, and the first start
@@ -46,8 +47,9 @@ services:
     # and be writable by it. `mkdir` alone is not enough: the directories land
     # owned by whoever ran it, and on a host where that is not uid 1000 the
     # failures are quiet — an iroh key that cannot be written is replaced by an
-    # ephemeral one (a new Node ID on every restart), and a config that cannot be
-    # written loses the 2FA counters. On a fresh setup, after copying the config:
+    # ephemeral one (a new Node ID on every restart), and a state file that
+    # cannot be written loses the 2FA counters. On a fresh setup, after copying
+    # the config:
     #
     #     mkdir -p config secrets logs
     #     sudo chown -R 1000:1000 config secrets logs

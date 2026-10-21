@@ -298,11 +298,13 @@ docker compose exec nexapipe /usr/local/bin/nexapipe \
   `docker compose restart` 也没用，它不重建挂载；要 `docker compose up -d --force-recreate`。
   compose 里写的 `./config:/app/config` 正是为此 —— 目录挂载每次按名字解析，
   永远看得到当前那个文件；改回 `./config.toml:/app/config/config.toml` 就又把坑请回来了。
-- **两个写者，没有锁。** 每次发生 2FA 尝试时，服务端都会重写整个文件，把
-  `failed_attempts` / `locked_until` / `last_used` 落盘（`save_auth_state`）。
-  两边的每次写入都是无锁的"读—改—写"，宿主机上的编辑和服务端的落盘一旦重叠，
-  就会丢掉其中一次。最坏的情况是 `pending_enrollment` 令牌：服务端从不把它写回，
-  所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
+- **两个写者，没有锁。** 服务端会重写整个文件，把 `pending_enrollment`
+  登记进去。两边的每次写入都是无锁的"读—改—写"，宿主机上的编辑和服务端的落盘
+  一旦重叠，就会丢掉其中一次。最坏的情况就是 `pending_enrollment` 令牌：服务端
+  从不把它写回，所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
+  2FA 计数曾经也在这个名单里——每次 2FA 尝试，服务端都要重写整个文件来落盘
+  `failed_attempts` / `locked_until` / `last_used`。它们现在住在服务端自己的
+  `state.toml` 里，这场竞争也跟着一起没了。
 - **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
   `[iroh] secret_key` 推导，所以 `nexapipe` 若和正在跑的那个不是同一个提交编出来的，
   生成的邀请码会指向一个没人在跑的端点。（"宿主机那份配置缺这个键"曾经也是触发方式之一；
@@ -400,10 +402,11 @@ systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UI
 之后可能交给另一个服务，所以 systemd 会把 `StateDirectory`、`CacheDirectory`
 和 `LogsDirectory` 自行挪到别处。`/etc` 下的凭据文件不在这三者之中。
 
-**配置目录必须保持可写。** 服务端会把 2FA 的 `failed_attempts` /
-`locked_until` 计数、已注册设备的密钥和它的 `last_used` 写回 `config.toml`，
-并在首次启动时在旁边写出 `config.toml.admin-token`。首次启动时它也会写这个
-文件 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
+**配置目录必须保持可写。** 服务端会把已注册设备的密钥写回 `config.toml`，
+并在首次启动时在旁边写出 `config.toml.admin-token`。2FA 的计数
+（`failed_attempts`、`locked_until`、`last_used`）落在旁边的 `state.toml` 里 ——
+那个文件归服务端自己所有，配置不会因为它被重写。首次启动时服务端也会写配置
+这个文件 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
 也必须可写，否则 Node ID 每次重启都会变。`ReadWritePaths` 只放开这一个目录。
 想在不可写的配置下运行，请设 `NEXAPIPE_NO_PERSIST_IDENTITY=1`，代价是 Node ID
 无法跨重启保持。
@@ -525,6 +528,33 @@ created_at = "1723756800"
 有两处改动在运行中的服务端上被刻意做成单向的：`[auth] enabled = true` 会被配置
 监视器拾取，但把 2FA 关掉会被拒绝（要禁用请重启）；而 `enabled = true` 与暴露的明文
 监听器同时出现则直接被拒绝启动。
+
+### 配置与状态是两个文件
+
+`config.toml` 是运维者的文件：他写的、他读的、他放进版本控制的。而运行中的服务端
+学到的东西——某个客户端输错几次密码、锁到什么时候、最后一次出现是什么时候——
+不属于这一类，所以它们住在配置**旁边**的 `state.toml` 里，格式相同，客户端与设备
+的名字也相同。
+
+```
+/etc/nexapipe/
+├── config.toml     运维者的文件
+├── state.toml      服务端的计数（0600，由服务端写入）
+└── config.toml.admin-token
+```
+
+状态文件由服务端写，除此之外没有别人写它；配置也不会为了这些计数被重写。这个
+分离不只是为了整洁：服务端会盯着配置文件的修改时间，所以一个把计数写回配置的
+服务端，会让每一次输错密码都变成一次配置重载——路由重建、健康检查重启，原因
+仅仅是陌生人输错了密码。
+
+不需要任何配置。状态文件在客户端第一次输错密码或认证成功时出现，权限是 `0600`。
+读不了的状态文件会让服务端拒绝启动：它记着的那些锁状态将无人知晓，硬着头皮启动
+等于把每一个都清零。想不要这些锁，删掉它就行。
+
+在状态文件出现之前写的配置依然可用：那三个计数字段仍然从配置里读，所以一直在
+那里计数的部署会保住自己的锁，直到状态文件里有了这个客户端的条目为止。它们不再
+被写回配置。
 
 ### 最小配置
 
@@ -1570,7 +1600,7 @@ Cargo feature：
 | 应用 | 目录 | 功能 |
 | --- | --- | --- |
 | Android | [`ui-android`](ui-android/README.md) | VpnService TUN，带 DNS 劫持 + TCP/UDP 重定向；Compose UI；二维码 2FA 导入。 |
-| 桌面端 | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3；本地 HTTP 代理或经可选提权服务的系统 TUN（WinTun）。 |
+| 桌面端 | [`ui-desktop`](ui-desktop/README.md) | Tauri 2 + Vue 3；本地 HTTP 代理或经可选提权服务的系统 TUN（WinTun）；显式的 DNS 策略（`scoped` / `global` / `none`），不会被程序替你改。 |
 
 <table>
   <tr>

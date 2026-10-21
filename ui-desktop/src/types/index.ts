@@ -122,12 +122,33 @@ export interface NodeConfig {
   publicKey?: string;
 }
 
+/**
+ * What the machine's DNS is asked to do.
+ *
+ * - `scoped` — only the configured domains resolve through the tunnel; the machine's own
+ *   names, and another tunnel's, keep resolving where they always did. The default.
+ * - `global` — every query on the machine goes to the tunnel's resolver.
+ * - `none` — the machine's DNS is not touched at all. The tunnel's own resolver still runs,
+ *   so a PAC file or a hosts entry can point at it.
+ *
+ * The strategy is never changed behind the user's back: a machine that cannot be scoped
+ * refuses the tunnel and says so, rather than having its whole DNS replaced.
+ */
+export type DnsStrategy = 'scoped' | 'global' | 'none';
+
 export interface ProxyConfig {
   nodes: NodeConfig[];
   domains: string[];
   localAddr: string;
   dnsAddr: string;
   upstreamDns: string;
+  /**
+   * What the machine's DNS is asked to do. See {@link DnsStrategy}.
+   *
+   * Absent in a payload written before the setting existed, and the default fills it in:
+   * `scoped`, the strategy that leaves the machine's own names alone.
+   */
+  dnsStrategy: DnsStrategy;
   loadBalancing: LoadBalancingStrategy;
   tunName: string;
   /**
