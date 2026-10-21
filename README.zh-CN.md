@@ -588,7 +588,7 @@ domains = ["app.example.com"]
 | `[iroh] secret_key` | 稳定的 Node ID；不填的话首次启动会自动生成并写进配置。想要旧行为（每次重启都是新 Node ID、且不碰配置文件）请设`NEXAPIPE_NO_PERSIST_IDENTITY=1` |
 | `[iroh] relay_mode` | `default`：使用 N0 中继，按延迟挑选 home relay |
 | `mode` | `http` |
-| `path_pattern` | `/`，前缀匹配 |
+| `path_pattern` | `/`，前缀匹配 —— 前缀止于路径段边界，因此 `/api` 覆盖 `/api/x`，不覆盖 `/apifoo` |
 | `strategy` | `round_robin`（或 `random`，或 `least_conn` —— 优先给当前在途请求最少的后端） |
 | `[health_check]` | 开启：每 10 秒 `GET {backend}/health`。后端没有这个端点时会被记为失败，但**只有一个后端的路由仍然照常转发** —— 那里没有第二个可挑的选项 —— 所以那只是日志噪音，不是故障；有多个后端且全部不健康时，直接回 503 且不再拨号。设 `enabled = false` 即可消停。 |
 | `[log]` | `./logs` 下的滚动日志 + 控制台输出，查询参数值会被脱敏 |
