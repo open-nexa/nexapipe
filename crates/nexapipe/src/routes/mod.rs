@@ -836,11 +836,18 @@ impl RouteConfig {
     /// client and into this table, and a reload is a routing change rather than a
     /// restatement of how long a dial may take.
     pub async fn update_routes(&self, new_routes: Vec<Route>) {
-        let mut routes = self.routes.write().await;
-
+        // **The keys are computed before the lock is taken.** Computing one is
+        // an await, and holding the routing table's write lock across an await
+        // stops every request in the process: the table is read on the way to
+        // every backend, and a read lock waits for a write lock. So a reload
+        // that took a moment to work out its keys held the whole server still
+        // while it did.
         let mut previous: HashMap<String, Arc<BackendPool>> = HashMap::new();
-        for route in routes.iter() {
-            previous.insert(route.pool_key().await, route.backend_pool().clone());
+        {
+            let routes = self.routes.read().await;
+            for route in routes.iter() {
+                previous.insert(route.pool_key().await, route.backend_pool().clone());
+            }
         }
 
         let mut updated = Vec::with_capacity(new_routes.len());
@@ -854,6 +861,8 @@ impl RouteConfig {
             updated.push(route);
         }
 
+        // The write lock is held for the swap and nothing else.
+        let mut routes = self.routes.write().await;
         *routes = updated;
         tracing::info!("Routes updated successfully");
     }
