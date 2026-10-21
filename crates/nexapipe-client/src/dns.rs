@@ -94,6 +94,10 @@ struct Inner {
     resolvers: Vec<Arc<Resolver>>,
     /// The scope an answer belongs to: the servers it came from.
     scope: Arc<str>,
+    /// How long one resolver is given to answer.
+    per_server: Duration,
+    /// How long the whole chain is given.
+    overall: Duration,
 }
 
 impl UpstreamResolvers {
@@ -110,6 +114,21 @@ impl UpstreamResolvers {
     /// Needs a runtime context: the sockets are registered with it, and the
     /// readers are tasks of it.
     pub fn new(servers: &[SocketAddr], stopped: Arc<AtomicBool>) -> Self {
+        Self::with_timeouts(servers, stopped, PER_SERVER_TIMEOUT, OVERALL_TIMEOUT)
+    }
+
+    /// [`UpstreamResolvers::new`] with the timeouts the caller wants.
+    ///
+    /// The two windows are the ones the chain has always had: how long one
+    /// resolver may take before the next is tried, and how long the whole
+    /// chain may take. A caller whose chain is longer, or whose resolvers are
+    /// further away, needs different numbers.
+    pub fn with_timeouts(
+        servers: &[SocketAddr],
+        stopped: Arc<AtomicBool>,
+        per_server: Duration,
+        overall: Duration,
+    ) -> Self {
         // IPv4 first: a phone's IPv6 path is the one more likely to be a
         // dead end, and asking it first would spend a timeout on it.
         let mut ordered: Vec<SocketAddr> = servers.to_vec();
@@ -133,6 +152,8 @@ impl UpstreamResolvers {
             inner: Arc::new(Inner {
                 resolvers,
                 scope: resolver_scope(servers),
+                per_server,
+                overall,
             }),
         }
     }
@@ -166,9 +187,9 @@ impl UpstreamResolvers {
             return None;
         }
 
-        let answer = tokio::time::timeout(OVERALL_TIMEOUT, async {
+        let answer = tokio::time::timeout(self.inner.overall, async {
             for resolver in &self.inner.resolvers {
-                if let Some(answer) = resolver.query(query, PER_SERVER_TIMEOUT).await {
+                if let Some(answer) = resolver.query(query, self.inner.per_server).await {
                     return Some(answer);
                 }
             }
@@ -188,7 +209,7 @@ impl UpstreamResolvers {
             Err(_) => {
                 jni_log!(
                     "[dns] the resolvers did not answer within {}s",
-                    OVERALL_TIMEOUT.as_secs()
+                    self.inner.overall.as_secs()
                 );
                 None
             }

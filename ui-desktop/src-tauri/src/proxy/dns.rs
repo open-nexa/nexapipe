@@ -5,10 +5,14 @@ use anyhow::Result;
 // stack can reverse-lookup, so both share one instance and one pool.
 pub use nexapipe_client::virtual_ip::IpMapping;
 
+use nexapipe_client::dns::UpstreamResolvers;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+
+/// How long one upstream is given to answer before the next is tried.
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// How many of the machine's own resolvers the upstream chain may carry.
 ///
@@ -74,11 +78,29 @@ impl DnsServer {
 
     /// Runs the DNS server main loop on an already bound socket.
     pub async fn run_with_socket(&self, socket: Arc<UdpSocket>) -> Result<()> {
-        let upstream = self.config.upstream_dns.clone();
         let proxy_domains = Arc::new(self.config.proxy_domains.clone());
-        let previous = Arc::new(self.previous_resolvers.clone());
         let ip_mapping = self.ip_mapping.clone();
         let stopped = self.stopped.clone();
+
+        // The upstream resolvers, and the sockets they are asked through.
+        //
+        // One socket per resolver, kept for as long as this server runs: a
+        // socket per query would mean a new source port for every lookup,
+        // and every router between the machine and the resolver would have to
+        // build a NAT mapping for it — and tear it down again as soon as the
+        // answer was in.
+        let upstreams = resolver_chain(&self.previous_resolvers, &self.config.upstream_dns);
+        let addresses: Vec<std::net::SocketAddr> =
+            upstreams.iter().filter_map(|server| server.parse().ok()).collect();
+        // The chain is tried in turn, and each one is given a window, so the
+        // whole chain is given one window per member and a little over.
+        let overall = UPSTREAM_TIMEOUT * addresses.len() as u32 + std::time::Duration::from_secs(1);
+        let resolvers = Arc::new(UpstreamResolvers::with_timeouts(
+            &addresses,
+            stopped.clone(),
+            UPSTREAM_TIMEOUT,
+            overall,
+        ));
 
         loop {
             if stopped.load(Ordering::Acquire) {
@@ -96,18 +118,16 @@ impl DnsServer {
                 Ok(Ok((len, addr))) => {
                     let data = buf[..len].to_vec();
                     let socket = socket.clone();
-                    let upstream = upstream.clone();
                     let proxy_domains = proxy_domains.clone();
-                    let previous = previous.clone();
                     let ip_mapping = ip_mapping.clone();
+                    let resolvers = resolvers.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_dns_query(
                             &socket,
                             &data,
                             addr,
-                            &upstream,
-                            &previous,
+                            &resolvers,
                             &proxy_domains,
                             &ip_mapping,
                         )
@@ -134,8 +154,7 @@ async fn handle_dns_query(
     socket: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: std::net::SocketAddr,
-    upstream: &str,
-    previous: &[String],
+    resolvers: &UpstreamResolvers,
     proxy_domains: &[String],
     ip_mapping: &IpMapping,
 ) -> Result<()> {
@@ -188,7 +207,7 @@ async fn handle_dns_query(
     // Non-proxied domains: forward upstream. The machine's own resolvers come
     // first — see [`resolver_chain`] for why — and the public fallbacks close the
     // chain for when none of them answers.
-    forward_to_upstream(socket, data, client_addr, upstream, previous).await
+    forward_to_upstream(socket, data, client_addr, resolvers).await
 }
 
 /// Of the resolvers a host reports, the ones worth forwarding a query to.
@@ -285,20 +304,6 @@ pub(crate) fn resolver_chain(previous: &[String], configured: &str) -> Vec<Strin
     chain
 }
 
-/// The address a socket is bound to before it dials `upstream`.
-///
-/// A socket can only reach an address of its own family: an IPv6 resolver
-/// dialled from an IPv4 socket fails at `send_to`, so it would spend one of the
-/// two slots on the machine's own resolvers and take a usable IPv4 one down
-/// with it, and the failure would look like a resolver that does not answer.
-fn bind_addr_for(upstream: &std::net::SocketAddr) -> &'static str {
-    if upstream.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    }
-}
-
 /// Fallback upstream resolvers, tried in order when the configured upstream times out or is
 /// unreachable.
 /// The default 8.8.8.8 is unreachable on some networks (e.g. direct connections in mainland
@@ -310,48 +315,24 @@ pub(crate) const FALLBACK_UPSTREAMS: &[&str] = &[
     "1.1.1.1:53",         // Cloudflare
 ];
 
-/// Forwards the query along [`resolver_chain`], returning the first successful
-/// reply. Each upstream gets a 1.5s window and only a response coming from the
-/// upstream we queried is accepted (spoofing protection).
+/// Forwards the query along the chain, returning the first successful reply.
+///
+/// The chain is tried in turn, and each upstream gets a window. Only a
+/// response coming from the upstream we queried is accepted (spoofing
+/// protection) — that is the shared resolver's own rule, and it is the one
+/// this path has always had.
 async fn forward_to_upstream(
     socket: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: std::net::SocketAddr,
-    configured_upstream: &str,
-    previous: &[String],
+    resolvers: &UpstreamResolvers,
 ) -> Result<()> {
-    let upstreams = resolver_chain(previous, configured_upstream);
-
-    for upstream in &upstreams {
-        let upstream_addr: std::net::SocketAddr = match upstream.parse() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let upstream_socket = match UdpSocket::bind(bind_addr_for(&upstream_addr)).await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if upstream_socket.send_to(data, upstream_addr).await.is_err() {
-            continue;
+    match resolvers.forward(data).await {
+        Some(answer) => {
+            socket.send_to(&answer, client_addr).await?;
         }
-        let mut buf = [0u8; 4096];
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(1500),
-            upstream_socket.recv_from(&mut buf),
-        )
-        .await
-        {
-            // Only accept a response from the upstream we queried, so spoofed or unrelated
-            // UDP packets are never forwarded to the client
-            Ok(Ok((len, src))) if src == upstream_addr => {
-                socket.send_to(&buf[..len], client_addr).await?;
-                return Ok(());
-            }
-            _ => continue, // timeout / unexpected source / error: try the next upstream
-        }
+        None => tracing::debug!("All upstream DNS servers failed for query"),
     }
-
-    tracing::debug!("All upstream DNS servers failed for query");
     Ok(())
 }
 
@@ -665,15 +646,83 @@ mod tests {
         assert_eq!(with_default_port("8.8.8.8:53"), "8.8.8.8:53");
     }
 
-    /// The socket that dials an upstream has to be of the upstream's family, or
-    /// every IPv6 resolver in the chain fails at `send_to` without a word.
-    #[test]
-    fn a_socket_is_bound_to_the_family_of_the_upstream_it_dials() {
+    /// A resolver that answers what it is asked, and remembers where the
+    /// queries came from.
+    ///
+    /// The answer carries the question it was asked and no records at all: the
+    /// shared resolver only needs the question to check the answer against.
+    struct FakeUpstream {
+        address: std::net::SocketAddr,
+        /// The source address of every query that arrived.
+        seen: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
+    }
+
+    impl FakeUpstream {
+        async fn start() -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
+            let address = socket.local_addr().expect("the address it got");
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = seen.clone();
+
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(from);
+                    let mut reply = buf[..n].to_vec();
+                    // QR: this is an answer, not another query.
+                    reply[2] |= 0x80;
+                    socket.send_to(&reply, from).await.ok();
+                }
+            });
+
+            Self { address, seen }
+        }
+
+        fn seen(&self) -> Vec<std::net::SocketAddr> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    /// A DNS query for `example.com`.
+    fn a_query() -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(&[0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00]);
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet
+    }
+
+    /// Every query leaves from the same socket.
+    ///
+    /// A socket per query would mean a new source port for every lookup, and
+    /// every router between the machine and the resolver would have to build a
+    /// NAT mapping for it — and tear it down again as soon as the answer was
+    /// in. One socket for the lot is what keeps the mapping alive.
+    #[tokio::test]
+    async fn every_query_leaves_from_the_same_socket() {
+        let upstream = FakeUpstream::start().await;
+        let resolvers = UpstreamResolvers::new(&[upstream.address], Arc::new(AtomicBool::new(false)));
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
+        let client_addr = client.local_addr().expect("the address it got");
+
+        for _ in 0..2 {
+            forward_to_upstream(&socket, &a_query(), client_addr, &resolvers)
+                .await
+                .expect("the query is forwarded");
+        }
+
+        let seen = upstream.seen();
+        assert_eq!(seen.len(), 2, "both queries reached the resolver");
         assert_eq!(
-            bind_addr_for(&"192.168.1.1:53".parse().unwrap()),
-            "0.0.0.0:0"
+            seen[0].port(),
+            seen[1].port(),
+            "both queries left from the same socket"
         );
-        assert_eq!(bind_addr_for(&"[fd00::1]:53".parse().unwrap()), "[::]:0");
     }
 
     /// Asking an address this process answers on itself is a loop, not a lookup:

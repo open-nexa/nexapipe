@@ -431,6 +431,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The desktop's DNS server keeps its sockets.** The desktop had a second
+  DNS implementation — its own resolver chain, its own timeouts, its own
+  socket handling — and like the client's it built **a new UDP socket for
+  every query** it forwarded. It now uses the same shared resolvers, so every
+  lookup leaves from the same source port and the NAT mapping the router
+  keeps for it is the one that stays. The chain, the order and the windows
+  are unchanged.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks
