@@ -477,7 +477,17 @@ impl ClientAuth {
     /// `unix_now` is whole seconds, so a device reconnecting inside the same
     /// second costs nothing.
     pub fn record_device_success(&mut self, device: &str) -> bool {
-        let now = unix_now();
+        self.record_device_success_at(device, unix_now())
+    }
+
+    /// The same, with the second handed in.
+    ///
+    /// Split out so that a test can ask about a second of its own choosing:
+    /// the rule is "a whole second", and a test that asks the wall clock for
+    /// it is a test that fails whenever the two calls land either side of a
+    /// second boundary — which is exactly what happened under a full test
+    /// run, where the process is descheduled between them.
+    fn record_device_success_at(&mut self, device: &str, now: u64) -> bool {
         let Some(entry) = self.devices.get_mut(device) else {
             return false;
         };
@@ -674,11 +684,11 @@ mod tests {
             .insert("phone".to_string(), device("PHONESECRET"));
 
         assert!(
-            client.record_device_success("laptop"),
+            client.record_device_success_at("laptop", 1_000),
             "the first stamp is a change"
         );
         let stamped = client.devices["laptop"].last_used;
-        assert!(stamped.is_some(), "the device was not stamped");
+        assert_eq!(stamped, Some(1_000), "the device was stamped");
         assert_eq!(
             client.devices["phone"].last_used, None,
             "a sibling device must not be stamped with it"
@@ -687,10 +697,17 @@ mod tests {
         // Whole seconds, so the same second is not a change — which is what
         // keeps a reconnecting device from costing a write every time.
         assert!(
-            !client.record_device_success("laptop"),
+            !client.record_device_success_at("laptop", 1_000),
             "the same second must not count as a new stamp"
         );
         assert_eq!(client.devices["laptop"].last_used, stamped);
+
+        // And the next second is a change, so the stamp does move.
+        assert!(
+            client.record_device_success_at("laptop", 1_001),
+            "the next second is a new stamp"
+        );
+        assert_eq!(client.devices["laptop"].last_used, Some(1_001));
     }
 
     /// A name that is not in the table is not a stamp, and not an error either:
