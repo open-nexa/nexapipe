@@ -473,6 +473,14 @@ lookup, which is what a config written before the key existed does.
   and only remembers a file once it has been loaded successfully. A failed
   load is retried, with a wait that grows so a file that is simply wrong does
   not fill the log.
+- **The tunnel answers a request it cannot route before reading its body.**
+  A request for a host no route serves had its body read and buffered first —
+  up to 64 MiB per stream, held in memory, for a request with no backend to
+  go to. Worse, the client waited for the refusal until the body arrived, so
+  a client with no body to send waited out the body deadline (60 s) instead
+  of being told there was nowhere to send it. The lookup now comes first and
+  the body is read only for a request that is going somewhere. The plaintext
+  listener already did it this way round.
 - **A route's path rewrite reaches the tunnel.** A route may pair a
   `path_pattern` with a `path_rewrite`, and the rewrite is what the operator
   writes when the service behind the route is not at the path the client asks
