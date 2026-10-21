@@ -642,17 +642,29 @@ class NexaVpnService : VpnService() {
             Log.d(TAG, "Starting TUN proxy: fd=$fd, " +
                     "proxyDomains=${allowedDomains.size} items")
 
-            val result = IrohProxy.nativeStartTunProxy(
-                fd, proxyDomainsStr
-            )
-
-            if (result != 0) {
-                Log.e(TAG, "Failed to start TUN proxy: $result, closing fd")
-                // When nativeStartTunProxy fails Rust never took ownership of
-                // the fd, so close it here.
+            // The native side takes ownership of the descriptor: it closes it
+            // on every path, including the ones that fail, because the
+            // ownership transfer happens at the JNI boundary and it happens
+            // once. So this side must not close it after the call — a second
+            // close of a number the process may already have handed to
+            // something else closes that instead, and the failure is silent.
+            //
+            // It is only ours again if the native method was never entered at
+            // all, which is what the catch below covers.
+            val result = try {
+                IrohProxy.nativeStartTunProxy(
+                    fd, proxyDomainsStr
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "nativeStartTunProxy threw before taking the fd", e)
                 try {
                     ParcelFileDescriptor.adoptFd(fd).close()
                 } catch (_: Exception) {}
+                throw e
+            }
+
+            if (result != 0) {
+                Log.e(TAG, "Failed to start TUN proxy: $result")
                 tunProxyStarted = false
                 return false
             }
