@@ -52,6 +52,7 @@
 
 use crate::ClientError;
 use crate::EndpointGroup;
+use crate::dns::UpstreamResolvers;
 use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
 use crate::local_proxy::{
@@ -169,7 +170,6 @@ const DNS_PORT: u16 = 53;
 /// and the number of AEAD operations per megabyte. 1400 leaves ~35 bytes of headroom and
 /// keeps one inner segment == one QUIC datagram.
 const TUN_MTU: usize = 1400;
-const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The per-socket TCP window the TUN stack uses, in bytes.
 ///
@@ -302,6 +302,14 @@ const MAX_UDP_FLOWS: usize = 32;
 /// connections cost a buffer each rather than four.
 const MAX_TCP_FLOWS: usize = 64;
 
+/// How many DNS queries may be in flight at once.
+///
+/// A device's resolver asks for a handful of names at a time — a page load is a
+/// few, a preconnect is a few more — so this is far above what a real device
+/// uses. It is here so that a device which floods the TUN with queries cannot
+/// make the number of outstanding DNS round trips grow without limit.
+const MAX_DNS_QUERIES: usize = 32;
+
 /// How many bytes one UDP flow may hold of a frame that has not arrived yet.
 ///
 /// Two maximum-size frames, which is the most the buffer can legitimately
@@ -351,6 +359,21 @@ struct TunContext {
     /// Slots left for TCP flows: one is taken per accepted connection and
     /// given back when the flow ends, however it ends.
     tcp_flow_slots: Arc<Semaphore>,
+    /// The upstream resolvers the DNS queries are forwarded to, and the sockets
+    /// they go through.
+    ///
+    /// One set for the whole proxy: a query that built a socket of its own
+    /// would come from a new source port every time, which is the thing this
+    /// exists to stop. See [`crate::dns`].
+    resolvers: UpstreamResolvers,
+    /// Permits left for DNS queries in flight.
+    ///
+    /// One is taken per query and given back when the answer is on its way.
+    /// The device's resolver asks for a handful of names at a time and never
+    /// more than this many at once; a query that finds no permit is dropped
+    /// rather than held, because holding it would stall the UDP flows that
+    /// share the demultiplexer with it.
+    dns_permits: Arc<Semaphore>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -426,6 +449,13 @@ fn start_stack_services(
     let (sink, stream) = stack.split();
 
     let (tun_out, tun_out_rx) = mpsc::channel::<UdpMsg>(TUN_WRITE_QUEUE);
+
+    // The upstream resolvers, and the sockets they are asked through. One set
+    // for the whole proxy: a socket per query would mean a new source port for
+    // every lookup, which is what a NAT has to keep a mapping for. See
+    // [`crate::dns`].
+    let resolvers = UpstreamResolvers::new(&custom_dns_servers, stopped.clone());
+
     let ctx = TunContext {
         endpoint_group,
         proxy_domains: Arc::new(proxy_domains),
@@ -434,6 +464,8 @@ fn start_stack_services(
         legacy_proxy_ip: net.legacy_proxy_ip,
         tun_out,
         tcp_flow_slots: Arc::new(Semaphore::new(MAX_TCP_FLOWS)),
+        resolvers,
+        dns_permits: Arc::new(Semaphore::new(MAX_DNS_QUERIES)),
         stopped: stopped.clone(),
     };
 
@@ -453,11 +485,7 @@ fn start_stack_services(
     if let Some(udp_socket) = udp_socket {
         let (udp_rx, udp_tx) = udp_socket.split();
         tasks.push(tokio::spawn(run_tun_udp_writer(udp_tx, tun_out_rx)));
-        tasks.push(tokio::spawn(run_udp_demux(
-            udp_rx,
-            Arc::new(custom_dns_servers),
-            ctx,
-        )));
+        tasks.push(tokio::spawn(run_udp_demux(udp_rx, ctx)));
     }
 
     Ok((sink, stream))
@@ -1400,11 +1428,7 @@ async fn run_tun_udp_writer(mut writer: UdpWriteHalf, mut queue: mpsc::Receiver<
 }
 
 /// Split the stack's inbound UDP stream into DNS queries and proxied flows.
-async fn run_udp_demux(
-    mut socket: UdpReadHalf,
-    dns_servers: Arc<Vec<SocketAddr>>,
-    ctx: TunContext,
-) {
+async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
     let table: FlowTable = Arc::new(Mutex::new(HashMap::new()));
     // One log line per episode of being full, not one per dropped datagram.
     let warned_full = AtomicBool::new(false);
@@ -1420,15 +1444,32 @@ async fn run_udp_demux(
         // route into the TUN, so a datagram to port 53 there is a DNS query and
         // nothing else.
         if dst_addr.ip() == IpAddr::V4(ctx.dns_ip) && dst_addr.port() == DNS_PORT {
+            // One permit per query in flight. A device asks for a handful of
+            // names at a time, so this is far above what it uses; it is here so
+            // that a device which floods the TUN with queries cannot make the
+            // number of outstanding DNS round trips grow without limit.
+            //
+            // A query that finds no permit is dropped rather than held: holding
+            // it would stall the UDP flows that share this loop, and the
+            // device's resolver retries a query that gets no answer.
+            let Ok(permit) = ctx.dns_permits.clone().try_acquire_owned() else {
+                jni_log!("[tun-proxy] too many DNS queries in flight, dropping one");
+                continue;
+            };
+
             // Answer from the address the query went to: the application's socket
             // may be connected, and a reply from anywhere else is discarded by the
             // kernel before the application ever sees it.
             let ctx = ctx.clone();
-            let dns_servers = dns_servers.clone();
             tokio::spawn(async move {
-                let Some(response) =
-                    handle_dns_query(&payload, &ctx.proxy_domains, &dns_servers, &ctx.ip_mapping)
-                        .await
+                let _permit = permit;
+                let Some(response) = handle_dns_query(
+                    &payload,
+                    &ctx.proxy_domains,
+                    &ctx.resolvers,
+                    &ctx.ip_mapping,
+                )
+                .await
                 else {
                     return;
                 };
@@ -1778,13 +1819,16 @@ fn set_nonblocking(fd: RawFd) -> Result<(), ClientError> {
 /// exclamation mark in the status bar. Let them use the real DNS and reach the physical network,
 /// matching the behavior when the VPN is off.
 ///
-/// Public so the desktop's loopback DNS listener (queries the OS local-delivers
-/// to `[::1]:53`, which never traverse the TUN) can answer with the same
-/// mapping the stack routes by.
+/// The mapping has to be the one the stack routes by: an address handed out
+/// here has to be an address the stack can reverse-lookup, or the connection
+/// that follows the answer has nowhere to go.
+///
+/// Public because it is the client's whole DNS surface — the TUN asks through
+/// it, and so does anything that wants the same answer the device would get.
 pub async fn handle_dns_query(
     query: &[u8],
     proxy_domains: &[String],
-    dns_servers: &[SocketAddr],
+    resolvers: &UpstreamResolvers,
     ip_mapping: &IpMapping,
 ) -> Option<Vec<u8>> {
     let (domain, qtype, qclass) = match parse_dns_query(query) {
@@ -1843,7 +1887,7 @@ pub async fn handle_dns_query(
     } else {
         // Forward to the real DNS.
         jni_log!("[tun-proxy] DNS: forwarding a query (qtype={})", qtype);
-        forward_dns_query(query, dns_servers).await
+        forward_dns_query(query, &domain, qtype, qclass, resolvers).await
     }
 }
 
@@ -2014,143 +2058,40 @@ fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
 
 /// Forward a DNS query to the real DNS server and return the response as-is.
 ///
-/// Iterates over all configured DNS servers, **preferring IPv4**, binding the socket by address family
-/// (IPv4→0.0.0.0:0, IPv6→[::]:0). Each server has its own 800ms timeout, with an overall 3s cap.
-///
 /// A name that was resolved recently is answered from a cache instead, for as
 /// long as the answer's own records say it is good — see [`remember_answer`].
 /// The transaction ID of the query asking now is written into the answer before
 /// it goes out.
 ///
-/// Fix: the system DNS list often starts with IPv6 servers (e.g. 2408:8888::8), which made binding
-/// 0.0.0.0:0 then connect() fail, and the old code only tried dns_servers[0] with no fallback.
-pub async fn forward_dns_query(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
-    if dns_servers.is_empty() {
-        jni_log!("[tun-proxy] No DNS servers configured, dropping query");
-        return None;
-    }
-
+/// The question is passed in rather than parsed here: the caller has already
+/// parsed it, and parsing a DNS message is not free.
+pub async fn forward_dns_query(
+    query: &[u8],
+    domain: &str,
+    qtype: u16,
+    qclass: u16,
+    resolvers: &UpstreamResolvers,
+) -> Option<Vec<u8>> {
     // Every name the device looks up comes through here, and a lookup the
     // resolver has already answered does not need another round trip to a
     // server — which on a phone is a radio wake-up, not a LAN packet.
-    let key = parse_dns_query(query).map(|(domain, qtype, qclass)| CacheKey {
-        name: domain.to_lowercase(),
+    let key = CacheKey {
+        name: Arc::from(domain.to_lowercase()),
         qtype,
         qclass,
-        resolvers: resolver_scope(dns_servers),
-    });
-    if let Some(key) = &key
-        && let Some(answer) = cached_answer(key, query)
-    {
+        resolvers: resolvers.scope().clone(),
+    };
+    if let Some(answer) = cached_answer(&key, query) {
         return Some(answer);
     }
 
-    let answer = forward_dns_query_uncached(query, dns_servers).await;
+    let answer = resolvers.forward(query).await;
 
-    if let (Some(key), Some(answer)) = (key, &answer) {
-        remember_answer(key.clone(), answer);
+    if let Some(answer) = &answer {
+        remember_answer(key, answer);
     }
 
     answer
-}
-
-/// Whether `response` is an answer to `query` rather than to something else.
-///
-/// A UDP socket hands back whatever arrives first, and the answer is believed
-/// without this on a path where DNS is interfered with — a reply that races the
-/// real one wins, is cached under the name that was asked for, and every app on
-/// the device is told that address for as long as its TTL says. The 16-bit ID
-/// is the only thing tying a response to a query, so it and the question are
-/// both required to match.
-fn answer_matches_query(response: &[u8], query: &[u8]) -> bool {
-    if response.len() < 12 || query.len() < 12 {
-        return false;
-    }
-    if response[0..2] != query[0..2] {
-        return false;
-    }
-    // QR: a query is the wrong kind of packet to be answering with.
-    if response[2] & 0x80 == 0 {
-        return false;
-    }
-    match (parse_dns_query(response), parse_dns_query(query)) {
-        (
-            Some((answered, answered_type, answered_class)),
-            Some((asked, asked_type, asked_class)),
-        ) => {
-            // Class included for the same reason the cache key carries it: an
-            // answer for one class is not an answer for another whose name and
-            // type happen to match.
-            answered.eq_ignore_ascii_case(&asked)
-                && answered_type == asked_type
-                && answered_class == asked_class
-        }
-        _ => false,
-    }
-}
-
-async fn forward_dns_query_uncached(query: &[u8], dns_servers: &[SocketAddr]) -> Option<Vec<u8>> {
-    // Prefer IPv4: try IPv4 DNS first (faster and more reliable), then IPv6.
-    let mut ordered: Vec<&SocketAddr> = dns_servers.iter().collect();
-    ordered.sort_by_key(|s| !s.is_ipv4() as u8); // false(=IPv4) goes first
-
-    let per_server_timeout = Duration::from_millis(800);
-
-    let result = tokio::time::timeout(DNS_FORWARD_TIMEOUT, async {
-        for dns_server in ordered.iter() {
-            // Bind by address family: IPv4 DNS → 0.0.0.0:0, IPv6 DNS → [::]:0.
-            let bind_addr = if dns_server.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-
-            // Per-server timeout so we don't get stuck on an unreachable IPv6 DNS server.
-            let server_result = tokio::time::timeout(per_server_timeout, async {
-                let sock = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
-                sock.connect(**dns_server).await.ok()?;
-                sock.send(query).await.ok()?;
-                let mut buf = vec![0u8; 4096];
-                // Keep reading: the first datagram to arrive is not necessarily
-                // an answer to this query, and believing one that is not is how
-                // a forged address gets cached under the name asked for. The
-                // enclosing timeout is what ends the wait.
-                loop {
-                    let n = sock.recv(&mut buf).await.ok()?;
-                    let response = buf[..n].to_vec();
-                    if answer_matches_query(&response, query) {
-                        return Some(response);
-                    }
-                }
-            })
-            .await;
-
-            match server_result {
-                Ok(Some(resp)) => return Some(resp),
-                _ => continue,
-            }
-        }
-        None
-    })
-    .await;
-
-    match result {
-        Ok(Some(resp)) => Some(resp),
-        Ok(None) => {
-            jni_log!(
-                "[tun-proxy] DNS forward failed (all {} servers failed)",
-                dns_servers.len()
-            );
-            None
-        }
-        Err(_) => {
-            jni_log!(
-                "[tun-proxy] DNS forward timed out after {}s",
-                DNS_FORWARD_TIMEOUT.as_secs()
-            );
-            None
-        }
-    }
 }
 
 // ============================================================
@@ -2182,24 +2123,17 @@ const DNS_CACHE_MAX_ENTRIES: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     /// Lower-cased, because DNS names are case-insensitive.
-    name: String,
+    ///
+    /// Shared rather than copied: the key is cloned on every lookup, and a
+    /// name is a handful of bytes that every query would otherwise copy.
+    name: Arc<str>,
     qtype: u16,
     qclass: u16,
     /// The resolvers this answer came from, in the order they were configured.
-    resolvers: String,
-}
-
-/// The resolvers an answer belongs to, joined in configuration order.
-///
-/// Not hashed: an answer from one resolver set must never be reachable through
-/// the name of another, and a hash collaboration would be the cache's bug all
-/// over again. A handful of strings in a 512-entry table costs nothing.
-fn resolver_scope(dns_servers: &[SocketAddr]) -> String {
-    dns_servers
-        .iter()
-        .map(|addr| addr.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
+    ///
+    /// Shared for the same reason as the name: the scope is the same for every
+    /// query, so there is no reason to rebuild it for each of them.
+    resolvers: Arc<str>,
 }
 
 struct CachedAnswer {
@@ -2264,13 +2198,20 @@ fn remember_answer(key: CacheKey, response: &[u8]) {
 
     let mut cache = lock_cache();
     let now = tokio::time::Instant::now();
-    cache.retain(|_, entry| entry.expires_at > now);
 
-    // No room and nothing expired: the whole table is dropped rather than
-    // picking a victim one record at a time, which for a cache this size is
-    // not worth the bookkeeping.
+    // The sweep walks the whole table, so it happens only when the table is
+    // full. An entry that has expired is never served anyway — the lookup
+    // checks the expiry — so nothing is lost by letting it sit there until
+    // there is a reason to look.
     if cache.len() >= DNS_CACHE_MAX_ENTRIES {
-        cache.clear();
+        cache.retain(|_, entry| entry.expires_at > now);
+
+        // No room and nothing expired: the whole table is dropped rather than
+        // picking a victim one record at a time, which for a cache this size is
+        // not worth the bookkeeping.
+        if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
     }
 
     cache.insert(
@@ -2395,11 +2336,12 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 mod tests {
     use super::{
         Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
-        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, answer_matches_query, answer_ttl,
+        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UpstreamResolvers, answer_ttl,
         answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at, handle_dns_query,
         lock_cache, next_activity, parse_dns_query, read_u32, remember_answer, resolve_tcp_window,
-        resolver_scope, set_answer_ttls, wait_for_stop,
+        set_answer_ttls, wait_for_stop,
     };
+    use crate::dns::resolver_scope;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -2414,10 +2356,10 @@ mod tests {
 
     fn key_in(name: &str, qclass: u16) -> CacheKey {
         CacheKey {
-            name: name.to_string(),
+            name: Arc::from(name),
             qtype: 1,
             qclass,
-            resolvers: RESOLVERS.to_string(),
+            resolvers: Arc::from(RESOLVERS),
         }
     }
 
@@ -2520,60 +2462,6 @@ mod tests {
     fn refuses_a_pointer_outside_the_packet() {
         let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
         assert!(parse_dns_query(&query(&name, 1)).is_none());
-    }
-
-    /// What a forwarded answer is checked against: a UDP socket hands over
-    /// whatever arrived first, and an answer that is not for this query would
-    /// otherwise be cached under the name that was asked for.
-    #[test]
-    fn an_answer_matches_when_its_id_and_question_do() {
-        let name = [
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-        ];
-        let q = query(&name, 1);
-        let mut response = q.clone();
-        response[2] = 0x81; // QR: this is an answer, not another query.
-
-        assert!(answer_matches_query(&response, &q));
-        // The query is not an answer to itself.
-        assert!(!answer_matches_query(&q, &q));
-    }
-
-    #[test]
-    fn an_answer_for_another_id_is_not_taken() {
-        let name = [
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-        ];
-        let q = query(&name, 1);
-        let mut response = q.clone();
-        response[2] = 0x81;
-        response[1] ^= 0xff;
-
-        assert!(!answer_matches_query(&response, &q));
-    }
-
-    #[test]
-    fn an_answer_for_another_name_or_type_is_not_taken() {
-        let asked = [
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-        ];
-        let other = [0x04, b'e', b'v', b'i', b'l', 0x03, b'c', b'o', b'm', 0x00];
-        let q = query(&asked, 1);
-
-        // Same ID, different question: the forged answer that races the real
-        // one on a path where DNS is interfered with.
-        let mut forged = query(&other, 1);
-        forged[0] = q[0];
-        forged[1] = q[1];
-        forged[2] = 0x81;
-        assert!(!answer_matches_query(&forged, &q));
-
-        // Same name, wrong record type.
-        let mut wrong_type = query(&asked, 28);
-        wrong_type[0] = q[0];
-        wrong_type[1] = q[1];
-        wrong_type[2] = 0x81;
-        assert!(!answer_matches_query(&wrong_type, &q));
     }
 
     /// An answer with two A records: the same header and question, then two
@@ -2781,14 +2669,11 @@ mod tests {
     /// it wrote, its type and its RDATA.
     async fn answered(qtype: u16, mapping: &IpMapping) -> (u16, Option<(u16, Vec<u8>)>) {
         let query = query(&wire_name(), qtype);
-        let response = handle_dns_query(
-            &query,
-            &["example.com".to_string()],
-            &[], // no upstream: a proxied name is never forwarded
-            mapping,
-        )
-        .await
-        .expect("a proxied query is answered");
+        // No upstream: a proxied name is never forwarded.
+        let resolvers = UpstreamResolvers::new(&[], Arc::new(AtomicBool::new(false)));
+        let response = handle_dns_query(&query, &["example.com".to_string()], &resolvers, mapping)
+            .await
+            .expect("a proxied query is answered");
 
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         if ancount == 0 {
