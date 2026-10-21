@@ -2069,6 +2069,30 @@ async fn perform_authentication(
                 AuthError::LockedOut => {
                     tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
                 }
+                AuthError::WrongSignature => {
+                    // Not counted, and worth saying why: a key cannot be
+                    // guessed, so there is nothing for the counter to protect
+                    // on this path — counting it would only let a peer that
+                    // knows the client id and the device name deny the
+                    // device's owner service.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that does not match \
+                         the challenge",
+                        peer,
+                        client_id
+                    );
+                }
+                AuthError::MalformedSignature => {
+                    // Not counted, and worth saying why: the peer sent noise
+                    // rather than a wrong credential, so this is not an
+                    // attempt at the device.
+                    tracing::warn!(
+                        "2FA: response from {} for '{}' carries a signature that is not a \
+                         signature",
+                        peer,
+                        client_id
+                    );
+                }
                 AuthError::UnnamedDeviceNotAllowed => {
                     // The one refusal that is a configuration the operator can
                     // change, so it is the one that says which knob.
