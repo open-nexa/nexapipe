@@ -111,13 +111,20 @@ fn a_key_device_proves_itself_with_a_signature() {
     );
 }
 
-/// A signature from a key the server does not hold is a wrong credential:
-/// `Ok(false)`, the one outcome that is counted — for a key device it is also
-/// the *only* wrong-credential signal there is, since there is no code to be
-/// the wrong one. After `max_attempts` the client is locked, and even the
-/// genuine device is refused until the lockout clears.
+/// A signature from a key the server does not hold is refused, and it does
+/// **not** move the counter.
+///
+/// This is the change. A key cannot be brute-forced, so a counter on this
+/// path protects nothing — while it does hand anyone who knows a client id
+/// and the name of a key device a way to lock a legitimate device out, over
+/// and over, without holding any credential at all.
+///
+/// The secret path keeps its counter, and the asymmetry is the point: there,
+/// the HMAC has to verify *before* the code is checked, so only a peer that
+/// already holds the secret can move the counter. The key path has no such
+/// gate, so a counter there is a DoS with no defence behind it.
 #[test]
-fn a_wrong_signature_is_refused_and_counted() {
+fn a_wrong_signature_is_refused_and_not_counted() {
     let (mut config, key) = auth_config_with_key_device();
     let genuine = TwoFactorAuth::with_key("client-001", key, "phone");
     let impostor = TwoFactorAuth::with_key("client-001", iroh::SecretKey::generate(), "phone");
@@ -135,17 +142,19 @@ fn a_wrong_signature_is_refused_and_counted() {
             "",
         );
         assert!(
-            matches!(outcome, Ok(false)),
-            "a foreign key is a wrong credential, not an error, got {outcome:?}"
+            matches!(outcome, Err(AuthError::WrongSignature)),
+            "a foreign key is refused, and refused is not counted, got {outcome:?}"
         );
         count(&mut config, &outcome);
     }
 
     assert!(
-        config.clients["client-001"].is_locked_out(),
-        "three wrong signatures must lock the client out"
+        !config.clients["client-001"].is_locked_out(),
+        "wrong signatures must not lock the client out: there is nothing to guess, and the \
+         counter would only let a peer who knows the client id deny the device its owner"
     );
 
+    // And the genuine device still gets in.
     let nonce = fresh_nonce();
     let timestamp = now();
     let signature = genuine.sign_challenge(&nonce, timestamp).unwrap();
@@ -158,8 +167,8 @@ fn a_wrong_signature_is_refused_and_counted() {
         "",
     );
     assert!(
-        matches!(outcome, Err(AuthError::LockedOut)),
-        "the counter is the client's, so the real device waits too, got {outcome:?}"
+        matches!(outcome, Ok(true)),
+        "the real device is not affected by another peer's noise, got {outcome:?}"
     );
 }
 
@@ -220,8 +229,10 @@ fn a_key_device_is_not_reachable_with_the_clients_secret() {
         &signature,
         &code,
     );
+    // Refused, and refused without a fallback to the client's secret. The
+    // HMAC is 32 bytes and a signature is 64, so this is the malformed case.
     assert!(
-        matches!(outcome, Ok(false)),
+        matches!(outcome, Err(AuthError::MalformedSignature)),
         "the client's secret is not the device's credential, got {outcome:?}"
     );
 
