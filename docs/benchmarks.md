@@ -151,6 +151,10 @@ window, which is the whole point:
 | 128 KiB | 512.7 KiB | 16.1 MiB |
 | 64 KiB | 256.7 KiB | 8.1 MiB |
 
+The client's window is 128 KiB now, and it may hold 64 flows at once, so the
+TUN's worst case is **32.1 MiB** — 64 flows at 512.8 KiB each — where it was
+**320.2 MiB** before: 256 flows at 1,280.7 KiB each.
+
 ## What this is not
 
 - **Not a budget.** Nothing here fails a build when a number gets worse. A
