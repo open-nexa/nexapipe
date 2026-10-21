@@ -296,16 +296,21 @@ fn locks_out_after_max_attempts() {
     );
 }
 
-/// Counters persist through `save_auth_state` and come back on the next load,
-/// without touching anything a human wrote into the file.
+/// Counters persist through `save_auth_state` and come back on the next load.
+///
+/// They live in the **state file**, beside the configuration, and the
+/// configuration is not touched at all: it is the operator's file, and a
+/// server that wrote its own counters into it moved its modification time
+/// every time somebody mistyped a code — which the configuration watcher
+/// watches, so a lockout was a configuration reload.
 #[test]
 fn persists_lockout_counters_across_a_reload() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().unwrap();
-    std::fs::write(
-        &path,
-        "# operator comment that must survive\n\
+    let state_path = dir.path().join("state.toml");
+    let state_path_str = state_path.to_str().unwrap();
+    let source = "# operator comment that must survive\n\
          [auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
@@ -313,9 +318,8 @@ fn persists_lockout_counters_across_a_reload() {
          created_at = \"1723756800\"\n\
          [auth.clients.client-002]\n\
          secret = \"KBSWY3DPEHPK3PXQ\"\n\
-         created_at = \"1723756800\"\n",
-    )
-    .unwrap();
+         created_at = \"1723756800\"\n";
+    std::fs::write(&path, source).unwrap();
 
     let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
@@ -324,18 +328,22 @@ fn persists_lockout_counters_across_a_reload() {
     entry.record_failure(3, 60);
     entry.record_failure(3, 60);
     entry.last_used = Some(1700000000);
-    save_auth_state(path_str, &auth).unwrap();
+    save_auth_state(state_path_str, &auth).unwrap();
 
+    // The configuration is byte for byte what the operator wrote.
     let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        on_disk.contains("# operator comment that must survive"),
-        "comments are not the server's to rewrite"
+    assert_eq!(
+        on_disk, source,
+        "the configuration is not the server's file to rewrite"
     );
-    assert!(on_disk.contains("failed_attempts = 2"));
-    assert!(on_disk.contains("last_used = 1700000000"));
+
+    // The counters are in the state file, and only the counters.
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    assert!(state.contains("failed_attempts = 2"), "{state}");
+    assert!(state.contains("last_used = 1700000000"), "{state}");
     assert!(
-        on_disk.contains("KBSWY3DPEHPK3PXQ"),
-        "the untouched client stays as written"
+        !state.contains("JBSWY3DPEHPK3PXP"),
+        "a credential has no business in the state file: {state}"
     );
 
     let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
@@ -347,10 +355,10 @@ fn persists_lockout_counters_across_a_reload() {
     // A success zeroes the counters, and zeroed counters leave no keys behind.
     let mut auth = reloaded;
     auth.clients.get_mut("client-001").unwrap().record_success();
-    save_auth_state(path_str, &auth).unwrap();
-    let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(!on_disk.contains("failed_attempts"));
-    assert!(!on_disk.contains("locked_until"));
+    save_auth_state(state_path_str, &auth).unwrap();
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    assert!(!state.contains("failed_attempts"), "{state}");
+    assert!(!state.contains("locked_until"), "{state}");
 
     let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
@@ -359,14 +367,20 @@ fn persists_lockout_counters_across_a_reload() {
     assert!(entry.locked_until.is_none());
 }
 
-/// A client that exists only in memory is not written to disk: the operator
-/// may have removed it from the file while the server was running, and a
-/// section without its secret would break the next load.
+/// A client the configuration does not have stays gone.
+///
+/// The state file is the server's own bookkeeping, so it may carry a client
+/// the configuration no longer lists — the operator removed it while the
+/// server was running. Loading the configuration does not bring it back: the
+/// state file has no say over which clients exist, only over what the server
+/// knows about the ones that do.
 #[test]
 fn does_not_resurrect_a_client_removed_from_disk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().unwrap();
+    let state_path = dir.path().join("state.toml");
+    let state_path_str = state_path.to_str().unwrap();
     std::fs::write(
         &path,
         "[auth]\n\
@@ -394,12 +408,22 @@ fn does_not_resurrect_a_client_removed_from_disk() {
         },
     );
 
-    save_auth_state(path_str, &auth).unwrap();
+    save_auth_state(state_path_str, &auth).unwrap();
 
+    // The configuration is not where a client comes back from.
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
         !on_disk.contains("client-002"),
         "a client removed from the file must not come back"
+    );
+
+    // And a state file that carries one does not bring it back either.
+    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let reloaded = reloaded.unwrap();
+    assert!(
+        !reloaded.clients.contains_key("client-002"),
+        "the state file has no say over which clients exist: {:?}",
+        reloaded.clients.keys().collect::<Vec<_>>()
     );
 }
 
@@ -587,18 +611,22 @@ fn a_device_shares_its_clients_lockout_counter() {
     assert!(matches!(outcome, Err(AuthError::LockedOut)), "{outcome:?}");
 }
 
-/// `save_auth_state` rewrites the file on every counted failure — which is
-/// also the file the device table lives in. A write that dropped the table
-/// would revoke every device the first time somebody mistyped a code, and it
-/// would do it on disk only, where the running server still has them.
+/// The device table lives in the configuration, and the counters live in the
+/// state file, so counting a failure cannot touch a device.
+///
+/// This is the separation earning its keep: the counters and the credentials
+/// used to share one file, and every counted failure rewrote it. A write
+/// that dropped the device table would revoke every device the first time
+/// somebody mistyped a code, and it would do it on disk only, where the
+/// running server still has them.
 #[test]
 fn keeps_the_device_table_when_it_writes_counters() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().unwrap();
-    std::fs::write(
-        &path,
-        "# operator comment that must survive\n\
+    let state_path = dir.path().join("state.toml");
+    let state_path_str = state_path.to_str().unwrap();
+    let source = "# operator comment that must survive\n\
          [auth]\n\
          enabled = true\n\
          [auth.clients.client-001]\n\
@@ -608,9 +636,8 @@ fn keeps_the_device_table_when_it_writes_counters() {
          secret = \"KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP\"\n\
          created_at = \"1723756801\"\n\
          [auth.clients.client-001.devices.phone]\n\
-         secret = \"MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA\"\n",
-    )
-    .unwrap();
+         secret = \"MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA\"\n";
+    std::fs::write(&path, source).unwrap();
 
     let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
@@ -624,24 +651,23 @@ fn keeps_the_device_table_when_it_writes_counters() {
         .get_mut("client-001")
         .unwrap()
         .record_failure(3, 60);
-    save_auth_state(path_str, &auth).unwrap();
+    save_auth_state(state_path_str, &auth).unwrap();
 
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        state.contains("failed_attempts = 1"),
+        "the counter was written: {state}"
+    );
+    assert!(
+        !state.contains("KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"),
+        "a credential has no business in the state file: {state}"
+    );
+
+    // The configuration is byte for byte what the operator wrote.
     let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        on_disk.contains("failed_attempts = 1"),
-        "the counter was written: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP"),
-        "the laptop's secret survives a counter write: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA"),
-        "so does the phone's: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("created_at = \"1723756801\""),
-        "a device's own keys are not the server's to rewrite: {on_disk}"
+    assert_eq!(
+        on_disk, source,
+        "the configuration was rewritten: {on_disk}"
     );
 
     let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();

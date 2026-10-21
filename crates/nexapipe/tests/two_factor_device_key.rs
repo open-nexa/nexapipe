@@ -302,6 +302,8 @@ fn keeps_a_key_device_when_it_writes_counters() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let path_str = path.to_str().unwrap();
+    let state_path = dir.path().join("state.toml");
+    let state_path_str = state_path.to_str().unwrap();
     let key = nexapipe::auth::public_key_hex(&iroh::SecretKey::generate().public());
     std::fs::write(
         &path,
@@ -332,7 +334,19 @@ fn keeps_a_key_device_when_it_writes_counters() {
         .get_mut("client-001")
         .unwrap()
         .record_device_success("phone");
-    save_auth_state(path_str, &auth).unwrap();
+    save_auth_state(state_path_str, &auth).unwrap();
+
+    // The stamp that says the device is in use goes to the state file; the
+    // key device itself stays where it is, in the operator's configuration.
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        state.contains("last_used = "),
+        "the stamp that says the device is in use was written: {state}"
+    );
+    assert!(
+        !state.contains(&key),
+        "a credential has no business in the state file: {state}"
+    );
 
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -343,14 +357,14 @@ fn keeps_a_key_device_when_it_writes_counters() {
         on_disk.contains(&format!("public_key = \"{key}\"")),
         "the key survives the writeback: {on_disk}"
     );
-    assert!(
-        on_disk.contains("last_used = "),
-        "the stamp that says the device is in use was written: {on_disk}"
-    );
 
     let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let phone = &reloaded.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));
     assert!(phone.secret.expose_secret().is_empty());
+    assert!(
+        phone.last_used.is_some(),
+        "the stamp comes back on the next load: {phone:?}"
+    );
 }

@@ -429,101 +429,50 @@ fn apply_auth_enabled(live: &mut AuthConfig, incoming: &AuthConfig) -> Option<bo
 
 pub type SharedConfigWatcher = Arc<ConfigWatcher>;
 
-/// Persists the runtime 2FA counters of `config` into the file at `path`.
+/// Persists the runtime 2FA counters of `config` into the state file at `path`.
 ///
 /// A lockout only means anything if it survives a restart, so
 /// `failed_attempts`, `locked_until` and `last_used` are written back whenever
 /// the connection layer changes them — and `last_used` under
 /// `[auth.clients.<id>.devices.<name>]` with them, which is the stamp that says
-/// whether a device is still in use. Only those keys are touched, and only for
-/// clients and devices that already have a section on disk, so a stale
-/// in-memory entry cannot resurrect one the operator removed. Everything else
-/// in the file, comments included, survives byte for byte, exactly like
-/// [`ProxyConfig::write_client_secret`].
+/// whether a device is still in use.
+///
+/// The file they go to is the **state file**, not the configuration file, and
+/// that is the whole point of this function having moved: the configuration is
+/// the operator's, and a server that writes its own counters into it changes
+/// a file nobody asked it to touch — and moves its modification time, which
+/// the watcher watches, so a stranger mistyping a code was a configuration
+/// reload. The state file is the server's, and only the server writes it.
+///
+/// Only the counters travel. The credentials, the host lists and the
+/// enrollment tokens stay where they are, and a client or device that the
+/// configuration does not have is not written: the operator may have removed
+/// it while the server was running.
 pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
     // The whole read-modify-write runs under the lock, not just the write: two
     // counter writebacks that both read first would each build their document
     // from the file as it was before the other one landed, and one set of
     // counters would be lost.
-    crate::config::with_config_lock(path, || save_auth_state_unlocked(path, config))
-}
-
-fn save_auth_state_unlocked(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
-    let mut doc = crate::config::read_config_document(path, "auth state not written")?;
-
-    let clients = doc
-        .as_table_mut()
-        .get_mut("auth")
-        .and_then(|item| item.as_table_like_mut())
-        .and_then(|auth| auth.get_mut("clients"))
-        .and_then(|item| item.as_table_like_mut())
-        .ok_or_else(|| {
-            anyhow::anyhow!("{path} has no [auth.clients] table, auth state not written")
-        })?;
-
-    for (id, client) in &config.clients {
-        let Some(table) = clients
-            .get_mut(id)
-            .and_then(|item| item.as_table_like_mut())
-        else {
-            // Not on disk: the operator edited the file under us; writing a
-            // section without a secret would break the next load.
-            continue;
-        };
-        set_counter(table, "failed_attempts", client.failed_attempts as u64);
-        set_counter(table, "locked_until", client.locked_until.unwrap_or(0));
-        set_counter(table, "last_used", client.last_used.unwrap_or(0));
-
-        // The same stamp per device, which is the one a per-device credential
-        // is for: without it `client list` answers "never used" for every named
-        // device, and "which of these can I revoke" has nothing to go on. Only
-        // devices the file already carries are written — inventing a section
-        // with no secret would leave a device nobody can authenticate as.
-        if !client.devices.is_empty() {
-            let Some(devices) = table
-                .get_mut("devices")
-                .and_then(|item| item.as_table_like_mut())
-            else {
-                continue;
-            };
-            for (name, device) in &client.devices {
-                let Some(entry) = devices
-                    .get_mut(name)
-                    .and_then(|item| item.as_table_like_mut())
-                else {
-                    continue;
-                };
-                set_counter(entry, "last_used", device.last_used.unwrap_or(0));
-            }
-        }
-    }
-
-    crate::config::write_config_document(path, doc)?;
-    Ok(())
-}
-
-/// Writes `value` under `key`, or removes the key when the counter is back at
-/// zero — a config file should not accumulate `failed_attempts = 0` lines for
-/// every client that ever mistyped a code.
-fn set_counter(table: &mut dyn toml_edit::TableLike, key: &str, value: u64) {
-    if value != 0 {
-        table.insert(key, toml_edit::value(value as i64));
-    } else {
-        table.remove(key);
-    }
+    crate::config::with_config_lock(path, || {
+        crate::auth::state::save(
+            std::path::Path::new(path),
+            &crate::auth::state::snapshot(config),
+        )
+    })
 }
 
 /// Folds the freshly parsed `[auth.clients]` table into the live one.
 ///
 /// Returns the ids that were added and the ones that were removed, for the
 /// reload log. A client present on both sides keeps its in-memory counters —
-/// [`save_auth_state`] flushes them, but a failure recorded between the last
-/// flush and this merge is newer than the file — and takes everything else
-/// (`secret`, `pending_enrollment`, `allow_hosts`) from the file, which is how
-/// an invite written by another process becomes spendable and a rotated secret
-/// takes over without a restart. A client the file no longer lists is dropped:
-/// the operator removed it, and keeping it alive in memory would let a deleted
-/// credential keep authenticating until the next restart.
+/// [`save_auth_state`] flushes them to the state file, but a failure recorded
+/// between the last flush and this merge is newer than the file — and takes
+/// everything else (`secret`, `pending_enrollment`, `allow_hosts`) from the
+/// file, which is how an invite written by another process becomes spendable
+/// and a rotated secret takes over without a restart. A client the file no
+/// longer lists is dropped: the operator removed it, and keeping it alive in
+/// memory would let a deleted credential keep authenticating until the next
+/// restart.
 fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<String>, Vec<String>) {
     let mut added = Vec::new();
     let mut removed = Vec::new();
@@ -938,11 +887,18 @@ mod tests {
     /// "never used" forever, and "which of these can I revoke without
     /// disconnecting someone" has nothing to go on — which is the whole of what
     /// a per-device credential is for.
+    ///
+    /// The stamp goes to the **state file**, and the configuration file is left
+    /// exactly as it was: the counters are the server's, the configuration is
+    /// the operator's, and a server that wrote its own counters into the
+    /// operator's file moved its modification time every time somebody
+    /// mistyped a code — which the watcher watches.
     #[test]
     fn a_device_stamp_is_written_back_without_touching_its_secret() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config.toml");
-        let path_str = path.to_str().expect("utf-8 path").to_string();
+        let state_path = dir.path().join("state.toml");
+        let state_path_str = state_path.to_str().expect("utf-8 path").to_string();
         std::fs::write(
             &path,
             "[auth]\n\
@@ -970,16 +926,29 @@ mod tests {
 
         // Written the way the connection layer writes it: from a snapshot, which
         // is a copy that carries no credential.
-        save_auth_state(&path_str, &config.counter_snapshot()).expect("the writeback succeeds");
+        save_auth_state(&state_path_str, &config.counter_snapshot())
+            .expect("the writeback succeeds");
 
-        let on_disk = std::fs::read_to_string(&path).expect("read the config back");
+        let on_disk = std::fs::read_to_string(&state_path).expect("read the state back");
         assert!(
             on_disk.contains("last_used = 1700000000"),
             "the device stamp did not reach the file: {on_disk}"
         );
         assert!(
-            on_disk.contains("LAPTOPLAPTOPLAPT"),
-            "the snapshot's blanked secret must not be written over the real one: {on_disk}"
+            !on_disk.contains("LAPTOPLAPTOPLAPT"),
+            "the snapshot's blanked secret must not be written: {on_disk}"
+        );
+
+        let config_on_disk = std::fs::read_to_string(&path).expect("read the config back");
+        assert_eq!(
+            config_on_disk,
+            "[auth]\n\
+             [auth.clients.alice]\n\
+             secret = \"ALICEALICEALICEA\"\n\
+             \n\
+             [auth.clients.alice.devices.laptop]\n\
+             secret = \"LAPTOPLAPTOPLAPT\"\n",
+            "the configuration is the operator's file and is not the server's to rewrite"
         );
     }
 

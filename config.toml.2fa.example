@@ -199,8 +199,12 @@ created_at = "1723756800"
 # goes). The HTTP path routes by host alone, so there the list refuses a
 # request that names a port off it and nothing more.
 # allow_ports = [443, 8443]
-# The server also writes `failed_attempts`, `locked_until` and `last_used` back
-# into a client that has failed a handshake, so a lockout survives a restart.
+# The server keeps `failed_attempts`, `locked_until` and `last_used` for a
+# client that has failed a handshake, so a lockout survives a restart. Those
+# three live in `state.toml` beside this file, not here — this file is the
+# operator's, and the server does not rewrite it for its own counters. They are
+# still read from here, so a file written before the state file existed keeps
+# its lockouts.
 # Nothing to configure; and `pending_enrollment`, written by the enrollment
 # command above, should never be edited by hand either.
 #
