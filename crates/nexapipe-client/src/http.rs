@@ -49,6 +49,14 @@ impl HttpRequest {
         self
     }
 
+    /// The host this request is for.
+    ///
+    /// The host is what picks the server: the domain mapping is keyed by it,
+    /// so a caller that wants a different server sends a different host.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("{} {} HTTP/1.1\r\n", self.method, self.path).as_bytes());
