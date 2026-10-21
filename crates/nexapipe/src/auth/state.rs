@@ -255,6 +255,7 @@ mod tests {
             created_at: "0".to_string(),
             allow_hosts: None,
             allow_ports: None,
+            allow_ports_strict: false,
             pending_enrollment: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,

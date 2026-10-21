@@ -212,6 +212,23 @@ async fn resolve_backend(
     // a name this proxy does not serve, whereas every backend behind the route
     // being down is an outage. `get_passthrough_backend` logs the detail; either
     // way there is nothing to copy bytes to, so nobody gets a TLS handshake.
+    // The port the session is served from, checked against the client's port
+    // list when the ACL is strict. The passthrough had no port check at all
+    // before: a client limited to one port could reach every service on every
+    // name it was allowed, over the SNI path as well as the HTTP one.
+    if let Some(acl) = acl
+        && let Some(backend) = config.get_passthrough_backend(&sni).await.backend()
+        && let Some(port) = crate::routes::backend_port(backend.url())
+        && !acl.allows_backend_port(port)
+    {
+        tracing::warn!(
+            "TLS passthrough: port {port} (the backend for '{}') is not allowed for this client, \
+             closing",
+            sni
+        );
+        return None;
+    }
+
     let Some(backend) = config.get_passthrough_backend(&sni).await.backend() else {
         tracing::warn!(
             "TLS passthrough: nothing to forward SNI '{}' to, closing",
