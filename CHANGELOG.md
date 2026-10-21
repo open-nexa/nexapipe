@@ -179,6 +179,13 @@ its defaults — which are on.
   `notexample.com` with it; it matches nothing now, and the server has always
   refused the spelling. The dot-prefixed spelling (`.example.com`) is refused
   as well: it is the suffix form a resolver uses, not a pattern here.
+  The client's own lookup of the backend that serves a name follows the same
+  rule now: a wildcard mapping serves the names it covers, a bare mapping
+  serves its own name alone, and a name written the way DNS writes it — with
+  the trailing dot — finds the same backend. A client that configured
+  `*.example.com` used to decide that `www.example.com` belonged in the
+  tunnel and then fail to find the backend for it, so the request went to the
+  default backend or to none.
 - **The handshake proves a credential, not necessarily a TOTP secret.** Which
   kind of credential a device has comes from the server's own record, not
   from a wire discriminator, so no message variant or scheme field was added,

@@ -1619,8 +1619,9 @@ mod tests {
     }
 
     /// The backend a host is sent to, or `None` when the group has none for it.
-    fn served_by(&self, host: &str) -> Option<EndpointId> {
-        self.pools_for(host)
+    fn served_by(group: &EndpointGroup, host: &str) -> Option<EndpointId> {
+        group
+            .pools_for(host)
             .map(|pools| pools.pools[0].backend_id())
     }
 
@@ -1645,10 +1646,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(group.served_by("www.example.com"), Some(backend));
-        assert_eq!(group.served_by("a.b.example.com"), Some(backend));
+        assert_eq!(served_by(&group, "www.example.com"), Some(backend));
+        assert_eq!(served_by(&group, "a.b.example.com"), Some(backend));
         // The apex is not under its own wildcard, the way DNS reads it.
-        assert_eq!(group.served_by("example.com"), None);
+        assert_eq!(served_by(&group, "example.com"), None);
     }
 
     /// A bare mapping is that name and nothing else.
@@ -1670,8 +1671,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(group.served_by("example.com"), Some(backend));
-        assert_eq!(group.served_by("www.example.com"), None);
+        assert_eq!(served_by(&group, "example.com"), Some(backend));
+        assert_eq!(served_by(&group, "www.example.com"), None);
     }
 
     /// A wildcard and the apex it sits next to are two mappings, and the
@@ -1697,8 +1698,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(group.served_by("example.com"), Some(apex_backend));
-        assert_eq!(group.served_by("www.example.com"), Some(wildcard_backend));
+        assert_eq!(served_by(&group, "example.com"), Some(apex_backend));
+        assert_eq!(served_by(&group, "www.example.com"), Some(wildcard_backend));
     }
 
     /// Where two wildcards cover the same name, the more specific one answers.
@@ -1720,11 +1721,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(group.served_by("a.example.com"), Some(broad_backend));
-        assert_eq!(
-            group.served_by("a.www.example.com"),
-            Some(narrow_backend)
-        );
+        assert_eq!(served_by(&group, "a.example.com"), Some(broad_backend));
+        assert_eq!(served_by(&group, "a.www.example.com"), Some(narrow_backend));
     }
 
     /// A name written the way DNS writes it — with the trailing dot — is the
@@ -1743,8 +1741,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(group.served_by("example.com."), Some(backend));
-        assert_eq!(group.served_by("EXAMPLE.com"), Some(backend));
+        assert_eq!(served_by(&group, "example.com."), Some(backend));
+        assert_eq!(served_by(&group, "EXAMPLE.com"), Some(backend));
     }
 
     /// The two answers have to be the same answer.
