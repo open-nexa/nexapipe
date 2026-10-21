@@ -1566,6 +1566,38 @@ fn constant_time_eq(expected: &[u8], given: &[u8]) -> bool {
 /// cannot be un-spawned. Two writes to one file then overlap and one of them
 /// is lost. The gate is taken *inside* the detached task, so it is held for as
 /// long as the write takes and not for as long as the caller is patient.
+/// Persists the runtime counters to the state file, without the auth lock.
+///
+/// The counters are read **at write time** and the file is written with the
+/// auth lock released: a write lock held across a disk write stalls every
+/// connection that is authenticating, not only the one whose counters are
+/// being written.
+///
+/// The gate orders the writes, so the file always carries the count as of the
+/// write that reached it last. Because the counters are read here rather than
+/// by the caller, a handshake that counted a failure in between is counted
+/// too — the file can lag the in-memory count by the moment between a read
+/// and the write, and the in-memory count is the one that decides.
+///
+/// The lock order is the gate and then the auth lock, the same order every
+/// other writer takes, so the two cannot deadlock against each other.
+async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
+    let path = auth.state_path().to_string();
+    let config = auth.config().clone();
+    let (done, wait) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let _gate = config_write_gate().lock().await;
+        let snapshot = { config.read().await.counter_snapshot() };
+        let result = tokio::task::spawn_blocking(move || save_auth_state(&path, &snapshot)).await;
+        let _ = done.send(result);
+    });
+
+    wait.await
+        .map_err(|_| anyhow::anyhow!("the auth state write was abandoned"))?
+        .map_err(|e| anyhow::anyhow!("the auth state write did not run: {e}"))?
+}
+
 async fn blocking_config_write<T, F>(path: String, write: F) -> anyhow::Result<T>
 where
     F: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
@@ -1852,6 +1884,9 @@ async fn perform_authentication(
     // counter up to the lockout and, from the change in the reply, learn that
     // the id they guessed exists. The real reason goes to the log instead.
     let mut verified_acl = ClientAcl::unrestricted();
+    // Whether the counters changed and the state file has to be written. The
+    // write itself happens after the lock is released.
+    let mut state_dirty = false;
     let is_valid = match outcome {
         Ok(true) => {
             // Which device this was, if it named one, recorded under the same
@@ -1881,19 +1916,9 @@ async fn perform_authentication(
                 if let Some(client) = cfg.clients.get_mut(&client_id) {
                     client.record_success();
                 }
-                let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-                    save_auth_state(path, &snapshot)
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "2FA: failed to persist auth state for '{}' to {}: {}",
-                        client_id,
-                        auth.state_path(),
-                        e
-                    );
-                }
+                // The write happens after the lock is released; see
+                // `persist_auth_state`.
+                state_dirty = true;
             }
             // Snapshot the host authorization while the same lock that verified
             // the credentials still holds: the entry cannot vanish between the
@@ -1909,20 +1934,10 @@ async fn perform_authentication(
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
                 client.record_failure(max_attempts, lockout_duration);
-                let snapshot = cfg.counter_snapshot();
-                if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-                    save_auth_state(path, &snapshot)
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "2FA: failed to persist lockout for '{}' to {}: {}",
-                        client_id,
-                        auth.state_path(),
-                        e
-                    );
-                }
             }
+            // The write happens after the lock is released; see
+            // `persist_auth_state`.
+            state_dirty = true;
             false
         }
         Err(e) => {
@@ -1991,6 +2006,17 @@ async fn perform_authentication(
     });
 
     drop(cfg);
+
+    // The state file is written with the auth lock released. The counters it
+    // carries are read at write time, so they are the ones as of now.
+    if state_dirty && let Err(e) = persist_auth_state(auth).await {
+        tracing::warn!(
+            "2FA: failed to persist the auth counters for '{}' to {}: {}",
+            client_id,
+            auth.state_path(),
+            e
+        );
+    }
 
     // One fixed string for every refusal, logged apart but sent identically: see
     // the note above the match.
@@ -2448,13 +2474,62 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, blocking_config_write,
-        build_websocket_upgrade_request, constant_time_eq, enrollment_verdict, find_headers_end,
-        issue_enrolled_secret, undo_enrolled_secret,
+        AuthState, EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets,
+        blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, persist_auth_state,
+        undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_client::secret::SecretString;
     use std::collections::HashMap;
+
+    /// The state file carries the counters as of the write, not as of an
+    /// earlier moment.
+    ///
+    /// The write happens with the auth lock released — a lock held across a
+    /// disk write stalls every connection that is authenticating, not only the
+    /// one whose counters are being written — so the counters are read at
+    /// write time. A failure counted between the record and the write is
+    /// counted too, which is what "as of the write" means.
+    #[tokio::test]
+    async fn the_state_file_carries_the_counters_as_of_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\nenabled = true\n\
+             [auth.clients.client-001]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n",
+        )
+        .unwrap();
+
+        let (_, config) = crate::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
+            .expect("the config loads");
+        let auth = AuthState::new(
+            config.expect("the config declares an [auth] section"),
+            path.to_str().unwrap(),
+        );
+
+        // Two failures, recorded in two separate critical sections — the
+        // second one after the first has already been counted.
+        for _ in 0..2 {
+            let mut cfg = auth.config().write().await;
+            cfg.clients
+                .get_mut("client-001")
+                .expect("the client is there")
+                .record_failure(3, 60);
+        }
+
+        persist_auth_state(&auth)
+            .await
+            .expect("the state is written");
+
+        let state = std::fs::read_to_string(dir.path().join("state.toml")).unwrap();
+        assert!(
+            state.contains("failed_attempts = 2"),
+            "the file carries the count as of the write, not as of an earlier moment: {state}"
+        );
+    }
 
     #[test]
     fn a_short_head_budget_does_not_cut_off_a_tls_or_l4_client() {
