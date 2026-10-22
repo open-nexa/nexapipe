@@ -29,7 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 
 /// The ALPN the tunnel speaks. The same bytes the client uses.
-const ALPN: &[u8] = b"\x05nexapipe";
+const ALPN: &[u8] = b"nexapipe";
 
 /// The host the application asks for.
 const HOST: &str = "app.test";

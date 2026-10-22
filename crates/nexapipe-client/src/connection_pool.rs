@@ -1,5 +1,5 @@
-use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
+use iroh::endpoint::{ConnectError, ConnectOptions, Connection};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,22 @@ use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use nexapipe_proto::secret::SecretString;
 
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
+/// The ALPN this build speaks.
+///
+/// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
+/// starts with — in front of the name. That byte was never part of a length
+/// encoding; it made the protocol name a nine-byte string that began with a
+/// control byte, which is a fingerprint on the wire and nothing else. The name
+/// is now the name.
+const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
+
+/// The ALPN servers built before the prefix byte was dropped accept.
+///
+/// Offered as an additional ALPN on every dial, so this client connects to a
+/// server of either vintage. Drop it once no server in the field speaks it any
+/// more.
+const ALPN_NEXAPIPE_LEGACY: &[u8] = b"\x05nexapipe";
+
 /// What a dial produced: the connection and the state its flows share, or
 /// the failure that stopped it.
 ///
@@ -872,10 +887,25 @@ impl IrohConnectionPool {
         timeout: tokio::time::Duration,
     ) -> Result<Connection, ClientError> {
         let started = tokio::time::Instant::now();
-        let conn = tokio::time::timeout(
-            timeout,
-            ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
-        )
+        // Both ALPNs are offered, the current one first: a server built before the
+        // prefix byte was dropped still answers, and one built after it takes the
+        // first it recognises. `connect` alone could only offer one.
+        //
+        // The address lookup and the handshake are both inside the timeout, the way
+        // they were when `connect` did the whole thing; `connect_with_opts` splits
+        // the two apart, so the block puts them back together.
+        let conn = tokio::time::timeout(timeout, async {
+            let connecting = ep
+                .connect_with_opts(
+                    self.inner.endpoint_addr.clone(),
+                    ALPN_NEXAPIPE,
+                    ConnectOptions::new()
+                        .with_additional_alpns(vec![ALPN_NEXAPIPE_LEGACY.to_vec()]),
+                )
+                .await
+                .map_err(ConnectError::from)?;
+            connecting.await.map_err(ConnectError::from)
+        })
         .await
         .map_err(|_| {
             #[cfg(feature = "tracing")]
@@ -1664,9 +1694,9 @@ pub fn parse_endpoint_addr(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALPN_NEXAPIPE, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome, IrohConnectionPool,
-        LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status, identity_changed,
-        is_idle_since, is_measured_rtt, may_publish,
+        ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
+        IrohConnectionPool, LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status,
+        identity_changed, is_idle_since, is_measured_rtt, may_publish,
     };
     use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
@@ -1726,6 +1756,46 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The pool reaches a server that speaks only the legacy ALPN.
+    ///
+    /// The client offers the current ALPN *and* the legacy one, so a server
+    /// built before the prefix byte was dropped is still reachable. This is the
+    /// client half of the compatibility the server's own test suite covers from
+    /// the other side.
+    #[tokio::test]
+    async fn the_pool_reaches_a_server_that_speaks_only_the_legacy_alpn() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE_LEGACY.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_counting(server, accepted.clone()));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+
+        let conn = pool
+            .get_connection()
+            .await
+            .expect("the pool reaches a server that speaks only the legacy ALPN");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the far side took the connection"
+        );
+        drop(conn);
     }
 
     /// A pool over a loopback endpoint, and the count the far side keeps.

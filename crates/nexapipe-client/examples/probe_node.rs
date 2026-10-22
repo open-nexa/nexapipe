@@ -16,7 +16,7 @@ use nexapipe_client::connection_pool::parse_endpoint_addr;
 use std::time::Duration;
 
 /// Same ALPN the pool negotiates with the server.
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
+const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

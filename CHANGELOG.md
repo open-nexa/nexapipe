@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty things land in this cycle so far: the device credential can be a **key**
+Twenty-one things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -39,8 +39,9 @@ is not written in Rust can configure a client through the UniFFI surface, the
 paths that carry the traffic can be measured instead of assumed, the first
 result of those measurements is written down, a route that rewrites the paths
 it serves now rewrites them for the tunnel as well, and the Android client's
-tunnel descriptor is closed exactly once, and the tunnel's congestion controller
-is BBR rather than Cubic.
+tunnel descriptor is closed exactly once, the tunnel's congestion controller is
+BBR rather than Cubic, and the protocol's name on the wire is the name rather
+than a name with a control byte in front of it.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -783,6 +784,18 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **The protocol's name on the wire is the name.** The ALPN was
+  `"\x05nexapipe"` — the byte the L4 preface starts with, in front of the name.
+  That byte was never part of a length encoding; it made the protocol name a
+  nine-byte string beginning with a control byte, and a QUIC Initial packet
+  carries its ALPN where a middlebox on the path can read it, so it was a
+  fingerprint and nothing else. The name is now `nexapipe`.
+  **Both ends still meet.** The server accepts the old name as well as the new
+  one, and the client offers both, the new one first, so a client built before
+  this change reaches a server built after it and the other way round. iroh
+  picks the first protocol of the peer's offer that it also accepts. The old
+  name goes when nothing in the field speaks it any more.
 
 - **A relay token is no longer written in the clear by its own migration.**
   The Android app moves a relay bearer token out of the backed-up preferences

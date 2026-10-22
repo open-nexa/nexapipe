@@ -310,7 +310,11 @@ pub async fn run_proxy(
         }
     }
 
-    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
+    // Both ALPNs are accepted: the current one, and the one clients built before
+    // the prefix byte was dropped use. iroh picks the first the peer offers, so a
+    // client of either vintage connects.
+    let mut builder = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN_NEXAPIPE.to_vec(), ALPN_NEXAPIPE_LEGACY.to_vec()]);
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
     // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).
@@ -1131,7 +1135,21 @@ pub async fn run_local_proxy(
     local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
 }
 
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
+/// The ALPN this build speaks.
+///
+/// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
+/// starts with — in front of the name. That byte was never part of a length
+/// encoding; it made the protocol name a nine-byte string that began with a
+/// control byte, which is a fingerprint on the wire and nothing else. The name
+/// is now the name.
+const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
+
+/// The ALPN clients before the prefix byte was dropped use.
+///
+/// Kept so that a client built before the change can still talk to a server
+/// built after it: the server accepts both, and a new client offers both. Drop
+/// it once no client in the field speaks it any more.
+const ALPN_NEXAPIPE_LEGACY: &[u8] = b"\x05nexapipe";
 
 #[cfg(test)]
 mod tests {
