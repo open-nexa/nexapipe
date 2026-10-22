@@ -802,7 +802,8 @@ pub struct IssuedCredential {
     /// Empty when the device was issued a key instead — see [`Self::public_key`].
     ///
     /// A [`SecretString`]: the credential is wiped when this is dropped, and
-    /// the value is read through [`Secret::expose_secret`] where it has to be.
+    /// the value is read through [`nexapipe_proto::secret::Secret::expose_secret`]
+    /// where it has to be.
     pub secret: SecretString,
     pub algorithm: String,
     /// The public half of the key the device was issued, lowercase hex — the

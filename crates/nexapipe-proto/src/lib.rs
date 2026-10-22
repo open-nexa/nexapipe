@@ -54,8 +54,8 @@
 //! The preface carries a host name, and both sides have to agree on what a
 //! name means: the client decides whether a name is one it proxies, the
 //! server decides whether a name is one a route serves. That agreement is one
-//! rule, and it lives here — see [`host`] for the rule itself and for why it
-//! used to be three.
+//! rule, and it lives here — see [`host_matches`] for the rule itself and for
+//! why it used to be three.
 //!
 //! # First byte back
 //!

@@ -1,11 +1,10 @@
 use crate::proxy::dns::DnsServerConfig;
 use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::local_proxy::LocalProxyWrapper;
-use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, tun_ip};
+use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_client::LinkStatus;
 use nexapipe_client::auth::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
@@ -15,6 +14,7 @@ use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
+use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;

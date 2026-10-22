@@ -40,7 +40,7 @@ pub struct PeerAllowList {
 }
 
 /// The close code a refused peer is sent, in the same register as the 2FA ones
-/// in [`super::auth_close_code`].
+/// in `auth_close_code`.
 ///
 /// It travels in the CONNECTION_CLOSE frame, so the client can read it and say
 /// "this Node ID is not in the server's allow list" rather than reporting a
