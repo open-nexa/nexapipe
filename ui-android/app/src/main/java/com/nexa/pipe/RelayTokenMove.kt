@@ -35,9 +35,15 @@ sealed interface RelayTokenMove {
      * the window runs from the first start without a keystore to the first
      * start with one, and the migration moves the token on that first start.
      *
-     * Writing it in the clear into the secrets file would be worse still:
-     * that file is not excluded from the backup either, so it would ride the
-     * backup *and* look like a credential that is protected.
+     * Writing it in the clear into the secrets file would be a different
+     * trade rather than a better one: that file is excluded from the backup,
+     * so the token would stop riding it — but it would sit among values that
+     * are all ciphertext, in a file every reader takes for a store of
+     * protected credentials.
+     *
+     * Staying where it is also keeps it usable: the read path looks there
+     * as well, so a token this device cannot seal is still the token the
+     * tunnel authenticates with.
      */
     data object Keep : RelayTokenMove
 }
@@ -56,4 +62,30 @@ internal fun relayTokenMove(
 ): RelayTokenMove = when {
     token.isBlank() -> RelayTokenMove.None
     else -> seal(token)?.let { RelayTokenMove.Move(it) } ?: RelayTokenMove.Keep
+}
+
+/**
+ * Reads the relay token out of the two places it can be.
+ *
+ * The secrets file is where the token lives once it has been sealed. The
+ * backed-up preferences are where it lives when this device cannot seal it —
+ * the rule [relayTokenMove] follows — so they are read as well: a token that
+ * stayed there is still the user's token, and the relay is handed it
+ * verbatim.
+ *
+ * The secrets file wins when it holds one: it is written whenever the token
+ * is saved, so it holds the newer of the two, and what is left in the
+ * backed-up file is the copy from before the token moved.
+ *
+ * The legacy value is read as it stands. It was written in the clear, and
+ * unsealing it could only lose a token that happens to look sealed.
+ */
+internal fun relayTokenRead(
+    stored: String?,
+    legacy: String?,
+    unseal: (String?) -> String
+): String {
+    val fromSecrets = stored?.let { unseal(it) }.orEmpty()
+    if (fromSecrets.isNotBlank()) return fromSecrets
+    return legacy?.takeIf { it.isNotBlank() } ?: ""
 }

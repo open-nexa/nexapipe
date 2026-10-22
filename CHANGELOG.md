@@ -669,6 +669,12 @@ lookup, which is what a config written before the key existed does.
   cannot seal rides the backup for as long as the keystore is unavailable —
   the trade is a credential that is preserved over one that never leaves the
   device, and the migration moves it on the first start that can seal it.
+  Staying there keeps it usable as well as safe: the app reads the token
+  out of both files, so a token this device cannot seal is still the token
+  the tunnel authenticates with. The move is a write whose success is
+  checked now — the sealed copy is committed to the disk before the
+  cleartext one is taken off it, and a write that failed leaves the token
+  where it was instead of losing it from both files.
 - **The WebSocket request line is rebuilt from the parsed request.** The
   client rebuilt the line it sends from the raw bytes of the one it
   received, and the HTTP version came out of that split — so a request line
