@@ -508,6 +508,73 @@ jobs:
           MATRIX_TARGET: ${{ matrix.target }}
         run: node .github/scripts/ci-config.mjs
 
+      - name: Prepare the macOS signing credentials
+        # The Developer ID certificate and the notarization credentials, when
+        # the deployment has them.
+        #
+        # Tauri imports the certificate from `APPLE_CERTIFICATE` (a base64
+        # .p12) itself and notarizes when the three notarization variables are
+        # set, so nothing here touches the keychain.
+        #
+        # The variables are only handed on when they are all there: Tauri
+        # notarizes when it sees them, and half a set is worse than none.
+        #
+        # Required, in the repository's secret and variable stores:
+        #   secret  APPLE_CERTIFICATE              base64 of the Developer ID .p12
+        #   secret  APPLE_CERTIFICATE_PASSWORD     the password of that .p12
+        #   secret  APPLE_APP_SPECIFIC_PASSWORD    an app-specific password for notarization
+        #   var     APPLE_SIGNING_IDENTITY         "Developer ID Application: … (TEAMID)"
+        #   var     APPLE_ID                       the Apple ID email
+        #   var     APPLE_TEAM_ID                  the team id
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # The certificate, **its password** and the identity are all needed:
+          # a certificate whose password is missing cannot be imported, and a
+          # failed import is a broken release rather than an unsigned one. So a
+          # half-configured set falls back to the unsigned path with a warning,
+          # exactly like no set at all.
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::warning::no Developer ID certificate is configured, so this macOS bundle is not signed and not notarized. macOS Gatekeeper refuses an unsigned app until the user allows it by hand — see the README for the secrets this needs."
+            exit 0
+          fi
+          echo "Signing with: $APPLE_SIGNING_IDENTITY"
+          {
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            # The certificate is base64, and base64 wraps at 76 columns, so it
+            # is a **multi-line** value. A plain `echo` would write the first
+            # line as one env entry and the rest as lines of their own, and
+            # the certificate would arrive truncated — which fails the import
+            # in a way that says nothing about the password. The heredoc form
+            # is the one that carries a multi-line value whole.
+            echo "APPLE_CERTIFICATE<<NEXAPIPE_APPLE_CERTIFICATE_EOF"
+            echo "$APPLE_CERTIFICATE"
+            echo "NEXAPIPE_APPLE_CERTIFICATE_EOF"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            # The Apple ID is a repository **variable**, so it is not a secret
+            # to be kept hidden — but it is an account, and a public job log
+            # is the wrong place for one. The log says that notarization is
+            # configured and leaves the address out of it.
+            echo "Notarizing with the configured Apple ID"
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::the Developer ID certificate is there but the notarization credentials are not, so the bundle is signed but not notarized. Apple requires notarization for a Developer ID Application, and Gatekeeper refuses an un-notarized one."
+          fi
+
       - name: Build bundle
         shell: bash
         run: |
@@ -515,6 +582,55 @@ jobs:
             --bundles ${{ matrix.bundles }} \
             --target ${{ matrix.target }} \
             --config ci-override.json
+
+      - name: Report what the macOS bundle is
+        # What the bundle actually is, rather than what was asked for: the
+        # signature and the notarization are the two things a user's Gatekeeper
+        # asks about, and a bundle that is signed but not notarized is refused
+        # just as firmly as one that is neither.
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # src-tauri/target/<triple>/release/bundle/macos/<name>.app
+          APP=$(find src-tauri/target -maxdepth 6 -name '*.app' -type d 2>/dev/null | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::warning::no .app was found to report the signature of"
+            exit 0
+          fi
+          if codesign --verify --deep --strict --verbose=2 "$APP" 2>&1; then
+            echo "the signature verifies"
+          else
+            echo "::warning::$APP does not carry a valid signature"
+          fi
+          # `codesign --verify` passes for an **ad-hoc** signature as well, so
+          # it says nothing about whose signature it is. The authority is what
+          # tells a Developer ID signature from an ad-hoc one, and only the
+          # first is the one a user's Gatekeeper accepts.
+          if codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID"; then
+            echo "the signature is a Developer ID one"
+          else
+            echo "::warning::$APP is not signed with a Developer ID certificate, so Gatekeeper will refuse it"
+          fi
+          if spctl --assess --type execute --verbose=2 "$APP" 2>&1; then
+            echo "Gatekeeper accepts the bundle"
+          else
+            echo "::warning::Gatekeeper does not accept $APP. It is either unsigned or not notarized, and macOS will refuse to open it until the user allows it by hand."
+          fi
+          # The published artifact is the **disk image**, not the application
+          # inside it: the image is what a user downloads, and the quarantine
+          # attribute lands on the image. The application is assessed above
+          # because that is what carries the signature.
+          DMG=$(find src-tauri/target -maxdepth 6 -name '*.dmg' -type f 2>/dev/null | head -n 1)
+          if [ -n "$DMG" ]; then
+            if spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" 2>&1; then
+              echo "Gatekeeper accepts the disk image $DMG"
+            else
+              echo "::warning::Gatekeeper does not accept $DMG, which is the artifact the release publishes."
+            fi
+          else
+            echo "::warning::no .dmg was found to assess, and the .dmg is the artifact the release publishes"
+          fi
 
       - name: Verify Debian service upgrade packaging
         if: matrix.os == 'linux'
