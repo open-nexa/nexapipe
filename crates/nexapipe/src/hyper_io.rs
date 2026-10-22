@@ -74,8 +74,7 @@ impl hyper::rt::Write for IrohIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let out = tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.get_mut().send), cx, buf);
-        out
+        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.get_mut().send), cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -97,7 +96,6 @@ mod tests {
     use iroh::Endpoint;
     use iroh::endpoint::presets;
     use std::net::SocketAddr;
-    use tokio::io::AsyncWriteExt;
 
     const ALPN: &[u8] = b"nexapipe";
 
@@ -122,25 +120,45 @@ mod tests {
         // closes before the answer is on its way loses it.
         let _server = server.clone();
 
-        let incoming = server.accept().await.expect("a connection");
-        let accepting = incoming.accept().expect("the connection is accepted");
-        let connection = accepting.await.expect("the handshake finishes");
-        let _connection = connection.clone();
-
-        tokio::spawn(async move {
+        // The far side waits for a connection, and the connection is the
+        // client's to make — so it waits in its own task. A far side that
+        // waited for it here would wait for a client this task has not
+        // built yet, and the two would never meet.
+        //
+        // It holds on to the connection until the client says it has the
+        // answer: dropping the last `Connection` handle closes the
+        // connection, and a close can throw away the answer that is still on
+        // its way.
+        let (answered, waiting) = tokio::sync::oneshot::channel::<()>();
+        let far_side = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("a connection");
+            let accepting = incoming.accept().expect("the connection is accepted");
+            let connection = accepting.await.expect("the handshake finishes");
             let (send, recv) = connection.accept_bi().await.expect("a bi-stream");
 
             let io = IrohIo::new(send, recv);
             let service = hyper::service::service_fn(
-                |req: hyper::Request<hyper::body::Incoming>| async move {
+                |_req: hyper::Request<hyper::body::Incoming>| async move {
                     Ok::<_, hyper::Error>(hyper::Response::new(http_body_util::Full::new(
                         bytes::Bytes::from_static(b"hello"),
                     )))
                 },
             );
-            let outcome = hyper::server::conn::http1::Builder::new()
+            // The codec's own verdict on the connection. It is not asserted on
+            // — the client reads the answer, and the answer is what the test
+            // is about — but it is not dropped either: a connection that ends
+            // in an error is worth saying out loud.
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
-                .await;
+                .await
+            {
+                tracing::warn!("The served connection ended with an error: {}", e);
+            }
+
+            // The connection outlives the served one: the answer is written,
+            // but it is still on its way, and a connection that closes now
+            // takes it with it.
+            let _ = waiting.await;
         });
 
         let client = Endpoint::builder(presets::N0)
@@ -170,5 +188,11 @@ mod tests {
 
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.ends_with("hello"), "{answer}");
+
+        // The answer is here, so the far side may let go of the connection.
+        let _ = answered.send(());
+        // And it has to have finished too: it is the one that wrote the
+        // answer, and a task that panicked would have taken it with it.
+        far_side.await.expect("the far side finished");
     }
 }
