@@ -574,6 +574,21 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **Replacing a credential no longer leaves the old identity connected.** The
+  handshake runs once per connection, so a connection made under the previous
+  credential kept serving traffic under the previous identity after the
+  credential had been replaced — and the server, which closes a connection
+  when it learns the credential is gone, was never told. The pool's
+  connections are closed when the identity changes, and kept when only the
+  secret was rotated: a rotation is the same account with a different secret,
+  and dropping the pool for that would close every request in flight.
+- **A UDP frame that announces more than a datagram is refused.** The length
+  prefix is a `u16`, so a frame can announce up to 65535 bytes — and a
+  datagram over IPv4 cannot carry more than 65507, because the IP header's
+  total-length field is sixteen bits wide. The encoder on the other side
+  refuses to produce one, so a frame that size is a peer that is not speaking
+  the protocol; the rule now lives in the shared framing crate and both ends
+  of the tunnel apply it.
 - **Revoking one device says what the shared secret still is.** `client revoke
   <id> --device <name>` strikes one device out and leaves the client's own
   secret standing — and that secret is still a credential: a peer that names
