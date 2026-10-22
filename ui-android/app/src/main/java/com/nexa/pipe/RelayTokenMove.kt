@@ -26,6 +26,18 @@ sealed interface RelayTokenMove {
      * point is that it holds ciphertext — and it is removed from the file it
      * came out of only once the sealed copy is written, so the value is never
      * lost.
+     *
+     * "Where it is" is the **backed-up** preferences: the ordinary
+     * preferences file is part of the device's backup, of device-to-device
+     * transfer and of cloud backup, and only the secrets file is excluded
+     * from it (see `res/xml/backup_rules.xml`). So a token this device cannot
+     * seal rides the backup for as long as the keystore stays unavailable —
+     * the window runs from the first start without a keystore to the first
+     * start with one, and the migration moves the token on that first start.
+     *
+     * Writing it in the clear into the secrets file would be worse still:
+     * that file is not excluded from the backup either, so it would ride the
+     * backup *and* look like a credential that is protected.
      */
     data object Keep : RelayTokenMove
 }
