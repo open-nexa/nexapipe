@@ -1517,11 +1517,15 @@ pub async fn proxy_to_backend_streaming(
     let has_content_length = parts.headers.get("content-length").is_some();
 
     for (name, value) in parts.headers.iter() {
-        let name_lower = name.as_str().to_lowercase();
+        // The name is **already** lower case: HTTP header names are
+        // case-insensitive and the parser folds them, so this is a borrow and
+        // not a copy. It used to be a `to_lowercase` per header, which is an
+        // allocation for every header of every response.
+        let name_lower = name.as_str();
         // A header that belongs to the hop between the backend and this
         // process does not belong on the hop between this process and the
         // client.
-        if !forwards_response_header(&name_lower) {
+        if !forwards_response_header(name_lower) {
             continue;
         }
         // Dropped, not duplicated: the id we write below is the one our own

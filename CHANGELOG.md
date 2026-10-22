@@ -457,6 +457,22 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
+- **Three small things on the server's response path.**
+  The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
+  coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
+  was bounded, so a WebSocket whose two sides both went quiet kept a backend
+  connection, a task and a stream slot for as long as the process lived. It
+  now moves 64 KiB and is bounded by the same `response_idle` deadline the
+  HTTP path uses. The bound is on the **gap**, not on the session: a
+  WebSocket that is idle for a while is still a WebSocket.
+  Every **response header's name** was copied to lower case, once per header
+  per response -- for a name that was already lower case, because HTTP header
+  names are case-insensitive and the parser folds them.
+  The **connection pool's idle reaper** had no clock: the timer that was set
+  is the h2 half's, and the pool's own 120-second idle timeout was only
+  enforced lazily, at the next checkout. A connection to a backend that
+  stopped answering now sits in the pool for 120 seconds and no longer.
+
 ### Changed
 
 - **The client speaks the binary form of the handshake.** A handshake with a
