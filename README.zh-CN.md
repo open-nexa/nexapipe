@@ -1622,6 +1622,7 @@ Cargo feature：
 | `NEXAPIPE_QUIC_INITIAL_MTU` | `0` | `0` 表示保持 iroh 的 1200；否则取 1200..=65535。 |
 | `NEXAPIPE_QUIC_KEEPALIVE_MS` | `0` | `0` 表示保持 iroh 的 5 秒。 |
 | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` | `1024` | 一条连接可同时承载的双向流数。库默认值（100）在每条 UDP 流都占用一条流之后就不够用了。 |
+| `NEXAPIPE_QUIC_CONGESTION` | `bbr` | 拥塞控制算法：`bbr` 或 `cubic`。BBR 是基于模型的，按瓶颈带宽和最小往返时延的乘积发包，所以长距离路径上的随机丢包不会让窗口缩小；Cubic 把丢包读作拥塞并退让。无法识别的值会告警并保留默认值。 |
 
 绝不要覆盖 iroh 的多路径或 NAT 穿透相关开关 —— 那会破坏打洞。`TUN_MTU` 是 1400，
 并且在每一个 TUN 实现中都必须完全一致。

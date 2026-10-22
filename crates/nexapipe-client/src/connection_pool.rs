@@ -15,21 +15,19 @@ use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use nexapipe_proto::secret::SecretString;
 
-/// The ALPN this build speaks.
-///
-/// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
-/// starts with — in front of the name. That byte was never part of a length
-/// encoding; it made the protocol name a nine-byte string that began with a
-/// control byte, which is a fingerprint on the wire and nothing else. The name
-/// is now the name.
-const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
-
-/// The ALPN servers built before the prefix byte was dropped accept.
-///
-/// Offered as an additional ALPN on every dial, so this client connects to a
-/// server of either vintage. Drop it once no server in the field speaks it any
-/// more.
-const ALPN_NEXAPIPE_LEGACY: &[u8] = b"\x05nexapipe";
+// The ALPN this build speaks, and the one servers built before the prefix
+// byte was dropped accept.
+//
+// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
+// starts with — in front of the name. That byte was never part of a length
+// encoding; it made the protocol name a nine-byte string that began with a
+// control byte, which is a fingerprint on the wire and nothing else. The name
+// is now the name.
+//
+// The constants live in `nexapipe-proto`, which the server links too: the two
+// ends have to agree on the name, and a name written down twice is a name
+// that eventually differs.
+use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
 
 /// What a dial produced: the connection and the state its flows share, or
 /// the failure that stopped it.

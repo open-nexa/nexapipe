@@ -13,10 +13,8 @@
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, RelayUrl};
 use nexapipe_client::connection_pool::parse_endpoint_addr;
+use nexapipe_proto::ALPN_NEXAPIPE;
 use std::time::Duration;
-
-/// Same ALPN the pool negotiates with the server.
-const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

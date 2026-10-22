@@ -793,9 +793,12 @@ lookup, which is what a config written before the key existed does.
   fingerprint and nothing else. The name is now `nexapipe`.
   **Both ends still meet.** The server accepts the old name as well as the new
   one, and the client offers both, the new one first, so a client built before
-  this change reaches a server built after it and the other way round. iroh
-  picks the first protocol of the peer's offer that it also accepts. The old
-  name goes when nothing in the field speaks it any more.
+  this change reaches a server built after it and the other way round. **The
+  server's list is what decides**: QUIC picks the first of the *accept side's*
+  entries that the client also offers, so the server's order is the preference
+  order and the client's offer order does not matter — what matters is that it
+  offers both. The old name goes when nothing in the field speaks it any more,
+  and the two spellings live in one place now, so they cannot drift apart.
 
 - **A relay token is no longer written in the clear by its own migration.**
   The Android app moves a relay bearer token out of the backed-up preferences
