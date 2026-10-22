@@ -1,6 +1,6 @@
 # Benchmarks
 
-Three benches, on the paths that carry user traffic. They exist because until
+Six benches, on the paths that carry user traffic. They exist because until
 they landed every performance claim in this repository was an expectation
 rather than a result — the reasoning behind that is in
 [`size-perf-roadmap.md`](size-perf-roadmap.md) §F1.
@@ -10,11 +10,9 @@ rather than a result — the reasoning behind that is in
 | `l4_forward` | `crates/nexapipe/benches/l4_forward.rs` | the copy loop of an L4 flow: bytes from the tunnel to the backend and back |
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
+| `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
-
-And one measurement that is not a bench, because what it measures is memory
-and not time: [`tun_flow_memory`](#what-a-flow-costs).
 
 And one measurement that is not a bench, because what it measures is memory
 and not time: [`tun_flow_memory`](#what-a-flow-costs).
@@ -35,11 +33,21 @@ have changed since are marked:
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
 
+The two `local_request` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain, and are listed separately because they are a
+different pair of questions from the rest:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
+| `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
+
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
-the idle wake-up rate, the per-flow memory, and both crates' HTTP request
-paths — so that what is a measurement and what is still an expectation stays
-visible.
+the idle wake-up rate, the per-flow memory, and the server's request
+path — so that what is a measurement and what is still an expectation stays
+visible. The client's HTTP request path is now covered by `local_request`; the
+server's is not, and that is the gap the next bench is for.
 
 None of them needs a network. The backends are loopback TCP echoes, the TUN
 device is a `tokio::io::duplex` pair standing in for the fd, and the two iroh
@@ -63,6 +71,7 @@ cargo bench --workspace --features nexapipe-client/tun-proxy -- --noplot
 cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
+cargo bench -p nexapipe-client --features local-proxy --bench local_request
 cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe-client --bench domain_match
 ```
@@ -126,6 +135,33 @@ itself and the copy loop on the way back. As with `l4_forward`, the tunnel is
 established before the clock starts, so the number is about the traffic over
 it rather than the price of opening it. The far side is an iroh endpoint on
 the same host that speaks the L4 framing and echoes.
+
+**`local_request`** is the other way a request goes through the same local
+proxy: not the CONNECT tunnel, but the plain HTTP path a browser takes when it
+is told to use the proxy for ordinary HTTP. That path parses the request head,
+finds the `Host` header, checks it against the domains the client proxies,
+rewrites the headers it forwards, opens a bi-stream, writes the request, and
+copies the response back — none of which is in `forwarding_path`'s numbers,
+and all of which happens on every request.
+
+It measures two moments:
+
+- `first_byte` — from the application sending to the response head having
+  arrived. This is what the application waits before it can start rendering,
+  and it is the part a user feels.
+- `request_response` — the whole request, from before the connection is opened
+  to after the proxy closes it. The difference between the two is the tail:
+  the proxy's end of stream and the application's end of file.
+
+Two things about it are worth knowing before reading its numbers into
+something. The proxy closes the connection after every response, so **every
+iteration opens one** — a real cost the number includes, and the reason the
+bench sets `SO_LINGER` to zero on the application's socket: at bench speed,
+tens of thousands of connections per minute would otherwise leave the
+operating system's ephemeral ports exhausted and the run would fail
+partway through. And the far side is an HTTP server over an iroh bi-stream on
+this host, not the server crate's own request path — which is the gap the
+next bench is for.
 
 ## What a flow costs
 

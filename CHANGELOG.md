@@ -290,6 +290,23 @@ lookup, which is what a config written before the key existed does.
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
   so is what keeps the ones that are results honest.
+- **The client's HTTP request path is measured too.** The benchmarks that
+  landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
+  cost, the server's routing table and the client's own name matching. They
+  did not measure the path a browser takes through the local proxy when it
+  uses it for ordinary HTTP rather than for a tunnel: the request head is
+  parsed, the `Host` header is found and checked against the domains the
+  client proxies, the forwarded headers are rewritten, a bi-stream is
+  opened, the request is written and the response is copied back. None of
+  that was in any of the numbers, and all of it happens on every request.
+  It is a benchmark of its own now, with two: **100 µs** from the
+  application sending to the response head arriving — the wait before a
+  page can start rendering — and **138 µs** for the whole request, from
+  before the connection is opened to after the proxy closes it.
+  It measures the client's half of a request. The far side of the bench is
+  an HTTP server over an iroh bi-stream on the same host, so what the
+  server does with the request is still not measured, and the list of what
+  is not measured says so.
 
 ### Changed
 

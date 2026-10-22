@@ -338,9 +338,20 @@ was most of the number.
 rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
 passes an empty resolver list and a proxied domain, so it exercises the
 hijack branch and never the forward branch), the idle wake-up rate, the
-per-TCP-flow memory, the client's HTTP request path, the server's request
-path, and every part of the server crate's own request handling — `l4_forward`
-stops at a `duplex` and never crosses an iroh hop.
+per-TCP-flow memory, the server's request path, and every part of the server
+crate's own request handling — `l4_forward` stops at a `duplex` and never
+crosses an iroh hop.
+
+**The client's HTTP request path is no longer on that list.** `local_request`
+measures it: the plain HTTP path through the client's local proxy — the head,
+the domain check, the rewrite, the bi-stream, and the response back — which
+is the path `forwarding_path` does not cover, because that one is the CONNECT
+tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
+`first_byte` at **100 µs** (the time to the response head) and
+`request_response` at **138 µs** (the whole request). The far side of that
+bench is an HTTP server over an iroh bi-stream on the same host, not the
+server crate's own request handling — so what is now measured is the
+client's half of a request, and the server's half is still an expectation.
 
 ### F2 — Optimize what the benchmarks show (P2)
 
