@@ -655,17 +655,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A credential bought by an enrollment goes through the same check.** The
+  enrollment writes the pool's credential itself, and it wrote it without the
+  comparison that closes the connections of the identity that is gone: the
+  identity changed and the connections of the old identity stayed in the
+  pool, serving traffic under an identity the server had already been told
+  was gone.
+  Every write of the credential goes through one place now, and that place
+  compares the identity and closes the connections when it changed.
 - **Replacing a credential no longer leaves the old identity connected.** The
   handshake runs once per connection, so a connection made under the previous
   credential kept serving traffic under the previous identity after the
   credential had been replaced — and the server, which closes a connection
-  when it learns the credential is gone, was never told. Every connection
-  records the identity it was authenticated as: the connections in the pool
-  are closed when the identity changes, and a connection that was out of the
-  pool when it changed is closed instead of going back in. The connections are
-  kept when only the secret was rotated: a rotation is the same account with a
-  different secret, and a rotation closes nothing. A credential bought by an
-  enrollment goes through the same check.
+  when it learns the credential is gone, was never told. The pool's
+  connections are closed when the identity changes, and kept when only the
+  secret was rotated: a rotation is the same account with a different secret,
+  and dropping the pool for that would close every request in flight.
 - **A UDP frame that announces more than a datagram is refused.** The length
   prefix is a `u16`, so a frame can announce up to 65535 bytes — and a
   datagram over IPv4 cannot carry more than 65507, because the IP header's
