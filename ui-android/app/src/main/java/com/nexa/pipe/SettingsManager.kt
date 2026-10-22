@@ -441,9 +441,9 @@ class SettingsManager(context: Context) {
      * [secretPrefs].
      *
      * Runs on every start but only does anything once: the key is removed from
-     * [prefs] whether or not the token is worth keeping, so a blank one — the
-     * value saved whenever a relay needs no token — does not leave the file
-     * marked as holding a credential.
+     * [prefs] once the token has moved or has been found to be no credential at
+     * all, so a blank one — the value saved whenever a relay needs no token —
+     * does not leave the file marked as holding a credential.
      *
      * A token that *is* worth keeping moves only when it can be sealed. The
      * decision is [relayTokenMove]'s; the point of the rule is that a token
@@ -463,8 +463,15 @@ class SettingsManager(context: Context) {
                 prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
             }
             is RelayTokenMove.Move -> {
+                // The sealed copy is written — and committed, not queued —
+                // before the token is removed from the file it came out of:
+                // the two are different files, so the order they reach the
+                // disk is this order rather than SharedPreferences' to choose,
+                // and a process that dies between them leaves the token where
+                // it was instead of nowhere. Once, at startup, on one small
+                // value: the block is the price of not losing a credential.
+                secretPrefs.edit(commit = true) { putString(KEY_RELAY_AUTH_TOKEN, move.sealed) }
                 prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
-                secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, move.sealed) }
                 Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
             }
             RelayTokenMove.Keep -> {
