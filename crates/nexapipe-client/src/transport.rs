@@ -30,10 +30,17 @@
 //! raised: it was `VarInt::MAX`, which is no limit at all. The per-stream
 //! window is what a peer may have in flight *per stream*, and a peer with a
 //! thousand streams could have a thousand windows' worth of data in this
-//! process — 4 GiB, from one peer. This module gives the connection a
-//! ceiling of its own, which bounds what any one peer can make this process
-//! hold. The two are different limits and both are needed: the per-stream
-//! one is a throughput ceiling, the connection one is a memory ceiling.
+//! process — 4 GiB, from one peer on one connection. This module gives the
+//! connection a ceiling of its own, which bounds what one connection's peer
+//! can make this process hold. The two are different limits and both are
+//! needed: the per-stream one is a throughput ceiling, the connection one is
+//! a memory ceiling.
+//!
+//! The connection ceiling is per **connection**. A process that holds several
+//! connections to the same peer holds one window for each of them, so the
+//! memory a peer can make the process hold is the window times the number of
+//! connections to it — the bound is not a per-peer one, and it does not
+//! pretend to be.
 //!
 //! # Deliberately left alone
 //!
@@ -81,13 +88,15 @@ pub const DEFAULT_SEND_WINDOW: u64 = 16 * 1024 * 1024;
 /// **iroh leaves this at `VarInt::MAX`,** so without a number here the
 /// connection-level flow control imposes no ceiling at all — the only limit is
 /// the per-stream one. That is 1024 streams of 4 MiB each, which is 4 GiB a
-/// single peer may fill.
+/// peer may fill on one connection.
 ///
 /// 64 MiB is generous enough not to be a limit in practice: it is sixteen
 /// full windows, and at a 200 ms round trip it carries 320 MB/s — more than
-/// any link this runs over. What it buys is a **ceiling**: the memory a peer
-/// can make this process hold is bounded, and a peer that opens streams and
-/// sends into them without reading cannot make it grow without limit.
+/// any link this runs over. What it buys is a **ceiling**: the memory one
+/// connection's peer can make this process hold is bounded to it, and a peer
+/// that opens streams and sends into them without reading cannot make it
+/// grow without limit. The bound is per connection: a process that holds
+/// several connections to the same peer holds one window for each.
 ///
 /// The window is not the same as the memory: quinn allocates as data arrives,
 /// so the 64 MiB is address space and only what a peer actually sends is
