@@ -298,7 +298,7 @@ jobs:
       - name: Install cargo-ndk
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2 @ 2026-10-16
         with:
-          tool: cargo-ndk
+          tool: cargo-ndk@4.1.2
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
@@ -441,6 +441,68 @@ jobs:
 
       - name: lint design tokens
         run: npm run lint:tokens
+
+  # The release installs the frontend with `npm ci`, so every platform a
+  # release is built on has to be able to install from the committed lockfile.
+  # The lockfile records each platform's native optional package (@tauri-apps/cli
+  # and the rest) with its integrity hash and its os/cpu constraints, and npm
+  # filters optional dependencies by those constraints at install time — but
+  # that is a claim about npm, and the release is where a claim like this is
+  # expensive to be wrong about.
+  #
+  # This job is the claim, checked: one runner per (os, arch) the desktop
+  # release matrix builds, running the same command the release runs and then
+  # the same probe. It installs nothing and builds nothing, so it is cheap.
+  desktop-npm-ci:
+    name: desktop npm ci (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            runner: ubuntu-22.04
+          - label: linux-arm64
+            runner: ubuntu-22.04-arm
+          - label: macos-x64
+            runner: macos-15-intel
+          - label: macos-arm64
+            runner: macos-14
+          - label: windows-x64
+            runner: windows-latest
+          - label: windows-arm64
+            runner: windows-11-arm
+
+    defaults:
+      run:
+        working-directory: ui-desktop
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
+        with:
+          node-version-file: ui-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-desktop/package-lock.json
+
+      # The same command the release runs, and the same probe: the Tauri CLI
+      # has to be runnable on this platform afterwards, or the release fails
+      # at build time instead.
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: the tauri CLI runs
+        shell: bash
+        run: npx tauri --version
+
+      # The lockfile must survive the install: a tree that was re-resolved
+      # would show up here as a changed file.
+      - name: the lockfile is unchanged
+        shell: bash
+        run: git diff --exit-code -- ui-desktop/package-lock.json
 
   desktop-check:
     name: desktop cargo check (${{ matrix.os }})

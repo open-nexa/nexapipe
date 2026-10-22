@@ -11,3 +11,16 @@ ui-android/
 ui-desktop/
 logs/
 *.md
+
+# The operator's own credentials and state. The Dockerfiles never COPY them —
+# they are runtime mounts — but `docker build` sends the whole context to the
+# daemon before the COPY filtering applies, so a remote or rootless buildx
+# builder would otherwise receive the 2FA seeds under [auth.clients], the
+# endpoint's private key, the relay bearer token and the admin token, and may
+# keep them in its build cache.
+config.toml
+config/
+secrets/
+*.key
+state.toml
+*.admin-token
