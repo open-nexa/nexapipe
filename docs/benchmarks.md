@@ -44,9 +44,13 @@ different pair of questions from the rest:
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
 
 The two `flow_connections` rows were measured on **2026-10-22**, on the same
-machine and the same toolchain:
+machine and the same toolchain. A round of that bench takes about five
+milliseconds, so criterion samples it in **Flat** mode — it measures the time
+of a round rather than the cost of one iteration — and a Flat run computes
+**no slope at all**. The number below is the **median**, which is what the
+report shows:
 
-| Bench | slope | The one-line reading |
+| Bench | median | The one-line reading |
 |---|---|---|
 | `flow_connections/connections` | **1** | **one connection for 100 concurrent flows.** It was **100** — one per flow — before the client let a flow borrow a connection instead of taking it out of the pool. The count does not move: every sample was exactly 1 |
 | `flow_connections/open_flows` | **5.1 ms** | how long those hundred flows take to open. It was **1.05 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
@@ -174,11 +178,12 @@ this host, not the server crate's own request path — which is the gap the
 next bench is for.
 
 **`flow_connections`** is the client asking how many QUIC connections its
-flows open. The client keeps a pool of connections to each backend, and a flow
-takes one **out** of it and hands it back when it ends — so while a flow is
-running its connection is not in the pool, and a hundred concurrent flows need
-a hundred connections. The transport is built for the opposite: one connection
-can carry 1024 bi-streams.
+flows open. The client keeps a pool of connections to each backend, and a
+flow **borrows** one of them: the pool keeps the connection, and the flow
+holds a handle to it until the flow ends. iroh's connection handle is a
+cheap clone, so a hundred concurrent flows share one connection — and a flow
+that ends has nothing to give back. The transport is built for that: one
+connection can carry 1024 bi-streams.
 
 It measures two things:
 
@@ -187,8 +192,9 @@ It measures two things:
   depend on anything the client reports about itself. It comes back as
   nanoseconds, so the report reads `100 ns` for a hundred connections; that
   is the encoding, and it is deliberate.
-- `open_flows` — how long those hundred flows take to open. Today each of
-  them pays for a handshake, so this is what the connection count costs.
+- `open_flows` — how long those hundred flows take to open. Before a flow
+  borrowed its connection, each of them paid for a handshake, so this is what
+  the connection count costs.
 
 Each round runs on a **fresh pool**, so a round starts with an empty one and
 the count is what that round needed. The bench waits for the count to stop

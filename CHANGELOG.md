@@ -324,20 +324,6 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
-- **The connections a client's flows cost are measured.** The client keeps a
-  pool of connections to each backend, and a flow takes one **out** of it and
-  hands it back when it ends. That sounds like pooling, and it is — but
-  while a flow is running its connection is not in the pool, so a hundred
-  concurrent flows need a hundred connections, and each of them pays for a
-  QUIC handshake on the way.
-  The number is **100 connections for 100 concurrent flows**, and it does not
-  move: every sample was exactly 100. Opening those hundred flows takes
-  **1.05 seconds**, against a transport built to carry 1024 bi-streams on one
-  connection.
-  The far side counts its own accepts, so the number does not depend on
-  anything the client reports about itself, and each round runs on a fresh
-  pool so that the count is what that round needed rather than what a
-  previous round left behind.
 - **A flow borrows a connection now, instead of taking it out of the pool.**
   The client keeps a pool of connections to each backend, and a flow used to
   take one out of it and hold it until the flow ended — so while a flow was
@@ -356,11 +342,21 @@ lookup, which is what a config written before the key existed does.
   The numbers: a hundred concurrent flows now open **one** connection where
   they opened a hundred, and they open it in **5 milliseconds** where it
   took **1.05 seconds**. Two hundred and five times faster, and a hundred
-  fewer handshakes for the peer to make.
-  Two things about it are worth knowing. A connection with a flow on it is
+  fewer handshakes for the peer to make. The number is measured, not read off
+  the code: the far side counts its own accepts, so it does not depend on
+  anything the client reports about itself, and each round runs on a fresh
+  pool so that the count is what that round needed rather than what a
+  previous round left behind.
+  Three things about it are worth knowing. A connection with a flow on it is
   **not idle**, so the pool's idle timeout no longer closes it underneath
   the flow — the pool counts the flows riding each connection for exactly
-  that. And a connection that turns out to be broken is closed, which now
+  that, and the last-use stamp moves when the last of them ends, so a
+  connection that has just carried a ten-minute flow is fresh for another
+  minute. The server counts the flows on a connection as well and refuses
+  the one that does not fit, so the client keeps below that ceiling itself
+  and opens another connection rather than piling every flow onto one; a
+  refusal is tried again on a connection of its own instead of failing the
+  flow. And a connection that turns out to be broken is closed, which now
   takes the other flows on it down with it; they retry, and they retry on a
   new connection.
 

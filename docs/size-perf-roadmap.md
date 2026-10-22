@@ -294,8 +294,11 @@ cargo bench --workspace --features nexapipe-client/tun-proxy --locked
 
 Criterion's numbers are only meaningful on the machine that produced them, so
 the machine is part of the result. `slope` is the regression-based estimate and
-the one to trust; `mean` and `median` are given beside it because they say how
-much variance there was, and here there is very little.
+the one to trust **where criterion computes one**: `mean` and `median` are
+given beside it because they say how much variance there was, and here there
+is very little. A bench whose round is short enough for criterion to sample
+it in Flat mode has no slope at all — it measures the time of a round rather
+than the cost of one iteration — and its median is the number to read.
 
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
@@ -310,13 +313,22 @@ the connections a client's flows open:
 
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
-| `flow_connections/connections` | 1 | 1 | **1** | **One connection for 100 concurrent flows.** It was **100** — one per flow, because a flow took its connection out of the pool and held it until it ended. A flow **borrows** a connection now: the pool keeps it and the flow holds a handle to it. The count does not move: every sample was exactly 1 |
-| `flow_connections/open_flows` | 5.132 ms | 5.133 ms | **5.132 ms** | How long those hundred flows take to open. It was **1.050 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
+| `flow_connections/connections` | 1 | 1 | — | **One connection for 100 concurrent flows.** It was **100** — one per flow, because a flow took its connection out of the pool and held it until it ended. A flow **borrows** a connection now: the pool keeps it and the flow holds a handle to it. The count does not move: every sample was exactly 1 |
+| `flow_connections/open_flows` | 5.132 ms | 5.133 ms | — | How long those hundred flows take to open. It was **1.050 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
 
-The transport is built for the opposite of what the client does with it: one
-connection can carry 1024 bi-streams, and the client opens one connection per
-flow instead. That is the largest single per-flow cost in the client, and it
-is now a number rather than a reading of the code.
+The two `flow_connections` rows have **no slope**: a round of that bench takes
+about five milliseconds, so criterion samples it in Flat mode — it measures
+the time of a round rather than the cost of one iteration — and a Flat run
+computes no regression slope at all. The numbers in the slope column of the
+rows above are criterion's linear-regression estimate; these two are read from
+its median.
+
+The transport is built for the opposite of what the client used to do with it:
+one connection can carry 1024 bi-streams, and the client opened one connection
+per flow instead. A flow **borrows** a connection now — the pool keeps it, and
+the flow holds a handle to it — so the number of connections a hundred
+concurrent flows cost is one. That was the largest single per-flow cost in the
+client, and it is now a number rather than a reading of the code.
 
 #### What the numbers say, and what they do not
 
@@ -360,7 +372,8 @@ measures it: the plain HTTP path through the client's local proxy — the head,
 the domain check, the rewrite, the bi-stream, and the response back — which
 is the path `forwarding_path` does not cover, because that one is the CONNECT
 tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
-`first_byte` at **100 µs** (the time to the response head) and`request_response` at **138 µs** (the whole request). The far side of that
+`first_byte` at **100 µs** (the time to the response head) and
+`request_response` at **138 µs** (the whole request). The far side of that
 bench is an HTTP server over an iroh bi-stream on the same host, not the
 server crate's own request handling — so what is now measured is the
 client's half of a request, and the server's half is still an expectation.
@@ -404,6 +417,14 @@ items the numbers pointed at.
    one connection between them and not a hundred. The count is **1**, and
    opening those hundred flows takes **5.1 ms** instead of **1.05 s**:
    **205 times** faster.
+   Two things came with it. A connection that carries a flow is **not idle**,
+   so the pool's idle timeout no longer closes it underneath the flow — the
+   pool counts the flows riding each connection, and the last-use stamp moves
+   when the last of them ends, so a connection that has just carried a
+   ten-minute flow is fresh for another minute. And the server counts the
+   flows on a connection as well — it refuses the one that does not fit — so
+   the client keeps below that ceiling itself and opens another connection
+   rather than piling every flow onto one.
 
 ### F3 — A performance budget (P2, after F1)
 
@@ -450,7 +471,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 | The JNI surface is fourteen functions, asserted in CI | `release.yml:794-816` |
 | Nothing in CI measures size | no `size`/`bytes`/`MiB` in `release.yml`; the 16 jobs in `ci.yml:55-628` plus `codeql.yml`, `pages.yml` and `dependency-report.yml` all do something else |
 | Benchmarks exist (as of 2026-10-21) | `crates/nexapipe/benches/l4_forward.rs`, `crates/nexapipe-client/benches/tun_pump.rs`, `crates/nexapipe-client/benches/forwarding_path.rs`; `criterion` in `Cargo.lock`; the `bench` job in `ci.yml` |
-| The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source |
+| The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source — and the `median` column where that run was in Flat mode, which computes no slope |
 | `ip_mapping` is a third of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns — the first bench measures an allocation and a reverse lookup, and only the lookup runs on every packet |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |
