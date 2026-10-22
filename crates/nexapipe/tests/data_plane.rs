@@ -613,6 +613,73 @@ async fn spawn_proxy_with_auth(routes: Vec<Route>, auth: conn::AuthState) -> Pro
     Proxy { addr }
 }
 
+/// The ALPNs the server accepts, in the order the binary lists them.
+///
+/// The per-protocol names come first, because QUIC picks the first of the
+/// **accept side's** entries that the peer also offers — so the server's
+/// order is the preference order, and the client's offer order is not.
+fn server_alpns() -> Vec<Vec<u8>> {
+    use nexapipe_proto::protocol::Protocol;
+    vec![
+        Protocol::Http.alpn().to_vec(),
+        Protocol::L4.alpn().to_vec(),
+        Protocol::Tls.alpn().to_vec(),
+        ALPN.to_vec(),
+        ALPN_LEGACY.to_vec(),
+    ]
+}
+
+/// The proxy the binary runs: the connection is handed to `handle_connection`,
+/// so the protocol is read off the handshake rather than sniffed off the
+/// stream.
+///
+/// The earlier harness here hands the stream to `handle_bidi_stream` with the
+/// protocol spelled out, which skips the half that reads it — and that half
+/// is the one this is about.
+async fn spawn_proxy_that_reads_the_protocol(routes: Vec<Route>) -> Proxy {
+    let ep = bind_with_alpns(server_alpns()).await;
+    let addr = dial_address(&ep);
+
+    let config = Arc::new(RoutingTable::with_settings(
+        routes,
+        Timeouts::default(),
+        Retry::default(),
+    ));
+    let clients = Arc::new(
+        http::BackendClients::new(Timeouts::default().connect, None)
+            .expect("the trust store is always usable"),
+    );
+    let peers = Arc::new(conn::peers::PeerRegistry::new());
+    let limits = conn::limits::Limits::resolve(
+        &conn::limits::LimitsConfig::default(),
+        &conn::limits::EnvCaps::from_environment(),
+    )
+    .expect("the default limits resolve");
+    let limiters = conn::limits::Limiters::from_limits(&limits);
+
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(accepting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = accepting.await else {
+                continue;
+            };
+
+            let config = config.clone();
+            let clients = clients.clone();
+            let peers = peers.clone();
+            let limiters = limiters.clone();
+
+            tokio::spawn(async move {
+                conn::handle_connection(conn, config, clients, None, peers, limiters).await;
+            });
+        }
+    });
+
+    Proxy { addr }
+}
+
 fn http_route(host: &str, backend: &str) -> Route {
     Route::new(
         host,
@@ -649,8 +716,17 @@ struct Tunnel {
 
 impl Tunnel {
     async fn dial(addr: EndpointAddr) -> Self {
+        Self::dial_with_alpn(addr, ALPN).await
+    }
+
+    /// The same, asking for a named protocol.
+    ///
+    /// The ALPN is what the negotiation lands on, and the server reads the
+    /// protocol off it — so a test that asks for one is a test of the
+    /// server's answer to it.
+    async fn dial_with_alpn(addr: EndpointAddr, alpn: &[u8]) -> Self {
         let endpoint = bind().await;
-        let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, ALPN))
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, alpn))
             .await
             .expect("dialling the proxy timed out")
             .expect("dial the proxy");
@@ -2489,4 +2565,107 @@ async fn a_proxy_that_speaks_only_the_current_alpn_refuses_the_legacy_one() {
         outcome.is_err(),
         "a proxy that speaks only the current ALPN took the legacy one"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The protocol at the handshake
+// ---------------------------------------------------------------------------
+
+/// A client built before the prefix byte was dropped speaks the legacy ALPN,
+/// and the server **serves** it rather than refusing it.
+///
+/// The server's accept list carries the legacy spelling so that a client of
+/// that vintage still reaches it, and the protocol it is served as is the
+/// generic one — the first byte of each stream decides, the way it always
+/// did.
+///
+/// The test above only asks whether the handshake succeeds. This one asks
+/// whether the connection is then *served*, which is the question that
+/// matters: a protocol the server cannot name is a connection refused at the
+/// door, and the legacy spelling is one its accept list is there for.
+#[tokio::test]
+async fn a_client_that_speaks_the_legacy_alpn_is_served() {
+    let backend = spawn_backend("hello from the backend").await;
+    let proxy =
+        spawn_proxy_that_reads_the_protocol(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr, ALPN_LEGACY).await;
+
+    let reply = tunnel
+        .exchange(b"GET /hello HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "a client of the older vintage is served, got {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(reply_body(&reply), "hello from the backend");
+}
+
+/// **The protocol the connection named decides what it carries.**
+///
+/// The same bytes — a request — are answered with the tunnel's status byte on
+/// a connection that named the L4 protocol, and with the backend's answer on a
+/// connection that named the HTTP one. A connection that named nothing is
+/// served the way it always was: the first byte decides, and this first byte
+/// says "a request".
+///
+/// This is the point of the change, end to end: the server reads the protocol
+/// off the handshake rather than sniffing it off the stream, and a connection
+/// that says what it carries is served as what it said.
+#[tokio::test]
+async fn the_negotiated_protocol_decides_what_the_connection_carries() {
+    use nexapipe_proto::Status;
+    use nexapipe_proto::protocol::{ALPN_HTTP, ALPN_L4};
+
+    let backend = spawn_backend("hello from the backend").await;
+    let proxy =
+        spawn_proxy_that_reads_the_protocol(vec![http_route("app.test", &backend.url)]).await;
+    let request = b"GET /hello HTTP/1.1\r\nHost: app.test\r\n\r\n";
+
+    // A connection that named the L4 protocol: the bytes are a tunnel's, and
+    // a tunnel's preface they are not — so the tunnel path answers with its
+    // status byte and nothing else.
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr.clone(), ALPN_L4).await;
+    let reply = tunnel.exchange(request).await;
+    assert_eq!(
+        reply.first().copied().map(Status::from_byte),
+        Some(Status::BadPreface),
+        "the tunnel path answers with its status byte, got {reply:?}"
+    );
+
+    // A connection that named the HTTP protocol: the same bytes are a
+    // request, and it is served as one.
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr.clone(), ALPN_HTTP).await;
+    let reply = tunnel.exchange(request).await;
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "the request path serves what it is given, got {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(reply_body(&reply), "hello from the backend");
+}
+
+/// A connection that named nothing is served the way it always was.
+///
+/// The generic name means "the first byte of each stream decides", so the
+/// same request is served as a request — the sniffing path still works, and
+/// a client of the older vintage is not left behind.
+#[tokio::test]
+async fn a_connection_that_named_nothing_is_served_the_way_it_always_was() {
+    let backend = spawn_backend("hello from the backend").await;
+    let proxy =
+        spawn_proxy_that_reads_the_protocol(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr, ALPN).await;
+
+    let reply = tunnel
+        .exchange(b"GET /hello HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "the generic name is served by the first byte, got {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(reply_body(&reply), "hello from the backend");
 }

@@ -3153,6 +3153,104 @@ mod tests {
         }
     }
 
+    /// **The protocol the connection named decides what the stream is.**
+    ///
+    /// The same bytes — an L4 preface — are a tunnel on a connection that
+    /// named the L4 protocol, and a request that is not one on a connection
+    /// that named the HTTP one. A connection that named nothing is served the
+    /// way it always was: the first byte decides, and this first byte says
+    /// L4.
+    ///
+    /// This is the whole point of choosing the protocol at the handshake: the
+    /// server does not have to guess, and a stream that is not what the
+    /// connection said it is does not get served as if it were.
+    #[tokio::test]
+    async fn the_named_protocol_decides_what_the_stream_is() {
+        let preface = b"\x05\x01\x01\x00";
+
+        // A connection that named L4 hands the bytes on.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::L4)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                preface.to_vec(),
+                "the bytes are handed on as they came"
+            ),
+            other => panic!("expected the bytes to be handed on, got {other:?}"),
+        }
+
+        // A connection that named HTTP reads them as a request — which they
+        // are not, and which is refused.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+            drop(client);
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Http)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Incomplete => {}
+            StreamHead::Other(_) => {
+                panic!("a connection that named HTTP was served a tunnel anyway")
+            }
+            other => panic!("expected the preface not to be a request, got {other:?}"),
+        }
+
+        // A connection that named nothing is served the way it always was.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                preface.to_vec(),
+                "the first byte decides, and it says L4"
+            ),
+            other => panic!("expected the bytes to be handed on, got {other:?}"),
+        }
+    }
+
+    /// A connection that named the TLS protocol is not served a request.
+    ///
+    /// A TLS session is not a request, and the ClientHello that starts it is
+    /// not a request line — on a connection that named the protocol, the
+    /// server does not have to read the first byte to find that out.
+    #[tokio::test]
+    async fn a_connection_that_named_tls_is_not_read_as_a_request() {
+        let hello = [0x16u8, 0x03, 0x01, 0x00, 0x05];
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(&hello).await;
+        });
+
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Tls)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                hello.to_vec(),
+                "the ClientHello is handed on as it came"
+            ),
+            other => panic!("expected the ClientHello to be handed on, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_short_head_budget_does_not_cut_off_a_tls_or_l4_client() {
         // The observation this test exists for: the first byte says which
