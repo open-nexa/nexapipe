@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 use tracing;
 
 use crate::ClientError;
-use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
+use crate::auth::{CredentialIdentity, Enrollment, IssuedCredential, TwoFactorAuth};
 use nexapipe_proto::secret::SecretString;
 
 const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
@@ -281,6 +281,15 @@ fn is_measured_rtt(rtt: std::time::Duration) -> bool {
 
 struct PooledConnection {
     conn: Connection,
+    /// The identity this connection was authenticated as.
+    ///
+    /// `None` when the connection was made without a credential: it carries no
+    /// identity at all, which is what it is compared with.
+    ///
+    /// The handshake runs once per connection, so this is the only record of
+    /// who the connection belongs to — and it is what a connection is checked
+    /// against before it is handed out or put back.
+    identity: Option<CredentialIdentity>,
     /// When the connection was last handed back to the pool.
     ///
     /// Not when it was dialled: a connection that is used continuously comes
@@ -302,6 +311,18 @@ impl PooledConnection {
     fn is_idle_for(&self, timeout: tokio::time::Duration) -> bool {
         is_idle_since(self.last_used, timeout)
     }
+}
+
+/// A connection that is out of the pool, and the identity it was
+/// authenticated as.
+///
+/// The identity travels with the connection because the pool cannot work it
+/// out later: a connection that was out of the pool when the credential was
+/// replaced comes back carrying the identity that is gone, and it must not go
+/// back in.
+struct LoanedConnection {
+    conn: Connection,
+    identity: Option<CredentialIdentity>,
 }
 
 /// Whether a connection that was last used at `last_used` has been sitting
@@ -355,6 +376,15 @@ pub struct IrohConnectionPool {
 /// turns a slow shutdown into a stall for every request.
 struct IrohConnectionPoolInner {
     connections: Mutex<Vec<PooledConnection>>,
+    /// The connections that are out of the pool, with the identity each was
+    /// authenticated as.
+    ///
+    /// A flow takes its connection out of the pool, so a credential that is
+    /// replaced while a flow is running cannot close it: the drop only sees
+    /// the connections that are in the pool. This is where the ones that are
+    /// out are, so that the identity they carry can be checked when they come
+    /// back — a connection of an identity that is gone does not go back in.
+    loaned: Mutex<Vec<LoanedConnection>>,
     ep: Arc<Mutex<Option<Endpoint>>>,
     endpoint_addr: EndpointAddr,
     /// Optional client 2FA credentials. When set, every freshly established
@@ -433,6 +463,7 @@ impl IrohConnectionPool {
             .map_err(|e| anyhow::anyhow!(e))?;
         let inner = Arc::new(IrohConnectionPoolInner {
             connections: Mutex::new(Vec::new()),
+            loaned: Mutex::new(Vec::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
@@ -450,6 +481,7 @@ impl IrohConnectionPool {
     pub fn new_with_endpoint(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
         let inner = Arc::new(IrohConnectionPoolInner {
             connections: Mutex::new(Vec::new()),
+            loaned: Mutex::new(Vec::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
@@ -506,13 +538,30 @@ impl IrohConnectionPool {
     /// authenticated as whoever the handshake ran for, and the handshake runs
     /// once per connection — so a connection made under the old credential
     /// keeps serving traffic under the old identity after the credential has
-    /// been replaced. The connections are closed when the identity changes.
+    /// been replaced. The connections in the pool are closed when the identity
+    /// changes, and a connection that was out of the pool when it changed is
+    /// closed when it comes back rather than going back in.
     ///
     /// The same identity keeps them: a rotated secret is the same account
-    /// with a different secret, and dropping the pool for that would close
-    /// every connection in flight over a rotation that changes nothing about
-    /// who they are.
+    /// with a different secret, and the connections still stand for that
+    /// account. A rotation closes nothing — neither the connections in the
+    /// pool nor the one a request is riding.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
+        self.set_credential(auth).await;
+    }
+
+    /// Writes the pool's credential, and closes the connections of the
+    /// identity that is gone.
+    ///
+    /// Every write of the credential goes through here. A path that wrote it
+    /// directly — the enrollment writes one of its own — would change the
+    /// identity without the comparison, and the connections of the old
+    /// identity would stay in the pool.
+    ///
+    /// The connections in the pool are closed here; one that was out of the
+    /// pool when the identity changed is closed when it comes back, and does
+    /// not go back in — see [`Self::return_connection`].
+    async fn set_credential(&self, auth: Option<TwoFactorAuth>) {
         let mut slot = self.inner.two_factor.lock().await;
         let changed = identity_changed(slot.as_ref(), auth.as_ref());
         *slot = auth;
@@ -525,6 +574,19 @@ impl IrohConnectionPool {
             // The connections were authenticated as the identity that is gone.
             self.drop_connections().await;
         }
+    }
+
+    /// The identity the pool's credential stands for right now.
+    ///
+    /// `None` when the pool has no credential: a connection made without one
+    /// carries no identity, which is what it is compared with.
+    async fn current_identity(&self) -> Option<CredentialIdentity> {
+        self.inner
+            .two_factor
+            .lock()
+            .await
+            .as_ref()
+            .map(|auth| auth.identity())
     }
 
     /// Configure a one-time enrollment token instead of credentials: the next
@@ -594,11 +656,16 @@ impl IrohConnectionPool {
     /// `timeout` is the budget for the QUIC handshake itself; see
     /// [`PRECONNECT_CONNECT_TIMEOUT`] for why a warm-up uses a tighter one than
     /// [`CONNECTION_TIMEOUT`].
+    ///
+    /// The identity the connection was authenticated as comes back with it:
+    /// the handshake runs once, so that is the only moment the connection's
+    /// identity is known, and the pool has to keep it to tell this connection
+    /// from one that belongs to another identity.
     async fn connect_and_auth(
         &self,
         ep: &Endpoint,
         timeout: tokio::time::Duration,
-    ) -> Result<Connection, ClientError> {
+    ) -> Result<(Connection, Option<CredentialIdentity>), ClientError> {
         let started = tokio::time::Instant::now();
         let conn = tokio::time::timeout(
             timeout,
@@ -652,7 +719,11 @@ impl IrohConnectionPool {
                         "Enrollment succeeded for client '{}'; the token is spent",
                         issued.client_id()
                     );
-                    *self.inner.two_factor.lock().await = Some(issued.clone());
+                    // The credential changes here, so it goes through the one
+                    // place that writes it: the identity comparison and the
+                    // drop of the connections of the identity that is gone
+                    // have to happen with it.
+                    self.set_credential(Some(issued.clone())).await;
                     *self.inner.enrollment.lock().await = None;
                     *self.inner.issued.lock().await = Some(issued);
                 }
@@ -666,6 +737,7 @@ impl IrohConnectionPool {
         }
 
         let two_factor = self.inner.two_factor.lock().await.clone();
+        let mut identity = None;
         if let Some(auth) = two_factor {
             #[cfg(feature = "tracing")]
             tracing::info!(
@@ -678,6 +750,9 @@ impl IrohConnectionPool {
                 tracing::warn!("2FA authentication failed: {}", e);
                 return Err(e);
             }
+            // The connection is authenticated as this credential from here on:
+            // this is the identity it carries for as long as it lives.
+            identity = Some(auth.identity());
             #[cfg(feature = "tracing")]
             tracing::info!(
                 "2FA authentication succeeded for client '{}'",
@@ -685,30 +760,82 @@ impl IrohConnectionPool {
             );
         }
 
-        Ok(conn)
+        Ok((conn, identity))
     }
 
     pub async fn get_connection(&self) -> Result<Connection, crate::error::ClientError> {
-        let mut connections = self.inner.connections.lock().await;
+        // The identity the pool's credential stands for right now. Read before
+        // the connections are locked, and released again: the lock order is
+        // `connections` first, and nesting the two is what makes a pool that
+        // dials while another task shuts it down deadlock-prone.
+        let current = self.current_identity().await;
 
-        // Drop stale connections before handing one out: anything already closed
-        // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
-        drop_stale_connections(&mut connections);
+        // A connection of an identity that is gone is closed rather than
+        // handed out: it was authenticated as somebody else.
+        let mut stale = Vec::new();
+        let chosen = {
+            let mut connections = self.inner.connections.lock().await;
 
-        if let Some(pooled) = connections.pop() {
-            return Ok(pooled.conn);
+            // Drop stale connections before handing one out: anything already closed
+            // by the peer, or idle for longer than CONNECTION_IDLE_TIMEOUT.
+            drop_stale_connections(&mut connections);
+
+            let mut chosen = None;
+            while let Some(pooled) = connections.pop() {
+                if pooled.identity == current {
+                    chosen = Some(pooled);
+                    break;
+                }
+                stale.push(pooled.conn);
+            }
+            chosen
+        };
+        for conn in stale {
+            #[cfg(feature = "tracing")]
+            tracing::info!("Closing a pooled connection of an identity that is gone");
+            conn.close(0u32.into(), b"credential changed");
         }
 
-        drop(connections);
+        if let Some(pooled) = chosen {
+            self.loan(pooled.conn.clone(), pooled.identity).await;
+            return Ok(pooled.conn);
+        }
 
         let ep = self.endpoint().await.ok_or_else(|| {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self.connect_and_auth(&ep, CONNECTION_TIMEOUT).await?;
+        let (conn, identity) = self.connect_and_auth(&ep, CONNECTION_TIMEOUT).await?;
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
+        self.loan(conn.clone(), identity).await;
 
         Ok(conn)
+    }
+
+    /// Records that a connection is out of the pool, with the identity it was
+    /// authenticated as.
+    async fn loan(&self, conn: Connection, identity: Option<CredentialIdentity>) {
+        self.inner
+            .loaned
+            .lock()
+            .await
+            .push(LoanedConnection { conn, identity });
+    }
+
+    /// Takes back the record of a connection that is out of the pool, and the
+    /// identity it was authenticated as.
+    ///
+    /// `None` when the pool has no record of the connection — it was not the
+    /// pool's, or it has already been taken back.
+    ///
+    /// The connection is found by iroh's stable id, which is fixed for the
+    /// lifetime of the connection: the record that comes back is the one that
+    /// belongs to this connection and not to another.
+    async fn take_loan(&self, conn: &Connection) -> Option<Option<CredentialIdentity>> {
+        let id = conn.stable_id();
+        let mut loaned = self.inner.loaned.lock().await;
+        let index = loaned.iter().position(|loan| loan.conn.stable_id() == id)?;
+        Some(loaned.swap_remove(index).identity)
     }
 
     /// How traffic to this backend is currently routed, and how far away it is.
@@ -768,7 +895,7 @@ impl IrohConnectionPool {
         let started = tokio::time::Instant::now();
         let deadline = started + PRECONNECT_TIMEOUT;
 
-        let conn = {
+        let (conn, identity) = {
             let Some(ep) = self.endpoint().await else {
                 return false;
             };
@@ -817,7 +944,7 @@ impl IrohConnectionPool {
         }
 
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
-        self.return_connection(conn).await;
+        self.pool_connection(conn, identity).await;
         true
     }
 
@@ -829,10 +956,46 @@ impl IrohConnectionPool {
             return;
         }
 
+        // The identity the connection was authenticated as, and the identity
+        // the pool's credential stands for now. Neither lock is held while the
+        // other is taken.
+        let identity = self.take_loan(&conn).await;
+        let current = self.current_identity().await;
+
+        match identity {
+            // The connection belongs to the identity that is current: it goes
+            // back into the pool.
+            Some(recorded) if recorded == current => {
+                self.pool_connection(conn, recorded).await;
+            }
+            // It belongs to an identity that is gone. The credential was
+            // replaced while this connection was out of the pool, so the drop
+            // could not close it then; it is closed now, and it does not go
+            // back in.
+            Some(_) => {
+                #[cfg(feature = "tracing")]
+                tracing::info!("Closing a connection of an identity that is gone");
+                conn.close(0u32.into(), b"credential changed");
+            }
+            // The pool has no record of this connection, so it cannot say which
+            // identity it was authenticated as. It does not go back in either:
+            // a connection nobody can vouch for is not one to hand out.
+            None => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("Closing a connection the pool has no record of");
+                conn.close(0u32.into(), b"unknown connection");
+            }
+        }
+    }
+
+    /// Puts a connection into the pool, with the identity it was
+    /// authenticated as.
+    async fn pool_connection(&self, conn: Connection, identity: Option<CredentialIdentity>) {
         let mut connections = self.inner.connections.lock().await;
         if connections.len() < MAX_CONNECTIONS {
             connections.push(PooledConnection {
                 conn,
+                identity,
                 last_used: tokio::time::Instant::now(),
             });
             return;
@@ -942,9 +1105,8 @@ impl IrohConnectionPool {
 /// changes.
 ///
 /// A rotated secret is the same account with a different secret, and the
-/// connections still stand for it: dropping the pool for that would close
-/// every connection in flight over a rotation that changes nothing about who
-/// they are.
+/// connections still stand for that account: a rotation changes nothing about
+/// who they are, so it closes nothing.
 ///
 /// Split out of [`IrohConnectionPool::set_two_factor`] so the decision can be
 /// tested without an endpoint: a connection needs one, a rule does not.
@@ -1165,6 +1327,14 @@ fn spawn_cleanup_task(inner: Weak<IrohConnectionPoolInner>) {
                     removed
                 );
             }
+            drop(connections);
+
+            // The records of the connections that are out of the pool and are
+            // closed: they will never come back, so the record of them is of
+            // no use. A connection that is still open keeps its record — that
+            // is what says which identity it was authenticated as.
+            let mut loaned = inner.loaned.lock().await;
+            loaned.retain(|loan| loan.conn.close_reason().is_none());
         }
     });
 }
@@ -1200,10 +1370,16 @@ pub fn parse_endpoint_addr(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECTION_IDLE_TIMEOUT, LinkKind, LinkStatus, encode_link_status, identity_changed,
-        is_idle_since, is_measured_rtt, may_publish,
+        CONNECTION_IDLE_TIMEOUT, IrohConnectionPool, LinkKind, LinkStatus, encode_link_status,
+        identity_changed, is_idle_since, is_measured_rtt, may_publish,
     };
-    use crate::auth::{TotpAlgorithm, TwoFactorAuth};
+    use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
+    use iroh::Endpoint;
+    use iroh::endpoint::presets;
+    use nexapipe_proto::auth::{Algorithm, AuthMessage};
+    use nexapipe_proto::secret::SecretString;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// A credential for `client_id`, optionally naming a device.
@@ -1216,11 +1392,243 @@ mod tests {
         }
     }
 
+    /// A backend that completes the authentication handshake, and nothing else.
+    ///
+    /// A connection is authenticated when it is made, so a test that wants a
+    /// connection of a given identity needs a server that answers the
+    /// handshake. This one checks nothing: it issues a challenge and says the
+    /// credential is good. The credential it enrolls is one of another client,
+    /// so an enrollment changes the identity of the pool.
+    async fn auth_backend() -> (Endpoint, Arc<AtomicUsize>) {
+        let ep = Endpoint::builder(presets::N0)
+            // Only the connections whose ALPN the endpoint knows are accepted.
+            .alpns(vec![super::ALPN_NEXAPIPE.to_vec()])
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = ep.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let conn = incoming.await.expect("the QUIC handshake completes");
+                    // More than one stream: an enrollment and the handshake
+                    // that follows it share one stream, and the handshake
+                    // that follows the enrollment opens another.
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        while let Some(message) = read_auth_message(&mut recv).await {
+                            match message {
+                                AuthMessage::EnrollStart { client_id, .. } => {
+                                    let issue = AuthMessage::EnrollIssue {
+                                        client_id,
+                                        secret: SecretString::new(
+                                            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string(),
+                                        ),
+                                        algorithm: Algorithm::Sha1,
+                                        digits: 6,
+                                        period: 30,
+                                        device_id: None,
+                                    };
+                                    write_auth_message(&mut send, &issue).await;
+                                }
+                                AuthMessage::Start { .. } => {
+                                    let challenge = AuthMessage::Challenge {
+                                        nonce: vec![1, 2, 3, 4],
+                                    };
+                                    write_auth_message(&mut send, &challenge).await;
+                                }
+                                AuthMessage::Response { .. } => {
+                                    write_auth_message(&mut send, &AuthMessage::Ok).await;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (ep, accepted)
+    }
+
+    /// Reads one length-prefixed authentication message.
+    async fn read_auth_message(recv: &mut iroh::endpoint::RecvStream) -> Option<AuthMessage> {
+        let mut len = [0u8; 4];
+        recv.read_exact(&mut len).await.ok()?;
+        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+        recv.read_exact(&mut buf).await.ok()?;
+        AuthMessage::from_bytes(&buf).ok()
+    }
+
+    /// Writes one length-prefixed authentication message.
+    async fn write_auth_message(send: &mut iroh::endpoint::SendStream, message: &AuthMessage) {
+        let bytes = message.to_bytes().expect("the message serializes");
+        send.write_all(&(bytes.len() as u32).to_le_bytes())
+            .await
+            .expect("the message is written");
+        send.write_all(&bytes)
+            .await
+            .expect("the message is written");
+    }
+
+    /// A pool pointed at a local backend that answers the handshake.
+    async fn pool_harness() -> (IrohConnectionPool, Arc<AtomicUsize>) {
+        let (backend, accepted) = auth_backend().await;
+        let client = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let pool = IrohConnectionPool::new_with_endpoint(client, backend.addr());
+        (pool, accepted)
+    }
+
+    /// A connection that was out of the pool when the credential was replaced
+    /// does not go back into it.
+    ///
+    /// The handshake runs once per connection, so the connection carries the
+    /// identity it was authenticated as, whatever the pool's credential says
+    /// afterwards. A credential of another identity means this connection
+    /// belongs to somebody else now, and handing it out again would serve the
+    /// old identity under the new credential.
+    #[tokio::test]
+    async fn a_connection_of_a_gone_identity_does_not_go_back_into_the_pool() {
+        let (pool, _accepted) = pool_harness().await;
+        pool.set_two_factor(Some(credential(
+            "client-001",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        let conn = pool.get_connection().await.expect("the connection is made");
+        let old_id = conn.stable_id();
+
+        // The credential is replaced while the connection is out of the pool.
+        pool.set_two_factor(Some(credential(
+            "client-002",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        pool.return_connection(conn.clone()).await;
+
+        assert!(
+            conn.close_reason().is_some(),
+            "the connection of the identity that is gone is closed instead of pooled"
+        );
+
+        // And it is not in the pool: the next request gets a connection of its own.
+        let next = pool
+            .get_connection()
+            .await
+            .expect("the next connection is made");
+        assert_ne!(
+            next.stable_id(),
+            old_id,
+            "the connection of the identity that is gone was handed out again"
+        );
+    }
+
+    /// A connection of the identity that is current goes back into the pool.
+    ///
+    /// The other half of the rule above: a connection is only refused when
+    /// its identity is gone, and the ordinary case — the same credential,
+    /// the same connection — keeps working.
+    #[tokio::test]
+    async fn a_connection_of_the_current_identity_goes_back_into_the_pool() {
+        let (pool, accepted) = pool_harness().await;
+        pool.set_two_factor(Some(credential(
+            "client-001",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        let conn = pool.get_connection().await.expect("the connection is made");
+        let id = conn.stable_id();
+        pool.return_connection(conn).await;
+
+        let next = pool
+            .get_connection()
+            .await
+            .expect("the next connection is made");
+        assert_eq!(
+            next.stable_id(),
+            id,
+            "the connection went back into the pool"
+        );
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the second request rode the pooled connection instead of dialling again"
+        );
+    }
+
+    /// The credential an enrollment buys goes through the same check.
+    ///
+    /// The enrollment writes the pool's credential itself, and a write that
+    /// skipped the check would change the identity without the pool hearing
+    /// about it: the connections of the old identity would carry on as if
+    /// nothing had happened.
+    #[tokio::test]
+    async fn an_enrollment_of_another_identity_closes_the_old_connections() {
+        let (pool, _accepted) = pool_harness().await;
+        pool.set_two_factor(Some(credential(
+            "client-001",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        // A connection of client-001, out of the pool.
+        let conn = pool.get_connection().await.expect("the connection is made");
+
+        // The next dial spends the enrollment token, and the credential it
+        // buys belongs to another client.
+        pool.set_enrollment(Some(Enrollment::new("client-002", "enrollment-token")))
+            .await;
+        let next = pool
+            .get_connection()
+            .await
+            .expect("the enrollment connection is made");
+
+        assert_ne!(
+            next.stable_id(),
+            conn.stable_id(),
+            "the enrollment opened a connection of its own"
+        );
+        assert!(
+            wait_for_close(&conn).await,
+            "the connection of the identity that is gone was not told the identity changed"
+        );
+    }
+
+    /// Waits for a connection to be closed, and says whether it was.
+    ///
+    /// The pool tells the connections it made that the identity has changed
+    /// by moving its generation, and the watcher of each connection notices
+    /// that on its next tick — so this waits for the tick rather than for the
+    /// instant.
+    async fn wait_for_close(conn: &iroh::endpoint::Connection) -> bool {
+        for _ in 0..50 {
+            if conn.close_reason().is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     /// A different secret under the same name is the same account.
     ///
     /// A rotation changes the seed and nothing else, so the connections that
-    /// were authenticated as that account still stand for it — and dropping
-    /// the pool would close every request in flight over a rotation.
+    /// were authenticated as that account still stand for it — and a rotation
+    /// closes nothing, neither the connections in the pool nor the one a
+    /// request is riding.
     #[test]
     fn a_rotated_secret_is_the_same_identity() {
         let before = credential("client-001", "JBSWY3DPEHPK3PXP", None);
