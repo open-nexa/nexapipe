@@ -6,7 +6,7 @@ use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinB
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_proto::{host_matches, normalize_host, normalize_pattern};
+use nexapipe_proto::{normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -393,6 +393,22 @@ impl DomainPools {
 
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
+    /// The domains that serve a name by **pattern**, keyed by the name the
+    /// pattern covers: `*.example.com` is keyed by `example.com`, and the
+    /// catch-all `*` by the empty string.
+    ///
+    /// An index rather than a scan. The lookup used to walk every configured
+    /// domain and ask whether it covered the name, and for a name the
+    /// configuration does not name exactly — which is every name a TUN device
+    /// asks about — that walk happened on every request and every flow.
+    ///
+    /// A pattern covers a name when the name ends with the pattern's suffix
+    /// **at a label boundary**, so the suffixes worth asking about are the
+    /// name's own label-aligned ones: `a.b.example.com`, `b.example.com`,
+    /// `example.com`, `com`. The walk below asks exactly those, and the
+    /// longest one is the longest pattern that covers the name — the same
+    /// answer the scan gave, without the scan.
+    wildcards: HashMap<String, Arc<DomainPools>>,
     default_pools: Option<Arc<DomainPools>>,
     /// What the background probe last found, per backend.
     ///
@@ -434,6 +450,24 @@ pub struct EndpointGroup {
     /// that then ran would dial them all again. That is the state a stopped
     /// tunnel would be left in: idle, and quietly reconnecting.
     probe_stopped: AtomicBool,
+}
+
+/// The wildcard patterns of a set of domains, keyed by the name they cover.
+///
+/// `*.example.com` is keyed by `example.com`, and the catch-all `*` by the
+/// empty string. A pattern that is not a wildcard is left out: the lookup
+/// finds an exactly-named domain in the map itself, and a pattern that is not
+/// a wildcard cannot cover a name that map did not find.
+fn wildcards_of(domains: &HashMap<String, Arc<DomainPools>>) -> HashMap<String, Arc<DomainPools>> {
+    let mut wildcards = HashMap::new();
+    for (pattern, pools) in domains {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            wildcards.insert(suffix.to_string(), pools.clone());
+        } else if pattern == "*" {
+            wildcards.insert(String::new(), pools.clone());
+        }
+    }
+    wildcards
 }
 
 /// How often each backend is asked whether it still answers.
@@ -681,8 +715,10 @@ impl EndpointGroup {
             None
         };
 
+        let wildcards = wildcards_of(&domains);
         Ok(Self {
             domains,
+            wildcards,
             default_pools,
             health,
             traffic,
@@ -806,8 +842,10 @@ impl EndpointGroup {
             None
         };
 
+        let wildcards = wildcards_of(&domains);
         Ok(Self {
             domains,
+            wildcards,
             default_pools,
             health,
             traffic,
@@ -829,6 +867,7 @@ impl EndpointGroup {
         )));
         Self {
             domains: HashMap::new(),
+            wildcards: HashMap::new(),
             default_pools,
             health,
             traffic,
@@ -962,11 +1001,20 @@ impl EndpointGroup {
             return Some(pools);
         }
 
-        self.domains
-            .iter()
-            .filter(|(pattern, _)| host_matches(pattern, &host))
-            .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
-            .map(|(_, pools)| pools)
+        // The name's **label-aligned** suffixes, longest first. A pattern
+        // `*.example.com` covers the names that end with `example.com` at a
+        // label boundary, and those are exactly the suffixes below — so the
+        // first one that is in the index is the longest pattern that covers
+        // the name, which is the answer the scan gave.
+        let mut suffix = host.as_ref();
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(pools) = self.wildcards.get(suffix) {
+                return Some(pools);
+            }
+        }
+        // The catch-all, `*`, covers everything, and is keyed by nothing.
+        self.wildcards.get("")
     }
 
     pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {

@@ -325,6 +325,22 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **A name the configuration does not name exactly is found by an index.**
+  The client kept a map of the configured domains, and a name that was not in
+  it exactly — which is **every** name a TUN device asks about, since those
+  are the names of the sites it visits rather than the names the operator
+  configured — was looked for by walking the whole map and asking each entry
+  whether it covered the name. That walk happened on every request and every
+  flow.
+  The wildcard patterns are now indexed by the name they cover: `*.example.com`
+  by `example.com`, and the catch-all `*` by nothing. A pattern covers a name
+  when the name ends with the pattern's suffix **at a label boundary**, and
+  those suffixes are exactly the name's own label-aligned ones, so the lookup
+  asks for them and the first one that is in the index is the longest pattern
+  that covers the name — the same answer the walk gave, without the walk.
+  The six tests that pin the wildcard behaviour, including the one that says
+  a wildcard does not serve its own apex, pass unchanged.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of
