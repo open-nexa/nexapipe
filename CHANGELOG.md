@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty things land in this cycle so far: the device credential can be a **key**
+Thirty-one things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -49,7 +49,8 @@ a name with a control byte in front of it, a UDP flow's queue is bounded by
 bytes rather than only by datagrams, the local proxy holds two buffers per
 connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
-handshake, and the protocol is chosen at the handshake.
+handshake, the protocol is chosen at the handshake, and the pool's ceiling
+is counted per protocol.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1029,6 +1030,25 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **The connection pool's ceiling is counted per protocol.** The protocol a
+  connection carries is chosen at the handshake, so a connection opened for
+  HTTP cannot carry an L4 tunnel, and the two cannot take each other's place.
+  The pool counted them together against one ceiling of ten: a protocol that
+  needed a connection of its own was refused — the connection was closed on
+  the spot and the flow failed with "the connection pool is full" — while
+  the other protocols' connections sat idle in the pool, unable to serve it.
+  The ceiling is now ten per protocol, and each protocol is counted on its
+  own.
+
+- **The crate's own documentation builds without a warning.** `cargo doc -p
+  nexapipe-proto` reported five: two links to an `ALPN_LEGACY` that the crate
+  never had — the constants are `ALPN_NEXAPIPE` and `ALPN_NEXAPIPE_LEGACY`,
+  and the two name different spellings — one to the private `preface` module,
+  one to a private `host`, and one to a `PREFACE_MAGIC` that was not in scope
+  where it was named. The links now point at the names that are really there,
+  and the prose says which spelling is the generic one and which is the one
+  that predates the prefix byte.
 
 - **The protocol's name on the wire is the name.** The ALPN was
   `"\x05nexapipe"` — the byte the L4 preface starts with, in front of the name.
