@@ -786,7 +786,7 @@ lookup, which is what a config written before the key existed does.
   filesystem, and the one into the updater.
   A renderer that can run script is a renderer that can ask for all three,
   and the answer was "yes" to each.
->- **A registration code no longer silently replaces a working credential.**
+- **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
   enrollment code was neither: it carries no secret, so it raised no conflict,
