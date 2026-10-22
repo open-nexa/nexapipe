@@ -3,6 +3,7 @@ use crate::connection_pool::IrohConnectionPool;
 use crate::http::{HttpRequest, HttpResponse};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId};
+use nexapipe_proto::protocol::Protocol;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -40,7 +41,7 @@ impl IrohProxyClient {
     }
 
     pub async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse, ClientError> {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
         let response = exchange_over(&conn.conn, request.to_bytes().as_slice()).await?;
         // The borrow ends when this handle is dropped, which is here: the pool
         // owns the connection and this was only ever a handle to it.
@@ -49,7 +50,7 @@ impl IrohProxyClient {
     }
 
     pub async fn send_raw(&self, data: &[u8]) -> Result<Vec<u8>, ClientError> {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
         let response = exchange_over(&conn.conn, data).await?;
         // The borrow ends here; the pool still owns the connection.
 
@@ -80,7 +81,7 @@ impl IrohProxyClient {
             &mut iroh::endpoint::RecvStream,
         ) -> Result<T, ClientError>,
     {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
         let (mut send, mut recv) = conn.conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
         let result = f(&mut send, &mut recv).await;

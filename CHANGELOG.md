@@ -674,6 +674,25 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
+- **The protocol is chosen at the handshake.** A connection used to carry
+  everything — an HTTP request, an L4 tunnel, a TLS session — and the server
+  told them apart by **the first byte of each stream**: `0x05` is an L4
+  preface, `0x16` is a TLS ClientHello, anything else is a request line.
+  That is a **sniff**: the bytes have to be read before the connection's
+  purpose is known, and a codec that wants the whole head cannot have it
+  without the bytes being read and handed back.
+  A client may now name the protocol it wants — `nexapipe/http`,
+  `nexapipe/l4`, `nexapipe/tls` — and the server knows what it is serving
+  before it reads a byte of it. The old generic name still means "the first
+  byte decides", so a client that speaks it is served the way it always was,
+  and a client that predates the name it once spoke still reaches the server.
+  **The price is a connection per protocol.** A client that speaks HTTP and
+  L4 to the same server holds a connection for each, where it held one: one
+  handshake more, and one connection's buffers more — a connection is
+  **110 KiB** of heap, both ends of it together. That is the trade for a
+  server that knows what it is serving, and it is the thing the next step
+  (the tunnel path using hyper's own HTTP/1 codec) is worth.
+
 ### Changed
 
 - **The tunnel's congestion controller is BBR rather than Cubic.** Cubic is a

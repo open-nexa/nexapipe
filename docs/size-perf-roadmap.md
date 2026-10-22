@@ -453,7 +453,19 @@ items the numbers pointed at.
    flows on a connection as well — it refuses the one that does not fit — so
    the client keeps below that ceiling itself and opens another connection
    rather than piling every flow onto one.
-7. **The request body is not held whole.** **Added on 2026-10-22, from the
+7. **The protocol is chosen at the handshake.** **Added on 2026-10-22, and
+   the enabler for the step after it.** A connection used to carry every
+   protocol at once, and the server told them apart by the first byte of
+   each stream — a **sniff**, and the reason the tunnel path could not use
+   hyper's own HTTP/1 codec without the bytes being read and handed back.
+   A client may now name the protocol it wants, and the server knows what it
+   is serving before it reads a byte of it.
+   **The price is a connection per protocol**: a client that speaks HTTP and
+   L4 to the same server holds a connection for each, where it held one.
+   That is **110 KiB** of heap for the extra connection (both ends
+   together) and one handshake more, paid once per endpoint and protocol.
+   The time is unchanged — the same number of round trips, the same bytes.
+8. **The request body is not held whole.** **Added on 2026-10-22, from the
    audit rather than from a bench.** The server read a request's whole body
    into memory — up to 64 MiB of it — before it contacted the backend, and
    only then sent it. A backend saw **nothing** of an upload until the last

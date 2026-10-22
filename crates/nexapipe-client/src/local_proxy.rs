@@ -5,6 +5,7 @@ use crate::flow::{FlowKind, FlowMeta};
 use crate::http::{is_websocket_request_static, parse_http_request_legacy};
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
+use nexapipe_proto::protocol::Protocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -737,11 +738,13 @@ pub(crate) async fn open_stream_with_retry(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
     initial_data: Option<&[u8]>,
+    protocol: Protocol,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     open_stream_with_retry_until(
         endpoint_group,
         host,
         initial_data,
+        protocol,
         tokio::time::Instant::now() + STREAM_OPERATION_TIMEOUT * OPEN_ATTEMPTS as u32,
     )
     .await
@@ -756,6 +759,7 @@ pub(crate) async fn open_stream_with_retry_until(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
     initial_data: Option<&[u8]>,
+    protocol: Protocol,
     deadline: tokio::time::Instant,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     let mut last_err: Option<ClientError> = None;
@@ -775,7 +779,7 @@ pub(crate) async fn open_stream_with_retry_until(
             break;
         }
 
-        let pooled_conn = match endpoint_group.get_connection(host).await {
+        let pooled_conn = match endpoint_group.get_connection(host, protocol).await {
             Ok(conn) => conn,
             Err(e) => {
                 // Leaving the loop before every attempt is spent must not lose
@@ -1246,8 +1250,13 @@ where
                 );
 
                 // Open iroh bi-stream and send the modified request
-                let (pooled_conn, mut send, mut recv) =
-                    open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
+                let (pooled_conn, mut send, mut recv) = open_stream_with_retry(
+                    &endpoint_group,
+                    &host,
+                    Some(&request_to_send),
+                    Protocol::Http,
+                )
+                .await?;
 
                 // One tunnel is one flow, and it stays counted until the
                 // handler this sits in returns — see the CONNECT branch.
@@ -1434,8 +1443,13 @@ where
         request_to_send.len(),
         host
     );
-    let (pooled_conn, mut send, mut recv) =
-        open_stream_with_retry(&endpoint_group, &host, Some(&request_to_send)).await?;
+    let (pooled_conn, mut send, mut recv) = open_stream_with_retry(
+        &endpoint_group,
+        &host,
+        Some(&request_to_send),
+        Protocol::Http,
+    )
+    .await?;
 
     // The helper wrote the request — headers and whatever body had already
     // arrived — before this line was reached. Counting the copy loop alone
@@ -1666,7 +1680,7 @@ where
         data.len()
     );
     let (pooled_conn, mut send, mut recv) =
-        open_stream_with_retry(&endpoint_group, &sni, Some(&data)).await?;
+        open_stream_with_retry(&endpoint_group, &sni, Some(&data), Protocol::Tls).await?;
 
     // Same accounting as the HTTP path: the helper already wrote the
     // ClientHello it was handed.

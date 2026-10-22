@@ -551,6 +551,7 @@ async fn spawn_proxy_with_timeouts(
                         None,
                         &request_id,
                         nexapipe::conn::peers::PeerIdentity::default(),
+                        nexapipe_proto::protocol::Protocol::Legacy,
                     )
                     .await;
                 }
