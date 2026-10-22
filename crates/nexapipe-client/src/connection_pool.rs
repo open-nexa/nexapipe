@@ -1325,23 +1325,36 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "local-proxy")]
+    use super::{ALPN_NEXAPIPE, IrohConnectionPool};
     use super::{
-        ALPN_NEXAPIPE, CONNECTION_IDLE_TIMEOUT, IrohConnectionPool, LinkKind, LinkStatus,
-        encode_link_status, is_idle_since, is_measured_rtt, may_publish,
+        CONNECTION_IDLE_TIMEOUT, LinkKind, LinkStatus, encode_link_status, is_idle_since,
+        is_measured_rtt, may_publish,
     };
+    #[cfg(feature = "local-proxy")]
     use crate::endpoint_group::EndpointGroup;
+    #[cfg(feature = "local-proxy")]
     use iroh::Endpoint;
+    #[cfg(feature = "local-proxy")]
     use iroh::endpoint::presets;
+    #[cfg(feature = "local-proxy")]
     use std::net::SocketAddr;
+    #[cfg(feature = "local-proxy")]
     use std::sync::Arc;
+    #[cfg(feature = "local-proxy")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// The far side of a tunnel: answers the preface, and counts the
     /// connections it is given.
     ///
+    /// The test below drives the L4 tunnel, and that module is behind the
+    /// `local-proxy` feature — so this is too.
+    #[cfg(feature = "local-proxy")]
+    ///
     /// The count is the far side's own, so the number a test reads does not
     /// depend on anything the client says about itself.
+    #[cfg(feature = "local-proxy")]
     async fn serve_counting(endpoint: Endpoint, accepted: Arc<AtomicUsize>) {
         while let Some(incoming) = endpoint.accept().await {
             // A copy for the task: the counter is shared, the handle is not
@@ -1385,6 +1398,7 @@ mod tests {
     }
 
     /// The two ends of a tunnel, and the count the far side keeps.
+    #[cfg(feature = "local-proxy")]
     async fn harness() -> (Arc<EndpointGroup>, Arc<AtomicUsize>) {
         let server = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN_NEXAPIPE.to_vec()])
@@ -1416,6 +1430,7 @@ mod tests {
     /// of it, so two flows to one backend are one connection and not two. The
     /// far side counts what it is given, which is the number that matters: it
     /// is what the peer sees.
+    #[cfg(feature = "local-proxy")]
     #[tokio::test]
     async fn two_concurrent_flows_share_one_connection() {
         let (group, accepted) = harness().await;
