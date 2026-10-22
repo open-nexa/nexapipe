@@ -57,6 +57,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The server answers the handshake in the form it was asked in.** The
+  handshake message has two forms — the JSON one every client already speaks,
+  and the binary one — and the payload's first byte says which one it is. The
+  server reads all of them: a client that speaks one form and a server that
+  speaks another still complete the handshake, and the answers come back in
+  the form the client asked in.
+  **The client does not use the binary form yet.** It is turned on one side at
+  a time, so that an old client keeps working against a new server and a new
+  client keeps working against an old one — the case that decides the whole
+  order of the change.
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
   speaks, and a binary one that is a third of the size where the bytes are —
@@ -342,6 +352,42 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **The routing table's benchmark measures a lookup that matches.** Its 51
+  routes all had the path pattern `/*`, which is not a wildcard — it is a
+  literal `/*` prefix, and a route with it serves no ordinary path at all.
+  The walk went over all 51 routes and ended at the table's end with **no
+  route taken**, while the benchmark's name and the documentation both said
+  it was measuring what taking the route costs. That half was never
+  measured.
+  The pattern is `/` now — the catch-all a route uses to say "any path" —
+  and the benchmark asserts that the lookup matched, so the mistake cannot
+  come back quietly. It measures two things now: **732 ns** for a host a
+  route serves, and **533 ns** for a host no route serves. The difference is
+  what taking the route costs, which is the balancer's part.
+  The number recorded before — 999 ns — was a lookup that found nothing, and
+  it is kept in the documentation marked as what it was.
+
+- **The host is folded once per request, not once per route.** The routing
+  table walks its routes until one matches, and every route in the walk was
+  folding the client's name again — trailing dots off, brackets off, case
+  folded — for the same name, over and over. The fold now happens once for
+  the whole walk, and the routes are handed the folded name.
+  It is the same name every time, so the fold is the same answer every time,
+  and doing it once is not a different answer: the HTTP path, the TLS
+  passthrough path and the L4 path all fold exactly as they did before, and
+  the tests that pin the matching rules still pass unchanged.
+  The numbers, from the routing table's own benchmark: a host a route
+  serves goes from **732 ns** to **134 ns**, and a host no route serves
+  from **533 ns** to **76 ns**.
+
+- **The health check reads the backends' status once a round, not once a
+  backend.** The status table was read **inside** the loop that probes the
+  backends, so the whole table — every backend's status, and a copy of its
+  address — was read again for each backend in it. One round of probes over
+  fifty backends read the table two thousand five hundred times, every
+  interval, for no reason: a probe reports, it does not change the state, so
+  the answer is the same every time it is asked.
+  It is read once now, and looked up.
 
 ### Changed
 
@@ -704,6 +750,31 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The webview is granted less than it was.** The desktop app's capability
+  granted the whole of `core:default`, the whole of `opener:default` and the
+  whole of `updater:default` to the renderer, and the renderer used almost
+  none of it. Three things came with that:
+  - `core:image:allow-from-path` let the renderer read **any image file the
+    user can read** — a screenshot, a photo, an exported chart — and hand its
+    pixels back over the IPC channel. It is denied now, and nothing in the
+    app used it.
+  - `opener:default` granted `reveal-item-in-dir` for **any path**, which
+    asks the OS file manager to open a directory the renderer names. The
+    frontend only ever opens a URL, so the permission is now the one that
+    opens a URL and the scope that says which ones.
+  - `updater:default` granted the renderer the right to download and install
+    an update. The frontend has never called the updater — the app has no
+    in-app update button — and the plugin is still registered on the Rust
+    side, so nothing about the release machinery changed; only the
+    renderer's reach into it is gone.
+  `core:default` itself is still granted, and it still brings the path, the
+  event, the window, the webview, the app, the resource, the menu and the
+  tray defaults with it — the renderer uses the window and the tray ones,
+  and the path and the resource defaults are what the rest of the set needs.
+  What is gone is the two reaches that mattered: the one into the
+  filesystem, and the one into the updater.
+  A renderer that can run script is a renderer that can ask for all three,
+  and the answer was "yes" to each.
 - **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
