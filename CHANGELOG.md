@@ -463,8 +463,10 @@ lookup, which is what a config written before the key existed does.
   was bounded, so a WebSocket whose two sides both went quiet kept a backend
   connection, a task and a stream slot for as long as the process lived. It
   now moves 64 KiB and is bounded by the same `response_idle` deadline the
-  HTTP path uses. The bound is on the **gap**, not on the session: a
-  WebSocket that is idle for a while is still a WebSocket.
+  HTTP path uses. The bound is on the **session**, not on a side of it: a
+  WebSocket that is quiet in one direction is still a WebSocket -- a client
+  that only listens to a feed the backend keeps pushing has nothing to say --
+  and what ends the session is neither side having moved for a whole window.
   Every **response header's name** was copied to lower case, once per header
   per response -- for a name that was already lower case, because HTTP header
   names are case-insensitive and the parser folds them.
