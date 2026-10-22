@@ -443,6 +443,12 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **An invite's relay hint has to name a relay this client can reach.** The
+  hint was accepted whenever the URL parser accepted it, so `ftp://`,
+  `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
+  and the length are checked now, and the n0-operated relays are refused for
+  the same reason the configuration refuses them. A code past a hard limit is
+  refused rather than parsed.
 - **The client refuses a request that names more than one host.** The client
   picked the first `Host` that matched a proxy domain and forwarded the head
   byte for byte, so a request with two `Host` headers reached the server, which
