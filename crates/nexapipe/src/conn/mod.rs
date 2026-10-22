@@ -575,11 +575,20 @@ pub async fn handle_bidi_stream(
 
     // The body is read once, before the first attempt: the bytes come off the
     // client's stream, and that stream has them only once. A retry sends the
-    // same bytes again, which is only possible because they were kept.
+    // same bytes again, which is only possible because they were kept — and
+    // only a body that is **whole** is kept. A body that is streamed is read
+    // as the backend asks for it, so there is no second copy of it to send:
+    // a retry is only possible while the stream has not been read at all,
+    // which is the case for a connection that was refused before the body
+    // was touched.
     //
     // A WebSocket upgrade has no body to read: the session starts where the
     // head ends, and the bytes after it are frames.
-    let body = if http::is_websocket_request_static(&request) {
+    // The stream is an `Option` because a body that is **streamed** takes it:
+    // the bytes are read from it as the backend asks for them, so it cannot
+    // also be used for anything else.
+    let mut recv = Some(recv);
+    let mut body = if http::is_websocket_request_static(&request) {
         None
     } else {
         match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
@@ -632,7 +641,7 @@ pub async fn handle_bidi_stream(
             tracing::debug!("WebSocket request detected");
             match handle_websocket_stream(
                 send,
-                recv,
+                recv.expect("a WebSocket request has no body, so its stream is still here"),
                 &request,
                 clients,
                 &backend_info,
@@ -658,7 +667,7 @@ pub async fn handle_bidi_stream(
             }
         } else {
             let body = body
-                .as_ref()
+                .as_mut()
                 .expect("the body of a request that is not a WebSocket is read above");
             let attempts = config.retry().attempts;
             let backoff = config.retry().backoff;
@@ -705,6 +714,30 @@ pub async fn handle_bidi_stream(
                 if attempt >= attempts || !failure.retry.may_retry(request.method()) {
                     break Err(failure);
                 }
+
+                // A body that has been **read** is gone: its bytes came off
+                // the client's stream and there is no second copy of them, so
+                // the request cannot be tried again. A body that is whole can
+                // be sent again, and is — and so can a streamed body that was
+                // never read, because the bytes are still on the client's
+                // stream: a connection that was refused never touched the
+                // body.
+                //
+                // The failure says so rather than sending an empty body to
+                // the next backend, which is what a retry without the bytes
+                // would do.
+                //
+                // Broken out of the loop rather than returned from the
+                // function, so that the refusal is recorded and logged like
+                // every other outcome.
+                if !body.may_retry() {
+                    break Err(http::ProxyFailure::from(anyhow::anyhow!(
+                        "the request has a body that cannot be read a second time, so it is not \
+                         tried again: {}",
+                        failure.error
+                    )));
+                }
+
                 attempt += 1;
 
                 tracing::warn!(
