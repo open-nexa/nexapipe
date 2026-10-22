@@ -307,6 +307,20 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **The connections a client's flows cost are measured.** The client keeps a
+  pool of connections to each backend, and a flow takes one **out** of it and
+  hands it back when it ends. That sounds like pooling, and it is — but
+  while a flow is running its connection is not in the pool, so a hundred
+  concurrent flows need a hundred connections, and each of them pays for a
+  QUIC handshake on the way.
+  The number is **100 connections for 100 concurrent flows**, and it does not
+  move: every sample was exactly 100. Opening those hundred flows takes
+  **1.05 seconds**, against a transport built to carry 1024 bi-streams on one
+  connection.
+  The far side counts its own accepts, so the number does not depend on
+  anything the client reports about itself, and each round runs on a fresh
+  pool so that the count is what that round needed rather than what a
+  previous round left behind.
 
 ### Changed
 

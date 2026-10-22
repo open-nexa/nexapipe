@@ -305,6 +305,19 @@ much variance there was, and here there is very little.
 | `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | One 64 KiB payload's round trip through the copy loop. **The copy loop itself is not the problem** |
 | `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | The same 64 KiB over an established tunnel, through the local proxy and a real iroh connection. The rate it moves at, not the cost of opening it |
 
+Two more rows, measured on **2026-10-22** on the same machine and toolchain, for
+the connections a client's flows open:
+
+| Bench | mean | median | slope | What the number says |
+|---|---|---|---|---|
+| `flow_connections/connections` | 100 | 100 | **100** | **100 connections for 100 concurrent flows.** One per flow, because a flow takes its connection out of the pool and holds it until it ends. The count does not move: every sample was exactly 100 |
+| `flow_connections/open_flows` | 1.049 s | 1.050 s | **1.050 s** | How long those hundred flows take to open, each of them paying for a QUIC handshake. The connection count is what this costs |
+
+The transport is built for the opposite of what the client does with it: one
+connection can carry 1024 bi-streams, and the client opens one connection per
+flow instead. That is the largest single per-flow cost in the client, and it
+is now a number rather than a reading of the code.
+
 #### What the numbers say, and what they do not
 
 Two things are worth writing down, because "we measured and it is already fast
@@ -347,8 +360,7 @@ measures it: the plain HTTP path through the client's local proxy — the head,
 the domain check, the rewrite, the bi-stream, and the response back — which
 is the path `forwarding_path` does not cover, because that one is the CONNECT
 tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
-`first_byte` at **100 µs** (the time to the response head) and
-`request_response` at **138 µs** (the whole request). The far side of that
+`first_byte` at **100 µs** (the time to the response head) and`request_response` at **138 µs** (the whole request). The far side of that
 bench is an HTTP server over an iroh bi-stream on the same host, not the
 server crate's own request handling — so what is now measured is the
 client's half of a request, and the server's half is still an expectation.
@@ -379,6 +391,14 @@ items the numbers pointed at.
 5. **Not the QUIC or rustls internals** — those are the vendored, audited,
    already-`opt-level = 3` layers, and nobody in this project is going to
    out-tune `ring` by hand. That one still stands.
+6. **The connections a flow costs.** **Added on 2026-10-22, and the largest
+   per-flow cost measured so far.** `flow_connections` counts the connections
+   the far side is given while a hundred flows are open: **100**, one per
+   flow, because a flow takes its connection out of the pool and holds it
+   until it ends. Opening those hundred flows takes **1.05 s**, each of them
+   paying for a handshake — against a transport built to carry 1024 bi-streams
+   on one connection. The candidate is to let a flow borrow a connection
+   instead of taking it, and the acceptance measurement already exists.
 
 ### F3 — A performance budget (P2, after F1)
 
