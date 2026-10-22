@@ -332,13 +332,24 @@ lookup, which is what a config written before the key existed does.
   flow to be open before it sends anything, so every flow paid for a name
   lookup that the flow before it had already paid for.
   The answers are cached now. A name that resolved is remembered for thirty
-  seconds, and a name that did **not** is remembered for five — much
+  seconds, and a name that does **not** exist is remembered for five — much
   shorter, because a name that failed is often a backend that has just come
-  up and the next flow should find it.
-  The cache holds addresses, not flows: every flow still opens its own
+  up and the next flow should find it. A resolver that could not answer at
+  all — a timeout, a SERVFAIL — is not remembered: the answer may be there in
+  a moment, and a remembered failure would keep the backend unreachable for
+  the whole negative TTL. The resolver's own message is what the flow fails
+  with, so a typo in the config and a DNS outage do not look the same in the
+  log.
+  Two flows that arrive together do not start two lookups: the second one
+  waits for the first and takes its answer.
+  The cache holds addresses, not flows: every TCP flow still opens its own
   connection, so a cached address that has gone away fails the dial like any
-  other. The port is not part of the cache's key, because a DNS answer is
-  about the name — `db.test:5432` and `db.test:5433` share one resolution.
+  other. A UDP flow is the exception — a UDP socket has no dial, so a stale
+  address would not fail loudly, it would open the flow and send every
+  datagram to an address that is no longer there. A UDP flow therefore
+  resolves its target every time it opens, the way it did before.
+  The port is not part of the cache's key, because a DNS answer is about the
+  name — `db.test:5432` and `db.test:5433` share one resolution.
 
 ### Changed
 

@@ -510,7 +510,7 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
-    let target = match resolve(&host, port).await {
+    let target = match resolve_udp_target(&host, port).await {
         Ok(addr) => addr,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
@@ -684,9 +684,30 @@ async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Re
     let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
         .await
         .map_err(|_| anyhow::anyhow!("timed out resolving backend {host}:{port}"))?
-        .map_err(|e| anyhow::anyhow!("cannot resolve backend {host}:{port}: {e}"))?;
+        // The resolver's own words are part of the message the log prints —
+        // it prints the top-level message — and the error they came from
+        // stays the source of the chain.
+        .map_err(|e| {
+            let message = format!("cannot resolve backend {host}:{port}: {e}");
+            e.context(message)
+        })?;
 
-    let mut failure = String::new();
+    connect_addrs(&addrs, deadline).await.map_err(|e| {
+        let message = format!("failed to connect to backend {host}:{port}: {e}");
+        e.context(message)
+    })
+}
+
+/// Tries the addresses in turn, under one deadline.
+///
+/// The deadline is handed in rather than computed here: the resolution that
+/// produced the addresses is inside the same budget, so a backend with many
+/// addresses cannot multiply it.
+async fn connect_addrs(
+    addrs: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<TcpStream> {
+    let mut failure = None;
     for addr in addrs {
         match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
@@ -695,22 +716,32 @@ async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Re
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
             }
-            Ok(Err(e)) => failure = format!("{addr}: {e}"),
-            Err(_) => failure = format!("{addr}: timed out"),
+            Ok(Err(e)) => failure = Some(anyhow::anyhow!("{addr}: {e}")),
+            Err(_) => failure = Some(anyhow::anyhow!("{addr}: timed out")),
         }
     }
 
-    Err(anyhow::anyhow!(
-        "failed to connect to backend {host}:{port}: {failure}"
-    ))
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("there was no address to try")))
 }
 
-async fn resolve(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    crate::dns::resolve_to(host, port)
+/// The address a UDP flow sends its datagrams to.
+///
+/// Resolved every time, and not through the cache. A UDP socket has no dial:
+/// `connect` on it is local and cannot tell that the peer is gone, so a
+/// stale address is not a failed dial — the flow would open, every datagram
+/// would go to an address that is no longer there, and nothing would report
+/// it. A TCP flow has the opposite property, which is why the TCP paths can
+/// use the cache: a stale address is refused and the dial fails loudly.
+async fn resolve_udp_target(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    crate::dns::resolve_uncached(host)
         .await
-        .map_err(|e| anyhow::anyhow!("cannot resolve backend {host}:{port}: {e}"))?
+        .map_err(|e| {
+            let message = format!("cannot resolve backend {host}:{port}: {e}");
+            e.context(message)
+        })?
         .into_iter()
         .next()
+        .map(|ip| SocketAddr::new(ip, port))
         .ok_or_else(|| anyhow::anyhow!("backend {host}:{port} resolved to no address"))
 }
 
@@ -1562,5 +1593,87 @@ mod tests {
         assert_eq!(parse_backend_addr("http://db.internal"), None);
         assert_eq!(parse_backend_addr(":5432"), None);
         assert_eq!(parse_backend_addr(""), None);
+    }
+
+    /// An address that refuses the connection: a port that was bound and
+    /// released, so nothing is listening on it any more.
+    async fn refusing_addr() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_dial_tries_the_next_address_when_the_first_refuses() {
+        // A backend with two addresses: the first refuses, the second
+        // accepts. The dial has to get to the second one — that is what
+        // `TcpStream::connect((host, port))` did, and what the hand-written
+        // dial has to keep doing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepting = listener.local_addr().unwrap();
+        let refused = refusing_addr().await;
+
+        let started = std::time::Instant::now();
+        let stream = connect_addrs(
+            &[refused, accepting],
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("the second address should have been tried");
+
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            accepting,
+            "the dial should have ended on the address that accepted"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second address is inside the same deadline, not a new one, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_address_is_tried_under_one_deadline() {
+        // The deadline has passed: every attempt is over before it starts, so
+        // the dial gives up at once instead of waiting once per address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepting = listener.local_addr().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = connect_addrs(
+            &[accepting, accepting, accepting],
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the deadline has passed");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a spent deadline must not be waited for once per address, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("timed out"),
+            "the error should say the attempt ran out of time, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_to_an_address_that_refuses_says_which_one() {
+        let refused = refusing_addr().await;
+
+        let error = connect_addrs(
+            &[refused],
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("nothing is listening on that port");
+
+        assert!(
+            error.to_string().contains(&refused.to_string()),
+            "the error should name the address that failed, got {error}"
+        );
     }
 }
