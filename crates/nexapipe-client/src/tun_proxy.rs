@@ -1426,6 +1426,44 @@ impl UdpQueue {
         self.queued.fetch_sub(len, Ordering::Relaxed);
     }
 
+    /// Puts a datagram into the queue, and says whether it went in.
+    ///
+    /// The bytes are reserved **before** the datagram goes in, so the queue
+    /// cannot pass its bound between the check and the send. A datagram that
+    /// does not go in gives its reservation back at once, so the budget the
+    /// queue holds is the budget it has — a reservation that was never given
+    /// back would shrink the queue a byte at a time until it was wedged.
+    ///
+    /// The three ways a datagram does not go in are told apart, because the
+    /// caller says something different about each: the queue's own byte bound
+    /// was reached, the channel's datagram count was reached, or the flow
+    /// ended.
+    fn send(&self, payload: Vec<u8>) -> Result<(), UdpSendError> {
+        let len = payload.len();
+        if !self.reserve(len) {
+            return Err(UdpSendError::NoRoom);
+        }
+        match self.sender.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.release(len);
+                Err(UdpSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.release(len);
+                Err(UdpSendError::Closed)
+            }
+        }
+    }
+
+    /// A datagram left the queue, so its bytes are no longer waiting for it.
+    ///
+    /// The datagram itself is passed in rather than its length, so the bytes
+    /// given back are the bytes that were taken in.
+    fn taken(&self, datagram: &[u8]) {
+        self.release(datagram.len());
+    }
+
     /// How many bytes are waiting.
     #[cfg(test)]
     fn queued_bytes(&self) -> usize {
@@ -1434,6 +1472,17 @@ impl UdpQueue {
 }
 
 type FlowTable = Arc<Mutex<HashMap<FlowKey, UdpQueue>>>;
+
+/// Why a datagram did not go into a flow's queue.
+#[derive(Debug, PartialEq, Eq)]
+enum UdpSendError {
+    /// The queue's byte budget was reached.
+    NoRoom,
+    /// The queue's datagram count was reached.
+    Full,
+    /// The flow ended before the datagram went in.
+    Closed,
+}
 
 /// Which side of a UDP flow spoke.
 #[derive(Debug)]
@@ -1620,26 +1669,16 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
 
         // The bytes are reserved **before** the datagram goes in, so that the
         // queue cannot pass its bound between the check and the send.
-        let len = payload.len();
-        if !queue.reserve(len) {
-            // The same answer as a full queue: the datagram is lost, which is
-            // what UDP promises anyway.
-            continue;
-        }
-
-        match queue.sender.try_send(payload) {
+        match queue.send(payload) {
             Ok(()) => {}
             // Datagrams arriving while the tunnel is still opening are the normal
             // case for the first few, so a full queue is not worth a log line —
             // printing one per dropped datagram would be its own problem under
             // load. Losing them is what UDP promises anyway.
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                queue.release(len);
-            }
+            Err(UdpSendError::NoRoom | UdpSendError::Full) => {}
             // The flow ended between the lookup and the send. The next datagram
             // creates a new one.
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                queue.release(len);
+            Err(UdpSendError::Closed) => {
                 jni_log!("[tun-proxy] UDP flow to {} closed", dst_addr);
             }
         }
@@ -1733,7 +1772,7 @@ async fn run_udp_flow(
             Activity::Application(Some(datagram)) => {
                 // The datagram is out of the queue now, so its bytes are no
                 // longer waiting for it.
-                mine.release(datagram.len());
+                mine.taken(&datagram);
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
@@ -2446,9 +2485,10 @@ mod tests {
     use super::{
         Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
         DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UDP_FLOW_QUEUE, UDP_FLOW_QUEUE_BYTES, UdpQueue,
-        UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
-        cached_answer_at, handle_dns_query, lock_cache, next_activity, parse_dns_query, read_u32,
-        remember_answer, resolve_tcp_window, set_answer_ttls, wait_for_stop,
+        UdpSendError, UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for,
+        cached_answer, cached_answer_at, handle_dns_query, lock_cache, next_activity,
+        parse_dns_query, read_u32, remember_answer, resolve_tcp_window, set_answer_ttls,
+        wait_for_stop,
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
@@ -3040,5 +3080,81 @@ mod tests {
         queue.release(chunk);
         assert_eq!(queue.queued_bytes(), UDP_FLOW_QUEUE_BYTES - chunk);
         assert!(queue.reserve(chunk), "there is room again");
+    }
+
+    /// A datagram that goes in and comes out leaves the queue empty.
+    ///
+    /// The arithmetic of the budget is one thing; the pairing is another. A
+    /// reservation that is never given back shrinks the queue a byte at a
+    /// time until it is wedged, and one that is given back twice takes the
+    /// count under the truth — which, in a debug build, is a panic.
+    ///
+    /// This drives the three steps the tunnel does: the datagram is put in,
+    /// the flow takes it out, and the bytes are given back. It is the same
+    /// code the demultiplexer and the flow run.
+    #[tokio::test]
+    async fn a_datagram_that_goes_in_and_comes_out_leaves_the_queue_empty() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let datagram = vec![7u8; 1400];
+        assert_eq!(queue.send(datagram.clone()), Ok(()), "the datagram goes in");
+        assert_eq!(
+            queue.queued_bytes(),
+            datagram.len(),
+            "the datagram's bytes are waiting for it"
+        );
+
+        // The flow takes it out of the queue.
+        let taken = receiver.recv().await.expect("the datagram is there");
+        assert_eq!(taken, datagram);
+        queue.taken(&taken);
+
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "the bytes are given back when the datagram leaves the queue"
+        );
+    }
+
+    /// A datagram that does not go in gives its bytes back.
+    ///
+    /// The other half of the pairing: a reservation taken for a datagram that
+    /// was then dropped must not stay taken. A flow whose tunnel is closing
+    /// drops datagrams all the time, and every one of them that kept its
+    /// reservation would eat into the budget of the next flow.
+    #[tokio::test]
+    async fn a_datagram_that_does_not_go_in_gives_its_bytes_back() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+        // The flow ended: the receiver is gone.
+        drop(receiver);
+
+        assert_eq!(
+            queue.send(vec![7u8; 1400]),
+            Err(UdpSendError::Closed),
+            "the datagram does not go into a flow that ended"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "a datagram that did not go in is not counted"
+        );
+
+        // And the same for the queue's own bounds: a datagram that does not
+        // fit in the byte budget is given back as well.
+        let (sender, _receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+        let big = vec![0u8; UDP_FLOW_QUEUE_BYTES + 1];
+        assert_eq!(
+            queue.send(big),
+            Err(UdpSendError::NoRoom),
+            "the datagram does not fit in the budget"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "a datagram that did not fit is not counted"
+        );
     }
 }
