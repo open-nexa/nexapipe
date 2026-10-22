@@ -501,8 +501,30 @@ impl IrohConnectionPool {
 
     /// Configure client 2FA credentials. Connections established afterwards
     /// (including preconnect warm-ups) will run the 2FA handshake first.
+    ///
+    /// **A different identity drops the connections.** A connection is
+    /// authenticated as whoever the handshake ran for, and the handshake runs
+    /// once per connection — so a connection made under the old credential
+    /// keeps serving traffic under the old identity after the credential has
+    /// been replaced. The connections are closed when the identity changes.
+    ///
+    /// The same identity keeps them: a rotated secret is the same account
+    /// with a different secret, and dropping the pool for that would close
+    /// every connection in flight over a rotation that changes nothing about
+    /// who they are.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
-        *self.inner.two_factor.lock().await = auth;
+        let mut slot = self.inner.two_factor.lock().await;
+        let changed = identity_changed(slot.as_ref(), auth.as_ref());
+        *slot = auth;
+        // Released before the connections are touched: the lock order is
+        // `connections` first, and nesting the two is what makes a pool that
+        // dials while another task shuts it down deadlock-prone.
+        drop(slot);
+
+        if changed {
+            // The connections were authenticated as the identity that is gone.
+            self.drop_connections().await;
+        }
     }
 
     /// Configure a one-time enrollment token instead of credentials: the next
@@ -911,6 +933,25 @@ impl IrohConnectionPool {
     }
 }
 
+/// Whether a credential change is a change of identity.
+///
+/// A connection is authenticated as whoever the handshake ran for, and the
+/// handshake runs once per connection — so a connection made under the old
+/// credential keeps serving traffic under the old identity after the
+/// credential has been replaced. The connections are closed when the identity
+/// changes.
+///
+/// A rotated secret is the same account with a different secret, and the
+/// connections still stand for it: dropping the pool for that would close
+/// every connection in flight over a rotation that changes nothing about who
+/// they are.
+///
+/// Split out of [`IrohConnectionPool::set_two_factor`] so the decision can be
+/// tested without an endpoint: a connection needs one, a rule does not.
+fn identity_changed(before: Option<&TwoFactorAuth>, after: Option<&TwoFactorAuth>) -> bool {
+    before.map(|a| a.identity()) != after.map(|a| a.identity())
+}
+
 /// Waits for a backend that demands 2FA to say so.
 ///
 /// Returns the reason the server gave when it closes the connection with
@@ -1159,10 +1200,76 @@ pub fn parse_endpoint_addr(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECTION_IDLE_TIMEOUT, LinkKind, LinkStatus, encode_link_status, is_idle_since,
-        is_measured_rtt, may_publish,
+        CONNECTION_IDLE_TIMEOUT, LinkKind, LinkStatus, encode_link_status, identity_changed,
+        is_idle_since, is_measured_rtt, may_publish,
     };
+    use crate::auth::{TotpAlgorithm, TwoFactorAuth};
     use std::time::Duration;
+
+    /// A credential for `client_id`, optionally naming a device.
+    fn credential(client_id: &str, secret: &str, device: Option<&str>) -> TwoFactorAuth {
+        let auth = TwoFactorAuth::new(client_id, secret, TotpAlgorithm::SHA1)
+            .expect("a valid base32 secret");
+        match device {
+            Some(device) => auth.with_device(device),
+            None => auth,
+        }
+    }
+
+    /// A different secret under the same name is the same account.
+    ///
+    /// A rotation changes the seed and nothing else, so the connections that
+    /// were authenticated as that account still stand for it — and dropping
+    /// the pool would close every request in flight over a rotation.
+    #[test]
+    fn a_rotated_secret_is_the_same_identity() {
+        let before = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+        let after = credential("client-001", "KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP", None);
+
+        assert!(!identity_changed(Some(&before), Some(&after)));
+    }
+
+    /// A different client is a different account, and the connections
+    /// authenticated as the old one are not the new one's.
+    #[test]
+    fn a_different_client_is_a_different_identity() {
+        let before = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+        let after = credential("client-002", "JBSWY3DPEHPK3PXP", None);
+
+        assert!(identity_changed(Some(&before), Some(&after)));
+    }
+
+    /// A different device of the same client is a different credential, and a
+    /// connection authenticated as one device is not the other's.
+    #[test]
+    fn a_different_device_is_a_different_identity() {
+        let before = credential("client-001", "JBSWY3DPEHPK3PXP", Some("laptop"));
+        let after = credential("client-001", "JBSWY3DPEHPK3PXP", Some("phone"));
+
+        assert!(identity_changed(Some(&before), Some(&after)));
+    }
+
+    /// A named device and the client it belongs to are different identities:
+    /// the named one answers with a secret of its own, the unnamed one with
+    /// the client's.
+    #[test]
+    fn a_named_device_is_not_the_client_it_belongs_to() {
+        let unnamed = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+        let named = credential("client-001", "JBSWY3DPEHPK3PXP", Some("laptop"));
+
+        assert!(identity_changed(Some(&unnamed), Some(&named)));
+    }
+
+    /// Going from a credential to none, and from none to a credential, are
+    /// both changes.
+    #[test]
+    fn dropping_or_adding_a_credential_is_a_change() {
+        let auth = credential("client-001", "JBSWY3DPEHPK3PXP", None);
+
+        assert!(identity_changed(Some(&auth), None));
+        assert!(identity_changed(None, Some(&auth)));
+        assert!(!identity_changed(None, None));
+    }
 
     /// A connection is idle since it was last used, not since it was dialled.
     ///

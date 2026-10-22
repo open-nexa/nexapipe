@@ -29,10 +29,19 @@ have changed since are marked:
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
-| `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
+
+The two `route_lookup` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain, and are listed separately because they were
+measured on a later day than the table above — and because the fold the
+routing table now does moved the numbers they report:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `route_lookup/a_matching_host` | **134 ns** | the routing table's walk over 51 routes, **and** what taking the route it found costs. **Was 732 ns** when the routing table folded the host once per route rather than once per walk, and **999 ns** before the bench's path pattern was fixed — and that number was a lookup that found *nothing*, so the half it claims to measure was never measured |
+| `route_lookup/a_host_nothing_serves` | **76 ns** | the same walk over the same 51 routes for a host no route serves: what the walk costs on its own. The difference between the two rows is what taking the route costs |
 
 The four rows below were measured on **2026-10-22**, on the same machine and
 the same toolchain, and are listed separately because they are a different
@@ -42,7 +51,7 @@ pair of questions from the rest:
 |---|---|---|
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
-| `request_path/allocations_per_request` | **46** | **46 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number. **Was 49** before the balancer stopped taking a lock and the backend URI stopped being rebuilt from scratch |
+| `request_path/allocations_per_request` | **40** | **40 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number. **Was 49** before the balancer stopped taking a lock and the backend's address stopped being parsed again for every request |
 | `request_path/request` | **50 µs** | the whole of the server's work for one request, backend round trip included. The interval is wide — 37 to 69 µs — because the round trip goes through the scheduler; the allocation count beside it is the one that does not move |
 
 Those numbers are what F2's candidate list is checked against, and the same
@@ -133,6 +142,17 @@ that list is the one thing in the client whose length a request pays for.
 **`route_lookup`** is the server's routing table: every request asks it which
 route serves the request, and the answer is a walk over the routes until one
 matches. The backends are never dialled — the bench measures the lookup.
+
+It measures two: a host a route serves, and a host no route serves. The
+difference between them is what **taking** the route costs, which is the
+balancer's part — the part the walk alone does not include.
+
+The path pattern in the table is `/`, which is the catch-all a route uses to
+say "any path". **`/*` is not a wildcard**: `path_suffix` treats it as a
+literal `/*` prefix, so a route with it matches no ordinary path at all. The
+bench used to use it, which meant it measured a walk that found nothing — and
+said otherwise. It now asserts that the lookup matched, so the mistake cannot
+come back quietly.
 
 **`forwarding_path`** is the only bench that reflects what a user experiences:
 the request crosses the proxy's accept loop, the tunnel handshake, the tunnel
