@@ -455,7 +455,14 @@ jobs:
   desktop:
     name: "desktop (linux: rust + frontend)"
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    # 60 rather than 40: this job does what the desktop's clippy job and the
+    # desktop's frontend job did, in sequence rather than in parallel, and
+    # its first step is an `apt-get install` of the GTK stack, which is the
+    # one step that can be slow for reasons of its own — a runner whose
+    # package mirror is slow sits there for minutes before a single line of
+    # Rust is compiled. The 40 the clippy job had was enough for that job
+    # alone; it is not enough for this one.
+    timeout-minutes: 60
     needs: changes
     if: needs.changes.outputs.desktop == 'true'
 
