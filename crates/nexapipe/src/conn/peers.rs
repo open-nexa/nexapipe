@@ -35,7 +35,8 @@
 //! of a [`tokio::sync::watch`] channel the connection task owns the other half
 //! of: [`PeerRegistry::close_where`] flips it, and the task, which is the only
 //! holder of the [`Connection`](iroh::endpoint::Connection), is what actually
-//! closes.//!
+//! closes.
+//!
 //! A signal rather than a connection handle, because owning the socket from two
 //! places means either can close it and neither learns about it — and because a
 //! `watch::Sender` can be created in a test without an endpoint to dial.

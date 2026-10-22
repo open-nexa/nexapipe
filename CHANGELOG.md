@@ -1031,6 +1031,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The peer registry's documentation had a stray marker in it.** Fixing the
+  broken links in the entry below moved a line break in the module comment of
+  `conn::peers`, and the `//!` that used to end the line was left standing
+  where the sentence should have stopped: the rendered page said "closes.//!"
+  and ran the paragraph that follows straight into it. The marker is gone, and
+  the two paragraphs are two paragraphs again.
+
 - **The server's own documentation builds without a warning.** `cargo doc -p
   nexapipe` reported eighteen, and every one of them was a link that pointed
   at nothing: nine named a thing the crate does not have — `Self::kind` on
