@@ -12,6 +12,7 @@ rather than a result — the reasoning behind that is in
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
 | `request_path` | `crates/nexapipe/benches/request_path.rs` | the server's work for one request: the route lookup, the balancer, the URI, and the round trip — and how many allocations it makes |
+| `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
@@ -54,6 +55,18 @@ pair of questions from the rest:
 | `request_path/allocations_per_request` | **40** | **40 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number. **Was 49** before the balancer stopped taking a lock and the backend's address stopped being parsed again for every request |
 | `request_path/request` | **50 µs** | the whole of the server's work for one request, backend round trip included. The interval is wide — 37 to 69 µs — because the round trip goes through the scheduler; the allocation count beside it is the one that does not move |
 
+The two `flow_connections` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain. A round of that bench takes about five
+milliseconds, so criterion samples it in **Flat** mode — it measures the time
+of a round rather than the cost of one iteration — and a Flat run computes
+**no slope at all**. The number below is the **median**, which is what the
+report shows:
+
+| Bench | median | The one-line reading |
+|---|---|---|
+| `flow_connections/connections` | **1** | **one connection for 100 concurrent flows.** It was **100** — one per flow — before the client let a flow borrow a connection instead of taking it out of the pool. The count does not move: every sample was exactly 1 |
+| `flow_connections/open_flows` | **5.1 ms** | how long those hundred flows take to open. It was **1.05 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
+
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
 the idle wake-up rate, and the per-flow memory — so that what is a
@@ -85,6 +98,7 @@ cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 cargo bench -p nexapipe-client --features local-proxy --bench local_request
+cargo bench -p nexapipe-client --features local-proxy --bench flow_connections
 cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe --bench request_path
 cargo bench -p nexapipe-client --bench domain_match
@@ -214,6 +228,36 @@ It is the server's **plaintext listener** path, driven through
 `http::proxy_to_backend_streaming` and shares every per-request cost this
 bench measures; what it adds is the transport, and the transport is not what
 these numbers are about.
+
+**`flow_connections`** is the client asking how many QUIC connections its
+flows open. The client keeps a pool of connections to each backend, and a
+flow **borrows** one of them: the pool keeps the connection, and the flow
+holds a handle to it until the flow ends. iroh's connection handle is a
+cheap clone, so a hundred concurrent flows share one connection — and a flow
+that ends has nothing to give back. The transport is built for that: one
+connection can carry 1024 bi-streams.
+
+It measures two things:
+
+- `connections` — how many connections the far side is given while a hundred
+  flows are open. The far side counts its own accepts, so the number does not
+  depend on anything the client reports about itself. It comes back as
+  nanoseconds, so the report reads `100 ns` for a hundred connections; that
+  is the encoding, and it is deliberate.
+- `open_flows` — how long those hundred flows take to open. Before a flow
+  borrowed its connection, each of them paid for a handshake, so this is what
+  the connection count costs.
+
+Each round runs on a **fresh pool**, so a round starts with an empty one and
+the count is what that round needed. The bench waits for the count to stop
+moving before it reads it — a count that has not moved *yet* looks exactly
+like a count that has stopped moving, and the far side accepts in its own
+task, so reading too early would report that the round opened no connections
+at all.
+
+The count does not move at all: every sample was exactly 100 when a flow
+**took** its connection out of the pool, and exactly 1 now that a flow
+**borrows** it.
 
 ## What a flow costs
 
