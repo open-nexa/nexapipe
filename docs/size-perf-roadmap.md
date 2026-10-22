@@ -305,6 +305,19 @@ much variance there was, and here there is very little.
 | `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | One 64 KiB payload's round trip through the copy loop. **The copy loop itself is not the problem** |
 | `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | The same 64 KiB over an established tunnel, through the local proxy and a real iroh connection. The rate it moves at, not the cost of opening it |
 
+Two more rows, measured on **2026-10-22** on the same machine and toolchain,
+for the server's request path:
+
+| Bench | mean | median | slope | What the number says |
+|---|---|---|---|---|
+| `request_path/request` | 77,970 ns | 41,110 ns | **50,300 ns** | The whole of the server's work for one request, backend round trip included. The spread is wide — the interval runs 37 to 69 µs — because the round trip goes through the scheduler |
+| `request_path/allocations_per_request` | 48.96 | 49.00 | **48.92** | **49 allocations** for one request, from the route lookup to the response head. The count is the stable one: its interval is 0.2% wide where the time's is 85% |
+
+The allocation count is the instrument the per-request candidates in F2 need.
+Three of them — the route lookup re-normalising the host per route, the
+balancer taking three locks, and the backend URI being rebuilt from scratch —
+are all allocation counts in disguise, and 49 is the number they have to beat.
+
 #### What the numbers say, and what they do not
 
 Two things are worth writing down, because "we measured and it is already fast
@@ -338,9 +351,20 @@ was most of the number.
 rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
 passes an empty resolver list and a proxied domain, so it exercises the
 hijack branch and never the forward branch), the idle wake-up rate, the
-per-TCP-flow memory, the server's request path, and every part of the server
-crate's own request handling — `l4_forward` stops at a `duplex` and never
-crosses an iroh hop.
+per-TCP-flow memory, the client's HTTP request path, and every part of the
+server crate's own request handling — `l4_forward` stops at a `duplex` and
+never crosses an iroh hop.
+
+**The server's request path is no longer on that list**, with one caveat
+written down rather than left out. `request_path` measures it: the route
+lookup, the balancer, the URI the backend is reached at, and the round trip —
+with the allocation count beside it, which is the number the per-request
+candidates in F2 have to beat. The caveat is the path: it is the **plaintext
+listener's**, driven through `http::proxy_request`. The QUIC tunnel path
+reaches the same backend through `http::proxy_to_backend_streaming` and shares
+every per-request cost, and what it adds is the transport — so what is now
+measured is the server's own work for a request, and the transport's share of
+a request is still an expectation.
 
 **The client's HTTP request path is no longer on that list.** `local_request`
 measures it: the plain HTTP path through the client's local proxy — the head,

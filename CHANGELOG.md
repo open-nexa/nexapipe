@@ -307,6 +307,24 @@ lookup, which is what a config written before the key existed does.
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
   so is what keeps the ones that are results honest.
+- **The server's request path is measured, and it is counted.** The
+  benchmarks that landed with this cycle measured the CONNECT tunnel, the
+  TUN's per-packet cost, the server's routing table and the client's own
+  name matching. None of them measured what the server does for a request:
+  the route lookup, the balancer, the URI the backend is reached at, and the
+  round trip to it. That is a benchmark of its own now, and it comes with
+  the number the per-request work had never had — **49 allocations** for
+  one request, from the lookup to the response head, counted by an
+  allocator the bench installs.
+  The count is the stable measurement: its interval is 0.2% wide, where the
+  time beside it — 50 µs for the whole request, backend round trip
+  included — runs from 37 to 69 µs, because the round trip goes through the
+  scheduler.
+  It is the plaintext listener's path, and the difference is written down
+  rather than left out: the QUIC tunnel reaches the same backend through
+  another function and shares every per-request cost, and what it adds is
+  the transport. So the server's own work for a request is a measurement
+  now; the transport's share of one is still an expectation.
 - **The client's HTTP request path is measured too.** The benchmarks that
   landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
   cost, the server's routing table and the client's own name matching. They

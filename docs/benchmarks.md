@@ -1,6 +1,6 @@
 # Benchmarks
 
-Six benches, on the paths that carry user traffic. They exist because until
+Seven benches, on the paths that carry user traffic. They exist because until
 they landed every performance claim in this repository was an expectation
 rather than a result — the reasoning behind that is in
 [`size-perf-roadmap.md`](size-perf-roadmap.md) §F1.
@@ -11,6 +11,7 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
+| `request_path` | `crates/nexapipe/benches/request_path.rs` | the server's work for one request: the route lookup, the balancer, the URI, and the round trip — and how many allocations it makes |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
@@ -33,21 +34,24 @@ have changed since are marked:
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
 
-The two `local_request` rows were measured on **2026-10-22**, on the same
-machine and the same toolchain, and are listed separately because they are a
-different pair of questions from the rest:
+The four rows below were measured on **2026-10-22**, on the same machine and
+the same toolchain, and are listed separately because they are a different
+pair of questions from the rest:
 
 | Bench | slope | The one-line reading |
 |---|---|---|
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
+| `request_path/allocations_per_request` | **49** | **49 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number |
+| `request_path/request` | **50 µs** | the whole of the server's work for one request, backend round trip included. The interval is wide — 37 to 69 µs — because the round trip goes through the scheduler; the allocation count beside it is the one that does not move |
 
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
-the idle wake-up rate, the per-flow memory, and the server's request
-path — so that what is a measurement and what is still an expectation stays
-visible. The client's HTTP request path is now covered by `local_request`; the
-server's is not, and that is the gap the next bench is for.
+the idle wake-up rate, and the per-flow memory — so that what is a
+measurement and what is still an expectation stays visible. Both crates' HTTP
+request paths are now covered: the client's by `local_request`, the server's by
+`request_path`, with the caveat that the latter is the plaintext listener's
+path rather than the QUIC tunnel's.
 
 None of them needs a network. The backends are loopback TCP echoes, the TUN
 device is a `tokio::io::duplex` pair standing in for the fd, and the two iroh
@@ -73,6 +77,7 @@ cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 cargo bench -p nexapipe-client --features local-proxy --bench local_request
 cargo bench -p nexapipe --bench route_lookup
+cargo bench -p nexapipe --bench request_path
 cargo bench -p nexapipe-client --bench domain_match
 ```
 
@@ -160,8 +165,35 @@ bench sets `SO_LINGER` to zero on the application's socket: at bench speed,
 tens of thousands of connections per minute would otherwise leave the
 operating system's ephemeral ports exhausted and the run would fail
 partway through. And the far side is an HTTP server over an iroh bi-stream on
-this host, not the server crate's own request path — which is the gap the
-next bench is for.
+this host — the client's half of a request, and not the server's.
+
+**`request_path`** is the server's own work for one request: the route lookup,
+the balancer, the URI the backend is reached at, and the round trip to it. The
+backend is a loopback HTTP server and the server's client pools the connection
+to it, so what is measured is the request rather than the price of opening a
+connection.
+
+It measures two things:
+
+- `request` — the time of one request. The interval is wide, because the
+  round trip goes through the scheduler and the machine's own load shows up
+  in it.
+- `allocations_per_request` — **how many allocations one request makes**,
+  counted by a global allocator the bench installs. The count is taken around
+  the request alone: the lookup, the balancer, the URI, and the request built
+  from them — not the response body, which is a lazy stream, and not anything
+  the bench allocated itself.
+
+The second number is the one that does not move. It is reported as a duration
+in nanoseconds, so the report reads `49 ns` for a request that made 49
+allocations; that is the encoding, and it is deliberate, because the number
+belongs in the report next to the times.
+
+It is the server's **plaintext listener** path, driven through
+`http::proxy_request`. The QUIC tunnel path reaches the same backend through
+`http::proxy_to_backend_streaming` and shares every per-request cost this
+bench measures; what it adds is the transport, and the transport is not what
+these numbers are about.
 
 ## What a flow costs
 
