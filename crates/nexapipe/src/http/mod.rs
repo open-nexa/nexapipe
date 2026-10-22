@@ -1294,6 +1294,99 @@ pub fn full_body(bytes: bytes::Bytes) -> HttpBody {
     UnsyncBoxBody::new(inner)
 }
 
+/// What the proxy knows about a body that is still on the client's stream.
+///
+/// Shared between the body the request carries and the request that owns it:
+/// the body knows when it has been read, and the owner needs to know that
+/// afterwards — a body that has been read cannot be sent a second time, and
+/// one that has not can.
+#[derive(Debug, Default)]
+pub struct BodyState {
+    /// Set once a byte has come off the client's stream.
+    ///
+    /// The head's bytes are not counted: they are in memory, and the request
+    /// still holds them, so a retry can send them again. What is gone once
+    /// the stream has been read is the rest of the body, and the stream is
+    /// the only place it was.
+    read: std::sync::atomic::AtomicBool,
+    /// Set when the body's deadline expired while it was being read.
+    timed_out: std::sync::atomic::AtomicBool,
+    /// Set once the body is over: everything the client promised has been
+    /// read, or the client stopped sending.
+    ///
+    /// The answer's deadline runs from this moment, because a backend cannot
+    /// answer before it has the body.
+    sent: std::sync::atomic::AtomicBool,
+}
+
+impl BodyState {
+    /// Records that a byte has come off the client's stream.
+    fn mark_read(&self) {
+        self.read.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records that the body's deadline expired.
+    fn mark_timed_out(&self) {
+        self.timed_out
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records that the body is over.
+    fn mark_sent(&self) {
+        self.sent.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the body has been read off the client's stream.
+    pub(crate) fn was_read(&self) -> bool {
+        self.read.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the body's deadline expired while it was being read.
+    pub(crate) fn did_time_out(&self) -> bool {
+        self.timed_out.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the body is over.
+    pub(crate) fn has_been_sent(&self) -> bool {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The client's stream, shared by the body that reads it and the request that
+/// owns it.
+///
+/// The reader is shared rather than moved because a request that fails
+/// *before* the body was read has to be able to send the body again — to the
+/// next backend — and the client's stream is the only place those bytes are.
+/// The lock is held for the length of one read and for nothing else, so it is
+/// never held across an await.
+#[derive(Clone)]
+pub struct BodyReader {
+    reader: std::sync::Arc<std::sync::Mutex<Box<dyn AsyncRead + Send + Unpin>>>,
+}
+
+impl BodyReader {
+    /// The reader, shared with whoever else has to read it.
+    fn new(reader: Box<dyn AsyncRead + Send + Unpin>) -> Self {
+        Self {
+            reader: Arc::new(std::sync::Mutex::new(reader)),
+        }
+    }
+
+    /// Reads into `buf`, registering `cx` for the wake-up.
+    fn poll_read(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut reader = self
+            .reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *reader).poll_read(cx, buf)
+    }
+}
+
 /// A request body that is still on its way from the client.
 ///
 /// The bytes are read from the client's stream as the backend asks for them,
@@ -1304,19 +1397,31 @@ struct StreamingBody {
     head: bytes::Bytes,
     /// The rest of it, still on the client's stream.
     ///
-    /// Boxed, so that the body can be driven by anything that reads — a
-    /// test's scripted reader as well as a real stream.
-    stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// Shared with the request that owns the body, so that a request that
+    /// failed before the body was read can send it again.
+    reader: BodyReader,
     /// How many bytes are still to come.
     remaining: usize,
     /// When the body has to be finished by.
     deadline: tokio::time::Instant,
-    /// What the process budget holds for this body.
+    /// The timer that ends the body when the deadline passes.
+    ///
+    /// The deadline is a clock reading, and a clock reading wakes nobody: a
+    /// body that is only checked when it is polled is never given up on
+    /// while the client is silent, which is exactly when it should be. The
+    /// timer is what turns the deadline into a bound.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// What the process budget holds for the bytes this body is reading.
     ///
     /// Grown as the bytes arrive rather than taken for the whole length up
     /// front: a client that promises a large body and sends nothing holds
     /// nothing, which is what the buffered path did as well. A promise is not
     /// a reservation.
+    ///
+    /// The head's bytes are charged by the request that owns the body, which
+    /// holds them for as long as it lives; this is the rest of it. The read
+    /// buffer is not charged: it is one fixed buffer per body, and the budget
+    /// is about what the process holds of the *upload*.
     reservation: crate::conn::limits::ByteReservation,
     /// The buffer the bytes are read into, reused for every chunk.
     ///
@@ -1324,6 +1429,8 @@ struct StreamingBody {
     /// upload is four thousand chunks, and four thousand buffers that are
     /// thrown away the moment after they are filled.
     buf: Vec<u8>,
+    /// What the owner of the request needs to know about this body.
+    state: Arc<BodyState>,
 }
 
 /// How much of a body is read at a time.
@@ -1347,7 +1454,18 @@ impl hyper::body::Body for StreamingBody {
         if this.remaining == 0 {
             return Poll::Ready(None);
         }
-        if tokio::time::Instant::now() > this.deadline {
+
+        // The deadline is a clock reading, and a clock reading wakes nobody:
+        // without a timer the check below would run only when the client
+        // sends something, so a client that goes silent would never be given
+        // up on. The timer is what turns the deadline into a bound, and it is
+        // armed on the first poll so that a body nobody asks for holds none.
+        let deadline = this.deadline;
+        let timer = this
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if timer.as_mut().poll(cx).is_ready() {
+            this.state.mark_timed_out();
             return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "the request body did not finish in time",
@@ -1360,6 +1478,10 @@ impl hyper::body::Body for StreamingBody {
             let n = this.head.len().min(this.remaining);
             let chunk = this.head.split_to(n);
             this.remaining -= n;
+            if this.remaining == 0 {
+                // The body is over: the backend has all of it.
+                this.state.mark_sent();
+            }
             crate::metrics::METRICS.record_bytes_received(n as u64);
             return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
         }
@@ -1376,16 +1498,25 @@ impl hyper::body::Body for StreamingBody {
             return Poll::Ready(Some(Err(Box::from(e))));
         }
 
-        let mut read_buf = tokio::io::ReadBuf::new(&mut this.buf[..want]);
-        let n = match std::pin::Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
+        let mut read_buf = ReadBuf::new(&mut this.buf[..want]);
+        let n = match this.reader.poll_read(cx, &mut read_buf) {
             Poll::Pending => {
-                // Nothing was read, so nothing is held.
+                // Nothing was read, so nothing is held — and nothing is spent:
+                // the bytes are still on the client's stream.
                 this.reservation.shrink(want);
                 return Poll::Pending;
             }
-            Poll::Ready(Ok(())) => read_buf.filled().len(),
+            Poll::Ready(Ok(())) => {
+                // The stream has been read: what came off it is gone, and
+                // there is no second copy of it. A request that has to be
+                // tried again cannot send this body a second time.
+                this.state.mark_read();
+                read_buf.filled().len()
+            }
             Poll::Ready(Err(e)) => {
                 this.reservation.shrink(want);
+                // The stream is broken, so what was on it is gone as well.
+                this.state.mark_read();
                 return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
             }
         };
@@ -1397,9 +1528,14 @@ impl hyper::body::Body for StreamingBody {
         if n == 0 {
             // The client stopped sending. The body is short, and the backend
             // will see it end.
+            this.state.mark_sent();
             return Poll::Ready(None);
         }
         this.remaining -= n;
+        if this.remaining == 0 {
+            // The body is over: the backend has all of it.
+            this.state.mark_sent();
+        }
         crate::metrics::METRICS.record_bytes_received(n as u64);
         Poll::Ready(Some(Ok(hyper::body::Frame::data(
             bytes::Bytes::copy_from_slice(read_buf.filled()),
@@ -1443,16 +1579,20 @@ pub enum RequestBody {
         head: bytes::Bytes,
         /// The rest of it, still on the client's stream.
         ///
-        /// Taken when the body is sent, because a stream can only be read
-        /// once — which is what makes a request with such a body **final**.
-        stream: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        /// Shared with the body the request carries, so that a request that
+        /// failed before the body was read can send the body again: the
+        /// bytes are still on the client's stream, and that stream is the
+        /// only place they are.
+        reader: BodyReader,
         /// How many bytes the whole body is.
         content_length: usize,
         /// Held for as long as the body is alive.
         ///
-        /// Taken when the body is sent, because the body that holds it is
-        /// what releases it.
-        reservation: Option<crate::conn::limits::ByteReservation>,
+        /// The head's bytes are charged here, and stay charged: the request
+        /// holds them for as long as it lives, and a retry sends them again.
+        reservation: crate::conn::limits::ByteReservation,
+        /// What the proxy knows about the body.
+        state: Arc<BodyState>,
     },
 }
 
@@ -1468,32 +1608,38 @@ impl RequestBody {
     /// Whether this body can be sent a second time.
     ///
     /// A body that is whole can: its bytes are here. A body that is
-    /// streaming cannot: it came off the client's stream and there is no
-    /// second copy of it.
+    /// streaming can be sent again only while it has **not been read**: the
+    /// bytes are still on the client's stream, and a request that failed
+    /// before the body was touched — a connection that was refused, say —
+    /// has not spent them. Once the body has been read, what came off the
+    /// stream is gone and there is no second copy of it.
     pub fn may_retry(&self) -> bool {
         match self {
             RequestBody::Whole { .. } => true,
-            // Once the stream has been handed to a request, there is no second
-            // copy of the body to send.
-            RequestBody::Streaming { stream, .. } => stream.is_some(),
+            RequestBody::Streaming { state, .. } => !state.was_read(),
         }
     }
 
-    /// Takes the stream out of a streaming body, for the request that carries
-    /// it.
-    fn take_stream(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+    /// Whether the body's deadline expired while it was being read.
+    ///
+    /// A body that ran out of time is not a backend that failed, and the
+    /// failure it caused says so.
+    pub(crate) fn did_time_out(&self) -> bool {
         match self {
-            RequestBody::Streaming { stream, .. } => stream.take(),
-            RequestBody::Whole { .. } => None,
+            RequestBody::Whole { .. } => false,
+            RequestBody::Streaming { state, .. } => state.did_time_out(),
         }
     }
 
-    /// Takes the reservation out of a streaming body, for the request that
-    /// carries it.
-    fn take_reservation(&mut self) -> Option<crate::conn::limits::ByteReservation> {
+    /// Whether the body has been sent to the backend.
+    ///
+    /// The answer's deadline runs from that moment: a backend cannot answer
+    /// before it has the body. A body that is whole was sent before this, and
+    /// its deadline runs from here.
+    fn has_been_sent(&self) -> bool {
         match self {
-            RequestBody::Streaming { reservation, .. } => reservation.take(),
-            RequestBody::Whole { .. } => None,
+            RequestBody::Whole { .. } => false,
+            RequestBody::Streaming { state, .. } => state.has_been_sent(),
         }
     }
 }
@@ -1516,13 +1662,14 @@ impl std::fmt::Debug for RequestBody {
                 .finish(),
             RequestBody::Streaming {
                 head,
-                stream,
+                state,
                 content_length,
                 reservation,
+                ..
             } => f
                 .debug_struct("Streaming")
                 .field("head", &head.len())
-                .field("on_the_wire", &stream.is_some())
+                .field("read", &state.was_read())
                 .field("content_length", content_length)
                 .field("reservation", reservation)
                 .finish(),
@@ -1581,9 +1728,13 @@ pub async fn read_request_body(
         })?;
         return Ok(RequestBody::Streaming {
             head: bytes::Bytes::from(head),
-            stream: Some(Box::new(stream)),
+            // The reader is shared rather than moved: a request that fails
+            // before the body was read has to be able to send the body again,
+            // and the client's stream is where the bytes are.
+            reader: BodyReader::new(Box::new(stream)),
             content_length,
-            reservation: Some(reservation),
+            reservation,
+            state: Arc::new(BodyState::default()),
         });
     }
 
@@ -1699,34 +1850,33 @@ fn build_backend_request(
         builder = builder.header("content-length", content_length);
     }
 
-    // The stream and the reservation are taken **before** the body is looked
-    // at: a streaming body hands both to the request that carries it, and
-    // there is only one of each.
-    let stream = body.take_stream();
-    let reservation = body.take_reservation();
-
+    // The body is **lent** to the request that carries it, not given away: a
+    // request that fails before the body was read has to be able to send it
+    // again, and the client's stream is where the bytes are. The head is
+    // copied — it is a reference to the same buffer, not a second copy of it
+    // — and the reader and the state are shared.
     let http_body: HttpBody = match &*body {
         RequestBody::Whole { bytes, .. } => full_body(bytes.clone()),
         RequestBody::Streaming {
             head,
+            reader,
+            state,
             content_length,
             ..
         } => {
             let head = head.clone();
             let remaining = *content_length;
-            let stream = stream.ok_or_else(|| {
-                anyhow::anyhow!("the request's body was already sent to the backend")
-            })?;
-            let reservation = reservation.ok_or_else(|| {
-                anyhow::anyhow!("the request's body was already sent to the backend")
-            })?;
             UnsyncBoxBody::new(StreamingBody {
                 head,
-                stream,
+                reader: reader.clone(),
                 remaining,
                 deadline: body_deadline,
-                reservation,
+                timer: None,
+                // The head's bytes are charged by the request that owns the
+                // body; this reservation is for the rest of it.
+                reservation: crate::conn::limits::ByteReservation::empty(),
                 buf: Vec::new(),
+                state: state.clone(),
             })
         }
     };
@@ -1758,12 +1908,13 @@ pub async fn proxy_to_backend_streaming(
 ) -> Result<ProxySummary, ProxyFailure> {
     let client = clients.for_protocol(backend_info.protocol);
 
-    let proxied_req = build_backend_request(
-        req,
-        backend_info,
-        body,
-        tokio::time::Instant::now() + timeouts.deadlines.body,
-    )?;
+    // When the body has to be finished by. It is the same deadline the
+    // buffered path had for the same phase — the client's own `[timeouts]
+    // body_secs` — and it is taken once per attempt, because an attempt is
+    // an attempt.
+    let body_deadline_at = tokio::time::Instant::now() + timeouts.deadlines.body;
+
+    let proxied_req = build_backend_request(req, backend_info, body, body_deadline_at)?;
 
     tracing::debug!(
         "Proxying request via client (streaming): {} {}",
@@ -1771,40 +1922,113 @@ pub async fn proxy_to_backend_streaming(
         proxied_req.uri()
     );
 
-    // The same deadline `proxy_request` uses — one number for one thing. Without
-    // it a backend that accepts the connection and then never sends a head keeps
-    // this task, and the stream slot it holds, alive forever.
-    let response_deadline = timeouts.response;
-    let response = match tokio::time::timeout(response_deadline, client.request(proxied_req)).await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            tracing::error!("Failed to send request: {:?}", e);
-            // A connect error means the request was never carried: the
-            // connection was refused, the name did not resolve, the handshake
-            // failed. Anything else means the request went out and the answer
-            // did not come, which only an idempotent request may be asked
-            // twice. The tunnel path needs this exactly as the plaintext one
-            // does, or `[retry]` would only work on one of them.
-            let retry = if e.is_connect() {
-                Retryability::Always
-            } else {
-                Retryability::IfIdempotent
-            };
-            return Err(ProxyFailure::unanswered(
-                anyhow::anyhow!("failed to send request: {e:?}"),
-                retry,
-            ));
+    // Two deadlines, and they are not the same one.
+    //
+    // The **body** has its own (`[timeouts] body_secs`): the client may take
+    // that long to send the body, and the body enforces that for itself. The
+    // **response** has its own (`[timeouts] response_secs`): the backend may
+    // take that long to answer with a status line — and that clock runs from
+    // the moment the body was sent, because a backend cannot answer before it
+    // has the body. That is the bound the buffered path had, where the body
+    // was read first and the response deadline started after it.
+    //
+    // A streamed body is still going out while the proxy waits for the
+    // answer, so the two overlap and the wait is under both. The answer's
+    // deadline is re-armed when the body has been sent; until then it is the
+    // body's deadline plus the response's, which is the longest the answer
+    // can be waited for.
+    let answer_deadline_at = match body {
+        RequestBody::Whole { .. } => tokio::time::Instant::now() + timeouts.response,
+        RequestBody::Streaming { .. } => body_deadline_at + timeouts.response,
+    };
+    let streaming = matches!(body, RequestBody::Streaming { .. });
+
+    let mut request = Box::pin(client.request(proxied_req));
+    let mut upload_deadline = Box::pin(tokio::time::sleep_until(body_deadline_at));
+    let mut answer_deadline = Box::pin(tokio::time::sleep_until(answer_deadline_at));
+    let mut answer_armed = false;
+
+    let response = futures_util::future::poll_fn(|cx| {
+        use std::task::Poll;
+
+        // The request itself.
+        if let Poll::Ready(result) = request.as_mut().poll(cx) {
+            return Poll::Ready(match result {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    tracing::error!("Failed to send request: {:?}", e);
+                    // A body that ran out of time is not a backend that
+                    // failed, and the error says so: the two have deadlines
+                    // of their own, and this is the one that expired.
+                    if body.did_time_out() {
+                        Err(ProxyFailure::unanswered(
+                            anyhow::anyhow!(
+                                "the request body did not finish in time (the body's deadline \
+                                 is {:?})",
+                                timeouts.deadlines.body
+                            ),
+                            // The request was carried: the head went out.
+                            Retryability::IfIdempotent,
+                        ))
+                    } else {
+                        // A connect error means the request was never
+                        // carried: the connection was refused, the name did
+                        // not resolve, the handshake failed. Anything else
+                        // means the request went out and the answer did not
+                        // come, which only an idempotent request may be asked
+                        // twice. The tunnel path needs this exactly as the
+                        // plaintext one does, or `[retry]` would only work on
+                        // one of them.
+                        let retry = if e.is_connect() {
+                            Retryability::Always
+                        } else {
+                            Retryability::IfIdempotent
+                        };
+                        Err(ProxyFailure::unanswered(
+                            anyhow::anyhow!("failed to send request: {e:?}"),
+                            retry,
+                        ))
+                    }
+                }
+            });
         }
-        Err(_) => {
-            return Err(ProxyFailure::unanswered(
-                anyhow::anyhow!("backend did not respond within {:?}", response_deadline),
+
+        // The body may have gone out while the request was being polled: the
+        // answer's deadline runs from that moment, not from the start.
+        if !answer_armed && body.has_been_sent() {
+            answer_deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + timeouts.response);
+            answer_armed = true;
+        }
+
+        // The upload's own deadline: the body has to be finished by then.
+        if streaming && upload_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(ProxyFailure::unanswered(
+                anyhow::anyhow!(
+                    "the request body did not finish in time (the body's deadline is {:?})",
+                    timeouts.deadlines.body
+                ),
+                // The request was carried: the head went out.
+                Retryability::IfIdempotent,
+            )));
+        }
+
+        // The answer's deadline.
+        if answer_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("backend did not respond within {:?}", timeouts.response),
                 // The request was carried: the deadline expired after it went
                 // out.
                 Retryability::IfIdempotent,
-            ));
+            )));
         }
-    };
+
+        Poll::Pending
+    })
+    .await;
+
+    let response = response?;
 
     let (parts, body) = response.into_parts();
 
@@ -2186,21 +2410,6 @@ fn request_is_chunked(req: &Request<()>) -> bool {
         .is_some_and(|v| v.to_lowercase().contains("chunked"))
 }
 
-/// Generic over the reader so the caps below can be tested without an endpoint;
-/// callers pass an iroh receive stream.
-///
-/// Returns the reservation for the bytes it read, and the caller has to keep it
-/// for as long as the body is alive — see `read_body_limited`, which does the
-/// same on the plaintext path.
-///
-/// The reservation tracks what is **buffered**, not what is declared. Those are
-/// different numbers and the gap between them is the whole design: a peer
-/// decides `content-length`, and this process decides how much memory it is
-/// willing to hold. Reserving the declared size up front reads well and is
-/// wrong — sixteen streams that declare 64 MiB and then send nothing hold the
-/// entire 1 GiB budget for five minutes, refusing every honest upload while none
-/// of them has a byte in memory. Growing per frame means the budget is always
-/// counting real bytes, whether they came with the head or off the wire.
 pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, anyhow::Error> {
     // The end of the header block is looked for in the bytes, never measured
     // off a decoded string: `from_utf8_lossy` turns each invalid byte into
@@ -2400,8 +2609,8 @@ mod tests {
         Full::new(bytes::Bytes::from(vec![b'x'; len]))
     }
 
-    /// `read_remaining_request_body` with the default `[timeouts]` body budget:
-    /// what these tests exercise is the cap and the reservation, not the
+    /// The plaintext listener's body reader with the default `[timeouts]` body
+    /// budget: what these tests exercise is the cap and the reservation, not the
     /// configured length of the deadline.
     #[tokio::test]
     async fn a_body_within_the_limit_is_read_whole() {
@@ -2817,34 +3026,6 @@ mod tests {
         }
     }
 
-    /// The clock is paused, so the deadline is reached without the test waiting
-    /// for it: what is being checked is that there is a bound at all.    /// The reservation a declared body takes is given back when the read fails,
-    /// so one stalled upload does not permanently shrink the process budget for
-    /// every other request behind it.
-    ///
-    /// Asserted by asking for a body twice and requiring both to be admitted,
-    /// rather than by watching the process-wide total: that total is shared with
-    /// every other test in this binary, which run concurrently, so a "same as
-    /// before" comparison here would mostly be measuring the other tests.
-    /// Bytes that arrived with the head are charged to the budget even though this
-    /// function never reads a byte for them.
-    ///
-    /// QUIC is a byte stream, so how much body rides along with the head is the
-    /// peer's choice — the head loop can hand this function a buffer already
-    /// holding the whole body. Those bytes are held and are going to the
-    /// backend, so a reservation of `remaining` alone (which is zero here)
-    /// would leave the entire body uncounted on every stream a peer chose to
-    /// send in one segment.
-    /// The reservation is the bytes this reader is holding, which is not the
-    /// declared length and not the bytes still owed.
-    ///
-    /// Observable directly because the read succeeds: the head carried more body
-    /// than the header declared, so nothing is left to read and the reservation
-    /// is returned intact. A reservation of the declared length would report 4
-    /// here for 8 KiB of live buffer — the undercount this whole change is about.
-    /// The reservation a declared body takes is what the caller holds, and it
-    /// covers the bytes actually buffered rather than the promise.
-    /// A body that outgrows the process budget is refused while it grows.
     /// A body that produces `frames` frames and then goes silent.
     ///
     /// What a backend that answered with a head and then stopped looks like to
@@ -3802,9 +3983,10 @@ mod transport {
 
         let mut body = RequestBody::Streaming {
             head: bytes::Bytes::new(),
-            stream: Some(Box::new(server_side)),
+            reader: BodyReader::new(Box::new(server_side)),
             content_length: b"the first piece and the rest".len(),
-            reservation: Some(crate::conn::limits::ByteReservation::empty()),
+            reservation: crate::conn::limits::ByteReservation::empty(),
+            state: Arc::new(BodyState::default()),
         };
 
         let request = Request::builder()
@@ -3970,11 +4152,13 @@ mod transport {
     {
         StreamingBody {
             head: bytes::Bytes::new(),
-            stream: Box::new(reader),
+            reader: BodyReader::new(Box::new(reader)),
             remaining: len,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            timer: None,
             reservation: crate::conn::limits::ByteReservation::empty(),
             buf: Vec::new(),
+            state: Arc::new(BodyState::default()),
         }
     }
 
@@ -4009,6 +4193,293 @@ mod transport {
         assert!(outcome.is_err(), "the body should have been given up on");
     }
 
+    /// A body that goes silent is given up on at its **own** deadline.
+    ///
+    /// The deadline is a clock reading, and a clock reading wakes nobody: a
+    /// body that is only checked when it is polled is never given up on
+    /// while the client is silent, which is exactly when it should be. The
+    /// test waits far longer than the deadline and requires the body to have
+    /// given up on its own rather than when the wait ran out.
+    #[tokio::test]
+    async fn a_body_that_goes_silent_is_given_up_on_at_its_deadline() {
+        let reader = ScriptedReader::pieces(&[], false);
+        let mut body = streaming(reader, 10);
+        body.deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), body.collect()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "the body did not give up on its own: it waited for something else to wake it"
+        );
+        let error = outcome
+            .expect("the body gave up before the wait ran out")
+            .expect_err("the body should have been given up on");
+        assert!(
+            error.to_string().contains("did not finish in time"),
+            "the error has to say that the body ran out of time: {error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the body gave up after {elapsed:?}, which is not its own deadline"
+        );
+    }
+
+    /// The body gives up at its own deadline while the request is still going
+    /// out.
+    ///
+    /// The response deadline is the backend's, and it is not the client's: a
+    /// client that stops sending is not a backend that is slow to answer.
+    /// The body has a deadline of its own, and this is what it looks like
+    /// when it fires.
+    #[tokio::test]
+    async fn a_body_that_stops_sending_gives_up_at_its_own_deadline() {
+        let (port, _accepted) = silent_backend().await;
+        let config = route_table(vec![format!("http://127.0.0.1:{port}")], 0);
+        let backend_info = config
+            .get_backend_with_acl("retry.test", "/", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+        let clients =
+            BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+
+        // The client sends the head and then nothing: the body never arrives.
+        let (_client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let mut body = streaming_request_body(server_side, 10);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(())
+            .expect("a request");
+        let forwarded = build_backend_request(
+            &request,
+            &backend_info,
+            &mut body,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+        )
+        .expect("a request for the backend");
+
+        let client = clients.for_protocol(backend_info.protocol).clone();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.request(forwarded),
+        )
+        .await
+        .expect("the body gave up before the wait ran out");
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("the backend never answered");
+        assert!(
+            format!("{error:?}").contains("did not finish in time"),
+            "the body ran out of time and the error has to say so: {error:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the body gave up after {elapsed:?}, which is not its own deadline"
+        );
+    }
+
+    /// A streaming request body over `reader`, `len` bytes long, as the proxy
+    /// holds it.
+    fn streaming_request_body<R>(reader: R, len: usize) -> RequestBody
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    {
+        RequestBody::Streaming {
+            head: bytes::Bytes::new(),
+            reader: BodyReader::new(Box::new(reader)),
+            content_length: len,
+            reservation: crate::conn::limits::ByteReservation::empty(),
+            state: Arc::new(BodyState::default()),
+        }
+    }
+
+    /// A body that was never read can be sent again.
+    ///
+    /// The bytes of a streamed body are on the client's stream, and a request
+    /// that failed before the body was touched — a connection that was
+    /// refused, say — has not spent them. Building the request must not spend
+    /// them either: the request is built before it is sent.
+    #[tokio::test]
+    async fn a_body_that_was_never_read_can_be_sent_again() {
+        let port = hello_backend().await;
+        let config = route_table(vec![format!("http://127.0.0.1:{port}")], 0);
+        let backend_info = config
+            .get_backend_with_acl("retry.test", "/", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let reader = ScriptedReader::pieces(&[b"0123456789".as_slice()], true);
+        let mut body = streaming_request_body(reader, 10);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(())
+            .expect("a request");
+
+        let forwarded = build_backend_request(
+            &request,
+            &backend_info,
+            &mut body,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("a request for the backend");
+        drop(forwarded);
+
+        assert!(
+            body.may_retry(),
+            "the body was never read, so it is still on the client's stream and can be sent again"
+        );
+    }
+
+    /// A body that was read cannot be sent again.
+    ///
+    /// What came off the client's stream is gone, and there is no second copy
+    /// of it: a retry would send a body that is short, which is worse than
+    /// not retrying at all.
+    #[tokio::test]
+    async fn a_body_that_was_read_cannot_be_sent_again() {
+        let port = hello_backend().await;
+        let config = route_table(vec![format!("http://127.0.0.1:{port}")], 0);
+        let backend_info = config
+            .get_backend_with_acl("retry.test", "/", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let reader = ScriptedReader::pieces(&[b"0123456789".as_slice()], true);
+        let mut body = streaming_request_body(reader, 10);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://retry.test/")
+            .header("host", "retry.test")
+            .body(())
+            .expect("a request");
+
+        let mut forwarded = build_backend_request(
+            &request,
+            &backend_info,
+            &mut body,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("a request for the backend");
+        let frame = forwarded
+            .body_mut()
+            .frame()
+            .await
+            .expect("a frame")
+            .expect("the frame is not an error");
+        assert_eq!(frame.into_data().expect("data").as_ref(), b"0123456789");
+
+        assert!(
+            !body.may_retry(),
+            "the body was read, so there is nothing left to send"
+        );
+    }
+
+    /// A body that outgrows the process budget is refused while it grows.
+    ///
+    /// The budget is about what this process holds, and a body that is bigger
+    /// than the budget is a body this process cannot hold: it is refused
+    /// rather than read and dropped.
+    #[tokio::test]
+    async fn a_streamed_body_that_outgrows_the_budget_is_refused() {
+        let budget = Arc::new(crate::conn::limits::ByteBudget::new(8));
+        let reader = ScriptedReader::pieces(&[b"0123456789abcdef".as_slice()], true);
+        let body = StreamingBody {
+            head: bytes::Bytes::new(),
+            reader: BodyReader::new(Box::new(reader)),
+            remaining: 16,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            timer: None,
+            reservation: crate::conn::limits::ByteReservation::take_from(&budget, 0)
+                .expect("a reservation"),
+            buf: Vec::new(),
+            state: Arc::new(BodyState::default()),
+        };
+
+        let outcome = body.collect().await;
+        assert!(
+            outcome.is_err(),
+            "a body that does not fit in the budget is refused"
+        );
+        assert_eq!(
+            budget.held(),
+            0,
+            "the refused body hands its reservation back"
+        );
+    }
+
+    /// The bytes that arrived with the head are charged to the budget.
+    ///
+    /// QUIC is a byte stream, so how much body rides along with the head is
+    /// the peer's choice — the head loop can hand the body a buffer already
+    /// holding the whole body. Those bytes are held and are going to the
+    /// backend, so a reservation of what is still owed alone would leave the
+    /// whole body uncounted on every stream a peer chose to send in one
+    /// segment.
+    #[tokio::test]
+    async fn the_bytes_that_arrived_with_the_head_are_charged() {
+        let budget = Arc::new(crate::conn::limits::ByteBudget::new(1024 * 1024));
+        let reservation =
+            crate::conn::limits::ByteReservation::take_from(&budget, 8).expect("a reservation");
+        let body = RequestBody::Streaming {
+            head: bytes::Bytes::from_static(b"01234567"),
+            reader: BodyReader::new(Box::new(ScriptedReader::pieces(&[], false))),
+            content_length: 8,
+            reservation,
+            state: Arc::new(BodyState::default()),
+        };
+
+        assert_eq!(
+            budget.held(),
+            8,
+            "the head's bytes are held, so they are charged"
+        );
+        drop(body);
+        assert_eq!(
+            budget.held(),
+            0,
+            "the body is gone, so what it held is given back"
+        );
+    }
+
+    /// A body that is given up on hands its reservation back.
+    ///
+    /// One stalled upload must not shrink the process budget for every other
+    /// request behind it.
+    #[tokio::test]
+    async fn a_body_that_is_given_up_on_hands_its_reservation_back() {
+        let budget = Arc::new(crate::conn::limits::ByteBudget::new(1024 * 1024));
+        let reader = ScriptedReader::pieces(&[], false);
+        let body = StreamingBody {
+            head: bytes::Bytes::new(),
+            reader: BodyReader::new(Box::new(reader)),
+            remaining: 10,
+            deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+            timer: None,
+            reservation: crate::conn::limits::ByteReservation::take_from(&budget, 64)
+                .expect("a reservation"),
+            buf: Vec::new(),
+            state: Arc::new(BodyState::default()),
+        };
+
+        let outcome = body.collect().await;
+        assert!(outcome.is_err(), "the body should have been given up on");
+        assert_eq!(
+            budget.held(),
+            0,
+            "the body that was given up on hands its reservation back"
+        );
+    }
+
     /// The part of the body that arrived with the head goes first, and the
     /// stream continues after it.
     #[tokio::test]
@@ -4038,12 +4509,14 @@ mod transport {
         let reader = ScriptedReader::pieces(&[b"0123456789".as_slice()], false);
         let mut body = StreamingBody {
             head: bytes::Bytes::new(),
-            stream: Box::new(reader),
+            reader: BodyReader::new(Box::new(reader)),
             remaining: 100,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            timer: None,
             reservation: crate::conn::limits::ByteReservation::take_from(&budget, 0)
                 .expect("a reservation"),
             buf: Vec::new(),
+            state: Arc::new(BodyState::default()),
         };
 
         let frame = body

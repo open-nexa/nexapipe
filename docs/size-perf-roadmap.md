@@ -463,13 +463,15 @@ items the numbers pointed at.
    than the ones the client **promised**, which is what the buffered path
    counted too.
    One thing came with it, and it is a change in what the server does rather
-   than in how fast it does it: a **streamed** body cannot be sent a second
-   time, because there is no second copy of it. A request with a body that
-   fails and would have been retried is refused with an error rather than
-   being sent to the next backend with an empty body. `[retry] attempts` is 0
+   than in how fast it does it: a body that has been **read** cannot be sent
+   a second time, because there is no second copy of it. A request with a
+   body that fails after the body was sent is refused with an error rather
+   than being tried again, where before the whole body was kept in memory
+   and sent again. A failure that happened before the body was touched — a
+   connection that was refused, say — is still tried on the next backend,
+   because the bytes are still on the client's stream. `[retry] attempts` is 0
    unless an operator asks for it, so this reaches only a deployment that
-   turned retries on — and there it fails loudly where it used to send a
-   broken request. A **chunked** body is still read whole: the proxy
+   turned retries on. A **chunked** body is still read whole: the proxy
    re-frames it as one buffer with a length of its own.
 
 ### F3 — A performance budget (P2, after F1)
