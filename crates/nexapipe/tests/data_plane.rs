@@ -1320,6 +1320,7 @@ async fn handshake(
             client_id: CLIENT_ID.to_string(),
             timestamp,
             device_id: None,
+            version: None,
         },
     )
     .await;
