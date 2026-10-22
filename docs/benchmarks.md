@@ -1,6 +1,6 @@
 # Benchmarks
 
-Six benches, on the paths that carry user traffic. They exist because until
+Seven benches, on the paths that carry user traffic. They exist because until
 they landed every performance claim in this repository was an expectation
 rather than a result — the reasoning behind that is in
 [`size-perf-roadmap.md`](size-perf-roadmap.md) §F1.
@@ -11,6 +11,7 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
+| `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
@@ -42,6 +43,14 @@ different pair of questions from the rest:
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
 
+The two `flow_connections` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `flow_connections/connections` | **100** | **100 connections for 100 concurrent flows** — one per flow, to the connection. The count does not move: every sample was exactly 100 |
+| `flow_connections/open_flows` | **1.05 s** | how long those hundred flows take to open, each of them paying for a handshake |
+
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
 the idle wake-up rate, the per-flow memory, and the server's request
@@ -72,6 +81,7 @@ cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 cargo bench -p nexapipe-client --features local-proxy --bench local_request
+cargo bench -p nexapipe-client --features local-proxy --bench flow_connections
 cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe-client --bench domain_match
 ```
@@ -162,6 +172,32 @@ operating system's ephemeral ports exhausted and the run would fail
 partway through. And the far side is an HTTP server over an iroh bi-stream on
 this host, not the server crate's own request path — which is the gap the
 next bench is for.
+
+**`flow_connections`** is the client asking how many QUIC connections its
+flows open. The client keeps a pool of connections to each backend, and a flow
+takes one **out** of it and hands it back when it ends — so while a flow is
+running its connection is not in the pool, and a hundred concurrent flows need
+a hundred connections. The transport is built for the opposite: one connection
+can carry 1024 bi-streams.
+
+It measures two things:
+
+- `connections` — how many connections the far side is given while a hundred
+  flows are open. The far side counts its own accepts, so the number does not
+  depend on anything the client reports about itself. It comes back as
+  nanoseconds, so the report reads `100 ns` for a hundred connections; that
+  is the encoding, and it is deliberate.
+- `open_flows` — how long those hundred flows take to open. Today each of
+  them pays for a handshake, so this is what the connection count costs.
+
+Each round runs on a **fresh pool**, so a round starts with an empty one and
+the count is what that round needed. The bench waits for the count to stop
+moving before it reads it — a count that has not moved *yet* looks exactly
+like a count that has stopped moving, and the far side accepts in its own
+task, so reading too early would report that the round opened no connections
+at all.
+
+The count does not move at all: every sample was exactly 100.
 
 ## What a flow costs
 
