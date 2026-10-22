@@ -443,6 +443,12 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **An invite's relay hint has to name a relay this client can reach.** The
+  hint was accepted whenever the URL parser accepted it, so `ftp://`,
+  `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
+  and the length are checked now, and the n0-operated relays are refused for
+  the same reason the configuration refuses them. A code past a hard limit is
+  refused rather than parsed.
 - **A stream leaves its connection in the pool.** The client's
   `open_bi_stream` returned the two streams and dropped the connection, so
   the pool never saw that connection again: every call dialled a new one, and
