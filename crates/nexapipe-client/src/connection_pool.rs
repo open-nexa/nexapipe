@@ -952,7 +952,8 @@ fn identity_changed(before: Option<&TwoFactorAuth>, after: Option<&TwoFactorAuth
     before.map(|a| a.identity()) != after.map(|a| a.identity())
 }
 
-/// Waits for a backend that demands 2FA to say so.///
+/// Waits for a backend that demands 2FA to say so.
+///
 /// Returns the reason the server gave when it closes the connection with
 /// [`AUTH_REQUIRED_CLOSE_CODE`], and `None` when the connection stays up — or
 /// dies for any other reason, which is not what this is looking for.
