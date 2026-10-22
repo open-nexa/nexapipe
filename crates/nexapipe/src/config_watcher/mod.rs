@@ -697,6 +697,20 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
 /// longer lists is dropped: the operator removed it, and keeping it alive in
 /// memory would let a deleted credential keep authenticating until the next
 /// restart.
+/// The greater of two step memories, whichever they are.
+///
+/// The live value is by construction never older than the file's — it is
+/// moved forward by every acceptance — so the greater of the two is the live
+/// one. Taking the greater rather than the live one outright keeps the rule
+/// right if the two ever disagree the other way, and it keeps the two
+/// optionals from needing three cases at every call site.
+fn newest_step(live: Option<u64>, from_file: Option<u64>) -> Option<u64> {
+    match (live, from_file) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<String>, Vec<String>) {
     let mut added = Vec::new();
     let mut removed = Vec::new();
@@ -720,6 +734,21 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
                     client.enrollment_locked_until = existing.enrollment_locked_until;
                 }
                 client.last_used = existing.last_used;
+                // The step memory is preserved the same way, and for the same
+                // reason: it is what refuses the second use of a code, and a
+                // reload that lands between the in-memory record and the
+                // state-file write would otherwise put the older value back
+                // and hand the replay protection away.
+                client.last_used_step = newest_step(existing.last_used_step, client.last_used_step);
+                // The devices' own step memory, for the same reason: a
+                // device's credential is its own, and a device that
+                // authenticated in memory must not lose that by a reload.
+                for (name, device) in client.devices.iter_mut() {
+                    if let Some(existing_device) = existing.devices.get(name) {
+                        device.last_used_step =
+                            newest_step(existing_device.last_used_step, device.last_used_step);
+                    }
+                }
             }
             None => added.push(id.clone()),
         }
@@ -930,6 +959,68 @@ mod tests {
             last_used: None,
             last_used_step: None,
         }
+    }
+
+    /// A reload does not take the step memory away.
+    ///
+    /// The step memory is what refuses the second use of a code, so a reload
+    /// that put an older value back would hand the replay protection away
+    /// without saying so. The live value is moved forward by every
+    /// acceptance, and the file is written after the lock is released — so a
+    /// reload that lands in that window reads a file that is one step behind
+    /// memory, and the merge has to keep the newer of the two.
+    #[test]
+    fn a_reload_keeps_the_step_memory() {
+        let mut live = config_with(&[("phone", client("s"))]);
+        let incoming = config_with(&[("phone", client("s"))]);
+
+        // The live server has accepted a code at step 100 and written it
+        // down; the file it is reading still says nothing, because the write
+        // has not happened yet.
+        live.clients.get_mut("phone").unwrap().last_used_step = Some(100);
+
+        merge_auth_clients(&mut live, &incoming);
+
+        assert_eq!(
+            live.clients.get("phone").unwrap().last_used_step,
+            Some(100),
+            "the step memory survives a reload that read a file without it"
+        );
+    }
+
+    /// A device's own step memory survives a reload too.
+    ///
+    /// A device's credential is its own, and a device that authenticated with
+    /// a code must not lose that by a reload any more than the client it
+    /// belongs to does.
+    #[test]
+    fn a_reload_keeps_a_device_s_step_memory() {
+        let mut live_client = client("s");
+        let mut live_device = device("d");
+        live_device.last_used_step = Some(100);
+        live_client
+            .devices
+            .insert("laptop".to_string(), live_device);
+
+        let mut incoming_client = client("s");
+        let incoming_device = device("d");
+        incoming_client
+            .devices
+            .insert("laptop".to_string(), incoming_device);
+
+        let mut live = config_with(&[("phone", live_client)]);
+        let incoming = config_with(&[("phone", incoming_client)]);
+
+        merge_auth_clients(&mut live, &incoming);
+
+        assert_eq!(
+            live.clients
+                .get("phone")
+                .and_then(|c| c.devices.get("laptop"))
+                .and_then(|d| d.last_used_step),
+            Some(100),
+            "the device's step memory survives a reload that read a file without it"
+        );
     }
 
     /// `removed_devices` is the detection half of revocation: a device struck

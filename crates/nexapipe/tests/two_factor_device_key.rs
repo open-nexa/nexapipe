@@ -112,8 +112,9 @@ fn a_key_device_proves_itself_with_a_signature() {
         "",
     );
     assert!(
-        matches!(outcome, Ok(Verified::Accepted { .. })),
-        "a correctly signed response from a key device must verify, got {outcome:?}"
+        matches!(outcome, Ok(Verified::Accepted { step: None })),
+        "a correctly signed response from a key device must verify, and it has no step, got \
+         {outcome:?}"
     );
 }
 
@@ -173,8 +174,9 @@ fn a_wrong_signature_is_refused_and_not_counted() {
         "",
     );
     assert!(
-        matches!(outcome, Ok(Verified::Accepted { .. })),
-        "the real device is not affected by another peer's noise, got {outcome:?}"
+        matches!(outcome, Ok(Verified::Accepted { step: None })),
+        "the real device is not affected by another peer's noise, and it has no step, got \
+         {outcome:?}"
     );
 }
 
@@ -253,8 +255,9 @@ fn a_key_device_is_not_reachable_with_the_clients_secret() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(Verified::Accepted { .. })),
-        "the unnamed device still answers with the client's secret, got {outcome:?}"
+        matches!(outcome, Ok(Verified::Accepted { step: Some(_) })),
+        "the unnamed device still answers with the client's secret, and it has a step, got \
+         {outcome:?}"
     );
 }
 

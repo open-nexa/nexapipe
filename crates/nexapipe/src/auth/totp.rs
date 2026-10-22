@@ -326,13 +326,6 @@ pub enum Verified {
     WrongCode,
 }
 
-impl Verified {
-    /// Whether the credential proved itself.
-    pub fn is_accepted(&self) -> bool {
-        matches!(self, Verified::Accepted { .. })
-    }
-}
-
 /// Authentication errors
 #[derive(Debug, Clone)]
 pub enum AuthError {

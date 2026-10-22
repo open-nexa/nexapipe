@@ -1929,6 +1929,14 @@ async fn a_client_that_does_not_handshake_is_closed() {
 /// something anybody guessed.
 #[tokio::test]
 async fn an_earlier_steps_code_is_refused_and_the_same_one_again_is_not() {
+    // The scenario is about a *step*, and a step is thirty seconds long: a
+    // boundary crossed in the middle of the test would put the code of the
+    // earlier step two steps behind the server's origin, outside the
+    // acceptance window, and the server would count it as a wrong code
+    // instead of refusing it. The test and the server share a clock, so the
+    // test can see the boundary coming and wait it out.
+    wait_for_a_comfortable_step().await;
+
     let backend = spawn_backend("hello").await;
     let (auth, _dir) = auth_state(auth_config());
     let proxy =
@@ -1964,19 +1972,74 @@ async fn an_earlier_steps_code_is_refused_and_the_same_one_again_is_not() {
     // may differ, not about whether a code has been used — and the memory of
     // the step is what refuses it.
     let older = Tunnel::dial(proxy.addr.clone()).await;
-    let answer = handshake(&older, &client, Some(previous_step_code(SECRET)), None).await;
+    let refused = handshake(&older, &client, Some(previous_step_code(SECRET)), None).await;
     assert!(
-        matches!(answer, AuthMessage::Failed { .. }),
-        "a code from an earlier step is refused, got {answer:?}"
+        matches!(refused, AuthMessage::Failed { .. }),
+        "a code from an earlier step is refused, got {refused:?}"
     );
 
     // And none of it was counted: the counter is for guesses, and a code
     // that has been used already is not one.
-    let config = auth.config().read().await;
+    //
+    // The guard is scoped to the block on purpose: it is a **read** lock on
+    // the same configuration the server takes a **write** lock on for the
+    // next handshake, and a reader held across it would keep the server
+    // waiting — until its handshake deadline closed the connection with "2FA
+    // required".
+    {
+        let config = auth.config().read().await;
+        assert_eq!(
+            config.clients[CLIENT_ID].failed_attempts, 0,
+            "a refused code is not a guess, and must not be counted as one"
+        );
+    }
+
+    // The reply for a refused replay is the reply for a wrong code, byte for
+    // byte: a distinct message would say that the code was *right* and only
+    // too old, which is an oracle — it would tell an attacker that the code
+    // it holds is the right one. The reason goes to the log instead.
+    let wrong = Tunnel::dial(proxy.addr.clone()).await;
+    let wrong_answer = handshake(&wrong, &client, Some("000000".to_string()), None).await;
+    let refused_reason = match &refused {
+        AuthMessage::Failed { reason } => reason.clone(),
+        other => panic!("a refused replay answers with a failure, got {other:?}"),
+    };
+    let wrong_reason = match &wrong_answer {
+        AuthMessage::Failed { reason } => reason.clone(),
+        other => panic!("a wrong code answers with a failure, got {other:?}"),
+    };
     assert_eq!(
-        config.clients[CLIENT_ID].failed_attempts, 0,
-        "a refused code is not a guess, and must not be counted as one"
+        refused_reason, wrong_reason,
+        "a refused replay answers exactly as a wrong code does"
     );
+}
+
+/// Waits until the current step has enough of it left for the test to finish.
+///
+/// A TOTP step is thirty seconds, and the code of the *earlier* step is only
+/// refused while the server is still in the step the test started in. A
+/// boundary crossed in between puts that code two steps behind, outside the
+/// acceptance window, and the server counts it as a wrong code — the test
+/// then fails for a reason that has nothing to do with what it is testing.
+/// The test and the server share a clock, so the test can see the boundary
+/// coming and wait it out.
+async fn wait_for_a_comfortable_step() {
+    const STEP: u64 = 30;
+    const WANTED: u64 = 5;
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let left = STEP - (now % STEP);
+        if left >= WANTED {
+            return;
+        }
+        // Past the boundary, and a second into the new step: the server's
+        // origin is the new one, and the code of the step before it is
+        // inside the window for the next twenty-nine seconds.
+        tokio::time::sleep(std::time::Duration::from_secs(left + 1)).await;
+    }
 }
 
 /// The code of the step **before** this one.
