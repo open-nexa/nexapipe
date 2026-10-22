@@ -703,6 +703,12 @@ lookup, which is what a config written before the key existed does.
     in-app update button — and the plugin is still registered on the Rust
     side, so nothing about the release machinery changed; only the
     renderer's reach into it is gone.
+  `core:default` itself is still granted, and it still brings the path, the
+  event, the window, the webview, the app, the resource, the menu and the
+  tray defaults with it — the renderer uses the window and the tray ones,
+  and the path and the resource defaults are what the rest of the set needs.
+  What is gone is the two reaches that mattered: the one into the
+  filesystem, and the one into the updater.
   A renderer that can run script is a renderer that can ask for all three,
   and the answer was "yes" to each.
 - **A registration code no longer silently replaces a working credential.**
