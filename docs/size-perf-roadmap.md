@@ -500,13 +500,12 @@ items the numbers pointed at.
    unless an operator asks for it, so this reaches only a deployment that
    turned retries on. A **chunked** body is still read whole: the proxy
    re-frames it as one buffer with a length of its own.
-8. **What a second connection costs.** **Added on 2026-10-22, and the number a
-   decision about choosing the protocol with ALPN needs.** The protocol is
-   chosen today by the first byte of each stream, so **one** connection
-   carries both the HTTP requests and the L4 tunnels a client makes to the
-   same endpoint. Choosing it at the handshake instead would give each
-   protocol a connection of its own, and a client that uses both would pay for
-   a second one.
+9. **What a second connection costs.** **Added on 2026-10-22, and the number a
+   decision about choosing the protocol with ALPN needed.** The protocol used
+   to be chosen by the first byte of each stream, so **one** connection
+   carried both the HTTP requests and the L4 tunnels a client made to the same
+   endpoint. Choosing it at the handshake gives each protocol a connection of
+   its own, and a client that uses both pays for a second one.
    **Measured** (`connection_cost`, two runs on a quiet machine): a QUIC
    handshake costs **796 µs** and **819 µs**, and a flow on a connection that is
    already open costs **555 µs** and **594 µs**. The two are **not
@@ -532,6 +531,20 @@ items the numbers pointed at.
    the count: the per-connection readings are bursty, and the total is stable.
    So a second connection costs **a handshake and about fifty kilobytes** — a
    small price for a protocol that is known at the handshake.
+10. **The protocol is chosen at the handshake.** **Added on 2026-10-22, and
+    the enabler for the step after it.** A connection used to carry every
+    protocol at once, and the server told them apart by the first byte of
+    each stream — a **sniff**, and the reason the tunnel path could not use
+    hyper's own HTTP/1 codec without the bytes being read and handed back.
+    A client may now name the protocol it wants, and the server knows what it
+    is serving before it reads a byte of it.
+    **The price is a connection per protocol**: a client that speaks HTTP and
+    L4 to the same server holds a connection for each, where it held one.
+    That is **110 KiB** of heap for the extra connection (both ends
+    together) and one handshake more, paid once per endpoint and protocol.
+    The **steady-state** cost of a request is unchanged — the same bytes on
+    the path — but the setup cost is not: the extra connection is one more
+    handshake, and a handshake is a round trip.
 
 ### F3 — A performance budget (P2, after F1)
 

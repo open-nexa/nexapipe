@@ -26,6 +26,7 @@ use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::relay::RelayModeSpec;
+use nexapipe_proto::protocol::Protocol;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -310,16 +311,26 @@ pub async fn run_proxy(
         }
     }
 
-    // Both ALPNs are accepted: the current one, and the one clients built before
-    // the prefix byte was dropped use.
+    // Every protocol a client may ask for, and the two generic names beside
+    // them.
     //
     // **This list is what decides.** QUIC's negotiation picks the first of the
     // *accept side's* entries that the peer also offers — not the first of the
-    // peer's offer. So the order below is the preference order, and the
-    // current spelling has to be first. The client offers both, but the order
-    // it offers them in does not matter; what matters is that it offers both.
-    let mut builder = Endpoint::builder(presets::N0)
-        .alpns(vec![ALPN_NEXAPIPE.to_vec(), ALPN_NEXAPIPE_LEGACY.to_vec()]);
+    // peer's offer. So the order below is the preference order: a client that
+    // asks for one protocol by name gets that one, and a client that asks for
+    // nothing in particular gets the generic name, which is served the way it
+    // always was — by the first byte of each stream.
+    //
+    // The last entry is the spelling clients used before the prefix byte was
+    // dropped; a client of that vintage offers only that, and it reaches a
+    // server of this one.
+    let mut builder = Endpoint::builder(presets::N0).alpns(vec![
+        Protocol::Http.alpn().to_vec(),
+        Protocol::L4.alpn().to_vec(),
+        Protocol::Tls.alpn().to_vec(),
+        ALPN_NEXAPIPE.to_vec(),
+        ALPN_NEXAPIPE_LEGACY.to_vec(),
+    ]);
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
     // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).

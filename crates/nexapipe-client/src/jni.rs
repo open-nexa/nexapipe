@@ -1644,7 +1644,11 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
             let covered = restriction.describe();
             jni_log!("[iroh] peers are dialled through {covered}");
         }
-        let mut builder = Endpoint::builder(presets::N0).relay_mode(relay.relay_mode());
+        let mut builder = Endpoint::builder(presets::N0)
+            .alpns(crate::connection_pool::alpns(
+                nexapipe_proto::protocol::Protocol::Legacy,
+            ))
+            .relay_mode(relay.relay_mode());
         builder = discovery.apply(builder);
         if let Some(restriction) = restriction {
             builder = builder.hooks(restriction);

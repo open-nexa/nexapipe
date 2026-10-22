@@ -3,6 +3,7 @@ use crate::connection_pool::IrohConnectionPool;
 use crate::http::{HttpRequest, HttpResponse};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId};
+use nexapipe_proto::protocol::Protocol;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -40,7 +41,7 @@ impl IrohProxyClient {
     }
 
     pub async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse, ClientError> {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
         let response = exchange_over(&conn.conn, request.to_bytes().as_slice()).await?;
         // The borrow ends when this handle is dropped, which is here: the pool
         // owns the connection and this was only ever a handle to it.
@@ -49,7 +50,7 @@ impl IrohProxyClient {
     }
 
     pub async fn send_raw(&self, data: &[u8]) -> Result<Vec<u8>, ClientError> {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
         let response = exchange_over(&conn.conn, data).await?;
         // The borrow ends here; the pool still owns the connection.
 
@@ -73,6 +74,13 @@ impl IrohProxyClient {
     /// every call dialled a new one and the pool lost a slot each time. The
     /// streams go **into** the closure rather than out of it, so a connection
     /// cannot escape the pool with its slot already spent.
+    ///
+    /// The connection is the **generic** one, where the first byte of each
+    /// stream decides what the stream carries: a request line is a request,
+    /// an L4 preface is a tunnel, a ClientHello is a TLS session. The closure
+    /// is not told what it may write, so the connection it borrows may not
+    /// promise either — a connection that named the HTTP protocol would
+    /// refuse a preface, and the stream would never open.
     pub async fn with_stream<T, F>(&self, f: F) -> Result<T, ClientError>
     where
         F: AsyncFnOnce(
@@ -80,7 +88,7 @@ impl IrohProxyClient {
             &mut iroh::endpoint::RecvStream,
         ) -> Result<T, ClientError>,
     {
-        let conn = self.conn_pool.get_connection().await?;
+        let conn = self.conn_pool.get_connection(Protocol::Legacy).await?;
         let (mut send, mut recv) = conn.conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
         let result = f(&mut send, &mut recv).await;

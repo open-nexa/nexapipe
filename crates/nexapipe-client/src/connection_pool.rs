@@ -13,7 +13,9 @@ use tracing;
 
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
+use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
+use std::collections::HashMap;
 
 // The ALPN this build speaks, and the one servers built before the prefix
 // byte was dropped accept.
@@ -27,7 +29,30 @@ use nexapipe_proto::secret::SecretString;
 // The constants live in `nexapipe-proto`, which the server links too: the two
 // ends have to agree on the name, and a name written down twice is a name
 // that eventually differs.
-use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
+#[cfg(test)]
+use nexapipe_proto::ALPN_NEXAPIPE;
+use nexapipe_proto::ALPN_NEXAPIPE_LEGACY;
+
+/// The ALPNs this client offers the server.
+///
+/// **The protocol it wants first**, and the two names a server of another
+/// vintage understands beside it: the generic one, which says "the first byte
+/// of each stream decides", and the spelling that predates the prefix byte
+/// being dropped.
+///
+/// The order of the *offer* does not decide anything — QUIC's negotiation
+/// picks the first of the **accept side's** entries that the peer also
+/// offers — so what matters is that the server's list has the per-protocol
+/// names in front of the generic one, and that the client offers the one it
+/// wants.
+pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
+    let mut list = vec![protocol.alpn().to_vec()];
+    if protocol != Protocol::Legacy {
+        list.push(Protocol::Legacy.alpn().to_vec());
+    }
+    list.push(ALPN_NEXAPIPE_LEGACY.to_vec());
+    list
+}
 
 /// What a dial produced: the connection and the state its flows share, or
 /// the failure that stopped it.
@@ -328,6 +353,13 @@ enum PoolRefusal {
 
 struct PooledConnection {
     conn: Connection,
+    /// What this connection carries.
+    ///
+    /// The protocol is chosen at the handshake, so a connection speaks one
+    /// thing: a connection that carries HTTP cannot carry an L4 tunnel, and
+    /// the pool keeps them apart for the same reason it keeps a connection
+    /// per protocol apart in the first place.
+    protocol: Protocol,
     /// What the pool and the flows on this connection share.
     ///
     /// The count is here because the pool owns the connection and the flows
@@ -615,7 +647,11 @@ struct IrohConnectionPoolInner {
     /// hundred concurrent flows would each start a dial and a hundred
     /// connections would be made to carry a hundred flows — against a
     /// transport built to carry 1024 bi-streams on one connection.
-    dialing: Mutex<Option<watch::Receiver<Option<DialOutcome>>>>,
+    /// One slot per protocol, because a dial for one protocol is not a dial
+    /// for another: a connection carries one thing, and waiting for an HTTP
+    /// dial to hand over an L4 connection would be waiting for the wrong
+    /// answer.
+    dialing: Mutex<HashMap<Protocol, watch::Receiver<Option<DialOutcome>>>>,
     ep: Arc<Mutex<Option<Endpoint>>>,
     endpoint_addr: EndpointAddr,
     /// Optional client 2FA credentials. When set, every freshly established
@@ -689,13 +725,14 @@ impl IrohConnectionPool {
         #[cfg(not(feature = "tracing"))]
         let _ = &tuning;
         let ep = Endpoint::builder(presets::N0)
+            .alpns(alpns(Protocol::Legacy))
             .transport_config(transport)
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         let inner = Arc::new(IrohConnectionPoolInner {
             connections: Mutex::new(Vec::new()),
-            dialing: Mutex::new(None),
+            dialing: Mutex::new(HashMap::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
@@ -713,7 +750,7 @@ impl IrohConnectionPool {
     pub fn new_with_endpoint(ep: Endpoint, endpoint_addr: EndpointAddr) -> Self {
         let inner = Arc::new(IrohConnectionPoolInner {
             connections: Mutex::new(Vec::new()),
-            dialing: Mutex::new(None),
+            dialing: Mutex::new(HashMap::new()),
             ep: Arc::new(Mutex::new(Some(ep))),
             endpoint_addr,
             two_factor: Mutex::new(None),
@@ -883,11 +920,20 @@ impl IrohConnectionPool {
         &self,
         ep: &Endpoint,
         timeout: tokio::time::Duration,
+        protocol: Protocol,
     ) -> Result<Connection, ClientError> {
         let started = tokio::time::Instant::now();
-        // Both ALPNs are offered, the current one first: a server built before the
-        // prefix byte was dropped still answers, and one built after it takes the
-        // first it recognises. `connect` alone could only offer one.
+        // **The protocol this connection is for, first**, and the two generic
+        // names beside it: a server that does not know the per-protocol names
+        // takes the generic one, which says "the first byte of each stream
+        // decides", and a server built before the prefix byte was dropped
+        // takes the older spelling.
+        //
+        // The order of the *offer* does not decide anything — QUIC's
+        // negotiation picks the first of the **accept side's** entries that
+        // the peer also offers — so what matters is that the server's list
+        // has the per-protocol names in front of the generic one, and that
+        // the client offers the one it wants.
         //
         // The address lookup and the handshake are both inside the timeout, the way
         // they were when `connect` did the whole thing; `connect_with_opts` splits
@@ -896,9 +942,8 @@ impl IrohConnectionPool {
             let connecting = ep
                 .connect_with_opts(
                     self.inner.endpoint_addr.clone(),
-                    ALPN_NEXAPIPE,
-                    ConnectOptions::new()
-                        .with_additional_alpns(vec![ALPN_NEXAPIPE_LEGACY.to_vec()]),
+                    protocol.alpn(),
+                    ConnectOptions::new().with_additional_alpns(alpns(protocol)[1..].to_vec()),
                 )
                 .await
                 .map_err(ConnectError::from)?;
@@ -935,6 +980,25 @@ impl IrohConnectionPool {
             }
             ClientError::ConnectionFailed(e.to_string())
         })?;
+
+        // **What was negotiated**, which is not always what was asked for.
+        //
+        // A server that does not know the per-protocol names answers with the
+        // generic one, and a server built before the prefix byte was dropped
+        // answers with the older spelling. Both are served the way they always
+        // were — the first byte of each stream decides — so the connection
+        // works either way, and the bytes the client writes are the bytes the
+        // sniff looks for. It is a real fallback, and an implicit one, so it is
+        // worth saying out loud: a server that fell back is a server that is
+        // still sniffing.
+        if conn.alpn() != protocol.alpn() {
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                "the server negotiated {:?} rather than {}, and will decide by the first byte",
+                String::from_utf8_lossy(conn.alpn()),
+                protocol.name()
+            );
+        }
 
         // Enrollment first: a token is spent once and buys the credentials the
         // block below then uses, so it only runs while there are none.
@@ -1015,18 +1079,21 @@ impl IrohConnectionPool {
     /// handed out again: the pool opens another connection instead, so the
     /// server's own ceiling — the number of L4 flows it allows on one
     /// connection — is never the client's problem.
-    pub async fn get_connection(&self) -> Result<BorrowedConnection, crate::error::ClientError> {
+    pub async fn get_connection(
+        &self,
+        protocol: Protocol,
+    ) -> Result<BorrowedConnection, crate::error::ClientError> {
         loop {
             // A pooled connection with room for another flow is the cheap
             // answer, and it is the answer the whole change is about.
-            if let Some(borrowed) = self.borrow_pooled().await {
+            if let Some(borrowed) = self.borrow_pooled(protocol).await {
                 return Ok(borrowed);
             }
 
             // No connection has room: another one is needed. The dial is
             // shared, so a hundred flows arriving together make one
             // connection between them and not a hundred.
-            let (conn, state) = self.dial_shared().await?;
+            let (conn, state) = self.dial_shared(protocol).await?;
 
             // The shared dial may have produced a connection that is already
             // full — a hundred flows can join one dial and fill it — so the
@@ -1043,7 +1110,7 @@ impl IrohConnectionPool {
     /// The connection with the **fewest** flows on it is the one handed out,
     /// so a hundred flows spread over the connections the pool has instead
     /// of piling onto the newest one.
-    async fn borrow_pooled(&self) -> Option<BorrowedConnection> {
+    async fn borrow_pooled(&self, protocol: Protocol) -> Option<BorrowedConnection> {
         let mut connections = self.inner.connections.lock().await;
 
         // Drop stale connections before handing one out: anything already
@@ -1053,6 +1120,8 @@ impl IrohConnectionPool {
 
         let pooled = connections
             .iter()
+            // A connection carries one protocol: the one it was opened with.
+            .filter(|pooled| pooled.protocol == protocol)
             .filter(|pooled| pooled.state.has_room())
             .min_by_key(|pooled| pooled.state.borrow_count())?;
 
@@ -1075,22 +1144,24 @@ impl IrohConnectionPool {
     /// timeouts on the same answer.
     async fn dial_shared(
         &self,
+        protocol: Protocol,
     ) -> Result<(Connection, Arc<BorrowState>), crate::error::ClientError> {
         loop {
             let (tx, rx) = watch::channel(None::<DialOutcome>);
 
-            // Take the slot, or join the one that is there.
+            // Take the slot for this protocol, or join the one that is there.
             let (tx, rx) = {
                 let mut dialing = self.inner.dialing.lock().await;
-                match dialing.as_ref() {
+                match dialing.get(&protocol) {
                     Some(joined) => {
-                        // Someone else is dialling. Our sender goes away — so the
-                        // channel closes if they do — and we wait on theirs.
+                        // Someone else is dialling the same protocol. Our
+                        // sender goes away — so the channel closes if they do
+                        // — and we wait on theirs.
                         drop(tx);
                         (None, joined.clone())
                     }
                     None => {
-                        *dialing = Some(rx.clone());
+                        dialing.insert(protocol, rx.clone());
                         (Some(tx), rx)
                     }
                 }
@@ -1103,7 +1174,7 @@ impl IrohConnectionPool {
             let outcome = match tx {
                 Some(tx) => {
                     // We are the dialer.
-                    let outcome = self.dial().await;
+                    let outcome = self.dial(protocol).await;
                     let _ = tx.send(Some(outcome.clone()));
                     Some(outcome)
                 }
@@ -1130,7 +1201,7 @@ impl IrohConnectionPool {
             // tries again rather than being handed a failure that has already been
             // paid for. The callers that were waiting when it failed share that
             // failure — they are watching the same channel.
-            self.clear_dial_slot(&channel).await;
+            self.clear_dial_slot(protocol, &channel).await;
 
             match outcome {
                 Some(outcome) => return outcome,
@@ -1148,26 +1219,38 @@ impl IrohConnectionPool {
     ///
     /// The check matters: a slot that another dial has taken in the meantime
     /// belongs to that dial, and clearing it would let two dials run at once.
-    async fn clear_dial_slot(&self, channel: &watch::Receiver<Option<DialOutcome>>) {
+    async fn clear_dial_slot(
+        &self,
+        protocol: Protocol,
+        channel: &watch::Receiver<Option<DialOutcome>>,
+    ) {
         let mut dialing = self.inner.dialing.lock().await;
-        if let Some(current) = dialing.as_ref()
+        if let Some(current) = dialing.get(&protocol)
             && current.same_channel(channel)
         {
-            *dialing = None;
+            dialing.remove(&protocol);
         }
     }
 
     /// Dials the backend and puts the connection in the pool.
-    async fn dial(&self) -> Result<(Connection, Arc<BorrowState>), crate::error::ClientError> {
+    async fn dial(
+        &self,
+        protocol: Protocol,
+    ) -> Result<(Connection, Arc<BorrowState>), crate::error::ClientError> {
         let ep = self.endpoint().await.ok_or_else(|| {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self.connect_and_auth(&ep, CONNECTION_TIMEOUT).await?;
+        let conn = self
+            .connect_and_auth(&ep, CONNECTION_TIMEOUT, protocol)
+            .await?;
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
 
         let state = Arc::new(BorrowState::new());
-        match self.pool_connection(conn.clone(), state.clone()).await {
+        match self
+            .pool_connection(conn.clone(), state.clone(), protocol)
+            .await
+        {
             Ok(()) => Ok((conn, state)),
             // The pool is full, so the connection was closed on the spot.
             // Handing it out would be handing out a connection that is
@@ -1244,7 +1327,7 @@ impl IrohConnectionPool {
             };
             match tokio::time::timeout_at(
                 deadline,
-                self.connect_and_auth(&ep, PRECONNECT_CONNECT_TIMEOUT),
+                self.connect_and_auth(&ep, PRECONNECT_CONNECT_TIMEOUT, Protocol::Http),
             )
             .await
             {
@@ -1287,7 +1370,7 @@ impl IrohConnectionPool {
         }
 
         spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
-        self.pool_connection(conn, Arc::new(BorrowState::new()))
+        self.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
             .await
             .is_ok()
     }
@@ -1305,6 +1388,7 @@ impl IrohConnectionPool {
         &self,
         conn: Connection,
         state: Arc<BorrowState>,
+        protocol: Protocol,
     ) -> Result<(), PoolRefusal> {
         // Never pool a connection that has already been closed: handing it out
         // again would just fail on the next request. The background watcher also
@@ -1315,7 +1399,11 @@ impl IrohConnectionPool {
 
         let mut connections = self.inner.connections.lock().await;
         if connections.len() < MAX_CONNECTIONS {
-            connections.push(PooledConnection { conn, state });
+            connections.push(PooledConnection {
+                conn,
+                state,
+                protocol,
+            });
             return Ok(());
         }
 
@@ -1702,6 +1790,7 @@ mod tests {
     use iroh::Endpoint;
     use iroh::endpoint::presets;
     use nexapipe_proto::auth::{Algorithm, AuthMessage, Format};
+    use nexapipe_proto::protocol::Protocol;
     use nexapipe_proto::secret::SecretString;
     use nexapipe_proto::{L4Proto, Preface};
     use std::net::SocketAddr;
@@ -1778,7 +1867,9 @@ mod tests {
     /// The client offers the current ALPN *and* the legacy one, so a server
     /// built before the prefix byte was dropped is still reachable. This is the
     /// client half of the compatibility the server's own test suite covers from
-    /// the other side.
+    /// the other side — `a_client_that_speaks_the_legacy_alpn_is_served`, in
+    /// `crates/nexapipe/tests/data_plane.rs`, is the server's half: the same
+    /// spelling, and the connection is not only made but **served**.
     #[tokio::test]
     async fn the_pool_reaches_a_server_that_speaks_only_the_legacy_alpn() {
         let server = Endpoint::builder(presets::N0)
@@ -1802,7 +1893,7 @@ mod tests {
         let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
 
         let conn = pool
-            .get_connection()
+            .get_connection(Protocol::Legacy)
             .await
             .expect("the pool reaches a server that speaks only the legacy ALPN");
 
@@ -1811,6 +1902,70 @@ mod tests {
         // after the client's handshake has already completed — so the count is
         // read only once the far side has answered a preface, which it does
         // only after it has counted the connection.
+        let (mut send, mut recv) = conn.conn.open_bi().await.expect("the flow opens");
+        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
+            .to_bytes()
+            .expect("the preface encodes");
+        send.write_all(&preface)
+            .await
+            .expect("the preface is written");
+        let mut status = [0u8; 1];
+        recv.read_exact(&mut status)
+            .await
+            .expect("the far side answers the preface");
+        assert_eq!(status[0], 0x00, "the far side opened the flow");
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the far side took the connection"
+        );
+        drop(conn);
+    }
+
+    /// **The pool reaches a server that speaks only the generic ALPN, even
+    /// though the client asked for a protocol by name.**
+    ///
+    /// The per-protocol names are newer than the generic one, so a server that
+    /// predates them answers with the generic one — and a connection
+    /// negotiated with it is served the way it always was, by the first byte
+    /// of each stream. The bytes the client writes are the bytes the sniff
+    /// looks for, so the flow still opens.
+    ///
+    /// The fallback is real, and it is implicit: nothing says out loud that
+    /// the server fell back. This test is the proof that it works.
+    #[tokio::test]
+    async fn the_pool_reaches_a_server_that_speaks_only_the_generic_alpn() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_counting(server, accepted.clone()));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+
+        // The client asks for L4 by name; the server only knows the generic
+        // one, and the negotiation lands there.
+        let conn = pool
+            .get_connection(Protocol::L4)
+            .await
+            .expect("the pool reaches a server that speaks only the generic ALPN");
+
+        // The flow has to open, not merely be made: the bytes the client
+        // writes are the bytes the sniff looks for, so the generic path
+        // serves them the way it always did.
         let (mut send, mut recv) = conn.conn.open_bi().await.expect("the flow opens");
         let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
             .to_bytes()
@@ -1855,6 +2010,52 @@ mod tests {
         let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
 
         (pool, accepted)
+    }
+
+    /// **A protocol is a connection.**
+    ///
+    /// The protocol is chosen at the handshake, so a client that speaks two
+    /// of them holds a connection for each: the far side is given one
+    /// connection per protocol, and not one connection carrying both.
+    ///
+    /// This is the price of the choice, and it is worth a test: a pool that
+    /// handed out the same connection for both would be serving an L4 tunnel
+    /// on a connection the server believes carries HTTP.
+    #[tokio::test]
+    async fn a_protocol_is_a_connection_of_its_own() {
+        let (pool, accepted) = pool_harness().await;
+
+        let _http = pool
+            .get_connection(Protocol::Http)
+            .await
+            .expect("the HTTP connection opens");
+        let _l4 = pool
+            .get_connection(Protocol::L4)
+            .await
+            .expect("the L4 connection opens");
+
+        // The far side counts its own accepts, so the number does not depend
+        // on anything the client reports about itself. The count is read
+        // after a wait for it: the connection is made on this side, and the
+        // far side counts its accepts in its own task, so a count read
+        // straight after the dial can be one short.
+        wait_for_accepted(&accepted, 2).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one connection per protocol: the far side was given one for each"
+        );
+
+        // And the same protocol again is the same connection.
+        let _another = pool
+            .get_connection(Protocol::Http)
+            .await
+            .expect("the HTTP connection opens");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "a second flow of the same protocol rides the connection it already has"
+        );
     }
 
     /// A backend that answers the authentication handshake, and issues a
@@ -1988,7 +2189,10 @@ mod tests {
         .await;
 
         // A connection of client-001.
-        let conn = pool.get_connection().await.expect("the connection is made");
+        let conn = pool
+            .get_connection(Protocol::Http)
+            .await
+            .expect("the connection is made");
 
         // The enrollment is only spent on a **new** connection, and the pool
         // hands out the one it has as long as it has room on it. Filling the
@@ -2009,7 +2213,7 @@ mod tests {
         pool.set_enrollment(Some(Enrollment::new("client-002", "enrollment-token")))
             .await;
         let next = pool
-            .get_connection()
+            .get_connection(Protocol::Http)
             .await
             .expect("the enrollment connection is made");
 
@@ -2092,7 +2296,7 @@ mod tests {
         let (pool, _accepted) = pool_harness().await;
 
         let borrowed = pool
-            .get_connection()
+            .get_connection(Protocol::Http)
             .await
             .expect("the connection is borrowed");
         assert_eq!(
@@ -2156,7 +2360,7 @@ mod tests {
         let mut borrows = Vec::new();
         for _ in 0..MAX_FLOWS_PER_CONNECTION {
             borrows.push(
-                pool.get_connection()
+                pool.get_connection(Protocol::Http)
                     .await
                     .expect("the connection is borrowed"),
             );
@@ -2172,7 +2376,7 @@ mod tests {
 
         // The next one does not fit, so it gets a connection of its own.
         let next = pool
-            .get_connection()
+            .get_connection(Protocol::Http)
             .await
             .expect("the connection is borrowed");
         // Give the far side a moment to accept the second connection.
@@ -2202,12 +2406,12 @@ mod tests {
         {
             let (tx, rx) = watch::channel(None::<DialOutcome>);
             drop(tx);
-            *pool.inner.dialing.lock().await = Some(rx);
+            pool.inner.dialing.lock().await.insert(Protocol::Http, rx);
         }
 
         // The next request dials again, and is served.
         let borrowed = pool
-            .get_connection()
+            .get_connection(Protocol::Http)
             .await
             .expect("the next request dials again");
         drop(borrowed);

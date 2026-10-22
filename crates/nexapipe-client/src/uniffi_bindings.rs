@@ -37,6 +37,7 @@ use crate::transport::TransportTuning;
 use crate::{HttpRequest, HttpResponse};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
+use nexapipe_proto::protocol::Protocol;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -462,6 +463,9 @@ impl ProxyClient {
         // connection at roughly 50 Mbps on a 200 ms path.
         let tuning = TransportTuning::from_env();
         let endpoint = Endpoint::builder(presets::N0)
+            .alpns(crate::connection_pool::alpns(
+                nexapipe_proto::protocol::Protocol::Legacy,
+            ))
             .transport_config(tuning.transport_config())
             .relay_mode(relay.relay_mode())
             .bind()
@@ -538,14 +542,14 @@ impl ProxyClient {
     /// One request, over a connection the domain mapping picked.
     async fn send_request_inner(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
         let host = request.host().to_string();
-        let pooled = self.group.get_connection(&host).await?;
+        let pooled = self.group.get_connection(&host, Protocol::Http).await?;
         let result = crate::client::exchange_over(pooled.conn(), &request.to_bytes()).await;
         HttpResponse::parse(&result?)
     }
 
     /// Raw bytes, over the connection the domain mapping picked.
     async fn send_raw_inner(&self, host: String, data: Vec<u8>) -> Result<Vec<u8>, ClientError> {
-        let pooled = self.group.get_connection(&host).await?;
+        let pooled = self.group.get_connection(&host, Protocol::Http).await?;
         let result = crate::client::exchange_over(pooled.conn(), &data).await;
         result
     }
