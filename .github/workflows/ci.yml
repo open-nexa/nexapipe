@@ -498,12 +498,17 @@ jobs:
         shell: bash
         run: npx tauri --version
 
-      # The tree that was installed has to be the tree the manifest asks
-      # for. `npm ci` installs strictly from the lockfile and refuses to run
-      # at all when the lockfile and the manifest disagree, so what is left
-      # to check is the **result**: a platform whose optional native package
-      # is missing shows up here as an invalid dependency, rather than as a
-      # failure at build time.
+      # The tree that was installed has to satisfy the manifest. `npm ci`
+      # installs strictly from the lockfile and refuses to run at all when the
+      # lockfile and the manifest disagree, so what is left to check is the
+      # **result**: a dependency that is missing, or a version that does not
+      # match what the manifest asks for, shows up here.
+      #
+      # It does **not** show a missing *optional* dependency: on a macOS
+      # arm64 runner `npm ls` prints `UNMET OPTIONAL DEPENDENCY` for the ten
+      # platform variants of `@tauri-apps/cli` that this platform does not
+      # need, and still exits 0. What proves that the native binary for
+      # **this** platform is there is the `npx tauri --version` above.
       #
       # A `git diff` on the lockfile would say nothing: `npm ci` never
       # writes it.

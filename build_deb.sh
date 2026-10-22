@@ -11,7 +11,7 @@
 #                   dependency present (src-tauri/Cargo.toml points at it and cargo fails
 #                   with a misleading "failed to load manifest" without it); node/npm/cargo
 #                   on PATH; rustup target installed; Tauri's Linux system packages present.
-#   2. Frontend   - npm ci (skipped when node_modules exists), then a probe of
+#   2. Frontend   - npm ci (always), then a probe of
 #                   `npx tauri --version`. The lockfile records every platform's
 #                   native optional package with its os/cpu constraints, and npm
 #                   filters by those at install time, so a missing
@@ -482,7 +482,7 @@ if ! npx tauri --version >/dev/null 2>&1; then
     # native binary the lockfile does not carry is a thing to fix in the
     # lockfile.
     warn "npx tauri is unusable after npm ci; the committed package-lock.json does not carry the @tauri-apps/cli native binary for this platform"
-    rm -rf node_modules
+    rm -rf "$DESKTOP_DIR/node_modules"
     install_frontend
     npx tauri --version >/dev/null 2>&1 || die "npx tauri is still unusable after reinstalling"
 fi

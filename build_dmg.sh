@@ -9,8 +9,8 @@
 #   1. Preflight  - ui-desktop present, crates/ path dependency reachable,
 #                   node/npm/cargo on PATH, rustup macOS target,
 #                   Tauri macOS deps (Xcode CLI tools) present.
-#   2. Frontend   - npm ci (skipped when node_modules exists), then a probe
-#                   of the local @tauri-apps/cli; wipe & reinstall on failure.
+#   2. Frontend   - npm ci (always), then a probe of the local
+#                   @tauri-apps/cli; wipe & reinstall on failure.
 #   3. Override   - write .workbuddy/build-override.json that:
 #                   * enables only macOS bundle target (app dmg), drops
 #                     Windows/Linux ones so the build does not waste time
@@ -312,7 +312,7 @@ if ! tauri_cli_works; then
     # very mismatch this branch exists to repair. Re-resolving it here would
     # also put a tree nobody reviewed into a signed bundle.
     warn "Tauri CLI not runnable — reinstalling from the committed lockfile once"
-    rm -rf node_modules
+    rm -rf "$DESKTOP_DIR/node_modules"
     install_frontend
     tauri_cli_works || die "Tauri CLI still not runnable after reinstalling ($TAURI_BIN)"
 fi

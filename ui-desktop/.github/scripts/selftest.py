@@ -275,8 +275,9 @@ if sums.exists():
 # --------- 5. lockfile platform completeness (warning only, not counted as a failure)
 # If the lockfile only contains the packages of the machine that generated it, npm ci
 # misses the native binaries on other platforms.
-# The workflow already heals itself with npm install, so this is only a hint — but a
-# lockfile covering every platform would still be better.
+# The workflow does not heal itself any more: there is no npm install fallback, so a
+# platform the lockfile does not cover fails the build. The lockfile has to cover
+# every platform that is released.
 lockfile = ROOT / "package-lock.json"
 try:
     lock_pkgs = set((json.loads(lockfile.read_text(encoding="utf-8")).get("packages") or {}).keys())
@@ -292,7 +293,7 @@ try:
     if missing_cli:
         print(f"WARN  package-lock.json is missing tauri CLI native packages for: {missing_cli}")
         print("      npm ci will report Cannot find native binding on those platforms (npm/cli#4828).")
-        print("      The workflow heals itself with npm install; for a real fix, regenerate a lockfile that covers every platform.")
+        print("      There is no npm install fallback: the build fails on those platforms. The fix is a lockfile that covers every platform.")
     else:
         print("PASS  package-lock.json contains tauri CLI native packages for all 6 platforms")
 except Exception as e:  # noqa: BLE001

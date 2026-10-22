@@ -77,7 +77,6 @@
         Accepted and ignored: the frontend install now always runs, because a
         node_modules that was resolved from a different lockfile is a tree nobody
         committed. -SkipInstall is the way out.
-    Reinstall the frontend even when node_modules exists.
 
 .PARAMETER NoSign
     Do not create updater artefacts even when TAURI_SIGNING_PRIVATE_KEY is set.
@@ -145,6 +144,10 @@ $CargoProfile = if ($DebugBuild) { 'debug' } else { 'release' }
 $RepoRoot    = $PSScriptRoot
 $DesktopDir  = [IO.Path]::Combine($RepoRoot, 'ui-desktop')
 $SrcTauriDir = [IO.Path]::Combine($DesktopDir, 'src-tauri')
+# The tree npm ci installs into. The retry below has to remove it before it
+# installs again, so it has to be named here rather than left to be guessed at
+# the point of use.
+$NodeModules = [IO.Path]::Combine($DesktopDir, 'node_modules')
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
 # src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 $ClientCrate = [IO.Path]::Combine($RepoRoot, 'crates', 'nexapipe-client', 'Cargo.toml')
@@ -422,7 +425,9 @@ try {
         # a tree nobody reviewed into a signed bundle. A platform whose native
         # binary the lockfile does not carry is a thing to fix in the lockfile.
         Write-Warn 'npx tauri is unusable after npm ci; the committed package-lock.json does not carry the @tauri-apps/cli native binary for this platform'
-        Remove-Item -LiteralPath $nodeModules -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $NodeModules) {
+            Remove-Item -LiteralPath $NodeModules -Recurse -Force -ErrorAction Stop
+        }
         Install-Frontend -Npm $npm
         if (-not (Test-TauriNativeBinding)) { Stop-Script 'npx tauri is still unusable after reinstalling' }
     }
