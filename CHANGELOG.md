@@ -394,6 +394,17 @@ lookup, which is what a config written before the key existed does.
   server move together, and `NEXAPIPE_QUIC_RECV_WINDOW` sets it for whoever
   wants another number.
 
+- **Opening a flow gets one budget, not a timeout per attempt.** Two retry
+  loops sat inside each other and each attempt had a timeout of its own, so a
+  CONNECT that could not be opened had **nine** thirty-second timeouts to
+  spend and could take **six minutes** to say so. The budget is taken once
+  now, at the start, and every attempt inside it shares what is left:
+  **ninety seconds**, which is what the three outer attempts were each
+  reaching for anyway.
+  The attempts themselves are unchanged — a dead pooled connection is still
+  retried on a fresh one, and a refusal is still final — and so is the
+  health accounting.
+
 ### Changed
 
 - **The client speaks the binary form of the handshake.** A handshake with a

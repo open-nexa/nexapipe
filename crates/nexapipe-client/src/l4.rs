@@ -26,19 +26,23 @@
 
 use crate::ClientError;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
-use crate::local_proxy::open_stream_with_retry;
+use crate::local_proxy::open_stream_with_retry_until;
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use nexapipe_proto::{L4Proto, Preface, Status};
 
-/// How long the server may take to answer the preface.
+/// How long opening a flow may take, however many attempts it takes.
 ///
-/// Generous on purpose: the server has to resolve and dial the backend before it can
-/// answer, and a cold database connection is slow.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// **One budget, not one per attempt.** The attempts used to have a timeout
+/// each, and there were nine of them — three outer, three inner, and one for
+/// reading the answer — so a flow that could not be opened could take six
+/// minutes to say so.
+///
+/// Ninety seconds is what the three outer attempts were each allowed, so this
+/// is the same budget the attempts were reaching for, spent once.
+const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Open a TCP flow to `host:port`.
 ///
@@ -84,7 +88,14 @@ pub async fn handshake(
 
     send.write_all(&preface).await?;
 
-    let status = read_status(recv, proto, host, port).await?;
+    let status = read_status_until(
+        recv,
+        proto,
+        host,
+        port,
+        tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT,
+    )
+    .await?;
     if status.is_ok() {
         Ok(())
     } else {
@@ -103,6 +114,11 @@ async fn open(
     })?;
 
     let mut last_err: Option<ClientError> = None;
+    // **One budget for the whole flow.** The outer attempts and the inner
+    // ones shared nothing: each of the nine dials had a timeout of its own,
+    // and the answer had another, so a flow that could not be opened could
+    // take six minutes to say so.
+    let deadline = tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT;
     // Whose health each attempt is spent on: see `open_stream_with_retry`, which
     // keeps the same list for the failures it discards on its own. Both lists
     // are writable only once every attempt has failed, so neither can condemn a
@@ -115,22 +131,28 @@ async fn open(
     for _attempt in 1..=crate::local_proxy::OPEN_ATTEMPTS {
         // `send` stays untouched: the caller writes the payload once the server has
         // accepted the flow, so nothing is pipelined behind the preface.
-        let (pooled, send, mut recv) =
-            match open_stream_with_retry(endpoint_group, host, Some(&preface)).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    // The helper has already said what it knows about the
-                    // attempts it spent. This reports the earlier ones recorded
-                    // above, which would otherwise leave no trace: `tried` is
-                    // dropped the moment this function returns, and a backend
-                    // that never answered the preface has every later request
-                    // dialling it again first.
-                    endpoint_group.record_request_failures(&tried);
-                    return Err(e);
-                }
-            };
+        let (pooled, send, mut recv) = match open_stream_with_retry_until(
+            endpoint_group,
+            host,
+            Some(&preface),
+            deadline,
+        )
+        .await
+        {
+            Ok(streams) => streams,
+            Err(e) => {
+                // The helper has already said what it knows about the
+                // attempts it spent. This reports the earlier ones recorded
+                // above, which would otherwise leave no trace: `tried` is
+                // dropped the moment this function returns, and a backend
+                // that never answered the preface has every later request
+                // dialling it again first.
+                endpoint_group.record_request_failures(&tried);
+                return Err(e);
+            }
+        };
 
-        match read_status(&mut recv, proto, host, port).await {
+        match read_status_until(&mut recv, proto, host, port, deadline).await {
             Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
             Ok(status) => {
                 // The server understood us and said no. Retrying the same request on a
@@ -166,11 +188,18 @@ async fn open(
 /// `read_exact` is documented as *not* being one, and this call sits inside a timeout. A
 /// timeout that fired after `read_exact` had already consumed the byte would leave the
 /// next attempt reading a payload byte as if it were a status.
-async fn read_status(
+/// Read the single status byte, mapping a missing or late one to a readable
+/// error.
+///
+/// The answer has to come inside the flow's budget: a server that never
+/// answers the preface must not hold the flow open for a timeout of its own.
+/// It used to have one of its own, on top of the attempts'.
+async fn read_status_until(
     recv: &mut RecvStream,
     proto: L4Proto,
     host: &str,
     port: u16,
+    deadline: tokio::time::Instant,
 ) -> Result<Status, ClientError> {
     let mut byte = [0u8; 1];
     let unannounced = |detail: String| {
@@ -180,7 +209,7 @@ async fn read_status(
         ))
     };
 
-    match tokio::time::timeout(STATUS_TIMEOUT, recv.read(&mut byte)).await {
+    match tokio::time::timeout_at(deadline, recv.read(&mut byte)).await {
         Ok(Ok(Some(1))) => Ok(Status::from_byte(byte[0])),
         // Zero bytes with a one-byte buffer: the peer finished the stream without
         // saying anything about the flow.
