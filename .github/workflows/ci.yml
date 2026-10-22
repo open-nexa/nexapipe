@@ -499,10 +499,11 @@ jobs:
         run: npx tauri --version
 
       # The lockfile must survive the install: a tree that was re-resolved
-      # would show up here as a changed file.
+      # would show up here as a changed file. The path is relative to the
+      # job's working directory, like every other path this job names.
       - name: the lockfile is unchanged
         shell: bash
-        run: git diff --exit-code -- ui-desktop/package-lock.json
+        run: git diff --exit-code -- package-lock.json
 
   desktop-check:
     name: desktop cargo check (${{ matrix.os }})
