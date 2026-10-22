@@ -53,7 +53,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -169,10 +169,17 @@ impl std::error::Error for ResolveError {
 pub trait Resolve: Send + Sync {
     /// The addresses `host` resolves to.
     ///
+    /// The port is **zero**: a DNS answer is about the name, and the port is
+    /// the caller's. The rest of the address is kept as it is — in particular
+    /// the scope id of a link-local IPv6 address, which is what says which
+    /// interface it belongs to. Reducing an answer to a bare `IpAddr` loses
+    /// that, and a backend on `fe80::1%lo0` becomes unreachable: the same
+    /// address on two interfaces is two addresses.
+    ///
     /// `Ok` with an empty list means the name does not exist. `Err` says why
     /// the resolver could not answer, and the two are remembered differently:
     /// see [`ResolveError`].
-    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError>;
+    fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, ResolveError>;
 }
 
 /// The system resolver, called on a blocking thread.
@@ -182,11 +189,12 @@ pub trait Resolve: Send + Sync {
 pub struct SystemResolver;
 
 impl Resolve for SystemResolver {
-    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+    fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, ResolveError> {
         // Port 0: the port is not part of a DNS answer, and it is added when
-        // the address is used.
+        // the address is used. The scope id of a link-local IPv6 address is
+        // part of the answer and is kept.
         match (host, 0u16).to_socket_addrs() {
-            Ok(addrs) => Ok(addrs.map(|addr| addr.ip()).collect()),
+            Ok(addrs) => Ok(addrs.collect()),
             Err(e) => Err(classify(e)),
         }
     }
@@ -200,7 +208,7 @@ impl Resolve for SystemResolver {
 struct ProcessResolver;
 
 impl Resolve for ProcessResolver {
-    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+    fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, ResolveError> {
         #[cfg(test)]
         {
             if let Some(resolver) = test_resolver() {
@@ -275,7 +283,7 @@ fn classify(error: io::Error) -> ResolveError {
 /// The answer the cache holds.
 enum Answer {
     /// The addresses the name resolves to.
-    Addresses(Vec<IpAddr>),
+    Addresses(Vec<SocketAddr>),
     /// Why the name does not resolve.
     Failure(ResolveError),
 }
@@ -297,7 +305,7 @@ struct Entry {
 
 impl Entry {
     /// The addresses, or the reason there are none.
-    fn answer(&self) -> Result<Vec<IpAddr>, ResolveError> {
+    fn answer(&self) -> Result<Vec<SocketAddr>, ResolveError> {
         match &self.answer {
             Answer::Addresses(addrs) => Ok(addrs.clone()),
             Answer::Failure(e) => Err(e.clone()),
@@ -327,7 +335,7 @@ fn used_at() -> u64 {
 /// The `OnceCell` runs its initializer once: the callers that arrive while
 /// the resolution runs wait for it and get its outcome.
 struct Flight {
-    outcome: tokio::sync::OnceCell<Result<Vec<IpAddr>, ResolveError>>,
+    outcome: tokio::sync::OnceCell<Result<Vec<SocketAddr>, ResolveError>>,
 }
 
 /// Forgets the flight when the resolution is over, however it ends.
@@ -380,7 +388,7 @@ impl DnsCache {
     ///
     /// A name that is not in the cache — or whose answer has expired — is
     /// resolved and remembered.
-    pub async fn resolve(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    pub async fn resolve(&self, host: &str) -> anyhow::Result<Vec<SocketAddr>> {
         if let Some(entry) = self.lookup(host) {
             return entry.answer().map_err(anyhow::Error::from);
         }
@@ -405,13 +413,15 @@ impl DnsCache {
     /// The addresses `host` resolves to, for a dial toward `port`.
     ///
     /// The port is the caller's: it is not part of the DNS answer and it is
-    /// not part of the cache's key.
+    /// not part of the cache's key. The rest of the address is the answer's
+    /// own, and is kept — in particular the scope id of a link-local IPv6
+    /// address, which is what says which interface it belongs to.
     pub async fn resolve_to(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         Ok(self
             .resolve(host)
             .await?
             .into_iter()
-            .map(|ip| SocketAddr::new(ip, port))
+            .map(|addr| with_port(addr, port))
             .collect())
     }
 
@@ -422,7 +432,7 @@ impl DnsCache {
     /// that is no longer there, and nothing reports it. A UDP flow therefore
     /// resolves its target every time it opens, the way it did before the
     /// cache existed.
-    pub async fn resolve_uncached(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    pub async fn resolve_uncached(&self, host: &str) -> anyhow::Result<Vec<SocketAddr>> {
         let resolver = self.resolver.clone();
         let name = host.to_string();
         match tokio::task::spawn_blocking(move || resolver.resolve(&name)).await {
@@ -433,7 +443,7 @@ impl DnsCache {
     }
 
     /// The resolution itself, and what is remembered about it.
-    async fn resolve_once(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+    async fn resolve_once(&self, host: &str) -> Result<Vec<SocketAddr>, ResolveError> {
         // The answer may have arrived while this caller waited for the
         // flight.
         if let Some(entry) = self.lookup(host) {
@@ -586,10 +596,28 @@ static CACHE: LazyLock<DnsCache> = LazyLock::new(|| {
     )
 });
 
+/// The same address, on another port.
+///
+/// The port is the caller's and the answer does not carry one. The rest of
+/// the address is the answer's own and is kept: in particular the scope id of
+/// a link-local IPv6 address, which is what says which interface it belongs
+/// to. A link-local address without it is unreachable.
+pub(crate) fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
+        SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+            *v6.ip(),
+            port,
+            v6.flowinfo(),
+            v6.scope_id(),
+        )),
+    }
+}
+
 /// The addresses `host` resolves to.
 ///
 /// Cached, and the answer is what the last resolution said until it expires.
-pub async fn resolve(host: &str) -> anyhow::Result<Vec<IpAddr>> {
+pub async fn resolve(host: &str) -> anyhow::Result<Vec<SocketAddr>> {
     CACHE.resolve(host).await
 }
 
@@ -604,19 +632,20 @@ pub async fn resolve_to(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>
 /// The addresses `host` resolves to, right now, without the cache.
 ///
 /// The UDP path uses this, and the module doc says why.
-pub async fn resolve_uncached(host: &str) -> anyhow::Result<Vec<IpAddr>> {
+pub async fn resolve_uncached(host: &str) -> anyhow::Result<Vec<SocketAddr>> {
     CACHE.resolve_uncached(host).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::atomic::AtomicUsize;
 
     /// What the test resolver answers with.
     #[derive(Clone)]
     enum Answer {
-        Addresses(Vec<IpAddr>),
+        Addresses(Vec<SocketAddr>),
         /// The name does not exist.
         NotFound,
         /// The resolver could not answer.
@@ -660,7 +689,7 @@ mod tests {
     }
 
     impl Resolve for Counting {
-        fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+        fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, ResolveError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if !self.delay.is_zero() {
                 std::thread::sleep(self.delay);
@@ -682,17 +711,39 @@ mod tests {
                 ))),
                 // A name the table does not mention resolves: the tests that
                 // care about a name that does not exist say so in the table.
-                None => Ok(vec![ip(9)]),
+                None => Ok(vec![socket(9)]),
             }
         }
     }
 
-    fn ip(last: u8) -> IpAddr {
-        IpAddr::from([10, 0, 0, last])
+    /// An address the table answers with.
+    fn socket(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::from([10, 0, 0, last]), 0)
+    }
+
+    /// A link-local IPv6 address on an interface, the way a resolver answers
+    /// it: the scope id is what says which interface it belongs to.
+    fn link_local(scope_id: u32) -> SocketAddr {
+        SocketAddr::V6(SocketAddrV6::new(
+            "fe80::1"
+                .parse::<std::net::Ipv6Addr>()
+                .expect("a literal address"),
+            0,
+            0,
+            scope_id,
+        ))
+    }
+
+    /// The scope id of an address, or zero for one that has none.
+    fn scope_of(addr: &SocketAddr) -> u32 {
+        match addr {
+            SocketAddr::V4(_) => 0,
+            SocketAddr::V6(v6) => v6.scope_id(),
+        }
     }
 
     fn addresses(host: &str, last: u8) -> HashMap<String, Answer> {
-        HashMap::from([(host.to_string(), Answer::Addresses(vec![ip(last)]))])
+        HashMap::from([(host.to_string(), Answer::Addresses(vec![socket(last)]))])
     }
 
     fn cache(resolver: Arc<Counting>) -> DnsCache {
@@ -813,6 +864,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_link_local_address_keeps_its_interface() {
+        // The scope id is what says which interface a link-local IPv6 address
+        // belongs to: the same address on two interfaces is two addresses, and
+        // an address without it cannot be reached at all. The old code
+        // resolved the name and kept only the address, so the interface was
+        // lost and a backend on `fe80::1%lo0` became unreachable.
+        let resolver = Arc::new(Counting::new(HashMap::from([(
+            "link.test".to_string(),
+            Answer::Addresses(vec![link_local(7)]),
+        )])));
+        let cache = cache(resolver.clone());
+
+        let first = cache.resolve("link.test").await.expect("the name resolves");
+        assert_eq!(
+            scope_of(&first[0]),
+            7,
+            "the interface must survive the resolution"
+        );
+
+        // And it must survive being remembered and handed out again.
+        let second = cache.resolve("link.test").await.expect("the name resolves");
+        assert_eq!(
+            scope_of(&second[0]),
+            7,
+            "the interface must survive the cache"
+        );
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "the second resolution should not have gone to the resolver"
+        );
+
+        // And it must reach the dial, with the port the caller asked for.
+        let addrs = cache
+            .resolve_to("link.test", 8080)
+            .await
+            .expect("the name resolves");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(scope_of(&addrs[0]), 7, "the interface must reach the dial");
+        assert_eq!(addrs[0].port(), 8080, "the caller's port must be used");
+    }
+
+    #[tokio::test]
     async fn an_expired_answer_is_resolved_again() {
         let resolver = Arc::new(Counting::new(addresses("db.test", 1)));
         let cache = DnsCache::new(
@@ -871,10 +965,10 @@ mod tests {
         let cache = cache(resolver.clone());
 
         let cached = cache.resolve("db.test").await.expect("the name resolves");
-        assert_eq!(cached, vec![ip(1)]);
+        assert_eq!(cached, vec![socket(1)]);
 
         // The record moves.
-        resolver.set("db.test", Answer::Addresses(vec![ip(2)]));
+        resolver.set("db.test", Answer::Addresses(vec![socket(2)]));
 
         let fresh = cache
             .resolve_uncached("db.test")
@@ -882,14 +976,14 @@ mod tests {
             .expect("the name resolves");
         assert_eq!(
             fresh,
-            vec![ip(2)],
+            vec![socket(2)],
             "the uncached resolution must not answer from the cache"
         );
 
         let still_cached = cache.resolve("db.test").await.expect("the name resolves");
         assert_eq!(
             still_cached,
-            vec![ip(1)],
+            vec![socket(1)],
             "the uncached resolution must not fill the cache either"
         );
         assert_eq!(resolver.calls(), 2);
@@ -938,8 +1032,8 @@ mod tests {
         let resolver = Arc::new(Counting::new(HashMap::from([
             ("gone1.test".to_string(), Answer::NotFound),
             ("gone2.test".to_string(), Answer::NotFound),
-            ("live1.test".to_string(), Answer::Addresses(vec![ip(1)])),
-            ("live2.test".to_string(), Answer::Addresses(vec![ip(2)])),
+            ("live1.test".to_string(), Answer::Addresses(vec![socket(1)])),
+            ("live2.test".to_string(), Answer::Addresses(vec![socket(2)])),
         ])));
         // The negative TTL is zero, so the names that do not exist are
         // expired the moment they are stored.

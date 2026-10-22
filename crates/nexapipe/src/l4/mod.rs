@@ -755,7 +755,7 @@ async fn resolve_udp_target(host: &str, port: u16) -> anyhow::Result<SocketAddr>
         })?
         .into_iter()
         .next()
-        .map(|ip| SocketAddr::new(ip, port))
+        .map(|addr| crate::dns::with_port(addr, port))
         .ok_or_else(|| anyhow::anyhow!("backend {host}:{port} resolved to no address"))
 }
 
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     impl crate::dns::Resolve for StubResolver {
-        fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, crate::dns::ResolveError> {
+        fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, crate::dns::ResolveError> {
             let known = self
                 .answers
                 .lock()
@@ -1727,7 +1727,7 @@ mod tests {
                 .get(host)
                 .cloned();
             match known {
-                Some(addrs) => Ok(addrs),
+                Some(addrs) => Ok(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()),
                 // Everything else is the system's business.
                 None => crate::dns::SystemResolver.resolve(host),
             }
@@ -1766,7 +1766,10 @@ mod tests {
         let cached = crate::dns::resolve("udp.test")
             .await
             .expect("the name resolves");
-        assert_eq!(cached, vec![IpAddr::from([127, 0, 0, 2])]);
+        assert_eq!(
+            cached,
+            vec![SocketAddr::new(IpAddr::from([127, 0, 0, 2]), 0)]
+        );
 
         // And now the name resolves to the backend.
         stub.set("udp.test", vec![IpAddr::from([127, 0, 0, 1])]);
