@@ -574,7 +574,9 @@ pub async fn handle_bidi_stream(
 
     // The body is read once, before the first attempt: the bytes come off the
     // client's stream, and that stream has them only once. A retry sends the
-    // same bytes again, which is only possible because they were kept.
+    // same bytes again, which is only possible because they were kept — and
+    // only a body that is **whole** is kept. A body that is streamed is read
+    // as the backend asks for it, so there is no second copy of it to send.
     //
     // A WebSocket upgrade has no body to read: the session starts where the
     // head ends, and the bytes after it are frames.

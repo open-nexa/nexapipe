@@ -506,15 +506,19 @@ where
     })
 }
 
-/// The largest request body this proxy will read into memory.
+/// The largest request body this proxy will carry.
 ///
-/// `content-length` is whatever the client says it is, and the request is
-/// buffered whole before it is forwarded, so taking the declaration at face
-/// value lets a client choose how much this process allocates — one stream at a
-/// time, and a peer can open many. Well past any ordinary upload; a deployment
-/// that needs to push larger bodies should stream them instead of raising this.
+/// `content-length` is whatever the client says it is, and the limit is
+/// checked against that declaration before a byte of the body is read — so
+/// this bounds one request whatever the client says it is sending.
 ///
-/// This bounds one request. How many such bodies may be held at once is
+/// What the process **holds** is a different matter. A body that declares a
+/// length is streamed: the bytes are read from the client as the backend asks
+/// for them, and only a buffer is held rather than the upload. A body with
+/// no length — a chunked one — is read whole, because the proxy re-frames it
+/// as one buffer with a length of its own, and this is what bounds that.
+///
+/// How many such bodies may be held at once is
 /// [`ByteBudget`](crate::conn::limits::ByteBudget)'s, which is why a body is
 /// only read once it has been given a reservation from it.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
@@ -525,19 +529,20 @@ const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 /// message (RFC 7230 6.1): `connection: keep-alive` is about the client's link
 /// to this proxy, and forwarding it asks the backend to keep *its* link open
 /// for a request that arrived over a different one. `transfer-encoding` is in
-/// the same group and has to go: the body has already been read whole and is
-/// sent as a single buffer, so a leftover `chunked` would disagree with the
-/// framing on the wire.
+/// the same group and has to go: the body is sent with a length of the
+/// proxy's own, so a leftover `chunked` would disagree with the framing on
+/// the wire.
 ///
 /// `proxy-authorization` is in the same group and is the one that matters most:
 /// it is a credential for *this* proxy, and forwarding it hands that credential
 /// to a third-party server. `proxy-authenticate` goes with it — it is the
 /// challenge this proxy answers, and the backend has no business seeing it.
 ///
-/// `expect: 100-continue` is dropped for a different reason. The proxy reads
-/// the body before it ever asks the backend anything, so the client's
-/// expectation was answered by this process — and a backend told to expect
-/// more would wait for bytes that are already here.
+/// `expect: 100-continue` is dropped for a different reason. The expectation
+/// is the client's, about the client's link to this proxy, and this proxy
+/// does not answer it with a `100` of its own: a client that waits for one
+/// before sending its body waits until the body's deadline. Forwarding the
+/// header would only tell the backend to wait as well.
 ///
 /// The WebSocket handshake does not use this: it is the one request that
 /// *must* carry `upgrade` and `connection`, because switching protocols is
@@ -1642,8 +1647,9 @@ fn build_backend_request(
 
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
-        // routing works. The body below is read whole and sent as one buffer,
-        // so `transfer-encoding` and friends must not claim otherwise.
+        // routing works. The body below is sent with a length of the proxy's
+        // own — whole, or streamed — so `transfer-encoding` and friends must
+        // not claim otherwise.
         if !forwards_request_header(name.as_str()) {
             continue;
         }
