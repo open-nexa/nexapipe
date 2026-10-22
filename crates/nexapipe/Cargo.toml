@@ -98,6 +98,9 @@ tempfile = '3.8'
 rcgen = "0.13"
 # The benchmarks; see docs/benchmarks.md.
 criterion = { workspace = true }
+# The same crate the validator uses, so a test can generate the code of an
+# *earlier* step: the client's own generator only makes the current one.
+totp-rs = { version = '6.0', features = ['gen_secret', 'zeroize'] }
 
 [[bench]]
 name = "l4_forward"
