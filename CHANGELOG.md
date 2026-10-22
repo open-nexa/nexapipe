@@ -443,6 +443,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A configuration reload reads the file once, and not under the auth
+  lock.** The file was read twice — once for the routes and once for the 2FA
+  clients — so the two halves could be applied from two different revisions of
+  it, and the second read happened while the auth write lock was held: every
+  handshake and every lockout write waited for the disk. The reload now takes
+  one snapshot, reads it outside the lock, and merges it under. An enrollment
+  that lands while the file is being read is noticed and the file is read
+  again, so a spent token is never handed out twice.
 - **A value the server cannot read is refused.** `algorithm = "sha-512"`,
   `strategy = "round-robin"` and `mode = "pass-through"` were each quietly
   turned into something else: SHA1, round-robin and `http`. Both ends of the

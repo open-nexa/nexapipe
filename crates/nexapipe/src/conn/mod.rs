@@ -108,6 +108,18 @@ pub struct AuthState {
     config: Arc<tokio::sync::RwLock<AuthConfig>>,
     path: String,
     state_path: String,
+    /// How many enrollments have been applied to the live config.
+    ///
+    /// The configuration watcher reads the file **before** it takes the lock
+    /// that guards the live config, and an enrollment that lands in between
+    /// would be undone by the merge: it spends a token by changing the live
+    /// state and only then writing the change back, so a snapshot taken a
+    /// moment earlier still carries the spent token and the pre-enrollment
+    /// secret.
+    ///
+    /// This counter is the witness. It is sampled before the read and compared
+    /// under the lock, and the two cannot disagree about what happened.
+    enroll_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AuthState {
@@ -121,7 +133,25 @@ impl AuthState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             path,
             state_path,
+            enroll_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// How many enrollments have been applied to the live config so far.
+    ///
+    /// Sampled before a read of the file and compared under the lock, to see
+    /// whether an enrollment landed while the file was being read.
+    pub fn enroll_epoch(&self) -> u64 {
+        self.enroll_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records that an enrollment has been applied to the live config.
+    ///
+    /// Under the same lock the enrollment itself holds, so a reader cannot see
+    /// the counter move and the state not yet changed, or the other way round.
+    pub fn bump_enroll_epoch(&self) {
+        self.enroll_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The shared config to validate against.
@@ -1392,6 +1422,12 @@ async fn enroll_client(
     const REFUSED: &str = "the enrollment token was not accepted";
 
     let mut cfg = auth.config().write().await;
+
+    // The watcher reads the file before it takes this same lock, so a
+    // snapshot it took a moment ago may be about to be merged over the top of
+    // this enrollment. The epoch is how it finds out: it is sampled before
+    // the read and compared under the lock, and this is where it moves.
+    auth.bump_enroll_epoch();
 
     // Drop a lockout that has run out before deciding anything, so an expired
     // one does not read as live and its stale counter does not push the client
