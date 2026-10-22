@@ -864,6 +864,13 @@ lookup, which is what a config written before the key existed does.
   signature and whether Gatekeeper accepts it. A release built without the
   credentials is signed by nothing and says so rather than quietly shipping
   an unsigned app. The README names the secrets and the variables.
+  The **application inside the disk image** is what is notarized: the
+  bundler submits it to Apple, waits for the answer and staples the ticket
+  to it, so an app copied out of the image opens on a Mac that has never seen
+  it before. The **image itself** is signed — it is the artifact the release
+  publishes — but it carries no ticket of its own, because the bundler
+  notarizes the application and signs the image. The job log says so too,
+  rather than leaving the gap to be found by a user.
   The updater path was never affected: the minisign signature is verified
   against a pinned key before anything is extracted or installed, so an
   update could not be swapped even though the initial download could.
@@ -911,7 +918,7 @@ lookup, which is what a config written before the key existed does.
   filesystem, and the one into the updater.
   A renderer that can run script is a renderer that can ask for all three,
   and the answer was "yes" to each.
->- **A registration code no longer silently replaces a working credential.**
+- **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
   enrollment code was neither: it carries no secret, so it raised no conflict,
