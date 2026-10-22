@@ -25,10 +25,22 @@
 //!
 //! They are the cost **on this machine, over the loopback interface**. A
 //! handshake over a real path costs more, and how much more is a property of
-//! the path rather than of the code. What the pair is for is the **ratio**:
-//! a connection is the round trip that a flow does not pay, and it is the
-//! difference between the two that says what splitting the protocol would
-//! cost a client that uses both.
+//! the path rather than of the code.
+//!
+//! **The two numbers are not commensurable, and their difference is not a
+//! result.** A handshake is CPU work — the key exchange and the packet
+//! protection — and it is what a second connection would cost. A flow on an
+//! open connection is a *wait*: for the far side to answer the preface, and
+//! for this task to be woken up. That wait belongs to the machine's scheduler
+//! rather than to the protocol, so it moves with the machine's load: the same
+//! code comes out several times larger in its median iteration than in its
+//! best one, while the handshake's number stays in the same band.
+//!
+//! So the pair says what each of the two costs on its own. It does **not**
+//! say that one is "a round trip more" than the other, and the difference
+//! between the two must not be read as what splitting the protocol would
+//! cost. What a second connection costs is **a handshake**, paid once per
+//! endpoint and protocol.
 //!
 //! The counts are not measured here — `flow_connections` measures how many
 //! connections a hundred flows open, and it measures them on the far side's
@@ -169,6 +181,9 @@ impl Harness {
     /// connection is dropped at the end of it, so the next iteration pays for
     /// its own — which is the point, because the question is what one
     /// connection costs.
+    ///
+    /// The work is CPU — the key exchange and the packet protection — so the
+    /// number stays in the same band whether the machine is busy or quiet.
     async fn open_connection(&self) -> Duration {
         let start = Instant::now();
         let connection = self
@@ -186,7 +201,9 @@ impl Harness {
     /// The first flow pays for the connection as well; the second one does
     /// not, because the pool keeps it and the flow borrows it. So the second
     /// flow is the one this measures, and what it costs is the preface and
-    /// the status byte — one round trip, and no handshake.
+    /// the status byte — one round trip, and no handshake. Most of what it
+    /// costs is the **wait** for that round trip, so the number moves with
+    /// the machine's load; the module's header says what follows from that.
     ///
     /// The far side counts the connections it is given, and the count is
     /// checked: **a flow that opened a connection would be a handshake
@@ -223,6 +240,14 @@ fn connection_cost(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("a benchmark runtime");
 
     let mut group = c.benchmark_group("connection_cost");
+
+    // A handshake is a millisecond and every sample builds a fresh iroh
+    // endpoint, so criterion's default of a hundred samples does not fit in
+    // its five-second window: it warns on every run, and the mean it reports
+    // is an average over a very noisy population. Ten samples is what
+    // `flow_connections` uses, and it is enough here — the point of this bench
+    // is what each of the two numbers is, not a difference between them.
+    group.sample_size(10);
 
     group.bench_function("open_connection", |b| {
         b.iter_custom(|iters| {

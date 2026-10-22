@@ -1,6 +1,6 @@
 # Benchmarks
 
-Seven benches, on the paths that carry user traffic. They exist because until
+Nine benches, on the paths that carry user traffic. They exist because until
 they landed every performance claim in this repository was an expectation
 rather than a result — the reasoning behind that is in
 [`size-perf-roadmap.md`](size-perf-roadmap.md) §F1.
@@ -15,6 +15,7 @@ rather than a result — the reasoning behind that is in
 | `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
+| `connection_cost` | `crates/nexapipe-client/benches/connection_cost.rs` | what one connection costs: a QUIC handshake, and a flow on a connection that is already open |
 
 And one measurement that is not a bench, because what it measures is memory
 and not time: [`tun_flow_memory`](#what-a-flow-costs).
@@ -34,7 +35,7 @@ have changed since are marked:
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
 | `connection_cost/open_connection` | **910,820 ns** | one QUIC handshake: **what a second connection would cost** if the protocol were chosen with ALPN |
-| `connection_cost/open_flow` | **809,230 ns** | a flow on a connection that is already open: the round trip a flow pays, and the difference between the two rows is what a connection adds |
+| `connection_cost/open_flow` | **809,230 ns** | a flow on a connection that is already open: the round trip a flow pays. **The two rows are not commensurable** — see the note below |
 
 The two `route_lookup` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they were
@@ -119,6 +120,7 @@ cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 cargo bench -p nexapipe-client --features local-proxy --bench local_request
 cargo bench -p nexapipe-client --features local-proxy --bench flow_connections
+cargo bench -p nexapipe-client --features local-proxy --bench connection_cost
 cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe --bench request_path
 cargo bench -p nexapipe-client --bench domain_match
@@ -253,6 +255,15 @@ in nanoseconds, so the report reads `33 ns` for a request that made 33
 allocations; that is the encoding, and it is deliberate, because the number
 belongs in the report next to the times.
 
+It is the server's **plaintext listener** path, driven through
+`http::proxy_request`. The QUIC tunnel path reaches the same backend through
+`http::proxy_to_backend_streaming` and shares the part of the work this bench
+is about — the route lookup, the balancer, the origin and the URI. The two
+paths build the backend request through different functions, so the header
+copying and the body handling are not shared, and this bench measures the
+plaintext one. What the tunnel adds on top is the transport, and the
+transport is not what these numbers are about.
+
 **`connection_cost`** is what one connection costs, and it is the number a
 decision about choosing the protocol with ALPN needs: the protocol would be
 chosen at the handshake, so a client that speaks both HTTP and L4 would open
@@ -267,10 +278,22 @@ It measures two:
   quietly opened a connection of its own would fail the bench rather than
   report a handshake's number under a flow's name.
 
-The two together are the ratio that matters: **a connection costs about a
-round trip more than a flow does**, so the price of a second connection is
-one handshake, paid once per endpoint and protocol, and then amortized over a
-connection the pool keeps for hours.
+The two are **not commensurable, and their difference is not a result.** A
+handshake is CPU work — the key exchange and the packet protection — and it is
+what a second connection would cost. A flow on an open connection is a *wait*:
+for the far side to answer the preface, and for this task to be woken up. That
+wait belongs to the machine's scheduler rather than to the protocol, so it
+moves with the machine's load: the same code comes out several times larger
+in its median iteration than in its best one, while the handshake's number
+stays in the same band. The flow's own run-to-run spread is larger than the
+difference between the two rows, and the sign of that difference changes
+between runs.
+
+So the pair says what each of the two costs **on its own**. It does **not** say
+that one is "a round trip more" than the other, and the difference between the
+two must not be read as what splitting the protocol would cost. What a second
+connection costs is **a handshake**, paid once per endpoint and protocol, and
+then amortized over a connection the pool keeps for hours.
 
 **The other half of the price is memory**, and it is an example rather than a
 bench — `crates/nexapipe-client/examples/connection_memory.rs` counts the heap
@@ -288,15 +311,6 @@ server's share is a cost of its own, whatever the client does.
 The per-connection readings that example prints are **bursty** — a connection's
 buffers are not all allocated when it opens — so the number to read is the
 total divided by the count, and that one is stable.
-
-It is the server's **plaintext listener** path, driven through
-`http::proxy_request`. The QUIC tunnel path reaches the same backend through
-`http::proxy_to_backend_streaming` and shares the part of the work this bench
-is about — the route lookup, the balancer, the origin and the URI. The two
-paths build the backend request through different functions, so the header
-copying and the body handling are not shared, and this bench measures the
-plaintext one. What the tunnel adds on top is the transport, and the
-transport is not what these numbers are about.
 
 **`flow_connections`** is the client asking how many QUIC connections its
 flows open. The client keeps a pool of connections to each backend, and a

@@ -57,6 +57,26 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **What a second connection costs is measured now.** The protocol a stream
+  carries is chosen by its first byte today, so **one** connection carries
+  both the HTTP requests and the L4 tunnels a client makes to the same
+  endpoint. Choosing it at the handshake instead would give each protocol a
+  connection of its own, and a client that uses both would pay for a second
+  one — a number nobody had.
+  It is **911 µs** for a QUIC handshake and **809 µs** for a flow on a
+  connection that is already open. The two are **not commensurable, and their
+  difference is not a result**: a handshake is CPU work — the key exchange and
+  the packet protection — while a flow on an open connection is a *wait*, for
+  the far side to answer the preface and for the task to be woken up. That
+  wait belongs to the machine's scheduler rather than to the protocol, so it
+  moves with the machine's load, and the flow's run-to-run spread is larger
+  than the difference between the two numbers. What a second connection costs
+  is therefore **a handshake**, paid once per endpoint and protocol, and then
+  amortized over a connection the pool keeps for hours.
+  The other half of the price is measured too: a connection holds **110 KiB**
+  of heap, counting both ends — a client's share is at most half of that. So
+  a second connection costs **under a millisecond and about fifty kilobytes**.
+
 - **A name the configuration does not name exactly is found by an index.**
   The client kept a map of the configured domains, and a name that was not in
   it exactly — which is **every** name a TUN device asks about, since those
@@ -547,21 +567,6 @@ lookup, which is what a config written before the key existed does.
   The attempts themselves are unchanged — a dead pooled connection is still
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
-
-- **What a second connection costs is measured now.** The protocol a stream
-  carries is chosen by its first byte today, so **one** connection carries
-  both the HTTP requests and the L4 tunnels a client makes to the same
-  endpoint. Choosing it at the handshake instead would give each protocol a
-  connection of its own, and a client that uses both would pay for a second
-  one — a number nobody had.
-  It is **911 µs** for a QUIC handshake and **809 µs** for a flow on a
-  connection that is already open. The difference is about a hundred
-  microseconds: **a connection costs about one round trip more than a flow
-  does**, paid once per endpoint and protocol, and then amortized over a
-  connection the pool keeps for hours.
-  The other half of the price is measured too: a connection holds **110 KiB**
-  of heap, counting both ends — a client's share is at most half of that. So
-  a second connection costs **under a millisecond and about fifty kilobytes**.
 
 ### Changed
 

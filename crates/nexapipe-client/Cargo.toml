@@ -136,4 +136,3 @@ required-features = ["tun-proxy"]
 # number is memory, not time, and the time is the benchmark's job.
 [[example]]
 name = "connection_memory"
-
