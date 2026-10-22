@@ -96,6 +96,14 @@ fn create_http_client_with_tls(
         // stays in the pool until something else notices.
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The pool's own idle reaper needs a clock as well. The `timer` above
+        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // the client panics the first time it negotiates h2. The pool is
+        // separate: without a timer of its own, an idle connection to a
+        // backend that stopped answering is only reaped when something else
+        // notices, and the `pool_idle_timeout` above is enforced lazily, at
+        // the next checkout.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         // The h2 half needs a clock of its own: an HTTP/2 connection
         // carries its own timeouts — a ping that has to be answered, a
         // stream that has to be reset — and without a timer the client
@@ -312,6 +320,14 @@ fn create_h2c_client_with_tls(
         .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        // The pool's own idle reaper needs a clock as well. The `timer` above
+        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // the client panics the first time it negotiates h2. The pool is
+        // separate: without a timer of its own, an idle connection to a
+        // backend that stopped answering is only reaped when something else
+        // notices, and the `pool_idle_timeout` above is enforced lazily, at
+        // the next checkout.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         // The clock the h2 half needs, for the same reason the other client
         // has one: an h2 connection times things on its own.
         .timer(hyper_util::rt::TokioTimer::new())
@@ -1501,11 +1517,15 @@ pub async fn proxy_to_backend_streaming(
     let has_content_length = parts.headers.get("content-length").is_some();
 
     for (name, value) in parts.headers.iter() {
-        let name_lower = name.as_str().to_lowercase();
+        // The name is **already** lower case: HTTP header names are
+        // case-insensitive and the parser folds them, so this is a borrow and
+        // not a copy. It used to be a `to_lowercase` per header, which is an
+        // allocation for every header of every response.
+        let name_lower = name.as_str();
         // A header that belongs to the hop between the backend and this
         // process does not belong on the hop between this process and the
         // client.
-        if !forwards_response_header(&name_lower) {
+        if !forwards_response_header(name_lower) {
             continue;
         }
         // Dropped, not duplicated: the id we write below is the one our own
