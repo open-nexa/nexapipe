@@ -1743,6 +1743,20 @@ async fn set_tray_labels(app: AppHandle, show_label: String, quit_label: String)
     }
 }
 
+/// Writes the connection state onto the tray icon.
+///
+/// The words come from the renderer, which is the only side that knows the status
+/// and the language it should be said in.
+///
+/// Infallible on purpose, like [`set_tray_labels`]: the state on the tray is
+/// information, and a tray that cannot be written to is still a working tray.
+#[tauri::command]
+async fn set_tray_status(app: AppHandle, status: String) {
+    if let Err(e) = tray::set_status(&app, &status) {
+        tracing::warn!("the tray status could not be written: {e}");
+    }
+}
+
 /// How long the window stays hidden waiting for the frontend to paint, before it is shown
 /// anyway.
 ///
@@ -1962,6 +1976,7 @@ pub fn run() {
             is_background_launch,
             is_tray_available,
             set_tray_labels,
+            set_tray_status,
             quit::finish_quit,
             quit::quit_guard_ready
         ]);

@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty-seven things land in this cycle so far: the device credential can be a **key**
+Thirty things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -28,7 +28,10 @@ config file can say rather than only an environment variable can, a name is
 spelled the same way in a client's list and in the server's routes, a client
 can be held to the ports it may reach and not only to the names, both clients
 can say how far away the path carrying the traffic is, the desktop app can
-stay in the tray instead of ending with its window, the third-party boundary
+stay in the tray instead of ending with its window, the desktop app can bring
+the tunnel back by itself after a restart, a login launch can show its window
+when the user wants to see it, the tray icon says whether the tunnel is up,
+the third-party boundary
 is two settings now rather than one, the Android app can bring the tunnel back
 after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
@@ -519,6 +522,29 @@ lookup, which is what a config written before the key existed does.
   it now works — on a desktop with no tray it says so and the close button
   keeps ending the app, because a hidden window with nowhere to come back from
   is an app nobody can reach.
+
+- **The desktop app can come back by itself.** A machine that woke up with the
+  tunnel down was a machine that forwarded nothing until someone opened the app
+  and pressed a button. "Connect after login" brings it up by itself, and it is
+  off until the user says otherwise: a proxy that reconnects on its own forwards
+  traffic on its own. It only happens for a launch the *machine* asked for — a
+  launch the user made is a launch the user is already looking at.
+
+- **A login launch can show its window.** The start-up entry used to mean one
+  thing: the app comes up in the tray, and there was no way to ask otherwise.
+  "Start silently" is now a preference, on by default, so a user who wants to
+  see the app arrive at login can have it — without the entry being rewritten,
+  because "the machine started this" and "this launch should be quiet" are two
+  different statements and are now two different things.
+
+- **The tray icon says whether the tunnel is up.** The icon is the app's only
+  always-on surface, and a window nobody opened is a window nobody is looking
+  at; the state was only visible by opening the app. The icon now carries it as
+  a word — "Nexa — Connected" — because a coloured dot would ask the user to
+  learn what the colour means. A failure says so too, rather than the same word
+  as "not connected": one is a switch that is off, the other is a switch that
+  was turned on and did not work. It is a state, not a control: the menu still
+  offers exactly what it did.
 
 - **`allow_ports` limits a client to the services it may reach.** `allow_hosts`
   says which *names* a client may reach, and a name is not a service: a host

@@ -28,6 +28,9 @@ import type {
   TrafficTotals,
 } from '../types';
 import { useConfigStore } from './config';
+import { usePrefsStore } from './prefs';
+import { isBackgroundLaunch } from '../api/autostart';
+import { setTrayStatus } from '../api/tray';
 import { takeIssuedCredential } from '../api/invite';
 import { translate } from '../i18n';
 import { useToast } from '../composables/useToast';
@@ -211,6 +214,40 @@ function isAppError(value: unknown): value is AppError {
   return typeof value === 'object' && value !== null && typeof (value as AppError).code === 'string';
 }
 
+/**
+ * Writes the connection state onto the tray icon.
+ *
+ * The tray is the app's only always-on surface: a window nobody opened is a
+ * window nobody is looking at, and the icon is where the state is written down.
+ *
+ * The words are the user's language, so they are resolved here rather than in
+ * the backend — the same arrangement the menu labels use.
+ *
+ * A failure is its own word rather than the same one as "not connected": the
+ * two mean different things to the user — one is a switch that is off, the
+ * other is a switch that was turned on and did not work — and the tray is the
+ * only place a start nobody watched can say so.
+ *
+ * Infallible: a tray that cannot be written to is still a working tray, and a
+ * failed write must not become a failed status read.
+ */
+async function writeTrayStatus(): Promise<void> {
+  const state = status.value;
+  const text = state.running
+    ? translate('tray.connected')
+    : state.mode === 'starting'
+      ? translate('tray.connecting')
+      : startupError.value
+        ? translate('tray.failed')
+        : translate('tray.disconnected');
+
+  try {
+    await setTrayStatus(text);
+  } catch (error) {
+    console.error('[proxy] the tray status could not be written:', error);
+  }
+}
+
 /** Reads the status (and, while running, the node ID). Returns whether the read succeeded. */
 async function refresh(): Promise<boolean> {
   try {
@@ -232,6 +269,7 @@ async function refresh(): Promise<boolean> {
         resetRateSample();
       }
       status.value = result;
+      void writeTrayStatus();
     }
     if (result.running) {
       await refreshNodeId();
@@ -787,6 +825,41 @@ export async function initProxyState(): Promise<void> {
   await refresh();
   // From here on the panel keeps itself up to date; nothing in the UI has to ask for a refresh.
   startPolling();
+  // Written once here as well as on every change: the tray says what the state is from the
+  // moment the app is up, rather than from the moment the state first moves.
+  await writeTrayStatus();
+  await autoConnectIfWanted();
+}
+
+/**
+ * Brings the tunnel up by itself, when the user asked for that.
+ *
+ * Only for a launch the *machine* asked for. A launch the user made is a launch
+ * the user is already looking at, and starting the tunnel under their hands
+ * without being asked is not what "connect after login" says.
+ *
+ * Skipped when the tunnel is already up: the service keeps a tunnel it started
+ * across a restart of the desktop app, and asking it for a second one would
+ * replace a working tunnel with a new one.
+ *
+ * The failure is the tray's business rather than the window's. `start` reports
+ * a failure with a toast, and nobody is watching a window the machine opened
+ * — so the state is read back and written to the tray, which is the surface
+ * that is always on screen.
+ */
+async function autoConnectIfWanted(): Promise<void> {
+  if (!usePrefsStore().prefs.autoConnect) return;
+  if (status.value.running) return;
+  if (!(await isBackgroundLaunch())) return;
+
+  await start();
+
+  // `start` swallows its own failure and reports it with a toast, so the state
+  // is read rather than caught: a failed automatic connection leaves the tunnel
+  // down, and the tray has to say so.
+  if (!status.value.running) {
+    await writeTrayStatus();
+  }
 }
 
 /**

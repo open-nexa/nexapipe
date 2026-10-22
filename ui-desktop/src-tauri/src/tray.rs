@@ -119,6 +119,33 @@ pub fn set_labels(app: &AppHandle, show_label: &str, quit_label: &str) -> tauri:
     Ok(())
 }
 
+/// Writes the connection state onto the tray icon.
+///
+/// The state is a word rather than a colour: the icon is the app's only always-on
+/// surface, and "Connected" beside it says what a coloured dot would, without
+/// asking the user to learn what the colour means.
+///
+/// Two surfaces, because the platforms do not offer the same one. A tooltip is
+/// unsupported on Linux — the appindicator backend has no tooltip — and the title
+/// is unsupported on Windows. Each platform uses the one it has, so the state is
+/// visible everywhere rather than on some desktops and not others.
+///
+/// Best effort: a tray that cannot be written to is still a working tray, and the
+/// failure is logged rather than raised.
+pub fn set_status(app: &AppHandle, status: &str) -> tauri::Result<()> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "linux")]
+    let result = tray.set_title(Some(status));
+
+    #[cfg(not(target_os = "linux"))]
+    let result = tray.set_tooltip(Some(status));
+
+    result
+}
+
 /// The menu itself.
 ///
 /// Rebuilt rather than patched: a menu's items are what it is, and swapping one
