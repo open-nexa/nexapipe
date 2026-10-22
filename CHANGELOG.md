@@ -443,6 +443,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A value the server cannot read is refused.** `algorithm = "sha-512"`,
+  `strategy = "round-robin"` and `mode = "pass-through"` were each quietly
+  turned into something else: SHA1, round-robin and `http`. Both ends of the
+  handshake read the same config, so a name nobody supports does not fail on
+  one side and the other — the deployment just runs differently from the one
+  in the file, and nothing says so. The three keys are refused now, with an
+  error that names the key, the value and the spellings that are accepted.
+  Every spelling that has always worked still works.
 - **The client refuses an algorithm it does not support.** The client's
   parser matched `sha256` and `sha512` and turned **everything else** into
   SHA1 — `sha-256`, `SHA3-256`, a typo, an empty string. A name that is

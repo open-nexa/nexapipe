@@ -1242,8 +1242,8 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
             redirect_to_https: _,
         } = spec;
 
-        let strategy = get_strategy(&strategy);
-        let modes = get_route_modes(&mode, &modes);
+        let strategy = get_strategy(&strategy)?;
+        let modes = get_route_modes(&mode, &modes)?;
         let path_is_prefix = path_is_prefix.unwrap_or(true);
         let label = format!("route {host_pattern}");
 
@@ -1583,48 +1583,57 @@ pub fn ensure_config_file(path: &str) -> anyhow::Result<bool> {
     })
 }
 
-pub fn get_strategy(strategy: &Option<String>) -> crate::lb::LoadBalancingStrategy {
+/// Reads the `strategy` key.
+///
+/// **Refused rather than guessed.** A strategy the operator did not ask for is
+/// a deployment that runs differently from the one in the file, and nothing
+/// says so: the traffic still flows, just not the way the config claims, and a
+/// mistyped strategy is otherwise invisible.
+///
+/// The spellings that have always worked are still accepted.
+pub fn get_strategy(strategy: &Option<String>) -> anyhow::Result<crate::lb::LoadBalancingStrategy> {
     match strategy.as_deref() {
-        Some("random") | Some("Random") => crate::lb::LoadBalancingStrategy::Random,
+        Some("random") | Some("Random") => Ok(crate::lb::LoadBalancingStrategy::Random),
         Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => {
-            crate::lb::LoadBalancingStrategy::RoundRobin
+            Ok(crate::lb::LoadBalancingStrategy::RoundRobin)
         }
         Some("least_conn") | Some("LeastConn") | Some("leastconn") => {
-            crate::lb::LoadBalancingStrategy::LeastConn
+            Ok(crate::lb::LoadBalancingStrategy::LeastConn)
         }
-        // Unrecognised values keep meaning round-robin rather than failing to
-        // load, and they say so: a mistyped strategy is otherwise invisible —
-        // traffic still flows, just not the way the config claims — and there
-        // is nowhere else this could be reported.
-        None => crate::lb::LoadBalancingStrategy::RoundRobin,
-        Some(other) => {
-            tracing::warn!(
-                "Unknown load balancing strategy {other:?}; falling back to round_robin \
-                 (accepted: \"round_robin\", \"random\", \"least_conn\")"
-            );
-            crate::lb::LoadBalancingStrategy::RoundRobin
-        }
+        None => Ok(crate::lb::LoadBalancingStrategy::RoundRobin),
+        Some(other) => anyhow::bail!(
+            "strategy {other:?} is not a load balancing strategy; expected \"round_robin\" \
+             (the default), \"random\" or \"least_conn\""
+        ),
     }
 }
 
-pub fn get_route_mode(mode: &Option<String>) -> RouteMode {
+/// Reads the `mode` key.
+///
+/// Refused rather than guessed, for the reason [`get_strategy`] gives: a route
+/// that serves something other than what the file says is a routing surprise
+/// nobody is told about.
+pub fn get_route_mode(mode: &Option<String>) -> anyhow::Result<RouteMode> {
     match mode.as_deref() {
-        None => RouteMode::Http,
+        None => Ok(RouteMode::Http),
         Some(name) => parse_route_mode(name),
     }
 }
 
 /// One mode name, as written in `mode` or in one entry of `modes`.
-pub fn parse_route_mode(mode: &str) -> RouteMode {
+///
+/// Refused rather than guessed, for the reason [`get_strategy`] gives. The
+/// spellings that have always worked are still accepted.
+pub fn parse_route_mode(mode: &str) -> anyhow::Result<RouteMode> {
     match mode {
-        "http" | "Http" | "HTTP" => RouteMode::Http,
-        "passthrough" | "Passthrough" => RouteMode::Passthrough,
-        "tcp" | "Tcp" | "TCP" => RouteMode::Tcp,
-        "udp" | "Udp" | "UDP" => RouteMode::Udp,
-        other => {
-            tracing::warn!("Unknown route mode {:?}, falling back to \"http\"", other);
-            RouteMode::Http
-        }
+        "http" | "Http" | "HTTP" => Ok(RouteMode::Http),
+        "passthrough" | "Passthrough" => Ok(RouteMode::Passthrough),
+        "tcp" | "Tcp" | "TCP" => Ok(RouteMode::Tcp),
+        "udp" | "Udp" | "UDP" => Ok(RouteMode::Udp),
+        other => anyhow::bail!(
+            "mode {other:?} is not a route mode; expected \"http\" (the default), \
+             \"passthrough\", \"tcp\" or \"udp\""
+        ),
     }
 }
 
@@ -1635,21 +1644,24 @@ pub fn parse_route_mode(mode: &str) -> RouteMode {
 /// nothing": it leaves `mode` (or the `http` default) in place, because a route
 /// that serves no mode is a silent hole in the table rather than a meaningful
 /// configuration.
-pub fn get_route_modes(mode: &Option<String>, modes: &Option<Vec<String>>) -> Vec<RouteMode> {
+pub fn get_route_modes(
+    mode: &Option<String>,
+    modes: &Option<Vec<String>>,
+) -> anyhow::Result<Vec<RouteMode>> {
     let mut resolved: Vec<RouteMode> = Vec::new();
 
     if let Some(single) = mode {
-        push_mode(&mut resolved, parse_route_mode(single));
+        push_mode(&mut resolved, parse_route_mode(single)?);
     }
     for name in modes.iter().flatten() {
-        push_mode(&mut resolved, parse_route_mode(name));
+        push_mode(&mut resolved, parse_route_mode(name)?);
     }
 
-    if resolved.is_empty() {
+    Ok(if resolved.is_empty() {
         vec![RouteMode::Http]
     } else {
         resolved
-    }
+    })
 }
 
 fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
@@ -2117,10 +2129,20 @@ impl ProxyConfig {
                         }
                     }
 
-                    let algorithm = match auth_toml.algorithm.as_deref() {
+                    // Refused rather than guessed. Both ends of the handshake
+                    // read the same config, so a name nobody supports does not
+                    // fail on one side and the other: the deployment just runs
+                    // weaker than the operator wrote, and nothing says so.
+                    let algorithm = match auth_toml.algorithm.as_deref().map(str::trim) {
+                        None | Some("") | Some("sha1") | Some("SHA1") => {
+                            crate::auth::TotpAlgorithm::SHA1
+                        }
                         Some("sha256") | Some("SHA256") => crate::auth::TotpAlgorithm::SHA256,
                         Some("sha512") | Some("SHA512") => crate::auth::TotpAlgorithm::SHA512,
-                        _ => crate::auth::TotpAlgorithm::SHA1,
+                        Some(other) => anyhow::bail!(
+                            "algorithm {other:?} is not a TOTP algorithm; expected \"sha1\" \
+                             (the default), \"sha256\" or \"sha512\""
+                        ),
                     };
 
                     let time_step = auth_toml.time_step.unwrap_or(30);
@@ -4401,41 +4423,104 @@ backends = ["http://10.0.0.5:8080"]
     #[test]
     fn least_conn_is_a_strategy_a_config_can_ask_for() {
         assert!(matches!(
-            get_strategy(&Some("least_conn".to_string())),
+            get_strategy(&Some("least_conn".to_string())).expect("least_conn"),
             crate::lb::LoadBalancingStrategy::LeastConn
         ));
         assert!(matches!(
-            get_strategy(&Some("LeastConn".to_string())),
+            get_strategy(&Some("LeastConn".to_string())).expect("LeastConn"),
             crate::lb::LoadBalancingStrategy::LeastConn
         ));
-        // A typo is not one of them, and it must not silently become a strategy
-        // that ignores load either.
         assert!(matches!(
-            get_strategy(&Some("least_conns".to_string())),
+            get_strategy(&Some("round_robin".to_string())).expect("round_robin"),
             crate::lb::LoadBalancingStrategy::RoundRobin
         ));
+        assert!(matches!(
+            get_strategy(&Some("Random".to_string())).expect("Random"),
+            crate::lb::LoadBalancingStrategy::Random
+        ));
+        // A typo is not one of them, and it is refused rather than becoming a
+        // strategy that ignores load without saying so.
+        let error =
+            get_strategy(&Some("least_conns".to_string())).expect_err("a typo is not a strategy");
+        let message = error.to_string();
+        assert!(message.contains("strategy"), "{message}");
+        assert!(message.contains("least_conns"), "{message}");
+        assert!(message.contains("round_robin"), "{message}");
     }
 
     #[test]
     fn route_mode_defaults_to_http() {
-        assert_eq!(get_route_mode(&None), RouteMode::Http);
-        assert_eq!(get_route_mode(&Some("http".to_string())), RouteMode::Http);
+        assert_eq!(get_route_mode(&None).expect("the default"), RouteMode::Http);
         assert_eq!(
-            get_route_mode(&Some("passthrough".to_string())),
-            RouteMode::Passthrough
-        );
-        // A typo warns and stays on http: better a plain route than one that
-        // silently accepts bytes it cannot serve.
-        assert_eq!(
-            get_route_mode(&Some("pass-through".to_string())),
+            get_route_mode(&Some("http".to_string())).expect("http"),
             RouteMode::Http
         );
+        assert_eq!(
+            get_route_mode(&Some("passthrough".to_string())).expect("passthrough"),
+            RouteMode::Passthrough
+        );
+        // A typo is refused: a route that serves something other than what the
+        // file says is a routing surprise nobody is told about.
+        let error =
+            get_route_mode(&Some("pass-through".to_string())).expect_err("a typo is not a mode");
+        let message = error.to_string();
+        assert!(message.contains("mode"), "{message}");
+        assert!(message.contains("pass-through"), "{message}");
+        assert!(message.contains("passthrough"), "{message}");
+    }
+
+    /// An algorithm the server cannot read is refused.
+    ///
+    /// Both ends of the handshake read the same config, so a name nobody
+    /// supports does not fail on one side and the other: the deployment just
+    /// runs weaker than the operator wrote, and nothing says so.
+    #[test]
+    fn an_algorithm_the_server_cannot_read_is_refused() {
+        let error = load_with_algorithm("sha-512").expect_err("nobody supports it");
+        let message = error.to_string();
+        assert!(message.contains("algorithm"), "{message}");
+        assert!(message.contains("sha-512"), "{message}");
+        assert!(message.contains("sha256"), "{message}");
+    }
+
+    /// The algorithm names that have always worked still work.
+    #[test]
+    fn the_algorithm_names_that_worked_still_work() {
+        for (name, expected) in [
+            ("sha1", crate::auth::TotpAlgorithm::SHA1),
+            ("SHA1", crate::auth::TotpAlgorithm::SHA1),
+            ("sha256", crate::auth::TotpAlgorithm::SHA256),
+            ("SHA256", crate::auth::TotpAlgorithm::SHA256),
+            ("sha512", crate::auth::TotpAlgorithm::SHA512),
+            ("SHA512", crate::auth::TotpAlgorithm::SHA512),
+        ] {
+            let config = load_with_algorithm(name).expect("the algorithm is read");
+            assert_eq!(config.algorithm, expected, "{name} is read as it was");
+        }
+    }
+
+    /// A config with an algorithm the server cannot read does not load.
+    fn load_with_algorithm(algorithm: &str) -> anyhow::Result<crate::auth::AuthConfig> {
+        let source = format!(
+            "[auth]\nenabled = true\nalgorithm = \"{algorithm}\"\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n"
+        );
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, source).expect("the config is written");
+        let (_, auth) = ProxyConfig::load_with_auth(path.to_str().expect("a path"))?;
+        auth.ok_or_else(|| anyhow::anyhow!("the config has no [auth] section"))
     }
 
     #[test]
     fn l4_route_modes_are_recognised() {
-        assert_eq!(get_route_mode(&Some("tcp".to_string())), RouteMode::Tcp);
-        assert_eq!(get_route_mode(&Some("UDP".to_string())), RouteMode::Udp);
+        assert_eq!(
+            get_route_mode(&Some("tcp".to_string())).expect("tcp"),
+            RouteMode::Tcp
+        );
+        assert_eq!(
+            get_route_mode(&Some("UDP".to_string())).expect("UDP"),
+            RouteMode::Udp
+        );
         assert!(RouteMode::Tcp.is_l4());
         assert!(RouteMode::Udp.is_l4());
         assert!(!RouteMode::Http.is_l4());
@@ -4556,7 +4641,10 @@ idle_timeout_secs = 120
 
         let routes = config.routes.as_ref().unwrap();
         assert_eq!(routes.len(), 1);
-        assert_eq!(get_route_mode(&routes[0].mode), RouteMode::Tcp);
+        assert_eq!(
+            get_route_mode(&routes[0].mode).expect("the mode"),
+            RouteMode::Tcp
+        );
         assert_eq!(routes[0].path_pattern, "/");
         assert_eq!(
             routes[0].client_ports.as_deref(),
@@ -4575,7 +4663,10 @@ backends = ["udp://10.0.0.60:3478"]
 "#,
         );
         let routes = config.routes.as_ref().unwrap();
-        assert_eq!(get_route_mode(&routes[0].mode), RouteMode::Udp);
+        assert_eq!(
+            get_route_mode(&routes[0].mode).expect("the mode"),
+            RouteMode::Udp
+        );
         assert!(routes[0].client_ports.is_none());
         assert!(routes[0].idle_timeout_secs.is_none());
         assert!(validate_backend("route turn", RouteMode::Udp, &routes[0].backends[0]).is_ok());
@@ -4632,7 +4723,10 @@ backends = ["caddy:443"]
 
         let routes = config.routes.as_ref().unwrap();
         assert_eq!(routes.len(), 1);
-        assert_eq!(get_route_mode(&routes[0].mode), RouteMode::Passthrough);
+        assert_eq!(
+            get_route_mode(&routes[0].mode).expect("the mode"),
+            RouteMode::Passthrough
+        );
         // `path_pattern` is required by the struct but meaningless here, so it
         // defaults rather than having to be written out.
         assert_eq!(routes[0].path_pattern, "/");
