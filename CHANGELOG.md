@@ -329,9 +329,9 @@ lookup, which is what a config written before the key existed does.
   backend.** The status table was read **inside** the loop that probes the
   backends, so the whole table — every backend's status, and a copy of its
   address — was read again for each backend in it. One round of probes over
-  fifty backends did two thousand five hundred and one reads and copies,
-  every interval, for no reason: a probe reports, it does not change the
-  state, so the answer is the same every time it is asked.
+  fifty backends read the table two thousand five hundred times, every
+  interval, for no reason: a probe reports, it does not change the state, so
+  the answer is the same every time it is asked.
   It is read once now, and looked up.
 
 ### Changed

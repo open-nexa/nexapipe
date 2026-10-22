@@ -145,7 +145,12 @@ impl HealthChecker {
         // reads and string copies for one round of probes, every interval.
         // The table is the same for the whole round — a probe reports, it does
         // not change the state — so one read is the same answer as N of them.
-        let statuses: HashMap<String, bool> = self
+        //
+        // The one thing that does change it is this loop's own writes, so the
+        // snapshot follows them: a pool is allowed to name the same backend
+        // twice, and the second time round the answer has to be the one the
+        // first time round left behind, not the one the round started with.
+        let mut statuses: HashMap<String, bool> = self
             .backend_pool
             .get_backend_statuses()
             .await
@@ -161,6 +166,7 @@ impl HealthChecker {
                 if current_healthy == Some(false) {
                     tracing::info!("Backend {} recovered, marking healthy", url);
                     self.backend_pool.set_backend_health(&url, true).await;
+                    statuses.insert(url.clone(), true);
                 }
                 continue;
             }
@@ -184,6 +190,7 @@ impl HealthChecker {
                     failures
                 );
                 self.backend_pool.set_backend_health(&url, false).await;
+                statuses.insert(url.clone(), false);
             }
         }
     }
@@ -376,6 +383,7 @@ mod tests {
     use crate::http;
     use crate::lb::LoadBalancingStrategy;
     use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A port nothing listens on: the probe fails immediately, with no network
     /// and no server to stand up.
@@ -600,6 +608,95 @@ mod tests {
         assert!(
             !healthy(&pool, DEAD_BACKEND).await,
             "two consecutive failures reached the threshold"
+        );
+    }
+
+    /// A backend that answers the first request and fails the second, so that
+    /// a round which probes it twice sees it change state under its own feet.
+    ///
+    /// The answers are counted, not timed: the first request is answered with
+    /// a 200 and every one after it with a 500, so which probe sees which
+    /// answer does not depend on how fast the machine is.
+    async fn flapping_backend() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local port needs no network");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            let mut answered = 0u32;
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                answered += 1;
+                let status = if answered == 1 {
+                    "200 OK"
+                } else {
+                    "500 Internal Server Error"
+                };
+
+                // The request is read before the answer is written: a client
+                // that is still writing when the answer arrives would see a
+                // reset instead of the status.
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let response =
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (url, server)
+    }
+
+    /// A pool is allowed to name the same backend twice, so one round probes
+    /// it twice.
+    ///
+    /// The status the round reads has to be the status the round itself
+    /// wrote: a backend that recovers and fails again inside one round has to
+    /// end that round marked unhealthy, because the last probe is the one that
+    /// counts. Reading the status once and never updating it left the round
+    /// believing the backend was still unhealthy, and the second probe's
+    /// failure was dropped on the floor.
+    #[tokio::test]
+    async fn a_backend_named_twice_ends_the_round_marked_by_its_last_probe() {
+        let (backend, _server) = flapping_backend().await;
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone(), backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+
+        // The round starts with the backend down, so that the first probe —
+        // which the server answers — is the one that recovers it.
+        pool.set_backend_health(&backend, false).await;
+
+        let checker = checker(pool.clone(), 1, Arc::new(AtomicBool::new(true)));
+        checker.check_all_backends().await;
+
+        assert!(
+            !healthy(&pool, &backend).await,
+            "the second probe failed, so the backend ends the round marked unhealthy"
+        );
+    }
+
+    /// The same round, with the backend down from the start and staying down:
+    /// the status is written once, and the failure is counted once.
+    #[tokio::test]
+    async fn a_backend_named_twice_is_marked_once_per_round() {
+        let backend = DEAD_BACKEND.to_string();
+        let pool = Arc::new(BackendPool::new(
+            vec![backend.clone(), backend.clone()],
+            LoadBalancingStrategy::RoundRobin,
+        ));
+        let checker = checker(pool.clone(), 1, Arc::new(AtomicBool::new(true)));
+
+        checker.check_all_backends().await;
+
+        assert!(
+            !healthy(&pool, &backend).await,
+            "a failed probe at the threshold empties the pool"
         );
     }
 
