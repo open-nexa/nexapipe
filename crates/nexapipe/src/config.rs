@@ -2197,6 +2197,8 @@ impl ProxyConfig {
                                     last_used: client_toml.last_used,
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
+                                    enrollment_failed_attempts: 0,
+                                    enrollment_locked_until: None,
                                 },
                             );
                         }
