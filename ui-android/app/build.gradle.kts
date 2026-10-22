@@ -115,7 +115,18 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // On. The release APK used to ship every class, every method and
+            // every debug log line under their own names, which tells a reader
+            // of the APK exactly how the credential handling is built — and
+            // which is the part of this app worth understanding before
+            // attacking it.
+            //
+            // The rules that keep the app working are in proguard-rules.pro.
+            // The JNI entry points are the important ones: the Rust side
+            // exports them by name and the runtime looks them up by name, so
+            // R8 must not rename the class or the methods.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

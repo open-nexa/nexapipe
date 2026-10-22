@@ -180,7 +180,7 @@ fn tun_pump(c: &mut Criterion) {
             // production path the frame is handed to the stack and freed
             // there, and a free inside the loop would be a cost the path does
             // not pay at this point. The batch is what keeps the memory
-            // bounded -- criterion runs this loop tens of millions of times,
+            // bounded — criterion runs this loop tens of millions of times,
             // and a frame per iteration would be gigabytes of it.
             let mut frames = Vec::with_capacity(FRAMES_PER_BATCH as usize);
             let mut elapsed = std::time::Duration::ZERO;
@@ -234,7 +234,7 @@ fn tun_pump(c: &mut Criterion) {
                 const TASKS: usize = 8;
 
                 // The lookups are **split** between the tasks, so that the
-                // number criterion reports is the time of one lookup -- the
+                // number criterion reports is the time of one lookup — the
                 // same thing the single-task case above reports, and the two
                 // can be compared.
                 //
@@ -243,7 +243,7 @@ fn tun_pump(c: &mut Criterion) {
                 // not match the work would report a number that is not the
                 // time of one lookup. The remainder goes to the first tasks,
                 // because `iters` is not always a multiple of the task count
-                // -- criterion's warm-up starts at one iteration.
+                // — criterion's warm-up starts at one iteration.
                 let per_task = iters / TASKS as u64;
                 let remainder = iters % TASKS as u64;
 

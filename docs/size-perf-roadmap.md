@@ -321,7 +321,7 @@ for the server's request path:
 The allocation count is the instrument the per-request candidates in F2 need.
 Three of them — the route lookup re-normalising the host per route, the
 balancer taking three locks, and the backend URI being rebuilt from scratch —
-are all allocation counts in disguise, and 42 is the number they have to beat.
+are all allocation counts in disguise, and 33 is the number they have to beat.
 Two more rows, measured on **2026-10-22** on the same machine and toolchain, for
 the connections a client's flows open:
 
@@ -388,7 +388,10 @@ with the allocation count beside it, which is the number the per-request
 candidates in F2 have to beat. The caveat is the path: it is the **plaintext
 listener's**, driven through `http::proxy_request`. The QUIC tunnel path
 reaches the same backend through `http::proxy_to_backend_streaming` and shares
-every per-request cost, and what it adds is the transport — so what is now
+the part of the work this bench is about — the route lookup, the balancer, the
+origin and the URI; the two paths build the backend request through different
+functions, so the header copying and the body handling are not shared. What
+the tunnel adds on top is the transport — so what is now
 measured is the server's own work for a request, and the transport's share of
 a request is still an expectation.
 

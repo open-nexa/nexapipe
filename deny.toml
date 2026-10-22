@@ -41,10 +41,11 @@ unsound = "none"
 yanked = "warn"
 #
 # The same three advisories are ignored for `cargo audit` in
-# ui-desktop/src-tauri/.cargo/audit.toml, and the two tools have to agree:
-# cargo-deny does not read that file, so an ignore that lives only there is
-# invisible here — and the desktop check failed on exactly these three until
-# they were written down in both places.
+# ui-desktop/src-tauri/.cargo/audit.toml, which is what a local `cargo audit`
+# run in that directory reads. The two lists have to agree: cargo-deny does
+# not read that file, so an ignore that lives only there is invisible here —
+# and the desktop check failed on exactly these three until they were written
+# down in both places.
 #
 # RUSTSEC-2026-0367/0368/0369: symlink and SUID/SGID handling flaws in
 # `zip::ZipArchive::extract`, fixed only in zip >= 9.0.0. zip enters this
