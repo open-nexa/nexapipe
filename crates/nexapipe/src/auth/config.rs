@@ -28,6 +28,22 @@ impl TotpAlgorithm {
     }
 }
 
+impl From<&TotpAlgorithm> for nexapipe_proto::auth::Algorithm {
+    /// The algorithm as it travels.
+    ///
+    /// The configuration has its own spelling of the three algorithms and the
+    /// wire has its own, and this is where the two meet: the wire's is a
+    /// closed type, so a name that is not one of the three cannot be put on
+    /// it at all.
+    fn from(algorithm: &TotpAlgorithm) -> Self {
+        match algorithm {
+            TotpAlgorithm::SHA1 => nexapipe_proto::auth::Algorithm::Sha1,
+            TotpAlgorithm::SHA256 => nexapipe_proto::auth::Algorithm::Sha256,
+            TotpAlgorithm::SHA512 => nexapipe_proto::auth::Algorithm::Sha512,
+        }
+    }
+}
+
 /// Main authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
@@ -223,6 +239,28 @@ pub struct ClientAuth {
     /// Lockout expiry time (Unix timestamp)
     #[serde(default)]
     pub locked_until: Option<u64>,
+    /// How many times in a row a guess at the pending enrollment token was wrong.
+    ///
+    /// A counter of its own, and not [`Self::failed_attempts`]: a client id is
+    /// not a secret — it is in the invite link, in `nexapipe client list` and in
+    /// whatever the operator pasted into a ticket — so anybody who knows one
+    /// can send enrollment attempts at a client that is waiting to enroll.
+    /// Counting those against the client's own counter meant a stranger could
+    /// lock out the devices that had already enrolled, over a credential those
+    /// devices were never sent. This one counts what is spent on the token
+    /// instead.
+    ///
+    /// It has its own window as well — [`Self::enrollment_locked_until`] — so
+    /// the token keeps a ceiling on guessing, and the ceiling is not paid for
+    /// by the client's authentication.
+    #[serde(default)]
+    pub enrollment_failed_attempts: u32,
+    /// When the enrollment lockout runs out, as a Unix timestamp.
+    ///
+    /// The enrollment slot's own lockout, separate from
+    /// [`Self::locked_until`] for the reason the counter above is separate.
+    #[serde(default)]
+    pub enrollment_locked_until: Option<u64>,
 }
 
 /// Handwritten so `secret` and `pending_enrollment` stay out of logs.
@@ -249,6 +287,11 @@ impl std::fmt::Debug for ClientAuth {
             .field("last_used", &self.last_used)
             .field("failed_attempts", &self.failed_attempts)
             .field("locked_until", &self.locked_until)
+            .field(
+                "enrollment_failed_attempts",
+                &self.enrollment_failed_attempts,
+            )
+            .field("enrollment_locked_until", &self.enrollment_locked_until)
             .finish()
     }
 }
@@ -340,8 +383,9 @@ impl AuthConfig {
     /// The whole config used to be cloned on every attempt worth counting, and
     /// a clone copies every client's secret and enrollment token with it — once
     /// per wrong code, from any peer that can name a client id. Only
-    /// `failed_attempts`, `locked_until`, `last_used` and each device's
-    /// `last_used` are persisted, so only those travel. Extend this alongside
+    /// `failed_attempts`, `locked_until`, `enrollment_failed_attempts`,
+    /// `enrollment_locked_until`, `last_used` and each device's `last_used` are
+    /// persisted, so only those travel. Extend this alongside
     /// `save_auth_state`, or a field added there is silently written as empty.
     pub fn counter_snapshot(&self) -> AuthConfig {
         AuthConfig {
@@ -396,6 +440,8 @@ impl AuthConfig {
                             last_used: client.last_used,
                             failed_attempts: client.failed_attempts,
                             locked_until: client.locked_until,
+                            enrollment_failed_attempts: client.enrollment_failed_attempts,
+                            enrollment_locked_until: client.enrollment_locked_until,
                         },
                     )
                 })
@@ -497,6 +543,56 @@ impl ClientAuth {
         self.failed_attempts += 1;
         if self.failed_attempts >= max_attempts {
             self.locked_until = Some(unix_now() + lockout_duration);
+        }
+    }
+
+    /// Whether the enrollment slot is locked out.
+    ///
+    /// The enrollment's own lockout, not the client's: a client that is
+    /// waiting to enroll and a client whose devices have already enrolled are
+    /// two situations, and only the first is what a guess at a token touches.
+    pub fn is_enrollment_locked_out(&self) -> bool {
+        self.enrollment_locked_until
+            .is_some_and(|until| unix_now() < until)
+    }
+
+    /// Clears an enrollment lockout whose time has run out.
+    ///
+    /// The same rule as [`Self::refresh_lockout`], for the enrollment's own
+    /// counter: without this the count stays where the last refusal left it,
+    /// so the first mistake after the window ends locks the slot out again
+    /// immediately, and every lockout after the first is one attempt long.
+    pub fn refresh_enrollment_lockout(&mut self) {
+        let now = unix_now();
+        if self
+            .enrollment_locked_until
+            .is_some_and(|until| until <= now)
+        {
+            self.enrollment_locked_until = None;
+            self.enrollment_failed_attempts = 0;
+        }
+    }
+
+    /// Clears the enrollment counters once the token has been spent.
+    ///
+    /// The token is gone after a successful enrollment, so the guesses at it
+    /// are spent too: keeping the count would leave the next invite — which
+    /// replaces this token, not extends it — starting one mistake away from a
+    /// lockout earned by a token that no longer exists.
+    pub fn record_enrollment_success(&mut self) {
+        self.enrollment_failed_attempts = 0;
+        self.enrollment_locked_until = None;
+    }
+
+    /// Records a guess at the pending enrollment token that was wrong.
+    ///
+    /// The enrollment's own counter, so the client this is about goes on
+    /// authenticating: the devices that already hold a credential are not
+    /// paying for somebody guessing at a token they were never sent.
+    pub fn record_enrollment_failure(&mut self, max_attempts: u32, lockout_duration: u64) {
+        self.enrollment_failed_attempts += 1;
+        if self.enrollment_failed_attempts >= max_attempts {
+            self.enrollment_locked_until = Some(unix_now() + lockout_duration);
         }
     }
 
@@ -736,6 +832,8 @@ mod tests {
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         }
     }
 

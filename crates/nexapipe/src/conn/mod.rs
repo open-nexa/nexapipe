@@ -1157,6 +1157,14 @@ impl EnrollmentVerdict {
 /// a wrong code cannot be traded for extra attempts by going through
 /// enrollment.
 ///
+/// **What a counted refusal moves is the enrollment's own counter.** A client
+/// id is not a secret — it is in the invite link and in whatever the operator
+/// pasted into a ticket — so anybody who knows one can send enrollment
+/// attempts at a client that is waiting to enroll. Counting those against the
+/// client's authentication counter meant the devices that had already enrolled
+/// were locked out over a credential they were never sent. The token keeps its
+/// ceiling, and the ceiling is paid for by the token.
+///
 /// A name that is already in the table is refused too. An enrollment token
 /// proves the invite reached *someone*, not which device it reached — the name
 /// is chosen by the client at enrollment time — so accepting any name turned a
@@ -1175,6 +1183,13 @@ fn enrollment_verdict(
         return EnrollmentVerdict::Refuse { counted: false };
     };
     if client.is_locked_out() {
+        return EnrollmentVerdict::Refuse { counted: false };
+    }
+    // The enrollment slot's own lockout, checked the same way. The window
+    // belongs to the token: a guess at the token closes the slot for a while,
+    // and it does not close the client's authentication — the devices that
+    // already hold a credential are not what a stranger is guessing at.
+    if client.is_enrollment_locked_out() {
         return EnrollmentVerdict::Refuse { counted: false };
     }
     // An empty token is refused on both sides before the comparison runs.
@@ -1400,6 +1415,31 @@ fn undo_enrolled_secret(cfg: &mut AuthConfig, client_id: &str, slot: EnrollmentS
     client.pending_enrollment = Some(SecretString::new(token.to_string()));
 }
 
+/// The counted refusal: what a wrong guess at a token moves.
+///
+/// **The enrollment's own counter, and not the client's.** A client id is not
+/// a secret — it is in the invite link, in `nexapipe client list` and in
+/// whatever the operator pasted into a ticket — so anybody who knows one can
+/// send enrollment attempts at a client that is waiting to enroll. Counting
+/// those against the client's authentication counter meant a stranger could
+/// lock out the devices that had already enrolled, over a credential those
+/// devices were never sent. The token keeps its ceiling; the ceiling is paid
+/// for by the token.
+///
+/// Public because it is the rule, and a rule that only one caller can reach
+/// is a rule nobody can state: the state file's round trip is checked against
+/// this function, so the two cannot drift apart.
+pub fn count_enrollment_failure(
+    cfg: &mut AuthConfig,
+    client_id: &str,
+    max_attempts: u32,
+    lockout_duration: u64,
+) {
+    if let Some(client) = cfg.clients.get_mut(client_id) {
+        client.record_enrollment_failure(max_attempts, lockout_duration);
+    }
+}
+
 /// Issues a credential against an enrollment token: a freshly generated secret,
 /// or the device key the client offered.
 ///
@@ -1435,6 +1475,7 @@ async fn enroll_client(
     // straight back over the threshold.
     if let Some(client) = cfg.clients.get_mut(client_id) {
         client.refresh_lockout();
+        client.refresh_enrollment_lockout();
     }
 
     let verdict = enrollment_verdict(&cfg, client_id, token, device);
@@ -1457,9 +1498,7 @@ async fn enroll_client(
         }
         if verdict.counted() {
             let (max_attempts, lockout_duration) = (cfg.max_attempts, cfg.lockout_duration);
-            if let Some(client) = cfg.clients.get_mut(client_id) {
-                client.record_failure(max_attempts, lockout_duration);
-            }
+            count_enrollment_failure(&mut cfg, client_id, max_attempts, lockout_duration);
             let snapshot = cfg.counter_snapshot();
             if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
                 save_auth_state(path, &snapshot)
@@ -1491,7 +1530,7 @@ async fn enroll_client(
     // Read off the config before the client is borrowed again: the credential
     // issued here has to be generated with what the server will verify against.
     let (algorithm, digits, period) = (
-        cfg.algorithm.name().to_string(),
+        nexapipe_proto::auth::Algorithm::from(&cfg.algorithm),
         cfg.digits,
         cfg.time_step as u64,
     );
@@ -1607,14 +1646,20 @@ async fn enroll_client(
     // Presenting the token is proof the invite reached the right hands, so a
     // counter left over from failed guesses is cleared: a client that just
     // enrolled should not be one wrong code away from a lockout it did not
-    // earn. Only written when there is something to clear, as above.
-    let dirty = cfg
-        .clients
-        .get(client_id)
-        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+    // earn. The token's own counter is cleared with it — the token has been
+    // spent, and the next invite replaces it rather than inheriting the
+    // guesses made at this one. Only written when there is something to
+    // clear, as above.
+    let dirty = cfg.clients.get(client_id).is_some_and(|c| {
+        c.failed_attempts != 0
+            || c.locked_until.is_some()
+            || c.enrollment_failed_attempts != 0
+            || c.enrollment_locked_until.is_some()
+    });
     if dirty {
         if let Some(client) = cfg.clients.get_mut(client_id) {
             client.record_success();
+            client.record_enrollment_success();
         }
         let snapshot = cfg.counter_snapshot();
         if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
@@ -2684,8 +2729,8 @@ mod tests {
     use super::{
         AuthState, EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
         blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
-        enrollment_verdict, find_headers_end, issue_enrolled_secret, persist_auth_state,
-        read_stream_head, undo_enrolled_secret,
+        count_enrollment_failure, enrollment_verdict, find_headers_end, issue_enrolled_secret,
+        persist_auth_state, read_stream_head, undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_proto::secret::SecretString;
@@ -2996,6 +3041,8 @@ mod tests {
                 last_used: None,
                 failed_attempts: 0,
                 locked_until: None,
+                enrollment_failed_attempts: 0,
+                enrollment_locked_until: None,
             },
         );
         cfg
@@ -3186,6 +3233,78 @@ mod tests {
             enrollment_verdict(&cfg, "alice", "", None),
             EnrollmentVerdict::Refuse { counted: true }
         );
+    }
+
+    /// **What the counting costs is the enrollment's own counter.**
+    ///
+    /// A client id is not a secret: it is in the invite link, in `nexapipe
+    /// client list` and in whatever the operator pasted into a ticket. So
+    /// anybody who knows one can send enrollment attempts at a client that is
+    /// waiting to enroll — and while those attempts were counted against the
+    /// client's authentication counter, the devices that had already enrolled
+    /// were locked out over a credential they were never sent.
+    #[test]
+    fn a_wrong_token_is_counted_against_the_enrollment_and_not_the_client() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+
+        count_enrollment_failure(&mut cfg, "alice", 5, 300);
+
+        let alice = &cfg.clients["alice"];
+        assert_eq!(
+            alice.enrollment_failed_attempts, 1,
+            "the token's own counter moved"
+        );
+        assert_eq!(
+            alice.failed_attempts, 0,
+            "the client's authentication counter did not: a client id is not a secret, and \
+             somebody who knows one must not be able to lock the client's own devices out"
+        );
+        assert_eq!(alice.locked_until, None, "the client is not locked out");
+        assert!(!alice.is_locked_out());
+    }
+
+    /// The token keeps a ceiling: `max_attempts` wrong guesses close the
+    /// enrollment slot for the window, and the right token is refused with it.
+    ///
+    /// The ceiling is what makes the link unguessable rather than merely
+    /// unshared — and it is the enrollment's ceiling, not the client's.
+    #[test]
+    fn the_token_has_a_ceiling_of_its_own() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+
+        for _ in 0..3 {
+            count_enrollment_failure(&mut cfg, "alice", 3, 300);
+        }
+
+        let alice = &cfg.clients["alice"];
+        assert!(alice.is_enrollment_locked_out(), "the slot is closed");
+        assert_eq!(
+            enrollment_verdict(&cfg, "alice", "0123456789abcdef", None),
+            EnrollmentVerdict::Refuse { counted: false },
+            "even the right token is refused while the slot is closed"
+        );
+        assert!(
+            !alice.is_locked_out(),
+            "the client itself is not locked out: the devices that already enrolled go on \
+             authenticating"
+        );
+        assert_eq!(alice.failed_attempts, 0);
+    }
+
+    /// A lockout whose time has run out is cleared, so the first mistake after
+    /// it does not close the slot again immediately.
+    #[test]
+    fn an_expired_enrollment_lockout_is_cleared() {
+        let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+
+        let alice = cfg.clients.get_mut("alice").unwrap();
+        alice.enrollment_failed_attempts = 3;
+        alice.enrollment_locked_until = Some(1);
+        assert!(!alice.is_enrollment_locked_out(), "the window has run out");
+
+        alice.refresh_enrollment_lockout();
+        assert_eq!(alice.enrollment_failed_attempts, 0);
+        assert_eq!(alice.enrollment_locked_until, None);
     }
 
     /// A client with no token outstanding is refused without being counted:

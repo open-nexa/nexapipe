@@ -706,8 +706,19 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
         let mut client = incoming_client.clone();
         match live.clients.get(id) {
             Some(existing) => {
+                // A token the file carries and memory does not — or a
+                // different one — is a new invite, not more guesses at the old
+                // one: the guesses and the lockout belong to the token they
+                // were paid for, and this one starts with its own budget. A
+                // reload that leaves the token alone keeps the live counter,
+                // which is newer than the file's.
+                let replaces_token = client.pending_enrollment != existing.pending_enrollment;
                 client.failed_attempts = existing.failed_attempts;
                 client.locked_until = existing.locked_until;
+                if !replaces_token {
+                    client.enrollment_failed_attempts = existing.enrollment_failed_attempts;
+                    client.enrollment_locked_until = existing.enrollment_locked_until;
+                }
                 client.last_used = existing.last_used;
             }
             None => added.push(id.clone()),
@@ -905,6 +916,8 @@ mod tests {
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         }
     }
 
@@ -1251,6 +1264,9 @@ mod tests {
         let existing = live.clients.get_mut("client-001").unwrap();
         existing.failed_attempts = 2;
         existing.locked_until = Some(12345);
+        existing.pending_enrollment = Some(SecretString::new("token".to_string()));
+        existing.enrollment_failed_attempts = 2;
+        existing.enrollment_locked_until = Some(54321);
 
         let mut incoming_client = client("NEWSECRETVALUE");
         incoming_client.pending_enrollment = Some(SecretString::new("token".to_string()));
@@ -1270,6 +1286,44 @@ mod tests {
         );
         assert_eq!(client.failed_attempts, 2, "the file's stale counter loses");
         assert_eq!(client.locked_until, Some(12345));
+        assert_eq!(
+            client.enrollment_failed_attempts, 2,
+            "the enrollment's counter is live state too"
+        );
+        assert_eq!(client.enrollment_locked_until, Some(54321));
+    }
+
+    /// A token the file replaces in memory is a new invite: the guesses at the
+    /// old token are not guesses at this one, so the new one starts with its
+    /// own budget rather than one lockout away from closed.
+    #[test]
+    fn a_new_invite_starts_with_its_own_budget() {
+        let mut live = config_with(&[("client-001", client("SECRETVALUE"))]);
+        let existing = live.clients.get_mut("client-001").unwrap();
+        existing.pending_enrollment = Some(SecretString::new("old-token".to_string()));
+        existing.enrollment_failed_attempts = 2;
+        existing.enrollment_locked_until = Some(54321);
+
+        let mut incoming_client = client("SECRETVALUE");
+        incoming_client.pending_enrollment = Some(SecretString::new("new-token".to_string()));
+        let incoming = config_with(&[("client-001", incoming_client)]);
+
+        let (added, removed) = merge_auth_clients(&mut live, &incoming);
+
+        assert!(added.is_empty() && removed.is_empty());
+        let client = &live.clients["client-001"];
+        assert_eq!(
+            client
+                .pending_enrollment
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
+            Some("new-token")
+        );
+        assert_eq!(
+            client.enrollment_failed_attempts, 0,
+            "the guesses went with the token they were made at"
+        );
+        assert_eq!(client.enrollment_locked_until, None);
     }
 
     /// A server started with no `[auth]` section at all can still switch 2FA on
