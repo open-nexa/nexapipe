@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The ALPN the tunnel speaks. The same bytes the client uses.
-const ALPN: &[u8] = b"\x05nexapipe";
+const ALPN: &[u8] = b"nexapipe";
 
 /// The host the flows ask for.
 const HOST: &str = "db.test";

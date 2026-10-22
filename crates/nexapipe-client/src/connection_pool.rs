@@ -1,5 +1,5 @@
-use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
+use iroh::endpoint::{ConnectError, ConnectOptions, Connection};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,20 @@ use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use nexapipe_proto::secret::SecretString;
 
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
+// The ALPN this build speaks, and the one servers built before the prefix
+// byte was dropped accept.
+//
+// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
+// starts with — in front of the name. That byte was never part of a length
+// encoding; it made the protocol name a nine-byte string that began with a
+// control byte, which is a fingerprint on the wire and nothing else. The name
+// is now the name.
+//
+// The constants live in `nexapipe-proto`, which the server links too: the two
+// ends have to agree on the name, and a name written down twice is a name
+// that eventually differs.
+use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
+
 /// What a dial produced: the connection and the state its flows share, or
 /// the failure that stopped it.
 ///
@@ -872,10 +885,25 @@ impl IrohConnectionPool {
         timeout: tokio::time::Duration,
     ) -> Result<Connection, ClientError> {
         let started = tokio::time::Instant::now();
-        let conn = tokio::time::timeout(
-            timeout,
-            ep.connect(self.inner.endpoint_addr.clone(), ALPN_NEXAPIPE),
-        )
+        // Both ALPNs are offered, the current one first: a server built before the
+        // prefix byte was dropped still answers, and one built after it takes the
+        // first it recognises. `connect` alone could only offer one.
+        //
+        // The address lookup and the handshake are both inside the timeout, the way
+        // they were when `connect` did the whole thing; `connect_with_opts` splits
+        // the two apart, so the block puts them back together.
+        let conn = tokio::time::timeout(timeout, async {
+            let connecting = ep
+                .connect_with_opts(
+                    self.inner.endpoint_addr.clone(),
+                    ALPN_NEXAPIPE,
+                    ConnectOptions::new()
+                        .with_additional_alpns(vec![ALPN_NEXAPIPE_LEGACY.to_vec()]),
+                )
+                .await
+                .map_err(ConnectError::from)?;
+            connecting.await.map_err(ConnectError::from)
+        })
         .await
         .map_err(|_| {
             #[cfg(feature = "tracing")]
@@ -1664,9 +1692,9 @@ pub fn parse_endpoint_addr(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALPN_NEXAPIPE, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome, IrohConnectionPool,
-        LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status, identity_changed,
-        is_idle_since, is_measured_rtt, may_publish,
+        ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
+        IrohConnectionPool, LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status,
+        identity_changed, is_idle_since, is_measured_rtt, may_publish,
     };
     use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
@@ -1675,6 +1703,7 @@ mod tests {
     use iroh::endpoint::presets;
     use nexapipe_proto::auth::{Algorithm, AuthMessage, Format};
     use nexapipe_proto::secret::SecretString;
+    use nexapipe_proto::{L4Proto, Preface};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1726,6 +1755,81 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Wait for the far side's count to reach `n`.
+    ///
+    /// The far side counts a connection in its own task, and the client's
+    /// handshake can complete before that task has run — so a count read
+    /// straight after the handshake is a race, not a measurement. A test that
+    /// wants the count waits for it.
+    async fn wait_for_accepted(accepted: &AtomicUsize, n: usize) {
+        for _ in 0..250 {
+            if accepted.load(Ordering::Relaxed) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the far side did not take {n} connection(s)");
+    }
+
+    /// The pool reaches a server that speaks only the legacy ALPN.
+    ///
+    /// The client offers the current ALPN *and* the legacy one, so a server
+    /// built before the prefix byte was dropped is still reachable. This is the
+    /// client half of the compatibility the server's own test suite covers from
+    /// the other side.
+    #[tokio::test]
+    async fn the_pool_reaches_a_server_that_speaks_only_the_legacy_alpn() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE_LEGACY.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_counting(server, accepted.clone()));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+
+        let conn = pool
+            .get_connection()
+            .await
+            .expect("the pool reaches a server that speaks only the legacy ALPN");
+
+        // The connection has to carry something, not merely be made: the far
+        // side counts a connection in its own task, and that task can run
+        // after the client's handshake has already completed — so the count is
+        // read only once the far side has answered a preface, which it does
+        // only after it has counted the connection.
+        let (mut send, mut recv) = conn.conn.open_bi().await.expect("the flow opens");
+        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
+            .to_bytes()
+            .expect("the preface encodes");
+        send.write_all(&preface)
+            .await
+            .expect("the preface is written");
+        let mut status = [0u8; 1];
+        recv.read_exact(&mut status)
+            .await
+            .expect("the far side answers the preface");
+        assert_eq!(status[0], 0x00, "the far side opened the flow");
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the far side took the connection"
+        );
+        drop(conn);
     }
 
     /// A pool over a loopback endpoint, and the count the far side keeps.
@@ -2057,6 +2161,9 @@ mod tests {
                     .expect("the connection is borrowed"),
             );
         }
+        // Give the far side a moment to count the connection: its own task
+        // can run after the handshake has already completed.
+        wait_for_accepted(&accepted, 1).await;
         assert_eq!(
             accepted.load(Ordering::Relaxed),
             1,
@@ -2069,7 +2176,7 @@ mod tests {
             .await
             .expect("the connection is borrowed");
         // Give the far side a moment to accept the second connection.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_accepted(&accepted, 2).await;
         assert_eq!(
             accepted.load(Ordering::Relaxed),
             2,

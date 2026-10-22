@@ -77,7 +77,7 @@ pub use lb::LoadBalancingStrategy;
 pub use nexapipe_proto::secret::{Secret, SecretBytes, SecretString};
 pub use provisioning::{EndpointInvite, EndpointTarget, InviteTotp};
 pub use relay::{PINNED_RELAY_URL, RelayModeSpec, RelayRestriction};
-pub use transport::{TransportTuning, transport_config, transport_config_with_tuning};
+pub use transport::{Congestion, TransportTuning, transport_config, transport_config_with_tuning};
 
 #[cfg(feature = "local-proxy")]
 pub use local_proxy::LocalProxy;
