@@ -328,7 +328,7 @@ lookup, which is what a config written before the key existed does.
   name matching. None of them measured what the server does for a request:
   the route lookup, the balancer, the URI the backend is reached at, and the
   round trip to it. That is a benchmark of its own now, and it comes with
-  the number the per-request work had never had — **49 allocations** for
+  the number the per-request work had never had — **42 allocations** for
   one request, from the lookup to the response head, counted by an
   allocator the bench installs.
   The count is the stable measurement: its interval is 0.2% wide, where the
@@ -437,8 +437,8 @@ lookup, which is what a config written before the key existed does.
   vectors where one would do.
   The address and the health flag now sit on the entry, where reading them
   needs no lock, and the candidates are filtered **in place** rather than
-  copied into a new vector at each step. One request makes **46 allocations**
-  where it made **49**.
+  copied into a new vector at each step. One request makes **39 allocations**
+  where it made **42**.
   The health flag is an atomic now, so the operator's view and the request
   path cannot disagree about it: the flag is written once, and both read it.
 
