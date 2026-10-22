@@ -10,7 +10,7 @@
 //! the device can produce.
 //!
 //! What is signed is the same byte string the HMAC path signs, defined once in
-//! [`sign_message`] and called from both — so whichever credential answers, the
+//! `sign_message` and called from both — so whichever credential answers, the
 //! handshake proves the same thing: this client saw this connection's nonce at
 //! this time.
 //!

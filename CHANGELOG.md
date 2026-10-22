@@ -1031,6 +1031,17 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The server's own documentation builds without a warning.** `cargo doc -p
+  nexapipe` reported eighteen, and every one of them was a link that pointed
+  at nothing: nine named a thing the crate does not have — `Self::kind` on
+  `BackendLookup`, where the method that tells the two refusals apart is
+  `reason`; `ConnectionLimiter::new`, whose name was right and whose path was
+  missing; `Connection`, which is iroh's type; `Bytes`, which is
+  `bytes::Bytes` — and nine linked to an item the crate keeps to itself, so
+  they rendered as text with a link that went nowhere. The links now point at
+  the names that are really there, and the ones that have no public name to
+  point at are code, the way the crate's other prose refers to them.
+
 - **The connection pool's ceiling is counted per protocol.** The protocol a
   connection carries is chosen at the handshake, so a connection opened for
   HTTP cannot carry an L4 tunnel, and the two cannot take each other's place.
