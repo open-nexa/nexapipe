@@ -45,8 +45,9 @@
 //!   What the summary carries includes the response head and any chunk framing,
 //!   because that is what the client actually received.
 //! - **A request is counted where it is assembled**: the head where it is
-//!   parsed, the body once it has been read whole. One refused before its head
-//!   finished is not counted, which is also what its access log line reports.
+//!   parsed, the body as it is read — whole for a buffered body, and as it
+//!   arrives for one that is streamed. One refused before its head finished is
+//!   not counted, which is also what its access log line reports.
 //! - **Tunnels** — TLS passthrough, L4 TCP, WebSocket after the handshake — are
 //!   counted in [`crate::stream_util`], and a chunk is recorded only once it has
 //!   left this process, so a write that failed reports nothing.
