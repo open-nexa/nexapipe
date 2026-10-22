@@ -57,6 +57,27 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The local proxy holds two buffers per connection, not three.** Reading a
+  request's head allocated a second 32 KiB buffer — one for the first read and
+  another for the rest of the head — and the first of them was then kept for
+  the whole connection while each of the two copy loops held another. A
+  connection cost three 32 KiB buffers, and the proxy serves up to 256 of
+  them at once.
+  There are **two** now. The head is read into one buffer, and that buffer
+  becomes the client half's copy buffer — the one that was there anyway. A
+  request allocates **two** 32 KiB buffers where it allocated **four**, and a
+  connection holds **64 KiB** of them where it held **96 KiB**. At the cap
+  that is 16 MiB of buffers rather than 24.
+  Nothing about the path changes: the same bytes are read, in the same order,
+  into a buffer of the same size. The time does not move either — this is a
+  change of memory, not of work — and the request path measures about
+  **150 µs** for the whole request and **107 µs** to the response head, the
+  same band it was in before. The runs land between 140 and 173 µs, and
+  between 100 and 115 µs, with the change and without it.
+  The local proxy still closes the connection after every response, so every
+  request is still a new one; that is a separate question and this is not the
+  answer to it.
+
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
   and the binary one — and the payload's first byte says which one it is. The
@@ -456,25 +477,6 @@ lookup, which is what a config written before the key existed does.
   The attempts themselves are unchanged — a dead pooled connection is still
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
-
-- **The local proxy holds two buffers per connection, not three.** Reading a
-  request's head allocated a second 32 KiB buffer — one for the first read and
-  another for the rest of the head — and the first of them was then kept for
-  the whole connection while each of the two copy loops held another. A
-  connection cost three 32 KiB buffers, and the proxy serves up to 256 of
-  them at once.
-  There are **two** now. The head is read into one buffer, and that buffer
-  becomes the client half's copy buffer — the one that was there anyway. A
-  request allocates **two** 32 KiB buffers where it allocated **four**, and a
-  connection holds **64 KiB** of them where it held **96 KiB**. At the cap
-  that is 16 MiB of buffers rather than 24.
-  Nothing about the path changes: the same bytes are read, in the same order,
-  into a buffer of the same size, and the time is the same — the local
-  proxy's request path measures **150 µs** for the whole request and
-  **106 µs** to the response head, against **151 µs** and **107 µs** before.
-  The local proxy still closes the connection after every response, so every
-  request is still a new one; that is a separate question and this is not the
-  answer to it.
 
 ### Changed
 

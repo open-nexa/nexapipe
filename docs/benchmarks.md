@@ -64,8 +64,14 @@ different pair of questions from the rest:
 
 | Bench | slope | The one-line reading |
 |---|---|---|
-| `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
-| `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
+| `local_request/first_byte` | **107 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
+| `local_request/request_response` | **150 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
+
+Both rows are the **median** of several runs, and the runs are spread: the
+whole request lands between 140 and 173 µs and the response head between 100
+and 115 µs. The spread is the machine's, not the bench's — the same band is
+measured before and after the local proxy's buffer change, which removes
+memory rather than work, and so the number does not move.
 
 The two `flow_connections` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain. A round of that bench takes about five

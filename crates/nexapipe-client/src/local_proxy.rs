@@ -245,10 +245,11 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 10;
 
 /// How many connections are served at once.
 ///
-/// Each one holds two [`STREAM_BUF_SIZE`] buffers — one per direction of the
-/// copy loop — so this is what turns an unbounded number of connections into a
-/// bounded amount of memory. The same figure the server's `accept_bi` uses,
-/// which is not a coincidence: a caller is one connection either way.
+/// A connection holds two [`STREAM_BUF_SIZE`] buffers once it is copying in
+/// both directions — one per direction of the copy loop — so this is what
+/// turns an unbounded number of connections into a bounded amount of memory.
+/// The same figure the server's `accept_bi` uses, which is not a coincidence:
+/// a caller is one connection either way.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 /// One line per this many refused connections. A refusal is the caller's
@@ -3050,5 +3051,155 @@ mod tests {
 
         assert!(kept.contains("X-If-None-Match: *"), "{kept}");
         assert!(kept.contains("If-None-Match-Extra: *"), "{kept}");
+    }
+
+    /// The far side: an HTTP server over an iroh bi-stream that reports the
+    /// size of the head it received and of the body that followed it.
+    async fn serve_an_http_backend(endpoint: Endpoint) {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else { return };
+                let Ok(connection) = accepting.await else { return };
+                loop {
+                    let Ok((mut send, mut recv)) = connection.accept_bi().await else { return };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let mut head = Vec::new();
+                        loop {
+                            let n = match recv.read(&mut buf).await {
+                                Ok(Some(n)) => n,
+                                Ok(None) | Err(_) => return,
+                            };
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                        }
+                        let head_end = head.windows(4).position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4).unwrap_or(head.len());
+                        let mut body = head[head_end..].to_vec();
+                        let mut want = 0usize;
+                        for line in head[..head_end].split(|b| *b == b'\n') {
+                            let line = line.strip_suffix(b"\r").unwrap_or(line);
+                            if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+                                want = String::from_utf8_lossy(&line[15..]).trim().parse().unwrap_or(0);
+                            }
+                        }
+                        while body.len() < want {
+                            let n = match recv.read(&mut buf).await {
+                                Ok(Some(n)) => n,
+                                Ok(None) | Err(_) => break,
+                            };
+                            body.extend_from_slice(&buf[..n]);
+                        }
+                        let answer = format!("head={} body={}", head_end, body.len());
+                        let response = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                            answer.len(), answer);
+                        let _ = send.write_all(response.as_bytes()).await;
+                        let _ = send.finish();
+                    });
+                }
+            });
+        }
+    }
+
+    /// The proxy in front of that backend.
+    async fn proxy_over(server_addr: iroh::EndpointAddr) -> (LocalProxy, std::net::SocketAddr) {
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+            .await
+            .expect("the proxy binds");
+        let addr = proxy.local_addr().expect("the proxy's address");
+        (proxy, addr)
+    }
+
+    /// A head that does not fit in one `STREAM_BUF_SIZE` buffer arrives whole.
+    ///
+    /// The head is read into the buffer that then becomes a copy loop's
+    /// buffer, so a head larger than the buffer is the case where reading it
+    /// and handing it on could go wrong: the bytes either stop at the buffer
+    /// or arrive whole.
+    #[tokio::test]
+    async fn a_head_larger_than_the_stream_buffer_arrives_whole() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_an_http_backend(server));
+
+        let (proxy, proxy_addr) = proxy_over(server_addr).await;
+        let runner = spawn_run(&proxy);
+
+        // A head that does not fit in one buffer, and stays under the cap.
+        let padding = "p".repeat(STREAM_BUF_SIZE + 4096);
+        let request = format!("GET / HTTP/1.1\r\nHost: {HOST}\r\nx-big: {padding}\r\n\r\n");
+        assert!(request.len() > STREAM_BUF_SIZE, "the head must be larger than the buffer");
+        assert!(request.len() < MAX_REQUEST_HEADER, "and under the cap");
+
+        let mut stream = TcpStream::connect(proxy_addr).await.expect("the proxy accepts");
+        stream.write_all(request.as_bytes()).await.expect("the request goes out");
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut answer)).await;
+        assert!(read.is_ok(), "the answer never arrived");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "the request was not served: {answer}");
+        assert!(answer.contains(&format!("head={}", request.len())), "the head did not arrive whole: {answer}");
+
+        proxy.stop();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+    }
+
+    /// The body that follows the head is forwarded.
+    ///
+    /// The buffer that held the head's bytes becomes a copy loop's buffer, and
+    /// the body arrives in the same stream. A body that arrives in the same
+    /// read as the head, and a body that arrives later, are both the body's
+    /// own bytes and neither may be lost.
+    #[tokio::test]
+    async fn a_body_after_the_head_is_forwarded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_an_http_backend(server));
+
+        let (proxy, proxy_addr) = proxy_over(server_addr).await;
+        let runner = spawn_run(&proxy);
+
+        let body = vec![b'z'; 100_000];
+        let request = format!("POST / HTTP/1.1\r\nHost: {HOST}\r\ncontent-length: {}\r\n\r\n", body.len());
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(&body);
+
+        let mut stream = TcpStream::connect(proxy_addr).await.expect("the proxy accepts");
+        stream.write_all(&bytes).await.expect("the request goes out");
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut answer)).await;
+        assert!(read.is_ok(), "the answer never arrived");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "the request was not served: {answer}");
+        assert!(answer.contains(&format!("body={}", body.len())), "the body did not arrive whole: {answer}");
+
+        proxy.stop();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
     }
 }
