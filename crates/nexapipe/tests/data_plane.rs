@@ -1265,6 +1265,20 @@ fn auth_config() -> AuthConfig {
     config
 }
 
+/// 2FA state whose files live in a directory the test owns.
+///
+/// The counters are written beside the configuration, and a relative path
+/// would leave a `state.toml` and its lock file in the crate directory every
+/// time the suite runs. The directory is returned so it outlives the proxy.
+fn auth_state(config: AuthConfig) -> (conn::AuthState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("config.toml");
+    (
+        conn::AuthState::new(config, path.to_string_lossy().into_owned()),
+        dir,
+    )
+}
+
 /// Writes one length-prefixed message.
 async fn write_message(send: &mut SendStream, message: &AuthMessage) {
     let bytes = message.to_bytes().expect("the message serializes");
@@ -1360,7 +1374,7 @@ async fn close_code(tunnel: &Tunnel) -> Option<u32> {
 #[tokio::test]
 async fn a_correct_code_gets_in() {
     let backend = spawn_backend("hello").await;
-    let auth = conn::AuthState::new(auth_config(), "no-such-file.toml");
+    let (auth, _dir) = auth_state(auth_config());
     let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
@@ -1379,7 +1393,7 @@ async fn a_correct_code_gets_in() {
 #[tokio::test]
 async fn a_wrong_code_is_refused() {
     let backend = spawn_backend("hello").await;
-    let auth = conn::AuthState::new(auth_config(), "no-such-file.toml");
+    let (auth, _dir) = auth_state(auth_config());
     let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
@@ -1404,7 +1418,7 @@ async fn a_wrong_code_is_refused() {
 #[tokio::test]
 async fn a_client_that_does_not_handshake_is_closed() {
     let backend = spawn_backend("hello").await;
-    let auth = conn::AuthState::new(auth_config(), "no-such-file.toml");
+    let (auth, _dir) = auth_state(auth_config());
     let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
@@ -1449,7 +1463,7 @@ async fn a_device_key_gets_in() {
     );
 
     let backend = spawn_backend("hello").await;
-    let auth = conn::AuthState::new(config, "no-such-file.toml");
+    let (auth, _dir) = auth_state(config);
     let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
