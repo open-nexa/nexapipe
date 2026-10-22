@@ -76,6 +76,7 @@ mod host;
 mod preface;
 pub mod protocol;
 pub mod secret;
+pub mod tls;
 mod udp;
 
 pub use alpn::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_ALL, ALPN_NEXAPIPE_LEGACY};

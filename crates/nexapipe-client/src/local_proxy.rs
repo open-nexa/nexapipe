@@ -1687,7 +1687,7 @@ where
     }
 
     // Extract SNI from TLS ClientHello
-    let sni = match extract_sni_from_client_hello(&data) {
+    let sni = match nexapipe_proto::tls::extract_sni(&data) {
         Some(sni) => {
             jni_log!("[DEBUG:local-proxy] TLS tunnel: extracted SNI '{}'", sni);
             sni
@@ -1798,136 +1798,6 @@ where
 
     jni_log!("[DEBUG:local-proxy] TLS tunnel closed");
     Ok(())
-}
-
-/// Extract the SNI (Server Name Indication) hostname from a TLS ClientHello.
-///
-/// The TLS 1.2/1.3 ClientHello format (simplified):
-///   1 byte  content_type (0x16 = Handshake)
-///   2 bytes version
-///   2 bytes record length
-///   --- record data ---
-///   1 byte  handshake_type (0x01 = ClientHello)
-///   3 bytes handshake length
-///   2 bytes client version
-///   32 bytes random
-///   1 byte  session ID length + data
-///   2 bytes cipher suites length + data
-///   1 byte  compression methods length + data
-///   2 bytes extensions length
-///   extensions...
-///
-/// SNI extension type = 0x0000
-fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
-    if data.len() < 5 {
-        return None;
-    }
-
-    // Must be TLS Handshake content type
-    if data[0] != 0x16 {
-        return None;
-    }
-
-    let record_len = ((data[3] as usize) << 8) | (data[4] as usize);
-    let total_needed = 5 + record_len;
-    if data.len() < total_needed {
-        return None;
-    }
-
-    let mut pos = 5usize;
-
-    // Handshake type: ClientHello (0x01)
-    if pos >= data.len() || data[pos] != 0x01 {
-        return None;
-    }
-    pos += 1;
-
-    // Handshake length (3 bytes, big-endian)
-    if pos + 3 > data.len() {
-        return None;
-    }
-    let _hs_len =
-        ((data[pos] as usize) << 16) | ((data[pos + 1] as usize) << 8) | (data[pos + 2] as usize);
-    pos += 3;
-
-    // Skip protocol version (2 bytes) + random (32 bytes)
-    pos += 34;
-    if pos > data.len() {
-        return None;
-    }
-
-    // Skip session ID
-    if pos >= data.len() {
-        return None;
-    }
-    let session_id_len = data[pos] as usize;
-    pos += 1 + session_id_len;
-    if pos > data.len() {
-        return None;
-    }
-
-    // Skip cipher suites
-    if pos + 1 >= data.len() {
-        return None;
-    }
-    let cipher_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
-    pos += 2 + cipher_len;
-    if pos > data.len() {
-        return None;
-    }
-
-    // Skip compression methods
-    if pos >= data.len() {
-        return None;
-    }
-    let comp_len = data[pos] as usize;
-    pos += 1 + comp_len;
-    if pos > data.len() {
-        return None;
-    }
-
-    // Extensions
-    if pos + 1 >= data.len() {
-        return None;
-    }
-    let ext_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
-    pos += 2;
-
-    let ext_end = pos + ext_len;
-    if ext_end > data.len() {
-        return None;
-    }
-
-    while pos + 4 <= ext_end {
-        let ext_type = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
-        let ext_data_len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
-        pos += 4;
-
-        if ext_type == 0x0000 {
-            // server_name (SNI) extension
-            if pos + 2 > ext_end {
-                return None;
-            }
-            let _sni_list_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
-            pos += 2;
-
-            if pos + 3 <= ext_end.min(data.len()) {
-                let name_type = data[pos];
-                pos += 1;
-                let name_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
-                pos += 2;
-
-                if name_type == 0x00 && pos + name_len <= data.len() && pos + name_len <= ext_end {
-                    // Read host_name (ASCII/UTF-8 encoded hostname)
-                    return String::from_utf8(data[pos..pos + name_len].to_vec()).ok();
-                }
-            }
-        }
-
-        pos += ext_data_len;
-    }
-
-    None
 }
 
 /// The header names a proxy must not forward.
