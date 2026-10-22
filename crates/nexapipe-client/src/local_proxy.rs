@@ -999,8 +999,8 @@ where
     for header in request.headers().get_all("host") {
         if let Ok(h) = header.to_str() {
             // The authority is split the way the server splits it, so
-            // `[::1]:8080` keeps its address and `example.com:` does not
-            // silently become `example.com`.
+            // `[::1]:8080` keeps its address. An empty port is dropped, as the
+            // server drops it: `example.com:` is `example.com`.
             let (h, _port) = nexapipe_proto::host_and_port(h);
             jni_log!("[DEBUG:local-proxy] Found Host header: '{}'", h);
             if should_proxy_domain(h, &proxy_domains) {
