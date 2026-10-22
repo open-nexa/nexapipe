@@ -15,6 +15,7 @@ use crate::auth::ClientAcl;
 use crate::routes::RoutingTable;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -152,17 +153,54 @@ async fn connect(
     port: u16,
     connect_timeout: Duration,
 ) -> anyhow::Result<tokio::net::TcpStream> {
-    let stream = tokio::time::timeout(
-        connect_timeout,
-        tokio::net::TcpStream::connect((host, port)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {}:{}", host, port))?
-    .map_err(|e| anyhow::anyhow!("failed to connect to backend {}:{}: {}", host, port, e))?;
+    // The name is resolved through the cache, so this dial does not wait for a
+    // `getaddrinfo` that the connection before it already paid for. The
+    // addresses are then tried in turn, which is what
+    // `TcpStream::connect((host, port))` did too.
+    // One deadline for the whole thing — the resolution and every address it
+    // names — so a backend with many addresses cannot multiply the budget.
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out resolving backend {}:{}", host, port))?
+        // The resolver's own words are part of the message the log prints —
+        // it prints the top-level message — and the error they came from
+        // stays the source of the chain.
+        .map_err(|e| {
+            let message = format!("cannot resolve backend {}:{}: {}", host, port, e);
+            e.context(message)
+        })?;
 
-    // The tunnel carries TLS records; Nagle would only add latency here.
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    connect_addrs(&addrs, deadline).await.map_err(|e| {
+        let message = format!("failed to connect to backend {}:{}: {}", host, port, e);
+        e.context(message)
+    })
+}
+
+/// Tries the addresses in turn, under one deadline.
+///
+/// The deadline is handed in rather than computed here: the resolution that
+/// produced the addresses is inside the same budget, so a backend with many
+/// addresses cannot multiply it.
+async fn connect_addrs(
+    addrs: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    let mut failure = None;
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                // The tunnel carries TLS records; Nagle would only add latency
+                // here.
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => failure = Some(anyhow::anyhow!("{}: {}", addr, e)),
+            Err(_) => failure = Some(anyhow::anyhow!("{}: timed out", addr)),
+        }
+    }
+
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("there was no address to try")))
 }
 
 /// Reads until the first TLS record is complete.
@@ -799,5 +837,44 @@ mod tests {
     fn a_backend_with_no_address_is_refused() {
         assert_eq!(parse_backend_addr(""), None);
         assert_eq!(parse_backend_addr("   "), None);
+    }
+
+    /// An address that refuses the connection: a port that was bound and
+    /// released, so nothing is listening on it any more.
+    async fn refusing_addr() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_dial_tries_the_next_address_when_the_first_refuses() {
+        // A backend with two addresses: the first refuses, the second
+        // accepts. The dial has to get to the second one — that is what
+        // `TcpStream::connect((host, port))` did, and what the hand-written
+        // dial has to keep doing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepting = listener.local_addr().unwrap();
+        let refused = refusing_addr().await;
+
+        let started = std::time::Instant::now();
+        let stream = connect_addrs(
+            &[refused, accepting],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the second address should have been tried");
+
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            accepting,
+            "the dial should have ended on the address that accepted"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the second address is inside the same deadline, not a new one, took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -1932,9 +1932,23 @@ the same tags as the server.
 
 ### First launch on macOS
 
-The desktop builds attached to GitHub releases are not code-signed or notarized.
-Safari marks the downloaded DMG, and the app copied from it, as quarantined, so
-the first launch is refused with:
+The desktop bundles in a GitHub release are code-signed and notarized **when the
+release pipeline has the credentials for it**, and not when it does not.
+
+The **application inside the disk image** is what is notarized: the bundler
+submits it to Apple, waits for the answer and staples the ticket to it, so a
+signed and notarized app opens on a Mac that has never seen it before, and
+the user is never told to weaken anything.
+
+The **image itself** is signed — it is the artifact the release publishes —
+but it carries no ticket of its own, because the bundler notarizes the
+application and signs the image. The release job says out loud whether
+Gatekeeper accepts the image it produced, so a gap here shows up in the job
+log rather than in a user's first launch.
+
+Without the credentials the bundle is unsigned, and Safari marks the
+downloaded DMG — and the app copied from it — as quarantined, so the first
+launch is refused with:
 
 > "nexa" is damaged and can't be opened. You should move it to the Trash.
 
@@ -1947,6 +1961,43 @@ xattr -cr /Applications/nexa.app
 Right-click → Open does not bypass this dialog, and the command has to be run
 again after every reinstall. A local build (`build_dmg.sh`) carries no
 quarantine flag in the first place.
+
+#### Turning the signing on
+
+The release workflow signs and notarizes the macOS bundle when the repository
+holds these:
+
+| Store | Name | What it is |
+|---|---|---|
+| secret | `APPLE_CERTIFICATE` | the base64 of the Developer ID `.p12` |
+| secret | `APPLE_CERTIFICATE_PASSWORD` | the password of that `.p12` |
+| secret | `APPLE_APP_SPECIFIC_PASSWORD` | an app-specific password for notarization |
+| variable | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <name> (<TEAMID>)` |
+| variable | `APPLE_ID` | the Apple ID email |
+| variable | `APPLE_TEAM_ID` | the team id |
+
+The certificate is a "Developer ID Application" certificate, not an "Apple
+Development" one: the latter cannot notarize, and Apple requires notarization
+for anything distributed outside the developer's own machine. Export the
+`.p12` from Keychain Access and base64 it:
+
+```bash
+openssl base64 -A -in /path/to/developer-id.p12 -out certificate-base64.txt
+```
+
+Tauri imports the certificate and does the notarization itself; the workflow
+only hands it the variables and then says, out loud, whether the application
+and the disk image it produced carry a valid signature and whether Gatekeeper
+accepts each of them. A release built without the credentials is signed by
+nothing and says so in the job log rather than quietly shipping an unsigned
+app.
+
+To sign a **local** build, the certificate is normally already in your own
+keychain, and the identity alone is enough:
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: <name> (<TEAMID>)" ./build_dmg.sh
+```
 
 ---
 

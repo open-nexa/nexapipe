@@ -14,11 +14,14 @@
                           (src-tauri/Cargo.toml depends on it; without it cargo fails
                           with a baffling "failed to load manifest"), then check
                           node/npm/cargo and the rustup target.
-      2. Frontend deps  - npm install (skipped when node_modules exists), then verify
-                          that npx tauri really runs: package-lock.json only records the
-                          Windows x64 native binaries, so a missing one turns into
-                          "Cannot find native binding" halfway through the build. Probe
-                          first, wipe and reinstall if it fails.
+      2. Frontend deps  - npm ci (skipped when node_modules exists), then verify
+                          that npx tauri really runs. The lockfile records every
+                          platform's native optional package with its os/cpu
+                          constraints, and npm filters by those at install time,
+                          so a missing one means the lockfile does not carry this
+                          platform — a thing to fix in the lockfile rather than
+                          at build time. Probe first, wipe and reinstall from the
+                          committed lockfile if it fails.
       3. Override       - write ui-desktop/.workbuddy/build-override.json (not tracked)
                           doing three things:
                           * bundle.resources: pick wintun/bin/<arch>/wintun.dll by
@@ -68,10 +71,12 @@
     be current, otherwise the previous frontend gets packaged.
 
 .PARAMETER SkipInstall
-    Skip npm install even when node_modules does not exist.
+    Skip the frontend install even when node_modules does not exist.
 
 .PARAMETER ForceInstall
-    Force npm install even when node_modules exists.
+        Accepted and ignored: the frontend install now always runs, because a
+        node_modules that was resolved from a different lockfile is a tree nobody
+        committed. -SkipInstall is the way out.
 
 .PARAMETER NoSign
     Do not create updater artefacts even when TAURI_SIGNING_PRIVATE_KEY is set.
@@ -139,6 +144,10 @@ $CargoProfile = if ($DebugBuild) { 'debug' } else { 'release' }
 $RepoRoot    = $PSScriptRoot
 $DesktopDir  = [IO.Path]::Combine($RepoRoot, 'ui-desktop')
 $SrcTauriDir = [IO.Path]::Combine($DesktopDir, 'src-tauri')
+# The tree npm ci installs into. The retry below has to remove it before it
+# installs again, so it has to be named here rather than left to be guessed at
+# the point of use.
+$NodeModules = [IO.Path]::Combine($DesktopDir, 'node_modules')
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
 # src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 $ClientCrate = [IO.Path]::Combine($RepoRoot, 'crates', 'nexapipe-client', 'Cargo.toml')
@@ -183,6 +192,25 @@ function Invoke-Native {
     & $Exe @Arguments
     $code = $LASTEXITCODE
     if ($code -ne 0) { Stop-Script "$Label failed (exit code $code)" }
+}
+
+# Installs the frontend from the committed lockfile.
+#
+# `npm ci` and not `npm install`: a bundle has to be built from the tree that
+# is committed and audited, not from whatever the registry serves today.
+# `npm ci` fails when package-lock.json and package.json disagree, which is a
+# thing to fix in the lockfile rather than around it — so the message says so
+# instead of leaving npm's own error to explain it.
+function Install-Frontend {
+    param([Parameter(Mandatory)][string] $Npm)
+    Write-Host "  `> $Npm ci --no-audit --no-fund" -ForegroundColor DarkGray
+    $ErrorActionPreference = 'Continue'
+    & $Npm ci --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        Stop-Script ("npm ci failed. Either package-lock.json and package.json disagree, or the " +
+                     "registry is unreachable. If the lockfile is stale, run 'npm install' in " +
+                     "ui-desktop and commit the updated package-lock.json.")
+    }
 }
 
 function Invoke-NativeCapture {
@@ -373,24 +401,34 @@ if ($Check) {
 # ---------------------------------------------------------------------------
 Push-Location -LiteralPath $DesktopDir
 try {
-    $nodeModules = [IO.Path]::Combine($DesktopDir, 'node_modules')
-    $needInstall = $ForceInstall -or (-not (Test-Path -LiteralPath $nodeModules))
     if ($SkipInstall) {
-        Write-Step 'Skipping npm install (-SkipInstall)'
-    } elseif ($needInstall) {
-        Write-Step 'Installing frontend dependencies'
-        Invoke-Native -Label 'npm install' -Exe $npm -Arguments @('install', '--no-audit', '--no-fund')
+        Write-Step 'Skipping the frontend install (-SkipInstall)'
     } else {
-        Write-Step 'node_modules exists, skipping npm install (-ForceInstall to rerun)'
+        # The install is unconditional, and that is the point: a node_modules
+        # that is already there may have been resolved from a different
+        # lockfile — a tree nobody committed and `npm audit` never saw — and a
+        # bundle built from it is a bundle nobody reviewed. -SkipInstall is
+        # the way out, for someone who knows what their tree is.
+        Write-Step 'Installing frontend dependencies'
+        # npm ci, not npm install: the bundle has to be built from the committed
+        # lockfile, not from whatever the registry serves today. npm ci installs
+        # strictly from the lockfile and fails outright when package-lock.json
+        # and package.json disagree, which is the point.
+        Install-Frontend -Npm $npm
     }
 
     if (-not (Test-TauriNativeBinding)) {
         if ($SkipInstall) {
             Stop-Script 'npx tauri --version failed: the @tauri-apps/cli native binary is missing, drop -SkipInstall to reinstall'
         }
-        Write-Warn 'npx tauri is unusable (missing platform native binary); wiping node_modules and reinstalling once'
-        Remove-Item -LiteralPath $nodeModules -Recurse -Force -ErrorAction Stop
-        Invoke-Native -Label 'npm install (retry)' -Exe $npm -Arguments @('install', '--no-audit', '--no-fund')
+        # The lockfile is deliberately left alone. Re-resolving it here would put
+        # a tree nobody reviewed into a signed bundle. A platform whose native
+        # binary the lockfile does not carry is a thing to fix in the lockfile.
+        Write-Warn 'npx tauri is unusable after npm ci; the committed package-lock.json does not carry the @tauri-apps/cli native binary for this platform'
+        if (Test-Path -LiteralPath $NodeModules) {
+            Remove-Item -LiteralPath $NodeModules -Recurse -Force -ErrorAction Stop
+        }
+        Install-Frontend -Npm $npm
         if (-not (Test-TauriNativeBinding)) { Stop-Script 'npx tauri is still unusable after reinstalling' }
     }
     $npxExe = Resolve-CommandPath 'npx'

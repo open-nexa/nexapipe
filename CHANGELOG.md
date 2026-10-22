@@ -59,6 +59,77 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A header whose name says it carries a credential is no longer printed.**
+  The local proxy's debug log redacted five exact header names, so a header
+  an application invented for its own token — `X-Auth-Token`, `X-Api-Key`,
+  `X-Session-Id` — was printed in the clear, in a log that reaches logcat.
+  The names are matched by what they **carry** now rather than by what they
+  are: a name with `auth`, `token`, `secret`, `key`, `session`, `cookie`,
+  `password` or `credential` in it is redacted. A name that merely contains
+  one of those is hidden too — `Sec-WebSocket-Key` is a nonce rather than a
+  credential — which is the right way round for a debug dump.
+- **The WebSocket debug dump cannot grow without end.** It assembles a
+  frame's bytes until the frame is whole, so a peer that sends a frame
+  header and then nothing had the bytes held for a frame that was never
+  coming. A megabyte is the ceiling now, and a frame that reaches it is
+  dropped with a line in the log saying so. The check is before the append,
+  so the buffer never grows past the ceiling in the first place.
+- **An unsound crate is refused.** The dependency check refused a
+  vulnerability and left an unsound crate to a warning, on the grounds
+  that the tree carries crates that are old rather than broken. That is
+  true of an **unmaintained** crate, and it is not true of an unsound one:
+  an unsound crate has a construct the language does not guarantee, and the
+  code using it may misbehave in ways the compiler cannot catch. The one
+  unsound crate the graph carries — `glib`, in the desktop app's GTK stack —
+  is listed as an ignore with the reason it cannot be fixed yet, so the
+  refusal costs nothing today.
+- **The macOS build no longer shadows the updater's settings.** The
+  platform config repeated the updater block without the signature key and
+  relied on the base config's key being merged in. A JSON merge patch
+  **removes** a key whose value is `null`, so the day somebody wrote
+  `"pubkey": null` into the platform config, the key would have gone
+  silently. The platform config says nothing about the updater now, and
+  the base config's block is used as it is.
+- **The exported 2FA secret is marked sensitive on the clipboard.** Copying
+  the `otpauth://` URI put the seed on the clipboard, which on Android 8
+  to 9 any app on the device could read. From Android 13 on the platform
+  takes a flag for exactly this, and it is set now: the value stays out of
+  the keyboard's preview and out of the clipboard's history. Below that
+  there is no flag and no restriction, and the warning in the dialog is
+  what says so.
+- **What the Android backup carries is now written down.** The seeds, the
+  enrollment tokens, the device key, the relay's bearer token and the name
+  the install answers as are all excluded from it — a restored phone is a new
+  device that has to be enrolled again — and what is in it is the
+  configuration: which endpoints this user set up, the language, a few
+  choices they made. The manifest says so, and it says the rule the next
+  change has to keep: a credential goes into the excluded file and nowhere
+  else.
+- **A backend's name is resolved once, not once per flow.** Every L4 flow and
+  every TLS passthrough dials a backend by **name**, and the name was
+  resolved again for every one of them. The resolution is a `getaddrinfo` on a
+  blocking thread, and it sits on the critical path: the client waits for the
+  flow to be open before it sends anything, so every flow paid for a name
+  lookup that the flow before it had already paid for.
+  The answers are cached now. A name that resolved is remembered for thirty
+  seconds, and a name that does **not** exist is remembered for five — much
+  shorter, because a name that failed is often a backend that has just come
+  up and the next flow should find it. A resolver that could not answer at
+  all — a timeout, a SERVFAIL — is not remembered: the answer may be there in
+  a moment, and a remembered failure would keep the backend unreachable for
+  the whole negative TTL. The resolver's own message is what the flow fails
+  with, so a typo in the config and a DNS outage do not look the same in the
+  log.
+  Two flows that arrive together do not start two lookups: the second one
+  waits for the first and takes its answer.
+  The cache holds addresses, not flows: every TCP flow still opens its own
+  connection, so a cached address that has gone away fails the dial like any
+  other. A UDP flow is the exception — a UDP socket has no dial, so a stale
+  address would not fail loudly, it would open the flow and send every
+  datagram to an address that is no longer there. A UDP flow therefore
+  resolves its target every time it opens, the way it did before.
+  The port is not part of the cache's key, because a DNS answer is about the
+  name — `db.test:5432` and `db.test:5433` share one resolution.
 - **A name the configuration does not name exactly is found by an index.**
   The client kept a map of the configured domains, and a name that was not in
   it exactly — which is **every** name a TUN device asks about, since those
@@ -504,6 +575,7 @@ lookup, which is what a config written before the key existed does.
   The errors are the same ones, in the same words: a backend whose address
   does not parse, or names no host, is still reported when the request is
   built, where the operator reads it.
+
 - **Two of the TUN's per-packet costs are measured, and neither is worth
   changing.** The TUN copies every packet once on its way into the network
   stack, because the stack takes a `Vec<u8>` of its own and the buffer the
@@ -1008,6 +1080,42 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The macOS bundles can be signed and notarized.** The desktop builds
+  attached to GitHub releases were neither: an unsigned app is quarantined by
+  Gatekeeper, and the only ways through it — "Control-click → Open" or
+  `xattr -dr com.apple.quarantine` — both ask the user to weaken the OS gate
+  for that application permanently, and a bundle with no signature cannot be
+  told apart from a look-alike.
+  The release workflow now signs with a Developer ID certificate and
+  notarizes, when the repository holds the credentials for it, and says out
+  loud in the job log whether the bundle it produced carries a valid
+  signature and whether Gatekeeper accepts it. A release built without the
+  credentials is signed by nothing and says so rather than quietly shipping
+  an unsigned app. The README names the secrets and the variables.
+  The **application inside the disk image** is what is notarized: the
+  bundler submits it to Apple, waits for the answer and staples the ticket
+  to it, so an app copied out of the image opens on a Mac that has never seen
+  it before. The **image itself** is signed — it is the artifact the release
+  publishes — but it carries no ticket of its own, because the bundler
+  notarizes the application and signs the image. The job log says so too,
+  rather than leaving the gap to be found by a user.
+  The updater path was never affected: the minisign signature is verified
+  against a pinned key before anything is extracted or installed, so an
+  update could not be swapped even though the initial download could.
+- **The Android release build is minified again.** It shipped with
+  `isMinifyEnabled = false` and a proguard file that was nothing but the
+  template's comments, so the release APK carried every class, every method
+  and every `Log.d` line under its own name. That is a map of the app for
+  whoever reads the APK, and the part of this app worth understanding before
+  attacking it is the credential handling. The release is shrunk and
+  obfuscated now, the debug logs are dropped, and the R8 rules that keep the
+  JNI bridge working are written down in `proguard-rules.pro`: the native
+  entry points are bound by name, so neither the class nor its `native`
+  methods may be renamed.
+  A CI job builds the release variant now, so the rules are exercised on every
+  pull request rather than only when a tag is pushed: a debug build never runs
+  R8, and a rule that keeps the app from building would otherwise be found by
+  a release.
 - **The local proxy does not hand out an authenticated tunnel to the
   network.** The client library bound whatever address it was given, and it
   does not authenticate the peer that connects to it — it hands out the tunnel
@@ -1070,6 +1178,33 @@ lookup, which is what a config written before the key existed does.
   invite import and the enrollment update both wrote it out in full, to the
   on-screen log panel and to logcat. What kind of credential arrived is what
   those lines are about; the id is not in them any more.
+- **A release is built from the committed dependency tree.** The desktop
+  bundles were installed with `npm install`, and the release workflow had a
+  fallback that deleted `package-lock.json` and re-resolved the whole frontend
+  tree from the registry at build time. A newly published malicious version of
+  any transitive package would have landed in a bundle that is then signed and
+  published as an official release — a tree nobody reviewed and `npm audit`
+  never saw. The release and the three local build scripts now install with
+  `npm ci`, and a platform whose native binary the lockfile does not carry
+  fails the build instead of re-resolving the tree.
+  The reason the fallback existed — that the lockfile recorded only one
+  platform's native binaries — stopped being true of this lockfile: it
+  carries every platform's `@tauri-apps/cli` with its integrity hash and its
+  `os`/`cpu` constraints, and npm filters optional dependencies by those at
+  install time. A new CI job checks that on each platform the release builds
+  on, so the claim is tested rather than asserted.
+- **The build context no longer carries the operator's credentials.**
+  `config.toml`, `secrets/` and the state file were absent from
+  `.dockerignore`. The Dockerfiles never `COPY` them, but `docker build`
+  sends the whole context to the daemon before that filtering applies, so a
+  remote or rootless buildx builder would have received the 2FA seeds, the
+  endpoint's private key and the relay bearer token, and may have kept them
+  in its build cache.
+- **The build tools are pinned like the actions are.** `cargo-ndk` and
+  `cross` were installed at whatever version the registry served that day,
+  while `cargo-audit` and `cargo-deny` in the same workflows were pinned. Both
+  now carry a version, so a compromised upstream release cannot change what
+  the runner that holds the signing keys executes.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:

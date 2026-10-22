@@ -510,7 +510,7 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
-    let target = match resolve(&host, port).await {
+    let target = match resolve_udp_target(&host, port).await {
         Ok(addr) => addr,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
@@ -688,22 +688,74 @@ where
 /// same action: one TCP dial toward one backend. They used to carry three copies
 /// of ten seconds, kept in step by whoever happened to look.
 async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
+    // The name is resolved through the cache, so this dial does not wait for a
+    // `getaddrinfo` that the flow before it already paid for. The addresses
+    // are then tried in turn, which is what `TcpStream::connect((host, port))`
+    // did too.
+    // One deadline for the whole thing — the resolution and every address it
+    // names — so a backend with many addresses cannot multiply the budget.
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
         .await
-        .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
-        .map_err(|e| anyhow::anyhow!("failed to connect to backend {host}:{port}: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("timed out resolving backend {host}:{port}"))?
+        // The resolver's own words are part of the message the log prints —
+        // it prints the top-level message — and the error they came from
+        // stays the source of the chain.
+        .map_err(|e| {
+            let message = format!("cannot resolve backend {host}:{port}: {e}");
+            e.context(message)
+        })?;
 
-    // A tunnel carries data with its own request/response pacing; Nagle would only add
-    // latency.
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    connect_addrs(&addrs, deadline).await.map_err(|e| {
+        let message = format!("failed to connect to backend {host}:{port}: {e}");
+        e.context(message)
+    })
 }
 
-async fn resolve(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    tokio::net::lookup_host((host, port))
+/// Tries the addresses in turn, under one deadline.
+///
+/// The deadline is handed in rather than computed here: the resolution that
+/// produced the addresses is inside the same budget, so a backend with many
+/// addresses cannot multiply it.
+async fn connect_addrs(
+    addrs: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<TcpStream> {
+    let mut failure = None;
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                // A tunnel carries data with its own request/response pacing;
+                // Nagle would only add latency.
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => failure = Some(anyhow::anyhow!("{addr}: {e}")),
+            Err(_) => failure = Some(anyhow::anyhow!("{addr}: timed out")),
+        }
+    }
+
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("there was no address to try")))
+}
+
+/// The address a UDP flow sends its datagrams to.
+///
+/// Resolved every time, and not through the cache. A UDP socket has no dial:
+/// `connect` on it is local and cannot tell that the peer is gone, so a
+/// stale address is not a failed dial — the flow would open, every datagram
+/// would go to an address that is no longer there, and nothing would report
+/// it. A TCP flow has the opposite property, which is why the TCP paths can
+/// use the cache: a stale address is refused and the dial fails loudly.
+async fn resolve_udp_target(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    crate::dns::resolve_uncached(host)
         .await
-        .map_err(|e| anyhow::anyhow!("cannot resolve backend {host}:{port}: {e}"))?
+        .map_err(|e| {
+            let message = format!("cannot resolve backend {host}:{port}: {e}");
+            e.context(message)
+        })?
+        .into_iter()
         .next()
+        .map(|addr| crate::dns::with_port(addr, port))
         .ok_or_else(|| anyhow::anyhow!("backend {host}:{port} resolved to no address"))
 }
 
@@ -805,6 +857,8 @@ mod tests {
     use crate::lb::LoadBalancingStrategy;
     use crate::routes::{L4Options, Route};
     use nexapipe_proto::{PREFACE_VERSION, encode_frame_to_vec};
+    use std::collections::HashMap;
+    use std::net::IpAddr;
 
     fn tcp_route(host: &str, backend: &str) -> Route {
         Route::new(
@@ -1555,5 +1609,209 @@ mod tests {
         assert_eq!(parse_backend_addr("http://db.internal"), None);
         assert_eq!(parse_backend_addr(":5432"), None);
         assert_eq!(parse_backend_addr(""), None);
+    }
+
+    /// An address that refuses the connection: a port that was bound and
+    /// released, so nothing is listening on it any more.
+    async fn refusing_addr() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_dial_tries_the_next_address_when_the_first_refuses() {
+        // A backend with two addresses: the first refuses, the second
+        // accepts. The dial has to get to the second one — that is what
+        // `TcpStream::connect((host, port))` did, and what the hand-written
+        // dial has to keep doing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepting = listener.local_addr().unwrap();
+        let refused = refusing_addr().await;
+
+        let started = std::time::Instant::now();
+        let stream = connect_addrs(
+            &[refused, accepting],
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("the second address should have been tried");
+
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            accepting,
+            "the dial should have ended on the address that accepted"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second address is inside the same deadline, not a new one, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_address_is_tried_under_one_deadline() {
+        // The deadline has passed: every attempt is over before it starts, so
+        // the dial gives up at once instead of waiting once per address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepting = listener.local_addr().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = connect_addrs(
+            &[accepting, accepting, accepting],
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the deadline has passed");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a spent deadline must not be waited for once per address, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("timed out"),
+            "the error should say the attempt ran out of time, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_to_an_address_that_refuses_says_which_one() {
+        let refused = refusing_addr().await;
+
+        let error = connect_addrs(
+            &[refused],
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("nothing is listening on that port");
+
+        assert!(
+            error.to_string().contains(&refused.to_string()),
+            "the error should name the address that failed, got {error}"
+        );
+    }
+
+    /// A resolver the test can steer.
+    ///
+    /// A name it knows is answered from the table; anything else is the
+    /// system's business, so a test that has it installed cannot disturb the
+    /// tests that run beside it.
+    struct StubResolver {
+        answers: std::sync::Mutex<HashMap<String, Vec<IpAddr>>>,
+    }
+
+    impl StubResolver {
+        fn new() -> Self {
+            Self {
+                answers: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// Changes what the name resolves to, the way a DNS record moves.
+        fn set(&self, host: &str, addrs: Vec<IpAddr>) {
+            self.answers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(host.to_string(), addrs);
+        }
+    }
+
+    impl crate::dns::Resolve for StubResolver {
+        fn resolve(&self, host: &str) -> Result<Vec<SocketAddr>, crate::dns::ResolveError> {
+            let known = self
+                .answers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(host)
+                .cloned();
+            match known {
+                Some(addrs) => Ok(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()),
+                // Everything else is the system's business.
+                None => crate::dns::SystemResolver.resolve(host),
+            }
+        }
+    }
+
+    /// A UDP flow does not use an address the cache is holding.
+    ///
+    /// The cache is for the paths that dial: a TCP dial to an address that
+    /// has gone away is refused, and the flow fails with it. A UDP flow has
+    /// **no dial** — `connect` on a UDP socket is local, so it cannot tell
+    /// that the peer is gone — and a datagram sent to an address that is no
+    /// longer there is dropped without a word. So a UDP flow resolves its
+    /// target every time it opens, and the address the cache is holding is
+    /// not the one it uses.
+    #[tokio::test]
+    async fn a_udp_flow_does_not_use_a_stale_address() {
+        // The backend that answers: a UDP echo on the loopback.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = backend.recv_from(&mut buf).await.unwrap();
+            backend.send_to(&buf[..n], from).await.unwrap();
+        });
+
+        // The name resolves to an address where nobody is listening, and to
+        // the backend after that: the address the cache is holding is one
+        // the flow must not use.
+        let stub = Arc::new(StubResolver::new());
+        stub.set("udp.test", vec![IpAddr::from([127, 0, 0, 2])]);
+        let _resolver = crate::dns::swap_resolver(stub.clone());
+
+        // The cache is given the address nobody is listening on, the way a
+        // flow that resolved the name a moment ago would have left it.
+        let cached = crate::dns::resolve("udp.test")
+            .await
+            .expect("the name resolves");
+        assert_eq!(
+            cached,
+            vec![SocketAddr::new(IpAddr::from([127, 0, 0, 2]), 0)]
+        );
+
+        // And now the name resolves to the backend.
+        stub.set("udp.test", vec![IpAddr::from([127, 0, 0, 1])]);
+
+        let backend = format!("udp.test:{}", backend_addr.port());
+        let config = RoutingTable::new(vec![udp_route("udp.test", &backend, None)]);
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let mut first = preface(L4Proto::Udp, "udp.test", 3478);
+        first.extend_from_slice(&encode_frame_to_vec(b"one").unwrap());
+        client_write.write_all(&first).await.unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::Ok);
+        // The datagram has to come back from the backend. Before the fix the
+        // flow was pointed at the address the cache was holding, so nothing
+        // came back and the flow ended instead.
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_udp_frame(&mut client_read))
+            .await
+            .expect("the echo should come back");
+        assert_eq!(echoed, b"one");
+
+        drop(client_write);
+        drop(client_read);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the flow should end when the client closes")
+            .unwrap();
+        assert!(outcome.is_ok());
+        echo.await.unwrap();
     }
 }

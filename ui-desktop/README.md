@@ -198,6 +198,16 @@ the UI can say exactly why TUN could not start.
 with signature verification enabled. `npm run tauri:build` produces
 `createUpdaterArtifacts` output as part of the bundle.
 
+**The platform configs do not repeat the updater block.** `tauri.conf.json` is
+merged with `tauri.macos.conf.json` (and its Windows and Linux siblings) as a
+JSON merge patch, and a merge patch **removes** a key whose value is `null` —
+so a platform config that repeated `plugins.updater` without a `pubkey` would
+work by inheritance today and would quietly drop the key the day somebody
+wrote `"pubkey": null` into it. The platform configs therefore say nothing
+about the updater at all, and the base config's block is used as it is. The
+same rule applies to the rest of the updater settings: they live in one place,
+and the platform configs do not shadow them.
+
 ---
 
 ## License
