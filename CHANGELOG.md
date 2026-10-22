@@ -325,6 +325,23 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **Two of the TUN's per-packet costs are measured, and neither is worth
+  changing.** The TUN copies every packet once on its way into the network
+  stack, because the stack takes a `Vec<u8>` of its own and the buffer the
+  bytes were read into is reused. That copy — the allocation and the memcpy
+  together — costs **18 ns**, against the **7.3 µs** the whole per-packet path
+  takes: **0.24%**. A buffer pool would need a lock of its own, and the lock
+  would cost more than the allocation it replaces.
+  The reverse lookup takes the mapping's lock **exclusively**, so the lookups
+  of several flows serialise. Making it a read lock was tried, and it is
+  **worse**: moving the clock and the "last used" out of the (serialising)
+  lock puts eight cores on the same two cache lines, and the lookup went from
+  **97 ns to 357 ns**. The critical section is far too short for the
+  parallelism to pay for the contention.
+  Both are benchmarks now, so the numbers are visible rather than assumed —
+  and the next person to look at either one finds the measurement instead of
+  the guess.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of

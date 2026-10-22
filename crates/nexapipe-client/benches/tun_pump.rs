@@ -145,6 +145,79 @@ fn tun_pump(c: &mut Criterion) {
         })
     });
 
+    // The copy the TUN's inbound path makes for every packet: the bytes are
+    // read into a buffer that is reused, and the stack is handed a **copy**,
+    // because the frame it takes is a `Vec<u8>` of its own.
+    //
+    // It is here on its own so that its share of `tun_packet` is visible:
+    // the whole path is measured above, and this is the part of it that the
+    // allocator pays for. It is 0.24% of that path.
+    group.bench_function("packet_copy", |b| {
+        b.iter_custom(|iters| {
+            let packet = dns_packet(&dns_query());
+            let mut buf = vec![0u8; 1500];
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                buf[..packet.len()].copy_from_slice(&packet);
+                let copy = buf[..packet.len()].to_vec();
+                black_box(&copy);
+            }
+            start.elapsed()
+        })
+    });
+
+    // The same mapping, looked up by several tasks at once.
+    //
+    // The lookup takes the mapping's lock, and it takes the **write** lock --
+    // so two lookups cannot happen at the same time. That does not show up in
+    // the single-task case above; it shows up here, where the work is the
+    // same and the only difference is that it is concurrent.
+    //
+    // **A read lock was tried here, and it is worse.** Making the clock and
+    // the "last used" atomic, so that the lookup needs no write lock, moves
+    // two updates out of the (serialising) lock and into eight cores
+    // contending for the same two cache lines: the measurement went from
+    // 97 ns per lookup to 357 ns. The critical section is far too short for
+    // the parallelism to pay for the contention, so the mapping keeps its
+    // exclusive lock.
+    group.bench_function("ip_mapping_concurrent", |b| {
+        b.iter_custom(|iters| {
+            runtime.block_on(async move {
+                let mapping = Arc::new(IpMapping::new());
+                let names: Vec<String> = (0..512).map(|i| format!("host{i}.test")).collect();
+                let addresses: Vec<std::net::Ipv4Addr> =
+                    names.iter().map(|name| mapping.allocate(name)).collect();
+
+                // How many lookups run at once.
+                const TASKS: usize = 8;
+
+                // The lookups are **split** between the tasks, so that the
+                // number criterion reports is the time of one lookup -- the
+                // same thing the single-task case above reports, and the two
+                // can be compared.
+                let per_task = iters / TASKS as u64;
+
+                let start = std::time::Instant::now();
+                let mut handles = Vec::with_capacity(TASKS);
+                for task in 0..TASKS as u64 {
+                    let mapping = mapping.clone();
+                    let addresses = addresses.clone();
+                    handles.push(tokio::spawn(async move {
+                        for i in 0..per_task {
+                            let index = ((i + task) % addresses.len() as u64) as usize;
+                            let back = mapping.lookup_domain(&addresses[index]);
+                            black_box(back);
+                        }
+                    }));
+                }
+                for handle in handles {
+                    let _ = handle.await;
+                }
+                start.elapsed()
+            })
+        })
+    });
+
     group.bench_function("tun_packet", |b| {
         b.iter_custom(|iters| {
             runtime.block_on(async move {
