@@ -334,6 +334,42 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **The routing table's benchmark measures a lookup that matches.** Its 51
+  routes all had the path pattern `/*`, which is not a wildcard — it is a
+  literal `/*` prefix, and a route with it serves no ordinary path at all.
+  The walk went over all 51 routes and ended at the table's end with **no
+  route taken**, while the benchmark's name and the documentation both said
+  it was measuring what taking the route costs. That half was never
+  measured.
+  The pattern is `/` now — the catch-all a route uses to say "any path" —
+  and the benchmark asserts that the lookup matched, so the mistake cannot
+  come back quietly. It measures two things now: **732 ns** for a host a
+  route serves, and **533 ns** for a host no route serves. The difference is
+  what taking the route costs, which is the balancer's part.
+  The number recorded before — 999 ns — was a lookup that found nothing, and
+  it is kept in the documentation marked as what it was.
+
+- **The host is folded once per request, not once per route.** The routing
+  table walks its routes until one matches, and every route in the walk was
+  folding the client's name again — trailing dots off, brackets off, case
+  folded — for the same name, over and over. The fold now happens once for
+  the whole walk, and the routes are handed the folded name.
+  It is the same name every time, so the fold is the same answer every time,
+  and doing it once is not a different answer: the HTTP path, the TLS
+  passthrough path and the L4 path all fold exactly as they did before, and
+  the tests that pin the matching rules still pass unchanged.
+  The numbers, from the routing table's own benchmark: a host a route
+  serves goes from **732 ns** to **134 ns**, and a host no route serves
+  from **533 ns** to **76 ns**.
+
+- **The health check reads the backends' status once a round, not once a
+  backend.** The status table was read **inside** the loop that probes the
+  backends, so the whole table — every backend's status, and a copy of its
+  address — was read again for each backend in it. One round of probes over
+  fifty backends read the table two thousand five hundred times, every
+  interval, for no reason: a probe reports, it does not change the state, so
+  the answer is the same every time it is asked.
+  It is read once now, and looked up.
 
 ### Changed
 
@@ -545,6 +581,21 @@ lookup, which is what a config written before the key existed does.
   the proxy sent a request whose first line a lenient parser would read as
   two. The method and the version come from the parsed request now, where
   both are validated.
+- **Replacing a credential no longer leaves the old identity connected.** The
+  handshake runs once per connection, so a connection made under the previous
+  credential kept serving traffic under the previous identity after the
+  credential had been replaced — and the server, which closes a connection
+  when it learns the credential is gone, was never told. The pool's
+  connections are closed when the identity changes, and kept when only the
+  secret was rotated: a rotation is the same account with a different secret,
+  and dropping the pool for that would close every request in flight.
+- **A UDP frame that announces more than a datagram is refused.** The length
+  prefix is a `u16`, so a frame can announce up to 65535 bytes — and a
+  datagram over IPv4 cannot carry more than 65507, because the IP header's
+  total-length field is sixteen bits wide. The encoder on the other side
+  refuses to produce one, so a frame that size is a peer that is not speaking
+  the protocol; the rule now lives in the shared framing crate and both ends
+  of the tunnel apply it.
 - **Revoking one device says what the shared secret still is.** `client revoke
   <id> --device <name>` strikes one device out and leaves the client's own
   secret standing — and that secret is still a credential: a peer that names

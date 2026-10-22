@@ -47,7 +47,7 @@ use crate::routes::{BackendLookup, RoutingTable};
 use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
     Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
-    encode_frame,
+    encode_frame, payload_fits_datagram,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -563,6 +563,20 @@ where
                 match decode_frame(&pending[offset..]) {
                     Frame::Incomplete => break,
                     Frame::Ready { payload, consumed } => {
+                        // A datagram larger than a UDP payload cannot be sent
+                        // to the backend either: the length prefix is a
+                        // `u16`, so a frame can announce more than the
+                        // protocol allows. The encoder on the other side
+                        // refuses to produce one, so this is a peer that is
+                        // not speaking the protocol, and the flow ends rather
+                        // than the datagram going out truncated.
+                        if !payload_fits_datagram(payload) {
+                            tracing::debug!(
+                                "L4 UDP: a frame of {} bytes is larger than a datagram, ending the flow",
+                                payload.len()
+                            );
+                            return;
+                        }
                         if let Err(e) = socket_up.send(payload).await {
                             tracing::debug!("L4 UDP: backend send failed: {}", e);
                             return;
