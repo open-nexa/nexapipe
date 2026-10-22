@@ -345,6 +345,26 @@ lookup, which is what a config written before the key existed does.
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
   so is what keeps the ones that are results honest.
+- **The server's request path is measured, and it is counted.** The
+  benchmarks that landed with this cycle measured the CONNECT tunnel, the
+  TUN's per-packet cost, the server's routing table and the client's own
+  name matching. None of them measured what the server does for a request:
+  the route lookup, the balancer, the URI the backend is reached at, and the
+  round trip to it. That is a benchmark of its own now, and it comes with
+  the number the per-request work had never had — **42 allocations** for
+  one request, from the lookup to the response head, counted by an
+  allocator the bench installs.
+  The count is the stable measurement: its interval is 0.2% wide, where the
+  time beside it — 50 µs for the whole request, backend round trip
+  included — runs from 37 to 69 µs, because the round trip goes through the
+  scheduler.
+  It is the plaintext listener's path, and the difference is written down
+  rather than left out: the QUIC tunnel reaches the same backend through
+  another function and shares the part of the work this bench is about -- the
+  lookup, the balancer, the origin and the URI -- while the header copying
+  and the body handling are its own, and what it adds on top is the
+  transport. So the server's own work for a request is a measurement now; the
+  transport's share of one is still an expectation.
 - **The client's HTTP request path is measured too.** The benchmarks that
   landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
   cost, the server's routing table and the client's own name matching. They
@@ -434,6 +454,34 @@ lookup, which is what a config written before the key existed does.
   the answer is the same every time it is asked.
   It is read once now, and looked up.
 
+- **Choosing a backend takes no lock, and one allocation instead of three.**
+  The balancer's choice happens on every request, and it took the status lock
+  once per backend to read whether each was healthy, again to compare the
+  addresses, and once more to hand the lease out — and the lease kept a **copy**
+  of the address, although the entry already had it. It also built three
+  vectors where one would do.
+  The address and the health flag now sit on the entry, where reading them
+  needs no lock, and the candidates are filtered **in place** rather than
+  copied into a new vector at each step. One request makes **39 allocations**
+  where it made **42**.
+  The health flag is an atomic now, so the operator's view and the request
+  path cannot disagree about it: the flag is written once, and both read it.
+
+- **The backend's address is parsed once, not once per request.** Two places
+  built the backend's URI for every request, and both parsed the address to
+  do it — a `Url::parse`, a copy of the host, and a formatted string. A
+  **backend does not move**: its scheme, host and port are fixed when the
+  route is configured, and they were being parsed again for every request
+  that chose it.
+  The origin is now parsed when the pool is built, and the request path
+  borrows the answer. The address is **shared** rather than copied, so
+  handing it to a request is a reference count.
+  One request makes **33 allocations** where it made **42** — nine fewer
+  across the balancer's choice and the backend's address, both of which were
+  doing per-request work for values that are fixed.
+  The errors are the same ones, in the same words: a backend whose address
+  does not parse, or names no host, is still reported when the request is
+  built, where the operator reads it.
 - **Two of the TUN's per-packet costs are measured, and neither is worth
   changing.** The TUN copies every packet once on its way into the network
   stack, because the stack takes a `Vec<u8>` of its own and the buffer the

@@ -713,7 +713,7 @@ pub async fn handle_bidi_stream(
                     failure.error,
                 );
 
-                tried.push(backend.url.clone());
+                tried.push(backend.url.to_string());
                 let next = match host {
                     Some((h, port)) => {
                         config
@@ -907,7 +907,7 @@ async fn handle_websocket_stream(
     backend_info: &BackendInfo,
     timeouts: Timeouts,
 ) -> Result<http::ProxySummary, http::ProxyFailure> {
-    let backend_url = backend_info.url.as_str();
+    let backend_url = &*backend_info.url;
     let protocol = backend_info.protocol;
     let url =
         url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
