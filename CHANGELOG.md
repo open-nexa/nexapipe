@@ -1048,6 +1048,16 @@ lookup, which is what a config written before the key existed does.
   code, the way the crate's other prose refers to them. `TunProxy::new` is
   code on every host, because a link to it is broken on every host but one.
 
+- **The desktop app's own documentation builds without a warning.** `cargo doc`
+  in `ui-desktop/src-tauri` reported five. Three linked to `accept_invite`, a
+  Tauri command the crate keeps to itself — all forty-two of its commands are
+  private — so they rendered as text with a link that went nowhere. The other
+  two named functions the crate does not have: `token_matches_any` and
+  `read_token`, both of which went when the service's answer stopped being
+  "the first token found" and became "any published token, proved by a
+  challenge", and the prose that pointed at them was left behind. The links
+  now name the functions that are really there.
+
 - **The peer registry's documentation had a stray marker in it.** Fixing the
   broken links in the entry below moved a line break in the module comment of
   `conn::peers`, and the `//!` that used to end the line was left standing
