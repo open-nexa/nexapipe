@@ -17,6 +17,10 @@
 #                   * disables updater signing unless both signing vars set
 #                   * forces npm for the frontend build
 #   4. Build      - tauri build --target <triple> --bundles app,dmg
+#                  (set APPLE_SIGNING_IDENTITY to sign the bundle; the
+#                  certificate is normally already in the developer's own
+#                  keychain, and APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#                  notarize it)
 #   5. Summary    - print produced .app / .dmg / .sig paths and sizes.
 #
 # Usage:
