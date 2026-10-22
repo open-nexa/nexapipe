@@ -107,3 +107,11 @@ harness = false
 [[bench]]
 name = "route_lookup"
 harness = false
+
+# The whole of the server's work for one request: the lookup, the balancer,
+# the URI the backend is reached at, and the round trip to it. The bench also
+# counts the allocations one request makes, which is what says whether the
+# per-request work is worth what it costs.
+[[bench]]
+name = "request_path"
+harness = false
