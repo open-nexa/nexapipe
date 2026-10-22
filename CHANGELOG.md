@@ -634,6 +634,26 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The webview is granted less than it was.** The desktop app's capability
+  granted the whole of `core:default`, the whole of `opener:default` and the
+  whole of `updater:default` to the renderer, and the renderer used almost
+  none of it. Three things came with that:
+  - `core:image:allow-from-path` let the renderer read **any image file the
+    user can read** — a screenshot, a photo, an exported chart — and hand its
+    pixels back over the IPC channel. It is denied now, and nothing in the
+    app used it.
+  - `opener:default` granted `reveal-item-in-dir` for **any path**, which
+    asks the OS file manager to open a directory the renderer names. The
+    frontend only ever opens a URL, so the permission is now the one that
+    opens a URL and the scope that says which ones.
+  - `updater:default` granted the renderer the right to download and install
+    an update. The frontend has never called the updater — the app has no
+    in-app update button — and the plugin is still registered on the Rust
+    side, so nothing about the release machinery changed; only the
+    renderer's reach into it is gone.
+  A renderer that can run script is a renderer that can ask for all three,
+  and the answer was "yes" to each.
+
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
   RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
