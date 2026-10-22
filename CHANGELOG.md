@@ -57,6 +57,23 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The authentication handshake has a binary form.** The message the client
+  and the server exchange now has two forms: the JSON one every peer already
+  speaks, and a binary one that is a third of the size where the bytes are —
+  a nonce and a signature are arrays of decimal numbers in JSON, so each byte
+  of either costs three. One handshake — a start, a challenge, a response and
+  an answer — is 427 bytes of JSON and 124 of binary.
+  The binary form is **not on the wire yet**: the peers keep speaking JSON,
+  and it is turned on one side at a time, so an old client keeps working
+  against a new server and a new client keeps working against an old one.
+  A payload's first byte says which form it is in, and a payload that does
+  not start with a version byte is the JSON one — which is what every peer
+  sent before the version byte existed.
+  `algorithm` is a closed type on the wire now: it was a free-form string,
+  and a name nobody supports was a name the receiving side had to decide what
+  to do with. Its spelling is unchanged — the canonical lowercase one the
+  server has always sent.
+
 - **The 2FA handshake is exercised end to end.** Nothing drove
   `perform_authentication` over a stream, so the deadline, the close codes
   and the registration-inside-the-lock rule were covered only by unit tests of

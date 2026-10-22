@@ -28,6 +28,22 @@ impl TotpAlgorithm {
     }
 }
 
+impl From<&TotpAlgorithm> for nexapipe_proto::auth::Algorithm {
+    /// The algorithm as it travels.
+    ///
+    /// The configuration has its own spelling of the three algorithms and the
+    /// wire has its own, and this is where the two meet: the wire's is a
+    /// closed type, so a name that is not one of the three cannot be put on
+    /// it at all.
+    fn from(algorithm: &TotpAlgorithm) -> Self {
+        match algorithm {
+            TotpAlgorithm::SHA1 => nexapipe_proto::auth::Algorithm::Sha1,
+            TotpAlgorithm::SHA256 => nexapipe_proto::auth::Algorithm::Sha256,
+            TotpAlgorithm::SHA512 => nexapipe_proto::auth::Algorithm::Sha512,
+        }
+    }
+}
+
 /// Main authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
