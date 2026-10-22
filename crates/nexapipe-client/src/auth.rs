@@ -9,7 +9,7 @@
 use crate::ClientError;
 use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
-use nexapipe_proto::auth::AuthMessage;
+use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, AuthMessage};
 use nexapipe_proto::secret::{SecretBytes, SecretString};
 use sha2::Sha256;
 use std::fmt;
@@ -110,6 +110,22 @@ impl TotpAlgorithm {
             TotpAlgorithm::SHA1 => "sha1",
             TotpAlgorithm::SHA256 => "sha256",
             TotpAlgorithm::SHA512 => "sha512",
+        }
+    }
+}
+
+impl From<ProtoAlgorithm> for TotpAlgorithm {
+    /// The algorithm as the protocol spells it.
+    ///
+    /// The two are the same three algorithms and neither is free-form: the
+    /// protocol's is a closed type, so a name nobody supports is refused
+    /// where the message is read rather than turned into a different
+    /// algorithm here.
+    fn from(algorithm: ProtoAlgorithm) -> Self {
+        match algorithm {
+            ProtoAlgorithm::Sha1 => TotpAlgorithm::SHA1,
+            ProtoAlgorithm::Sha256 => TotpAlgorithm::SHA256,
+            ProtoAlgorithm::Sha512 => TotpAlgorithm::SHA512,
         }
     }
 }
@@ -574,6 +590,10 @@ impl TwoFactorAuth {
             client_id: self.client_id.clone(),
             timestamp,
             device_id: self.device_id.clone(),
+            // No announcement: this client speaks the old form only, and a
+            // server that knows the versioned protocol asks for it in the
+            // answer.
+            version: None,
         };
 
         let start_bytes = start_msg
@@ -1029,16 +1049,12 @@ impl Enrollment {
                     let period = u32::try_from(period).map_err(|_| {
                         ClientError::InvalidConfig(format!("{period} is not a TOTP period"))
                     })?;
-                    // An algorithm the client does not know is an error, not
-                    // a silent downgrade to SHA1: the two would compute
-                    // different codes, and every attempt would fail with
-                    // "wrong code" instead of the algorithm being named once
-                    // as unsupported.
-                    let algorithm = TotpAlgorithm::try_from_name(&algorithm).map_err(|e| {
-                        ClientError::AuthenticationFailed(format!(
-                            "the server issued a credential with an unsupported algorithm: {e}"
-                        ))
-                    })?;
+                    // The algorithm is a closed type on the wire now: a name
+                    // nobody supports is refused where the message is read,
+                    // rather than quietly turned into a different algorithm
+                    // here — which would compute codes the server does not
+                    // accept, and every attempt would fail with "wrong code".
+                    let algorithm = TotpAlgorithm::from(algorithm);
                     let issued = TwoFactorAuth::with_params(
                         &client_id,
                         secret.as_str(),
@@ -1168,7 +1184,7 @@ mod tests {
         AuthMessage, DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
         TwoFactorConfig, device_id_is_usable,
     };
-    use nexapipe_proto::auth::MAX_DEVICE_ID_LEN;
+    use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, MAX_DEVICE_ID_LEN};
     use nexapipe_proto::secret::SecretString;
 
     /// An algorithm nobody supports is refused, and the refusal says what was
@@ -1321,7 +1337,7 @@ mod tests {
         let issue = AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
             secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-            algorithm: "SHA1".to_string(),
+            algorithm: ProtoAlgorithm::Sha1,
             digits: 6,
             period: 30,
             device_id: None,
@@ -1513,6 +1529,7 @@ mod tests {
             client_id: auth.client_id().to_string(),
             timestamp: 0,
             device_id: auth.device_id().map(str::to_string),
+            version: None,
         };
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
@@ -1542,6 +1559,7 @@ mod tests {
             client_id: auth.client_id().to_string(),
             timestamp: 0,
             device_id: auth.device_id().map(str::to_string),
+            version: None,
         };
         let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
         assert!(!json.contains("device_id"), "{json}");

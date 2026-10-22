@@ -61,15 +61,202 @@
 //! field ignores it rather than failing, so a client and a server built either
 //! side of the change still complete a handshake.
 //!
-//! # The wire format does not change
+//! # The two forms
 //!
-//! This is a move, not a redesign. Every tag, every field name, every field
-//! type and every `serde` attribute is the one that was on the wire before,
-//! and the tests below are the ones that were watching it — they came with it.
+//! A message travels in one of two forms, and the payload's first byte says
+//! which:
+//!
+//! | first byte | the payload |
+//! |---|---|
+//! | `0x00` | the JSON form, behind the version byte |
+//! | `0x01` | the binary form, behind the version byte |
+//! | anything else | the JSON form with no version byte — what every peer sent before the version byte existed |
+//!
+//! A JSON message starts with `{`, which is neither of the two version bytes,
+//! so the three are told apart by one look. The version byte is a
+//! **discriminator**, not a negotiation: a message says what it is, and the
+//! other end reads it. Nothing is agreed on beforehand, and nothing has to be
+//! remembered between messages.
+//!
+//! The binary form exists because the JSON form is wasteful exactly where
+//! the bytes are: a nonce and a signature are arrays of decimal numbers, so
+//! each byte of either costs three. One handshake — a start, a challenge, a
+//! response and an answer — is 427 bytes of JSON and 124 of binary.
+//!
+//! The JSON form stays, and stays readable, for as long as old peers exist.
+//!
+//! # What the wire format does change
+//!
+//! Two things, and both of them are things the wire should not have carried
+//! in the first place:
+//!
+//! - **`algorithm` is a type.** It was a free-form string, and a name nobody
+//!   supports was a name the receiving side had to decide what to do with. It
+//!   is one of three now, and its spelling on the wire is the one the server
+//!   has always sent.
+//! - **`AUTH_START` can announce a version.** The field is optional and
+//!   absent by default, so a peer that predates it sends exactly what it
+//!   sent before.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::secret::SecretString;
+
+/// The TOTP algorithm, as it travels.
+///
+/// The names are the canonical ones — `sha1`, `sha256`, `sha512` — and they
+/// are read in any case, because the configuration this comes from is read
+/// that way too. What is not free-form any more is the algorithm itself: it
+/// was a string on the wire, and a name nobody supports was a name the
+/// receiving side had to decide what to do with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Algorithm {
+    /// HMAC-SHA1 — the default, and what every client used before the choice
+    /// existed.
+    Sha1,
+    /// HMAC-SHA256.
+    Sha256,
+    /// HMAC-SHA512.
+    Sha512,
+}
+
+impl Algorithm {
+    /// The canonical name, as the configuration and the wire spell it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Algorithm::Sha1 => "sha1",
+            Algorithm::Sha256 => "sha256",
+            Algorithm::Sha512 => "sha512",
+        }
+    }
+
+    /// The algorithm a name means, in any case — or `None` for a name nobody
+    /// supports.
+    ///
+    /// `None` rather than a default: an algorithm that is quietly turned into
+    /// a different one is a silent downgrade, and the client computes codes
+    /// the server does not accept.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("sha1") {
+            Some(Algorithm::Sha1)
+        } else if name.eq_ignore_ascii_case("sha256") {
+            Some(Algorithm::Sha256)
+        } else if name.eq_ignore_ascii_case("sha512") {
+            Some(Algorithm::Sha512)
+        } else {
+            None
+        }
+    }
+
+    /// The byte this algorithm is in the binary form.
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            Algorithm::Sha1 => 0x01,
+            Algorithm::Sha256 => 0x02,
+            Algorithm::Sha512 => 0x03,
+        }
+    }
+
+    /// The algorithm a byte is — or `None` for a byte that is not one.
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Algorithm::Sha1),
+            0x02 => Some(Algorithm::Sha256),
+            0x03 => Some(Algorithm::Sha512),
+            _ => None,
+        }
+    }
+}
+
+/// The name is read in any case, and a name nobody supports is an error
+/// rather than a quiet fall back to SHA1.
+impl<'de> Deserialize<'de> for Algorithm {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Algorithm::from_name(&name).ok_or_else(|| {
+            de::Error::custom(format!(
+                "{name:?} is not a TOTP algorithm; expected \"sha1\", \"sha256\" or \"sha512\""
+            ))
+        })
+    }
+}
+
+/// The version byte that says the payload behind it is the JSON form.
+pub const VERSION_JSON: u8 = 0x00;
+
+/// The version byte that says the payload behind it is the binary form.
+pub const VERSION_BINARY: u8 = 0x01;
+
+/// The form a message travels in.
+///
+/// The payload's first byte says which of these it is — and a payload that
+/// does not start with a version byte is the JSON form, because that is what
+/// every peer sent before the version byte existed. A JSON message always
+/// starts with `{`, which is neither of the two version bytes, so the three
+/// are told apart by one look.
+///
+/// The version byte is a **discriminator**, not a negotiation: a message says
+/// what it is, and the other end reads it. Nothing is agreed on beforehand
+/// and nothing has to be remembered between messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// The JSON form with no version byte in front of it: what every peer
+    /// sent before the version byte existed, and what a peer that predates it
+    /// can read.
+    LegacyJson,
+    /// The JSON form behind the version byte [`VERSION_JSON`].
+    ///
+    /// A peer that speaks the versioned protocol but whose messages are still
+    /// JSON. It keeps the JSON encoder alive inside the versioned protocol,
+    /// which is what stops the two encoders drifting apart unnoticed.
+    Json,
+    /// The binary form behind the version byte [`VERSION_BINARY`].
+    Binary,
+}
+
+impl Format {
+    /// The version byte in front of a payload in this form — or `None` for
+    /// the form that has none.
+    pub fn version_byte(&self) -> Option<u8> {
+        match self {
+            Format::LegacyJson => None,
+            Format::Json => Some(VERSION_JSON),
+            Format::Binary => Some(VERSION_BINARY),
+        }
+    }
+
+    /// The form a version number means, if this build knows it.
+    pub fn from_version(version: u8) -> Option<Self> {
+        match version {
+            VERSION_JSON => Some(Format::Json),
+            VERSION_BINARY => Some(Format::Binary),
+            _ => None,
+        }
+    }
+}
+
+/// Why a message could not be put on the wire, or taken off it.
+#[derive(Debug)]
+pub enum CodecError {
+    /// The JSON form: the payload is not JSON, or not a message.
+    Json(serde_json::Error),
+    /// The binary form: the payload is not a message this build knows.
+    Binary(String),
+}
+
+impl fmt::Display for CodecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodecError::Json(error) => write!(f, "{error}"),
+            CodecError::Binary(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for CodecError {}
 
 /// Messages exchanged during authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +272,22 @@ pub enum AuthMessage {
         /// existed before a client could have several.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
+        /// The version of the protocol this client speaks, when it speaks more
+        /// than one.
+        ///
+        /// **Absent** is a client that does not: the server answers in the
+        /// old form and the two never leave it. That is what an old client
+        /// sends, and it is why the field is optional — a peer that predates
+        /// it drops the field and is understood as one that has only the old
+        /// form.
+        ///
+        /// A new client announces the best version it speaks here, because
+        /// this message has to be readable by a server that predates the
+        /// version byte: the announcement is inside the JSON, where an old
+        /// server ignores it, rather than in front of it, where an old server
+        /// would choke on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u8>,
     },
     /// Server sends challenge nonce
     #[serde(rename = "AUTH_CHALLENGE")]
@@ -156,7 +359,13 @@ pub enum AuthMessage {
         /// A [`SecretString`]: a credential that has just been issued is the
         /// most valuable thing this process holds.
         secret: SecretString,
-        algorithm: String,
+        /// The algorithm the issued secret is to be used with.
+        ///
+        /// A closed set, and it was a string: the name was free-form on the
+        /// wire, so a peer had to decide what to do with a name nobody
+        /// supports. The names are the canonical ones, and they are read in
+        /// any case.
+        algorithm: Algorithm,
         digits: u32,
         period: u64,
         /// The device this credential was issued for, which is how the client
@@ -219,6 +428,458 @@ impl AuthMessage {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
+
+    /// The message as it travels, in the form asked for.
+    ///
+    /// The version byte is part of the payload: the frame around it is
+    /// `[u32le length][payload]`, and the length covers the byte.
+    pub fn to_payload(&self, format: Format) -> Result<Vec<u8>, CodecError> {
+        match format {
+            Format::LegacyJson => serde_json::to_vec(self).map_err(CodecError::Json),
+            Format::Json => {
+                let mut payload = Vec::new();
+                payload.push(VERSION_JSON);
+                payload.extend(serde_json::to_vec(self).map_err(CodecError::Json)?);
+                Ok(payload)
+            }
+            Format::Binary => {
+                let mut payload = Vec::new();
+                payload.push(VERSION_BINARY);
+                payload.extend(self.to_binary()?);
+                Ok(payload)
+            }
+        }
+    }
+
+    /// The message a payload carries, and the form it was in.
+    ///
+    /// The form is read from the payload's first byte, and a payload that
+    /// does not start with a version byte is the JSON form — which is what
+    /// every peer sent before the version byte existed.
+    pub fn from_payload(payload: &[u8]) -> Result<(Self, Format), CodecError> {
+        match payload.first() {
+            None => Err(CodecError::Binary("the payload is empty".to_string())),
+            Some(&VERSION_JSON) => Ok((
+                serde_json::from_slice(&payload[1..]).map_err(CodecError::Json)?,
+                Format::Json,
+            )),
+            Some(&VERSION_BINARY) => Ok((Self::from_binary(&payload[1..])?, Format::Binary)),
+            Some(_) => Ok((
+                serde_json::from_slice(payload).map_err(CodecError::Json)?,
+                Format::LegacyJson,
+            )),
+        }
+    }
+
+    /// The version this message announces, if it announces one.
+    ///
+    /// Only [`AuthMessage::Start`] announces: it is the first message of a
+    /// handshake, and it has to be one an old peer can read.
+    pub fn announced_version(&self) -> Option<u8> {
+        match self {
+            AuthMessage::Start { version, .. } => *version,
+            _ => None,
+        }
+    }
+
+    /// The message in the binary form, without the version byte.
+    fn to_binary(&self) -> Result<Vec<u8>, CodecError> {
+        let mut writer = Writer::default();
+        match self {
+            AuthMessage::Start {
+                client_id,
+                timestamp,
+                device_id,
+                version,
+            } => {
+                let mut flags = 0;
+                if device_id.is_some() {
+                    flags |= flag::DEVICE_ID;
+                }
+                if version.is_some() {
+                    flags |= flag::VERSION;
+                }
+                writer.u8(kind::START);
+                writer.u8(flags);
+                writer.string(client_id)?;
+                writer.i64(*timestamp);
+                if let Some(device_id) = device_id {
+                    writer.string(device_id)?;
+                }
+                if let Some(version) = version {
+                    writer.u8(*version);
+                }
+            }
+            AuthMessage::Challenge { nonce } => {
+                writer.u8(kind::CHALLENGE);
+                writer.u8(0);
+                writer.bytes(nonce)?;
+            }
+            AuthMessage::Response {
+                client_id,
+                timestamp,
+                totp_code,
+                signature,
+                device_id,
+            } => {
+                let mut flags = 0;
+                if device_id.is_some() {
+                    flags |= flag::DEVICE_ID;
+                }
+                writer.u8(kind::RESPONSE);
+                writer.u8(flags);
+                writer.string(client_id)?;
+                writer.i64(*timestamp);
+                writer.string(totp_code)?;
+                writer.bytes(signature)?;
+                if let Some(device_id) = device_id {
+                    writer.string(device_id)?;
+                }
+            }
+            AuthMessage::Ok => {
+                writer.u8(kind::OK);
+                writer.u8(0);
+            }
+            AuthMessage::Failed { reason } => {
+                writer.u8(kind::FAILED);
+                writer.u8(0);
+                writer.string(reason)?;
+            }
+            AuthMessage::EnrollStart {
+                client_id,
+                token,
+                device_id,
+                public_key,
+            } => {
+                let mut flags = 0;
+                if device_id.is_some() {
+                    flags |= flag::DEVICE_ID;
+                }
+                if public_key.is_some() {
+                    flags |= flag::PUBLIC_KEY;
+                }
+                writer.u8(kind::ENROLL_START);
+                writer.u8(flags);
+                writer.string(client_id)?;
+                writer.string(token.expose_secret())?;
+                if let Some(device_id) = device_id {
+                    writer.string(device_id)?;
+                }
+                if let Some(public_key) = public_key {
+                    writer.string(public_key)?;
+                }
+            }
+            AuthMessage::EnrollIssue {
+                client_id,
+                secret,
+                algorithm,
+                digits,
+                period,
+                device_id,
+            } => {
+                let mut flags = 0;
+                if device_id.is_some() {
+                    flags |= flag::DEVICE_ID;
+                }
+                writer.u8(kind::ENROLL_ISSUE);
+                writer.u8(flags);
+                writer.string(client_id)?;
+                writer.string(secret.expose_secret())?;
+                writer.u8(algorithm.to_byte());
+                writer.u32(*digits);
+                writer.u64(*period);
+                if let Some(device_id) = device_id {
+                    writer.string(device_id)?;
+                }
+            }
+            AuthMessage::EnrollFailed { reason } => {
+                writer.u8(kind::ENROLL_FAILED);
+                writer.u8(0);
+                writer.string(reason)?;
+            }
+        }
+        Ok(writer.into_bytes())
+    }
+
+    /// The message a binary payload carries.
+    fn from_binary(payload: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(payload);
+        let kind = reader.u8()?;
+        let flags = reader.u8()?;
+        if flags & !allowed_flags(kind) != 0 {
+            return Err(CodecError::Binary(format!(
+                "a message of type {kind:#04x} carries flags {flags:#04x} that it has no meaning for"
+            )));
+        }
+        match kind {
+            kind::START => {
+                let client_id = reader.string()?;
+                let timestamp = reader.i64()?;
+                let device_id = if flags & flag::DEVICE_ID != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                let version = if flags & flag::VERSION != 0 {
+                    Some(reader.u8()?)
+                } else {
+                    None
+                };
+                Ok(AuthMessage::Start {
+                    client_id,
+                    timestamp,
+                    device_id,
+                    version,
+                })
+            }
+            kind::CHALLENGE => {
+                let nonce = reader.bytes()?;
+                Ok(AuthMessage::Challenge { nonce })
+            }
+            kind::RESPONSE => {
+                let client_id = reader.string()?;
+                let timestamp = reader.i64()?;
+                let totp_code = reader.string()?;
+                let signature = reader.bytes()?;
+                let device_id = if flags & flag::DEVICE_ID != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                Ok(AuthMessage::Response {
+                    client_id,
+                    timestamp,
+                    totp_code,
+                    signature,
+                    device_id,
+                })
+            }
+            kind::OK => Ok(AuthMessage::Ok),
+            kind::FAILED => {
+                let reason = reader.string()?;
+                Ok(AuthMessage::Failed { reason })
+            }
+            kind::ENROLL_START => {
+                let client_id = reader.string()?;
+                let token = SecretString::new(reader.string()?);
+                let device_id = if flags & flag::DEVICE_ID != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                let public_key = if flags & flag::PUBLIC_KEY != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                Ok(AuthMessage::EnrollStart {
+                    client_id,
+                    token,
+                    device_id,
+                    public_key,
+                })
+            }
+            kind::ENROLL_ISSUE => {
+                let client_id = reader.string()?;
+                let secret = SecretString::new(reader.string()?);
+                let algorithm = Algorithm::from_byte(reader.u8()?).ok_or_else(|| {
+                    CodecError::Binary("the algorithm is not one this build knows".to_string())
+                })?;
+                let digits = reader.u32()?;
+                let period = reader.u64()?;
+                let device_id = if flags & flag::DEVICE_ID != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                Ok(AuthMessage::EnrollIssue {
+                    client_id,
+                    secret,
+                    algorithm,
+                    digits,
+                    period,
+                    device_id,
+                })
+            }
+            kind::ENROLL_FAILED => {
+                let reason = reader.string()?;
+                Ok(AuthMessage::EnrollFailed { reason })
+            }
+            other => Err(CodecError::Binary(format!(
+                "unknown message type {other:#04x}"
+            ))),
+        }
+    }
+}
+
+/// The message types of the binary form.
+mod kind {
+    pub const START: u8 = 0x01;
+    pub const CHALLENGE: u8 = 0x02;
+    pub const RESPONSE: u8 = 0x03;
+    pub const OK: u8 = 0x04;
+    pub const FAILED: u8 = 0x05;
+    pub const ENROLL_START: u8 = 0x06;
+    pub const ENROLL_ISSUE: u8 = 0x07;
+    pub const ENROLL_FAILED: u8 = 0x08;
+}
+
+/// The flags of the binary form: one bit per optional field.
+mod flag {
+    /// The message carries a device id.
+    pub const DEVICE_ID: u8 = 0b0000_0001;
+    /// The message carries a public key.
+    pub const PUBLIC_KEY: u8 = 0b0000_0010;
+    /// The message announces the protocol version it speaks.
+    pub const VERSION: u8 = 0b0000_0100;
+}
+
+/// The flags a message type may carry.
+///
+/// A flag a type has no meaning for is refused rather than ignored: a future
+/// version that adds one would otherwise be read as if the field were
+/// absent, which is the kind of quiet difference a version byte exists to
+/// prevent.
+fn allowed_flags(kind: u8) -> u8 {
+    match kind {
+        kind::START => flag::DEVICE_ID | flag::VERSION,
+        kind::RESPONSE => flag::DEVICE_ID,
+        kind::ENROLL_START => flag::DEVICE_ID | flag::PUBLIC_KEY,
+        kind::ENROLL_ISSUE => flag::DEVICE_ID,
+        _ => 0,
+    }
+}
+
+/// Writes the binary form, a field at a time.
+#[derive(Default)]
+struct Writer {
+    bytes: Vec<u8>,
+}
+
+impl Writer {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// A string: a `u16le` length and the UTF-8 bytes.
+    ///
+    /// Every string in the protocol is short — a client id is 255 bytes at
+    /// most, a reason is a sentence — so two bytes of length are enough, and
+    /// a string that would not fit is a message this build cannot write
+    /// rather than one it writes wrong.
+    fn string(&mut self, value: &str) -> Result<(), CodecError> {
+        let bytes = value.as_bytes();
+        let len = u16::try_from(bytes.len()).map_err(|_| {
+            CodecError::Binary(format!(
+                "a string of {} bytes does not fit the wire format",
+                bytes.len()
+            ))
+        })?;
+        self.u16(len);
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// A byte string: a `u32le` length and the bytes.
+    fn bytes(&mut self, value: &[u8]) -> Result<(), CodecError> {
+        let len = u32::try_from(value.len()).map_err(|_| {
+            CodecError::Binary(format!(
+                "{} bytes of payload do not fit the wire format",
+                value.len()
+            ))
+        })?;
+        self.u32(len);
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Reads the binary form, a field at a time.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Reader { bytes, at: 0 }
+    }
+
+    /// The next `len` bytes — or an error if there are not that many left.
+    ///
+    /// The length in the payload is the peer's to write, so it is checked
+    /// against what is actually there before anything is allocated for it.
+    fn take(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
+        let end = self.at.checked_add(len).ok_or_else(|| {
+            CodecError::Binary("the payload claims more bytes than it has".to_string())
+        })?;
+        if end > self.bytes.len() {
+            return Err(CodecError::Binary(format!(
+                "the payload ends after {} of the {len} bytes it claims",
+                self.bytes.len() - self.at
+            )));
+        }
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, CodecError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, CodecError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, CodecError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, CodecError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn i64(&mut self) -> Result<i64, CodecError> {
+        Ok(self.u64()? as i64)
+    }
+
+    fn string(&mut self) -> Result<String, CodecError> {
+        let len = self.u16()? as usize;
+        let bytes = self.take(len)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| CodecError::Binary("a string is not UTF-8".to_string()))
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, CodecError> {
+        let len = self.u32()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +904,7 @@ mod tests {
                     client_id: "c".to_string(),
                     timestamp: 7,
                     device_id: None,
+                    version: None,
                 },
                 r#"{"type":"AUTH_START","client_id":"c","timestamp":7}"#,
             ),
@@ -251,6 +913,7 @@ mod tests {
                     client_id: "c".to_string(),
                     timestamp: 7,
                     device_id: Some("laptop".to_string()),
+                    version: None,
                 },
                 r#"{"type":"AUTH_START","client_id":"c","timestamp":7,"device_id":"laptop"}"#,
             ),
@@ -309,23 +972,23 @@ mod tests {
                 AuthMessage::EnrollIssue {
                     client_id: "c".to_string(),
                     secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-                    algorithm: "SHA1".to_string(),
+                    algorithm: Algorithm::Sha1,
                     digits: 6,
                     period: 30,
                     device_id: None,
                 },
-                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30}"#,
+                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"sha1","digits":6,"period":30}"#,
             ),
             (
                 AuthMessage::EnrollIssue {
                     client_id: "c".to_string(),
                     secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-                    algorithm: "SHA1".to_string(),
+                    algorithm: Algorithm::Sha1,
                     digits: 6,
                     period: 30,
                     device_id: Some("laptop".to_string()),
                 },
-                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"SHA1","digits":6,"period":30,"device_id":"laptop"}"#,
+                r#"{"type":"ENROLL_ISSUE","client_id":"c","secret":"JBSWY3DPEHPK3PXP","algorithm":"sha1","digits":6,"period":30,"device_id":"laptop"}"#,
             ),
             (
                 AuthMessage::EnrollFailed {
@@ -366,7 +1029,7 @@ mod tests {
         let issue = AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
             secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-            algorithm: "SHA1".to_string(),
+            algorithm: Algorithm::Sha1,
             digits: 6,
             period: 30,
             device_id: None,
@@ -401,7 +1064,7 @@ mod tests {
         let issue = AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
             secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-            algorithm: "SHA1".to_string(),
+            algorithm: Algorithm::Sha1,
             digits: 6,
             period: 30,
             device_id: None,
@@ -423,6 +1086,7 @@ mod tests {
             client_id,
             timestamp,
             device_id,
+            version,
         } = parsed
         else {
             panic!("expected AUTH_START, got {parsed:?}");
@@ -440,6 +1104,7 @@ mod tests {
                     client_id,
                     timestamp,
                     device_id,
+                    version,
                 }
                 .to_bytes()
                 .unwrap()
@@ -480,6 +1145,7 @@ mod tests {
                 client_id: "client-001".to_string(),
                 timestamp: 1,
                 device_id: Some("laptop".to_string()),
+                version: None,
             },
             AuthMessage::Response {
                 client_id: "client-001".to_string(),
@@ -497,7 +1163,7 @@ mod tests {
             AuthMessage::EnrollIssue {
                 client_id: "client-001".to_string(),
                 secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
-                algorithm: "SHA1".to_string(),
+                algorithm: Algorithm::Sha1,
                 digits: 6,
                 period: 30,
                 device_id: Some("laptop".to_string()),
@@ -586,6 +1252,327 @@ mod tests {
             )
             .unwrap(),
             wire,
+        );
+    }
+
+    // ===== The binary form =====
+
+    /// Every message, in every shape it has.
+    fn every_message() -> Vec<AuthMessage> {
+        vec![
+            AuthMessage::Start {
+                client_id: "client-001".to_string(),
+                timestamp: 7,
+                device_id: None,
+                version: None,
+            },
+            AuthMessage::Start {
+                client_id: "client-001".to_string(),
+                timestamp: 7,
+                device_id: Some("laptop".to_string()),
+                version: None,
+            },
+            AuthMessage::Start {
+                client_id: "client-001".to_string(),
+                timestamp: 7,
+                device_id: Some("laptop".to_string()),
+                version: Some(VERSION_BINARY),
+            },
+            AuthMessage::Challenge {
+                nonce: (0..32u8).collect(),
+            },
+            AuthMessage::Response {
+                client_id: "client-001".to_string(),
+                timestamp: 1_750_000_000,
+                totp_code: "123456".to_string(),
+                signature: vec![9u8; 32],
+                device_id: None,
+            },
+            AuthMessage::Response {
+                client_id: "client-001".to_string(),
+                timestamp: 1_750_000_000,
+                totp_code: String::new(),
+                signature: vec![7u8; 64],
+                device_id: Some("laptop".to_string()),
+            },
+            AuthMessage::Ok,
+            AuthMessage::Failed {
+                reason: "the credentials were refused".to_string(),
+            },
+            AuthMessage::EnrollStart {
+                client_id: "client-001".to_string(),
+                token: SecretString::new("0123456789abcdef".to_string()),
+                device_id: None,
+                public_key: None,
+            },
+            AuthMessage::EnrollStart {
+                client_id: "client-001".to_string(),
+                token: SecretString::new("0123456789abcdef".to_string()),
+                device_id: Some("laptop".to_string()),
+                public_key: Some("ab".repeat(32)),
+            },
+            AuthMessage::EnrollIssue {
+                client_id: "client-001".to_string(),
+                secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                algorithm: Algorithm::Sha1,
+                digits: 6,
+                period: 30,
+                device_id: None,
+            },
+            AuthMessage::EnrollIssue {
+                client_id: "client-001".to_string(),
+                secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                algorithm: Algorithm::Sha512,
+                digits: 8,
+                period: 60,
+                device_id: Some("laptop".to_string()),
+            },
+            AuthMessage::EnrollFailed {
+                reason: "the enrollment token was not accepted".to_string(),
+            },
+        ]
+    }
+
+    /// The binary form is the same message.
+    ///
+    /// Every message goes out in the binary form and comes back as the same
+    /// message — and as the same JSON, which is what says the two encoders
+    /// are two views of one thing rather than two things that happen to look
+    /// alike.
+    #[test]
+    fn every_message_survives_the_binary_form() {
+        for message in every_message() {
+            let payload = message
+                .to_payload(Format::Binary)
+                .expect("the binary form is writable");
+            assert_eq!(payload[0], VERSION_BINARY, "the version byte comes first");
+
+            let (back, format) =
+                AuthMessage::from_payload(&payload).expect("the binary form is readable");
+            assert_eq!(format, Format::Binary);
+            assert_eq!(
+                back.to_bytes().expect("serializable"),
+                message.to_bytes().expect("serializable"),
+                "{message:?} came back as something else"
+            );
+        }
+    }
+
+    /// The same for the versioned JSON form.
+    #[test]
+    fn every_message_survives_the_versioned_json_form() {
+        for message in every_message() {
+            let payload = message
+                .to_payload(Format::Json)
+                .expect("the versioned JSON form is writable");
+            assert_eq!(payload[0], VERSION_JSON);
+
+            let (back, format) =
+                AuthMessage::from_payload(&payload).expect("the versioned JSON form is readable");
+            assert_eq!(format, Format::Json);
+            assert_eq!(
+                back.to_bytes().expect("serializable"),
+                message.to_bytes().expect("serializable"),
+                "{message:?} came back as something else"
+            );
+        }
+    }
+
+    /// A payload that does not start with a version byte is the JSON form.
+    ///
+    /// That is what every peer sent before the version byte existed, and it
+    /// has to keep working: a JSON message starts with `{`, which is neither
+    /// of the two version bytes, so the three are told apart by one look.
+    #[test]
+    fn a_payload_without_a_version_byte_is_the_json_form() {
+        for message in every_message() {
+            let payload = message.to_bytes().expect("serializable");
+            assert_eq!(payload[0], b'{', "a JSON message starts with a brace");
+
+            let (back, format) =
+                AuthMessage::from_payload(&payload).expect("an old peer still parses");
+            assert_eq!(format, Format::LegacyJson);
+            assert_eq!(
+                back.to_bytes().expect("serializable"),
+                payload,
+                "{message:?} came back as something else"
+            );
+        }
+    }
+
+    /// The binary form is smaller than the JSON, and that is the reason it
+    /// exists.
+    ///
+    /// The two big messages are the ones that carry a nonce and a signature,
+    /// and the JSON writes those as arrays of decimal numbers — three bytes
+    /// per byte. The numbers here are the ones a real handshake produces.
+    #[test]
+    fn the_binary_form_is_smaller_than_the_json_one() {
+        let handshake = [
+            AuthMessage::Start {
+                client_id: "client-001".to_string(),
+                timestamp: 1_750_000_000,
+                device_id: None,
+                version: None,
+            },
+            AuthMessage::Challenge {
+                nonce: (0..32u8).collect(),
+            },
+            AuthMessage::Response {
+                client_id: "client-001".to_string(),
+                timestamp: 1_750_000_000,
+                totp_code: "123456".to_string(),
+                signature: (0..32u8).collect(),
+                device_id: None,
+            },
+            AuthMessage::Ok,
+        ];
+
+        let json: usize = handshake
+            .iter()
+            .map(|message| message.to_bytes().expect("serializable").len())
+            .sum();
+        let binary: usize = handshake
+            .iter()
+            .map(|message| {
+                message
+                    .to_payload(Format::Binary)
+                    .expect("the binary form is writable")
+                    .len()
+            })
+            .sum();
+
+        assert!(
+            binary * 2 < json,
+            "the binary form is {binary} bytes against the JSON's {json}"
+        );
+    }
+
+    /// A payload that is not a message is refused, and it is refused without
+    /// a panic and without allocating for a length the peer made up.
+    #[test]
+    fn a_broken_binary_payload_is_refused() {
+        let good = AuthMessage::Challenge {
+            nonce: vec![1, 2, 3],
+        }
+        .to_payload(Format::Binary)
+        .expect("writable");
+
+        // Truncated at every length: a payload that ends early is not a
+        // message, and none of the cuts may take the process down.
+        for cut in 1..good.len() {
+            let error = AuthMessage::from_payload(&good[..cut])
+                .expect_err("a truncated payload is not a message");
+            assert!(
+                !error.to_string().is_empty(),
+                "the refusal says something: {error}"
+            );
+        }
+
+        // A type byte nobody knows.
+        let mut unknown_type = good.clone();
+        unknown_type[1] = 0x7f;
+        let error =
+            AuthMessage::from_payload(&unknown_type).expect_err("an unknown type is refused");
+        assert!(
+            error.to_string().contains("unknown message type"),
+            "{error}"
+        );
+
+        // A flag the message type has no meaning for: refusing it is what
+        // stops a future version being read as if the field were absent.
+        let mut unknown_flag = good.clone();
+        unknown_flag[2] = 0b1000_0000;
+        let error =
+            AuthMessage::from_payload(&unknown_flag).expect_err("an unknown flag is refused");
+        assert!(error.to_string().contains("flags"), "{error}");
+
+        // A length that overruns the payload: the length is the peer's to
+        // write, so it is checked before anything is allocated for it.
+        let mut overrun = good.clone();
+        overrun[3] = 0xff;
+        overrun[4] = 0xff;
+        let error =
+            AuthMessage::from_payload(&overrun).expect_err("an overrunning length is refused");
+        assert!(!error.to_string().is_empty(), "{error}");
+    }
+
+    /// The algorithm is a closed set, in both forms.
+    #[test]
+    fn the_algorithm_is_a_closed_set() {
+        // A byte that is not one of the three.
+        let mut payload = AuthMessage::EnrollIssue {
+            client_id: "client-001".to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            algorithm: Algorithm::Sha1,
+            digits: 6,
+            period: 30,
+            device_id: None,
+        }
+        .to_payload(Format::Binary)
+        .expect("writable");
+        // The algorithm is the byte after the type, the flags, the client id
+        // and the secret — each of the two strings behind its own length.
+        let at = 1 + 1 + 1 + 2 + "client-001".len() + 2 + "JBSWY3DPEHPK3PXP".len();
+        payload[at] = 0x09;
+        let error =
+            AuthMessage::from_payload(&payload).expect_err("an unknown algorithm is refused");
+        assert!(error.to_string().contains("algorithm"), "{error}");
+
+        // A name nobody supports, in the JSON form.
+        let wire = r#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"JBSWY3DPEHPK3PXP","algorithm":"sha-256","digits":6,"period":30}"#;
+        let error = AuthMessage::from_payload(wire.as_bytes())
+            .expect_err("a name nobody supports is refused");
+        assert!(
+            error.to_string().contains("sha-256"),
+            "the refusal names the value: {error}"
+        );
+    }
+
+    /// The names are read in any case and written in one.
+    ///
+    /// The wire has always carried the canonical lowercase name, and the
+    /// configuration it comes from is read in any case — so a peer that says
+    /// `SHA1` is understood, and the answer is always `sha1`.
+    #[test]
+    fn an_algorithm_name_is_read_in_any_case() {
+        for (said, meant) in [
+            ("sha1", Algorithm::Sha1),
+            ("SHA1", Algorithm::Sha1),
+            ("Sha1", Algorithm::Sha1),
+            ("sha256", Algorithm::Sha256),
+            ("SHA256", Algorithm::Sha256),
+            ("sha512", Algorithm::Sha512),
+            ("SHA512", Algorithm::Sha512),
+        ] {
+            let wire = format!(
+                r#"{{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"JBSWY3DPEHPK3PXP","algorithm":"{said}","digits":6,"period":30}}"#
+            );
+            let (parsed, _) = AuthMessage::from_payload(wire.as_bytes())
+                .unwrap_or_else(|e| panic!("{said} parses: {e}"));
+            let AuthMessage::EnrollIssue { algorithm, .. } = parsed else {
+                panic!("expected ENROLL_ISSUE");
+            };
+            assert_eq!(algorithm, meant, "{said}");
+            assert_eq!(algorithm.name(), said.to_ascii_lowercase());
+        }
+    }
+
+    /// The announcement is the only thing a message says about the version,
+    /// and only the first message says it.
+    #[test]
+    fn only_the_first_message_announces_a_version() {
+        let start = AuthMessage::Start {
+            client_id: "client-001".to_string(),
+            timestamp: 1,
+            device_id: None,
+            version: Some(VERSION_BINARY),
+        };
+        assert_eq!(start.announced_version(), Some(VERSION_BINARY));
+        assert_eq!(
+            AuthMessage::Ok.announced_version(),
+            None,
+            "nothing else announces anything"
         );
     }
 }
