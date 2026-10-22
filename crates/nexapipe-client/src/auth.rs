@@ -377,6 +377,17 @@ impl TwoFactorAuth {
         self.device_id.as_deref()
     }
 
+    /// Who this credential proves itself as: the client, and the device of it.
+    ///
+    /// Two credentials with the same identity are the same account with a
+    /// different secret — the seed was rotated, the account was not — and a
+    /// connection authenticated as that account still stands for it. Two
+    /// credentials with different identities are different accounts, and a
+    /// connection authenticated as the old one is not the new one's.
+    pub fn identity(&self) -> (&str, Option<&str>) {
+        (self.client_id.as_str(), self.device_id.as_deref())
+    }
+
     /// Generate current TOTP code
     pub fn generate_code(&self) -> Result<String, ClientError> {
         let Proof::Totp {

@@ -31,6 +31,23 @@ pub fn encode_frame_to_vec(payload: &[u8]) -> Result<Vec<u8>, ProtoError> {
     Ok(out)
 }
 
+/// Whether a frame's payload is one a UDP datagram can carry.
+///
+/// The length prefix is a `u16`, so a frame can announce up to 65535 bytes —
+/// and a UDP datagram over IPv4 cannot carry more than 65507, because the IP
+/// header's total-length field is sixteen bits wide and the headers take some
+/// of it.
+///
+/// [`encode_frame`] refuses to produce such a frame, so one that arrives is a
+/// peer that is not speaking the protocol rather than a datagram that was
+/// meant to be sent. The check lives here because the rule belongs to the
+/// framing and both ends of the tunnel have to agree on it: the writer that
+/// would have to put the packet on the wire and the reader that would have
+/// to take it off are the same rule seen from two sides.
+pub fn payload_fits_datagram(payload: &[u8]) -> bool {
+    payload.len() <= MAX_UDP_PAYLOAD
+}
+
 /// Result of reading a frame off the front of a buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame<'a> {
@@ -142,5 +159,23 @@ mod tests {
             encode_frame_to_vec(&[0u8; MAX_UDP_PAYLOAD + 1]),
             Err(ProtoError::PayloadTooLarge)
         );
+    }
+
+    /// A frame can announce more than a datagram can carry: the length prefix
+    /// is a `u16`, and a datagram over IPv4 cannot be larger than 65507.
+    #[test]
+    fn a_frame_announcing_more_than_a_datagram_is_not_one() {
+        // 65535 is what the length prefix can express, and it is 28 bytes
+        // more than a datagram can carry.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&u16::MAX.to_be_bytes());
+        frame.extend(std::iter::repeat_n(0u8, usize::from(u16::MAX)));
+
+        let Frame::Ready { payload, .. } = decode_frame(&frame) else {
+            panic!("the frame did not decode");
+        };
+
+        assert!(!payload_fits_datagram(payload));
+        assert!(payload_fits_datagram(&[0u8; MAX_UDP_PAYLOAD]));
     }
 }
