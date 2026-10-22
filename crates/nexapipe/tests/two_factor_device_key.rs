@@ -64,6 +64,8 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         },
     );
     (config, key)
