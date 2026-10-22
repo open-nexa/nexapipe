@@ -951,11 +951,17 @@ fn two_factor_auth(cfg: &NodeCredential, key: Option<&iroh::SecretKey>) -> Optio
         if key.is_some() {
             jni_log!("2FA: a secret is registered beside a device key; answering with the secret");
         }
-        return match TwoFactorAuth::new(
-            client_id,
-            secret.as_str(),
-            TotpAlgorithm::from_name(algorithm),
-        ) {
+        // A name nobody supports is refused rather than downgraded: the node
+        // would compute codes the server does not accept, and every attempt
+        // would fail with "wrong code".
+        let algorithm = match TotpAlgorithm::try_from_name(algorithm) {
+            Ok(algorithm) => algorithm,
+            Err(e) => {
+                jni_log!("2FA auth config invalid: {}", e);
+                return None;
+            }
+        };
+        return match TwoFactorAuth::new(client_id, secret.as_str(), algorithm) {
             Ok(auth) => Some(match device {
                 Some(name) => auth.with_device(name),
                 None => auth,

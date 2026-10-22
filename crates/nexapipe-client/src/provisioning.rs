@@ -585,17 +585,14 @@ fn enrollment_from_params(params: &QueryParams, version: u32) -> Result<Option<I
 
 /// Reads the algorithm name.
 ///
-/// Stricter than [`TotpAlgorithm::from_name`], which falls back to SHA1 to
-/// survive a half-filled config file: an invite is a finished artifact, so a
-/// name nobody supports is an error, not a silent downgrade to a weaker code.
+/// The same parser the configuration path uses — see
+/// [`TotpAlgorithm::try_from_name`] — so the two cannot drift apart: an invite
+/// and a config that name the same algorithm have to be read the same way.
+///
+/// An absent name is the default, `sha1`, which is what a URI that leaves the
+/// parameter out means.
 fn parse_algorithm(name: Option<&str>) -> Result<TotpAlgorithm> {
-    match name.map(str::trim) {
-        None | Some("") => Ok(TotpAlgorithm::SHA1),
-        Some(name) if name.eq_ignore_ascii_case("sha1") => Ok(TotpAlgorithm::SHA1),
-        Some(name) if name.eq_ignore_ascii_case("sha256") => Ok(TotpAlgorithm::SHA256),
-        Some(name) if name.eq_ignore_ascii_case("sha512") => Ok(TotpAlgorithm::SHA512),
-        Some(other) => bail!("unsupported algorithm {other:?} (expected SHA1, SHA256 or SHA512)"),
-    }
+    Ok(TotpAlgorithm::try_from_name(name.unwrap_or_default())?)
 }
 
 /// Reads a nested standard `otpauth://` URI into the same structure.
@@ -848,6 +845,44 @@ fn percent_decode(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The invite path and the configuration path read a name the same way.
+    ///
+    /// They used to be two parsers: the invite one was strict and the
+    /// configuration one fell back to SHA1. A name the invite path refused and
+    /// the configuration path accepted was a name the two halves of the client
+    /// did not agree about.
+    #[test]
+    fn the_invite_and_the_configuration_read_a_name_the_same_way() {
+        for name in ["sha1", "sha256", "sha512", "SHA1", "SHA256", "SHA512"] {
+            let invite = parse_algorithm(Some(name)).expect("the invite path accepts it");
+            let config = TotpAlgorithm::try_from_name(name).expect("the config path accepts it");
+            assert_eq!(invite, config, "{name:?} is read the same way by both");
+        }
+
+        for name in ["sha-256", "SHA3-256", "sha", "sha 256", "sha1x"] {
+            assert!(
+                parse_algorithm(Some(name)).is_err(),
+                "the invite path refuses {name:?}"
+            );
+            assert!(
+                TotpAlgorithm::try_from_name(name).is_err(),
+                "the configuration path refuses {name:?}"
+            );
+        }
+    }
+
+    /// An invite that names no algorithm gets the default.
+    #[test]
+    fn an_invite_that_names_no_algorithm_gets_the_default() {
+        assert_eq!(
+            parse_algorithm(None).expect("the default"),
+            TotpAlgorithm::SHA1
+        );
+        assert_eq!(
+            parse_algorithm(Some("")).expect("the default"),
+            TotpAlgorithm::SHA1
+        );
+    }
 
     /// A Node ID nobody is listening on.
     ///
