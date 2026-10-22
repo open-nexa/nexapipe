@@ -1686,6 +1686,19 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
     jni_log!("[tun-proxy] UDP demux task exiting");
 }
 
+/// Takes a datagram out of a flow's queue, and gives its bytes back.
+///
+/// The bytes are given back **here**, where the datagram leaves the queue: the
+/// queue's budget is what the flow is holding, and a datagram that is no
+/// longer waiting is no longer part of it. One place does it, so that a call
+/// site cannot forget — a reservation that is never given back shrinks the
+/// budget a byte at a time until the flow is wedged and drops every datagram
+/// it is given.
+fn take_from_queue(queue: &UdpQueue, datagram: Vec<u8>) -> Vec<u8> {
+    queue.taken(&datagram);
+    datagram
+}
+
 /// Carry one UDP flow: datagrams in from the demultiplexer, frames out to the
 /// tunnel, and the reverse.
 ///
@@ -1772,7 +1785,7 @@ async fn run_udp_flow(
             Activity::Application(Some(datagram)) => {
                 // The datagram is out of the queue now, so its bytes are no
                 // longer waiting for it.
-                mine.taken(&datagram);
+                let datagram = take_from_queue(&mine, datagram);
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
@@ -2488,7 +2501,7 @@ mod tests {
         UdpSendError, UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for,
         cached_answer, cached_answer_at, handle_dns_query, lock_cache, next_activity,
         parse_dns_query, read_u32, remember_answer, resolve_tcp_window, set_answer_ttls,
-        wait_for_stop,
+        take_from_queue, wait_for_stop,
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
@@ -3087,7 +3100,9 @@ mod tests {
     /// The arithmetic of the budget is one thing; the pairing is another. A
     /// reservation that is never given back shrinks the queue a byte at a
     /// time until it is wedged, and one that is given back twice takes the
-    /// count under the truth — which, in a debug build, is a panic.
+    /// count under the truth — the counter wraps rather than panicking, so the
+    /// cost is a flow that can never reserve anything again and drops every
+    /// datagram it is given.
     ///
     /// This drives the three steps the tunnel does: the datagram is put in,
     /// the flow takes it out, and the bytes are given back. It is the same
@@ -3155,6 +3170,88 @@ mod tests {
             queue.queued_bytes(),
             0,
             "a datagram that did not fit is not counted"
+        );
+    }
+
+    /// A datagram that the **count** bound turns away gives its bytes back.
+    ///
+    /// The third way a datagram does not go in: the queue had room in bytes
+    /// but the channel was already carrying as many datagrams as it takes.
+    /// The reservation was taken before the send, so it has to be given back
+    /// here as well — otherwise a full channel would eat the byte budget of
+    /// the flow a datagram at a time, and the flow would be wedged by a
+    /// condition that has nothing to do with bytes.
+    #[tokio::test]
+    async fn a_datagram_the_count_bound_turns_away_gives_its_bytes_back() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        // Fill the channel with datagrams that are small enough not to touch
+        // the byte bound, so that the count is the only bound left.
+        let small = vec![7u8; 16];
+        for _ in 0..UDP_FLOW_QUEUE {
+            assert_eq!(
+                queue.send(small.clone()),
+                Ok(()),
+                "the datagram goes in while there is room"
+            );
+        }
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE * small.len(),
+            "every datagram in the channel is counted"
+        );
+
+        // The channel is full now, so the next one does not go in — and the
+        // bytes it had reserved are given back.
+        assert_eq!(
+            queue.send(small.clone()),
+            Err(UdpSendError::Full),
+            "the datagram does not go into a channel that is full"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE * small.len(),
+            "a datagram that did not go in is not counted"
+        );
+
+        // And the budget is intact: a datagram that is taken out of the
+        // channel makes room for another one.
+        let taken = receiver.recv().await.expect("a datagram is there");
+        queue.taken(&taken);
+        assert_eq!(queue.send(small.clone()), Ok(()), "there is room again");
+    }
+
+    /// The flow's own step gives the bytes back.
+    ///
+    /// The step the flow takes when a datagram comes out of the queue is the
+    /// one that gives the bytes back, and it is the one a mistake would be
+    /// made in: a flow that forwards a datagram without giving its bytes back
+    /// would shrink its own budget a datagram at a time until it dropped
+    /// everything it was given. This drives that step, so that the pairing
+    /// the budget depends on is pinned by a test rather than by a comment.
+    #[tokio::test]
+    async fn the_flow_gives_the_bytes_back_when_it_takes_a_datagram() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let datagram = vec![7u8; 1400];
+        assert_eq!(queue.send(datagram.clone()), Ok(()), "the datagram goes in");
+        assert_eq!(
+            queue.queued_bytes(),
+            datagram.len(),
+            "the datagram's bytes are waiting for it"
+        );
+
+        // The flow takes it out of the queue, and the bytes go back with it.
+        let taken = receiver.recv().await.expect("the datagram is there");
+        let datagram = take_from_queue(&queue, taken);
+        assert_eq!(datagram, vec![7u8; 1400], "the datagram is the one sent");
+
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "the bytes are given back when the datagram leaves the queue"
         );
     }
 }

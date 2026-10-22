@@ -40,7 +40,7 @@ paths that carry the traffic can be measured instead of assumed, the first
 result of those measurements is written down, a route that rewrites the paths
 it serves now rewrites them for the tunnel as well, a request's body is
 forwarded to the backend while it is still arriving, and the Android client's
-tunnel descriptor is closed exactly once, a UDP flow's queue is bounded by
+tunnel descriptor is closed exactly once, and a UDP flow's queue is bounded by
 bytes rather than only by datagrams.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
