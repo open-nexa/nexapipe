@@ -665,6 +665,10 @@ lookup, which is what a config written before the key existed does.
   of. A token that cannot be sealed now moves nowhere: it stays where it is
   until the keystore can hold it, and the decision is a tested function
   rather than a line of bookkeeping.
+  "Where it is" is the **backed-up** preferences, so a token this device
+  cannot seal rides the backup for as long as the keystore is unavailable —
+  the trade is a credential that is preserved over one that never leaves the
+  device, and the migration moves it on the first start that can seal it.
 - **The WebSocket request line is rebuilt from the parsed request.** The
   client rebuilt the line it sends from the raw bytes of the one it
   received, and the HTTP version came out of that split — so a request line
