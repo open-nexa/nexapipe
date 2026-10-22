@@ -21,6 +21,7 @@ and its meaning.
 
 Twenty-three things land in this cycle so far: the device credential can be a **key**
 Twenty-four things land in this cycle so far: the device credential can be a **key**
+Twenty-five things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -46,8 +47,9 @@ BBR rather than Cubic, the protocol's name on the wire is the name rather than
 a name with a control byte in front of it, and a UDP flow's queue is bounded by
 bytes rather than only by datagrams.
 a name with a control byte in front of it, a UDP flow's queue is bounded by
-bytes rather than only by datagrams, and the local proxy holds two buffers per
-connection rather than three.
+bytes rather than only by datagrams, the local proxy holds two buffers per
+connection rather than three, and a 2FA code from a step that has gone by is
+refused.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -64,6 +66,36 @@ every port it had, and leaving `[iroh] discovery` out keeps n0's address
 lookup, which is what a config written before the key existed does.
 
 ### Added
+
+- **A 2FA code from an earlier step is refused.** The server remembered
+  nothing about the codes it had accepted, so a code from a step that had
+  already gone by could still be used — it is inside the acceptance window,
+  because the window is about how far the clocks may differ and not about
+  whether a code has been used. The step is remembered now, and a step
+  **behind** the last accepted one is refused.
+  The step is the thing worth remembering, not the code: a code is inside the
+  acceptance window for the whole of its step, so "this code is current" and
+  "this code has been used" are different questions, and only the step tells
+  them apart.
+  The **same** step again is allowed, and it has to be: a client that opens
+  several connections in the same step sends the same code for each of them —
+  the protocol is chosen at the handshake, so a client that speaks HTTP and
+  L4 holds a connection for each — and refusing the second would leave the
+  client with connections it cannot open.
+  What is refused is a code from a step **behind** the last accepted one
+  **that is still inside the acceptance window** — and the band is one step
+  wide: a code captured at the step the client used is accepted again on the
+  next step, and only refused once the memory has moved past it. The window
+  is about how far the clocks may differ, so a code that has fallen out of it
+  is counted as a wrong code instead.
+  A refusal is **not counted**. The counter is what stops the guessing, and a
+  code from an earlier step is not something anybody guessed.
+  The memory is per credential — the client's own secret, or a named
+  device's — and it survives a restart: the state file beside the
+  configuration carries it.
+  This is hardening rather than a hole that was open: the response's
+  signature covers the challenge issued for one connection, so a captured
+  response was already useless on another connection.
 
 - **A UDP flow's queue is bounded by bytes, not only by datagrams.** A
   flow's queue held up to 256 datagrams, and a datagram may be 65,507 bytes

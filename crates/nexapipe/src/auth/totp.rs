@@ -68,10 +68,17 @@ impl<'a> TotpValidator<'a> {
     /// device with a public key proves itself with an Ed25519 signature over
     /// the same bytes, and has no code to offer: `totp_code` is empty.
     ///
-    /// `Ok(false)` is the credential being wrong, and the caller counts it
-    /// toward the lockout. Today that is one case: a wrong TOTP code for a
-    /// secret device. Every `Err` is a refusal the caller logs instead of
+    /// `Ok(Verified::WrongCode)` is the credential being wrong, and the caller
+    /// counts it toward the lockout. Today that is one case: a wrong TOTP code
+    /// for a secret device. Every `Err` is a refusal the caller logs instead of
     /// counting.
+    ///
+    /// `Ok(Verified::Accepted { step })` carries the step the code matched on,
+    /// because the caller needs it: **the same code is inside the window for
+    /// the whole of its step**, so "this code is current" and "this code has
+    /// already been used" are different questions, and only the step tells
+    /// them apart. The caller is the one that remembers, and what it refuses
+    /// is a step **behind** the last one it accepted.
     ///
     /// A key device's wrong signature is a refusal and not a count, and the
     /// difference is the difference between the two proofs. A code is
@@ -103,9 +110,9 @@ impl<'a> TotpValidator<'a> {
         timestamp: i64,
         signature: &[u8],
         code: &str,
-    ) -> Result<bool, AuthError> {
+    ) -> Result<Verified, AuthError> {
         if !self.config.enabled {
-            return Ok(true);
+            return Ok(Verified::Accepted { step: None });
         }
 
         let client = self
@@ -164,7 +171,10 @@ impl<'a> TotpValidator<'a> {
                 if !constant_time_eq(signature, &expected) {
                     return Err(AuthError::ChallengeMismatch);
                 }
-                self.check_code(secret, code)
+                match self.check_code(secret, code)? {
+                    Some(step) => Ok(Verified::Accepted { step: Some(step) }),
+                    None => Ok(Verified::WrongCode),
+                }
             }
             // The key path's whole verdict: a signature over the same message
             // the HMAC above covers, so this is the same statement, proven the
@@ -195,14 +205,20 @@ impl<'a> TotpValidator<'a> {
                 if !super::device_key::ed25519_verify(&key, nonce, timestamp, signature) {
                     return Err(AuthError::WrongSignature);
                 }
-                Ok(true)
+                // No step: a key device has no code, and the challenge-bound
+                // signature is not something a second use could replay.
+                Ok(Verified::Accepted { step: None })
             }
         }
     }
 
-    /// The code half of the secret path: whether `code` is current for
-    /// `secret` under this config's algorithm, digits, window and step.
-    fn check_code(&self, secret: SecretBytes, code: &str) -> Result<bool, AuthError> {
+    /// The code half of the secret path: the step it matched on, if any.
+    ///
+    /// The step is what RFC 6238 §5.2 asks a verifier to remember. A code
+    /// that is *inside* the window is not the same as a code that has
+    /// **already been used**, and only the step tells the two apart: the same
+    /// code is inside the window for the whole of its step.
+    fn check_code(&self, secret: SecretBytes, code: &str) -> Result<Option<u64>, AuthError> {
         // `Builder` narrows two of these: 5.x took `digits` as a `usize` and
         // `skew` as a `u8`, 6.0 takes a `u8` and a `u16`. Converting rather
         // than casting keeps a config that does not fit from being truncated
@@ -223,10 +239,13 @@ impl<'a> TotpValidator<'a> {
             .build()
             .map_err(|_| AuthError::TotpCreationFailed)?;
 
-        // `check_current` answers with the step it matched on — `Some` is the
-        // "yes" this used to get as a `bool`, and the step itself is nothing
-        // an AUTH_RESPONSE is asking about.
-        Ok(totp.check_current(code).is_some())
+        // `check_current` answers with the step it matched on — and the step
+        // is what makes a code that is *current* different from one that has
+        // already been used, so the caller keeps it: RFC 6238 §5.2 asks a
+        // verifier to refuse the second use of a step it has already accepted.
+        //
+        // `None` is a code that is not current: wrong, or outside the window.
+        Ok(totp.check_current(code))
     }
 
     /// Generate a new TOTP secret for a client (for setup)
@@ -283,6 +302,28 @@ fn current_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// What the verification found.
+///
+/// The three answers are different in kind, and the difference matters to the
+/// caller: a credential that proved itself, a **guess** at one, and a refusal.
+/// The first clears the counters, the second counts, and the third does
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verified {
+    /// The credential proved itself.
+    ///
+    /// `step` is the TOTP step the code matched on. A **key** device has no
+    /// code, so it has no step either — and the key path is not the one that
+    /// needs the memory: a signature cannot be replayed, because it covers the
+    /// challenge that was issued for this connection.
+    Accepted {
+        /// The step the code matched on, when there was a code.
+        step: Option<u64>,
+    },
+    /// The code was wrong: a guess at the credential.
+    WrongCode,
 }
 
 /// Authentication errors
@@ -383,6 +424,7 @@ mod tests {
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -414,10 +456,12 @@ mod tests {
                     public_key: None,
                     created_at: String::new(),
                     last_used: None,
+                    last_used_step: None,
                 },
             )]),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -445,6 +489,7 @@ mod tests {
                 public_key: Some(crate::auth::public_key_hex(&key.public())),
                 created_at: String::new(),
                 last_used: None,
+                last_used_step: None,
             },
         );
         (config, key)
@@ -526,7 +571,7 @@ mod tests {
             &laptop,
             "000000",
         );
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(matches!(outcome, Ok(Verified::WrongCode)), "{outcome:?}");
 
         // The same name, signed with the client's own secret: a mismatch, not
         // a fallback.
@@ -592,7 +637,7 @@ mod tests {
 
         let outcome =
             validator.verify_response("alice", None, &nonce, timestamp, &clients_own, "000000");
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(matches!(outcome, Ok(Verified::WrongCode)), "{outcome:?}");
     }
 
     /// The fallback is a credential no revocation can reach: `client revoke
@@ -658,7 +703,7 @@ mod tests {
             &laptop,
             "000000",
         );
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(matches!(outcome, Ok(Verified::WrongCode)), "{outcome:?}");
     }
 
     /// The default has to stay permissive, or every client that predates the
@@ -668,6 +713,60 @@ mod tests {
     fn an_unnamed_device_is_allowed_unless_the_config_says_otherwise() {
         let config = config_with_one_device();
         assert!(config.clients["alice"].unnamed_device_allowed);
+    }
+
+    /// The step the code matched on comes back with the acceptance.
+    ///
+    /// It is what tells a code that is *current* from one that has **already
+    /// been used**: a code is inside the acceptance window for the whole of
+    /// its step, so the window alone cannot answer the second question. The
+    /// caller keeps the step, and RFC 6238 §5.2 asks it to refuse the second
+    /// use of one.
+    #[test]
+    fn the_step_the_code_matched_on_comes_back() {
+        let config = config_with_one_device();
+        let secret = config.clients["alice"].devices["laptop"]
+            .decode_secret()
+            .expect("the secret reads back");
+        // The code a client would send right now.
+        let code = totp_rs::Builder::new()
+            .with_secret(secret.expose_secret_cloned())
+            .build()
+            .expect("the validator is built")
+            .generate_current()
+            .to_string();
+
+        let validator = TotpValidator::new(&config);
+        let nonce = fresh_nonce();
+        let timestamp = current_timestamp();
+        let signature = hmac_signature(
+            config.clients["alice"].devices["laptop"]
+                .decode_secret()
+                .unwrap()
+                .as_slice(),
+            &nonce,
+            timestamp,
+        )
+        .unwrap();
+
+        let outcome = validator.verify_response(
+            "alice",
+            Some("laptop"),
+            &nonce,
+            timestamp,
+            &signature,
+            &code,
+        );
+        let Ok(Verified::Accepted { step: Some(step) }) = outcome else {
+            panic!("the code is current: {outcome:?}");
+        };
+        // The step is a time index: the thirty-second window the code belongs
+        // to, counted from the epoch.
+        let expected = (timestamp as u64) / 30;
+        assert!(
+            step.abs_diff(expected) <= 1,
+            "the step is the time index of the code: {step} against {expected}"
+        );
     }
 
     /// A key device proves itself with a signature over the challenge, and it
@@ -690,11 +789,15 @@ mod tests {
             &signature.to_bytes(),
             "",
         );
-        assert!(matches!(outcome, Ok(true)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(Verified::Accepted { .. })),
+            "{outcome:?}"
+        );
     }
 
     /// A signature that is not this device's is the key path's wrong
-    /// credential, so it is `Ok(false)` — the verdict the caller counts — and
+    /// credential, so it is `Ok(Verified::WrongCode)` — the verdict the caller
+    /// counts — and
     /// not an `Err`. If it were an `Err`, the counter would never move and the
     /// device could be tried without limit.
     #[test]

@@ -1,6 +1,6 @@
 use crate::auth::{
-    AuthConfig, AuthError, AuthMessage, ClientAcl, DeviceAuth, TotpValidator,
-    is_presentable_client_id, is_presentable_device_id,
+    AuthConfig, AuthError, AuthMessage, ClientAcl, DeviceAuth, StepVerdict, TotpValidator,
+    Verified, is_presentable_client_id, is_presentable_device_id,
 };
 use crate::config::{BackendProtocol, Timeouts};
 use crate::config_watcher::save_auth_state;
@@ -1522,6 +1522,7 @@ fn issue_enrolled_secret(
                     public_key: None,
                     created_at: crate::auth::config::default_created_at(),
                     last_used: None,
+                    last_used_step: None,
                 },
             ),
             name: name.clone(),
@@ -1534,6 +1535,7 @@ fn issue_enrolled_secret(
                     public_key: Some(key.clone()),
                     created_at: crate::auth::config::default_created_at(),
                     last_used: None,
+                    last_used_step: None,
                 },
             ),
             name: name.clone(),
@@ -2304,48 +2306,89 @@ async fn perform_authentication(
     // write itself happens after the lock is released.
     let mut state_dirty = false;
     let is_valid = match outcome {
-        Ok(true) => {
-            // Which device this was, if it named one, recorded under the same
-            // lock that verified it. This is the stamp `client list` reads to
-            // say whether a device is still in use: without it every named
-            // device reports "never used" forever, and the one question the
-            // device table exists to answer — which of these can be revoked
-            // without disconnecting a live one — has nothing to go on.
-            let device_stamp_moved = match resp_device_id.as_deref() {
-                Some(name) => cfg
-                    .clients
-                    .get_mut(&client_id)
-                    .is_some_and(|client| client.record_device_success(name)),
-                None => false,
+        Ok(Verified::Accepted { step }) => {
+            // **The step check**, under the same lock that verified the code.
+            //
+            // A code is inside the acceptance window for the whole of its
+            // step, so "this code is current" and "this code has already been
+            // used" are different questions, and only the step tells them
+            // apart. RFC 6238 §5.2 asks the verifier to refuse the second
+            // use of a step it has already accepted.
+            //
+            // The check and the record are one operation: a caller that
+            // checked and then recorded could let two connections through
+            // between the two, and the whole point is that the second one does
+            // not get in.
+            let step_verdict = match step {
+                Some(step) => cfg.accept_step(&client_id, resp_device_id.as_deref(), step),
+                // No code, so no step: a key device's signature covers the
+                // challenge issued for this connection, and there is nothing
+                // for a second use to replay.
+                None => StepVerdict::Accepted { moved: false },
             };
-            // Clear the counters only when there is something to clear, so a
-            // healthy client does not turn every connection into a disk write.
-            // A named device that moved its stamp is worth one: `unix_now` is
-            // whole seconds, so a device reconnecting inside the same second
-            // is not.
-            let dirty = device_stamp_moved
-                || cfg
-                    .clients
-                    .get(&client_id)
-                    .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
-            if dirty {
-                if let Some(client) = cfg.clients.get_mut(&client_id) {
-                    client.record_success();
+            let (step_moved, step_refused) = match step_verdict {
+                StepVerdict::Refused => (false, true),
+                StepVerdict::Accepted { moved } => (moved, false),
+            };
+            if step_refused {
+                // **Not counted.** A code that has already been used is not a
+                // guess at the credential, and counting it would let whoever
+                // holds one code lock the device's owner out — over a
+                // credential the owner did nothing wrong.
+                tracing::warn!(
+                    "2FA: client '{}' from {} sent a code that has already been used; refused \
+                     without counting it as an attempt",
+                    client_id,
+                    peer
+                );
+                false
+            } else {
+                // Which device this was, if it named one, recorded under the same
+                // lock that verified it. This is the stamp `client list` reads to
+                // say whether a device is still in use: without it every named
+                // device reports "never used" forever, and the one question the
+                // device table exists to answer — which of these can be revoked
+                // without disconnecting a live one — has nothing to go on.
+                let device_stamp_moved = match resp_device_id.as_deref() {
+                    Some(name) => cfg
+                        .clients
+                        .get_mut(&client_id)
+                        .is_some_and(|client| client.record_device_success(name)),
+                    None => false,
+                };
+                // Clear the counters only when there is something to clear, so a
+                // healthy client does not turn every connection into a disk write.
+                // A named device that moved its stamp is worth one: `unix_now` is
+                // whole seconds, so a device reconnecting inside the same second
+                // is not.
+                // The step's memory is worth a write too: it is the thing that
+                // refuses the second use of a code, and a server that forgot it
+                // over a restart would accept one.
+                let dirty = step_moved
+                    || device_stamp_moved
+                    || cfg
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+                if dirty {
+                    if let Some(client) = cfg.clients.get_mut(&client_id) {
+                        client.record_success();
+                    }
+                    // The write happens after the lock is released; see
+                    // `persist_auth_state`.
+                    state_dirty = true;
                 }
-                // The write happens after the lock is released; see
-                // `persist_auth_state`.
-                state_dirty = true;
+                // Snapshot the host authorization while the same lock that verified
+                // the credentials still holds: the entry cannot vanish between the
+                // two reads, and a connection keeps the ACL it authenticated with
+                // even if a reload changes it right after.
+                if let Some(client) = cfg.clients.get(&client_id) {
+                    verified_acl = client.acl();
+                }
+                true
             }
-            // Snapshot the host authorization while the same lock that verified
-            // the credentials still holds: the entry cannot vanish between the
-            // two reads, and a connection keeps the ACL it authenticated with
-            // even if a reload changes it right after.
-            if let Some(client) = cfg.clients.get(&client_id) {
-                verified_acl = client.acl();
-            }
-            true
         }
-        Ok(false) => {
+        Ok(Verified::WrongCode) => {
             let max_attempts = cfg.max_attempts;
             let lockout_duration = cfg.lockout_duration;
             if let Some(client) = cfg.clients.get_mut(&client_id) {
@@ -3250,6 +3293,7 @@ mod tests {
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,
                 last_used: None,
+                last_used_step: None,
                 failed_attempts: 0,
                 locked_until: None,
                 enrollment_failed_attempts: 0,
@@ -3376,6 +3420,7 @@ mod tests {
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
+                last_used_step: None,
             },
         );
 
@@ -3616,6 +3661,7 @@ mod tests {
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
+                last_used_step: None,
             },
         );
         cfg

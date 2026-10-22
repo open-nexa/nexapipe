@@ -1686,6 +1686,7 @@ fn auth_config() -> AuthConfig {
             devices: std::collections::HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -1922,6 +1923,155 @@ async fn a_client_that_does_not_handshake_is_closed() {
     );
 }
 
+/// The step memory refuses a code from an **earlier** step, and lets the same
+/// one through again.
+///
+/// A code is inside the acceptance window for the whole of its step, so "this
+/// code is current" and "this code has been used" are different questions,
+/// and only the step tells them apart.
+///
+/// The rule is one step back, not the same step: a client that opens several
+/// connections in the same step sends the same code for each of them — the
+/// protocol is chosen at the handshake, so a client that speaks HTTP and L4
+/// holds a connection for each — and refusing the second would leave the
+/// client with connections it cannot open.
+///
+/// The refusal is not a **guess**, and it does not count as one. The counter
+/// is what stops the guessing, and a code from an earlier step is not
+/// something anybody guessed.
+#[tokio::test]
+async fn an_earlier_steps_code_is_refused_and_the_same_one_again_is_not() {
+    // The scenario is about a *step*, and a step is thirty seconds long: a
+    // boundary crossed in the middle of the test would put the code of the
+    // earlier step two steps behind the server's origin, outside the
+    // acceptance window, and the server would count it as a wrong code
+    // instead of refusing it. The test and the server share a clock, so the
+    // test can see the boundary coming and wait it out.
+    wait_for_a_comfortable_step().await;
+
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy =
+        spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
+    let tunnel = Tunnel::dial(proxy.addr.clone()).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    let code = client.generate_code().expect("the code is generated");
+
+    // The first use is accepted, and the step it matched on is remembered.
+    let answer = handshake(&tunnel, &client, Some(code.clone()), None).await;
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the first use of a code is accepted, got {answer:?}"
+    );
+
+    // The same code on a **second connection** is accepted, and it has to be:
+    // a client that opens several connections in the same step sends the
+    // same code for each of them — the protocol is chosen at the handshake,
+    // so a client that speaks HTTP and L4 holds a connection for each — and
+    // refusing the second would leave the client with connections it cannot
+    // open.
+    let second = Tunnel::dial(proxy.addr.clone()).await;
+    let answer = handshake(&second, &client, Some(code), None).await;
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the same code on another connection is accepted, got {answer:?}"
+    );
+
+    // What **is** refused is a code from an *earlier* step: it is still
+    // inside the acceptance window — the window is about how far the clocks
+    // may differ, not about whether a code has been used — and the memory of
+    // the step is what refuses it.
+    let older = Tunnel::dial(proxy.addr.clone()).await;
+    let refused = handshake(&older, &client, Some(previous_step_code(SECRET)), None).await;
+    assert!(
+        matches!(refused, AuthMessage::Failed { .. }),
+        "a code from an earlier step is refused, got {refused:?}"
+    );
+
+    // And none of it was counted: the counter is for guesses, and a code
+    // that has been used already is not one.
+    //
+    // The guard is scoped to the block on purpose: it is a **read** lock on
+    // the same configuration the server takes a **write** lock on for the
+    // next handshake, and a reader held across it would keep the server
+    // waiting — until its handshake deadline closed the connection with "2FA
+    // required".
+    {
+        let config = auth.config().read().await;
+        assert_eq!(
+            config.clients[CLIENT_ID].failed_attempts, 0,
+            "a refused code is not a guess, and must not be counted as one"
+        );
+    }
+
+    // The reply for a refused replay is the reply for a wrong code, byte for
+    // byte: a distinct message would say that the code was *right* and only
+    // too old, which is an oracle — it would tell an attacker that the code
+    // it holds is the right one. The reason goes to the log instead.
+    let wrong = Tunnel::dial(proxy.addr.clone()).await;
+    let wrong_answer = handshake(&wrong, &client, Some("000000".to_string()), None).await;
+    let refused_reason = match &refused {
+        AuthMessage::Failed { reason } => reason.clone(),
+        other => panic!("a refused replay answers with a failure, got {other:?}"),
+    };
+    let wrong_reason = match &wrong_answer {
+        AuthMessage::Failed { reason } => reason.clone(),
+        other => panic!("a wrong code answers with a failure, got {other:?}"),
+    };
+    assert_eq!(
+        refused_reason, wrong_reason,
+        "a refused replay answers exactly as a wrong code does"
+    );
+}
+
+/// Waits until the current step has enough of it left for the test to finish.
+///
+/// A TOTP step is thirty seconds, and the code of the *earlier* step is only
+/// refused while the server is still in the step the test started in. A
+/// boundary crossed in between puts that code two steps behind, outside the
+/// acceptance window, and the server counts it as a wrong code — the test
+/// then fails for a reason that has nothing to do with what it is testing.
+/// The test and the server share a clock, so the test can see the boundary
+/// coming and wait it out.
+async fn wait_for_a_comfortable_step() {
+    const STEP: u64 = 30;
+    const WANTED: u64 = 5;
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let left = STEP - (now % STEP);
+        if left >= WANTED {
+            return;
+        }
+        // Past the boundary, and a second into the new step: the server's
+        // origin is the new one, and the code of the step before it is
+        // inside the window for the next twenty-nine seconds.
+        tokio::time::sleep(std::time::Duration::from_secs(left + 1)).await;
+    }
+}
+
+/// The code of the step **before** this one.
+///
+/// The client's own generator only makes the current code, and the code of an
+/// earlier step is what the memory refuses — so the test makes it itself.
+fn previous_step_code(secret: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secret = totp_rs::Secret::try_from_base32(secret).expect("the secret decodes");
+    totp_rs::Builder::new()
+        .with_secret(secret)
+        .build()
+        .expect("the generator is built")
+        .generate(now - 30)
+        .to_string()
+}
+
 /// A device that proves itself with a key gets in without a code.
 ///
 /// The device is issued its credential at enrollment, and the answer to the
@@ -1942,6 +2092,7 @@ async fn a_device_key_gets_in() {
             public_key: Some(public_key),
             created_at: "0".to_string(),
             last_used: None,
+            last_used_step: None,
         },
     );
 

@@ -2182,6 +2182,7 @@ impl ProxyConfig {
                                             crate::auth::config::default_created_at,
                                         ),
                                         last_used: device_toml.last_used,
+                                        last_used_step: None,
                                     },
                                 );
                             }
@@ -2203,6 +2204,10 @@ impl ProxyConfig {
                                         .unnamed_device_allowed
                                         .unwrap_or(true),
                                     last_used: client_toml.last_used,
+                                    last_used_step: None,
+                                    // The step memory is not in the config
+                                    // file: it is a counter, and the counters
+                                    // live in the state file beside it.
                                     failed_attempts: client_toml.failed_attempts.unwrap_or(0),
                                     locked_until: client_toml.locked_until,
                                     enrollment_failed_attempts: 0,
