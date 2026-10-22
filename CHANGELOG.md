@@ -449,6 +449,12 @@ lookup, which is what a config written before the key existed does.
   and the length are checked now, and the n0-operated relays are refused for
   the same reason the configuration refuses them. A code past a hard limit is
   refused rather than parsed.
+- **A stream leaves its connection in the pool.** The client's
+  `open_bi_stream` returned the two streams and dropped the connection, so
+  the pool never saw that connection again: every call dialled a new one, and
+  the pool lost a slot each time. The connection now goes back into the pool
+  when the exchange is done. The pool's idle stamp is also named after what
+  it is — the last use, not the creation.
 - **The client refuses a request that names more than one host.** The client
   picked the first `Host` that matched a proxy domain and forwarded the head
   byte for byte, so a request with two `Host` headers reached the server, which
