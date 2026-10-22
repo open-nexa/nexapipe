@@ -74,6 +74,13 @@ impl IrohProxyClient {
     /// every call dialled a new one and the pool lost a slot each time. The
     /// streams go **into** the closure rather than out of it, so a connection
     /// cannot escape the pool with its slot already spent.
+    ///
+    /// The connection is the **generic** one, where the first byte of each
+    /// stream decides what the stream carries: a request line is a request,
+    /// an L4 preface is a tunnel, a ClientHello is a TLS session. The closure
+    /// is not told what it may write, so the connection it borrows may not
+    /// promise either — a connection that named the HTTP protocol would
+    /// refuse a preface, and the stream would never open.
     pub async fn with_stream<T, F>(&self, f: F) -> Result<T, ClientError>
     where
         F: AsyncFnOnce(
@@ -81,7 +88,7 @@ impl IrohProxyClient {
             &mut iroh::endpoint::RecvStream,
         ) -> Result<T, ClientError>,
     {
-        let conn = self.conn_pool.get_connection(Protocol::Http).await?;
+        let conn = self.conn_pool.get_connection(Protocol::Legacy).await?;
         let (mut send, mut recv) = conn.conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
         let result = f(&mut send, &mut recv).await;
