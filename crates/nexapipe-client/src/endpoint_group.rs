@@ -1,6 +1,8 @@
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::connection_pool::{IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT};
+use crate::connection_pool::{
+    Borrow, IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT,
+};
 use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
 use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
@@ -10,7 +12,7 @@ use nexapipe_proto::{host_matches, normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,7 +33,12 @@ macro_rules! jni_log {
     };
 }
 
-#[derive(Debug, Clone)]
+/// A connection the group handed out, and the borrow it was handed out under.
+///
+/// Not `Clone`: a copy would be a second handle on the **same** borrow, and
+/// the pool's count of the flows on the connection would then be wrong —
+/// the connection would look busy after the flow that held it was gone.
+#[derive(Debug)]
 pub struct PooledConnection {
     conn: Connection,
     pool_index: usize,
@@ -56,15 +63,15 @@ pub struct PooledConnection {
     /// a node nobody is tracking, and a flow that is counted but not listed is a
     /// list with a hole in it.
     flows: Option<Arc<FlowRegistry>>,
-    /// The pool's count of the flows riding this connection.
+    /// The borrow this connection is held under.
     ///
     /// The pool owns the connection and the flows **borrow** it, so the pool
     /// cannot tell from the handle alone whether anyone is still on it — and
     /// it has to: a connection with a flow on it is not idle, and closing it
     /// would take that flow down with it.
     ///
-    /// `None` for a connection that was not taken from a pool.
-    borrows: Option<Arc<AtomicUsize>>,
+    /// `None` for a connection that was not borrowed from a pool.
+    borrow: Option<Borrow>,
 }
 
 impl PooledConnection {
@@ -75,7 +82,7 @@ impl PooledConnection {
             node: None,
             traffic: None,
             flows: None,
-            borrows: None,
+            borrow: None,
         }
     }
 
@@ -86,7 +93,7 @@ impl PooledConnection {
         node: EndpointId,
         traffic: TrafficTable,
         flows: Arc<FlowRegistry>,
-        borrows: Arc<AtomicUsize>,
+        borrow: Borrow,
     ) -> Self {
         Self {
             conn,
@@ -94,7 +101,7 @@ impl PooledConnection {
             node: Some(node),
             traffic: Some(traffic::of(&traffic, node)),
             flows: Some(flows),
-            borrows: Some(borrows),
+            borrow: Some(borrow),
         }
     }
 
@@ -172,22 +179,19 @@ impl PooledConnection {
         self.conn.close(0u32.into(), reason);
     }
 
+    /// Marks the connection as carrying as many flows as the server allows.
+    ///
+    /// The server refused a flow with `TooManyFlows`, which says something
+    /// about the connection rather than about the flow: the pool must stop
+    /// handing this connection out, or the next flow is refused the same way.
+    pub fn saturate(&self) {
+        if let Some(borrow) = &self.borrow {
+            borrow.saturate();
+        }
+    }
+
     pub fn pool_index(&self) -> usize {
         self.pool_index
-    }
-}
-
-/// Gives the pool back the borrow this connection was taken under.
-///
-/// The pool counts the flows on a connection so that it can tell one nobody
-/// is using from one that a flow is still riding — and a flow ends in more
-/// ways than one (EOF, an error, a cancellation), so `Drop` is what covers
-/// all of them.
-impl Drop for PooledConnection {
-    fn drop(&mut self) {
-        if let Some(borrows) = &self.borrows {
-            borrows.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -385,7 +389,7 @@ impl DomainPools {
                 backend_id,
                 self.traffic.clone(),
                 self.flows.clone(),
-                borrowed.borrows,
+                borrowed.borrow,
             )),
             Err(e @ ClientError::InvalidConfig(_)) => Err(e),
             Err(e) => {

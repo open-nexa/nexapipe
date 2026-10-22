@@ -42,10 +42,12 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Open a TCP flow to `host:port`.
 ///
-/// Returns the pooled connection together with the stream. The caller owns the pooled
-/// connection for the life of the tunnel and must hand it back with
-/// the pool — unlike the HTTP paths, an L4 flow can last
-/// minutes, so it cannot be returned as soon as the first response arrives.
+/// Returns the pooled connection together with the stream. The caller holds
+/// the **borrow** on the connection for the life of the tunnel, and gives it
+/// back by dropping the returned value — unlike the HTTP paths, an L4 flow
+/// can last minutes, so it cannot be given back as soon as the first
+/// response arrives. The pool keeps the connection either way: the flow
+/// borrowed it.
 pub async fn open_tcp(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
@@ -132,6 +134,16 @@ async fn open(
 
         match read_status(&mut recv, proto, host, port).await {
             Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
+            Ok(status) if status == Status::TooManyFlows => {
+                // The server is carrying as many flows on this connection as
+                // it allows. That is a statement about the **connection**,
+                // not about this flow, and another connection can carry it:
+                // the connection is marked as full so that the pool stops
+                // handing it out, and the flow is tried again on another
+                // one.
+                pooled.saturate();
+                last_err = Some(status_error(status, proto, host, port));
+            }
             Ok(status) => {
                 // The server understood us and said no. Retrying the same request on a
                 // fresh connection cannot change the answer.
@@ -248,7 +260,107 @@ pub fn parse_connect_target(target: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_pool::IrohConnectionPool;
     use nexapipe_proto::PREFACE_MAGIC;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The ALPN the tunnel speaks. The same bytes the client uses.
+    const ALPN: &[u8] = b"\x05nexapipe";
+
+    /// The far side of the tunnel: answers the first connection's flows with
+    /// "too many flows" and every later connection's flows with "ok".
+    ///
+    /// The count is the far side's own, so the number a test reads does not
+    /// depend on anything the client says about itself.
+    async fn serve_refusing_the_first_connection(
+        endpoint: iroh::Endpoint,
+        accepted: Arc<AtomicUsize>,
+    ) {
+        while let Some(incoming) = endpoint.accept().await {
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                // The first connection is the one that refuses.
+                let status = if accepted.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Status::TooManyFlows
+                } else {
+                    Status::Ok
+                };
+                loop {
+                    let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        // The preface: its length is known once the fourth
+                        // byte has been read.
+                        let mut header = [0u8; 4];
+                        if recv.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        let mut rest = vec![0u8; usize::from(header[3]) + 2];
+                        if recv.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        if send.write_all(&[status.as_byte()]).await.is_err() {
+                            return;
+                        }
+                        let mut sink = [0u8; 1];
+                        let _ = recv.read(&mut sink).await;
+                    });
+                }
+            });
+        }
+    }
+
+    /// A flow the server refuses for carrying too many flows is tried on
+    /// another connection.
+    ///
+    /// "Too many flows" says something about the connection, not about the
+    /// flow: the server counts the flows on one connection and refuses the
+    /// one that does not fit. Another connection can carry it, so the flow is
+    /// not lost to a ceiling the client cannot see.
+    #[tokio::test]
+    async fn a_flow_refused_for_too_many_flows_is_tried_on_another_connection() {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_refusing_the_first_connection(
+            server,
+            accepted.clone(),
+        ));
+
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let group = Arc::new(EndpointGroup::new_with_single_pool(pool).await);
+
+        let flow = open_tcp(&group, "db.test", 5432)
+            .await
+            .expect("the flow opens on another connection");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            2,
+            "the refused flow was tried on a second connection"
+        );
+        drop(flow);
+    }
 
     #[test]
     fn parses_the_authority_form_a_client_sends() {

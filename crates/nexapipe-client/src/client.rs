@@ -10,7 +10,7 @@ use tokio::time::timeout;
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024 * 10;
 
 /// Budget for a single request/response exchange, once a connection has been
-/// taken from the pool.
+/// borrowed from the pool.
 ///
 /// Neither `open_bi` nor `read_to_end` carries a deadline of its own, so a peer
 /// that accepts the stream but never answers would otherwise hold the caller
@@ -42,8 +42,8 @@ impl IrohProxyClient {
     pub async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse, ClientError> {
         let conn = self.conn_pool.get_connection().await?;
         let response = exchange_over(&conn.conn, request.to_bytes().as_slice()).await?;
-        // The connection goes back to the pool when the borrow ends, which is
-        // here: the pool owns it and this was only ever a handle to it.
+        // The borrow ends when this handle is dropped, which is here: the pool
+        // owns the connection and this was only ever a handle to it.
 
         HttpResponse::parse(&response)
     }
@@ -58,8 +58,8 @@ impl IrohProxyClient {
 
     /// Opens a bidirectional stream on a pooled connection and lends it to `f`.
     ///
-    /// The connection goes back into the pool when `f` is done, whatever `f`
-    /// does with the stream — the pool owns it and this is a handle to it.
+    /// The borrow ends when `f` is done, whatever `f` does with the stream —
+    /// the pool owns the connection and this is a handle to it.
     ///
     /// The streams are borrowed rather than moved, so they cannot leave the
     /// closure: the lease and the streams' lifetime are the same scope. A

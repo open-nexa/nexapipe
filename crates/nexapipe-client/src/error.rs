@@ -13,8 +13,8 @@ use std::sync::Arc;
 /// did.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
-// `flat_error`: only `Display` crosses the boundary. `IoError(std::io::Error)` is
-// not a uniffi type, so the variants cannot be lowered structurally.
+// `flat_error`: only `Display` crosses the boundary. `IoError(Arc<std::io::Error>)`
+// is not a uniffi type, so the variants cannot be lowered structurally.
 #[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum ClientError {
     ConnectionError(String),

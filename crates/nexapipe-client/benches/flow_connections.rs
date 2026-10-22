@@ -1,14 +1,15 @@
 //! How many QUIC connections a hundred concurrent flows open.
 //!
-//! The client keeps a pool of connections to each backend, and a flow takes
-//! one out of it and hands it back when it ends. That sounds like pooling, and
-//! it is — but while a flow is running the connection is **out of the pool**,
-//! so a hundred concurrent flows need a hundred connections, and each of them
-//! pays for a QUIC handshake and a path validation on the way.
+//! The client keeps a pool of connections to each backend, and a flow
+//! **borrows** one of them: the pool keeps the connection, and the flow
+//! holds a handle to it until the flow ends. iroh's connection handle is a
+//! cheap clone — *"may be cloned to obtain another handle to the same
+//! connection"* — so a hundred flows share one connection, and a flow that
+//! ends has nothing to give back.
 //!
-//! The transport is built for the opposite: one connection can carry 1024
-//! bi-streams. So the number of connections a client opens is a property of
-//! the flow model, not of the network, and it is worth having a number for.
+//! That is the number worth having. The transport is built for it: one
+//! connection can carry 1024 bi-streams, so the number of connections a
+//! client opens is a property of the flow model, not of the network.
 //!
 //! This bench opens a hundred concurrent L4 flows to one backend and counts
 //! the connections the far side is given. The far side counts its own
@@ -16,7 +17,8 @@
 //! about itself.
 //!
 //! It also measures the time those flows take to open, because that is what
-//! the number costs: today every one of them pays a handshake.
+//! the number costs: before a flow borrowed its connection, every one of
+//! them paid for a QUIC handshake.
 //!
 //! The far side is an iroh endpoint on this host, bound to the loopback
 //! interface, so the bench needs no network and no relay.
@@ -165,6 +167,16 @@ async fn settled(connections: &AtomicUsize, before: usize) -> usize {
 struct Harness {
     /// This side's endpoint. Shared between rounds: only the pool is fresh.
     client: Endpoint,
+    /// The far side's endpoint.
+    ///
+    /// Kept here so that the harness can close it: the accept loop below
+    /// owns a copy of it, and an endpoint that is only released when a task
+    /// that never ends is dropped stays open — with its socket — for the life
+    /// of the process. One of those per iteration is a leak that grows with
+    /// the sample count.
+    server: Endpoint,
+    /// The far side's accept task, stopped when the harness is stopped.
+    server_task: tokio::task::JoinHandle<()>,
     /// Where the far side is.
     server_addr: iroh::EndpointAddr,
     /// How many connections the far side has been given.
@@ -183,7 +195,7 @@ impl Harness {
             .expect("the far side binds");
         let server_addr = server.addr();
         let connections = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(serve(server, connections.clone()));
+        let server_task = tokio::spawn(serve(server.clone(), connections.clone()));
 
         // This side.
         let client = Endpoint::builder(presets::N0)
@@ -196,9 +208,21 @@ impl Harness {
 
         Self {
             client,
+            server,
+            server_task,
             server_addr,
             connections,
         }
+    }
+
+    /// Stops the far side: the accept task ends and the endpoint closes.
+    ///
+    /// The task owns a copy of the endpoint and loops on `accept()` for as
+    /// long as it is open, so the two have to go together — the task would
+    /// otherwise keep the accept loop running on a closed endpoint.
+    async fn stop(self) {
+        self.server_task.abort();
+        self.server.close().await;
     }
 
     /// One round: a hundred flows opened at once, and how many connections
@@ -238,6 +262,13 @@ impl Harness {
         // read would not be one the round needed.
         let after = settled(&self.connections, before).await;
         let opened = after - before;
+        // A round that opened no connection has measured nothing, and
+        // criterion would report it as a zero-time sample — a diagnosis that
+        // names the symptom rather than the cause. The cause is here.
+        assert!(
+            opened > 0,
+            "the far side accepted no connection: the round measured nothing"
+        );
 
         // The flows end here, and with them the pool and the connections the
         // round opened.
@@ -270,6 +301,12 @@ fn flow_connections(c: &mut Criterion) {
                 }
                 black_box(&harness);
 
+                // The far side is stopped here, not left to the end of the
+                // process: criterion calls this once per sample, and every
+                // one of them would otherwise leave an endpoint and an
+                // accept task behind.
+                harness.stop().await;
+
                 // The count is the result. It is returned as nanoseconds so
                 // that it lands in criterion's report next to the times, and
                 // the encoding is written down in this file's own header.
@@ -289,6 +326,8 @@ fn flow_connections(c: &mut Criterion) {
                     total += elapsed;
                 }
                 black_box(&harness);
+
+                harness.stop().await;
 
                 total
             })
