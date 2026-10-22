@@ -362,6 +362,15 @@ lookup, which is what a config written before the key existed does.
   serves goes from **732 ns** to **134 ns**, and a host no route serves
   from **533 ns** to **76 ns**.
 
+- **The health check reads the backends' status once a round, not once a
+  backend.** The status table was read **inside** the loop that probes the
+  backends, so the whole table — every backend's status, and a copy of its
+  address — was read again for each backend in it. One round of probes over
+  fifty backends read the table two thousand five hundred times, every
+  interval, for no reason: a probe reports, it does not change the state, so
+  the answer is the same every time it is asked.
+  It is read once now, and looked up.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of
