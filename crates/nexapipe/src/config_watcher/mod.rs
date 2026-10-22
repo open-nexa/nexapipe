@@ -254,26 +254,15 @@ impl ConfigWatcher {
     /// here, and keeping the previous routes costs far less than dropping every
     /// connection. The two halves fail independently: one refusing does not
     /// stop the other from being applied.
-    /// Whether the new config was applied.
-    ///
-    /// `false` means the file was read and could not be used, and the file is
-    /// worth trying again: a half-written file is the common case, and it
-    /// becomes a good file a moment later.
-    /// Re-reads the file and applies what is live in it: the `[auth]` section
-    /// and the routing table, each keeping the old value if the new one is
-    /// unusable.
-    ///
-    /// A bad edit must not take the proxy down: the file is saved every time it
-    /// is touched, so half-written and downright invalid configs are both normal
-    /// here, and keeping the previous routes costs far less than dropping every
-    /// connection. The two halves fail independently: one refusing does not
-    /// stop the other from being applied.
     ///
     /// Whether the new config was applied.
     ///
     /// `false` means the file was read and could not be used, and the file is
     /// worth trying again: a half-written file is the common case, and it
-    /// becomes a good file a moment later.
+    /// becomes a good file a moment later. It is also `false` when the routes
+    /// were applied but the auth half was left for the next attempt: the file
+    /// stamp is only advanced on `true`, which is what makes that attempt
+    /// happen.
     async fn reload_config(&self) -> bool {
         tracing::info!("Detected config change, reloading...");
 
@@ -323,7 +312,12 @@ impl ConfigWatcher {
         // so it must not be lost to a route table that does not parse. The two
         // are separate failure domains: either can fail and the other still
         // applies.
-        self.reload_auth(new_auth, epoch).await;
+        //
+        // The one case where the auth half is not applied is a snapshot that an
+        // enrollment overtook twice. Reporting that up keeps the file stamp
+        // where it was, so the watcher reads the file again instead of
+        // forgetting the edit until somebody touches the file.
+        let auth_applied = self.reload_auth(new_auth, epoch).await;
 
         let routes = match new_config.build_routes() {
             Ok(routes) => routes,
@@ -350,11 +344,16 @@ impl ConfigWatcher {
         )
         .await;
 
-        tracing::info!(
-            "Config reloaded: {} routes now live",
-            self.route_config.routes().await.len()
-        );
-        true
+        let routes_live = self.route_config.routes().await.len();
+        if auth_applied {
+            tracing::info!("Config reloaded: {routes_live} routes now live");
+        } else {
+            tracing::warn!(
+                "Config reloaded: {routes_live} routes now live, but the 2FA half was not; the \
+                 file is tried again"
+            );
+        }
+        auth_applied
     }
     /// Applies the `[auth]` section of a freshly read config to the live 2FA
     /// state.
@@ -364,6 +363,10 @@ impl ConfigWatcher {
     /// that moment. The two go together: an enrollment that lands between the
     /// read and the lock would be undone by the merge, and the epoch is what
     /// says whether one did.
+    ///
+    /// Returns `false` when the snapshot was overtaken twice, or when the
+    /// re-read that follows an overtake failed: either way the auth half has
+    /// not been applied, and the caller has to keep the file on the retry list.
     ///
     /// The clients table is swapped unconditionally; `enabled` is applied by
     /// [`ConfigWatcher::apply_auth_enabled`], which may refuse it. The TOTP
@@ -379,9 +382,9 @@ impl ConfigWatcher {
     /// in-memory lockout state wins over whatever the file says. Everything
     /// else — a new client from an invite, a rotated secret, a removed
     /// client — comes from the file.
-    async fn reload_auth(&self, mut snapshot: Option<AuthConfig>, mut epoch: u64) {
+    async fn reload_auth(&self, mut snapshot: Option<AuthConfig>, mut epoch: u64) -> bool {
         let Some(state) = &self.auth else {
-            return;
+            return true;
         };
 
         // Two attempts: the snapshot the caller read, and — if an enrollment
@@ -404,9 +407,9 @@ impl ConfigWatcher {
                 if attempt == 1 {
                     tracing::warn!(
                         "2FA clients not reloaded: an enrollment landed while the config was \
-                         being read, twice; the next poll tries again"
+                         being read, twice; the file is kept for the next attempt"
                     );
-                    return;
+                    return false;
                 }
 
                 // Read the file again — outside the lock — and sample the
@@ -423,7 +426,7 @@ impl ConfigWatcher {
                             "2FA clients not reloaded, keeping the current ones: {}",
                             e
                         );
-                        return;
+                        return false;
                     }
                     Err(e) => {
                         tracing::error!(
@@ -431,7 +434,7 @@ impl ConfigWatcher {
                              run: {}",
                             e
                         );
-                        return;
+                        return false;
                     }
                 }
                 continue;
@@ -462,7 +465,7 @@ impl ConfigWatcher {
                         "Reloaded config has no [auth] section; keeping the current 2FA clients"
                     );
                 }
-                return;
+                return true;
             };
 
             // `enabled` first, because it is the only value here that can refuse
@@ -535,8 +538,14 @@ impl ConfigWatcher {
                 }
             }
 
-            return;
+            return true;
         }
+
+        // Unreachable: the second attempt either merges the snapshot or
+        // returns `false`. Written out rather than `unreachable!()` because a
+        // future third attempt that falls through must not claim the auth half
+        // was applied.
+        false
     }
 
     /// Which `(client, device)` pairs the merge dropped, for clients that are
@@ -1101,16 +1110,19 @@ mod tests {
         // An enrollment lands after the snapshot was taken: the epoch moves.
         state.bump_enroll_epoch();
 
-        watcher
-            .reload_auth(
-                Some(config_with(&[(
-                    "from-the-snapshot",
-                    client("FROMTHESNAPSHOT"),
-                )])),
-                // The epoch as it was when the snapshot was taken.
-                state.enroll_epoch() - 1,
-            )
-            .await;
+        assert!(
+            watcher
+                .reload_auth(
+                    Some(config_with(&[(
+                        "from-the-snapshot",
+                        client("FROMTHESNAPSHOT"),
+                    )])),
+                    // The epoch as it was when the snapshot was taken.
+                    state.enroll_epoch() - 1,
+                )
+                .await,
+            "the snapshot the second read produced was merged"
+        );
 
         let live = state.config().read().await;
         assert!(
@@ -1120,6 +1132,45 @@ mod tests {
         assert!(
             live.clients.contains_key("from-the-file"),
             "the file was read again, and the client it names is live"
+        );
+    }
+
+    /// A re-read that fails is reported as not applied.
+    ///
+    /// The first read already happened when the overtake is noticed, and the
+    /// file can be gone or half-written by the time the second one runs. An
+    /// auth half that was never merged must not be recorded as loaded, or the
+    /// edit waits until somebody touches the file again.
+    #[tokio::test]
+    async fn a_reload_whose_second_read_fails_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\n\n[auth.clients.from-the-file]\nsecret = \"FROMTHEFILE\"\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap().to_string();
+
+        let state = AuthState::new(AuthConfig::default(), &path);
+        let watcher = watcher_for(state.clone(), &path);
+
+        // The snapshot is stale, so the reload reads again — and there is
+        // nothing left to read.
+        state.bump_enroll_epoch();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            !watcher
+                .reload_auth(
+                    Some(config_with(&[(
+                        "from-the-snapshot",
+                        client("FROMTHESNAPSHOT"),
+                    )])),
+                    state.enroll_epoch() - 1,
+                )
+                .await,
+            "an auth half that was not merged is not reported as applied"
         );
     }
 
@@ -1495,10 +1546,10 @@ mod tests {
     /// two. The epoch does: it is sampled before the read and compared under
     /// the lock the enrollment itself holds.
     ///
-    /// The enrollment is reproduced by holding the lock the way it does, moving
-    /// the epoch and rewriting the file while it is held: the reload then has
-    /// to wait for the lock, notice that its snapshot was overtaken, and come
-    /// away with what the file says *now*.
+    /// The enrollment is reproduced by holding the lock the way it does,
+    /// rewriting the file and moving the epoch while it is held: the reload
+    /// then has to wait for the lock, notice that its snapshot was overtaken,
+    /// and come away with what the file says *now*.
     #[tokio::test]
     async fn a_reload_that_finds_an_enrollment_has_overtaken_it_reads_again() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1532,11 +1583,13 @@ mod tests {
 
         let holder = tokio::spawn(async move {
             let _guard = enrolled.config().write().await;
-            // An enrollment moves the epoch, exactly as `enroll_client` does
-            // under this same lock.
-            enrolled.bump_enroll_epoch();
+            // The order `enroll_client` uses: the file is written first, and
+            // the epoch moves after it, under the same lock. A bump before the
+            // write would let the reload sample the new epoch and still read
+            // the old file.
             std::fs::write(&path_for_task, file_with("new", "NEWNEWNEWNEWNEWN"))
                 .expect("write the second file");
+            enrolled.bump_enroll_epoch();
             tokio::time::sleep(Duration::from_millis(150)).await;
         });
 

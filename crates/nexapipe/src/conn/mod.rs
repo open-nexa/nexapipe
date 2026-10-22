@@ -118,7 +118,11 @@ pub struct AuthState {
     /// secret.
     ///
     /// This counter is the witness. It is sampled before the read and compared
-    /// under the lock, and the two cannot disagree about what happened.
+    /// under the lock, and the two cannot disagree about what happened — which
+    /// holds only because the counter moves **after** the enrollment's write
+    /// has landed, still under the lock. A counter bumped at the start of an
+    /// enrollment could be sampled by a reload that then read the file before
+    /// the write, and the stale snapshot would look current.
     enroll_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -147,8 +151,11 @@ impl AuthState {
 
     /// Records that an enrollment has been applied to the live config.
     ///
-    /// Under the same lock the enrollment itself holds, so a reader cannot see
-    /// the counter move and the state not yet changed, or the other way round.
+    /// Called under the same lock the enrollment itself holds, and only after
+    /// the enrollment's write to the config file has landed: the watcher
+    /// samples this before it reads that file, so a bump that came first would
+    /// let the read see the file as it was before the enrollment and still
+    /// look current.
     pub fn bump_enroll_epoch(&self) {
         self.enroll_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1423,12 +1430,6 @@ async fn enroll_client(
 
     let mut cfg = auth.config().write().await;
 
-    // The watcher reads the file before it takes this same lock, so a
-    // snapshot it took a moment ago may be about to be merged over the top of
-    // this enrollment. The epoch is how it finds out: it is sampled before
-    // the read and compared under the lock, and this is where it moves.
-    auth.bump_enroll_epoch();
-
     // Drop a lockout that has run out before deciding anything, so an expired
     // one does not read as live and its stale counter does not push the client
     // straight back over the threshold.
@@ -1594,6 +1595,14 @@ async fn enroll_client(
         .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(reason));
     }
+
+    // The file carries the enrollment now, so this is the moment the watcher
+    // has to be able to see it. Still under the lock the enrollment holds: a
+    // reload samples the epoch before it reads the file and compares it here,
+    // and a bump placed any earlier — before the write — could be sampled by a
+    // reload that then read the pre-enrollment file and merged it back over
+    // the top of this enrollment.
+    auth.bump_enroll_epoch();
 
     // Presenting the token is proof the invite reached the right hands, so a
     // counter left over from failed guesses is cleared: a client that just
