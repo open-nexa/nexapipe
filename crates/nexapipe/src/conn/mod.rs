@@ -880,15 +880,19 @@ fn forwards_websocket_header(name: &str) -> bool {
 /// every 8 KiB of the stream.
 const WS_COPY_BUFFER: usize = 64 * 1024;
 
-/// The current time in milliseconds since the epoch.
+/// The current time in milliseconds, from a fixed base.
 ///
 /// The WebSocket tunnel has to know when the last byte moved, and it has to
 /// know it from two tasks at once, so the answer has to fit in an atomic.
+///
+/// The base is a **monotonic** clock, and it has to be: this measures an
+/// interval, and the wall clock can step. A step backwards would suspend the
+/// bound — the session would never be found quiet — and a step forwards
+/// would end a session that was still carrying traffic.
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    base.elapsed().as_millis() as u64
 }
 
 /// Returns the status the client was answered with: 101 once the tunnel is up,

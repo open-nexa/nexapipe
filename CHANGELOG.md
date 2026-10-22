@@ -57,6 +57,29 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **Three small things on the server's response path.**
+  The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
+  coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
+  was bounded, so a WebSocket whose two sides both went quiet kept a backend
+  connection, a task and a stream slot for as long as the process lived. It
+  now moves 64 KiB and is bounded by the same `response_idle` deadline the
+  HTTP path uses. The bound is on the **session**, not on a side of it: a
+  WebSocket that is quiet in one direction is still a WebSocket -- a client
+  that only listens to a feed the backend keeps pushing has nothing to say --
+  and what ends the session is neither side having moved for a whole window.
+  The window is measured with a **monotonic** clock: the wall clock steps with
+  NTP and with a machine waking from sleep, and a step forward would end a
+  session that was still carrying traffic.
+  The copy buffer is 64 KiB of **heap** per direction rather than 8 KiB of
+  stack, so a session costs 128 KiB where it cost 16 KiB.
+  Every **response header's name** was copied to lower case, once per header
+  per response -- for a name that was already lower case, because HTTP header
+  names are case-insensitive and the parser folds them.
+  The **connection pool's idle reaper** had no clock: the timer that was set
+  is the h2 half's, and the pool's own 120-second idle timeout was only
+  enforced lazily, at the next checkout. A connection to a backend that
+  stopped answering now sits in the pool for 120 seconds and no longer.
+
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
   and the binary one — and the payload's first byte says which one it is. The
@@ -456,24 +479,6 @@ lookup, which is what a config written before the key existed does.
   The attempts themselves are unchanged — a dead pooled connection is still
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
-
-- **Three small things on the server's response path.**
-  The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
-  coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
-  was bounded, so a WebSocket whose two sides both went quiet kept a backend
-  connection, a task and a stream slot for as long as the process lived. It
-  now moves 64 KiB and is bounded by the same `response_idle` deadline the
-  HTTP path uses. The bound is on the **session**, not on a side of it: a
-  WebSocket that is quiet in one direction is still a WebSocket -- a client
-  that only listens to a feed the backend keeps pushing has nothing to say --
-  and what ends the session is neither side having moved for a whole window.
-  Every **response header's name** was copied to lower case, once per header
-  per response -- for a name that was already lower case, because HTTP header
-  names are case-insensitive and the parser folds them.
-  The **connection pool's idle reaper** had no clock: the timer that was set
-  is the h2 half's, and the pool's own 120-second idle timeout was only
-  enforced lazily, at the next checkout. A connection to a backend that
-  stopped answering now sits in the pool for 120 seconds and no longer.
 
 ### Changed
 
