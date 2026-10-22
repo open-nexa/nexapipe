@@ -57,6 +57,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The 2FA handshake is exercised end to end.** Nothing drove
+  `perform_authentication` over a stream, so the deadline, the close codes
+  and the registration-inside-the-lock rule were covered only by unit tests of
+  their pieces. A test now does the whole handshake over a real connection: a
+  correct code gets in, a wrong one is refused and the connection is closed
+  with the code that says so, a client that does not handshake at all is
+  closed with the code that says the handshake was required, and a device
+  that proves itself with a key gets in without a code.
 - **The UniFFI surface can configure a client.** The `uniffi` feature used to
   export five functions around one server and no credentials, which is not a
   surface an app can build a client on: a real deployment has several servers,
