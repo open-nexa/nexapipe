@@ -1530,7 +1530,7 @@ async fn enroll_client(
     // Read off the config before the client is borrowed again: the credential
     // issued here has to be generated with what the server will verify against.
     let (algorithm, digits, period) = (
-        cfg.algorithm.name().to_string(),
+        nexapipe_proto::auth::Algorithm::from(&cfg.algorithm),
         cfg.digits,
         cfg.time_step as u64,
     );
