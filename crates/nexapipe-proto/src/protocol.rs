@@ -27,12 +27,21 @@
 //! more, and one connection's buffers more, against a server that knows
 //! what it is serving.
 //!
-//! # The old one
+//! # The two generic names
 //!
-//! [`crate::ALPN_NEXAPIPE_LEGACY`] is what the client used before this, and
-//! it keeps working: a connection negotiated with it is served the way it
-//! always was, by the first byte of each stream. It is not removed — a client
-//! that predates this cannot be made to speak a protocol it does not know.
+//! There are two spellings that both mean "the first byte of each stream
+//! decides", and they are different things:
+//!
+//! * [`crate::ALPN_NEXAPIPE`] is `b"nexapipe"` — the generic name, and the
+//!   one a client that names no protocol in particular gets;
+//! * [`crate::ALPN_NEXAPIPE_LEGACY`] is `b"\x05nexapipe"` — the spelling
+//!   that predates the prefix byte being dropped, which a client of that
+//!   vintage offers and cannot be made to offer anything else.
+//!
+//! Both name [`Protocol::Legacy`], because both mean the same thing, and a
+//! connection negotiated with either is served the way it always was: by the
+//! first byte of each stream. The older spelling is not removed — a client
+//! that predates it cannot be made to speak a protocol it does not know.
 
 /// The ALPN of a connection that carries HTTP requests.
 pub const ALPN_HTTP: &[u8] = b"nexapipe/http";
