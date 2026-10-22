@@ -359,14 +359,15 @@ mod tests {
         restored.clients.insert("alice".to_string(), alice);
         apply(&state, &mut restored);
 
-        // Both memories came back, so both refuse the same step again.
+        // Both memories came back, so both refuse a step behind the one they
+        // accepted.
         assert_eq!(
-            restored.accept_step("alice", None, 100),
+            restored.accept_step("alice", None, 99),
             crate::auth::config::StepVerdict::Refused,
             "the client's own memory survived"
         );
         assert_eq!(
-            restored.accept_step("alice", Some("laptop"), 100),
+            restored.accept_step("alice", Some("laptop"), 99),
             crate::auth::config::StepVerdict::Refused,
             "the device's memory survived"
         );

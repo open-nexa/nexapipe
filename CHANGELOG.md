@@ -620,27 +620,29 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
-- **A 2FA code that has already been used is refused.** The server remembered
-  nothing about the codes it had accepted, so the same code could be used
-  twice inside the same thirty-second step. RFC 6238 §5.2 asks a verifier to
-  refuse the second use of a step it has already accepted, and the step is
-  remembered now: a step that is not greater than the last accepted one is
-  refused.
+- **A 2FA code from an earlier step is refused.** The server remembered
+  nothing about the codes it had accepted, so a code from a step that had
+  already gone by could still be used — it is inside the acceptance window,
+  because the window is about how far the clocks may differ and not about
+  whether a code has been used. The step is remembered now, and a step
+  **behind** the last accepted one is refused.
   The step is the thing worth remembering, not the code: a code is inside the
   acceptance window for the whole of its step, so "this code is current" and
   "this code has been used" are different questions, and only the step tells
   them apart.
-  It is refused **without being counted**. The counter is what stops the
-  guessing, and a code that has been used already is not a guess — it is a
-  device reconnecting inside the same step, and counting that would let a
-  device lock itself out.
+  The **same** step again is allowed, and it has to be: a client that opens
+  several connections in the same step sends the same code for each of them —
+  the protocol is chosen at the handshake, so a client that speaks HTTP and
+  L4 holds a connection for each — and refusing the second would leave the
+  client with connections it cannot open.
+  A refusal is **not counted**. The counter is what stops the guessing, and a
+  code from an earlier step is not something anybody guessed.
   The memory is per credential — the client's own secret, or a named
   device's — and it survives a restart: the state file beside the
   configuration carries it.
   This is hardening rather than a hole that was open: the response's
   signature covers the challenge issued for one connection, so a captured
-  response was already useless on another connection. What the memory stops
-  is the second use of one code.
+  response was already useless on another connection.
 
 ### Changed
 

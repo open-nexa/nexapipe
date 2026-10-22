@@ -77,9 +77,8 @@ impl<'a> TotpValidator<'a> {
     /// because the caller needs it: **the same code is inside the window for
     /// the whole of its step**, so "this code is current" and "this code has
     /// already been used" are different questions, and only the step tells
-    /// them apart. RFC 6238 §5.2 asks the verifier to refuse the second use
-    /// of a step it has already accepted, and the caller is the one that
-    /// remembers.
+    /// them apart. The caller is the one that remembers, and what it refuses
+    /// is a step **behind** the last one it accepted.
     ///
     /// A key device's wrong signature is a refusal and not a count, and the
     /// difference is the difference between the two proofs. A code is

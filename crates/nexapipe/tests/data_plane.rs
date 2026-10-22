@@ -1712,20 +1712,24 @@ async fn a_client_that_does_not_handshake_is_closed() {
     );
 }
 
-/// A code that has already been used is refused — and refused **without**
-/// counting.
+/// The step memory refuses a code from an **earlier** step, and lets the same
+/// one through again.
 ///
-/// RFC 6238 §5.2 asks a verifier to refuse the second use of a step it has
-/// already accepted, and a code is inside the acceptance window for the whole
-/// of its step: so "this code is current" and "this code has been used" are
-/// different questions, and only the step tells them apart.
+/// A code is inside the acceptance window for the whole of its step, so "this
+/// code is current" and "this code has been used" are different questions,
+/// and only the step tells them apart.
+///
+/// The rule is one step back, not the same step: a client that opens several
+/// connections in the same step sends the same code for each of them — the
+/// protocol is chosen at the handshake, so a client that speaks HTTP and L4
+/// holds a connection for each — and refusing the second would leave the
+/// client with connections it cannot open.
 ///
 /// The refusal is not a **guess**, and it does not count as one. The counter
-/// is what stops the guessing, and a code that has been used already is not
-/// something anybody guessed — it is the device reconnecting inside the same
-/// step, and counting that would let a device lock itself out.
+/// is what stops the guessing, and a code from an earlier step is not
+/// something anybody guessed.
 #[tokio::test]
-async fn a_code_that_has_already_been_used_is_refused() {
+async fn an_earlier_steps_code_is_refused_and_the_same_one_again_is_not() {
     let backend = spawn_backend("hello").await;
     let (auth, _dir) = auth_state(auth_config());
     let proxy =
@@ -1743,23 +1747,55 @@ async fn a_code_that_has_already_been_used_is_refused() {
         "the first use of a code is accepted, got {answer:?}"
     );
 
-    // The second use of the same code is the one that is refused. It is a
-    // **second connection**: the handshake happens once per connection, and
-    // the memory that refuses the second use lives in the server, not in the
-    // connection.
-    let second = Tunnel::dial(proxy.addr).await;
+    // The same code on a **second connection** is accepted, and it has to be:
+    // a client that opens several connections in the same step sends the
+    // same code for each of them — the protocol is chosen at the handshake,
+    // so a client that speaks HTTP and L4 holds a connection for each — and
+    // refusing the second would leave the client with connections it cannot
+    // open.
+    let second = Tunnel::dial(proxy.addr.clone()).await;
     let answer = handshake(&second, &client, Some(code), None).await;
     assert!(
-        matches!(answer, AuthMessage::Failed { .. }),
-        "the second use of a code is refused, got {answer:?}"
+        matches!(answer, AuthMessage::Ok),
+        "the same code on another connection is accepted, got {answer:?}"
     );
 
-    // And it was not counted: the counter is for guesses, and this was not one.
+    // What **is** refused is a code from an *earlier* step: it is still
+    // inside the acceptance window — the window is about how far the clocks
+    // may differ, not about whether a code has been used — and the memory of
+    // the step is what refuses it.
+    let older = Tunnel::dial(proxy.addr.clone()).await;
+    let answer = handshake(&older, &client, Some(previous_step_code(SECRET)), None).await;
+    assert!(
+        matches!(answer, AuthMessage::Failed { .. }),
+        "a code from an earlier step is refused, got {answer:?}"
+    );
+
+    // And none of it was counted: the counter is for guesses, and a code
+    // that has been used already is not one.
     let config = auth.config().read().await;
     assert_eq!(
         config.clients[CLIENT_ID].failed_attempts, 0,
-        "a code that has been used already is not a guess, and must not be counted as one"
+        "a refused code is not a guess, and must not be counted as one"
     );
+}
+
+/// The code of the step **before** this one.
+///
+/// The client's own generator only makes the current code, and the code of an
+/// earlier step is what the memory refuses — so the test makes it itself.
+fn previous_step_code(secret: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secret = totp_rs::Secret::try_from_base32(secret).expect("the secret decodes");
+    totp_rs::Builder::new()
+        .with_secret(secret)
+        .build()
+        .expect("the generator is built")
+        .generate(now - 30)
+        .to_string()
 }
 
 /// A device that proves itself with a key gets in without a code.

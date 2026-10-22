@@ -235,9 +235,9 @@ pub struct ClientAuth {
     pub last_used: Option<u64>,
     /// The last TOTP step this client's own secret was accepted on.
     ///
-    /// The step, not the code: a code changes every thirty seconds, and
-    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
-    /// same code cannot be used twice.
+    /// The step, not the code: a code changes every thirty seconds, and what
+    /// is worth remembering is the **step** — a code from an earlier step is
+    /// still inside the acceptance window, and this is what refuses it.
     ///
     /// This is the memory of the **unnamed** device — the client answering
     /// with its own `secret`. A named device keeps its own, under its own
@@ -350,9 +350,9 @@ pub struct DeviceAuth {
     pub last_used: Option<u64>,
     /// The last TOTP step this device's code was accepted on.
     ///
-    /// The step, not the code: a code changes every thirty seconds, and
-    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
-    /// same code cannot be used twice.
+    /// The step, not the code: a code changes every thirty seconds, and what
+    /// is worth remembering is the **step** — a code from an earlier step is
+    /// still inside the acceptance window, and this is what refuses it.
     ///
     /// A device that answers with a **signature** has no code and no step:
     /// a signature covers the challenge that was issued for one connection,
@@ -364,9 +364,9 @@ pub struct DeviceAuth {
 /// What became of a step.
 ///
 /// The two answers are different in kind, and the caller needs both: a step
-/// that was refused is **not** a failed attempt — it is a code that has
-/// already been used, which is not a guess — and a step that was accepted may
-/// or may not have moved the memory, and only a moved memory is worth a write.
+/// that was refused is **not** a failed attempt — it is a code from an earlier
+/// step, which is not a guess — and a step that was accepted may or may not
+/// have moved the memory, and only a moved memory is worth a write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepVerdict {
     /// The step was accepted.
@@ -382,18 +382,27 @@ pub enum StepVerdict {
 /// Whether `step` may be used given the last accepted one, and what the last
 /// accepted one is afterwards.
 ///
-/// **The rule is RFC 6238 §5.2's**: a step that is not greater than the last
-/// accepted one is refused, so the same code cannot be used twice. The step
-/// is what a code is worth remembering as — a code is inside the acceptance
-/// window for the whole of its step, so "this code is current" and "this code
-/// has been used" are different questions.
+/// **A step that is behind the last accepted one is refused.** That is the
+/// code of an *earlier* step, and it is still inside the acceptance window:
+/// the window is about how far the clocks may differ, not about whether a code
+/// has been used. So this is what refuses a replay of the previous step's
+/// code.
+///
+/// **The same step again is allowed**, and it has to be. A client that opens
+/// several connections in the same step sends the same code for each of them
+/// — the protocol is chosen at the handshake, so a client that speaks HTTP
+/// and L4 holds a connection for each — and refusing the second would leave
+/// the client with connections it cannot open, over a rule that buys
+/// nothing: a captured response is already useless on another connection,
+/// because its signature covers the challenge issued for this one, and
+/// anybody who can sign holds the seed and can compute a code anyway.
 ///
 /// The check and the record are one operation on purpose: a caller that
 /// checked and then recorded could let two connections through between the
-/// two, and the whole point is that the second one does not get in.
+/// two.
 fn accept_step(last: &mut Option<u64>, step: u64) -> StepVerdict {
     match *last {
-        Some(previous) if step <= previous => StepVerdict::Refused,
+        Some(previous) if step < previous => StepVerdict::Refused,
         _ => {
             let moved = *last != Some(step);
             *last = Some(step);
@@ -527,8 +536,9 @@ impl AuthConfig {
     /// different credentials, and a step accepted for one says nothing about
     /// the other — so the memory is kept apart as well.
     ///
-    /// The rule is RFC 6238 §5.2's: a step that is not greater than the last
-    /// accepted one has been used already.
+    /// The rule: a step that is **behind** the last accepted one has been used
+    /// already. The same step again is allowed — a client that opens several
+    /// connections in the same step sends the same code for each of them.
     pub fn accept_step(
         &mut self,
         client_id: &str,
@@ -1248,10 +1258,11 @@ mod tests {
     /// A device secret is issued and spelled the way a client's is, so it has
     /// to decode under the same rule — a device stuck at "Invalid Base32
     /// secret" is stuck regardless of which table its secret came from.
-    /// The rule is RFC 6238 §5.2's: a step that is not greater than the last
-    /// accepted one has been used already.
+    /// A step that is **behind** the last accepted one is refused: it is the
+    /// code of an earlier step, and that code is still inside the acceptance
+    /// window.
     #[test]
-    fn a_step_that_is_not_greater_than_the_last_is_refused() {
+    fn a_step_behind_the_last_is_refused() {
         let mut last = None;
 
         assert_eq!(
@@ -1260,19 +1271,33 @@ mod tests {
             "the first step is accepted, and the memory moves"
         );
         assert_eq!(
-            accept_step(&mut last, 100),
-            StepVerdict::Refused,
-            "the same step again is the one that is refused"
-        );
-        assert_eq!(
             accept_step(&mut last, 99),
             StepVerdict::Refused,
-            "an older step is refused as well: it is the same code"
+            "an older step is refused: its code is still inside the window"
         );
         assert_eq!(
             accept_step(&mut last, 101),
             StepVerdict::Accepted { moved: true },
             "the next step is accepted"
+        );
+    }
+
+    /// **The same step again is allowed**, and it has to be: a client that
+    /// opens several connections in the same step sends the same code for each
+    /// of them, and refusing the second would leave the client with
+    /// connections it cannot open.
+    #[test]
+    fn the_same_step_again_is_allowed() {
+        let mut last = None;
+
+        assert_eq!(
+            accept_step(&mut last, 100),
+            StepVerdict::Accepted { moved: true }
+        );
+        assert_eq!(
+            accept_step(&mut last, 100),
+            StepVerdict::Accepted { moved: false },
+            "the same step again is the same code, and the memory does not move"
         );
     }
 
@@ -1327,17 +1352,28 @@ mod tests {
             },
         );
 
-        // The client's own secret, the unnamed device.
+        // The client's own secret, the unnamed device: it authenticated on
+        // step 100.
         assert_eq!(
             config.accept_step("alice", None, 100),
             StepVerdict::Accepted { moved: true }
         );
-        assert_eq!(config.accept_step("alice", None, 100), StepVerdict::Refused);
-
-        // A different credential, the same step: accepted, because the two
-        // are different credentials and one says nothing about the other.
+        // The named device authenticated earlier, on step 50.
         assert_eq!(
-            config.accept_step("alice", Some("laptop"), 100),
+            config.accept_step("alice", Some("laptop"), 50),
+            StepVerdict::Accepted { moved: true }
+        );
+
+        // The same step, two credentials, two answers: step 99 is behind the
+        // client's own memory and ahead of the device's, because the two
+        // memories are their own.
+        assert_eq!(
+            config.accept_step("alice", None, 99),
+            StepVerdict::Refused,
+            "behind the client's own memory"
+        );
+        assert_eq!(
+            config.accept_step("alice", Some("laptop"), 99),
             StepVerdict::Accepted { moved: true },
             "a named device's memory is its own"
         );
