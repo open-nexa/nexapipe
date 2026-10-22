@@ -443,6 +443,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The client refuses a request that names more than one host.** The client
+  picked the first `Host` that matched a proxy domain and forwarded the head
+  byte for byte, so a request with two `Host` headers reached the server, which
+  refused it with a 400 — a failure that looks like a proxy bug rather than a
+  request that cannot be answered. The client refuses it now, with the same
+  400, before any tunnel is opened.
+  The authority is also split the way the server splits it: taking everything
+  before the first colon left an IPv6 literal as `[`.
 - **A configuration reload reads the file once, and not under the auth
   lock.** The file was read twice — once for the routes and once for the 2FA
   clients — so the two halves could be applied from two different revisions of
