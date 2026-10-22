@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Nineteen things land in this cycle so far: the device credential can be a **key**
+Twenty things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -39,7 +39,8 @@ is not written in Rust can configure a client through the UniFFI surface, the
 paths that carry the traffic can be measured instead of assumed, the first
 result of those measurements is written down, a route that rewrites the paths
 it serves now rewrites them for the tunnel as well, and the Android client's
-tunnel descriptor is closed exactly once.
+tunnel descriptor is closed exactly once, and the tunnel's congestion controller
+is BBR rather than Cubic.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -549,6 +550,26 @@ lookup, which is what a config written before the key existed does.
   health accounting.
 
 ### Changed
+
+- **The tunnel's congestion controller is BBR rather than Cubic.** Cubic is a
+  loss-based controller: it reads a loss as "the link is congested" and cuts its
+  window. On a long international path the loss is usually *noise* rather than
+  congestion — a router dropping a packet here and there, or a carrier shaping
+  the flow — and each such loss costs Cubic a window it has to win back over the
+  next round trip. At 200 ms that is a fifth of a second of recovery per
+  mistake, and the throughput cliff Cubic is known for is what an operator
+  feels as "the line is fine, and then it is not".
+  BBR is model-based instead: it measures the bottleneck bandwidth and the
+  minimum round trip time and paces to their product, so a random loss does not
+  move the rate. The tunnel stays at the ceiling of a shaped or lossy link
+  instead of falling off it.
+  This does **not** change how the tunnel looks on the wire, and it cannot lift
+  a limit an operator imposed — under a cap the tunnel gets close to the cap
+  with BBR and may not reach half of it with Cubic. QUIC does not negotiate the
+  controller: each end applies its own to the direction it sends in, so both
+  ends are switched by the same setting.
+  `NEXAPIPE_QUIC_CONGESTION=cubic` puts the old one back, for an A/B run or a
+  rollback, and the startup log says which one is in use.
 
 - **The client speaks the binary form of the handshake.** A handshake with a
   server that knows it is 189 bytes instead of 427: the message is a binary

@@ -2652,6 +2652,7 @@ dependencies = [
  "ndk-context",
  "netstack-smoltcp",
  "nexapipe-proto",
+ "noq-proto",
  "once_cell",
  "rustls-native-certs",
  "serde",
