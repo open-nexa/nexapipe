@@ -498,12 +498,18 @@ jobs:
         shell: bash
         run: npx tauri --version
 
-      # The lockfile must survive the install: a tree that was re-resolved
-      # would show up here as a changed file. The path is relative to the
-      # job's working directory, like every other path this job names.
-      - name: the lockfile is unchanged
+      # The tree that was installed has to be the tree the manifest asks
+      # for. `npm ci` installs strictly from the lockfile and refuses to run
+      # at all when the lockfile and the manifest disagree, so what is left
+      # to check is the **result**: a platform whose optional native package
+      # is missing shows up here as an invalid dependency, rather than as a
+      # failure at build time.
+      #
+      # A `git diff` on the lockfile would say nothing: `npm ci` never
+      # writes it.
+      - name: the installed tree satisfies the manifest
         shell: bash
-        run: git diff --exit-code -- package-lock.json
+        run: npm ls --all
 
   desktop-check:
     name: desktop cargo check (${{ matrix.os }})

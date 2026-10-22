@@ -74,6 +74,9 @@
     Skip the frontend install even when node_modules does not exist.
 
 .PARAMETER ForceInstall
+        Accepted and ignored: the frontend install now always runs, because a
+        node_modules that was resolved from a different lockfile is a tree nobody
+        committed. -SkipInstall is the way out.
     Reinstall the frontend even when node_modules exists.
 
 .PARAMETER NoSign
@@ -395,19 +398,20 @@ if ($Check) {
 # ---------------------------------------------------------------------------
 Push-Location -LiteralPath $DesktopDir
 try {
-    $nodeModules = [IO.Path]::Combine($DesktopDir, 'node_modules')
-    $needInstall = $ForceInstall -or (-not (Test-Path -LiteralPath $nodeModules))
     if ($SkipInstall) {
         Write-Step 'Skipping the frontend install (-SkipInstall)'
-    } elseif ($needInstall) {
+    } else {
+        # The install is unconditional, and that is the point: a node_modules
+        # that is already there may have been resolved from a different
+        # lockfile — a tree nobody committed and `npm audit` never saw — and a
+        # bundle built from it is a bundle nobody reviewed. -SkipInstall is
+        # the way out, for someone who knows what their tree is.
         Write-Step 'Installing frontend dependencies'
         # npm ci, not npm install: the bundle has to be built from the committed
         # lockfile, not from whatever the registry serves today. npm ci installs
         # strictly from the lockfile and fails outright when package-lock.json
         # and package.json disagree, which is the point.
         Install-Frontend -Npm $npm
-    } else {
-        Write-Step 'node_modules exists, skipping the frontend install (-ForceInstall to rerun)'
     }
 
     if (-not (Test-TauriNativeBinding)) {

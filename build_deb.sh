@@ -112,7 +112,7 @@ Options:
   --skip-type-check      Frontend build runs "npx vite build", skipping vue-tsc.
   --skip-frontend        Do not rebuild the frontend at all; dist/ must be current.
   --skip-install         Skip the frontend install even when node_modules is missing.
-  --force-install        Reinstall the frontend even when node_modules exists.
+  --force-install        Accepted and ignored: the frontend install always runs.
   --no-sign              Never create updater artefacts, even with a signing key set.
   --clean                Delete ui-desktop/dist and the bundle output before building.
   --install-deps         apt-get install the missing system packages (needs sudo).
@@ -148,6 +148,7 @@ while [[ $# -gt 0 ]]; do
         --skip-type-check) SKIP_TYPE_CHECK=true; shift ;;
         --skip-frontend)  SKIP_FRONTEND=true; shift ;;
         --skip-install)   SKIP_INSTALL=true; shift ;;
+        # The install always runs now, so the flag is the default.
         --force-install)  FORCE_INSTALL=true; shift ;;
         --no-sign)        NO_SIGN=true; shift ;;
         --clean)          CLEAN=true; shift ;;
@@ -457,15 +458,18 @@ cd "$DESKTOP_DIR"
 
 if $SKIP_INSTALL; then
     step "Skipping the frontend install (--skip-install)"
-elif $FORCE_INSTALL || [[ ! -d node_modules ]]; then
+else
+    # The install is unconditional, and that is the point: a `node_modules`
+    # that is already there may have been resolved from a different lockfile
+    # — a tree nobody committed and `npm audit` never saw — and a bundle
+    # built from it is a bundle nobody reviewed. `--skip-install` is the way
+    # out, for someone who knows what their tree is.
     step "Installing frontend dependencies"
     # npm ci, not npm install: the bundle has to be built from the committed
     # lockfile, not from whatever the registry serves today. npm ci installs
     # strictly from the lockfile and fails outright when package-lock.json and
     # package.json disagree, which is the point.
     install_frontend
-else
-    step "node_modules exists, skipping the frontend install (--force-install to rerun)"
 fi
 
 if ! npx tauri --version >/dev/null 2>&1; then
