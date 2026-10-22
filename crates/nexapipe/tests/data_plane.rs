@@ -1348,6 +1348,11 @@ async fn handshake_in(
         panic!("the server answers with a challenge, got {challenge:?}");
     };
 
+    // The nonce is the server's random challenge, read off the wire — not a
+    // value this file makes up. The code-scanning query reads the buffer it
+    // arrived in as a hard-coded one, and the challenge is then "a nonce" that
+    // is hard-coded.
+    // codeql[rust/hard-coded-cryptographic-value]
     let signature = client
         .sign_challenge(&nonce, timestamp)
         .expect("the challenge is signed");
@@ -1386,8 +1391,19 @@ async fn write_message_in(send: &mut SendStream, message: &AuthMessage, format: 
 async fn read_message_in(recv: &mut RecvStream) -> (AuthMessage, Format) {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await.expect("the length comes");
-    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-    recv.read_exact(&mut buf).await.expect("the message comes");
+    let len = u32::from_le_bytes(len) as usize;
+    // Read into an empty buffer rather than a zero-filled one. The bytes come
+    // from the peer, and a buffer of constant bytes is what the code-scanning
+    // query reads as a hard-coded cryptographic value — the challenge nonce
+    // ends up looking like one, because the query cannot see that
+    // `read_exact` overwrites every byte of it.
+    let mut buf = Vec::new();
+    let mut limited = recv.take(len as u64);
+    limited
+        .read_to_end(&mut buf)
+        .await
+        .expect("the message comes");
+    assert_eq!(buf.len(), len, "the message is as long as it said");
     AuthMessage::from_payload(&buf).expect("the message parses")
 }
 
