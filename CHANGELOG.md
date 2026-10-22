@@ -63,19 +63,24 @@ lookup, which is what a config written before the key existed does.
   server reads all of them: a client that speaks one form and a server that
   speaks another still complete the handshake, and the answers come back in
   the form the client asked in.
-  **The client does not use the binary form yet.** It is turned on one side at
-  a time, so that an old client keeps working against a new server and a new
-  client keeps working against an old one — the case that decides the whole
-  order of the change.
+  **The client uses the binary form now.** It announces the version it speaks
+  inside the first message — the JSON one, where a server that predates the
+  version byte ignores the field — and the exchange from the challenge onwards
+  is in that form. A client that announces nothing is still answered in the
+  JSON it asked for, so an old client keeps working against a new server and a
+  new client keeps working against an old one.
+
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
   speaks, and a binary one that is a third of the size where the bytes are —
   a nonce and a signature are arrays of decimal numbers in JSON, so each byte
   of either costs three. One handshake — a start, a challenge, a response and
   an answer — is 427 bytes of JSON and 124 of binary.
-  The binary form is **not on the wire yet**: the peers keep speaking JSON,
-  and it is turned on one side at a time, so an old client keeps working
-  against a new server and a new client keeps working against an old one.
+  The binary form is **on the wire for a client that asks for it**: a client
+  announces the version it speaks inside its first message, and the exchange
+  from the challenge onwards is in that form. A client that announces nothing
+  still gets the JSON it asked for, so an old client keeps working against a
+  new server and a new client keeps working against an old one.
   A payload's first byte says which form it is in, and a payload that does
   not start with a version byte is the JSON one — which is what every peer
   sent before the version byte existed.
@@ -407,7 +412,30 @@ lookup, which is what a config written before the key existed does.
   server move together, and `NEXAPIPE_QUIC_RECV_WINDOW` sets it for whoever
   wants another number.
 
+- **Opening a flow gets one budget, not a timeout per attempt.** Two retry
+  loops sat inside each other and each attempt had a timeout of its own, so a
+  CONNECT that could not be opened had **nine** thirty-second timeouts to
+  spend and could take **six minutes** to say so. The budget is taken once
+  now, at the start, and every attempt inside it shares what is left:
+  **ninety seconds**, which is what the three outer attempts were each
+  reaching for anyway.
+  The attempts themselves are unchanged — a dead pooled connection is still
+  retried on a fresh one, and a refusal is still final — and so is the
+  health accounting.
+
 ### Changed
+
+- **The client speaks the binary form of the handshake.** A handshake with a
+  server that knows it is 189 bytes instead of 427: the message is a binary
+  form with a version byte in front of it, and the bytes that cost three
+  bytes each — the nonce and the signature, which the JSON writes as arrays of
+  decimal numbers — cost one each.
+  **A client against a server that does not know it still works.** The first
+  message says which version the client speaks, inside the JSON, where a
+  server that predates the version byte drops the field it does not know; the
+  answers then come back in the old form and the client answers in the old
+  form. The version byte is a discriminator and not a negotiation: a message
+  says what it is, and the other end reads it.
 
 - **A key the config file does not know is an error now.** Every section of
   `config.toml` refuses the keys it does not have, and so does the top level:
