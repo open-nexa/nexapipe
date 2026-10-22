@@ -57,6 +57,23 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The authentication handshake has a binary form.** The message the client
+  and the server exchange now has two forms: the JSON one every peer already
+  speaks, and a binary one that is a third of the size where the bytes are —
+  a nonce and a signature are arrays of decimal numbers in JSON, so each byte
+  of either costs three. One handshake — a start, a challenge, a response and
+  an answer — is 427 bytes of JSON and 124 of binary.
+  The binary form is **not on the wire yet**: the peers keep speaking JSON,
+  and it is turned on one side at a time, so an old client keeps working
+  against a new server and a new client keeps working against an old one.
+  A payload's first byte says which form it is in, and a payload that does
+  not start with a version byte is the JSON one — which is what every peer
+  sent before the version byte existed.
+  `algorithm` is a closed type on the wire now: it was a free-form string,
+  and a name nobody supports was a name the receiving side had to decide what
+  to do with. Its spelling is unchanged — the canonical lowercase one the
+  server has always sent.
+
 - **The 2FA handshake is exercised end to end.** Nothing drove
   `perform_authentication` over a stream, so the deadline, the close codes
   and the registration-inside-the-lock rule were covered only by unit tests of
@@ -686,6 +703,25 @@ lookup, which is what a config written before the key existed does.
   at all.
 
 ### Security
+
+- **A registration code no longer silently replaces a working credential.**
+  The Android app asked before an invite overwrote something that worked — but
+  the question was asked for a secret and for the relay, and a one-time
+  enrollment code was neither: it carries no secret, so it raised no conflict,
+  and it was applied with no confirmation at all. The credential the endpoint
+  already held went with it, and because the guard in `ProxyConnector` that
+  keeps an endpoint from spending a token it already has a credential for
+  looks at what the endpoint holds, the drop that came before it defeated the
+  guard. A registration code is exactly the artefact a user is primed to
+  accept — shared in a chat, pasted by an "operator", one tap from the
+  scanner — so this was a credential one accepted code could destroy.
+  The rule now names the enrollment, and it is a pure function with tests
+  beside it: `ui/InviteConflicts.kt`.
+- **The client id no longer reaches the log.** It is half of the 2FA
+  credential pair, and the app says so where it logs the other one — but the
+  invite import and the enrollment update both wrote it out in full, to the
+  on-screen log panel and to logcat. What kind of credential arrived is what
+  those lines are about; the id is not in them any more.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:

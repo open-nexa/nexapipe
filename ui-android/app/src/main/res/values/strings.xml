@@ -81,6 +81,8 @@
     <string name="invite_replaces">\n\nThis replaces %1$s.</string>
     <string name="invite_conflict_2fa">the 2FA credentials of this endpoint (\"%1$s\")</string>
     <string name="invite_conflict_2fa_current_client">the current client</string>
+    <string name="invite_conflict_enrollment">the 2FA credentials of this endpoint (a one-time enrollment replaces them)</string>
+    <string name="invite_conflict_enrollment_pending">the one-time enrollment token of this endpoint</string>
     <string name="invite_conflict_relay">the relay settings</string>
     <string name="invite_summary_node">Node: %1$s</string>
     <string name="invite_summary_name">Name: %1$s</string>

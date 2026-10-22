@@ -66,6 +66,8 @@
     <string name="invite_replaces">\n\n这将覆盖%1$s。</string>
     <string name="invite_conflict_2fa">该端点的两步验证凭据（“%1$s”）</string>
     <string name="invite_conflict_2fa_current_client">当前的客户端</string>
+    <string name="invite_conflict_enrollment">该端点的两步验证凭据（一次性注册将替换它们）</string>
+    <string name="invite_conflict_enrollment_pending">该端点的一次性注册令牌</string>
     <string name="invite_conflict_relay">中继设置</string>
     <string name="invite_summary_node">节点：%1$s</string>
     <string name="invite_summary_name">名称：%1$s</string>
