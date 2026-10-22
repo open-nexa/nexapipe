@@ -57,6 +57,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The server answers the handshake in the form it was asked in.** The
+  handshake message has two forms — the JSON one every client already speaks,
+  and the binary one — and the payload's first byte says which one it is. The
+  server reads all of them: a client that speaks one form and a server that
+  speaks another still complete the handshake, and the answers come back in
+  the form the client asked in.
+  **The client does not use the binary form yet.** It is turned on one side at
+  a time, so that an old client keeps working against a new server and a new
+  client keeps working against an old one — the case that decides the whole
+  order of the change.
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
   speaks, and a binary one that is a third of the size where the bytes are —
