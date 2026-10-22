@@ -28,7 +28,15 @@ pub async fn run_local_proxy(
     tracing::info!("Starting local proxy on: {}", listen_addr);
     tracing::info!("Proxy domains: {:?}", proxy_domains);
 
-    let default_strategy = get_strategy(&config.strategy);
+    // The strategy is the client's, because what it picks is a node: the
+    // server's own `config::get_strategy` picks a backend out of a route's
+    // pool, which is a different choice with a different list. The rule that
+    // turns a name into one is the enum's own, in the client crate, and it
+    // refuses a name it does not have rather than answering with round-robin.
+    let default_strategy = match config.strategy.as_deref() {
+        None | Some("") => LoadBalancingStrategy::RoundRobin,
+        Some(name) => LoadBalancingStrategy::from_name(name).map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
 
     let endpoint_group = if let Some(nodes) = config.nodes {
         tracing::info!(
@@ -192,14 +200,4 @@ pub async fn run_local_proxy(
 
     result?;
     Ok(())
-}
-
-fn get_strategy(strategy: &Option<String>) -> LoadBalancingStrategy {
-    match strategy.as_deref() {
-        Some("random") | Some("Random") => LoadBalancingStrategy::Random,
-        Some("round_robin") | Some("RoundRobin") | Some("roundrobin") => {
-            LoadBalancingStrategy::RoundRobin
-        }
-        None | Some(_) => LoadBalancingStrategy::RoundRobin,
-    }
 }

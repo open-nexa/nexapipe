@@ -6,6 +6,34 @@ pub enum LoadBalancingStrategy {
     Random,
 }
 
+impl LoadBalancingStrategy {
+    /// The strategy a name asks for.
+    ///
+    /// Refused rather than guessed, for the reason the server's own parser
+    /// refuses: a strategy the configuration does not name is a deployment
+    /// that runs differently from the one in the file, and nothing says so —
+    /// the traffic still flows, just not the way the configuration claims.
+    ///
+    /// The spellings are the server's, so a configuration that names one
+    /// means the same thing on both sides of the tunnel. `least_conn` is the
+    /// server's alone: it picks a backend out of a pool that tracks what each
+    /// backend is doing, and a client picking a node out of a list has no such
+    /// thing to pick the least of — so it is refused here, by name, rather
+    /// than quietly answered with round-robin.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name.trim() {
+            "round_robin" | "RoundRobin" | "roundrobin" => Ok(Self::RoundRobin),
+            "random" | "Random" => Ok(Self::Random),
+            "least_conn" | "LeastConn" | "leastconn" => Err(
+                "least_conn is a server-side strategy: it picks the least loaded backend of a \
+                 route, and a client picks a node of a list it does not measure"
+                    .to_string(),
+            ),
+            other => Err(format!("Unknown load balancing strategy: {other}")),
+        }
+    }
+}
+
 pub struct RoundRobinBalancer {
     index: AtomicUsize,
 }

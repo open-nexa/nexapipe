@@ -66,6 +66,7 @@
 
 pub mod alpn;
 pub mod auth;
+pub mod deadline;
 mod host;
 mod preface;
 pub mod secret;
@@ -76,6 +77,7 @@ pub use auth::{
     Algorithm, AuthMessage, CodecError, Format, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN,
     VERSION_BINARY, VERSION_JSON, is_presentable_client_id, is_presentable_device_id,
 };
+pub use deadline::{HEADER_SECS, STREAM_SECS, TLS_HELLO_SECS};
 pub use host::{
     host_and_port, host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error,
 };
