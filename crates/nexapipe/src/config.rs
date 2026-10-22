@@ -1150,13 +1150,13 @@ impl ProxyConfig {
 
     /// Whether the config file this was read from holds a credential.
     ///
-    /// Asked about the *file*, not about what the process is running with: the
-    /// permission check it feeds is "can another account on this host read the
-    /// secrets in that file". So a key generated at startup and never written —
-    /// because the config was read-only, or because
-    /// `NEXAPIPE_NO_PERSIST_IDENTITY` said not to — must not make this true.
-    /// Folding an ephemeral identity in here would make exactly the deployments
-    /// that need one refuse to start over a key that is not on disk.
+    /// Asked about the *file*, not about what the process is running with: what
+    /// it feeds is "can another account on this host read the secrets in that
+    /// file". So a key generated at startup and never written — because the
+    /// config was read-only, or because `NEXAPIPE_NO_PERSIST_IDENTITY` said not
+    /// to — must not make this true. Folding an ephemeral identity in here
+    /// would warn exactly the deployments that need one about a key that is
+    /// not on disk.
     ///
     /// The same logic covers a credential that lives outside the file: a key
     /// resolved from the environment or from a `secret_key_file` pointer is
@@ -2775,15 +2775,15 @@ impl Drop for ConfigLock {
 /// old contents or the new ones.
 ///
 /// The replacement is created `0600`, because what it holds is TOTP secrets and
-/// enrollment tokens: a new file takes the umask, and the file it replaces was
-/// checked at startup for being private.
+/// enrollment tokens: a new file takes the umask, and the file it replaces may
+/// have been wider.
 ///
 /// The mode is part of the call that creates the file, not a `chmod` after the
 /// write. Tightening it afterwards leaves the secrets on disk at `0644` for as
 /// long as the write takes, and `write_all` plus `sync_all` make sure they
-/// really are on disk in that window — the server refuses to *start* on a
-/// world-readable config, so handing one to every local account for the length
-/// of a write contradicts the check that exists to prevent it.
+/// really are on disk in that window — a file only its owner can read is what
+/// the write is for, and the seconds it spends at the umask's width would
+/// undo it.
 ///
 /// Crate-private on purpose: the text of a config is a copy of its
 /// credentials, so every write of one goes through [`write_config_document`],
