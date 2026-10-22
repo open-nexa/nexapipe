@@ -210,7 +210,7 @@ fn table(backend: &str) -> Arc<RoutingTable> {
 /// everything that decided it, and nothing the bench allocated around it.
 async fn one(clients: &BackendClients, routes: &Arc<RoutingTable>) -> (Bytes, usize) {
     // The request is built **before** the counter is read. Building it is the
-    // bench's own work -- the URI it formats, the headers it writes -- and the
+    // bench's own work — the URI it formats, the headers it writes — and the
     // metric is the server's: the lookup, the balancer, the URI the backend is
     // reached at, and the request built from them. Counting the bench's own
     // work would make the number a statement about the bench.
@@ -278,8 +278,8 @@ fn request_path(c: &mut Criterion) {
                 COUNTING.store(true, Ordering::Relaxed);
                 // The count is the **sum of the counted windows**, not the
                 // difference of the counter over the whole loop: the loop
-                // also holds the bench's own work -- the request it builds and
-                // the response body it drains -- and the metric says those are
+                // also holds the bench's own work — the request it builds and
+                // the response body it drains — and the metric says those are
                 // not part of it. Criterion divides by the number of
                 // iterations, so the sum is the per-request figure.
                 let mut count = 0usize;

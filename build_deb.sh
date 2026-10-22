@@ -11,12 +11,15 @@
 #                   dependency present (src-tauri/Cargo.toml points at it and cargo fails
 #                   with a misleading "failed to load manifest" without it); node/npm/cargo
 #                   on PATH; rustup target installed; Tauri's Linux system packages present.
-#   2. Frontend   - npm install (skipped when node_modules exists), then a probe of
-#                   `npx tauri --version`. package-lock.json was generated on Windows x64
-#                   and only records that platform's native binaries, so a missing
-#                   @tauri-apps/cli native binding otherwise surfaces as "Cannot find
-#                   native binding" halfway through the build. On failure node_modules and
-#                   the lockfile are wiped and reinstalled once.
+#   2. Frontend   - npm ci (always), then a probe of
+#                   `npx tauri --version`. The lockfile records every platform's
+#                   native optional package with its os/cpu constraints, and npm
+#                   filters by those at install time, so a missing
+#                   @tauri-apps/cli native binding means the lockfile does not
+#                   carry this platform — a thing to fix in the lockfile rather
+#                   than at build time. On failure node_modules is wiped and the
+#                   committed lockfile is installed once more; the lockfile
+#                   itself is never re-resolved.
 #   3. Override   - writes ui-desktop/.workbuddy/build-override.json (git-ignored) with:
 #                   * bundle.resources = []          - wintun.dll is Windows only; a
 #                     missing resource path aborts the bundle step
@@ -79,6 +82,18 @@ bad()  { printf '  %s[FAIL]%s %s\n'  "$C_RED"    "$C_RESET" "$*"; }
 info() { printf '  %s%s%s\n'         "$C_GRAY"   "$*"       "$C_RESET"; }
 die()  { bad "$*"; exit 1; }
 
+# Installs the frontend from the committed lockfile.
+#
+# `npm ci` and not `npm install`: a bundle has to be built from the tree that
+# is committed and audited, not from whatever the registry serves today.
+# `npm ci` fails when package-lock.json and package.json disagree, which is a
+# thing to fix in the lockfile rather than around it — so the message says so
+# instead of leaving npm's own error to explain it.
+install_frontend() {
+    npm ci --no-audit --no-fund \
+        || die "npm ci failed. Either package-lock.json and package.json disagree, or the registry is unreachable. If the lockfile is stale, run 'npm install' in ui-desktop and commit the updated package-lock.json."
+}
+
 usage() {
     cat <<'EOF'
 build_deb.sh - build the nexapipe desktop Debian package (Tauri 2)
@@ -96,8 +111,8 @@ Options:
   --debug                Use the debug cargo profile (much faster Rust build).
   --skip-type-check      Frontend build runs "npx vite build", skipping vue-tsc.
   --skip-frontend        Do not rebuild the frontend at all; dist/ must be current.
-  --skip-install         Skip npm install even when node_modules is missing.
-  --force-install        Run npm install even when node_modules exists.
+  --skip-install         Skip the frontend install even when node_modules is missing.
+  --force-install        Accepted and ignored: the frontend install always runs.
   --no-sign              Never create updater artefacts, even with a signing key set.
   --clean                Delete ui-desktop/dist and the bundle output before building.
   --install-deps         apt-get install the missing system packages (needs sudo).
@@ -133,6 +148,7 @@ while [[ $# -gt 0 ]]; do
         --skip-type-check) SKIP_TYPE_CHECK=true; shift ;;
         --skip-frontend)  SKIP_FRONTEND=true; shift ;;
         --skip-install)   SKIP_INSTALL=true; shift ;;
+        # The install always runs now, so the flag is the default.
         --force-install)  FORCE_INSTALL=true; shift ;;
         --no-sign)        NO_SIGN=true; shift ;;
         --clean)          CLEAN=true; shift ;;
@@ -441,21 +457,33 @@ fi
 cd "$DESKTOP_DIR"
 
 if $SKIP_INSTALL; then
-    step "Skipping npm install (--skip-install)"
-elif $FORCE_INSTALL || [[ ! -d node_modules ]]; then
-    step "Installing frontend dependencies"
-    npm install --no-audit --no-fund
+    step "Skipping the frontend install (--skip-install)"
 else
-    step "node_modules exists, skipping npm install (--force-install to rerun)"
+    # The install is unconditional, and that is the point: a `node_modules`
+    # that is already there may have been resolved from a different lockfile
+    # — a tree nobody committed and `npm audit` never saw — and a bundle
+    # built from it is a bundle nobody reviewed. `--skip-install` is the way
+    # out, for someone who knows what their tree is.
+    step "Installing frontend dependencies"
+    # npm ci, not npm install: the bundle has to be built from the committed
+    # lockfile, not from whatever the registry serves today. npm ci installs
+    # strictly from the lockfile and fails outright when package-lock.json and
+    # package.json disagree, which is the point.
+    install_frontend
 fi
 
 if ! npx tauri --version >/dev/null 2>&1; then
     if $SKIP_INSTALL; then
         die "npx tauri --version failed: the @tauri-apps/cli native binary is missing, drop --skip-install"
     fi
-    warn "npx tauri is unusable (missing platform native binary); wiping node_modules and reinstalling once"
-    rm -rf node_modules package-lock.json
-    npm install --no-audit --no-fund
+    # The lockfile is deliberately left alone. Re-resolving it here would put a
+    # tree nobody reviewed — and that `npm audit` never saw — into a signed
+    # bundle, which is the one thing a release must not do. A platform whose
+    # native binary the lockfile does not carry is a thing to fix in the
+    # lockfile.
+    warn "npx tauri is unusable after npm ci; the committed package-lock.json does not carry the @tauri-apps/cli native binary for this platform"
+    rm -rf "$DESKTOP_DIR/node_modules"
+    install_frontend
     npx tauri --version >/dev/null 2>&1 || die "npx tauri is still unusable after reinstalling"
 fi
 ok "tauri CLI $(npx tauri --version 2>/dev/null | head -n1)"

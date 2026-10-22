@@ -97,7 +97,7 @@ fn create_http_client_with_tls(
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         // The pool's own idle reaper needs a clock as well. The `timer` above
-        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // is the h2 half's — HTTP/2 carries its own timeouts, and without one
         // the client panics the first time it negotiates h2. The pool is
         // separate: without a timer of its own, an idle connection to a
         // backend that stopped answering is only reaped when something else
@@ -321,7 +321,7 @@ fn create_h2c_client_with_tls(
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         // The pool's own idle reaper needs a clock as well. The `timer` above
-        // is the h2 half's -- HTTP/2 carries its own timeouts, and without one
+        // is the h2 half's — HTTP/2 carries its own timeouts, and without one
         // the client panics the first time it negotiates h2. The pool is
         // separate: without a timer of its own, an idle connection to a
         // backend that stopped answering is only reaped when something else
