@@ -1533,6 +1533,43 @@ mod tests {
         );
     }
 
+    /// A connection in the pool is closed when the credential is replaced.
+    ///
+    /// The other half of the rule above: the connections the pool holds are
+    /// the ones the drop sees, and a credential of another identity leaves
+    /// them authenticated as the identity that is gone.
+    ///
+    /// This is the check the enrollment path now goes through: it writes a
+    /// credential of its own, and a write that skipped the check would leave
+    /// these connections in the pool.
+    #[tokio::test]
+    async fn a_pooled_connection_of_a_gone_identity_is_closed() {
+        let (pool, _accepted) = pool_harness().await;
+        pool.set_two_factor(Some(credential(
+            "client-001",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        // A connection of client-001, back in the pool.
+        let conn = pool.get_connection().await.expect("the connection is made");
+        pool.return_connection(conn.clone()).await;
+
+        // The credential is replaced: the identity changes.
+        pool.set_two_factor(Some(credential(
+            "client-002",
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            None,
+        )))
+        .await;
+
+        assert!(
+            wait_for_close(&conn).await,
+            "the pooled connection of the identity that is gone is closed"
+        );
+    }
+
     /// A connection of the identity that is current goes back into the pool.
     ///
     /// The other half of the rule above: a connection is only refused when
