@@ -308,6 +308,19 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **The connection-level receive window has a ceiling.** The transport gave
+  every stream a 4 MiB receive window and left the **connection's** window at
+  `VarInt::MAX` — which is no limit at all. A peer with a thousand streams
+  could therefore have 4 GiB of its data in this process, and nothing the
+  server does could stop it.
+  The connection now has a window of its own: 64 MiB, which is sixteen full
+  per-stream windows and carries 320 MB/s over a 200 ms path — more than any
+  link this runs over, so it is a ceiling rather than a limit. What it buys
+  is that the memory one peer can make this process hold is bounded.
+  It is the same tuning the two ends already share, so the client and the
+  server move together, and `NEXAPIPE_QUIC_RECV_WINDOW` sets it for whoever
+  wants another number.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of
