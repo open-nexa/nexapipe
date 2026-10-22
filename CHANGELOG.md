@@ -307,6 +307,20 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **The routing table's benchmark measures a lookup that matches.** Its 51
+  routes all had the path pattern `/*`, which is not a wildcard — it is a
+  literal `/*` prefix, and a route with it serves no ordinary path at all.
+  The walk went over all 51 routes and ended at the table's end with **no
+  route taken**, while the benchmark's name and the documentation both said
+  it was measuring what taking the route costs. That half was never
+  measured.
+  The pattern is `/` now — the catch-all a route uses to say "any path" —
+  and the benchmark asserts that the lookup matched, so the mistake cannot
+  come back quietly. It measures two things now: **732 ns** for a host a
+  route serves, and **533 ns** for a host no route serves. The difference is
+  what taking the route costs, which is the balancer's part.
+  The number recorded before — 999 ns — was a lookup that found nothing, and
+  it is kept in the documentation marked as what it was.
 
 ### Changed
 
