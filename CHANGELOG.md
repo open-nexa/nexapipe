@@ -997,6 +997,28 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The macOS bundles can be signed and notarized.** The desktop builds
+  attached to GitHub releases were neither: an unsigned app is quarantined by
+  Gatekeeper, and the only ways through it — "Control-click → Open" or
+  `xattr -dr com.apple.quarantine` — both ask the user to weaken the OS gate
+  for that application permanently, and a bundle with no signature cannot be
+  told apart from a look-alike.
+  The release workflow now signs with a Developer ID certificate and
+  notarizes, when the repository holds the credentials for it, and says out
+  loud in the job log whether the bundle it produced carries a valid
+  signature and whether Gatekeeper accepts it. A release built without the
+  credentials is signed by nothing and says so rather than quietly shipping
+  an unsigned app. The README names the secrets and the variables.
+  The **application inside the disk image** is what is notarized: the
+  bundler submits it to Apple, waits for the answer and staples the ticket
+  to it, so an app copied out of the image opens on a Mac that has never seen
+  it before. The **image itself** is signed — it is the artifact the release
+  publishes — but it carries no ticket of its own, because the bundler
+  notarizes the application and signs the image. The job log says so too,
+  rather than leaving the gap to be found by a user.
+  The updater path was never affected: the minisign signature is verified
+  against a pinned key before anything is extracted or installed, so an
+  update could not be swapped even though the initial download could.
 - **The Android release build is minified again.** It shipped with
   `isMinifyEnabled = false` and a proguard file that was nothing but the
   template's comments, so the release APK carried every class, every method
