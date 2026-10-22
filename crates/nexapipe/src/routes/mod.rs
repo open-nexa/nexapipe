@@ -165,7 +165,16 @@ impl Route {
     /// The TLS passthrough path selects on SNI, i.e. before a request line
     /// exists, so there is no path to match against.
     pub fn matches_host(&self, host: &str) -> bool {
-        host_matches(&self.host_pattern, &normalize_host(host))
+        self.serves_host(&normalize_host(host))
+    }
+
+    /// Host-only match against a host the caller has **already folded**.
+    ///
+    /// The routes are walked one after another, and every one of them was
+    /// folding the same name again — once per route, for every request. The
+    /// fold is the caller's, done once for the whole walk.
+    pub fn serves_host(&self, host: &str) -> bool {
+        host_matches(&self.host_pattern, host)
     }
 
     /// Match for an L4 flow: the host, plus the optional client-port allow list.
@@ -174,7 +183,17 @@ impl Route {
     /// is then dialled is entirely the route's `backends`, so a client cannot use the
     /// list to steer the tunnel somewhere else.
     pub fn matches_l4(&self, host: &str, port: u16) -> bool {
-        if !self.matches_host(host) {
+        self.serves_l4(&normalize_host(host), port)
+    }
+
+    /// Match for an L4 flow, against a host the caller has **already folded**.
+    ///
+    /// The fold is the caller's, done once for the whole walk — see
+    /// [`Self::serves_host`]. The port rule lives here, once: the walk calls
+    /// this, and [`Self::matches_l4`] is this with the fold put back in, so a
+    /// change to the rule cannot leave one of the two behind.
+    pub fn serves_l4(&self, host: &str, port: u16) -> bool {
+        if !self.serves_host(host) {
             return false;
         }
         match &self.l4.client_ports {
@@ -194,13 +213,28 @@ impl Route {
     }
 
     pub fn matches(&self, host: &str, path: &str) -> bool {
-        let path_matches = if self.path_is_prefix {
+        self.serves_request(&normalize_host(host), path)
+    }
+
+    /// The match, against a host the caller has **already folded**.
+    ///
+    /// The fold is the caller's, done once for the whole walk — see
+    /// [`Self::serves_host`].
+    pub fn serves_request(&self, host: &str, path: &str) -> bool {
+        // The host first, and the path only if the host matched: the path is
+        // the more expensive half, and a route whose host does not match must
+        // not pay for it. Before the fold moved out here the path was
+        // compared eagerly for every route, so this order is a change and not
+        // the preservation of one.
+        if !self.serves_host(host) {
+            return false;
+        }
+
+        if self.path_is_prefix {
             path_suffix(&self.path_pattern, path).is_some()
         } else {
             path == self.path_pattern
-        };
-
-        self.matches_host(host) && path_matches
+        }
     }
 
     /// How specific this route is; `best_match` keeps the highest.
@@ -678,7 +712,12 @@ impl RoutingTable {
         // TLS port.
         let matched_route = {
             let routes = self.routes.read().await;
-            best_match(&routes, RouteMode::Http, |route| route.matches(host, path))
+            // The host is folded once for the whole walk, rather than once
+            // for every route in it.
+            let folded = normalize_host(host);
+            best_match(&routes, RouteMode::Http, |route| {
+                route.serves_request(&folded, path)
+            })
         };
 
         let Some(route) = matched_route else {
@@ -748,8 +787,10 @@ impl RoutingTable {
     pub async fn get_passthrough_backend(&self, sni: &str) -> BackendLookup<BackendLease> {
         let matched_route = {
             let routes = self.routes.read().await;
+            // The name is folded once for the whole walk.
+            let folded = normalize_host(sni);
             best_match(&routes, RouteMode::Passthrough, |route| {
-                route.matches_host(sni)
+                route.serves_host(&folded)
             })
         };
 
@@ -804,7 +845,9 @@ impl RoutingTable {
 
         let matched_route = {
             let routes = self.routes.read().await;
-            best_match(&routes, mode, |route| route.matches_l4(host, port))
+            // The host is folded once for the whole walk.
+            let folded = normalize_host(host);
+            best_match(&routes, mode, |route| route.serves_l4(&folded, port))
         };
 
         let Some(route) = matched_route else {
@@ -1875,6 +1918,35 @@ mod tests {
                 .expect("the folded pattern matches the lowercase host")
                 .url,
             "http://10.0.0.7:8080"
+        );
+    }
+
+    /// The walk folds the host once, before it starts, and the route's own
+    /// methods take the host that is already folded.
+    ///
+    /// A caller that hands one of them an unfolded name gets a quiet `false`
+    /// rather than an error, so the precondition is pinned here: it is a fact
+    /// about the API and not a comment.
+    #[tokio::test]
+    async fn the_route_is_asked_about_a_host_that_is_already_folded() {
+        let route = http_route("api.iakl.top", &["http://10.0.0.5:8080"]);
+
+        assert!(
+            route.serves_host(&normalize_host("API.Iakl.Top.")),
+            "the folded name reaches the route"
+        );
+        assert!(
+            !route.serves_host("API.Iakl.Top."),
+            "an unfolded name does not match, and says so by not matching"
+        );
+
+        assert!(
+            route.serves_request(&normalize_host("API.Iakl.Top."), "/"),
+            "the request is matched against the folded host too"
+        );
+        assert!(
+            !route.serves_request("API.Iakl.Top.", "/"),
+            "an unfolded name does not match the request either"
         );
     }
 
