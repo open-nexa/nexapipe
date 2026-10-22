@@ -22,7 +22,7 @@ use nexapipe::l4::FlowLimiter;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RoutingTable};
 use nexapipe_client::auth::{TotpAlgorithm as ClientTotpAlgorithm, TwoFactorAuth};
-use nexapipe_proto::auth::AuthMessage;
+use nexapipe_proto::auth::{AuthMessage, Format};
 use nexapipe_proto::secret::SecretString;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -1279,24 +1279,6 @@ fn auth_state(config: AuthConfig) -> (conn::AuthState, tempfile::TempDir) {
     )
 }
 
-/// Writes one length-prefixed message.
-async fn write_message(send: &mut SendStream, message: &AuthMessage) {
-    let bytes = message.to_bytes().expect("the message serializes");
-    send.write_all(&(bytes.len() as u32).to_le_bytes())
-        .await
-        .expect("the length goes out");
-    send.write_all(&bytes).await.expect("the message goes out");
-}
-
-/// Reads one length-prefixed message.
-async fn read_message(recv: &mut RecvStream) -> AuthMessage {
-    let mut len = [0u8; 4];
-    recv.read_exact(&mut len).await.expect("the length comes");
-    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-    recv.read_exact(&mut buf).await.expect("the message comes");
-    AuthMessage::from_bytes(&buf).expect("the message parses")
-}
-
 /// Performs the handshake on a fresh stream: AUTH_START, the challenge, and
 /// the response signed over it.
 ///
@@ -1308,13 +1290,31 @@ async fn handshake(
     code: Option<String>,
     device: Option<&str>,
 ) -> AuthMessage {
+    handshake_in(tunnel, client, code, device, Format::LegacyJson)
+        .await
+        .0
+}
+
+/// The same handshake, in the form the client speaks, and the forms the
+/// answers came back in.
+///
+/// The forms are returned because they are the point: the server answers in
+/// the form the client asked in, and a test that only looked at the message
+/// would not notice a server that answered in the wrong one.
+async fn handshake_in(
+    tunnel: &Tunnel,
+    client: &TwoFactorAuth,
+    code: Option<String>,
+    device: Option<&str>,
+    format: Format,
+) -> (AuthMessage, Format, Format) {
     let (mut send, mut recv) = tunnel.conn.open_bi().await.expect("open_bi");
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    write_message(
+    write_message_in(
         &mut send,
         &AuthMessage::Start {
             client_id: CLIENT_ID.to_string(),
@@ -1322,10 +1322,11 @@ async fn handshake(
             device_id: None,
             version: None,
         },
+        format,
     )
     .await;
 
-    let challenge = read_message(&mut recv).await;
+    let (challenge, challenge_format) = read_message_in(&mut recv).await;
     let AuthMessage::Challenge { nonce } = challenge else {
         panic!("the server answers with a challenge, got {challenge:?}");
     };
@@ -1338,7 +1339,7 @@ async fn handshake(
         None => client.generate_code().expect("the code is generated"),
     };
 
-    write_message(
+    write_message_in(
         &mut send,
         &AuthMessage::Response {
             client_id: CLIENT_ID.to_string(),
@@ -1347,10 +1348,30 @@ async fn handshake(
             signature,
             device_id: device.map(str::to_string),
         },
+        format,
     )
     .await;
 
-    read_message(&mut recv).await
+    let (result, result_format) = read_message_in(&mut recv).await;
+    (result, challenge_format, result_format)
+}
+
+/// Writes one length-prefixed message in the form asked for.
+async fn write_message_in(send: &mut SendStream, message: &AuthMessage, format: Format) {
+    let bytes = message.to_payload(format).expect("the message serializes");
+    send.write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .expect("the length goes out");
+    send.write_all(&bytes).await.expect("the message goes out");
+}
+
+/// Reads one length-prefixed message, in whatever form it arrived.
+async fn read_message_in(recv: &mut RecvStream) -> (AuthMessage, Format) {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await.expect("the length comes");
+    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+    recv.read_exact(&mut buf).await.expect("the message comes");
+    AuthMessage::from_payload(&buf).expect("the message parses")
 }
 
 /// The close code the server ended the connection with, if it has.
@@ -1474,5 +1495,112 @@ async fn a_device_key_gets_in() {
     assert!(
         matches!(answer, AuthMessage::Ok),
         "the handshake succeeded, got {answer:?}"
+    );
+}
+
+/// A client that speaks the versioned JSON form completes the handshake.
+///
+/// The server answers in the form the client asked in: the challenge and the
+/// result are both the versioned JSON, and the client reads them without
+/// knowing which form to expect.
+#[tokio::test]
+async fn a_client_that_speaks_the_versioned_json_form_gets_in() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    let (answer, challenge_format, result_format) =
+        handshake_in(&tunnel, &client, None, None, Format::Json).await;
+
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the handshake succeeded, got {answer:?}"
+    );
+    assert_eq!(
+        challenge_format,
+        Format::Json,
+        "the challenge came back in the form the client asked in"
+    );
+    assert_eq!(
+        result_format,
+        Format::Json,
+        "the result came back in the form the client asked in"
+    );
+}
+
+/// A client that speaks the binary form completes the handshake, and the
+/// answers come back in the binary form.
+#[tokio::test]
+async fn a_client_that_speaks_the_binary_form_gets_in() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    let (answer, challenge_format, result_format) =
+        handshake_in(&tunnel, &client, None, None, Format::Binary).await;
+
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the handshake succeeded, got {answer:?}"
+    );
+    assert_eq!(
+        challenge_format,
+        Format::Binary,
+        "the challenge came back in the form the client asked in"
+    );
+    assert_eq!(
+        result_format,
+        Format::Binary,
+        "the result came back in the form the client asked in"
+    );
+}
+
+/// A client that announces a version is answered in it.
+///
+/// The announcement is inside the JSON of the first message, where a server
+/// that predates the version byte ignores it — and a server that knows it
+/// answers in the version the client asked for.
+#[tokio::test]
+async fn a_client_that_announces_a_version_is_answered_in_it() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let (mut send, mut recv) = tunnel.conn.open_bi().await.expect("open_bi");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // The announcement travels in the JSON, where an old server drops the
+    // field it does not know.
+    write_message_in(
+        &mut send,
+        &AuthMessage::Start {
+            client_id: CLIENT_ID.to_string(),
+            timestamp,
+            device_id: None,
+            version: Some(nexapipe_proto::auth::VERSION_BINARY),
+        },
+        Format::LegacyJson,
+    )
+    .await;
+
+    let (challenge, challenge_format) = read_message_in(&mut recv).await;
+    assert!(
+        matches!(challenge, AuthMessage::Challenge { .. }),
+        "the server answers with a challenge, got {challenge:?}"
+    );
+    assert_eq!(
+        challenge_format,
+        Format::Binary,
+        "the server answered in the version the client announced"
     );
 }
