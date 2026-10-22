@@ -287,6 +287,8 @@ impl HealthChecker {
         };
 
         let client = self.clients.for_protocol(protocol);
+        let request =
+            request.map(|body| crate::http::full_body(body.into_inner().unwrap_or_default()));
         match tokio::time::timeout(self.timeout, client.request(request)).await {
             Ok(Ok(response)) => {
                 let status = response.status();

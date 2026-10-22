@@ -477,6 +477,29 @@ items the numbers pointed at.
    closes the connection after every response, so every request is a new
    socket, two new tasks and two new entries in the flow table. That is a
    change to the proxy's connection lifecycle, and it is a separate decision.
+8. **The request body is not held whole.** **Added on 2026-10-22, from the
+   audit rather than from a bench.** The server read a request's whole body
+   into memory — up to 64 MiB of it — before it contacted the backend, and
+   only then sent it. A backend saw **nothing** of an upload until the last
+   byte was in, and the proxy held the whole upload for the whole exchange.
+   **Done**: a request that declares a `content-length` is forwarded as it
+   arrives. The backend reads the body while the client is still sending it,
+   and the proxy holds a 16 KiB read buffer rather than the upload — a 64 MiB
+   upload costs the proxy tens of kilobytes where it cost 64 MiB. The
+   process-wide byte budget counts the bytes that have **arrived** rather
+   than the ones the client **promised**, which is what the buffered path
+   counted too.
+   One thing came with it, and it is a change in what the server does rather
+   than in how fast it does it: a body that has been **read** cannot be sent
+   a second time, because there is no second copy of it. A request with a
+   body that fails after the body was sent is refused with an error rather
+   than being tried again, where before the whole body was kept in memory
+   and sent again. A failure that happened before the body was touched — a
+   connection that was refused, say — is still tried on the next backend,
+   because the bytes are still on the client's stream. `[retry] attempts` is 0
+   unless an operator asks for it, so this reaches only a deployment that
+   turned retries on. A **chunked** body is still read whole: the proxy
+   re-frames it as one buffer with a length of its own.
 
 ### F3 — A performance budget (P2, after F1)
 

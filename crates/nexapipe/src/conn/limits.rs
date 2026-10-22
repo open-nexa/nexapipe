@@ -514,26 +514,26 @@ pub const DEFAULT_MAX_BODY_BYTES_GLOBAL: usize = 1024 * 1024 * 1024;
 /// Overrides [`DEFAULT_MAX_BODY_BYTES_GLOBAL`] at startup.
 const ENV_MAX_BODY_BYTES_GLOBAL: &str = "NEXAPIPE_MAX_BODY_BYTES";
 
-/// Counts the bytes held in buffered request bodies across the process.
+/// Counts the bytes held in request bodies across the process.
 ///
-/// Request bodies are read whole before being forwarded, so what this bounds is
-/// memory: [`MAX_REQUEST_BODY`](crate::http::MAX_REQUEST_BODY) per request is
-/// defensible, and the same 64 MB times every stream the process will accept at
-/// once is not. This is the third ceiling for the same reason the other two are
-/// there — each one bounds a resource that the per-connection and per-peer
+/// What this bounds is memory: [`MAX_REQUEST_BODY`](crate::http::MAX_REQUEST_BODY) per
+/// request is defensible, and the same 64 MB times every stream the process will
+/// accept at once is not. This is the third ceiling for the same reason the other
+/// two are there — each one bounds a resource that the per-connection and per-peer
 /// numbers cannot bound on their own.
 ///
 /// **Both body paths reserve here**, which took two changes to arrange. The
 /// plaintext listener buffers through `read_body_limited`, which grows a
-/// reservation per frame. The iroh path buffers through two readers of its own:
-/// the one with a `content-length` takes the whole declared size before its
-/// first read, because QUIC is a byte stream and a peer decides how much body
-/// rides along with the head, so the declared size is the only honest number;
-/// the chunked one charges the raw bytes as they arrive, because a chunked
-/// body declares no length and there is no moment at which the total is
-/// knowable — and a peer that declares a 64 MiB chunk and then trickles the
-/// data into it holds those bytes for as long as it takes, so the budget has
-/// to see them.
+/// reservation per frame. The iroh path has two readers of its own: the one
+/// with a `content-length` **streams** the body — the bytes are read as the
+/// backend asks for them, so what it holds is a buffer rather than the upload —
+/// and it charges the bytes as they arrive, because QUIC is a byte stream and a
+/// peer decides how much body rides along with the head, so the only honest
+/// number is the one that counts what has arrived. The chunked reader charges
+/// the raw bytes the same way, because a chunked body declares no length and
+/// there is no moment at which the total is knowable — and a peer that declares
+/// a 64 MiB chunk and then trickles the data into it holds those bytes for as
+/// long as it takes, so the budget has to see them.
 ///
 /// Every reader returns its reservation to its caller rather than dropping it:
 /// the bytes are still held after the read, right up to when the body goes to

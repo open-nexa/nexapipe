@@ -201,6 +201,38 @@ async fn read_request(sock: &mut TcpStream) -> Option<Seen> {
     Some(Seen { request_line, body })
 }
 
+/// A backend that reads the whole request and then hangs up without
+/// answering.
+///
+/// The request was carried — the backend saw it, body and all — and the
+/// answer never came. That is the shape of a failure a retry would answer,
+/// and what decides whether it is tried again is the body.
+async fn spawn_backend_that_hangs_up() -> Backend {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let url = format!("http://{}", listener.local_addr().expect("backend address"));
+
+    let sink = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let Some(request) = read_request(&mut sock).await else {
+                    return;
+                };
+                sink.lock().unwrap().push(request);
+                // The connection dies with the request read: the backend saw
+                // it and says nothing.
+                drop(sock);
+            });
+        }
+    });
+
+    Backend { url, seen }
+}
+
 /// An address nothing is listening on.
 ///
 /// The port is held by a UDP socket, so a TCP connection to it is refused
@@ -644,10 +676,15 @@ impl Tunnel {
     /// bytes it cannot use yet and pick them up on the next read, which is
     /// where chunk framing is easy to get wrong.
     async fn exchange_split(&self, parts: &[&[u8]]) -> Vec<u8> {
+        self.exchange_parts(parts, Duration::from_millis(50)).await
+    }
+
+    /// Sends `parts` on one stream, `gap` apart.
+    async fn exchange_parts(&self, parts: &[&[u8]], gap: Duration) -> Vec<u8> {
         let (mut send, mut recv) = self.conn.open_bi().await.expect("open_bi");
         for part in parts {
             send.write_all(part).await.expect("write request");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(gap).await;
         }
         send.finish().expect("finish request");
 
@@ -973,6 +1010,168 @@ async fn a_tunneled_request_that_failed_is_tried_on_another_backend() {
         backend.seen().len(),
         1,
         "the surviving backend should have seen the retried request once"
+    );
+}
+
+/// An upload that takes longer than the response deadline is not cut short.
+///
+/// The response deadline is the backend's: it says how long the backend may
+/// take to answer with a status line. It is not the client's, and a client
+/// that is still sending its body is not a backend that is slow to answer —
+/// the body has a deadline of its own, and it is the one that bounds the
+/// upload.
+#[tokio::test]
+async fn an_upload_longer_than_the_response_deadline_is_not_cut_short() {
+    let backend = spawn_backend("uploaded").await;
+    let proxy = spawn_proxy_with_timeouts(
+        vec![http_route("upload.test", &backend.url)],
+        Retry::default(),
+        None,
+        Timeouts {
+            connect: Duration::from_secs(1),
+            response: Duration::from_secs(1),
+            deadlines: nexapipe::deadline::Deadlines {
+                body: Duration::from_secs(30),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // The body takes longer to arrive than the backend is given to answer.
+    let reply = tunnel
+        .exchange_parts(
+            &[
+                b"POST /upload HTTP/1.1\r\nHost: upload.test\r\ncontent-length: 11\r\n\r\nhello ",
+                b"world",
+            ],
+            Duration::from_secs(2),
+        )
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "the upload was cut short by the response deadline: {:?}",
+        status_of(&reply)
+    );
+    let seen = backend.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the backend should have seen the request once"
+    );
+    assert_eq!(
+        seen[0].body, b"hello world",
+        "the backend saw the whole of the body"
+    );
+}
+
+/// A request with a body is tried on another backend when the first one
+/// refused the connection.
+///
+/// The body was never touched: the connection was refused before a byte of it
+/// was sent, so the bytes are still on the client's stream and the next
+/// backend gets the whole of them.
+#[tokio::test]
+async fn a_tunneled_request_with_a_body_is_tried_on_another_backend() {
+    let (dead, _hold) = dead_backend().await;
+    let backend = spawn_backend("second").await;
+    let route = Route::new(
+        "retry.test",
+        "/",
+        true,
+        vec![dead, backend.url.clone()],
+        LoadBalancingStrategy::RoundRobin,
+        RouteMode::Http,
+        None,
+    );
+    let proxy = spawn_proxy_with_settings(
+        vec![route],
+        Retry {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(
+            b"POST /retry HTTP/1.1\r\nHost: retry.test\r\ncontent-length: 11\r\n\r\nhello world",
+        )
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "expected the second backend's 200, got {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(reply_body(&reply), "second");
+    let seen = backend.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the surviving backend should have seen the retried request once"
+    );
+    assert_eq!(
+        seen[0].body, b"hello world",
+        "the retried request carries the body the client sent"
+    );
+}
+
+/// A request whose body was read is **not** tried on another backend.
+///
+/// The bytes came off the client's stream and are gone: there is no second
+/// copy of them, so a retry would send a body that is short. The request
+/// fails instead, and the other backend is not asked at all.
+#[tokio::test]
+async fn a_tunneled_request_whose_body_was_read_is_not_tried_again() {
+    let first = spawn_backend_that_hangs_up().await;
+    let second = spawn_backend("second").await;
+    let route = Route::new(
+        "retry.test",
+        "/",
+        true,
+        vec![first.url.clone(), second.url.clone()],
+        LoadBalancingStrategy::RoundRobin,
+        RouteMode::Http,
+        None,
+    );
+    let proxy = spawn_proxy_with_settings(
+        vec![route],
+        Retry {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+    )
+    .await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // The body arrives in two pieces, so part of it is still on the client's
+    // stream when the backend is reached: the backend reads it, and what came
+    // off the stream is gone.
+    let reply = tunnel
+        .exchange_split(&[
+            b"PUT /retry HTTP/1.1\r\nHost: retry.test\r\ncontent-length: 11\r\n\r\nhello ",
+            b"world",
+        ])
+        .await;
+
+    assert!(
+        !status_of(&reply).starts_with("HTTP/1.1 200"),
+        "the request cannot be tried again, so there is no answer to give: {:?}",
+        status_of(&reply)
+    );
+    assert_eq!(
+        first.seen().len(),
+        1,
+        "the first backend should have seen the request once"
+    );
+    assert_eq!(
+        second.seen().len(),
+        0,
+        "the second backend must not be asked: the body cannot be sent again"
     );
 }
 
