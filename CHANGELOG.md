@@ -457,6 +457,19 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
+- **The UDP queue is bounded by bytes, not only by datagrams.** A flow's queue
+  held up to 256 datagrams, and a datagram may be 65,507 bytes — so one flow
+  could have 16 MiB of datagrams waiting to go into the tunnel, and there are
+  32 flows. A device could have **half a gigabyte** queued at once, for a
+  queue that exists to smooth a burst.
+  The queue now has a byte budget of its own — a megabyte per flow, which is
+  sixteen full-size datagrams, and 32 MiB for all the flows together. A
+  datagram that would take the queue past it is dropped, which is what UDP
+  promises anyway, and the count of datagrams stays as a second bound.
+  The bytes are reserved before the datagram goes in, so the queue cannot pass
+  its bound between the check and the send, and they are given back when the
+  flow takes the datagram out.
+
 ### Changed
 
 - **The client speaks the binary form of the handshake.** A handshake with a

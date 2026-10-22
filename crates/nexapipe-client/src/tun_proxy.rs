@@ -109,7 +109,7 @@ use std::net::Ipv6Addr;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "android")]
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 #[cfg(target_os = "android")]
@@ -267,6 +267,19 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// allowed to lose datagrams, and buffering without bound would turn a stalled
 /// flow into memory growth.
 const UDP_FLOW_QUEUE: usize = 256;
+
+/// How many bytes of datagrams one flow may have waiting to go into the
+/// tunnel.
+///
+/// **The queue is bounded by bytes, not only by datagrams.** A datagram may be
+/// 65,507 bytes, so a queue of 256 of them is 16 MiB per flow — and there are
+/// 32 flows, so half a gigabyte of datagrams a device may have queued at
+/// once, for a queue that is meant to smooth a burst.
+///
+/// A megabyte is sixteen full-size datagrams, and thirty-two flows at that is
+/// 32 MiB: the same order as the TCP side's per-flow budget, and a sixteenth
+/// of what the datagram count alone allowed.
+const UDP_FLOW_QUEUE_BYTES: usize = 1024 * 1024;
 
 /// Datagrams on their way from the proxy to the application (DNS replies and
 /// every UDP flow's inbound traffic) queue here for the single TUN writer.
@@ -1364,7 +1377,24 @@ fn client_addr_hint(stream: &SmolTcpStream) -> String {
 type FlowKey = (SocketAddr, SocketAddr);
 
 /// The live UDP flows: their key, and the channel feeding datagrams into them.
-type FlowTable = Arc<Mutex<HashMap<FlowKey, mpsc::Sender<Vec<u8>>>>>;
+/// One flow's queue: the datagrams waiting to go into the tunnel, and how
+/// many bytes they are.
+///
+/// The count of datagrams is the channel's own bound; the count of **bytes**
+/// is this one, and it is the one that matters: a datagram may be 65,507
+/// bytes, so a bound on the number of them is not a bound on the memory.
+#[derive(Clone)]
+struct UdpQueue {
+    /// The datagrams waiting to go into the tunnel.
+    sender: mpsc::Sender<Vec<u8>>,
+    /// How many bytes are waiting.
+    ///
+    /// Shared with the demultiplexer, which adds to it, and with the flow,
+    /// which takes from it.
+    queued: Arc<AtomicUsize>,
+}
+
+type FlowTable = Arc<Mutex<HashMap<FlowKey, UdpQueue>>>;
 
 /// Which side of a UDP flow spoke.
 #[derive(Debug)]
@@ -1505,20 +1535,24 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
         // written into a dead tunnel.
         let existing = lock_flows(&table)
             .get(&key)
-            .filter(|sender| !sender.is_closed())
+            .filter(|queue| !queue.sender.is_closed())
             .cloned();
 
-        let sender = match existing {
-            Some(sender) => sender,
+        let queue = match existing {
+            Some(queue) => queue,
             None => {
                 let (sender, receiver) = mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+                let queue = UdpQueue {
+                    sender,
+                    queued: Arc::new(AtomicUsize::new(0)),
+                };
                 let mut flows = lock_flows(&table);
 
                 if flows.len() >= MAX_UDP_FLOWS {
                     // A flow that has ended is still in the table until its
                     // task gets to `release_flow`, so the count is not the
                     // number of live flows — look again before refusing.
-                    flows.retain(|_, sender| !sender.is_closed());
+                    flows.retain(|_, queue| !queue.sender.is_closed());
                 }
                 if flows.len() >= MAX_UDP_FLOWS {
                     drop(flows);
@@ -1534,30 +1568,44 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 }
 
                 warned_full.store(false, Ordering::Relaxed);
-                flows.insert(key, sender.clone());
+                flows.insert(key, queue.clone());
                 drop(flows);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
                     key,
-                    sender.clone(),
+                    queue.clone(),
                     receiver,
                     domain,
                 ));
-                sender
+                queue
             }
         };
 
-        match sender.try_send(payload) {
+        // The bytes are reserved **before** the datagram goes in, so that the
+        // queue cannot pass its bound between the check and the send.
+        let len = payload.len();
+        let queued = queue.queued.fetch_add(len, Ordering::Relaxed) + len;
+        if queued > UDP_FLOW_QUEUE_BYTES {
+            queue.queued.fetch_sub(len, Ordering::Relaxed);
+            // The same answer as a full queue: the datagram is lost, which is
+            // what UDP promises anyway.
+            continue;
+        }
+
+        match queue.sender.try_send(payload) {
             Ok(()) => {}
             // Datagrams arriving while the tunnel is still opening are the normal
             // case for the first few, so a full queue is not worth a log line —
             // printing one per dropped datagram would be its own problem under
             // load. Losing them is what UDP promises anyway.
-            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                queue.queued.fetch_sub(len, Ordering::Relaxed);
+            }
             // The flow ended between the lookup and the send. The next datagram
             // creates a new one.
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                queue.queued.fetch_sub(len, Ordering::Relaxed);
                 jni_log!("[tun-proxy] UDP flow to {} closed", dst_addr);
             }
         }
@@ -1576,7 +1624,7 @@ async fn run_udp_flow(
     ctx: TunContext,
     table: FlowTable,
     key: FlowKey,
-    mine: mpsc::Sender<Vec<u8>>,
+    mine: UdpQueue,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     domain: std::sync::Arc<str>,
 ) {
@@ -1649,6 +1697,9 @@ async fn run_udp_flow(
             // The demultiplexer dropped our sender: the flow was replaced.
             Activity::Application(None) => break,
             Activity::Application(Some(datagram)) => {
+                // The datagram is out of the queue now, so its bytes are no
+                // longer waiting for it.
+                mine.queued.fetch_sub(datagram.len(), Ordering::Relaxed);
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
@@ -1791,9 +1842,12 @@ async fn run_udp_flow(
 /// Only removes the entry if it is still *ours*: a flow that ends after the
 /// demultiplexer replaced it (which happens when the channel is closed) must not
 /// take the live flow's channel down with it.
-fn release_flow(table: &FlowTable, key: &FlowKey, mine: &mpsc::Sender<Vec<u8>>) {
+fn release_flow(table: &FlowTable, key: &FlowKey, mine: &UdpQueue) {
     let mut flows = lock_flows(table);
-    if flows.get(key).is_some_and(|entry| entry.same_channel(mine)) {
+    if flows
+        .get(key)
+        .is_some_and(|entry| entry.sender.same_channel(&mine.sender))
+    {
         flows.remove(key);
     }
 }
@@ -1801,7 +1855,7 @@ fn release_flow(table: &FlowTable, key: &FlowKey, mine: &mpsc::Sender<Vec<u8>>) 
 /// A poisoned lock still holds a usable table — every critical section is a
 /// handful of `HashMap` calls and nothing that can panic in between — so
 /// recovering beats taking the tunnel down.
-fn lock_flows(table: &FlowTable) -> MutexGuard<'_, HashMap<FlowKey, mpsc::Sender<Vec<u8>>>> {
+fn lock_flows(table: &FlowTable) -> MutexGuard<'_, HashMap<FlowKey, UdpQueue>> {
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2364,7 +2418,7 @@ mod tests {
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// The resolvers every test answer claims to have come from. What matters
