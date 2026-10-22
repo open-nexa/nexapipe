@@ -270,7 +270,7 @@ impl TunProxy {
     pub fn is_admin() -> bool {
         #[cfg(windows)]
         {
-            std::process::Command::new("net")
+            crate::win::hidden("net")
                 .arg("session")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

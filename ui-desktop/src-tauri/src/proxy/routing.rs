@@ -10,7 +10,10 @@
 //! - macOS:   ifconfig / route (utun interfaces need an explicit IP and route)
 
 use anyhow::Result;
+#[cfg(not(windows))]
 use std::process::Command;
+#[cfg(windows)]
+use crate::win::hidden;
 
 #[cfg(windows)]
 use crate::proxy::tun_proxy::{set_tun_base, tun_network, TUN_BASE_CANDIDATES, TUN_NETMASK};
@@ -366,7 +369,7 @@ fn configure_ipv6_windows(interface: &str) -> bool {
 
     let addr = tun_v6_ip().to_string();
     // Already there is success — every command here is idempotent.
-    let present = Command::new("powershell")
+    let present = hidden("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -384,7 +387,7 @@ fn configure_ipv6_windows(interface: &str) -> bool {
         }
     }
 
-    let out = Command::new("powershell")
+    let out = hidden("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -417,7 +420,7 @@ fn configure_ipv6_windows(interface: &str) -> bool {
 fn remove_ipv6_windows(interface: &str) -> Result<()> {
     use crate::proxy::tun_proxy::tun_v6_ip;
 
-    let _ = Command::new("powershell")
+    let _ = hidden("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -507,7 +510,7 @@ fn configure_interface_windows(interface: &str) -> Result<()> {
         }
         if !assigned {
             tracing::warn!("IP Helper refused {}; falling back to netsh", ip);
-            let output = Command::new("netsh")
+            let output = hidden("netsh")
                 .args([
                     "interface",
                     "ip",
@@ -591,7 +594,7 @@ fn configure_interface_windows(interface: &str) -> Result<()> {
 
     // Last resort before giving up: say what the machine itself thinks, using a program that is
     // not the one that may have silently done nothing.
-    let seen = Command::new("ipconfig").output().map(|o| {
+    let seen = hidden("ipconfig").output().map(|o| {
         let text = String::from_utf8_lossy(&o.stdout).to_string();
         text.contains(interface)
     });

@@ -185,7 +185,7 @@ fn quote_argument(exe: &std::path::Path) -> String {
 mod platform {
     use super::{current_exe, ENTRY_NAME};
     use crate::error::{codes, AppError};
-    use std::process::Command;
+    use crate::win;
 
     /// Where Windows looks for what to run at login.
     ///
@@ -213,7 +213,7 @@ mod platform {
     ///
     /// The exit code is what is read; the text is localized, so it is not.
     fn query(args: &[&str]) -> Result<bool, AppError> {
-        Command::new(reg())
+        win::hidden(reg())
             .args(args)
             .output()
             .map(|output| output.status.success())
@@ -237,7 +237,7 @@ mod platform {
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
-        let mut command = Command::new(reg());
+        let mut command = win::hidden(reg());
         if enabled {
             let exe = current_exe()?;
             // The value is a command line, so the path is quoted: a program
