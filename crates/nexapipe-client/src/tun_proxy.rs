@@ -1341,7 +1341,6 @@ async fn serve_tcp_flow(
 
     // Dropping both halves closes the smoltcp socket (its `Drop` sends, at most,
     // a FIN; the flow is over either way).
-    ctx.endpoint_group.return_connection(&domain, pooled).await;
 }
 
 /// The application's address, for the log line. Only valid before `split`.
@@ -1761,7 +1760,6 @@ async fn run_udp_flow(
     }
 
     let _ = tunnel_send.finish();
-    ctx.endpoint_group.return_connection(&domain, pooled).await;
     release_flow(&table, &key, &mine);
 }
 

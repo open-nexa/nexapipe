@@ -977,7 +977,6 @@ where
         client_task.abort();
         backend_task.abort();
 
-        endpoint_group.return_connection(&host, pooled_conn).await;
         return Ok(());
     }
 
@@ -1225,7 +1224,6 @@ where
                     close_reason
                 );
 
-                endpoint_group.return_connection(&host, pooled_conn).await;
                 return Ok(());
             }
         }
@@ -1389,7 +1387,6 @@ where
     // so a keep-alive client socket can't pin this task.
     client_task.abort();
 
-    endpoint_group.return_connection(&host, pooled_conn).await;
     jni_log!("[DEBUG:local-proxy] Connection closed");
     Ok(())
 }
@@ -1551,7 +1548,6 @@ where
         _ = flow.cancelled() => (),
     }
 
-    endpoint_group.return_connection(&sni, pooled_conn).await;
     jni_log!("[DEBUG:local-proxy] TLS tunnel closed");
     Ok(())
 }

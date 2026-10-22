@@ -310,8 +310,8 @@ the connections a client's flows open:
 
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
-| `flow_connections/connections` | 100 | 100 | **100** | **100 connections for 100 concurrent flows.** One per flow, because a flow takes its connection out of the pool and holds it until it ends. The count does not move: every sample was exactly 100 |
-| `flow_connections/open_flows` | 1.049 s | 1.050 s | **1.050 s** | How long those hundred flows take to open, each of them paying for a QUIC handshake. The connection count is what this costs |
+| `flow_connections/connections` | 1 | 1 | **1** | **One connection for 100 concurrent flows.** It was **100** — one per flow, because a flow took its connection out of the pool and held it until it ended. A flow **borrows** a connection now: the pool keeps it and the flow holds a handle to it. The count does not move: every sample was exactly 1 |
+| `flow_connections/open_flows` | 5.132 ms | 5.133 ms | **5.132 ms** | How long those hundred flows take to open. It was **1.050 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
 
 The transport is built for the opposite of what the client does with it: one
 connection can carry 1024 bi-streams, and the client opens one connection per
@@ -393,12 +393,17 @@ items the numbers pointed at.
    out-tune `ring` by hand. That one still stands.
 6. **The connections a flow costs.** **Added on 2026-10-22, and the largest
    per-flow cost measured so far.** `flow_connections` counts the connections
-   the far side is given while a hundred flows are open: **100**, one per
-   flow, because a flow takes its connection out of the pool and holds it
-   until it ends. Opening those hundred flows takes **1.05 s**, each of them
+   the far side is given while a hundred flows are open: it was **100**, one
+   per flow, because a flow took its connection out of the pool and held it
+   until it ended. Opening those hundred flows took **1.05 s**, each of them
    paying for a handshake — against a transport built to carry 1024 bi-streams
-   on one connection. The candidate is to let a flow borrow a connection
-   instead of taking it, and the acceptance measurement already exists.
+   on one connection.
+   **Done**: a flow **borrows** a connection now. The pool keeps it and the
+   flow holds a handle to it — iroh's `Connection` is a cheap clonable
+   handle — and a dial is shared, so a hundred flows arriving together make
+   one connection between them and not a hundred. The count is **1**, and
+   opening those hundred flows takes **5.1 ms** instead of **1.05 s**:
+   **205 times** faster.
 
 ### F3 — A performance budget (P2, after F1)
 

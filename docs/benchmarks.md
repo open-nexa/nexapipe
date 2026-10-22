@@ -48,8 +48,8 @@ machine and the same toolchain:
 
 | Bench | slope | The one-line reading |
 |---|---|---|
-| `flow_connections/connections` | **100** | **100 connections for 100 concurrent flows** — one per flow, to the connection. The count does not move: every sample was exactly 100 |
-| `flow_connections/open_flows` | **1.05 s** | how long those hundred flows take to open, each of them paying for a handshake |
+| `flow_connections/connections` | **1** | **one connection for 100 concurrent flows.** It was **100** — one per flow — before the client let a flow borrow a connection instead of taking it out of the pool. The count does not move: every sample was exactly 1 |
+| `flow_connections/open_flows` | **5.1 ms** | how long those hundred flows take to open. It was **1.05 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
 
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
@@ -197,7 +197,9 @@ like a count that has stopped moving, and the far side accepts in its own
 task, so reading too early would report that the round opened no connections
 at all.
 
-The count does not move at all: every sample was exactly 100.
+The count does not move at all: every sample was exactly 100 when a flow
+**took** its connection out of the pool, and exactly 1 now that a flow
+**borrows** it.
 
 ## What a flow costs
 

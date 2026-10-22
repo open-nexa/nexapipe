@@ -10,7 +10,7 @@ use nexapipe_proto::{host_matches, normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -56,6 +56,15 @@ pub struct PooledConnection {
     /// a node nobody is tracking, and a flow that is counted but not listed is a
     /// list with a hole in it.
     flows: Option<Arc<FlowRegistry>>,
+    /// The pool's count of the flows riding this connection.
+    ///
+    /// The pool owns the connection and the flows **borrow** it, so the pool
+    /// cannot tell from the handle alone whether anyone is still on it — and
+    /// it has to: a connection with a flow on it is not idle, and closing it
+    /// would take that flow down with it.
+    ///
+    /// `None` for a connection that was not taken from a pool.
+    borrows: Option<Arc<AtomicUsize>>,
 }
 
 impl PooledConnection {
@@ -66,6 +75,7 @@ impl PooledConnection {
             node: None,
             traffic: None,
             flows: None,
+            borrows: None,
         }
     }
 
@@ -76,6 +86,7 @@ impl PooledConnection {
         node: EndpointId,
         traffic: TrafficTable,
         flows: Arc<FlowRegistry>,
+        borrows: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             conn,
@@ -83,6 +94,7 @@ impl PooledConnection {
             node: Some(node),
             traffic: Some(traffic::of(&traffic, node)),
             flows: Some(flows),
+            borrows: Some(borrows),
         }
     }
 
@@ -136,10 +148,6 @@ impl PooledConnection {
         self.node
     }
 
-    pub fn into_inner(self) -> Connection {
-        self.conn
-    }
-
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -166,6 +174,20 @@ impl PooledConnection {
 
     pub fn pool_index(&self) -> usize {
         self.pool_index
+    }
+}
+
+/// Gives the pool back the borrow this connection was taken under.
+///
+/// The pool counts the flows on a connection so that it can tell one nobody
+/// is using from one that a flow is still riding — and a flow ends in more
+/// ways than one (EOF, an error, a cancellation), so `Drop` is what covers
+/// all of them.
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(borrows) = &self.borrows {
+            borrows.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -357,30 +379,19 @@ impl DomainPools {
         // about nobody's backend. Calling it "down" would paint the whole node
         // list unreachable each time a tunnel stops.
         match pool.get_connection().await {
-            Ok(conn) => Ok(PooledConnection::tracked(
-                conn,
+            Ok(borrowed) => Ok(PooledConnection::tracked(
+                borrowed.conn,
                 index,
                 backend_id,
                 self.traffic.clone(),
                 self.flows.clone(),
+                borrowed.borrows,
             )),
             Err(e @ ClientError::InvalidConfig(_)) => Err(e),
             Err(e) => {
                 record_outcome(&self.health, backend_id, false);
                 Err(e)
             }
-        }
-    }
-
-    pub async fn return_connection(&self, pooled_conn: PooledConnection) {
-        if self.pools.is_empty() {
-            return;
-        }
-        let index = pooled_conn.pool_index();
-        if index < self.pools.len() {
-            self.pools[index]
-                .return_connection(pooled_conn.into_inner())
-                .await;
         }
     }
 
@@ -999,19 +1010,6 @@ impl EndpointGroup {
             "No endpoint configured for domain: {}",
             domain
         )))
-    }
-
-    pub async fn return_connection(&self, domain: &str, pooled_conn: PooledConnection) {
-        // The same lookup the connection came from, or the connection would be
-        // handed back to a pool it was never taken out of.
-        if let Some(pools) = self.pools_for(domain) {
-            pools.return_connection(pooled_conn).await;
-            return;
-        }
-
-        if let Some(default) = &self.default_pools {
-            default.return_connection(pooled_conn).await;
-        }
     }
 
     /// Test iroh-level connectivity to each unique backend node, in parallel.

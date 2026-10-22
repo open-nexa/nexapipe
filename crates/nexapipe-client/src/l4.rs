@@ -44,7 +44,7 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Returns the pooled connection together with the stream. The caller owns the pooled
 /// connection for the life of the tunnel and must hand it back with
-/// [`EndpointGroup::return_connection`] — unlike the HTTP paths, an L4 flow can last
+/// the pool — unlike the HTTP paths, an L4 flow can last
 /// minutes, so it cannot be returned as soon as the first response arrives.
 pub async fn open_tcp(
     endpoint_group: &Arc<EndpointGroup>,
@@ -135,7 +135,6 @@ async fn open(
             Ok(status) => {
                 // The server understood us and said no. Retrying the same request on a
                 // fresh connection cannot change the answer.
-                endpoint_group.return_connection(host, pooled).await;
                 return Err(status_error(status, proto, host, port));
             }
             Err(e) => {
