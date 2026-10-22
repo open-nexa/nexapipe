@@ -62,6 +62,13 @@ pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
 /// borrows, and the pool has to be able to say so.
 type DialOutcome = Result<(Connection, Arc<BorrowState>), ClientError>;
 
+/// How many connections the pool holds **per protocol**.
+///
+/// A connection carries one protocol — the one it was opened with — so the
+/// ceiling is counted per protocol: a global one would be spent on
+/// connections the requester cannot use. Three protocols in use and the pool
+/// would refuse a fourth HTTP connection while three idle L4 ones sat there,
+/// each of them unable to carry the HTTP flow.
 const MAX_CONNECTIONS: usize = 10;
 const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Idle connections older than this are evicted when a new connection is requested.
@@ -1398,7 +1405,19 @@ impl IrohConnectionPool {
         }
 
         let mut connections = self.inner.connections.lock().await;
-        if connections.len() < MAX_CONNECTIONS {
+        // **The ceiling is counted per protocol.**
+        //
+        // A connection carries one protocol, so a connection opened for HTTP
+        // can never carry an L4 flow — and a ceiling that counted them
+        // together would be spent on connections the requester cannot use:
+        // three protocols in use, and the pool refuses a second HTTP
+        // connection while three idle L4 ones sit there, none of them able to
+        // carry the HTTP flow.
+        let held = connections
+            .iter()
+            .filter(|pooled| pooled.protocol == protocol)
+            .count();
+        if held < MAX_CONNECTIONS {
             connections.push(PooledConnection {
                 conn,
                 state,
@@ -1414,12 +1433,13 @@ impl IrohConnectionPool {
         //
         // **Nothing is riding it**: a connection is pooled the moment it is
         // established, and the flows that borrow it are counted on its entry.
-        // The pool holds one connection in practice — the second one only
-        // arrives when the first is full or has died — so this is the tail of
-        // a tail.
+        // The pool holds one connection per protocol in practice — the second
+        // one only arrives when the first is full or has died — so this is the
+        // tail of a tail.
         #[cfg(feature = "tracing")]
         tracing::debug!(
-            "Connection pool is full ({}), closing the connection that came back",
+            "Connection pool is full for {} ({}), closing the connection that came back",
+            protocol.name(),
             MAX_CONNECTIONS
         );
         conn.close(0u32.into(), b"connection pool full");
@@ -1781,8 +1801,8 @@ pub fn parse_endpoint_addr(
 mod tests {
     use super::{
         ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
-        IrohConnectionPool, LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status,
-        identity_changed, is_idle_since, is_measured_rtt, may_publish,
+        IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS, MAX_FLOWS_PER_CONNECTION,
+        encode_link_status, identity_changed, is_idle_since, is_measured_rtt, may_publish,
     };
     use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
@@ -2010,6 +2030,77 @@ mod tests {
         let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
 
         (pool, accepted)
+    }
+
+    /// **The pool's ceiling is counted per protocol.**
+    ///
+    /// A connection carries one protocol — the one it was opened with — so a
+    /// global ceiling would be spent on connections the requester cannot use:
+    /// the pool would refuse a second HTTP connection while idle L4 ones sat
+    /// there, none of them able to carry the HTTP flow.
+    ///
+    /// The pool is filled by hand here rather than through `get_connection`,
+    /// because the ceiling is only reached when a protocol's connections are
+    /// all full — and a flow makes a connection full at two hundred.
+    #[tokio::test]
+    async fn the_ceiling_is_counted_per_protocol() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_counting(server, Arc::new(AtomicUsize::new(0))));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client.clone(), server_addr.clone());
+
+        // Fill the pool for one protocol.
+        for _ in 0..MAX_CONNECTIONS {
+            let conn = client
+                .connect(server_addr.clone(), ALPN_NEXAPIPE)
+                .await
+                .expect("the connection opens");
+            assert!(
+                pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
+                    .await
+                    .is_ok(),
+                "the connection is pooled"
+            );
+        }
+
+        // The next one for that protocol is refused: its own ceiling is
+        // reached.
+        let conn = client
+            .connect(server_addr.clone(), ALPN_NEXAPIPE)
+            .await
+            .expect("the connection opens");
+        assert!(
+            pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
+                .await
+                .is_err(),
+            "the protocol's own ceiling is reached"
+        );
+
+        // And another protocol is not refused: the ceiling was never global.
+        let conn = client
+            .connect(server_addr.clone(), ALPN_NEXAPIPE)
+            .await
+            .expect("the connection opens");
+        assert!(
+            pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::L4)
+                .await
+                .is_ok(),
+            "another protocol's ceiling is its own"
+        );
     }
 
     /// **A protocol is a connection.**
