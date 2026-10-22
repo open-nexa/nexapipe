@@ -152,17 +152,38 @@ async fn connect(
     port: u16,
     connect_timeout: Duration,
 ) -> anyhow::Result<tokio::net::TcpStream> {
-    let stream = tokio::time::timeout(
-        connect_timeout,
-        tokio::net::TcpStream::connect((host, port)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out connecting to backend {}:{}", host, port))?
-    .map_err(|e| anyhow::anyhow!("failed to connect to backend {}:{}: {}", host, port, e))?;
+    // The name is resolved through the cache, so this dial does not wait for a
+    // `getaddrinfo` that the connection before it already paid for. The
+    // addresses are then tried in turn, which is what
+    // `TcpStream::connect((host, port))` did too.
+    // One deadline for the whole thing — the resolution and every address it
+    // names — so a backend with many addresses cannot multiply the budget.
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out resolving backend {}:{}", host, port))?
+        .map_err(|e| anyhow::anyhow!("cannot resolve backend {}:{}: {}", host, port, e))?;
 
-    // The tunnel carries TLS records; Nagle would only add latency here.
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    let mut failure = String::new();
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                // The tunnel carries TLS records; Nagle would only add latency
+                // here.
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => failure = format!("{}: {}", addr, e),
+            Err(_) => failure = format!("{}: timed out", addr),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to connect to backend {}:{}: {}",
+        host,
+        port,
+        failure
+    ))
 }
 
 /// Reads until the first TLS record is complete.

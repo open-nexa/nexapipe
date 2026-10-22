@@ -308,6 +308,21 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **A backend's name is resolved once, not once per flow.** Every L4 flow and
+  every TLS passthrough dials a backend by **name**, and the name was
+  resolved again for every one of them. The resolution is a `getaddrinfo` on a
+  blocking thread, and it sits on the critical path: the client waits for the
+  flow to be open before it sends anything, so every flow paid for a name
+  lookup that the flow before it had already paid for.
+  The answers are cached now. A name that resolved is remembered for thirty
+  seconds, and a name that did **not** is remembered for five — much
+  shorter, because a name that failed is often a backend that has just come
+  up and the next flow should find it.
+  The cache holds addresses, not flows: every flow still opens its own
+  connection, so a cached address that has gone away fails the dial like any
+  other. The port is not part of the cache's key, because a DNS answer is
+  about the name — `db.test:5432` and `db.test:5433` share one resolution.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of

@@ -674,21 +674,42 @@ where
 /// same action: one TCP dial toward one backend. They used to carry three copies
 /// of ten seconds, kept in step by whoever happened to look.
 async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
+    // The name is resolved through the cache, so this dial does not wait for a
+    // `getaddrinfo` that the flow before it already paid for. The addresses
+    // are then tried in turn, which is what `TcpStream::connect((host, port))`
+    // did too.
+    // One deadline for the whole thing — the resolution and every address it
+    // names — so a backend with many addresses cannot multiply the budget.
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
         .await
-        .map_err(|_| anyhow::anyhow!("timed out connecting to backend {host}:{port}"))?
-        .map_err(|e| anyhow::anyhow!("failed to connect to backend {host}:{port}: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("timed out resolving backend {host}:{port}"))?
+        .map_err(|e| anyhow::anyhow!("cannot resolve backend {host}:{port}: {e}"))?;
 
-    // A tunnel carries data with its own request/response pacing; Nagle would only add
-    // latency.
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    let mut failure = String::new();
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                // A tunnel carries data with its own request/response pacing;
+                // Nagle would only add latency.
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => failure = format!("{addr}: {e}"),
+            Err(_) => failure = format!("{addr}: timed out"),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to connect to backend {host}:{port}: {failure}"
+    ))
 }
 
 async fn resolve(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    tokio::net::lookup_host((host, port))
+    crate::dns::resolve_to(host, port)
         .await
         .map_err(|e| anyhow::anyhow!("cannot resolve backend {host}:{port}: {e}"))?
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("backend {host}:{port} resolved to no address"))
 }
