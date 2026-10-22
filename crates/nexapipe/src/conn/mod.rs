@@ -1646,14 +1646,20 @@ async fn enroll_client(
     // Presenting the token is proof the invite reached the right hands, so a
     // counter left over from failed guesses is cleared: a client that just
     // enrolled should not be one wrong code away from a lockout it did not
-    // earn. Only written when there is something to clear, as above.
-    let dirty = cfg
-        .clients
-        .get(client_id)
-        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
+    // earn. The token's own counter is cleared with it — the token has been
+    // spent, and the next invite replaces it rather than inheriting the
+    // guesses made at this one. Only written when there is something to
+    // clear, as above.
+    let dirty = cfg.clients.get(client_id).is_some_and(|c| {
+        c.failed_attempts != 0
+            || c.locked_until.is_some()
+            || c.enrollment_failed_attempts != 0
+            || c.enrollment_locked_until.is_some()
+    });
     if dirty {
         if let Some(client) = cfg.clients.get_mut(client_id) {
             client.record_success();
+            client.record_enrollment_success();
         }
         let snapshot = cfg.counter_snapshot();
         if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {

@@ -328,7 +328,10 @@ lookup, which is what a config written before the key existed does.
   `failed_attempts` and `locked_until` stay where they were. The two are
   listed side by side in `GET /v1/clients`, and the enrollment's counter is
   written to `state.toml` beside the client's — so it survives a restart
-  without ever touching the credential the devices hold.
+  without ever touching the credential the devices hold. A successful
+  enrollment clears the guesses with the token it spent, and a config reload
+  carries the counter the server has been maintaining rather than the file's
+  older copy.
   A client whose devices have already enrolled goes on authenticating
   throughout.
 

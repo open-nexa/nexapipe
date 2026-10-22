@@ -1538,6 +1538,62 @@ async fn a_wrong_enrollment_token_is_counted_against_the_enrollment_only() {
     );
 }
 
+/// Spending the token spends the guesses at it: a successful enrollment clears
+/// the enrollment's counter along with the token it belonged to.
+///
+/// The next invite replaces the token rather than extending it, so a count left
+/// over from this one would start the next enrollment one mistake away from a
+/// lockout earned by a token that no longer exists — and the state file would
+/// carry that count across a restart.
+#[tokio::test]
+async fn a_spent_token_takes_its_guesses_with_it() {
+    let backend = spawn_backend("hello").await;
+    let (auth, dir) = auth_state(auth_config_with_pending("0123456789abcdef"));
+    // A successful enrollment spends the token by editing the file, so the
+    // client it edits has to be there.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[auth]\nenabled = true\n\n[auth.clients.{CLIENT_ID}]\nsecret = \"{SECRET}\"\n\
+             pending_enrollment = \"0123456789abcdef\"\n"
+        ),
+    )
+    .expect("the config file is written");
+    let proxy =
+        spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
+
+    let tunnel = Tunnel::dial(proxy.addr.clone()).await;
+    let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .exchange(&tunnel.conn)
+        .await;
+    assert!(outcome.is_err(), "the wrong token is refused");
+
+    let tunnel = Tunnel::dial(proxy.addr).await;
+    Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .exchange(&tunnel.conn)
+        .await
+        .expect("the right token enrolls");
+
+    let config = auth.config().read().await;
+    let client = &config.clients[CLIENT_ID];
+    assert_eq!(
+        client.enrollment_failed_attempts, 0,
+        "the counter went with the token it was counting guesses at"
+    );
+    assert!(
+        client.enrollment_locked_until.is_none(),
+        "the enrollment slot is open again"
+    );
+    drop(config);
+
+    let state =
+        std::fs::read_to_string(dir.path().join("state.toml")).expect("the state file is written");
+    assert!(
+        !state.contains("enrollment_failed_attempts"),
+        "the spent guess is not carried into the state file: {state}"
+    );
+}
+
 /// The token keeps a ceiling: `max_attempts` wrong guesses close the
 /// enrollment for the window, and the right token is refused with it.
 ///

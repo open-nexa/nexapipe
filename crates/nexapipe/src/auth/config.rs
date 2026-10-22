@@ -557,6 +557,17 @@ impl ClientAuth {
         }
     }
 
+    /// Clears the enrollment counters once the token has been spent.
+    ///
+    /// The token is gone after a successful enrollment, so the guesses at it
+    /// are spent too: keeping the count would leave the next invite — which
+    /// replaces this token, not extends it — starting one mistake away from a
+    /// lockout earned by a token that no longer exists.
+    pub fn record_enrollment_success(&mut self) {
+        self.enrollment_failed_attempts = 0;
+        self.enrollment_locked_until = None;
+    }
+
     /// Records a guess at the pending enrollment token that was wrong.
     ///
     /// The enrollment's own counter, so the client this is about goes on

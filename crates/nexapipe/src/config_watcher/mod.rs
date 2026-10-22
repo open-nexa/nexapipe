@@ -708,6 +708,8 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
             Some(existing) => {
                 client.failed_attempts = existing.failed_attempts;
                 client.locked_until = existing.locked_until;
+                client.enrollment_failed_attempts = existing.enrollment_failed_attempts;
+                client.enrollment_locked_until = existing.enrollment_locked_until;
                 client.last_used = existing.last_used;
             }
             None => added.push(id.clone()),
@@ -1253,6 +1255,8 @@ mod tests {
         let existing = live.clients.get_mut("client-001").unwrap();
         existing.failed_attempts = 2;
         existing.locked_until = Some(12345);
+        existing.enrollment_failed_attempts = 2;
+        existing.enrollment_locked_until = Some(54321);
 
         let mut incoming_client = client("NEWSECRETVALUE");
         incoming_client.pending_enrollment = Some(SecretString::new("token".to_string()));
@@ -1272,6 +1276,11 @@ mod tests {
         );
         assert_eq!(client.failed_attempts, 2, "the file's stale counter loses");
         assert_eq!(client.locked_until, Some(12345));
+        assert_eq!(
+            client.enrollment_failed_attempts, 2,
+            "the enrollment's counter is live state too"
+        );
+        assert_eq!(client.enrollment_locked_until, Some(54321));
     }
 
     /// A server started with no `[auth]` section at all can still switch 2FA on
