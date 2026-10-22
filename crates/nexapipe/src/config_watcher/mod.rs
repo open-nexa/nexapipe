@@ -252,8 +252,11 @@ impl ConfigWatcher {
     /// A bad edit must not take the proxy down: the file is saved every time it
     /// is touched, so half-written and downright invalid configs are both normal
     /// here, and keeping the previous routes costs far less than dropping every
-    /// connection. The two halves fail independently: one refusing does not
-    /// stop the other from being applied.
+    /// connection. Once the file parses, the two halves are applied separately:
+    /// a route table that will not build leaves the auth half applied, and an
+    /// `[auth] enabled` the server refuses does not stop the clients table from
+    /// being merged. A file that does not parse at all is refused whole, as the
+    /// startup path refuses it.
     ///
     /// Whether the new config was applied.
     ///
