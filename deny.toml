@@ -37,17 +37,19 @@ unmaintained = "none"
 # **Unsound is not the same as unmaintained.** An unmaintained crate is one
 # nobody is fixing; an unsound one has a construct the language does not
 # guarantee, and the code that uses it may misbehave in ways the compiler
-# cannot catch. The graph carries none, so refusing them costs nothing today
-# and the refusal is free insurance for the version that brings one.
+# cannot catch. Refusing them costs nothing today — the one crate the graph
+# carries is listed as an ignore below, with the reason it cannot be fixed
+# yet — and the refusal is free insurance for the version that brings
+# another.
 unsound = "all"
 # A version pulled from crates.io is worth saying out loud, but it is not a
 # reason to refuse to build: the lockfile pins a version that still exists.
 yanked = "warn"
 #
-# The same three advisories are ignored for `cargo audit` in
+# The same advisories are ignored for `cargo audit` in
 # ui-desktop/src-tauri/.cargo/audit.toml, and the two tools have to agree:
 # cargo-deny does not read that file, so an ignore that lives only there is
-# invisible here — and the desktop check failed on exactly these three until
+# invisible here — and the desktop check failed on exactly these until
 # they were written down in both places.
 #
 # RUSTSEC-2026-0367/0368/0369: symlink and SUID/SGID handling flaws in
@@ -59,10 +61,19 @@ yanked = "warn"
 # release backend after minisign signature verification. Remove these three
 # and bump the lockfile as soon as a tauri-plugin-updater release allows
 # zip >= 9.
+#
+# RUSTSEC-2024-0429: unsoundness in the `Iterator` and `DoubleEndedIterator`
+# impls for `glib::VariantStrIter`, fixed only in glib >= 0.20. glib reaches
+# this graph through the desktop app's GTK stack — gtk 0.18.2, via tauri
+# 2.12.1's tray-icon and webkit2gtk — and every published tauri release pins
+# `gtk ^0.18`, which pins `glib ^0.18`, so the lockfile cannot move to the
+# patched line without a tauri major bump. Remove this entry and bump the
+# lockfile as soon as a tauri release allows glib >= 0.20.
 ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0368", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0369", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x via the desktop's GTK stack; fixed only in glib >= 0.20, which needs a tauri major bump" },
 ]
 # An advisory on this list that no crate in the graph matches is worth
 # knowing about — it means the ignore can go. This file is used for two

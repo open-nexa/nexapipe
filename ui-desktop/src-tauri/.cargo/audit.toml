@@ -16,4 +16,13 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # RUSTSEC-2024-0429: unsoundness in the `Iterator` and
+    # `DoubleEndedIterator` impls for `glib::VariantStrIter`, fixed only in
+    # glib >= 0.20. glib reaches this tree through the GTK stack — gtk
+    # 0.18.2, via tauri 2.12.1's tray-icon and webkit2gtk — and every
+    # published tauri release pins `gtk ^0.18`, which pins `glib ^0.18`, so
+    # the lockfile cannot move to the patched line without a tauri major
+    # bump. Remove this entry and bump the lockfile as soon as a tauri
+    # release allows glib >= 0.20.
+    "RUSTSEC-2024-0429",
 ]

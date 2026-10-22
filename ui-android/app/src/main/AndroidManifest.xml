@@ -36,12 +36,12 @@
             than leaving to be read out of the file names.
 
             **The credentials are not in it.** The seeds, the enrollment
-            tokens and the device key live in `NexaPipeSecrets.xml`, and both
-            rule files exclude that one file. So does the name this install
-            answers as (`device_id`): a configuration restored onto another
-            phone must not turn up claiming to be the one it was copied from,
-            and it does not — the restored phone is a new device that has to
-            be enrolled again.
+            tokens, the device key and the relay's bearer token live in
+            `NexaPipeSecrets.xml`, and both rule files exclude that one file.
+            So does the name this install answers as (`device_id`): a
+            configuration restored onto another phone must not turn up
+            claiming to be the one it was copied from, and it does not — the
+            restored phone is a new device that has to be enrolled again.
 
             **What is in it is the configuration**: which endpoints this user
             set up, the UI language, and a few choices they made. That is

@@ -98,7 +98,22 @@ fn request_line_end(request: &[u8]) -> usize {
 /// hidden anyway. That is the right way round for a debug dump — a value
 /// that is hidden when it did not need to be costs an argument, and a value
 /// that is printed when it did costs a credential.
-const SENSITIVE_HEADER_WORDS: [&str; 6] = ["auth", "token", "secret", "key", "session", "cookie"];
+///
+/// The words are the ones that name a credential outright. A name that says
+/// nothing of the sort — `X-Jwt`, `X-Otp`, `X-Csrf-Token` is caught by
+/// `token` but `X-Csrf` is not — is still printed, and that is the edge of
+/// the rule: a word list is a word list, and the point is that it no longer
+/// has to be a list of names.
+const SENSITIVE_HEADER_WORDS: [&str; 8] = [
+    "auth",
+    "token",
+    "secret",
+    "key",
+    "session",
+    "cookie",
+    "password",
+    "credential",
+];
 
 /// The headers of a request, with the values that carry credentials replaced.
 ///
@@ -619,6 +634,22 @@ fn websocket_frame_preview(data: &[u8]) -> String {
 /// more than the dump needs — it prints 256 bytes of a frame — and it is a
 /// ceiling rather than a limit.
 const WS_FRAME_BUFFER_LIMIT: usize = 1024 * 1024;
+
+/// Adds a chunk to the WebSocket debug buffer when it fits under the ceiling.
+///
+/// Returns `false` when the chunk would take the buffer past its ceiling, in
+/// which case the buffer is left as it was and the caller drops it.
+///
+/// The check is **before** the append, so the buffer never grows past the
+/// ceiling: a check after the append would let the last chunk take it
+/// `chunk.len()` bytes over, which is how a ceiling stops being one.
+fn ws_frame_buffer_append(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buffer.len().saturating_add(chunk.len()) > WS_FRAME_BUFFER_LIMIT {
+        return false;
+    }
+    buffer.extend_from_slice(chunk);
+    true
+}
 
 fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>) {
     let mut pos = 0usize;
@@ -1262,22 +1293,7 @@ where
                                 // logs. So the decode is part of what is
                                 // switched off with them.
                                 if debug_log_enabled() {
-                                    ws_buffer.extend_from_slice(&buf[..n]);
-                                    if ws_buffer.len() > WS_FRAME_BUFFER_LIMIT {
-                                        // The frame is never finished, so the
-                                        // bytes are held for a frame that will
-                                        // not arrive. They are dropped rather
-                                        // than kept: the dump is a preview of
-                                        // 256 bytes, and a peer that sends a
-                                        // header and then nothing would
-                                        // otherwise grow this without end.
-                                        jni_log!(
-                                            "[DEBUG:local-proxy] WS client frame over {} bytes \
-                                             and never finished, dropping it",
-                                            WS_FRAME_BUFFER_LIMIT
-                                        );
-                                        ws_buffer.clear();
-                                    } else {
+                                    if ws_frame_buffer_append(&mut ws_buffer, &buf[..n]) {
                                         let mut frames = Vec::new();
                                         parse_websocket_frames(&mut ws_buffer, &mut frames);
                                         for (opcode, payload) in frames {
@@ -1290,6 +1306,20 @@ where
                                                 );
                                             }
                                         }
+                                    } else {
+                                        // The frame is never finished, so the
+                                        // bytes are held for a frame that will
+                                        // not arrive. They are dropped rather
+                                        // than kept: the dump is a preview of
+                                        // 256 bytes, and a peer that sends a
+                                        // header and then nothing would
+                                        // otherwise grow this without end.
+                                        ws_buffer.clear();
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS client frame over {} bytes \
+                                             and never finished, dropping it",
+                                            WS_FRAME_BUFFER_LIMIT
+                                        );
                                     }
                                 }
                                 if let Err(e) = send.write_all(&buf[..n]).await {
@@ -2112,6 +2142,8 @@ mod tests {
             "x-auth-token",
             "x-session-id",
             "x-custom-secret",
+            "x-user-password",
+            "x-aws-credential",
         ] {
             headers.insert(
                 ::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
@@ -2133,6 +2165,50 @@ mod tests {
             dumped.contains("content-type: \"application/json\""),
             "a header that carries no credential is still what makes the dump useful: {dumped}"
         );
+    }
+
+    /// The WebSocket debug buffer has a ceiling, and it is a ceiling.
+    ///
+    /// A peer that sends a frame header and then nothing would grow the
+    /// buffer without end, and the check has to be **before** the append: a
+    /// check after it would let the last chunk take the buffer past the line,
+    /// which is how a ceiling stops being one.
+    #[test]
+    fn the_websocket_debug_buffer_does_not_grow_past_its_ceiling() {
+        let chunk = vec![0u8; 32 * 1024];
+
+        let mut buffer = Vec::new();
+        loop {
+            let kept = ws_frame_buffer_append(&mut buffer, &chunk);
+            // The size is checked after **every** call, including the one
+            // that refuses the chunk: an implementation that appended before
+            // it checked would grow past the ceiling on exactly that call,
+            // and a check that only ran on the calls that kept the chunk
+            // would never see it.
+            assert!(
+                buffer.len() <= WS_FRAME_BUFFER_LIMIT,
+                "the buffer grew past its ceiling: {} bytes",
+                buffer.len()
+            );
+            if !kept {
+                break;
+            }
+        }
+
+        assert_eq!(
+            buffer.len(),
+            WS_FRAME_BUFFER_LIMIT,
+            "the buffer filled to the ceiling and stopped there"
+        );
+    }
+
+    /// The bytes that fit are kept.
+    #[test]
+    fn the_websocket_debug_buffer_keeps_what_fits() {
+        let mut buffer = Vec::new();
+
+        assert!(ws_frame_buffer_append(&mut buffer, &[1, 2, 3]));
+        assert_eq!(buffer, vec![1, 2, 3]);
     }
 
     /// A proxy listening on an ephemeral port, with no backends behind it.
