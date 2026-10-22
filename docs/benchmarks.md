@@ -1,6 +1,6 @@
 # Benchmarks
 
-Six benches, on the paths that carry user traffic. They exist because until
+Seven benches, on the paths that carry user traffic. They exist because until
 they landed every performance claim in this repository was an expectation
 rather than a result — the reasoning behind that is in
 [`size-perf-roadmap.md`](size-perf-roadmap.md) §F1.
@@ -11,6 +11,7 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
+| `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
@@ -28,10 +29,19 @@ have changed since are marked:
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
-| `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
+
+The two `route_lookup` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain, and are listed separately because they were
+measured on a later day than the table above — and because the fold the
+routing table now does moved the numbers they report:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `route_lookup/a_matching_host` | **134 ns** | the routing table's walk over 51 routes, **and** what taking the route it found costs. **Was 732 ns** when the routing table folded the host once per route rather than once per walk, and **999 ns** before the bench's path pattern was fixed — and that number was a lookup that found *nothing*, so the half it claims to measure was never measured |
+| `route_lookup/a_host_nothing_serves` | **76 ns** | the same walk over the same 51 routes for a host no route serves: what the walk costs on its own. The difference between the two rows is what taking the route costs |
 
 The two `local_request` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they are a
@@ -41,6 +51,18 @@ different pair of questions from the rest:
 |---|---|---|
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
+
+The two `flow_connections` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain. A round of that bench takes about five
+milliseconds, so criterion samples it in **Flat** mode — it measures the time
+of a round rather than the cost of one iteration — and a Flat run computes
+**no slope at all**. The number below is the **median**, which is what the
+report shows:
+
+| Bench | median | The one-line reading |
+|---|---|---|
+| `flow_connections/connections` | **1** | **one connection for 100 concurrent flows.** It was **100** — one per flow — before the client let a flow borrow a connection instead of taking it out of the pool. The count does not move: every sample was exactly 1 |
+| `flow_connections/open_flows` | **5.1 ms** | how long those hundred flows take to open. It was **1.05 s** — a second, because a hundred connections were made and each of them paid for a handshake. One connection and a hundred streams is **205 times** faster |
 
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,
@@ -72,6 +94,7 @@ cargo bench -p nexapipe --bench l4_forward
 cargo bench -p nexapipe-client --features tun-proxy --bench tun_pump
 cargo bench -p nexapipe-client --features local-proxy --bench forwarding_path
 cargo bench -p nexapipe-client --features local-proxy --bench local_request
+cargo bench -p nexapipe-client --features local-proxy --bench flow_connections
 cargo bench -p nexapipe --bench route_lookup
 cargo bench -p nexapipe-client --bench domain_match
 ```
@@ -129,6 +152,17 @@ that list is the one thing in the client whose length a request pays for.
 route serves the request, and the answer is a walk over the routes until one
 matches. The backends are never dialled — the bench measures the lookup.
 
+It measures two: a host a route serves, and a host no route serves. The
+difference between them is what **taking** the route costs, which is the
+balancer's part — the part the walk alone does not include.
+
+The path pattern in the table is `/`, which is the catch-all a route uses to
+say "any path". **`/*` is not a wildcard**: `path_suffix` treats it as a
+literal `/*` prefix, so a route with it matches no ordinary path at all. The
+bench used to use it, which meant it measured a walk that found nothing — and
+said otherwise. It now asserts that the lookup matched, so the mistake cannot
+come back quietly.
+
 **`forwarding_path`** is the only bench that reflects what a user experiences:
 the request crosses the proxy's accept loop, the tunnel handshake, the tunnel
 itself and the copy loop on the way back. As with `l4_forward`, the tunnel is
@@ -162,6 +196,36 @@ operating system's ephemeral ports exhausted and the run would fail
 partway through. And the far side is an HTTP server over an iroh bi-stream on
 this host, not the server crate's own request path — which is the gap the
 next bench is for.
+
+**`flow_connections`** is the client asking how many QUIC connections its
+flows open. The client keeps a pool of connections to each backend, and a
+flow **borrows** one of them: the pool keeps the connection, and the flow
+holds a handle to it until the flow ends. iroh's connection handle is a
+cheap clone, so a hundred concurrent flows share one connection — and a flow
+that ends has nothing to give back. The transport is built for that: one
+connection can carry 1024 bi-streams.
+
+It measures two things:
+
+- `connections` — how many connections the far side is given while a hundred
+  flows are open. The far side counts its own accepts, so the number does not
+  depend on anything the client reports about itself. It comes back as
+  nanoseconds, so the report reads `100 ns` for a hundred connections; that
+  is the encoding, and it is deliberate.
+- `open_flows` — how long those hundred flows take to open. Before a flow
+  borrowed its connection, each of them paid for a handshake, so this is what
+  the connection count costs.
+
+Each round runs on a **fresh pool**, so a round starts with an empty one and
+the count is what that round needed. The bench waits for the count to stop
+moving before it reads it — a count that has not moved *yet* looks exactly
+like a count that has stopped moving, and the far side accepts in its own
+task, so reading too early would report that the round opened no connections
+at all.
+
+The count does not move at all: every sample was exactly 100 when a flow
+**took** its connection out of the pool, and exactly 1 now that a flow
+**borrows** it.
 
 ## What a flow costs
 

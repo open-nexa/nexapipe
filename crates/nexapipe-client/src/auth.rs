@@ -9,7 +9,7 @@
 use crate::ClientError;
 use hmac::{Hmac, KeyInit, Mac};
 use iroh::endpoint::Connection;
-use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, AuthMessage};
+use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, AuthMessage, Format, VERSION_BINARY};
 use nexapipe_proto::secret::{SecretBytes, SecretString};
 use sha2::Sha256;
 use std::fmt;
@@ -377,6 +377,17 @@ impl TwoFactorAuth {
         self.device_id.as_deref()
     }
 
+    /// Who this credential proves itself as: the client, and the device of it.
+    ///
+    /// Two credentials with the same identity are the same account with a
+    /// different secret — the seed was rotated, the account was not — and a
+    /// connection authenticated as that account still stands for it. Two
+    /// credentials with different identities are different accounts, and a
+    /// connection authenticated as the old one is not the new one's.
+    pub fn identity(&self) -> (&str, Option<&str>) {
+        (self.client_id.as_str(), self.device_id.as_deref())
+    }
+
     /// Generate current TOTP code
     pub fn generate_code(&self) -> Result<String, ClientError> {
         let Proof::Totp {
@@ -586,34 +597,20 @@ impl TwoFactorAuth {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let start_msg = AuthMessage::Start {
-            client_id: self.client_id.clone(),
-            timestamp,
-            device_id: self.device_id.clone(),
-            // No announcement: this client speaks the old form only, and a
-            // server that knows the versioned protocol asks for it in the
-            // answer.
-            version: None,
-        };
-
-        let start_bytes = start_msg
-            .to_bytes()
-            .map_err(|e| ClientError::Other(format!("Serialization error: {}", e)))?;
-
-        // Send message length + message
-        let len = start_bytes.len() as u32;
-        send.write_all(&len.to_le_bytes())
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send length: {}", e)))?;
-        send.write_all(&start_bytes)
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send message: {}", e)))?;
+        // The old form, with the version this client speaks announced inside
+        // it. A server that predates the version byte drops the field it does
+        // not know and answers in the old form; a server that knows it
+        // answers in the version that was asked for. A version byte *in front
+        // of* the JSON would break the first case, because a server that
+        // predates it reads the payload as JSON and would choke on it.
+        let start_msg = self.start_message(timestamp);
+        write_message(send, &start_msg, Format::LegacyJson).await?;
 
         // Step 2: Receive AUTH_CHALLENGE
-        let nonce = match read_message(recv)
+        let (challenge, format) = read_message(recv)
             .await
-            .map_err(|e| self.read_failure(conn, "the AUTH_CHALLENGE could not be read", e))?
-        {
+            .map_err(|e| self.read_failure(conn, "the AUTH_CHALLENGE could not be read", e))?;
+        let nonce = match challenge {
             AuthMessage::Challenge { nonce } => nonce,
             _ => return Err(ClientError::Other("Expected AUTH_CHALLENGE".to_string())),
         };
@@ -642,23 +639,16 @@ impl TwoFactorAuth {
             device_id: self.device_id.clone(),
         };
 
-        let response_bytes = response_msg
-            .to_bytes()
-            .map_err(|e| ClientError::Other(format!("Serialization error: {}", e)))?;
-
-        let len = response_bytes.len() as u32;
-        send.write_all(&len.to_le_bytes())
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send length: {}", e)))?;
-        send.write_all(&response_bytes)
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(format!("Failed to send message: {}", e)))?;
+        // The form the server answered in: a server that knows the binary
+        // form is answered in it, and a server that does not is answered in
+        // the old one — which is the only form it can read.
+        write_message(send, &response_msg, format).await?;
         send.finish().map_err(|e| {
             ClientError::ConnectionFailed(format!("Failed to finish stream: {}", e))
         })?;
 
         // Step 4: Receive AUTH_OK or AUTH_FAILED
-        let result_msg = read_message(recv).await.map_err(|e| {
+        let (result_msg, _) = read_message(recv).await.map_err(|e| {
             self.read_failure(conn, "the authentication result could not be read", e)
         })?;
 
@@ -666,6 +656,23 @@ impl TwoFactorAuth {
             AuthMessage::Ok => Ok(()),
             AuthMessage::Failed { reason } => Err(ClientError::AuthenticationFailed(reason)),
             _ => Err(ClientError::Other("Unexpected response".to_string())),
+        }
+    }
+
+    /// The first message of the handshake.
+    ///
+    /// It carries the version this client speaks, **inside** the JSON: a
+    /// server that predates the version byte drops the field it does not know
+    /// and answers in the old form, and a server that knows it answers in the
+    /// version that was asked for. A version byte in front of the JSON would
+    /// break the first case, because a server that predates it reads the
+    /// payload as JSON and would choke on it.
+    fn start_message(&self, timestamp: i64) -> AuthMessage {
+        AuthMessage::Start {
+            client_id: self.client_id.clone(),
+            timestamp,
+            device_id: self.device_id.clone(),
+            version: Some(VERSION_BINARY),
         }
     }
 
@@ -968,6 +975,10 @@ impl Enrollment {
             .await
             .map_err(|e| ClientError::ConnectionFailed(format!("Failed to open stream: {}", e)))?;
 
+        // The old form: this is the first message of the exchange, and the
+        // server reading it may be one that predates the version byte. The
+        // version is announced in the AUTH_START that follows, on the same
+        // stream.
         write_message(
             &mut send,
             &AuthMessage::EnrollStart {
@@ -983,10 +994,12 @@ impl Enrollment {
                     .as_ref()
                     .map(|key| hex::encode(key.public().as_bytes())),
             },
+            Format::LegacyJson,
         )
         .await?;
 
-        let issued = match read_message(&mut recv).await? {
+        let (issued_message, _) = read_message(&mut recv).await?;
+        let issued = match issued_message {
             AuthMessage::EnrollIssue {
                 client_id,
                 secret,
@@ -1087,13 +1100,14 @@ impl Enrollment {
     }
 }
 
-/// Writes one length-prefixed message.
+/// Writes one length-prefixed message in the form asked for.
 async fn write_message(
     send: &mut iroh::endpoint::SendStream,
     message: &AuthMessage,
+    format: Format,
 ) -> Result<(), ClientError> {
     let bytes = message
-        .to_bytes()
+        .to_payload(format)
         .map_err(|e| ClientError::Other(format!("Serialization error: {}", e)))?;
     let len = bytes.len() as u32;
     send.write_all(&len.to_le_bytes())
@@ -1105,7 +1119,9 @@ async fn write_message(
 }
 
 /// Reads one length-prefixed message.
-async fn read_message(recv: &mut iroh::endpoint::RecvStream) -> Result<AuthMessage, ClientError> {
+async fn read_message(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<(AuthMessage, Format), ClientError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.map_err(|e| {
         ClientError::ConnectionFailed(format!("Failed to read message length: {e}"))
@@ -1122,7 +1138,7 @@ async fn read_message(recv: &mut iroh::endpoint::RecvStream) -> Result<AuthMessa
     recv.read_exact(&mut msg_buf)
         .await
         .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {e}")))?;
-    AuthMessage::from_bytes(&msg_buf)
+    AuthMessage::from_payload(&msg_buf)
         .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))
 }
 
@@ -1184,7 +1200,7 @@ mod tests {
         AuthMessage, DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
         TwoFactorConfig, device_id_is_usable,
     };
-    use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, MAX_DEVICE_ID_LEN};
+    use nexapipe_proto::auth::{Algorithm as ProtoAlgorithm, MAX_DEVICE_ID_LEN, VERSION_BINARY};
     use nexapipe_proto::secret::SecretString;
 
     /// An algorithm nobody supports is refused, and the refusal says what was
@@ -1649,6 +1665,28 @@ mod tests {
             DeviceKey::from_hex(&"a".repeat(65)).is_err(),
             "one character long"
         );
+    }
+
+    /// The first message announces the version this client speaks, and the
+    /// announcement rides **inside** the JSON.
+    ///
+    /// Inside, not in front: a server that predates the version byte drops the
+    /// field it does not know and answers in the old form, and a version byte
+    /// in front of the JSON would break that server instead — it reads the
+    /// payload as JSON and would choke on it.
+    #[test]
+    fn the_first_message_announces_the_version_the_client_speaks() {
+        let auth =
+            TwoFactorAuth::new("client-001", "JBSWY3DPEHPK3PXP", TotpAlgorithm::SHA1).unwrap();
+        let start = auth.start_message(1);
+
+        assert_eq!(
+            start.announced_version(),
+            Some(VERSION_BINARY),
+            "the client says which version it speaks"
+        );
+        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""version":1"#), "{json}");
     }
 
     /// The key's own `Debug` is redacted, and this wrapper must not undo that:
