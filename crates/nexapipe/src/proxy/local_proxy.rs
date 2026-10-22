@@ -160,7 +160,16 @@ pub async fn run_local_proxy(
     }
     tracing::info!("{} backend(s) reachable", report.reachable.len());
 
-    let local_proxy = Arc::new(LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await?);
+    // The local proxy hands out the tunnel of a connection that has already
+    // authenticated, so anything that reaches the port gets the tunnel without
+    // a credential. A loopback bind is the default and a non-loopback one has
+    // to be asked for — the same shape as `[server] expose`.
+    let exposed = config.expose.unwrap_or(false);
+    let local_proxy = Arc::new(if exposed {
+        LocalProxy::new_exposed(&listen_addr, proxy_domains, endpoint_group).await?
+    } else {
+        LocalProxy::new(&listen_addr, proxy_domains, endpoint_group).await?
+    });
 
     // Waits for the notice instead of polling for it, and is aborted once
     // `run()` is over: the watcher used to keep running — waking ten times a

@@ -986,6 +986,7 @@ token 是一个没有作用域、也没有轮换机制的不透明值，不该�
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8081"
+expose = false
 proxy_domains = ["app.example.com"]
 strategy = "round_robin"
 
@@ -997,6 +998,13 @@ domains = ["app.example.com"]
 同一个域名可以出现在多个节点上，这正是跨多台服务器做负载均衡的方式。
 `[local_proxy]` 层级的 `server_ticket` 与 `server_node_id` 仍然可用但已废弃 ——
 优先使用 `[[local_proxy.nodes]]`。
+
+**本地代理不校验连接方**：它直接交出那条已经完成认证的连接的隧道，
+因此任何能连上该端口的一方都能在没有凭据的情况下拿到隧道。所以
+`listen_addr` 必须写回环地址，非回环地址在启动时会被拒绝 —— 判定依据是
+套接字实际绑定的地址，因此 `0.0.0.0` 与 `[::]` 同样会被拦下。
+`expose = true` 是显式选择开启，用于端口前面另有防护的部署场景 ——
+防火墙、容器网络 —— 含义与 `[server] expose` 相同。
 
 ### `[peers]` —— 允许哪些 Node ID 连接
 
@@ -1610,6 +1618,7 @@ Cargo feature：
 | --- | --- | --- |
 | `NEXAPIPE_QUIC_STREAM_WINDOW` | `4194304` | 每条流的接收窗口，字节。 |
 | `NEXAPIPE_QUIC_SEND_WINDOW` | `16777216` | 连接级发送窗口，字节。 |
+| `NEXAPIPE_QUIC_RECV_WINDOW` | `67108864` | 连接级接收窗口，字节。 |
 | `NEXAPIPE_QUIC_INITIAL_MTU` | `0` | `0` 表示保持 iroh 的 1200；否则取 1200..=65535。 |
 | `NEXAPIPE_QUIC_KEEPALIVE_MS` | `0` | `0` 表示保持 iroh 的 5 秒。 |
 | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` | `1024` | 一条连接可同时承载的双向流数。库默认值（100）在每条 UDP 流都占用一条流之后就不够用了。 |

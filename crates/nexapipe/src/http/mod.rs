@@ -529,6 +529,11 @@ const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 /// sent as a single buffer, so a leftover `chunked` would disagree with the
 /// framing on the wire.
 ///
+/// `proxy-authorization` is in the same group and is the one that matters most:
+/// it is a credential for *this* proxy, and forwarding it hands that credential
+/// to a third-party server. `proxy-authenticate` goes with it — it is the
+/// challenge this proxy answers, and the backend has no business seeing it.
+///
 /// `expect: 100-continue` is dropped for a different reason. The proxy reads
 /// the body before it ever asks the backend anything, so the client's
 /// expectation was answered by this process — and a backend told to expect
@@ -541,6 +546,8 @@ fn forwards_request_header(name: &str) -> bool {
     ![
         "connection",
         "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
         "keep-alive",
         "transfer-encoding",
         "te",
@@ -2729,6 +2736,11 @@ mod tests {
             "trailer",
             "upgrade",
             "expect",
+            // A credential for this proxy: forwarding it hands it to a
+            // third-party server.
+            "proxy-authorization",
+            "Proxy-Authorization",
+            "proxy-authenticate",
         ] {
             assert!(
                 !forwards_request_header(dropped),
