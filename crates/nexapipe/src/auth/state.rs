@@ -67,6 +67,18 @@ pub struct ClientState {
     /// When the lockout runs out, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_until: Option<u64>,
+    /// How many times in a row a guess at the pending enrollment token was
+    /// wrong.
+    ///
+    /// The enrollment's own counter, kept apart from `failed_attempts` for the
+    /// reason [`crate::auth::ClientAuth::enrollment_failed_attempts`] gives: a
+    /// client id is not a secret, so a stranger who knows one must not be able
+    /// to lock the client's own devices out of authenticating.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub enrollment_failed_attempts: u32,
+    /// When the enrollment lockout runs out, as a Unix timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_locked_until: Option<u64>,
     /// When the client last authenticated, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
@@ -193,6 +205,8 @@ pub fn snapshot(config: &AuthConfig) -> RuntimeState {
         let state = ClientState {
             failed_attempts: client.failed_attempts,
             locked_until: client.locked_until,
+            enrollment_failed_attempts: client.enrollment_failed_attempts,
+            enrollment_locked_until: client.enrollment_locked_until,
             last_used: client.last_used,
             devices,
         };
@@ -208,6 +222,8 @@ pub fn snapshot(config: &AuthConfig) -> RuntimeState {
 fn is_empty(state: &ClientState) -> bool {
     state.failed_attempts == 0
         && state.locked_until.is_none()
+        && state.enrollment_failed_attempts == 0
+        && state.enrollment_locked_until.is_none()
         && state.last_used.is_none()
         && state.devices.is_empty()
 }
@@ -230,6 +246,8 @@ pub fn apply(state: &RuntimeState, config: &mut AuthConfig) {
         };
         client.failed_attempts = client_state.failed_attempts;
         client.locked_until = client_state.locked_until;
+        client.enrollment_failed_attempts = client_state.enrollment_failed_attempts;
+        client.enrollment_locked_until = client_state.enrollment_locked_until;
         client.last_used = client_state.last_used;
 
         for (name, device) in &mut client.devices {
@@ -262,6 +280,8 @@ mod tests {
             last_used,
             failed_attempts,
             locked_until,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         }
     }
 
@@ -383,6 +403,8 @@ mod tests {
             ClientState {
                 failed_attempts: 0,
                 locked_until: None,
+                enrollment_failed_attempts: 0,
+                enrollment_locked_until: None,
                 last_used: Some(1699999999),
                 devices: HashMap::new(),
             },
@@ -405,6 +427,8 @@ mod tests {
             ClientState {
                 failed_attempts: 9,
                 locked_until: None,
+                enrollment_failed_attempts: 0,
+                enrollment_locked_until: None,
                 last_used: None,
                 devices: HashMap::new(),
             },

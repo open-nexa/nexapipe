@@ -268,6 +268,63 @@ fn revoking_a_device_leaves_the_client_alone() {
     assert!(listed.contains("devices     none"), "{listed}");
 }
 
+/// Revoking one device leaves the client's own secret standing, and that
+/// secret is still a credential: a peer that names no device answers with it.
+/// The revoke says so, and says what takes it away.
+#[test]
+fn revoking_a_device_says_what_the_shared_secret_still_is() {
+    let (_dir, path) = empty_auth();
+    let (ok, _) = run(&path, &["client", "add", "acme"]);
+    assert!(ok, "the client should be added");
+    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
+    assert!(ok, "the device should be added");
+
+    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "laptop"]);
+    assert!(ok, "revoking failed:\n{text}");
+    assert!(
+        text.contains("one can still authenticate as this client"),
+        "the revoke does not say that the shared secret still answers:\n{text}"
+    );
+    assert!(
+        text.contains("unnamed_device_allowed = false"),
+        "the revoke does not say how to take the shared credential away:\n{text}"
+    );
+}
+
+/// With `unnamed_device_allowed = false`, a peer that names no device is
+/// refused — so the untouched shared secret is not a credential, and the
+/// revoke must say that rather than claim it still answers.
+#[test]
+fn revoking_a_device_does_not_hint_at_a_credential_that_is_already_gone() {
+    let (_dir, path) = scratch_config(
+        "config.toml",
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.acme]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         unnamed_device_allowed = false\n\
+         \n\
+         [auth.clients.acme.devices.laptop]\n\
+         secret = \"KRSXG5BAMFRGGZDFMZTWQ2LKNNWG23TP\"\n",
+    );
+
+    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "laptop"]);
+    assert!(ok, "revoking failed:\n{text}");
+    assert!(
+        !text.contains("Set unnamed_device_allowed = false"),
+        "the hint is for a credential that is still a credential:\n{text}"
+    );
+    assert!(
+        !text.contains("one can still authenticate as this client"),
+        "the shared secret is refused when no device is named:\n{text}"
+    );
+    assert!(
+        text.contains("so that secret authenticates no one"),
+        "the revoke should say the untouched secret authenticates nobody:\n{text}"
+    );
+}
+
 #[test]
 fn revoking_a_client_takes_its_devices_with_it() {
     let (_dir, path) = empty_auth();
