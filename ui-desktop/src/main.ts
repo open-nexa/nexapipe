@@ -25,7 +25,7 @@ import i18n, { currentLocale, resolveLocale, setI18nLocale, translate } from './
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale, usePrefsStore } from './stores/prefs';
-import { initProxyState, onAppFocused } from './stores/proxy';
+import { initProxyState, onAppFocused, refreshTrayStatus } from './stores/proxy';
 import { initGate, refreshGate } from './stores/gate';
 import { initConfigStore, initConfigStoreDeferred } from './stores/config';
 import { flushStartupTiming, mark } from './app/startup';
@@ -226,9 +226,13 @@ async function bootstrap(): Promise<void> {
   // The tray menu is a native menu and not a template, so a language change does
   // not reach it on its own: the labels have to be written again, or the tray
   // keeps the language the app started in while everything else has changed.
+  // The status on the icon is in the same language, so it is written again too.
   watch(
     () => currentLocale(),
-    () => void setTrayLabels(),
+    () => {
+      void setTrayLabels();
+      refreshTrayStatus();
+    },
   );
 
   // Everything from here on is a projection no first screen renders, so it must not sit between

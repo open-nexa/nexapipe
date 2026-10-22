@@ -393,13 +393,7 @@ loadAppVersion();
             </div>
           </div>
           <div class="setting-right">
-            <button
-              class="toggle"
-              :class="{ active: autoConnect }"
-              @click="autoConnect = !autoConnect"
-            >
-              <div class="toggle-thumb"></div>
-            </button>
+            <AppToggle v-model="autoConnect" :label="t('settings.autoConnect')" />
           </div>
         </div>
 
@@ -415,13 +409,7 @@ loadAppVersion();
             </div>
           </div>
           <div class="setting-right">
-            <button
-              class="toggle"
-              :class="{ active: silentStart }"
-              @click="silentStart = !silentStart"
-            >
-              <div class="toggle-thumb"></div>
-            </button>
+            <AppToggle v-model="silentStart" :label="t('settings.silentStart')" />
           </div>
         </div>
 

@@ -248,6 +248,25 @@ async function writeTrayStatus(): Promise<void> {
   }
 }
 
+/**
+ * The tray writes, one after another.
+ *
+ * Each write is a round trip to the backend, and two of them in flight at once
+ * can arrive in the other order — the older state landing last, so the tray
+ * says "connected" about a tunnel that is down. The queue makes the order the
+ * order the states happened in.
+ *
+ * The state is read when a write *begins*, not when it is queued: a write
+ * that was queued for an older state would otherwise put the old words on the
+ * tray after the new ones.
+ */
+let trayWrite: Promise<void> = Promise.resolve();
+
+function queueTrayStatus(): Promise<void> {
+  trayWrite = trayWrite.then(writeTrayStatus, writeTrayStatus);
+  return trayWrite;
+}
+
 /** Reads the status (and, while running, the node ID). Returns whether the read succeeded. */
 async function refresh(): Promise<boolean> {
   try {
@@ -269,7 +288,7 @@ async function refresh(): Promise<boolean> {
         resetRateSample();
       }
       status.value = result;
-      void writeTrayStatus();
+      void queueTrayStatus();
     }
     if (result.running) {
       await refreshNodeId();
@@ -546,8 +565,10 @@ async function start(): Promise<void> {
       // Only read the recorded failure when the start did not succeed: it is never cleared, so a
       // stale entry from an earlier attempt must not be reported as this one's.
       const recorded = await readStartupError();
-      startupError.value = recorded;
+      startupError.value = recorded ?? { code: 'proxy.start_failed' };
       toast.error(recorded ?? { code: 'proxy.start_failed' }, 'error.proxy.start_failed');
+      // The tray says so too: a start nobody watched has only the tray to say so.
+      void queueTrayStatus();
       return;
     }
 
@@ -568,8 +589,12 @@ async function start(): Promise<void> {
 
     toast.success(translate('connect.started'));
   } catch (error) {
-    startupError.value = isAppError(error) ? error : null;
+    // A failure with no structured error still is a failure: recorded as the generic code
+    // rather than as nothing, so the tray can say "connection failed" instead of "not
+    // connected" — the two mean different things to the user.
+    startupError.value = isAppError(error) ? error : { code: 'proxy.start_failed' };
     toast.error(error, 'error.proxy.start_failed');
+    void queueTrayStatus();
   } finally {
     busy.value = false;
   }
@@ -819,6 +844,16 @@ export function useProxyStore() {
   };
 }
 
+/**
+ * Writes the current state onto the tray icon again, in the current language.
+ *
+ * Called when the language changes: the tray's words are the user's language,
+ * so they do not change on their own the way the menu's labels do not.
+ */
+export function refreshTrayStatus(): void {
+  void queueTrayStatus();
+}
+
 /** Called once at startup by the shell, before the first status render. */
 export async function initProxyState(): Promise<void> {
   await refreshServiceRunning();
@@ -827,7 +862,7 @@ export async function initProxyState(): Promise<void> {
   startPolling();
   // Written once here as well as on every change: the tray says what the state is from the
   // moment the app is up, rather than from the moment the state first moves.
-  await writeTrayStatus();
+  await queueTrayStatus();
   await autoConnectIfWanted();
 }
 
@@ -852,13 +887,44 @@ async function autoConnectIfWanted(): Promise<void> {
   if (status.value.running) return;
   if (!(await isBackgroundLaunch())) return;
 
+  // The status read above falls back to the desktop process when the service
+  // cannot be reached, so "not running" here can mean "the service is down and
+  // we do not know what it is doing" rather than "the tunnel is stopped". A
+  // start on that guess would ask the service for a tunnel it may already
+  // have, and a refusal would leave the machine unprotected for a reason
+  // nobody can see. So the state is asked of the service directly.
+  if (config.useService && !(await serviceReportsStopped())) {
+    return;
+  }
+
   await start();
 
   // `start` swallows its own failure and reports it with a toast, so the state
   // is read rather than caught: a failed automatic connection leaves the tunnel
   // down, and the tray has to say so.
   if (!status.value.running) {
-    await writeTrayStatus();
+    await queueTrayStatus();
+  }
+}
+
+/**
+ * Whether the service says the tunnel is down.
+ *
+ * Asked of the service rather than read from the status above, because that
+ * read falls back to the desktop process when the service cannot be reached —
+ * and a fallback that answers "stopped" about a service it never reached is
+ * exactly the guess this must not make.
+ *
+ * `false` covers "the service is not answering", which is the honest answer
+ * here: nothing is known, so nothing is started.
+ */
+async function serviceReportsStopped(): Promise<boolean> {
+  try {
+    const result = await invoke<ProxyStatus>('get_proxy_status', { useService: true });
+    return !result.running;
+  } catch (error) {
+    console.error('[proxy] the service did not report its status:', error);
+    return false;
   }
 }
 
