@@ -1031,6 +1031,23 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The client's own documentation builds without a warning.** `cargo doc -p
+  nexapipe-client` reported sixteen. Fifteen of them were links that pointed at
+  nothing: five named a thing the crate does not have — `Secret::expose_secret`,
+  which is `nexapipe_proto::secret::Secret`'s method and not one of the
+  client's own; `Self::two_factor`, which is a field of the pool's inner struct
+  and not an item of the pool; `Weak`, which is `std::sync::Weak`; and
+  `TunProxy::new` twice, which exists only on Android and so cannot be linked
+  from a page the desktop reads too — and ten linked to an item the crate keeps
+  to itself, so they rendered as text with a link that went nowhere. The
+  sixteenth was not a link at all: the JNI crate's note on the pkarr path
+  spelled a zone as `<z32>`, which rustdoc read as an unclosed HTML tag.
+
+  The links now point at the names that are really there, the two that could
+  name a path name it, and the ones that have no public name to point at are
+  code, the way the crate's other prose refers to them. `TunProxy::new` is
+  code on every host, because a link to it is broken on every host but one.
+
 - **The desktop app's own documentation builds without a warning.** `cargo doc`
   in `ui-desktop/src-tauri` reported five. Three linked to `accept_invite`, a
   Tauri command the crate keeps to itself — all forty-two of its commands are

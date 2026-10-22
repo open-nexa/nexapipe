@@ -715,7 +715,7 @@ fn set_dns_servers(env: &mut Env<'_>, dns_servers: JString) -> jint {
 /// "domain=ip1,ip2;domain2=ip3,ip4". This function parses and stores them in DNS_OVERRIDES.
 /// OverrideResolver returns the pre-resolved IPs directly for these domains, bypassing hickory's
 /// UDP DNS queries (the GFW drops UDP DNS responses for iroh.link domains).
-/// This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/<z32>) reach iroh's pkarr server and fetch
+/// This lets pkarr resolve (HTTPS to dns.iroh.link/pkarr/`<z32>`) reach iroh's pkarr server and fetch
 /// the target node's EndpointInfo (relay URL + direct addr), even if DNS TXT is blocked by the GFW.
 /// Must be called before nativeStartIroh.
 #[unsafe(no_mangle)]
