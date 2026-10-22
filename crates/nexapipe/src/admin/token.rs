@@ -184,9 +184,12 @@ fn create_private(path: &str) -> std::io::Result<std::fs::File> {
 
 /// Whether `provided` is the token.
 ///
-/// Compared in constant time, and the length is not compared separately: a
-/// token is a bearer credential presented on every request, so how much of a
-/// wrong guess was right is not something to hand out.
+/// Compared in constant time, and a guess of the wrong length is rejected
+/// before the comparison even runs: a token is a bearer credential presented
+/// on every request, so how much of a wrong guess was right is not something
+/// to hand out. The length is the one thing the comparison does say — and the
+/// token has a fixed, known length, so it says nothing an attacker did not
+/// already know.
 pub fn matches_token(provided: &str, expected: &str) -> bool {
     constant_time_eq(provided.as_bytes(), expected.as_bytes())
 }

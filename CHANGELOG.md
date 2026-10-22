@@ -490,6 +490,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **Revoking one device says what the shared secret still is.** `client revoke
+  <id> --device <name>` strikes one device out and leaves the client's own
+  secret standing — and that secret is still a credential: a peer that names
+  no device answers with it, because `unnamed_device_allowed` is `true` by
+  default. The revoke said the secret was untouched; it did not say what that
+  means or how to change it. It names the setting now, and when the setting is
+  already off it says the untouched secret authenticates no one instead of
+  claiming it still does.
+- **The comments about the config file's permissions tell the truth.** The
+  startup refusal over a world-readable config was removed on purpose
+  (ROADMAP §3.5), so that a `0644` bind mount starts — but several comments
+  still described it, and one still said the server "refuses to *start*" over
+  one. What is left is a warning, and it is there: the config says so itself
+  now, in the places that used to claim otherwise.
 - **An invite's relay hint has to name a relay this client can reach.** The
   hint was accepted whenever the URL parser accepted it, so `ftp://`,
   `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
