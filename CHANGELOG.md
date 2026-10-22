@@ -98,7 +98,6 @@ lookup, which is what a config written before the key existed does.
   resolves its target every time it opens, the way it did before.
   The port is not part of the cache's key, because a DNS answer is about the
   name — `db.test:5432` and `db.test:5433` share one resolution.
->>>>>>> upstream/main
 - **A name the configuration does not name exactly is found by an index.**
   The client kept a map of the configured domains, and a name that was not in
   it exactly — which is **every** name a TUN device asks about, since those
