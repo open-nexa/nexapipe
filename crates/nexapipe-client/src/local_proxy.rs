@@ -598,6 +598,26 @@ pub(crate) async fn open_stream_with_retry(
     host: &str,
     initial_data: Option<&[u8]>,
 ) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+    open_stream_with_retry_until(
+        endpoint_group,
+        host,
+        initial_data,
+        tokio::time::Instant::now() + STREAM_OPERATION_TIMEOUT * OPEN_ATTEMPTS as u32,
+    )
+    .await
+}
+
+/// [`open_stream_with_retry`], with the caller's deadline.
+///
+/// **One budget for every attempt.** Each attempt used to have a timeout of
+/// its own, and there are three of them, so opening a stream could take a
+/// minute and a half — and the caller had three of those as well.
+pub(crate) async fn open_stream_with_retry_until(
+    endpoint_group: &Arc<EndpointGroup>,
+    host: &str,
+    initial_data: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
     let mut last_err: Option<ClientError> = None;
     // Whose health each attempt is spent on, kept so that running out of
     // attempts can name the backend that ran out. Recording the failure as it
@@ -622,9 +642,7 @@ pub(crate) async fn open_stream_with_retry(
         let tried_node = pooled_conn.node();
         let conn = pooled_conn.conn().clone();
 
-        let (mut send, recv) = match tokio::time::timeout(STREAM_OPERATION_TIMEOUT, conn.open_bi())
-            .await
-        {
+        let (mut send, recv) = match tokio::time::timeout_at(deadline, conn.open_bi()).await {
             Ok(Ok(streams)) => streams,
             Ok(Err(e)) => {
                 jni_log!(
