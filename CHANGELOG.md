@@ -331,7 +331,8 @@ lookup, which is what a config written before the key existed does.
   without ever touching the credential the devices hold. A successful
   enrollment clears the guesses with the token it spent, and a config reload
   carries the counter the server has been maintaining rather than the file's
-  older copy.
+  older copy — except when the file carries a new token, which starts with its
+  own budget.
   A client whose devices have already enrolled goes on authenticating
   throughout.
 
