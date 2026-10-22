@@ -71,8 +71,8 @@ pub mod secret;
 mod udp;
 
 pub use auth::{
-    AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, is_presentable_client_id,
-    is_presentable_device_id,
+    Algorithm, AuthMessage, CodecError, Format, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN,
+    VERSION_BINARY, VERSION_JSON, is_presentable_client_id, is_presentable_device_id,
 };
 pub use host::{
     host_and_port, host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error,
