@@ -137,14 +137,25 @@ impl HealthChecker {
 
     async fn check_all_backends(&self) {
         let backends = self.backend_pool.backends().await;
+
+        // The statuses are read **once** for the round.
+        //
+        // They used to be read inside the loop, which meant the whole table
+        // was read again for every backend in it: a quadratic number of lock
+        // reads and string copies for one round of probes, every interval.
+        // The table is the same for the whole round — a probe reports, it does
+        // not change the state — so one read is the same answer as N of them.
+        let statuses: HashMap<String, bool> = self
+            .backend_pool
+            .get_backend_statuses()
+            .await
+            .into_iter()
+            .collect();
+
         for url in backends {
             let is_healthy = self.check_backend(&url).await;
             let failures = self.record_result(&url, is_healthy);
-            let statuses = self.backend_pool.get_backend_statuses().await;
-            let current_healthy = statuses
-                .into_iter()
-                .find(|(u, _)| u == &url)
-                .map(|(_, h)| h);
+            let current_healthy = statuses.get(&url).copied();
 
             if is_healthy {
                 if current_healthy == Some(false) {
