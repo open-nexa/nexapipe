@@ -304,10 +304,24 @@ than the cost of one iteration — and its median is the number to read.
 |---|---|---|---|---|
 | `tun_pump/dns_query` | 174 ns | 172 ns | **174 ns** | A DNS query answered from the virtual address pool is **fast**. The cache path is not a problem |
 | `tun_pump/ip_mapping` | 2,217 ns | 2,226 ns | **2,274 ns** | **A hotspot.** The mapping's whole job — an allocation and a reverse lookup — measured against the 7,348 ns per-packet path, for what should be a hash lookup |
+| `tun_pump/ip_mapping_concurrent` | — | — | **97 ns** | The same lookup with eight tasks at once. Measured on 2026-10-22, on the same machine; only the slope was written down for this run, so the mean and median are left empty rather than invented |
+| `tun_pump/packet_copy` | — | — | **18 ns** | The copy the TUN's inbound path makes for every packet. Measured on 2026-10-22, on the same machine; only the slope was written down for this run |
 | `tun_pump/tun_packet` | 7,308 ns | 7,244 ns | **7,348 ns** | The whole TUN path: a packet in, an answer out. The per-packet cost on the platform with the least headroom |
 | `l4_forward/tcp_flow` | 41,990 ns | 41,716 ns | **42,059 ns** | One 64 KiB payload's round trip through the copy loop. **The copy loop itself is not the problem** |
 | `forwarding_path/connect_tunnel` | 811,219 ns | 805,634 ns | **834,955 ns** | The same 64 KiB over an established tunnel, through the local proxy and a real iroh connection. The rate it moves at, not the cost of opening it |
 
+Two more rows, measured on **2026-10-22** on the same machine and toolchain,
+for the server's request path:
+
+| Bench | mean | median | slope | What the number says |
+|---|---|---|---|---|
+| `request_path/request` | 77,970 ns | 41,110 ns | **50,300 ns** | The whole of the server's work for one request, backend round trip included. The spread is wide — the interval runs 37 to 69 µs — because the round trip goes through the scheduler |
+| `request_path/allocations_per_request` | 33.00 | 33.00 | **33.00** | **33 allocations** for one request, from the route lookup to the response head. The count is the stable one: its interval is 0.005% wide where the time's is 85% |
+
+The allocation count is the instrument the per-request candidates in F2 need.
+Three of them — the route lookup re-normalising the host per route, the
+balancer taking three locks, and the backend URI being rebuilt from scratch —
+are all allocation counts in disguise, and 33 is the number they have to beat.
 Two more rows, measured on **2026-10-22** on the same machine and toolchain, for
 the connections a client's flows open:
 
@@ -363,9 +377,23 @@ was most of the number.
 rather than a result: the DNS *forward* path (`tun_pump`'s `dns_query` case
 passes an empty resolver list and a proxied domain, so it exercises the
 hijack branch and never the forward branch), the idle wake-up rate, the
-per-TCP-flow memory, the server's request path, and every part of the server
-crate's own request handling — `l4_forward` stops at a `duplex` and never
-crosses an iroh hop.
+per-TCP-flow memory, the client's HTTP request path, and every part of the
+server crate's own request handling — `l4_forward` stops at a `duplex` and
+never crosses an iroh hop.
+
+**The server's request path is no longer on that list**, with one caveat
+written down rather than left out. `request_path` measures it: the route
+lookup, the balancer, the URI the backend is reached at, and the round trip —
+with the allocation count beside it, which is the number the per-request
+candidates in F2 have to beat. The caveat is the path: it is the **plaintext
+listener's**, driven through `http::proxy_request`. The QUIC tunnel path
+reaches the same backend through `http::proxy_to_backend_streaming` and shares
+the part of the work this bench is about — the route lookup, the balancer, the
+origin and the URI; the two paths build the backend request through different
+functions, so the header copying and the body handling are not shared. What
+the tunnel adds on top is the transport — so what is now
+measured is the server's own work for a request, and the transport's share of
+a request is still an expectation.
 
 **The client's HTTP request path is no longer on that list.** `local_request`
 measures it: the plain HTTP path through the client's local proxy — the head,

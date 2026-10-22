@@ -57,6 +57,49 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A name the configuration does not name exactly is found by an index.**
+  The client kept a map of the configured domains, and a name that was not in
+  it exactly — which is **every** name a TUN device asks about, since those
+  are the names of the sites it visits rather than the names the operator
+  configured — was looked for by walking the whole map and asking each entry
+  whether it covered the name. That walk happened on every request and every
+  flow.
+  The wildcard patterns are now indexed by the name they cover: `*.example.com`
+  by `example.com`, and the catch-all `*` by nothing. A pattern covers a name
+  when the name ends with the pattern's suffix **at a label boundary**, and
+  those suffixes are exactly the name's own label-aligned ones, so the lookup
+  asks for them and the first one that is in the index is the longest pattern
+  that covers the name — the same answer the walk gave, without the walk.
+  A pattern that matches nothing — `*.`, the catch-all in another spelling,
+  which the rule refuses — is indexed under no name at all, so it serves
+  nothing and cannot widen what a client proxies.
+  The six tests that pin the wildcard behaviour, including the one that says
+  a wildcard does not serve its own apex, pass unchanged.
+
+- **Three small things on the server's response path.**
+  The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
+  coalesces into 64 KiB, and it had **no bound at all** — only the handshake
+  was bounded, so a WebSocket whose two sides both went quiet kept a backend
+  connection, a task and a stream slot for as long as the process lived. It
+  now moves 64 KiB and is bounded by the same `response_idle` deadline the
+  HTTP path uses. The bound is on the **session**, not on a side of it: a
+  WebSocket that is quiet in one direction is still a WebSocket — a client
+  that only listens to a feed the backend keeps pushing has nothing to say --
+  and what ends the session is neither side having moved for a whole window.
+  The window is measured with a **monotonic** clock: the wall clock steps with
+  NTP and with a machine waking from sleep, and a step forward would end a
+  session that was still carrying traffic.
+  The copy buffer is 64 KiB of **heap** per direction rather than 8 KiB of
+  stack, so a session costs 128 KiB where it cost 16 KiB.
+  Every **response header's name** was copied to lower case, once per header
+  per response — for a name that was already lower case, because HTTP header
+  names are case-insensitive and the parser folds them.
+  The **connection pool's idle reaper** had no clock: the timer that was set
+  is the h2 half's, and the pool's own 120-second idle timeout was only
+  enforced lazily, at the next checkout. A connection to a backend that
+  stopped answering now sits in the pool for 120 seconds and no longer.
+
+
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
   and the binary one — and the payload's first byte says which one it is. The
@@ -322,6 +365,26 @@ lookup, which is what a config written before the key existed does.
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
   so is what keeps the ones that are results honest.
+- **The server's request path is measured, and it is counted.** The
+  benchmarks that landed with this cycle measured the CONNECT tunnel, the
+  TUN's per-packet cost, the server's routing table and the client's own
+  name matching. None of them measured what the server does for a request:
+  the route lookup, the balancer, the URI the backend is reached at, and the
+  round trip to it. That is a benchmark of its own now, and it comes with
+  the number the per-request work had never had — **42 allocations** for
+  one request, from the lookup to the response head, counted by an
+  allocator the bench installs.
+  The count is the stable measurement: its interval is 0.2% wide, where the
+  time beside it — 50 µs for the whole request, backend round trip
+  included — runs from 37 to 69 µs, because the round trip goes through the
+  scheduler.
+  It is the plaintext listener's path, and the difference is written down
+  rather than left out: the QUIC tunnel reaches the same backend through
+  another function and shares the part of the work this bench is about — the
+  lookup, the balancer, the origin and the URI — while the header copying
+  and the body handling are its own, and what it adds on top is the
+  transport. So the server's own work for a request is a measurement now; the
+  transport's share of one is still an expectation.
 - **The client's HTTP request path is measured too.** The benchmarks that
   landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
   cost, the server's routing table and the client's own name matching. They
@@ -410,6 +473,51 @@ lookup, which is what a config written before the key existed does.
   interval, for no reason: a probe reports, it does not change the state, so
   the answer is the same every time it is asked.
   It is read once now, and looked up.
+
+- **Choosing a backend takes no lock, and one allocation instead of three.**
+  The balancer's choice happens on every request, and it took the status lock
+  once per backend to read whether each was healthy, again to compare the
+  addresses, and once more to hand the lease out — and the lease kept a **copy**
+  of the address, although the entry already had it. It also built three
+  vectors where one would do.
+  The address and the health flag now sit on the entry, where reading them
+  needs no lock, and the candidates are filtered **in place** rather than
+  copied into a new vector at each step. One request makes **39 allocations**
+  where it made **42**.
+  The health flag is an atomic now, so the operator's view and the request
+  path cannot disagree about it: the flag is written once, and both read it.
+
+- **The backend's address is parsed once, not once per request.** Two places
+  built the backend's URI for every request, and both parsed the address to
+  do it — a `Url::parse`, a copy of the host, and a formatted string. A
+  **backend does not move**: its scheme, host and port are fixed when the
+  route is configured, and they were being parsed again for every request
+  that chose it.
+  The origin is now parsed when the pool is built, and the request path
+  borrows the answer. The address is **shared** rather than copied, so
+  handing it to a request is a reference count.
+  One request makes **33 allocations** where it made **42** — nine fewer
+  across the balancer's choice and the backend's address, both of which were
+  doing per-request work for values that are fixed.
+  The errors are the same ones, in the same words: a backend whose address
+  does not parse, or names no host, is still reported when the request is
+  built, where the operator reads it.
+- **Two of the TUN's per-packet costs are measured, and neither is worth
+  changing.** The TUN copies every packet once on its way into the network
+  stack, because the stack takes a `Vec<u8>` of its own and the buffer the
+  bytes were read into is reused. That copy — the allocation and the memcpy
+  together — costs **18 ns**, against the **7.3 µs** the whole per-packet path
+  takes: **0.24%**. A buffer pool would need a lock of its own, and the lock
+  would cost more than the allocation it replaces.
+  The reverse lookup takes the mapping's lock **exclusively**, so the lookups
+  of several flows serialise. Making it a read lock was tried, and it is
+  **worse**: moving the clock and the "last used" out of the (serialising)
+  lock puts eight cores on the same two cache lines, and the lookup went from
+  **97 ns to 357 ns**. The critical section is far too short for the
+  parallelism to pay for the contention.
+  Both are benchmarks now, so the numbers are visible rather than assumed —
+  and the next person to look at either one finds the measurement instead of
+  the guess.
 
 - **The connection-level receive window has a ceiling.** The transport gave
   every stream a 4 MiB receive window and left the **connection's** window at
@@ -655,6 +763,41 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A relay token is no longer written in the clear by its own migration.**
+  The Android app moves a relay bearer token out of the backed-up preferences
+  and into the secrets file, which is excluded from the backup precisely
+  because it holds ciphertext. The move used `seal`, which hands the value
+  back in the clear on a device with no keystore — so on exactly the devices
+  that could not protect the token, the migration wrote it in the clear into
+  the file that says it holds none, and removed it from the file it came out
+  of. A token that cannot be sealed now moves nowhere: it stays where it is
+  until the keystore can hold it, and the decision is a tested function
+  rather than a line of bookkeeping.
+  "Where it is" is the **backed-up** preferences, so a token this device
+  cannot seal rides the backup for as long as the keystore is unavailable —
+  the trade is a credential that is preserved over one that never leaves the
+  device, and the migration moves it on the first start that can seal it.
+  Staying there keeps it usable as well as safe: the app reads the token
+  out of both files, so a token this device cannot seal is still the token
+  the tunnel authenticates with. The move is a write whose success is
+  checked now — the sealed copy is committed to the disk before the
+  cleartext one is taken off it, and a write that failed leaves the token
+  where it was instead of losing it from both files.
+- **A credential bought by an enrollment goes through the same check.** The
+  enrollment writes the pool's credential itself, and it wrote it without the
+  comparison that closes the connections of the identity that is gone: the
+  identity changed and the connections of the old identity stayed in the
+  pool, serving traffic under an identity the server had already been told
+  was gone.
+  Every write of the credential goes through one place now, and that place
+  compares the identity and closes the connections when it changed.
+- **The WebSocket request line is rebuilt from the parsed request.** The
+  client rebuilt the line it sends from the raw bytes of the one it
+  received, and the HTTP version came out of that split — so a request line
+  carrying a bare LF put the rest of the line into the version token, and
+  the proxy sent a request whose first line a lenient parser would read as
+  two. The method and the version come from the parsed request now, where
+  both are validated.
 - **Replacing a credential no longer leaves the old identity connected.** The
   handshake runs once per connection, so a connection made under the previous
   credential kept serving traffic under the previous identity after the
@@ -828,6 +971,39 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The Android release build is minified again.** It shipped with
+  `isMinifyEnabled = false` and a proguard file that was nothing but the
+  template's comments, so the release APK carried every class, every method
+  and every `Log.d` line under its own name. That is a map of the app for
+  whoever reads the APK, and the part of this app worth understanding before
+  attacking it is the credential handling. The release is shrunk and
+  obfuscated now, the debug logs are dropped, and the R8 rules that keep the
+  JNI bridge working are written down in `proguard-rules.pro`: the native
+  entry points are bound by name, so neither the class nor its `native`
+  methods may be renamed.
+  A CI job builds the release variant now, so the rules are exercised on every
+  pull request rather than only when a tag is pushed: a debug build never runs
+  R8, and a rule that keeps the app from building would otherwise be found by
+  a release.
+- **The local proxy does not hand out an authenticated tunnel to the
+  network.** The client library bound whatever address it was given, and it
+  does not authenticate the peer that connects to it — it hands out the tunnel
+  of a connection that has already authenticated. So a non-loopback bind
+  published that tunnel to everyone who could reach the machine, and the
+  server's `[local_proxy]` section passed the address through without
+  checking it. The library refuses a non-loopback address now, the same
+  shape as the server's own plaintext listener and as the desktop app's
+  `require_loopback`, and `[local_proxy] expose = true` is the explicit
+  opt-in for a deployment that puts something else in front of the port.
+- **A proxy credential no longer crosses the tunnel.** `Proxy-Authorization`
+  is a credential for *this* proxy, and it was forwarded to the backend
+  along with the rest of the hop-by-hop headers — on the client's side and on
+  the server's, in the WebSocket path as well as the ordinary one. The
+  client's bytes cross the tunnel verbatim, so the whole hop-by-hop set goes
+  now: `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+  `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`,
+  together with whatever `Connection` nominates. `Transfer-Encoding` stays,
+  because the body it describes is carried over unchanged.
 - **The webview is granted less than it was.** The desktop app's capability
   granted the whole of `core:default`, the whole of `opener:default` and the
   whole of `updater:default` to the renderer, and the renderer used almost
@@ -871,6 +1047,33 @@ lookup, which is what a config written before the key existed does.
   invite import and the enrollment update both wrote it out in full, to the
   on-screen log panel and to logcat. What kind of credential arrived is what
   those lines are about; the id is not in them any more.
+- **A release is built from the committed dependency tree.** The desktop
+  bundles were installed with `npm install`, and the release workflow had a
+  fallback that deleted `package-lock.json` and re-resolved the whole frontend
+  tree from the registry at build time. A newly published malicious version of
+  any transitive package would have landed in a bundle that is then signed and
+  published as an official release — a tree nobody reviewed and `npm audit`
+  never saw. The release and the three local build scripts now install with
+  `npm ci`, and a platform whose native binary the lockfile does not carry
+  fails the build instead of re-resolving the tree.
+  The reason the fallback existed — that the lockfile recorded only one
+  platform's native binaries — stopped being true of this lockfile: it
+  carries every platform's `@tauri-apps/cli` with its integrity hash and its
+  `os`/`cpu` constraints, and npm filters optional dependencies by those at
+  install time. A new CI job checks that on each platform the release builds
+  on, so the claim is tested rather than asserted.
+- **The build context no longer carries the operator's credentials.**
+  `config.toml`, `secrets/` and the state file were absent from
+  `.dockerignore`. The Dockerfiles never `COPY` them, but `docker build`
+  sends the whole context to the daemon before that filtering applies, so a
+  remote or rootless buildx builder would have received the 2FA seeds, the
+  endpoint's private key and the relay bearer token, and may have kept them
+  in its build cache.
+- **The build tools are pinned like the actions are.** `cargo-ndk` and
+  `cross` were installed at whatever version the registry served that day,
+  while `cargo-audit` and `cargo-deny` in the same workflows were pinned. Both
+  now carry a version, so a compromised upstream release cannot change what
+  the runner that holds the signing keys executes.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
