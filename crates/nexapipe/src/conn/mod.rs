@@ -876,6 +876,13 @@ fn forwards_websocket_header(name: &str) -> bool {
 /// or whatever the backend answered when it refused the upgrade. Bytes are the
 /// handshake response only — once both directions are piped the session has no
 /// finite length to report.
+/// How much of a WebSocket's stream is moved at a time.
+///
+/// The HTTP path coalesces into 64 KiB before it writes; the WebSocket path
+/// used to move 8 KiB at a time, which is one QUIC frame and one wake-up for
+/// every 8 KiB of the stream.
+const WS_COPY_BUFFER: usize = 64 * 1024;
+
 async fn handle_websocket_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
@@ -1009,37 +1016,52 @@ async fn handle_websocket_stream(
 
         let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
 
+        // How long the session may be **quiet** — in either direction, not in
+        // total. A WebSocket that is idle for a while is still a WebSocket;
+        // one that has stopped both ways has ended, and the copy loop used to
+        // wait for it for ever.
+        let idle = timeouts.deadlines.response_idle;
+
         let iroh_to_backend = async {
-            let mut buf = [0u8; 8192];
+            // **64 KiB**, like the HTTP path's coalescing buffer: the copy
+            // loop used to move 8 KiB at a time, which is one QUIC frame and
+            // one wake-up for every 8 KiB of a stream.
+            let mut buf = vec![0u8; WS_COPY_BUFFER];
             loop {
-                match recv.read(&mut buf).await {
-                    Ok(None) => return "iroh_finished",
-                    Ok(Some(n)) => {
+                // A **gap** in either direction ends the session, so the bound
+                // is on the gap and not on the session: a WebSocket that is
+                // quiet for a while is still a WebSocket, and one that has
+                // stopped both ways has ended.
+                match tokio::time::timeout(idle, recv.read(&mut buf)).await {
+                    Err(_) => return "idle",
+                    Ok(Ok(None)) => return "iroh_finished",
+                    Ok(Ok(Some(n))) => {
                         if let Err(e) = backend_write.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket backend write failed: {}", e);
                             return "backend_write_error";
                         }
                         crate::metrics::METRICS.record_bytes_received(n as u64);
                     }
-                    Err(_) => return "iroh_read_error",
+                    Ok(Err(_)) => return "iroh_read_error",
                 }
             }
         };
 
         let backend_to_iroh = async {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; WS_COPY_BUFFER];
             let mut backend_read = backend_read;
             loop {
-                match backend_read.read(&mut buf).await {
-                    Ok(0) => return "backend_finished",
-                    Ok(n) => {
+                match tokio::time::timeout(idle, backend_read.read(&mut buf)).await {
+                    Err(_) => return "idle",
+                    Ok(Ok(0)) => return "backend_finished",
+                    Ok(Ok(n)) => {
                         if let Err(e) = send.write_all(&buf[..n]).await {
                             tracing::debug!("WebSocket iroh write failed: {}", e);
                             return "iroh_write_error";
                         }
                         crate::metrics::METRICS.record_bytes_sent(n as u64);
                     }
-                    Err(_) => return "backend_read_error",
+                    Ok(Err(_)) => return "backend_read_error",
                 }
             }
         };
