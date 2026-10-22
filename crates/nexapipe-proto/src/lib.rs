@@ -84,6 +84,7 @@ pub use preface::{
 pub use secret::{Secret, SecretBytes, SecretString};
 pub use udp::{
     FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame, encode_frame_to_vec,
+    payload_fits_datagram,
 };
 
 use std::fmt;
