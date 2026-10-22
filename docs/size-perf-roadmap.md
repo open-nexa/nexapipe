@@ -310,8 +310,14 @@ the connections a client's flows open:
 
 | Bench | mean | median | slope | What the number says |
 |---|---|---|---|---|
-| `flow_connections/connections` | 100 | 100 | **100** | **100 connections for 100 concurrent flows.** One per flow, because a flow takes its connection out of the pool and holds it until it ends. The count does not move: every sample was exactly 100 |
-| `flow_connections/open_flows` | 1.049 s | 1.050 s | **1.050 s** | How long those hundred flows take to open, each of them paying for a QUIC handshake. The connection count is what this costs |
+| `flow_connections/connections` | 100 | 100 | — | **100 connections for 100 concurrent flows.** One per flow, because a flow takes its connection out of the pool and holds it until it ends. The count does not move: every sample was exactly 100 |
+| `flow_connections/open_flows` | 1.049 s | 1.050 s | — | How long those hundred flows take to open, each of them paying for a QUIC handshake. The connection count is what this costs |
+
+The two rows have **no slope**: a round of this bench takes about a second, so
+the run criterion would need to keep going to stay in its Linear sampling mode
+is longer than twice the time it is asked to spend, and it measures the bench
+in **Flat** mode instead — where it computes no slope at all. The mean and the
+median are the numbers it produced, and they are the numbers to read.
 
 The transport is built for the opposite of what the client does with it: one
 connection can carry 1024 bi-streams, and the client opens one connection per
@@ -360,7 +366,8 @@ measures it: the plain HTTP path through the client's local proxy — the head,
 the domain check, the rewrite, the bi-stream, and the response back — which
 is the path `forwarding_path` does not cover, because that one is the CONNECT
 tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
-`first_byte` at **100 µs** (the time to the response head) and`request_response` at **138 µs** (the whole request). The far side of that
+`first_byte` at **100 µs** (the time to the response head) and
+`request_response` at **138 µs** (the whole request). The far side of that
 bench is an HTTP server over an iroh bi-stream on the same host, not the
 server crate's own request handling — so what is now measured is the
 client's half of a request, and the server's half is still an expectation.

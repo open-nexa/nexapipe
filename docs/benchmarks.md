@@ -46,10 +46,16 @@ different pair of questions from the rest:
 The two `flow_connections` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain:
 
-| Bench | slope | The one-line reading |
+| Bench | median | The one-line reading |
 |---|---|---|
 | `flow_connections/connections` | **100** | **100 connections for 100 concurrent flows** — one per flow, to the connection. The count does not move: every sample was exactly 100 |
 | `flow_connections/open_flows` | **1.05 s** | how long those hundred flows take to open, each of them paying for a handshake |
+
+The two rows are the **median**, not a slope: a round of this bench takes about
+a second, so the run criterion would need to keep going to stay in its Linear
+sampling mode is longer than twice the time it is asked to spend, and it
+measures the bench in **Flat** mode instead — where it computes no slope at
+all. The two numbers above are the medians of the samples it did take.
 
 Those numbers are what F2's candidate list is checked against, and the same
 section lists the paths the numbers do **not** cover — the DNS forward branch,

@@ -165,10 +165,37 @@ async fn settled(connections: &AtomicUsize, before: usize) -> usize {
 struct Harness {
     /// This side's endpoint. Shared between rounds: only the pool is fresh.
     client: Endpoint,
+    /// The far side's endpoint.
+    ///
+    /// Held so that it is closed when the harness is dropped. The accept loop
+    /// never returns on its own, so without this every round of every sample
+    /// would leave a bound UDP socket, an iroh endpoint driver and an accept
+    /// task behind for the life of the process.
+    server: Endpoint,
     /// Where the far side is.
     server_addr: iroh::EndpointAddr,
     /// How many connections the far side has been given.
     connections: Arc<AtomicUsize>,
+    /// The task that accepts on the far side.
+    server_task: tokio::task::JoinHandle<()>,
+}
+
+impl Harness {
+    /// Closes the far side and ends the accept loop.
+    ///
+    /// The accept loop waits on the endpoint forever, so the task is aborted
+    /// rather than left to notice the close on its own. The close itself is
+    /// bounded: it waits for the endpoint to drain, and a bench must not hang
+    /// on that.
+    async fn close(self) {
+        let Harness {
+            server,
+            server_task,
+            ..
+        } = self;
+        server_task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server.close()).await;
+    }
 }
 
 impl Harness {
@@ -183,7 +210,7 @@ impl Harness {
             .expect("the far side binds");
         let server_addr = server.addr();
         let connections = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(serve(server, connections.clone()));
+        let server_task = tokio::spawn(serve(server.clone(), connections.clone()));
 
         // This side.
         let client = Endpoint::builder(presets::N0)
@@ -196,8 +223,10 @@ impl Harness {
 
         Self {
             client,
+            server,
             server_addr,
             connections,
+            server_task,
         }
     }
 
@@ -239,6 +268,15 @@ impl Harness {
         let after = settled(&self.connections, before).await;
         let opened = after - before;
 
+        // A round whose connections were never accepted measured nothing.
+        // Criterion would see a zero-time sample and abort the analysis with
+        // a message about a zero measurement; the cause is that the far side
+        // accepted nothing, and that is what this says.
+        assert!(
+            opened > 0,
+            "the far side accepted no connection: the round measured nothing"
+        );
+
         // The flows end here, and with them the pool and the connections the
         // round opened.
         drop(flows);
@@ -273,7 +311,14 @@ fn flow_connections(c: &mut Criterion) {
                 // The count is the result. It is returned as nanoseconds so
                 // that it lands in criterion's report next to the times, and
                 // the encoding is written down in this file's own header.
-                Duration::from_nanos(total as u64)
+                let result = Duration::from_nanos(total as u64);
+
+                // The far side goes away with the round: an accept loop that
+                // never returns would leave an endpoint, a driver and a task
+                // behind for every round of every sample.
+                harness.close().await;
+
+                result
             })
         })
     });
@@ -289,6 +334,9 @@ fn flow_connections(c: &mut Criterion) {
                     total += elapsed;
                 }
                 black_box(&harness);
+
+                // The far side goes away with the round, as above.
+                harness.close().await;
 
                 total
             })
