@@ -713,6 +713,31 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The webview is granted less than it was.** The desktop app's capability
+  granted the whole of `core:default`, the whole of `opener:default` and the
+  whole of `updater:default` to the renderer, and the renderer used almost
+  none of it. Three things came with that:
+  - `core:image:allow-from-path` let the renderer read **any image file the
+    user can read** — a screenshot, a photo, an exported chart — and hand its
+    pixels back over the IPC channel. It is denied now, and nothing in the
+    app used it.
+  - `opener:default` granted `reveal-item-in-dir` for **any path**, which
+    asks the OS file manager to open a directory the renderer names. The
+    frontend only ever opens a URL, so the permission is now the one that
+    opens a URL and the scope that says which ones.
+  - `updater:default` granted the renderer the right to download and install
+    an update. The frontend has never called the updater — the app has no
+    in-app update button — and the plugin is still registered on the Rust
+    side, so nothing about the release machinery changed; only the
+    renderer's reach into it is gone.
+  `core:default` itself is still granted, and it still brings the path, the
+  event, the window, the webview, the app, the resource, the menu and the
+  tray defaults with it — the renderer uses the window and the tray ones,
+  and the path and the resource defaults are what the rest of the set needs.
+  What is gone is the two reaches that mattered: the one into the
+  filesystem, and the one into the updater.
+  A renderer that can run script is a renderer that can ask for all three,
+  and the answer was "yes" to each.
 - **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
