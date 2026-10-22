@@ -1475,6 +1475,7 @@ fn auth_config() -> AuthConfig {
             devices: std::collections::HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -1711,6 +1712,56 @@ async fn a_client_that_does_not_handshake_is_closed() {
     );
 }
 
+/// A code that has already been used is refused — and refused **without**
+/// counting.
+///
+/// RFC 6238 §5.2 asks a verifier to refuse the second use of a step it has
+/// already accepted, and a code is inside the acceptance window for the whole
+/// of its step: so "this code is current" and "this code has been used" are
+/// different questions, and only the step tells them apart.
+///
+/// The refusal is not a **guess**, and it does not count as one. The counter
+/// is what stops the guessing, and a code that has been used already is not
+/// something anybody guessed — it is the device reconnecting inside the same
+/// step, and counting that would let a device lock itself out.
+#[tokio::test]
+async fn a_code_that_has_already_been_used_is_refused() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config());
+    let proxy =
+        spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
+    let tunnel = Tunnel::dial(proxy.addr.clone()).await;
+
+    let client =
+        TwoFactorAuth::new(CLIENT_ID, SECRET, ClientTotpAlgorithm::SHA1).expect("the client");
+    let code = client.generate_code().expect("the code is generated");
+
+    // The first use is accepted, and the step it matched on is remembered.
+    let answer = handshake(&tunnel, &client, Some(code.clone()), None).await;
+    assert!(
+        matches!(answer, AuthMessage::Ok),
+        "the first use of a code is accepted, got {answer:?}"
+    );
+
+    // The second use of the same code is the one that is refused. It is a
+    // **second connection**: the handshake happens once per connection, and
+    // the memory that refuses the second use lives in the server, not in the
+    // connection.
+    let second = Tunnel::dial(proxy.addr).await;
+    let answer = handshake(&second, &client, Some(code), None).await;
+    assert!(
+        matches!(answer, AuthMessage::Failed { .. }),
+        "the second use of a code is refused, got {answer:?}"
+    );
+
+    // And it was not counted: the counter is for guesses, and this was not one.
+    let config = auth.config().read().await;
+    assert_eq!(
+        config.clients[CLIENT_ID].failed_attempts, 0,
+        "a code that has been used already is not a guess, and must not be counted as one"
+    );
+}
+
 /// A device that proves itself with a key gets in without a code.
 ///
 /// The device is issued its credential at enrollment, and the answer to the
@@ -1731,6 +1782,7 @@ async fn a_device_key_gets_in() {
             public_key: Some(public_key),
             created_at: "0".to_string(),
             last_used: None,
+            last_used_step: None,
         },
     );
 

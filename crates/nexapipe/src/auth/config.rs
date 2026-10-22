@@ -233,6 +233,18 @@ pub struct ClientAuth {
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
+    /// The last TOTP step this client's own secret was accepted on.
+    ///
+    /// The step, not the code: a code changes every thirty seconds, and
+    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
+    /// same code cannot be used twice.
+    ///
+    /// This is the memory of the **unnamed** device — the client answering
+    /// with its own `secret`. A named device keeps its own, under its own
+    /// entry, because the two are different credentials and a step accepted
+    /// for one says nothing about the other.
+    #[serde(default)]
+    pub last_used_step: Option<u64>,
     /// Number of failed attempts
     #[serde(default)]
     pub failed_attempts: u32,
@@ -285,6 +297,7 @@ impl std::fmt::Debug for ClientAuth {
             .field("devices", &self.devices)
             .field("unnamed_device_allowed", &self.unnamed_device_allowed)
             .field("last_used", &self.last_used)
+            .field("last_used_step", &self.last_used_step)
             .field("failed_attempts", &self.failed_attempts)
             .field("locked_until", &self.locked_until)
             .field(
@@ -335,6 +348,58 @@ pub struct DeviceAuth {
     /// Last successful authentication time (Unix timestamp)
     #[serde(default)]
     pub last_used: Option<u64>,
+    /// The last TOTP step this device's code was accepted on.
+    ///
+    /// The step, not the code: a code changes every thirty seconds, and
+    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
+    /// same code cannot be used twice.
+    ///
+    /// A device that answers with a **signature** has no code and no step:
+    /// a signature covers the challenge that was issued for one connection,
+    /// so there is nothing for a second use to replay.
+    #[serde(default)]
+    pub last_used_step: Option<u64>,
+}
+
+/// What became of a step.
+///
+/// The two answers are different in kind, and the caller needs both: a step
+/// that was refused is **not** a failed attempt — it is a code that has
+/// already been used, which is not a guess — and a step that was accepted may
+/// or may not have moved the memory, and only a moved memory is worth a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepVerdict {
+    /// The step was accepted.
+    Accepted {
+        /// Whether the memory moved: the state file has to be written when it
+        /// did, and left alone when it did not.
+        moved: bool,
+    },
+    /// The step was refused: it has been used already.
+    Refused,
+}
+
+/// Whether `step` may be used given the last accepted one, and what the last
+/// accepted one is afterwards.
+///
+/// **The rule is RFC 6238 §5.2's**: a step that is not greater than the last
+/// accepted one is refused, so the same code cannot be used twice. The step
+/// is what a code is worth remembering as — a code is inside the acceptance
+/// window for the whole of its step, so "this code is current" and "this code
+/// has been used" are different questions.
+///
+/// The check and the record are one operation on purpose: a caller that
+/// checked and then recorded could let two connections through between the
+/// two, and the whole point is that the second one does not get in.
+fn accept_step(last: &mut Option<u64>, step: u64) -> StepVerdict {
+    match *last {
+        Some(previous) if step <= previous => StepVerdict::Refused,
+        _ => {
+            let moved = *last != Some(step);
+            *last = Some(step);
+            StepVerdict::Accepted { moved }
+        }
+    }
 }
 
 /// The material one device's credential is made of, on its way into the file:
@@ -367,6 +432,7 @@ impl std::fmt::Debug for DeviceAuth {
             .field("public_key", &self.public_key)
             .field("created_at", &self.created_at)
             .field("last_used", &self.last_used)
+            .field("last_used_step", &self.last_used_step)
             .finish()
     }
 }
@@ -384,9 +450,10 @@ impl AuthConfig {
     /// a clone copies every client's secret and enrollment token with it — once
     /// per wrong code, from any peer that can name a client id. Only
     /// `failed_attempts`, `locked_until`, `enrollment_failed_attempts`,
-    /// `enrollment_locked_until`, `last_used` and each device's `last_used` are
-    /// persisted, so only those travel. Extend this alongside
-    /// `save_auth_state`, or a field added there is silently written as empty.
+    /// `enrollment_locked_until`, `last_used`, `last_used_step` and each
+    /// device's `last_used` and `last_used_step` are persisted, so only those
+    /// travel. Extend this alongside `save_auth_state`, or a field added there
+    /// is silently written as empty.
     pub fn counter_snapshot(&self) -> AuthConfig {
         AuthConfig {
             enabled: self.enabled,
@@ -428,6 +495,7 @@ impl AuthConfig {
                                             public_key: None,
                                             created_at: String::new(),
                                             last_used: device.last_used,
+                                            last_used_step: device.last_used_step,
                                         },
                                     )
                                 })
@@ -438,6 +506,7 @@ impl AuthConfig {
                             // change what a reload sees even though it travels.
                             unnamed_device_allowed: client.unnamed_device_allowed,
                             last_used: client.last_used,
+                            last_used_step: client.last_used_step,
                             failed_attempts: client.failed_attempts,
                             locked_until: client.locked_until,
                             enrollment_failed_attempts: client.enrollment_failed_attempts,
@@ -450,6 +519,37 @@ impl AuthConfig {
             lockout_duration: self.lockout_duration,
         }
     }
+    /// Whether this step may be used by this credential, and the memory that
+    /// goes with the answer.
+    ///
+    /// The credential is the one the code was checked against: the named
+    /// device, or the client's own secret for the unnamed device. They are
+    /// different credentials, and a step accepted for one says nothing about
+    /// the other — so the memory is kept apart as well.
+    ///
+    /// The rule is RFC 6238 §5.2's: a step that is not greater than the last
+    /// accepted one has been used already.
+    pub fn accept_step(
+        &mut self,
+        client_id: &str,
+        device_id: Option<&str>,
+        step: u64,
+    ) -> StepVerdict {
+        let Some(client) = self.clients.get_mut(client_id) else {
+            // The client was checked before this, so it cannot be gone. If it
+            // were, refusing is the safe direction.
+            return StepVerdict::Refused;
+        };
+        match device_id {
+            Some(name) => match client.devices.get_mut(name) {
+                Some(device) => device.accept_step(step),
+                // The device was checked before this too.
+                None => StepVerdict::Refused,
+            },
+            None => client.accept_step(step),
+        }
+    }
+
     /// Whether the file holds a 2FA secret that nothing else protects.
     ///
     /// A client's seed, or a device's. A device that proves itself with a
@@ -481,6 +581,15 @@ impl DeviceAuth {
     /// signature instead of calling this.
     pub fn decode_secret(&self) -> Result<SecretBytes, anyhow::Error> {
         decode_base32_secret(self.secret.as_str())
+    }
+
+    /// Whether this device's code may be used on this step, and the memory
+    /// that goes with the answer.
+    ///
+    /// RFC 6238 §5.2's rule: a step that is not greater than the last
+    /// accepted one has been used already.
+    pub fn accept_step(&mut self, step: u64) -> StepVerdict {
+        accept_step(&mut self.last_used_step, step)
     }
 }
 
@@ -522,6 +631,15 @@ impl ClientAuth {
     /// Check if client is currently locked out
     pub fn is_locked_out(&self) -> bool {
         self.locked_until.is_some_and(|until| unix_now() < until)
+    }
+
+    /// Whether the client's own secret may be used on this step, and the
+    /// memory that goes with the answer.
+    ///
+    /// This is the **unnamed** device's memory — the client answering with
+    /// its own `secret`. A named device keeps its own, under its own entry.
+    pub fn accept_step(&mut self, step: u64) -> StepVerdict {
+        accept_step(&mut self.last_used_step, step)
     }
 
     /// Clears a lockout whose time has run out.
@@ -830,6 +948,7 @@ mod tests {
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -843,6 +962,7 @@ mod tests {
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,
+            last_used_step: None,
         }
     }
 
@@ -1128,6 +1248,101 @@ mod tests {
     /// A device secret is issued and spelled the way a client's is, so it has
     /// to decode under the same rule — a device stuck at "Invalid Base32
     /// secret" is stuck regardless of which table its secret came from.
+    /// The rule is RFC 6238 §5.2's: a step that is not greater than the last
+    /// accepted one has been used already.
+    #[test]
+    fn a_step_that_is_not_greater_than_the_last_is_refused() {
+        let mut last = None;
+
+        assert_eq!(
+            accept_step(&mut last, 100),
+            StepVerdict::Accepted { moved: true },
+            "the first step is accepted, and the memory moves"
+        );
+        assert_eq!(
+            accept_step(&mut last, 100),
+            StepVerdict::Refused,
+            "the same step again is the one that is refused"
+        );
+        assert_eq!(
+            accept_step(&mut last, 99),
+            StepVerdict::Refused,
+            "an older step is refused as well: it is the same code"
+        );
+        assert_eq!(
+            accept_step(&mut last, 101),
+            StepVerdict::Accepted { moved: true },
+            "the next step is accepted"
+        );
+    }
+
+    /// The memory only moves when the step is a new one, so a client that
+    /// authenticates twice inside one step does not turn every connection
+    /// into a write.
+    #[test]
+    fn a_step_that_did_not_move_is_not_worth_a_write() {
+        let mut last = Some(100);
+
+        assert_eq!(
+            accept_step(&mut last, 101),
+            StepVerdict::Accepted { moved: true },
+            "a new step moves the memory"
+        );
+        assert_eq!(last, Some(101));
+    }
+
+    /// Two credentials, two memories: a step accepted for one says nothing
+    /// about the other.
+    #[test]
+    fn the_memory_is_the_credential_s_own() {
+        let mut config = AuthConfig::default();
+        config.clients.insert(
+            "alice".to_string(),
+            ClientAuth {
+                secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                created_at: "0".to_string(),
+                allow_hosts: None,
+                allow_ports: None,
+                allow_ports_strict: false,
+                pending_enrollment: None,
+                devices: HashMap::from([(
+                    "laptop".to_string(),
+                    DeviceAuth {
+                        secret: nexapipe_proto::secret::SecretString::new(
+                            "JBSWY3DPEHPK3PXP".to_string(),
+                        ),
+                        public_key: None,
+                        created_at: "0".to_string(),
+                        last_used: None,
+                        last_used_step: None,
+                    },
+                )]),
+                unnamed_device_allowed: true,
+                last_used: None,
+                last_used_step: None,
+                failed_attempts: 0,
+                locked_until: None,
+                enrollment_failed_attempts: 0,
+                enrollment_locked_until: None,
+            },
+        );
+
+        // The client's own secret, the unnamed device.
+        assert_eq!(
+            config.accept_step("alice", None, 100),
+            StepVerdict::Accepted { moved: true }
+        );
+        assert_eq!(config.accept_step("alice", None, 100), StepVerdict::Refused);
+
+        // A different credential, the same step: accepted, because the two
+        // are different credentials and one says nothing about the other.
+        assert_eq!(
+            config.accept_step("alice", Some("laptop"), 100),
+            StepVerdict::Accepted { moved: true },
+            "a named device's memory is its own"
+        );
+    }
+
     #[test]
     fn a_device_secret_decodes_the_way_a_clients_does() {
         assert_eq!(

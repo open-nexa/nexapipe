@@ -7,7 +7,7 @@
 //! with a secret, and the server's `TotpValidator` — against each other, plus
 //! the counter writeback that has to leave a key device's entry intact.
 
-use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator};
+use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator, Verified};
 use nexapipe::config::ProxyConfig;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
@@ -58,10 +58,12 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
                     public_key: Some(nexapipe::auth::public_key_hex(&key.public())),
                     created_at: "0".to_string(),
                     last_used: None,
+                    last_used_step: None,
                 },
             )]),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -72,10 +74,11 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
 }
 
 /// `perform_authentication`'s counting rule, mirrored: only a wrong credential
-/// (`Ok(false)`) is recorded toward the lockout. Every `Err` — a stale
-/// timestamp, a config the server cannot use — is a refusal and moves nothing.
-fn count(config: &mut AuthConfig, outcome: &Result<bool, AuthError>) {
-    if matches!(outcome, Ok(false)) {
+/// (`Ok(Verified::WrongCode)`) is recorded toward the lockout. Every `Err` — a
+/// stale timestamp, a config the server cannot use — is a refusal and moves
+/// nothing.
+fn count(config: &mut AuthConfig, outcome: &Result<Verified, AuthError>) {
+    if matches!(outcome, Ok(Verified::WrongCode)) {
         let max_attempts = config.max_attempts;
         let lockout_duration = config.lockout_duration;
         config
@@ -109,7 +112,7 @@ fn a_key_device_proves_itself_with_a_signature() {
         "",
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "a correctly signed response from a key device must verify, got {outcome:?}"
     );
 }
@@ -170,7 +173,7 @@ fn a_wrong_signature_is_refused_and_not_counted() {
         "",
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "the real device is not affected by another peer's noise, got {outcome:?}"
     );
 }
@@ -250,7 +253,7 @@ fn a_key_device_is_not_reachable_with_the_clients_secret() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "the unnamed device still answers with the client's secret, got {outcome:?}"
     );
 }
@@ -272,6 +275,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: None,
+                last_used_step: None,
             },
         );
         client.devices.insert(
@@ -281,6 +285,7 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
                 public_key: Some("not a key".to_string()),
                 created_at: "0".to_string(),
                 last_used: None,
+                last_used_step: None,
             },
         );
     }

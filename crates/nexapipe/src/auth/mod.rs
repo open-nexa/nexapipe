@@ -11,7 +11,7 @@ pub mod state;
 pub mod totp;
 
 pub use config::{
-    AuthConfig, ClientAcl, ClientAuth, DeviceAuth, DeviceMaterial, TotpAlgorithm,
+    AuthConfig, ClientAcl, ClientAuth, DeviceAuth, DeviceMaterial, StepVerdict, TotpAlgorithm,
     generate_enrollment_token,
 };
 pub use device_key::{parse_public_key, public_key_hex};
@@ -24,4 +24,4 @@ pub use nexapipe_proto::auth::{
     AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, is_presentable_client_id,
     is_presentable_device_id,
 };
-pub use totp::{AuthError, TotpValidator};
+pub use totp::{AuthError, TotpValidator, Verified};

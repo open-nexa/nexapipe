@@ -620,6 +620,28 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
+- **A 2FA code that has already been used is refused.** The server remembered
+  nothing about the codes it had accepted, so the same code could be used
+  twice inside the same thirty-second step. RFC 6238 §5.2 asks a verifier to
+  refuse the second use of a step it has already accepted, and the step is
+  remembered now: a step that is not greater than the last accepted one is
+  refused.
+  The step is the thing worth remembering, not the code: a code is inside the
+  acceptance window for the whole of its step, so "this code is current" and
+  "this code has been used" are different questions, and only the step tells
+  them apart.
+  It is refused **without being counted**. The counter is what stops the
+  guessing, and a code that has been used already is not a guess — it is a
+  device reconnecting inside the same step, and counting that would let a
+  device lock itself out.
+  The memory is per credential — the client's own secret, or a named
+  device's — and it survives a restart: the state file beside the
+  configuration carries it.
+  This is hardening rather than a hole that was open: the response's
+  signature covers the challenge issued for one connection, so a captured
+  response was already useless on another connection. What the memory stops
+  is the second use of one code.
+
 ### Changed
 
 - **The client speaks the binary form of the handshake.** A handshake with a

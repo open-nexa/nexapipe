@@ -914,6 +914,7 @@ mod tests {
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -927,6 +928,7 @@ mod tests {
             public_key: None,
             created_at: "0".to_string(),
             last_used: None,
+            last_used_step: None,
         }
     }
 
@@ -1547,6 +1549,7 @@ mod tests {
                 public_key: None,
                 created_at: "0".to_string(),
                 last_used: Some(1700000000),
+                last_used_step: None,
             },
         )]
         .into_iter()
