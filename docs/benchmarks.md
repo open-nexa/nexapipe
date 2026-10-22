@@ -11,8 +11,8 @@ rather than a result — the reasoning behind that is in
 | `tun_pump` | `crates/nexapipe-client/benches/tun_pump.rs` | the TUN's per-packet cost: the DNS path, the virtual-address bookkeeping, and the whole path with a packet in and an answer out |
 | `forwarding_path` | `crates/nexapipe-client/benches/forwarding_path.rs` | the end-to-end path: an application, the local proxy, the tunnel, and the copy loop |
 | `local_request` | `crates/nexapipe-client/benches/local_request.rs` | the client's local proxy on a plain HTTP request: the head, the domain check, the rewrite, the stream, and the response back |
-| `request_path` | `crates/nexapipe/benches/request_path.rs` | the server's work for one request: the route lookup, the balancer, the URI, and the round trip — and how many allocations it makes |
 | `flow_connections` | `crates/nexapipe-client/benches/flow_connections.rs` | how many QUIC connections a hundred concurrent flows open, and how long they take to open |
+| `request_path` | `crates/nexapipe/benches/request_path.rs` | the server's work for one request: the route lookup, the balancer, the URI, and the round trip — and how many allocations it makes |
 | `route_lookup` | `crates/nexapipe/benches/route_lookup.rs` | the server's routing table: the walk over the routes, and what taking the one it found costs |
 | `domain_match` | `crates/nexapipe-client/benches/domain_match.rs` | the client asking whether a name is one of its own: the walk over the configured list |
 
