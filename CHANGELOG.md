@@ -57,6 +57,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A name the configuration does not name exactly is found by an index.**
+  The client kept a map of the configured domains, and a name that was not in
+  it exactly — which is **every** name a TUN device asks about, since those
+  are the names of the sites it visits rather than the names the operator
+  configured — was looked for by walking the whole map and asking each entry
+  whether it covered the name. That walk happened on every request and every
+  flow.
+  The wildcard patterns are now indexed by the name they cover: `*.example.com`
+  by `example.com`, and the catch-all `*` by nothing. A pattern covers a name
+  when the name ends with the pattern's suffix **at a label boundary**, and
+  those suffixes are exactly the name's own label-aligned ones, so the lookup
+  asks for them and the first one that is in the index is the longest pattern
+  that covers the name — the same answer the walk gave, without the walk.
+  A pattern that matches nothing — `*.`, the catch-all in another spelling,
+  which the rule refuses — is indexed under no name at all, so it serves
+  nothing and cannot widen what a client proxies.
+  The six tests that pin the wildcard behaviour, including the one that says
+  a wildcard does not serve its own apex, pass unchanged.
+
 - **The server answers the handshake in the form it was asked in.** The
   handshake message has two forms — the JSON one every client already speaks,
   and the binary one — and the payload's first byte says which one it is. The
@@ -439,25 +458,6 @@ lookup, which is what a config written before the key existed does.
   The attempts themselves are unchanged — a dead pooled connection is still
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
-
-- **A name the configuration does not name exactly is found by an index.**
-  The client kept a map of the configured domains, and a name that was not in
-  it exactly — which is **every** name a TUN device asks about, since those
-  are the names of the sites it visits rather than the names the operator
-  configured — was looked for by walking the whole map and asking each entry
-  whether it covered the name. That walk happened on every request and every
-  flow.
-  The wildcard patterns are now indexed by the name they cover: `*.example.com`
-  by `example.com`, and the catch-all `*` by nothing. A pattern covers a name
-  when the name ends with the pattern's suffix **at a label boundary**, and
-  those suffixes are exactly the name's own label-aligned ones, so the lookup
-  asks for them and the first one that is in the index is the longest pattern
-  that covers the name — the same answer the walk gave, without the walk.
-  A pattern that matches nothing — `*.`, the catch-all in another spelling,
-  which the rule refuses — is indexed under no name at all, so it serves
-  nothing and cannot widen what a client proxies.
-  The six tests that pin the wildcard behaviour, including the one that says
-  a wildcard does not serve its own apex, pass unchanged.
 
 ### Changed
 
