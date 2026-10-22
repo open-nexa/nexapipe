@@ -63,10 +63,12 @@ lookup, which is what a config written before the key existed does.
   server reads all of them: a client that speaks one form and a server that
   speaks another still complete the handshake, and the answers come back in
   the form the client asked in.
-  **The client does not use the binary form yet.** It is turned on one side at
-  a time, so that an old client keeps working against a new server and a new
-  client keeps working against an old one — the case that decides the whole
-  order of the change.
+  **The client uses the binary form now.** It announces the version it speaks
+  inside the first message — the JSON one, where a server that predates the
+  version byte ignores the field — and the exchange from the challenge onwards
+  is in that form. A client that announces nothing is still answered in the
+  JSON it asked for, so an old client keeps working against a new server and a
+  new client keeps working against an old one.
 
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
@@ -74,9 +76,11 @@ lookup, which is what a config written before the key existed does.
   a nonce and a signature are arrays of decimal numbers in JSON, so each byte
   of either costs three. One handshake — a start, a challenge, a response and
   an answer — is 427 bytes of JSON and 124 of binary.
-  The binary form is **not on the wire yet**: the peers keep speaking JSON,
-  and it is turned on one side at a time, so an old client keeps working
-  against a new server and a new client keeps working against an old one.
+  The binary form is **on the wire for a client that asks for it**: a client
+  announces the version it speaks inside its first message, and the exchange
+  from the challenge onwards is in that form. A client that announces nothing
+  still gets the JSON it asked for, so an old client keeps working against a
+  new server and a new client keeps working against an old one.
   A payload's first byte says which form it is in, and a payload that does
   not start with a version byte is the JSON one — which is what every peer
   sent before the version byte existed.
@@ -371,6 +375,27 @@ lookup, which is what a config written before the key existed does.
   unknown keys (`[auth]`, `[limits]` and `[peers]`) keep refusing them. A
   `config.toml` that only carries keys this build knows loads exactly as it
   did.
+- **A guess at a pending enrollment token no longer locks the client out of
+  authenticating.** A client id is not a secret: it is in the invite link, in
+  `nexapipe client list` and in whatever the operator pasted into a ticket. So
+  anybody who knew one could send enrollment attempts at a client that was
+  waiting to enroll — and, because those attempts were counted against the
+  client's own `failed_attempts`, lock out the devices that had already
+  enrolled, over a credential those devices were never sent.
+  The token keeps its ceiling: `max_attempts` wrong guesses close the
+  enrollment for the lockout window, and the right token is refused with it.
+  What changed is which counter pays. The guess moves the enrollment's own
+  `enrollment_failed_attempts` and `enrollment_locked_until`; the client's
+  `failed_attempts` and `locked_until` stay where they were. The two are
+  listed side by side in `GET /v1/clients`, and the enrollment's counter is
+  written to `state.toml` beside the client's — so it survives a restart
+  without ever touching the credential the devices hold. A successful
+  enrollment clears the guesses with the token it spent, and a config reload
+  carries the counter the server has been maintaining rather than the file's
+  older copy — except when the file carries a new token, which starts with its
+  own budget.
+  A client whose devices have already enrolled goes on authenticating
+  throughout.
 
 - **A route's `path_pattern` is a prefix in the path sense.**
   `path_pattern = "/api"` used to match `/apifoo` as well as `/api/x`: the
@@ -530,6 +555,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **Revoking one device says what the shared secret still is.** `client revoke
+  <id> --device <name>` strikes one device out and leaves the client's own
+  secret standing — and that secret is still a credential: a peer that names
+  no device answers with it, because `unnamed_device_allowed` is `true` by
+  default. The revoke said the secret was untouched; it did not say what that
+  means or how to change it. It names the setting now, and when the setting is
+  already off it says the untouched secret authenticates no one instead of
+  claiming it still does.
+- **The comments about the config file's permissions tell the truth.** The
+  startup refusal over a world-readable config was removed on purpose
+  (ROADMAP §3.5), so that a `0644` bind mount starts — but several comments
+  still described it, and one still said the server "refuses to *start*" over
+  one. What is left is a warning, and it is there: the config says so itself
+  now, in the places that used to claim otherwise.
 - **An invite's relay hint has to name a relay this client can reach.** The
   hint was accepted whenever the URL parser accepted it, so `ftp://`,
   `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
@@ -673,6 +712,25 @@ lookup, which is what a config written before the key existed does.
   at all.
 
 ### Security
+
+- **A registration code no longer silently replaces a working credential.**
+  The Android app asked before an invite overwrote something that worked — but
+  the question was asked for a secret and for the relay, and a one-time
+  enrollment code was neither: it carries no secret, so it raised no conflict,
+  and it was applied with no confirmation at all. The credential the endpoint
+  already held went with it, and because the guard in `ProxyConnector` that
+  keeps an endpoint from spending a token it already has a credential for
+  looks at what the endpoint holds, the drop that came before it defeated the
+  guard. A registration code is exactly the artefact a user is primed to
+  accept — shared in a chat, pasted by an "operator", one tap from the
+  scanner — so this was a credential one accepted code could destroy.
+  The rule now names the enrollment, and it is a pure function with tests
+  beside it: `ui/InviteConflicts.kt`.
+- **The client id no longer reaches the log.** It is half of the 2FA
+  credential pair, and the app says so where it logs the other one — but the
+  invite import and the enrollment update both wrote it out in full, to the
+  on-screen log panel and to logcat. What kind of credential arrived is what
+  those lines are about; the id is not in them any more.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
