@@ -338,6 +338,18 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **The client speaks the binary form of the handshake.** A handshake with a
+  server that knows it is 189 bytes instead of 427: the message is a binary
+  form with a version byte in front of it, and the bytes that cost three
+  bytes each — the nonce and the signature, which the JSON writes as arrays of
+  decimal numbers — cost one each.
+  **A client against a server that does not know it still works.** The first
+  message says which version the client speaks, inside the JSON, where a
+  server that predates the version byte drops the field it does not know; the
+  answers then come back in the old form and the client answers in the old
+  form. The version byte is a discriminator and not a negotiation: a message
+  says what it is, and the other end reads it.
+
 - **A key the config file does not know is an error now.** Every section of
   `config.toml` refuses the keys it does not have, and so does the top level:
   `exposee = true` under `[server]` used to be dropped without a word, and the
