@@ -443,6 +443,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The client refuses an algorithm it does not support.** The client's
+  parser matched `sha256` and `sha512` and turned **everything else** into
+  SHA1 — `sha-256`, `SHA3-256`, a typo, an empty string. A name that is
+  quietly turned into a different algorithm is a silent downgrade: the client
+  computes codes the server does not accept, and every attempt fails with
+  "wrong code" rather than the algorithm being named once as unsupported.
+  The client had a strict parser and a lenient one, and the lenient one was
+  the one every configuration path went through; there is one now, and it
+  refuses a name nobody supports. The Android client already behaved this
+  way, so the two agree.
 - **The L4 sniffer reads its buffer once.** Every chunk appended to that
   side's buffer and then re-ran the decision over the **whole** buffer, so a
   peer that opens a flow with something this proxy does not read — an SSH

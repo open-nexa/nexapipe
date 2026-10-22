@@ -108,11 +108,10 @@ pub async fn run_local_proxy(
     if let Some(tf) = two_factor_config
         && tf.enabled.unwrap_or(false)
     {
-        let auth = TwoFactorAuth::new(
-            &tf.client_id,
-            &tf.secret,
-            TotpAlgorithm::from_name(tf.algorithm.as_deref().unwrap_or("sha1")),
-        )?;
+        // A name nobody supports is refused rather than downgraded: the node
+        // would compute codes this server does not accept.
+        let algorithm = TotpAlgorithm::try_from_name(tf.algorithm.as_deref().unwrap_or("sha1"))?;
+        let auth = TwoFactorAuth::new(&tf.client_id, &tf.secret, algorithm)?;
         endpoint_group.set_two_factor(Some(auth)).await;
         tracing::info!("2FA enabled for local proxy, client_id: {}", tf.client_id);
     }

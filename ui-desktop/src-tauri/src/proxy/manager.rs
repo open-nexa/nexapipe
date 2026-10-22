@@ -1,10 +1,11 @@
 use crate::proxy::dns::DnsServerConfig;
 use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::local_proxy::LocalProxyWrapper;
-use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
+use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, tun_ip};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use nexapipe_client::LinkStatus;
 use nexapipe_client::auth::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
@@ -14,7 +15,6 @@ use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
-use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -135,7 +135,7 @@ pub struct ProxyNodeConfig {
 pub struct NodeTwoFactor {
     pub client_id: String,
     pub secret: String,
-    /// Lowercase algorithm name, as `TotpAlgorithm::from_name` expects it.
+    /// Lowercase algorithm name, as `TotpAlgorithm::try_from_name` expects it.
     pub algorithm: String,
     /// Which device of this client this secret belongs to.
     ///
@@ -554,12 +554,16 @@ impl ProxyManager {
                 (false, Some(key), Some(device)) if !device.is_empty() => {
                     TwoFactorAuth::with_key(&two_factor.client_id, key, device)
                 }
-                _ => TwoFactorAuth::new(
-                    &two_factor.client_id,
-                    &two_factor.secret,
-                    TotpAlgorithm::from_name(&two_factor.algorithm),
-                )
-                .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?,
+                _ => {
+                    // A name nobody supports is refused rather than downgraded:
+                    // the node would compute codes the server does not accept.
+                    let algorithm =
+                        TotpAlgorithm::try_from_name(&two_factor.algorithm).map_err(|e| {
+                            anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e)
+                        })?;
+                    TwoFactorAuth::new(&two_factor.client_id, &two_factor.secret, algorithm)
+                        .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?
+                }
             };
             // Named only when the node carries a name: an empty one is not the
             // unnamed device, it is a field somebody left blank, and enrolling

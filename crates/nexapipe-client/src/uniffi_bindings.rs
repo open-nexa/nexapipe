@@ -512,11 +512,11 @@ impl ProxyClient {
                     group.set_enrollment_for(&backend_id, Some(token)).await;
                 }
                 Some(Credential::TwoFactor(two_factor)) => {
-                    let auth = TwoFactorAuth::new(
-                        &two_factor.client_id,
-                        &two_factor.secret,
-                        TotpAlgorithm::from_name(two_factor.algorithm.as_deref().unwrap_or("sha1")),
+                    let algorithm = TotpAlgorithm::try_from_name(
+                        two_factor.algorithm.as_deref().unwrap_or("sha1"),
                     )?;
+                    let auth =
+                        TwoFactorAuth::new(&two_factor.client_id, &two_factor.secret, algorithm)?;
                     let auth = match two_factor.device.as_deref().map(str::trim) {
                         Some(device) if !device.is_empty() => auth.with_device(device),
                         _ => auth,

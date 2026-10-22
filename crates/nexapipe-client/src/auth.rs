@@ -59,7 +59,43 @@ impl TotpAlgorithm {
         }
     }
 
-    /// Parse an algorithm name from configuration / UI (case-insensitive).
+    /// Parse an algorithm name, refusing one nobody supports.
+    ///
+    /// The names are the canonical ones, in any case: `sha1`, `sha256`,
+    /// `sha512`. An empty name is the default, `sha1` — which is what the
+    /// Android client does with the same field, and what a URI that leaves
+    /// the parameter out means.
+    ///
+    /// Anything else is an error that names the value and the spellings that
+    /// are accepted. A name quietly turned into a different algorithm is a
+    /// silent downgrade: the client computes codes the server does not
+    /// accept, and every attempt fails with "wrong code" rather than the
+    /// algorithm being named once as unsupported.
+    pub fn try_from_name(name: &str) -> Result<Self, ClientError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(TotpAlgorithm::SHA1);
+        }
+        if name.eq_ignore_ascii_case("sha1") {
+            return Ok(TotpAlgorithm::SHA1);
+        }
+        if name.eq_ignore_ascii_case("sha256") {
+            return Ok(TotpAlgorithm::SHA256);
+        }
+        if name.eq_ignore_ascii_case("sha512") {
+            return Ok(TotpAlgorithm::SHA512);
+        }
+        Err(ClientError::InvalidConfig(format!(
+            "unsupported algorithm {name:?} (expected SHA1, SHA256 or SHA512)"
+        )))
+    }
+
+    /// Parse an algorithm name, falling back to SHA1.
+    ///
+    /// **Only for a value that is already one of ours** — a name this crate
+    /// produced. A name that came from a peer or from a file is read with
+    /// [`TotpAlgorithm::try_from_name`], which refuses one nobody supports
+    /// instead of quietly computing a different code.
     pub fn from_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "sha256" => TotpAlgorithm::SHA256,
@@ -993,10 +1029,20 @@ impl Enrollment {
                     let period = u32::try_from(period).map_err(|_| {
                         ClientError::InvalidConfig(format!("{period} is not a TOTP period"))
                     })?;
+                    // An algorithm the client does not know is an error, not
+                    // a silent downgrade to SHA1: the two would compute
+                    // different codes, and every attempt would fail with
+                    // "wrong code" instead of the algorithm being named once
+                    // as unsupported.
+                    let algorithm = TotpAlgorithm::try_from_name(&algorithm).map_err(|e| {
+                        ClientError::AuthenticationFailed(format!(
+                            "the server issued a credential with an unsupported algorithm: {e}"
+                        ))
+                    })?;
                     let issued = TwoFactorAuth::with_params(
                         &client_id,
                         secret.as_str(),
-                        TotpAlgorithm::from_name(&algorithm),
+                        algorithm,
                         period,
                         digits,
                     )?;
@@ -1124,6 +1170,61 @@ mod tests {
     };
     use nexapipe_proto::auth::MAX_DEVICE_ID_LEN;
     use nexapipe_proto::secret::SecretString;
+
+    /// An algorithm nobody supports is refused, and the refusal says what was
+    /// wrong.
+    ///
+    /// A name quietly turned into a different algorithm is a silent downgrade:
+    /// the client computes codes the server does not accept, and every attempt
+    /// fails with "wrong code" rather than the algorithm being named once.
+    #[test]
+    fn an_unknown_algorithm_name_is_refused() {
+        let error = TotpAlgorithm::try_from_name("sha-256").expect_err("nobody supports it");
+        let message = error.to_string();
+
+        assert!(message.contains("sha-256"), "{message}");
+        assert!(message.contains("SHA1"), "{message}");
+        assert!(message.contains("SHA256"), "{message}");
+        assert!(message.contains("SHA512"), "{message}");
+    }
+
+    /// The three names the client supports, in any case.
+    #[test]
+    fn the_supported_algorithm_names_parse_in_any_case() {
+        for name in ["sha1", "SHA1", "Sha1", " sha1 "] {
+            assert_eq!(
+                TotpAlgorithm::try_from_name(name).expect("sha1"),
+                TotpAlgorithm::SHA1,
+                "{name:?} is sha1"
+            );
+        }
+        for name in ["sha256", "SHA256", "Sha256"] {
+            assert_eq!(
+                TotpAlgorithm::try_from_name(name).expect("sha256"),
+                TotpAlgorithm::SHA256,
+                "{name:?} is sha256"
+            );
+        }
+        for name in ["sha512", "SHA512", "Sha512"] {
+            assert_eq!(
+                TotpAlgorithm::try_from_name(name).expect("sha512"),
+                TotpAlgorithm::SHA512,
+                "{name:?} is sha512"
+            );
+        }
+    }
+
+    /// A name that is not there is the default, `sha1`.
+    ///
+    /// Which is what a URI that leaves the parameter out means, and what the
+    /// Android client does with the same field.
+    #[test]
+    fn an_absent_algorithm_name_is_the_default() {
+        assert_eq!(
+            TotpAlgorithm::try_from_name("").expect("the default"),
+            TotpAlgorithm::SHA1
+        );
+    }
 
     /// A `Debug` that prints a secret turns every log line, panic message and
     /// bug report that touches one into a credential disclosure — and these are
