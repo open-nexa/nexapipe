@@ -27,13 +27,26 @@ have changed since are marked:
 |---|---|---|
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
-| `tun_pump/ip_mapping_concurrent` | **97 ns** | the same lookup, eight tasks at once. The mapping's lock is an **exclusive** one, so the lookups serialise — and that is cheaper than the alternative: a read lock, tried and measured, came out at 357 ns, because making the clock atomic moves two updates out of the lock and into eight cores contending for the same cache lines |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
-| `tun_pump/packet_copy` | **18 ns** | the copy the TUN's inbound path makes for every packet — the bytes are read into a buffer that is reused, and the stack is handed a copy, because the frame it takes is a `Vec<u8>` of its own. **It is 0.24% of `tun_packet`**, so the allocation it costs is not worth a buffer pool |
 | `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
+
+The two `tun_pump` rows measured on **2026-10-22**, on the same machine and
+the same toolchain, are listed separately because they were measured on a
+later day than the table above:
+
+| Bench | slope | The one-line reading |
+|---|---|---|
+| `tun_pump/ip_mapping_concurrent` | **97 ns** | the same lookup, eight tasks at once. The mapping's lock is an **exclusive** one, so the lookups serialise — and that is cheaper than the alternative: a read lock, tried and measured, came out at 357 ns, because making the clock atomic moves two updates out of the lock and into eight cores contending for the same cache lines |
+| `tun_pump/packet_copy` | **18 ns** | the copy the TUN's inbound path makes for every packet — the bytes are read into a buffer that is reused, and the stack is handed a copy, because the frame it takes is a `Vec<u8>` of its own. **It is 0.24% of `tun_packet`**, so the allocation it costs is not worth a buffer pool |
+
+The `packet_copy` figure was measured with an earlier version of that bench,
+which also timed the read into the buffer and the free of the frame at the
+end of each iteration — neither of which the production path pays at that
+point. The bench now times the allocation and the copy alone, so the figure
+above is an upper bound for what the path pays.
 
 The two `local_request` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they are a
@@ -118,9 +131,6 @@ and the tests cover what it does.
 - `ip_mapping` — the bookkeeping behind those answers: one address per
   domain, and the reverse lookup that turns a packet's destination back into
   a name.
-- `tun_packet` — the whole path, with the query arriving as an IP packet on
-  the TUN device and the answer leaving as one. The stack in the middle is
-  smoltcp's; what is measured around it is ours.
 - `ip_mapping_concurrent` — the reverse lookup with several tasks doing it at
   once. The mapping's lock is exclusive, so the lookups serialise; the case
   is here because the alternative (a read lock) was measured and is **worse**,
@@ -131,6 +141,9 @@ and the tests cover what it does.
   **copy**, because the frame it takes is a `Vec<u8>` of its own. It is here
   on its own so that its share of the path is visible, because it is the one
   per-packet cost a reader would think was worth removing.
+- `tun_packet` — the whole path, with the query arriving as an IP packet on
+  the TUN device and the answer leaving as one. The stack in the middle is
+  smoltcp's; what is measured around it is ours.
 
 **`domain_match`** is the client asking whether a name is one of its own — the
 question every `CONNECT` and every DNS query asks, answered by walking the
