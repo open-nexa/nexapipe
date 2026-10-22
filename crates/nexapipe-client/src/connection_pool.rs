@@ -62,7 +62,24 @@ pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
 /// borrows, and the pool has to be able to say so.
 type DialOutcome = Result<(Connection, Arc<BorrowState>), ClientError>;
 
-const MAX_CONNECTIONS: usize = 10;
+/// How many connections the pool keeps **per protocol**.
+///
+/// A connection carries one protocol — the one it was opened with — so the
+/// ceiling is counted per protocol: a protocol that needs a connection of its
+/// own is not refused because another protocol's connections are sitting in the
+/// pool. The pool therefore holds at most this many of each protocol, and at
+/// most this many times the number of protocols in all.
+///
+/// It used to be one ceiling for the pool as a whole, which counted the
+/// connections of one protocol against another's. A connection opened for HTTP
+/// cannot carry an L4 flow, so it cannot stand in for one, and the protocol
+/// that needed a connection was refused while the others' connections sat
+/// idle.
+///
+/// Ten per protocol is the same headroom one protocol had before, and the pool
+/// reaches the second connection only when the first is full or has died — so
+/// this is the tail of a tail, per protocol.
+const MAX_CONNECTIONS_PER_PROTOCOL: usize = 10;
 const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Idle connections older than this are evicted when a new connection is requested.
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
@@ -143,6 +160,24 @@ const AUTH_REQUIRED_CLOSE_CODE: u32 = 2;
 /// preconnect has to read the close reason from that failure to turn "connection
 /// lost" into a cause the operator can act on.
 const PEER_NOT_ALLOWED_CLOSE_CODE: u32 = 5;
+
+/// How many of the pool's connections carry `protocol`.
+///
+/// The count is per protocol, because a connection carries exactly one: a
+/// connection opened for HTTP cannot carry an L4 flow, so the two cannot take
+/// each other's place.
+fn connections_for(protocol: Protocol, held: impl Iterator<Item = Protocol>) -> usize {
+    held.filter(|each| *each == protocol).count()
+}
+
+/// Whether the pool will take one more connection for `protocol`.
+///
+/// A protocol is refused when **its own** connections are at the ceiling, not
+/// when the pool as a whole is: the connections of another protocol cannot
+/// carry this one's flows, so they cannot stand in for it.
+fn may_pool(protocol: Protocol, held: impl Iterator<Item = Protocol>) -> bool {
+    connections_for(protocol, held) < MAX_CONNECTIONS_PER_PROTOCOL
+}
 
 /// How traffic currently reaches a backend: direct, or through a relay.
 ///
@@ -347,7 +382,7 @@ fn is_measured_rtt(rtt: std::time::Duration) -> bool {
 enum PoolRefusal {
     /// The connection was already closed.
     Closed,
-    /// The pool holds as many connections as it may.
+    /// The pool holds as many connections of this protocol as it may.
     Full,
 }
 
@@ -1256,7 +1291,7 @@ impl IrohConnectionPool {
             // Handing it out would be handing out a connection that is
             // already closed.
             Err(PoolRefusal::Full) => Err(ClientError::ConnectionFailed(
-                "the connection pool is full".to_string(),
+                "the connection pool is full for this protocol".to_string(),
             )),
             Err(PoolRefusal::Closed) => Err(ClientError::ConnectionFailed(
                 "the connection was closed as soon as it was established".to_string(),
@@ -1398,7 +1433,7 @@ impl IrohConnectionPool {
         }
 
         let mut connections = self.inner.connections.lock().await;
-        if connections.len() < MAX_CONNECTIONS {
+        if may_pool(protocol, connections.iter().map(|pooled| pooled.protocol)) {
             connections.push(PooledConnection {
                 conn,
                 state,
@@ -1407,20 +1442,22 @@ impl IrohConnectionPool {
             return Ok(());
         }
 
-        // The pool is full, so this one is closed on the spot. Dropping the
-        // handle would close it just as surely, but silently: the peer would
-        // see a connection that vanished with no reason attached, which is
-        // indistinguishable from a crash on this side.
+        // This protocol's own connections are at the ceiling, so this one is
+        // closed on the spot. Dropping the handle would close it just as
+        // surely, but silently: the peer would see a connection that vanished
+        // with no reason attached, which is indistinguishable from a crash on
+        // this side.
         //
         // **Nothing is riding it**: a connection is pooled the moment it is
         // established, and the flows that borrow it are counted on its entry.
-        // The pool holds one connection in practice — the second one only
-        // arrives when the first is full or has died — so this is the tail of
-        // a tail.
+        // The pool holds one connection per protocol in practice — the second
+        // one only arrives when the first is full or has died — so this is the
+        // tail of a tail.
         #[cfg(feature = "tracing")]
         tracing::debug!(
-            "Connection pool is full ({}), closing the connection that came back",
-            MAX_CONNECTIONS
+            "Connection pool is full for {} ({} connections), closing the connection that came back",
+            protocol.name(),
+            MAX_CONNECTIONS_PER_PROTOCOL
         );
         conn.close(0u32.into(), b"connection pool full");
         Err(PoolRefusal::Full)
@@ -1781,8 +1818,9 @@ pub fn parse_endpoint_addr(
 mod tests {
     use super::{
         ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
-        IrohConnectionPool, LinkKind, LinkStatus, MAX_FLOWS_PER_CONNECTION, encode_link_status,
-        identity_changed, is_idle_since, is_measured_rtt, may_publish,
+        IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL,
+        MAX_FLOWS_PER_CONNECTION, connections_for, encode_link_status, identity_changed,
+        is_idle_since, is_measured_rtt, may_pool, may_publish,
     };
     use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
@@ -2615,5 +2653,40 @@ mod tests {
         };
 
         assert_eq!(encode_link_status(&id, &status), format!("{}=direct/-", id));
+    }
+
+    /// The pool's ceiling is counted **per protocol**.
+    ///
+    /// A connection carries one protocol, so the connections of one protocol
+    /// cannot carry another's flows and cannot stand in for it. A protocol
+    /// that needs a connection of its own is therefore not refused because
+    /// another protocol's connections are sitting in the pool.
+    #[test]
+    fn the_ceiling_is_counted_per_protocol() {
+        let http = [Protocol::Http; MAX_CONNECTIONS_PER_PROTOCOL];
+        let l4 = [Protocol::L4; MAX_CONNECTIONS_PER_PROTOCOL];
+
+        // HTTP is at its own ceiling, and is refused.
+        assert!(!may_pool(Protocol::Http, http.iter().copied()));
+        // L4 is not refused for it: a connection opened for HTTP cannot carry
+        // an L4 flow, so it cannot stand in for one.
+        assert!(may_pool(Protocol::L4, http.iter().copied()));
+
+        // Both protocols at their ceilings: the pool holds twice the number,
+        // and each is still counted on its own.
+        let both: Vec<Protocol> = http.iter().chain(l4.iter()).copied().collect();
+        assert!(!may_pool(Protocol::Http, both.iter().copied()));
+        assert!(!may_pool(Protocol::L4, both.iter().copied()));
+        assert!(may_pool(Protocol::Tls, both.iter().copied()));
+    }
+
+    /// The count is of the connections of **that** protocol, and of no other.
+    #[test]
+    fn a_protocol_is_counted_on_its_own() {
+        let held = [Protocol::Http, Protocol::L4, Protocol::Http];
+
+        assert_eq!(connections_for(Protocol::Http, held.iter().copied()), 2);
+        assert_eq!(connections_for(Protocol::L4, held.iter().copied()), 1);
+        assert_eq!(connections_for(Protocol::Tls, held.iter().copied()), 0);
     }
 }
