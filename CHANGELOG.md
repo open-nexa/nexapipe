@@ -360,6 +360,41 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **A flow borrows a connection now, instead of taking it out of the pool.**
+  The client keeps a pool of connections to each backend, and a flow used to
+  take one out of it and hold it until the flow ended — so while a flow was
+  running its connection was not in the pool, and a hundred concurrent flows
+  needed a hundred connections. The transport is built for the opposite: one
+  connection carries 1024 bi-streams.
+  A flow **borrows** a connection now. The pool keeps it; the flow holds a
+  handle to it, and iroh's connection handle is a cheap clone — *"may be
+  cloned to obtain another handle to the same connection"* — so a hundred
+  flows share one connection and a flow that ends has nothing to give back.
+  A **dial is shared** too: everything that asks for a connection while one
+  is in progress waits for that one rather than starting its own, so a
+  hundred flows arriving together make one connection between them and not a
+  hundred. That matters most when the backend is down: one failed dial is
+  paid for once, not once per flow.
+  The numbers: a hundred concurrent flows now open **one** connection where
+  they opened a hundred, and they open it in **5 milliseconds** where it
+  took **1.05 seconds**. Two hundred and five times faster, and a hundred
+  fewer handshakes for the peer to make. The number is measured, not read off
+  the code: the far side counts its own accepts, so it does not depend on
+  anything the client reports about itself, and each round runs on a fresh
+  pool so that the count is what that round needed rather than what a
+  previous round left behind.
+  Three things about it are worth knowing. A connection with a flow on it is
+  **not idle**, so the pool's idle timeout no longer closes it underneath
+  the flow — the pool counts the flows riding each connection for exactly
+  that, and the last-use stamp moves when the last of them ends, so a
+  connection that has just carried a ten-minute flow is fresh for another
+  minute. The server counts the flows on a connection as well and refuses
+  the one that does not fit, so the client keeps below that ceiling itself
+  and opens another connection rather than piling every flow onto one; a
+  refusal is tried again on a connection of its own instead of failing the
+  flow. And a connection that turns out to be broken is closed, which now
+  takes the other flows on it down with it; they retry, and they retry on a
+  new connection.
 - **The routing table's benchmark measures a lookup that matches.** Its 51
   routes all had the path pattern `/*`, which is not a wildcard — it is a
   literal `/*` prefix, and a route with it serves no ordinary path at all.
