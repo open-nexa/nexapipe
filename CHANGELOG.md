@@ -371,6 +371,31 @@ lookup, which is what a config written before the key existed does.
   the answer is the same every time it is asked.
   It is read once now, and looked up.
 
+- **The request body is forwarded while it is still arriving, instead of
+  after all of it has arrived.** The server read a request's whole body into
+  memory — up to 64 MiB of it — before it contacted the backend at all, and
+  only then sent it. A backend therefore saw **nothing** of an upload until
+  the last byte was in, and the proxy held the entire upload for the whole
+  exchange.
+  A request that declares a `content-length` is forwarded **as it arrives**
+  now: the backend reads the body while the client is still sending it, and
+  the proxy holds a 16 KiB read buffer rather than the upload. A 64 MiB
+  upload costs the proxy tens of kilobytes where it cost 64 MiB, and the
+  process-wide byte budget counts the bytes that have **arrived** rather than
+  the ones the client **promised** — so a client that declares a large body
+  and sends nothing holds nothing, exactly as before.
+  Two things come with it, and both are worth knowing. A body that has been
+  **streamed** cannot be sent a second time — there is no second copy of it —
+  so a request with a body that fails and would have been retried is
+  **refused with an error** instead of being sent to the next backend with an
+  empty body. `[retry] attempts` is 0 unless an operator asks for it, so this
+  reaches only a deployment that turned retries on, and there it fails loudly
+  where it used to send a broken request. And a **chunked** body — one with
+  no `content-length` — is still read whole, because the proxy re-frames it
+  as a single buffer with a length of its own. The 64 MiB limit is unchanged
+  either way, and so is the plaintext listener: hyper's own body was already
+  streamed there.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of

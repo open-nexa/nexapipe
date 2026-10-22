@@ -578,7 +578,11 @@ pub async fn handle_bidi_stream(
     //
     // A WebSocket upgrade has no body to read: the session starts where the
     // head ends, and the bytes after it are frames.
-    let body = if http::is_websocket_request_static(&request) {
+    // The stream is an `Option` because a body that is **streamed** takes it:
+    // the bytes are read from it as the backend asks for them, so it cannot
+    // also be used for anything else.
+    let mut recv = Some(recv);
+    let mut body = if http::is_websocket_request_static(&request) {
         None
     } else {
         match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
@@ -631,7 +635,7 @@ pub async fn handle_bidi_stream(
             tracing::debug!("WebSocket request detected");
             match handle_websocket_stream(
                 send,
-                recv,
+                recv.expect("a WebSocket request has no body, so its stream is still here"),
                 &request,
                 clients,
                 &backend_info,
@@ -657,7 +661,7 @@ pub async fn handle_bidi_stream(
             }
         } else {
             let body = body
-                .as_ref()
+                .as_mut()
                 .expect("the body of a request that is not a WebSocket is read above");
             let attempts = config.retry().attempts;
             let backoff = config.retry().backoff;
@@ -704,6 +708,23 @@ pub async fn handle_bidi_stream(
                 if attempt >= attempts || !failure.retry.may_retry(request.method()) {
                     break Err(failure);
                 }
+
+                // A body that was **streamed** is gone: its bytes came off
+                // the client's stream and there is no second copy of them, so
+                // the request cannot be tried again. A body that is whole can
+                // be sent again, and is.
+                //
+                // The failure says so rather than sending an empty body to
+                // the next backend, which is what a retry without the bytes
+                // would do.
+                if !body.may_retry() {
+                    return Err(anyhow::anyhow!(
+                        "the request has a body that cannot be read a second time, so it is not \
+                         tried again: {}",
+                        failure.error
+                    ));
+                }
+
                 attempt += 1;
 
                 tracing::warn!(
