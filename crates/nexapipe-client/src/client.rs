@@ -140,7 +140,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The ALPN the tunnel speaks. The same bytes the client uses.
-    const ALPN: &[u8] = b"\x05nexapipe";
+    const ALPN: &[u8] = b"nexapipe";
 
     /// The connection comes back to the pool.
     ///

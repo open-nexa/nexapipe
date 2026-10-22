@@ -1884,6 +1884,7 @@ RTT. `TransportTuning` raises it and can be overridden without a rebuild:
 | `NEXAPIPE_QUIC_INITIAL_MTU` | `0` | `0` keeps iroh's 1200; otherwise 1200..=65535. |
 | `NEXAPIPE_QUIC_KEEPALIVE_MS` | `0` | `0` keeps iroh's 5 s. |
 | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS` | `1024` | Bi-streams one connection may carry at once. The library default (100) is too low once every UDP flow takes a stream of its own. |
+| `NEXAPIPE_QUIC_CONGESTION` | `bbr` | The congestion controller: `bbr` or `cubic`. BBR is model-based and paces to the bottleneck bandwidth and the minimum round trip time, so a random loss on a long path does not cost a window; Cubic reads a loss as congestion and cuts back. An unrecognised value warns and keeps the default. |
 
 Never override iroh's multipath or NAT-traversal knobs — doing so breaks hole
 punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
