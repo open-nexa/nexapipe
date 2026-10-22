@@ -14,7 +14,7 @@ use error::{codes, AppError};
 use nexapipe_client::auth::DeviceKey;
 use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use proxy::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ConnectionConfig, ProxyManager, ProxyManagerConfig,
     ProxyNodeConfig, StartError,
 };
 use serde::Serialize;
@@ -352,8 +352,7 @@ async fn start_proxy(
     }
 
     let load_balancing = load_balancing.unwrap_or_else(|| "round_robin".to_string());
-    let load_balancing: ProxyLoadBalancingStrategy = load_balancing
-        .parse()
+    let load_balancing = nexapipe_client::lb::LoadBalancingStrategy::from_name(&load_balancing)
         .map_err(|e: String| AppError::cause(codes::PROXY_INVALID_LOAD_BALANCING, e))?;
 
     let local_addr = local_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());

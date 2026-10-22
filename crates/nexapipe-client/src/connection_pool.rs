@@ -147,19 +147,21 @@ const _: () = assert!(
 );
 
 /// The application error code the server closes a connection with when it
-/// requires 2FA the client never performed. Must match `auth_close_code::REQUIRED`
-/// in `crates/nexapipe/src/conn/mod.rs`.
-const AUTH_REQUIRED_CLOSE_CODE: u32 = 2;
+/// requires 2FA the client never performed.
+///
+/// The number lives in [`nexapipe_proto::auth::close_code`], which the server
+/// links too.
+const AUTH_REQUIRED_CLOSE_CODE: u32 = nexapipe_proto::auth::close_code::REQUIRED;
 
 /// The application error code the server closes a connection with when a
-/// `[peers]` allow-list refuses this Node ID. Must match
-/// `PEER_NOT_ALLOWED_CLOSE_CODE` in `crates/nexapipe/src/conn/allow_list.rs`.
+/// `[peers]` allow-list refuses this Node ID. The number lives in
+/// [`nexapipe_proto::auth::close_code`], which the server links too.
 ///
 /// Reached from a different place than the 2FA codes: the server refuses inside
 /// the QUIC handshake, so `connect` itself fails rather than a later stream. The
 /// preconnect has to read the close reason from that failure to turn "connection
 /// lost" into a cause the operator can act on.
-const PEER_NOT_ALLOWED_CLOSE_CODE: u32 = 5;
+const PEER_NOT_ALLOWED_CLOSE_CODE: u32 = nexapipe_proto::auth::close_code::PEER_NOT_ALLOWED;
 
 /// How many of the pool's connections carry `protocol`.
 ///

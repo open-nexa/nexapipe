@@ -1,7 +1,7 @@
 use crate::error::{codes, AppError};
 use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 use crate::proxy::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ConnectionConfig, ProxyManager, ProxyManagerConfig,
     ProxyNodeConfig, StartError,
 };
 use crate::service::ipc::{
@@ -536,7 +536,9 @@ impl ServiceRunner {
         }
 
         let load_balancing = load_balancing.unwrap_or_else(|| "round_robin".to_string());
-        let load_balancing: ProxyLoadBalancingStrategy = match load_balancing.parse() {
+        let load_balancing = match nexapipe_client::lb::LoadBalancingStrategy::from_name(
+            &load_balancing,
+        ) {
             Ok(lb) => lb,
             Err(e) => {
                 return IpcResponse::Error(AppError::cause(codes::PROXY_INVALID_LOAD_BALANCING, e))
