@@ -83,16 +83,20 @@ const MAX_ENTRIES: usize = 1024;
 /// message is not one of these is treated as transient, because the cost of
 /// that mistake is one name looked up again, while the cost of the other
 /// mistake is a backend that stays unreachable for the whole negative TTL.
+///
+/// The texts are lower-cased, because the platforms do not spell the same
+/// resolver error the same way: glibc says "No address associated with
+/// hostname" where macOS says "no address associated with hostname".
 const NOT_FOUND_MESSAGES: &[&str] = &[
     // glibc and musl.
-    "Name or service not known",
-    "Name does not resolve",
+    "name or service not known",
+    "name does not resolve",
     // macOS and the BSDs.
     "nodename nor servname provided",
     // A name that exists but has no address record.
-    "No address associated with hostname",
+    "no address associated with hostname",
     // Windows.
-    "No such host is known",
+    "no such host is known",
 ];
 
 /// Why a name did not resolve.
@@ -188,14 +192,79 @@ impl Resolve for SystemResolver {
     }
 }
 
+/// The resolver the process resolves names through.
+///
+/// In a build that is not a test it is the system's. In a test build it is
+/// the one the test put in place — see [`swap_resolver`] — and the system
+/// resolver is what is left when the test takes it away again.
+struct ProcessResolver;
+
+impl Resolve for ProcessResolver {
+    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+        #[cfg(test)]
+        {
+            if let Some(resolver) = test_resolver() {
+                return resolver.resolve(host);
+            }
+        }
+        SystemResolver.resolve(host)
+    }
+}
+
+/// The resolver a test put in the process's place.
+///
+/// It is `None` unless a test put one there, and the test that put one there
+/// takes it away again when it is done.
+#[cfg(test)]
+static TEST_RESOLVER: Mutex<Option<Arc<dyn Resolve>>> = Mutex::new(None);
+
+/// The resolver a test put in the process's place, if there is one.
+#[cfg(test)]
+fn test_resolver() -> Option<Arc<dyn Resolve>> {
+    TEST_RESOLVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Puts a resolver in the process's place, until the guard is dropped.
+///
+/// The guard puts the old one back, so a test that has a resolver in place
+/// does not leave it there for the tests that run beside it.
+#[cfg(test)]
+pub(crate) struct ResolverGuard {
+    previous: Option<Arc<dyn Resolve>>,
+}
+
+#[cfg(test)]
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        let mut current = TEST_RESOLVER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = self.previous.take();
+    }
+}
+
+/// Puts a resolver in the process's place, until the guard is dropped.
+#[cfg(test)]
+pub(crate) fn swap_resolver(resolver: Arc<dyn Resolve>) -> ResolverGuard {
+    let mut current = TEST_RESOLVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = current.replace(resolver);
+    ResolverGuard { previous }
+}
+
 /// Says whether a resolver failure means "this name does not exist" or "the
 /// resolver could not answer right now".
 fn classify(error: io::Error) -> ResolveError {
     let message = error.to_string();
+    let lowered = message.to_lowercase();
     let not_found = error.kind() == io::ErrorKind::NotFound
         || NOT_FOUND_MESSAGES
             .iter()
-            .any(|known| message.contains(known));
+            .any(|known| lowered.contains(*known));
     if not_found {
         ResolveError::not_found(error)
     } else {
@@ -510,7 +579,7 @@ fn evict(entries: &mut HashMap<String, Arc<Entry>>, max_entries: usize) {
 /// The cache this process resolves names through.
 static CACHE: LazyLock<DnsCache> = LazyLock::new(|| {
     DnsCache::new(
-        Arc::new(SystemResolver),
+        Arc::new(ProcessResolver),
         POSITIVE_TTL,
         NEGATIVE_TTL,
         MAX_ENTRIES,
@@ -710,6 +779,37 @@ mod tests {
                 .any(|message| message.contains("temporary failure in name resolution")),
             "the resolver's own message should be in the chain, got {chain:?}"
         );
+    }
+
+    /// The two resolver failures the cache tells apart are told apart by the
+    /// words the resolver used, and the words are read the way the platforms
+    /// spell them.
+    #[test]
+    fn a_name_that_does_not_exist_is_not_a_resolver_that_could_not_answer() {
+        // The words the platforms use for "no such name".
+        for message in [
+            "failed to lookup address information: nodename nor servname provided, or not known",
+            "failed to lookup address information: Name or service not known",
+            "failed to lookup address information: no address associated with hostname",
+            "failed to lookup address information: No such host is known.",
+        ] {
+            assert!(
+                classify(io::Error::other(message)).is_not_found(),
+                "{message:?} should mean that the name does not exist"
+            );
+        }
+
+        // And the words they use for a resolver that could not answer.
+        for message in [
+            "failed to lookup address information: Temporary failure in name resolution",
+            "failed to lookup address information: server misbehaving",
+            "failed to lookup address information: Non-recoverable failure in name resolution",
+        ] {
+            assert!(
+                !classify(io::Error::other(message)).is_not_found(),
+                "{message:?} should mean that the resolver could not answer"
+            );
+        }
     }
 
     #[tokio::test]

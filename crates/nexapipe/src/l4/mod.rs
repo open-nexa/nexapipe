@@ -843,6 +843,8 @@ mod tests {
     use crate::lb::LoadBalancingStrategy;
     use crate::routes::{L4Options, Route};
     use nexapipe_proto::{PREFACE_VERSION, encode_frame_to_vec};
+    use std::collections::HashMap;
+    use std::net::IpAddr;
 
     fn tcp_route(host: &str, backend: &str) -> Route {
         Route::new(
@@ -1675,5 +1677,124 @@ mod tests {
             error.to_string().contains(&refused.to_string()),
             "the error should name the address that failed, got {error}"
         );
+    }
+
+    /// A resolver the test can steer.
+    ///
+    /// A name it knows is answered from the table; anything else is the
+    /// system's business, so a test that has it installed cannot disturb the
+    /// tests that run beside it.
+    struct StubResolver {
+        answers: std::sync::Mutex<HashMap<String, Vec<IpAddr>>>,
+    }
+
+    impl StubResolver {
+        fn new() -> Self {
+            Self {
+                answers: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// Changes what the name resolves to, the way a DNS record moves.
+        fn set(&self, host: &str, addrs: Vec<IpAddr>) {
+            self.answers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(host.to_string(), addrs);
+        }
+    }
+
+    impl crate::dns::Resolve for StubResolver {
+        fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, crate::dns::ResolveError> {
+            let known = self
+                .answers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(host)
+                .cloned();
+            match known {
+                Some(addrs) => Ok(addrs),
+                // Everything else is the system's business.
+                None => crate::dns::SystemResolver.resolve(host),
+            }
+        }
+    }
+
+    /// A UDP flow does not use an address the cache is holding.
+    ///
+    /// The cache is for the paths that dial: a TCP dial to an address that
+    /// has gone away is refused, and the flow fails with it. A UDP flow has
+    /// **no dial** — `connect` on a UDP socket is local, so it cannot tell
+    /// that the peer is gone — and a datagram sent to an address that is no
+    /// longer there is dropped without a word. So a UDP flow resolves its
+    /// target every time it opens, and the address the cache is holding is
+    /// not the one it uses.
+    #[tokio::test]
+    async fn a_udp_flow_does_not_use_a_stale_address() {
+        // The backend that answers: a UDP echo on the loopback.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = backend.recv_from(&mut buf).await.unwrap();
+            backend.send_to(&buf[..n], from).await.unwrap();
+        });
+
+        // The name resolves to an address where nobody is listening, and to
+        // the backend after that: the address the cache is holding is one
+        // the flow must not use.
+        let stub = Arc::new(StubResolver::new());
+        stub.set("udp.test", vec![IpAddr::from([127, 0, 0, 2])]);
+        let _resolver = crate::dns::swap_resolver(stub.clone());
+
+        // The cache is given the address nobody is listening on, the way a
+        // flow that resolved the name a moment ago would have left it.
+        let cached = crate::dns::resolve("udp.test")
+            .await
+            .expect("the name resolves");
+        assert_eq!(cached, vec![IpAddr::from([127, 0, 0, 2])]);
+
+        // And now the name resolves to the backend.
+        stub.set("udp.test", vec![IpAddr::from([127, 0, 0, 1])]);
+
+        let backend = format!("udp.test:{}", backend_addr.port());
+        let config = RoutingTable::new(vec![udp_route("udp.test", &backend, None)]);
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_stream(
+                server,
+                Vec::new(),
+                &config,
+                &limiter(),
+                "test",
+                None,
+                "test-request-id",
+                None,
+            )
+            .await
+        });
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let mut first = preface(L4Proto::Udp, "udp.test", 3478);
+        first.extend_from_slice(&encode_frame_to_vec(b"one").unwrap());
+        client_write.write_all(&first).await.unwrap();
+
+        assert_eq!(read_status(&mut client_read).await, Status::Ok);
+        // The datagram has to come back from the backend. Before the fix the
+        // flow was pointed at the address the cache was holding, so nothing
+        // came back and the flow ended instead.
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_udp_frame(&mut client_read))
+            .await
+            .expect("the echo should come back");
+        assert_eq!(echoed, b"one");
+
+        drop(client_write);
+        drop(client_read);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the flow should end when the client closes")
+            .unwrap();
+        assert!(outcome.is_ok());
+        echo.await.unwrap();
     }
 }
