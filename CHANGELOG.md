@@ -634,6 +634,17 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The Android release build is minified again.** It shipped with
+  `isMinifyEnabled = false` and a proguard file that was nothing but the
+  template's comments, so the release APK carried every class, every method
+  and every `Log.d` line under its own name. That is a map of the app for
+  whoever reads the APK, and the part of this app worth understanding before
+  attacking it is the credential handling. The release is shrunk and
+  obfuscated now, the debug logs are dropped, and the R8 rules that keep the
+  JNI bridge working are written down in `proguard-rules.pro`: the native
+  entry points are bound by name, so neither the class nor its `native`
+  methods may be renamed.
+
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
   RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
