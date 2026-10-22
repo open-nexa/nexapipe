@@ -1394,6 +1394,45 @@ struct UdpQueue {
     queued: Arc<AtomicUsize>,
 }
 
+impl UdpQueue {
+    /// A queue with nothing in it.
+    fn new(sender: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            sender,
+            queued: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Reserves room for `len` bytes, and says whether there was room.
+    ///
+    /// The bytes are counted **before** the datagram goes in, so the queue
+    /// cannot pass its bound between the check and the send. A reservation
+    /// that does not fit is given back at once, so a datagram that is dropped
+    /// for want of room leaves the count as it was.
+    fn reserve(&self, len: usize) -> bool {
+        let queued = self.queued.fetch_add(len, Ordering::Relaxed) + len;
+        if queued > UDP_FLOW_QUEUE_BYTES {
+            self.release(len);
+            return false;
+        }
+        true
+    }
+
+    /// Gives `len` bytes back to the queue.
+    ///
+    /// Called when a datagram leaves the queue — because the flow took it, or
+    /// because it never went in.
+    fn release(&self, len: usize) {
+        self.queued.fetch_sub(len, Ordering::Relaxed);
+    }
+
+    /// How many bytes are waiting.
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+}
+
 type FlowTable = Arc<Mutex<HashMap<FlowKey, UdpQueue>>>;
 
 /// Which side of a UDP flow spoke.
@@ -1542,10 +1581,7 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
             Some(queue) => queue,
             None => {
                 let (sender, receiver) = mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
-                let queue = UdpQueue {
-                    sender,
-                    queued: Arc::new(AtomicUsize::new(0)),
-                };
+                let queue = UdpQueue::new(sender);
                 let mut flows = lock_flows(&table);
 
                 if flows.len() >= MAX_UDP_FLOWS {
@@ -1585,9 +1621,7 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
         // The bytes are reserved **before** the datagram goes in, so that the
         // queue cannot pass its bound between the check and the send.
         let len = payload.len();
-        let queued = queue.queued.fetch_add(len, Ordering::Relaxed) + len;
-        if queued > UDP_FLOW_QUEUE_BYTES {
-            queue.queued.fetch_sub(len, Ordering::Relaxed);
+        if !queue.reserve(len) {
             // The same answer as a full queue: the datagram is lost, which is
             // what UDP promises anyway.
             continue;
@@ -1600,12 +1634,12 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
             // printing one per dropped datagram would be its own problem under
             // load. Losing them is what UDP promises anyway.
             Err(mpsc::error::TrySendError::Full(_)) => {
-                queue.queued.fetch_sub(len, Ordering::Relaxed);
+                queue.release(len);
             }
             // The flow ended between the lookup and the send. The next datagram
             // creates a new one.
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                queue.queued.fetch_sub(len, Ordering::Relaxed);
+                queue.release(len);
                 jni_log!("[tun-proxy] UDP flow to {} closed", dst_addr);
             }
         }
@@ -1699,7 +1733,7 @@ async fn run_udp_flow(
             Activity::Application(Some(datagram)) => {
                 // The datagram is out of the queue now, so its bytes are no
                 // longer waiting for it.
-                mine.queued.fetch_sub(datagram.len(), Ordering::Relaxed);
+                mine.release(datagram.len());
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
@@ -2411,14 +2445,14 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 mod tests {
     use super::{
         Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
-        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UpstreamResolvers, answer_ttl,
-        answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at, handle_dns_query,
-        lock_cache, next_activity, parse_dns_query, read_u32, remember_answer, resolve_tcp_window,
-        set_answer_ttls, wait_for_stop,
+        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UDP_FLOW_QUEUE, UDP_FLOW_QUEUE_BYTES, UdpQueue,
+        UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer,
+        cached_answer_at, handle_dns_query, lock_cache, next_activity, parse_dns_query, read_u32,
+        remember_answer, resolve_tcp_window, set_answer_ttls, wait_for_stop,
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// The resolvers every test answer claims to have come from. What matters
@@ -2966,5 +3000,45 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), wait_for_stop(stopped))
             .await
             .expect("the watch does not wait for a flag that is already set");
+    }
+
+    /// The queue is bounded by **bytes**, not only by datagrams.
+    ///
+    /// A datagram may be 65,507 bytes, so a queue of 256 of them is 16 MiB
+    /// per flow. The bound is a megabyte, and the test says so: a megabyte
+    /// fits, one byte more does not, and the datagram that does not fit is
+    /// not counted against the queue.
+    #[tokio::test]
+    async fn the_udp_queue_is_bounded_by_bytes() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let chunk = 1024;
+        let mut reserved = 0;
+        while reserved + chunk <= UDP_FLOW_QUEUE_BYTES {
+            assert!(
+                queue.reserve(chunk),
+                "the queue has room for {chunk} more bytes"
+            );
+            reserved += chunk;
+        }
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE_BYTES,
+            "the queue holds exactly its bound"
+        );
+
+        // The next one does not fit, and it leaves the count as it was.
+        assert!(!queue.reserve(chunk), "the queue is full");
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE_BYTES,
+            "a datagram that did not fit is not counted"
+        );
+
+        // A datagram that leaves the queue gives its bytes back.
+        queue.release(chunk);
+        assert_eq!(queue.queued_bytes(), UDP_FLOW_QUEUE_BYTES - chunk);
+        assert!(queue.reserve(chunk), "there is room again");
     }
 }
