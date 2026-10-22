@@ -550,6 +550,14 @@ enabled = false
 [local_proxy]
 enabled = false
 listen_addr = "127.0.0.1:8081"
+# The local proxy does not authenticate the peer that connects to it: it hands
+# out the tunnel of a connection that has already authenticated, so whoever
+# reaches the port gets that tunnel without a credential. `listen_addr`
+# therefore has to name a loopback address, and a non-loopback one is refused
+# at startup. `expose = true` is the explicit opt-in for a deployment that
+# puts something else in front of the port — a firewall, a container network —
+# and it means the same thing as `[server] expose`.
+expose = false
 # Domains to tunnel; --generate-invite without --invite-domains takes its
 # domains from here too.
 #
