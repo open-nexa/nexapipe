@@ -338,6 +338,9 @@ lookup, which is what a config written before the key existed does.
   those suffixes are exactly the name's own label-aligned ones, so the lookup
   asks for them and the first one that is in the index is the longest pattern
   that covers the name — the same answer the walk gave, without the walk.
+  A pattern that matches nothing — `*.`, the catch-all in another spelling,
+  which the rule refuses — is indexed under no name at all, so it serves
+  nothing and cannot widen what a client proxies.
   The six tests that pin the wildcard behaviour, including the one that says
   a wildcard does not serve its own apex, pass unchanged.
 
