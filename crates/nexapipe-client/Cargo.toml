@@ -114,6 +114,14 @@ required-features = ["local-proxy"]
 name = "domain_match"
 harness = false
 
+# What one connection costs: a handshake, and a flow on a connection that is
+# already open. It is a bench of its own because it is the number a decision
+# about choosing the protocol with ALPN needs, and no other bench has it.
+[[bench]]
+name = "connection_cost"
+harness = false
+required-features = ["local-proxy"]
+
 # How many QUIC connections a hundred concurrent flows open. The number is a
 # property of the flow model rather than of the network, and it is what says
 # whether the client is paying for a handshake per flow.
@@ -127,3 +135,8 @@ required-features = ["local-proxy"]
 [[example]]
 name = "tun_flow_memory"
 required-features = ["tun-proxy"]
+
+# What one connection costs in memory. An example for the same reason: the
+# number is memory, not time, and the time is the benchmark's job.
+[[example]]
+name = "connection_memory"
