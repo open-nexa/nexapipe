@@ -363,6 +363,11 @@ async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
                 "last_used": client.last_used,
                 "failed_attempts": client.failed_attempts,
                 "locked_until": client.locked_until,
+                // The enrollment's own counters, listed beside the client's so
+                // an operator can tell the two apart: a guess at a pending
+                // token is counted here and not there.
+                "enrollment_failed_attempts": client.enrollment_failed_attempts,
+                "enrollment_locked_until": client.enrollment_locked_until,
                 "enrollment_pending": client.pending_enrollment.is_some(),
             })
         })
