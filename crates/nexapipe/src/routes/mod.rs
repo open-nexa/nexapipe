@@ -35,26 +35,11 @@ pub(crate) fn host_without_port(host: &str) -> &str {
 /// Split off the same way [`host_without_port`] takes the port off, so the two
 /// cannot disagree about where the host ends.
 pub(crate) fn host_and_port(host: &str) -> (&str, Option<u16>) {
-    if host.starts_with('[') {
-        match host.find(']') {
-            // Up to and including the closing bracket: a port can only follow
-            // it, and the colons inside belong to the address.
-            Some(end) => {
-                let port = host[end + 1..]
-                    .strip_prefix(':')
-                    .and_then(|p| p.parse().ok());
-                (&host[..=end], port)
-            }
-            // A bracket that is never closed is not a port separator, so
-            // nothing is taken off.
-            None => (host, None),
-        }
-    } else {
-        match host.split_once(':') {
-            Some((name, port)) => (name, port.parse().ok()),
-            None => (host, None),
-        }
-    }
+    // The rule lives in `nexapipe-proto`, which the client links too: the
+    // server routes by what this says and the client decides whether to
+    // tunnel by what this says, and the two cannot disagree about where the
+    // host ends.
+    nexapipe_proto::host_and_port(host)
 }
 
 /// The most a path is allowed to add to [`Route::priority`], so that length
