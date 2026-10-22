@@ -185,13 +185,17 @@ fn quote_argument(exe: &std::path::Path) -> String {
 mod platform {
     use super::{current_exe, ENTRY_NAME};
     use crate::error::{codes, AppError};
-    use std::process::Command;
+    use crate::win;
 
     /// Where Windows looks for what to run at login.
-    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    ///
+    /// The hive is part of the path: `reg` rejects a key without a root key with a
+    /// syntax error, which the three-answer rule above would otherwise report as an
+    /// unreadable registry.
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
     /// The key above it, asked when the Run key cannot be read.
-    const RUN_KEY_PARENT: &str = r"Software\Microsoft\Windows\CurrentVersion";
+    const RUN_KEY_PARENT: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion";
 
     /// `reg.exe`, which is in `System32` on every Windows that has ever run.
     ///
@@ -209,7 +213,7 @@ mod platform {
     ///
     /// The exit code is what is read; the text is localized, so it is not.
     fn query(args: &[&str]) -> Result<bool, AppError> {
-        Command::new(reg())
+        win::hidden(reg())
             .args(args)
             .output()
             .map(|output| output.status.success())
@@ -233,7 +237,7 @@ mod platform {
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), AppError> {
-        let mut command = Command::new(reg());
+        let mut command = win::hidden(reg());
         if enabled {
             let exe = current_exe()?;
             // The value is a command line, so the path is quoted: a program
@@ -274,6 +278,19 @@ mod platform {
                 codes::AUTOSTART_WRITE_FAILED,
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{RUN_KEY, RUN_KEY_PARENT};
+
+        #[test]
+        fn the_registry_keys_name_their_hive() {
+            // A path with no root key is a syntax error to `reg`, not a missing entry.
+            for key in [RUN_KEY, RUN_KEY_PARENT] {
+                assert!(key.starts_with("HKCU\\"), "{key}");
+            }
         }
     }
 }

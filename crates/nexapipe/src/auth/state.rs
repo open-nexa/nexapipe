@@ -82,6 +82,16 @@ pub struct ClientState {
     /// When the client last authenticated, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
+    /// The last TOTP step the client's own secret was accepted on.
+    ///
+    /// The step, not the code: a code changes every thirty seconds, and
+    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
+    /// same code cannot be used twice.
+    ///
+    /// This is the **unnamed** device's memory — the client answering with
+    /// its own secret. A named device keeps its own, under its own entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_step: Option<u64>,
     /// The per-device stamps.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub devices: HashMap<String, DeviceState>,
@@ -93,6 +103,13 @@ pub struct DeviceState {
     /// When the device last authenticated, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
+    /// The last TOTP step the device's code was accepted on.
+    ///
+    /// The step, not the code: a code changes every thirty seconds, and
+    /// RFC 6238 §5.2 asks a verifier to remember the **step** so that the
+    /// same code cannot be used twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_step: Option<u64>,
 }
 
 /// A zero counter is not written: a state file that accumulated
@@ -191,13 +208,18 @@ pub fn snapshot(config: &AuthConfig) -> RuntimeState {
     for (id, client) in &config.clients {
         let mut devices = HashMap::with_capacity(client.devices.len());
         for (name, device) in &client.devices {
-            if device.last_used.is_none() {
+            // A device that has neither stamp is not written at all. A device
+            // that has only the **step** is: the memory of the step it
+            // accepted is what refuses the second use of a code, and a server
+            // that forgot it over a restart would accept one.
+            if device.last_used.is_none() && device.last_used_step.is_none() {
                 continue;
             }
             devices.insert(
                 name.clone(),
                 DeviceState {
                     last_used: device.last_used,
+                    last_used_step: device.last_used_step,
                 },
             );
         }
@@ -208,6 +230,7 @@ pub fn snapshot(config: &AuthConfig) -> RuntimeState {
             enrollment_failed_attempts: client.enrollment_failed_attempts,
             enrollment_locked_until: client.enrollment_locked_until,
             last_used: client.last_used,
+            last_used_step: client.last_used_step,
             devices,
         };
         if is_empty(&state) {
@@ -225,6 +248,7 @@ fn is_empty(state: &ClientState) -> bool {
         && state.enrollment_failed_attempts == 0
         && state.enrollment_locked_until.is_none()
         && state.last_used.is_none()
+        && state.last_used_step.is_none()
         && state.devices.is_empty()
 }
 
@@ -249,10 +273,12 @@ pub fn apply(state: &RuntimeState, config: &mut AuthConfig) {
         client.enrollment_failed_attempts = client_state.enrollment_failed_attempts;
         client.enrollment_locked_until = client_state.enrollment_locked_until;
         client.last_used = client_state.last_used;
+        client.last_used_step = client_state.last_used_step;
 
         for (name, device) in &mut client.devices {
             if let Some(device_state) = client_state.devices.get(name) {
                 device.last_used = device_state.last_used;
+                device.last_used_step = device_state.last_used_step;
             }
         }
     }
@@ -278,11 +304,73 @@ mod tests {
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used,
+            last_used_step: None,
             failed_attempts,
             locked_until,
             enrollment_failed_attempts: 0,
             enrollment_locked_until: None,
         }
+    }
+
+    /// The step memory survives a write and a read.
+    ///
+    /// The state file is what carries it, and a server that forgot it over a
+    /// restart would accept the second use of a code — which is the whole
+    /// point of remembering it.
+    #[test]
+    fn the_step_memory_survives_a_write_and_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        let mut config = AuthConfig::default();
+        let mut alice = client(0, None, None);
+        alice.devices.insert(
+            "laptop".to_string(),
+            crate::auth::DeviceAuth {
+                secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                public_key: None,
+                created_at: "0".to_string(),
+                last_used: None,
+                last_used_step: None,
+            },
+        );
+        config.clients.insert("alice".to_string(), alice);
+
+        // The client authenticates: the client's own secret on one step, and
+        // the named device on the same one.
+        config.accept_step("alice", None, 100);
+        config.accept_step("alice", Some("laptop"), 100);
+
+        save(&path, &snapshot(&config)).expect("the write succeeds");
+        let state = load(&path).expect("the file reads back");
+
+        let mut restored = AuthConfig::default();
+        let mut alice = client(0, None, None);
+        alice.devices.insert(
+            "laptop".to_string(),
+            crate::auth::DeviceAuth {
+                secret: nexapipe_proto::secret::SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+                public_key: None,
+                created_at: "0".to_string(),
+                last_used: None,
+                last_used_step: None,
+            },
+        );
+        restored.clients.insert("alice".to_string(), alice);
+        apply(&state, &mut restored);
+
+        // Both memories came back, so both refuse a step behind the one they
+        // accepted.
+        assert_eq!(
+            restored.accept_step("alice", None, 99),
+            crate::auth::config::StepVerdict::Refused,
+            "the client's own memory survived"
+        );
+        assert_eq!(
+            restored.accept_step("alice", Some("laptop"), 99),
+            crate::auth::config::StepVerdict::Refused,
+            "the device's memory survived"
+        );
     }
 
     #[test]
@@ -406,6 +494,7 @@ mod tests {
                 enrollment_failed_attempts: 0,
                 enrollment_locked_until: None,
                 last_used: Some(1699999999),
+                last_used_step: None,
                 devices: HashMap::new(),
             },
         );
@@ -430,6 +519,7 @@ mod tests {
                 enrollment_failed_attempts: 0,
                 enrollment_locked_until: None,
                 last_used: None,
+                last_used_step: None,
                 devices: HashMap::new(),
             },
         );

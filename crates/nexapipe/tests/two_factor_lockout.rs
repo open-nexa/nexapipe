@@ -6,7 +6,7 @@
 //! each other, plus the `save_auth_state` round trip that makes a lockout
 //! survive a restart.
 
-use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator};
+use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator, Verified};
 use nexapipe::config::ProxyConfig;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
@@ -60,6 +60,7 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -98,6 +99,7 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                         public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
+                        last_used_step: None,
                     },
                 ),
                 (
@@ -107,11 +109,13 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
                         public_key: None,
                         created_at: "0".to_string(),
                         last_used: None,
+                        last_used_step: None,
                     },
                 ),
             ]),
             unnamed_device_allowed: true,
             last_used: None,
+            last_used_step: None,
             failed_attempts: 0,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -148,7 +152,7 @@ fn accepts_a_signed_current_response() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "a correctly signed current response must verify, got {:?}",
         outcome
     );
@@ -227,7 +231,7 @@ fn reports_a_wrong_code_as_a_counted_failure() {
         &signature,
         "000000",
     );
-    assert!(matches!(outcome, Ok(false)));
+    assert!(matches!(outcome, Ok(Verified::WrongCode)));
 }
 
 /// The lockout itself: `max_attempts` counted failures lock the client, and a
@@ -255,7 +259,7 @@ fn locks_out_after_max_attempts() {
             &signature,
             "000000",
         );
-        assert!(matches!(outcome, Ok(false)));
+        assert!(matches!(outcome, Ok(Verified::WrongCode)));
         config
             .clients
             .get_mut("client-001")
@@ -295,7 +299,7 @@ fn locks_out_after_max_attempts() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "record_success must clear the lockout"
     );
 }
@@ -463,6 +467,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: Some(1),
+            last_used_step: None,
             failed_attempts: 1,
             locked_until: None,
             enrollment_failed_attempts: 0,
@@ -511,7 +516,7 @@ fn a_device_authenticates_with_its_own_secret() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "the laptop's own response must verify, got {outcome:?}"
     );
 
@@ -576,7 +581,7 @@ fn revoking_one_device_leaves_the_other_authenticating() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "the laptop is untouched by the phone's revocation, got {outcome:?}"
     );
 }
@@ -603,7 +608,7 @@ fn an_unnamed_device_still_answers_with_the_clients_secret() {
         &code,
     );
     assert!(
-        matches!(outcome, Ok(true)),
+        matches!(outcome, Ok(Verified::Accepted { .. })),
         "no name sent is the unnamed device, got {outcome:?}"
     );
 }
@@ -629,7 +634,7 @@ fn a_device_shares_its_clients_lockout_counter() {
             &signature,
             "000000",
         );
-        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
+        assert!(matches!(outcome, Ok(Verified::WrongCode)), "{outcome:?}");
         config
             .clients
             .get_mut("client-001")
