@@ -33,6 +33,8 @@ have changed since are marked:
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
+| `connection_cost/open_connection` | **910,820 ns** | one QUIC handshake: **what a second connection would cost** if the protocol were chosen with ALPN |
+| `connection_cost/open_flow` | **809,230 ns** | a flow on a connection that is already open: the round trip a flow pays, and the difference between the two rows is what a connection adds |
 
 The two `route_lookup` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they were
@@ -250,6 +252,25 @@ The second number is the one that does not move. It is reported as a duration
 in nanoseconds, so the report reads `33 ns` for a request that made 33
 allocations; that is the encoding, and it is deliberate, because the number
 belongs in the report next to the times.
+
+**`connection_cost`** is what one connection costs, and it is the number a
+decision about choosing the protocol with ALPN needs: the protocol would be
+chosen at the handshake, so a client that speaks both HTTP and L4 would open
+**two** connections to the same endpoint where it opens one today.
+
+It measures two:
+
+- `open_connection` — a QUIC handshake and nothing else.
+- `open_flow` — a flow on a connection that is **already open**: the preface
+  and the status byte, one round trip, and no handshake. The far side counts
+  the connections it is given and the bench checks the count, so a flow that
+  quietly opened a connection of its own would fail the bench rather than
+  report a handshake's number under a flow's name.
+
+The two together are the ratio that matters: **a connection costs about a
+round trip more than a flow does**, so the price of a second connection is
+one handshake, paid once per endpoint and protocol, and then amortized over a
+connection the pool keeps for hours.
 
 It is the server's **plaintext listener** path, driven through
 `http::proxy_request`. The QUIC tunnel path reaches the same backend through
