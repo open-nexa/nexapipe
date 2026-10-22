@@ -162,9 +162,14 @@ enum HeaderOutcome {
 /// testable on its own. Under the per-read timeout this replaces, a caller
 /// sending one byte before each expiry renewed the deadline on every read and
 /// was never disconnected — which is precisely what the test below pins.
+///
+/// The buffer is the caller's, not one of its own: a request used to allocate
+/// two 32 KiB buffers to read one head, and the second was thrown away as soon
+/// as the head was complete.
 async fn read_http_header<S>(
     stream: &mut S,
     request_buf: &mut Vec<u8>,
+    temp_buf: &mut [u8],
     deadline: tokio::time::Instant,
 ) -> HeaderOutcome
 where
@@ -185,9 +190,8 @@ where
         return HeaderOutcome::Closed;
     }
 
-    let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
     while header_end.is_none() {
-        let n = match tokio::time::timeout_at(deadline, stream.read(&mut temp_buf)).await {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut *temp_buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -241,10 +245,10 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: usize = 10;
 
 /// How many connections are served at once.
 ///
-/// Each one holds a [`STREAM_BUF_SIZE`] buffer (sometimes two), so this is what
-/// turns an unbounded number of connections into a bounded amount of memory.
-/// The same figure the server's `accept_bi` uses, which is not a coincidence:
-/// a caller is one connection either way.
+/// Each one holds two [`STREAM_BUF_SIZE`] buffers — one per direction of the
+/// copy loop — so this is what turns an unbounded number of connections into a
+/// bounded amount of memory. The same figure the server's `accept_bi` uses,
+/// which is not a coincidence: a caller is one connection either way.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 /// One line per this many refused connections. A refusal is the caller's
@@ -873,7 +877,16 @@ where
     // Check if this is a TLS connection (ClientHello starts with 0x16 = Handshake content type)
     if !request_buf.is_empty() && request_buf[0] == 0x16 {
         jni_log!("[DEBUG:local-proxy] Detected TLS ClientHello, handling as raw tunnel via SNI");
-        return handle_tls_tunnel(stream, request_buf, endpoint_group, proxy_domains, peer).await;
+        let header_buf = std::mem::take(&mut temp_buf);
+        return handle_tls_tunnel(
+            stream,
+            request_buf,
+            header_buf,
+            endpoint_group,
+            proxy_domains,
+            peer,
+        )
+        .await;
     }
 
     // Step 2: HTTP — read the complete request head (up to \r\n\r\n).
@@ -888,11 +901,19 @@ where
     // sending one byte of `Host:` before each expiry kept the connection, the
     // task and the slot for as long as it liked — the read that arrived *was*
     // the renewal.
-    let header_end =
-        match read_http_header(&mut stream, &mut request_buf, first_byte_deadline).await {
-            HeaderOutcome::Complete(header_end) => header_end,
-            HeaderOutcome::Closed => return Ok(()),
-        };
+    // The same buffer the first read used: one buffer for the whole head,
+    // rather than one for the first read and another for the rest of it.
+    let header_end = match read_http_header(
+        &mut stream,
+        &mut request_buf,
+        &mut temp_buf,
+        first_byte_deadline,
+    )
+    .await
+    {
+        HeaderOutcome::Complete(header_end) => header_end,
+        HeaderOutcome::Closed => return Ok(()),
+    };
 
     let request = match parse_http_request_legacy(&request_buf[..header_end]) {
         Ok(req) => {
@@ -977,8 +998,13 @@ where
         // Spawn bidirectional forwarding as separate tasks to keep each
         // task's async state machine small (avoids deep nesting that causes
         // stack overflow on tokio worker threads).
+        //
+        // The buffer the head was read into becomes the client half's buffer:
+        // a connection holds two of them — one per direction — rather than
+        // three.
+        let header_buf = std::mem::take(&mut temp_buf);
         let mut client_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; STREAM_BUF_SIZE];
+            let mut buf = header_buf;
             loop {
                 match client_read.read(&mut buf).await {
                     Ok(0) => {
@@ -1217,8 +1243,13 @@ where
                 );
 
                 // Bidirectional forwarding (no send.finish() — keep stream open)
+                //
+                // The buffer the head was read into becomes the client half's
+                // buffer: a connection holds two of them — one per direction —
+                // rather than three.
+                let header_buf = std::mem::take(&mut temp_buf);
                 let client_to_iroh = async move {
-                    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+                    let mut buf = header_buf;
                     let mut ws_buffer = Vec::new();
                     loop {
                         match client_read.read(&mut buf).await {
@@ -1386,8 +1417,11 @@ where
 
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
+    // The buffer the head was read into becomes the client half's buffer: a
+    // connection holds two of them — one per direction — rather than three.
+    let header_buf = std::mem::take(&mut temp_buf);
     let client_to_backend = async move {
-        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+        let mut buf = header_buf;
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -1526,6 +1560,10 @@ where
 pub(crate) async fn handle_tls_tunnel<S>(
     mut stream: S,
     initial_data: Vec<u8>,
+    // The buffer the ClientHello was read into, handed over rather than
+    // allocated again: a connection holds two 32 KiB buffers — one per
+    // direction of the copy loop — rather than three.
+    header_buf: Vec<u8>,
     endpoint_group: Arc<EndpointGroup>,
     proxy_domains: Arc<Vec<String>>,
     // Where the bytes came from; see `handle_local_connection`.
@@ -1616,8 +1654,12 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(stream);
 
     // Bidirectional raw data forwarding (TCP tunnel)
-    let client_to_iroh = async {
-        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    //
+    // The buffer the ClientHello was read into becomes the client half's
+    // buffer: a connection holds two of them — one per direction — rather
+    // than three.
+    let client_to_iroh = async move {
+        let mut buf = header_buf;
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -2611,8 +2653,10 @@ mod tests {
         });
 
         let mut request_buf = Vec::new();
+        let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
         let started = std::time::Instant::now();
-        let outcome = read_http_header(&mut server, &mut request_buf, deadline).await;
+        let outcome =
+            read_http_header(&mut server, &mut request_buf, &mut temp_buf, deadline).await;
 
         assert_eq!(
             outcome,
@@ -2649,7 +2693,8 @@ mod tests {
         });
 
         let mut request_buf = Vec::new();
-        match read_http_header(&mut server, &mut request_buf, deadline).await {
+        let mut temp_buf = vec![0u8; STREAM_BUF_SIZE];
+        match read_http_header(&mut server, &mut request_buf, &mut temp_buf, deadline).await {
             HeaderOutcome::Complete(end) => {
                 assert_eq!(
                     &request_buf[..end],

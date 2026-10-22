@@ -427,6 +427,25 @@ items the numbers pointed at.
    flows on a connection as well — it refuses the one that does not fit — so
    the client keeps below that ceiling itself and opens another connection
    rather than piling every flow onto one.
+7. **The buffers a connection holds.** **Added on 2026-10-22, from the audit
+   rather than from a bench.** The local proxy read a request's head into one
+   32 KiB buffer, read the rest of it into **another** one, and then kept the
+   first for the whole connection while each of the two copy loops held
+   another: **three** 32 KiB buffers per connection, and up to 256
+   connections at once.
+   **Done**: the head is read into one buffer, and that buffer becomes the
+   client half's copy buffer. A request allocates **two** 32 KiB buffers where
+   it allocated **four**, and a connection holds **64 KiB** where it held
+   **96 KiB** — 16 MiB at the cap rather than 24.
+   The time is unchanged, which is what the change is for: the local proxy's
+   request path measures **150 µs** for the whole request and **106 µs** to
+   the response head, against **151 µs** and **107 µs** before. A benchmark
+   that runs the path four times — twice with the change and twice without —
+   puts the two within a percent of each other.
+   What is **not** in here is the other half of the item: the local proxy
+   closes the connection after every response, so every request is a new
+   socket, two new tasks and two new entries in the flow table. That is a
+   change to the proxy's connection lifecycle, and it is a separate decision.
 
 ### F3 — A performance budget (P2, after F1)
 
