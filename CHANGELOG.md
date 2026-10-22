@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty-two things land in this cycle so far: the device credential can be a **key**
+Twenty-three things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -41,8 +41,9 @@ result of those measurements is written down, a route that rewrites the paths
 it serves now rewrites them for the tunnel as well, a request's body is
 forwarded to the backend while it is still arriving, and the Android client's
 tunnel descriptor is closed exactly once, the tunnel's congestion controller is
-BBR rather than Cubic, and the protocol's name on the wire is the name rather
-than a name with a control byte in front of it.
+BBR rather than Cubic, the protocol's name on the wire is the name rather than
+a name with a control byte in front of it, and a UDP flow's queue is bounded by
+bytes rather than only by datagrams.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -60,6 +61,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A UDP flow's queue is bounded by bytes, not only by datagrams.** A
+  flow's queue held up to 256 datagrams, and a datagram may be 65,507 bytes
+  — so one flow could have 16 MiB of datagrams waiting to go into the
+  tunnel, and there are 32 flows. A device could have **half a gigabyte**
+  queued at once, for a queue that exists to smooth a burst.
+  The queue now has a byte budget of its own — a megabyte per flow, which is
+  sixteen full-size datagrams, and 32 MiB for all the flows together. A
+  datagram that would take the queue past it is dropped, which is what UDP
+  promises anyway, and the count of datagrams stays as a second bound.
+  The bytes are reserved before the datagram goes in, so the queue cannot pass
+  its bound between the check and the send, and they are given back when the
+  flow takes the datagram out.
+  The queue on the other side — the one the TUN writer reads from, which
+  holds the datagrams coming back — is still bounded by their number alone.
+  This change bounds the queue a flow hands to the tunnel; that one is a
+  separate bound and is not touched here.
 - **The request body is forwarded while it is still arriving, instead of
   after all of it has arrived.** The server read a request's whole body into
   memory — up to 64 MiB of it — before it contacted the backend at all, and
