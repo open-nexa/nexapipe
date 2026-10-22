@@ -384,9 +384,8 @@ mod tests {
     use super::*;
     use crate::http;
     use crate::lb::LoadBalancingStrategy;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tracing_subscriber::layer::SubscriberExt;
 
     /// A port nothing listens on: the probe fails immediately, with no network
     /// and no server to stand up.
@@ -684,62 +683,14 @@ mod tests {
         );
     }
 
-    /// Counts the "marking unhealthy" lines a round writes.
-    ///
-    /// The transition is what a duplicated backend got wrong: the round marked
-    /// it unhealthy once per probe of it, so one backend was written and
-    /// logged twice in a single round, with two different failure counts.
-    #[derive(Clone, Default)]
-    struct MarkedUnhealthy(Arc<AtomicUsize>);
-
-    impl MarkedUnhealthy {
-        fn count(&self) -> usize {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MarkedUnhealthy {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut visitor = MessageVisitor(None);
-            event.record(&mut visitor);
-            if visitor
-                .0
-                .as_deref()
-                .is_some_and(|message| message.contains("marking unhealthy"))
-            {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }
-
-    /// Picks the `message` field out of an event.
-    struct MessageVisitor(Option<String>);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = Some(value.to_string());
-            }
-        }
-
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = Some(format!("{value:?}"));
-            }
-        }
-    }
-
     /// The same round, with the backend down from the start and staying down:
     /// the status is written once, and the failure is counted once.
     ///
     /// The end of the round is not enough to tell a round that marked the
     /// backend once from a round that marked it twice — both leave it
-    /// unhealthy. The transition is counted instead, because that is the part
-    /// that was written and logged twice.
+    /// unhealthy. The pool is asked instead, because the pool is what was
+    /// marked: a backend that is marked unhealthy twice in one round is
+    /// counted twice, and the count is the transition itself.
     #[tokio::test]
     async fn a_backend_named_twice_is_marked_once_per_round() {
         let backend = DEAD_BACKEND.to_string();
@@ -749,19 +700,15 @@ mod tests {
         ));
         let checker = checker(pool.clone(), 1, Arc::new(AtomicBool::new(true)));
 
-        let marked = MarkedUnhealthy::default();
-        let subscriber = tracing_subscriber::registry().with(marked.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
         checker.check_all_backends().await;
-        drop(_guard);
 
         assert!(
             !healthy(&pool, &backend).await,
             "a failed probe at the threshold empties the pool"
         );
         assert_eq!(
-            marked.count(),
-            1,
+            pool.backend_failures(&backend).await,
+            Some(1),
             "one backend is marked unhealthy once per round, not once per probe of it"
         );
     }
