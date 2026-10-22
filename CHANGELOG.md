@@ -743,6 +743,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A credential bought by an enrollment goes through the same check.** The
+  enrollment writes the pool's credential itself, and it wrote it without the
+  comparison that closes the connections of the identity that is gone: the
+  identity changed and the connections of the old identity stayed in the
+  pool, serving traffic under an identity the server had already been told
+  was gone.
+  Every write of the credential goes through one place now, and that place
+  compares the identity and closes the connections when it changed.
 - **The WebSocket request line is rebuilt from the parsed request.** The
   client rebuilt the line it sends from the raw bytes of the one it
   received, and the HTTP version came out of that split — so a request line
