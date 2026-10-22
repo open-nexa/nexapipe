@@ -57,6 +57,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The server answers the handshake in the form it was asked in.** The
+  handshake message has two forms — the JSON one every client already speaks,
+  and the binary one — and the payload's first byte says which one it is. The
+  server reads all of them: a client that speaks one form and a server that
+  speaks another still complete the handshake, and the answers come back in
+  the form the client asked in.
+  **The client does not use the binary form yet.** It is turned on one side at
+  a time, so that an old client keeps working against a new server and a new
+  client keeps working against an old one — the case that decides the whole
+  order of the change.
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
   speaks, and a binary one that is a third of the size where the bytes are —
@@ -712,6 +722,31 @@ lookup, which is what a config written before the key existed does.
   `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`,
   together with whatever `Connection` nominates. `Transfer-Encoding` stays,
   because the body it describes is carried over unchanged.
+- **The webview is granted less than it was.** The desktop app's capability
+  granted the whole of `core:default`, the whole of `opener:default` and the
+  whole of `updater:default` to the renderer, and the renderer used almost
+  none of it. Three things came with that:
+  - `core:image:allow-from-path` let the renderer read **any image file the
+    user can read** — a screenshot, a photo, an exported chart — and hand its
+    pixels back over the IPC channel. It is denied now, and nothing in the
+    app used it.
+  - `opener:default` granted `reveal-item-in-dir` for **any path**, which
+    asks the OS file manager to open a directory the renderer names. The
+    frontend only ever opens a URL, so the permission is now the one that
+    opens a URL and the scope that says which ones.
+  - `updater:default` granted the renderer the right to download and install
+    an update. The frontend has never called the updater — the app has no
+    in-app update button — and the plugin is still registered on the Rust
+    side, so nothing about the release machinery changed; only the
+    renderer's reach into it is gone.
+  `core:default` itself is still granted, and it still brings the path, the
+  event, the window, the webview, the app, the resource, the menu and the
+  tray defaults with it — the renderer uses the window and the tray ones,
+  and the path and the resource defaults are what the rest of the set needs.
+  What is gone is the two reaches that mattered: the one into the
+  filesystem, and the one into the updater.
+  A renderer that can run script is a renderer that can ask for all three,
+  and the answer was "yes" to each.
 - **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
