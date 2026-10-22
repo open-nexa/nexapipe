@@ -68,6 +68,23 @@ pub fn may_bind_local_proxy(bound: SocketAddr, exposed: bool) -> bool {
     exposed || bound.ip().is_loopback()
 }
 
+/// Where the request line ends, in the bytes of a request's header block.
+///
+/// The end is the first **line feed**, whether it came with a carriage return
+/// or not: a bare LF ends the line for a parser that accepts one, and
+/// looking for "\r\n" instead would step over the first header as well — and
+/// the header it steps over is the `Host` one, which says which name the
+/// request is for. The server substitutes the backend's address for a
+/// request that arrives without one, and a request for a name is then served
+/// by the wrong site.
+///
+/// Returns the offset of the line feed, so the line itself ends at
+/// `offset + 1`; zero when there is no line feed at all, which is a header
+/// block that never had a request line.
+fn request_line_end(request: &[u8]) -> usize {
+    request.iter().position(|b| *b == b'\n').unwrap_or(0)
+}
+
 /// Headers whose value is a credential, and so never belongs in a log.
 const SENSITIVE_HEADERS: [&str; 5] = [
     "authorization",
@@ -334,7 +351,8 @@ impl LocalProxy {
             return Err(ClientError::InvalidConfig(format!(
                 "the local proxy would bind {bound}, which is reachable from the network, and it \
                  hands out an already-authenticated tunnel to whoever connects. Use a loopback \
-                 address, or LocalProxy::new_exposed when something else gates the port"
+                 address, or set `[local_proxy] expose = true` when something else gates the port \
+                 (the library's `LocalProxy::new_exposed`)"
             )));
         }
         #[cfg(feature = "tracing")]
@@ -1109,10 +1127,7 @@ where
         );
 
         // Find the first line (request line)
-        let first_line_end = request_buf[..header_end]
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap_or(0);
+        let first_line_end = request_line_end(&request_buf[..header_end]);
 
         if first_line_end > 0 {
             // The method and the version come from the **parsed** request, not
@@ -1141,7 +1156,7 @@ where
                 // Copy the rest of headers (skip the original request line),
                 // minus the ones that must not be forwarded. `Upgrade` and
                 // `Connection` stay: the upgrade is the point of this request.
-                let rest_start = first_line_end + 2; // skip \r\n
+                let rest_start = first_line_end + 1; // skip the line feed
                 if rest_start < header_end {
                     request_to_send.extend_from_slice(&filter_request_headers(
                         &request_buf[rest_start..header_end],
@@ -2024,6 +2039,63 @@ mod tests {
     /// Enough for the accept loop, which in these tests never gets as far as
     /// dialling one. Built through `shared` rather than `new` because the test
     /// needs the address `new` keeps to itself.
+    /// The refusal is the constructor's, not only the predicate's.
+    ///
+    /// A bind that reaches the network has to fail, and it has to fail with a
+    /// message that names the way out — the predicate on its own says
+    /// nothing about what a caller is supposed to do about it.
+    #[tokio::test]
+    async fn a_non_loopback_bind_is_refused_by_the_constructor() {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            Vec::new(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a group with no backend still builds");
+
+        // `0.0.0.0` is the address every interface answers on, and it is what
+        // the socket becomes — so the refusal is judged by what was bound
+        // rather than by what was asked for.
+        let err = match LocalProxy::new("0.0.0.0:0", Vec::new(), Arc::new(group)).await {
+            Ok(_) => panic!("a bind that reaches the network is refused"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("expose"),
+            "the message has to name the way out of it: {message}"
+        );
+    }
+
+    /// The same bind, with the opt-in: it is allowed, because that is what
+    /// the opt-in is for.
+    #[tokio::test]
+    async fn the_opt_in_binds_a_non_loopback_address() {
+        let ep = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("binding a local endpoint needs no network");
+        let group = EndpointGroup::new_with_nodes_and_endpoint(
+            Vec::new(),
+            None,
+            LoadBalancingStrategy::RoundRobin,
+            ep,
+        )
+        .await
+        .expect("a group with no backend still builds");
+
+        let proxy = LocalProxy::new_exposed("0.0.0.0:0", Vec::new(), Arc::new(group))
+            .await
+            .expect("the opt-in is the way to bind elsewhere");
+        proxy.stop();
+    }
+
     async fn listening_proxy() -> (LocalProxy, std::net::SocketAddr) {
         listening_proxy_for(&[]).await
     }
@@ -2684,6 +2756,38 @@ mod tests {
     /// The headers a request keeps, as one string, with the upgrade kept.
     fn kept_headers_with_upgrade(request: &[u8]) -> String {
         String::from_utf8(filter_request_headers(request, true)).expect("the headers are ASCII")
+    }
+
+    /// A request line that ends with a bare LF still ends there.
+    ///
+    /// The headers after it are the headers, and the first of them is the
+    /// `Host` one — the one that says which name the request is for. A walk
+    /// that took the first `\r\n` instead would step over it, and the server
+    /// substitutes the backend's address for a request that arrives without
+    /// one: a request for a name would then be served by the wrong site.
+    #[test]
+    fn a_bare_lf_request_line_does_not_take_the_first_header_with_it() {
+        let request = b"GET /chat HTTP/1.1\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
+        let end = request_line_end(request);
+
+        assert_eq!(
+            &request[end + 1..],
+            b"Host: example.com\r\nUpgrade: websocket\r\n\r\n",
+            "the headers after the request line are still there"
+        );
+    }
+
+    /// The ordinary spelling, with the carriage return, is the same answer.
+    #[test]
+    fn a_crlf_request_line_ends_where_it_did() {
+        let request = b"GET /chat HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let end = request_line_end(request);
+
+        assert_eq!(
+            &request[end + 1..],
+            b"Host: example.com\r\n\r\n",
+            "the headers after the request line are still there"
+        );
     }
 
     /// The hop-by-hop headers do not cross the tunnel.
