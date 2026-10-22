@@ -403,6 +403,14 @@ impl std::fmt::Debug for LocalProxyTwoFactorConfig {
 pub struct LocalProxyConfig {
     pub enabled: bool,
     pub listen_addr: String,
+    /// Whether the local proxy may bind an address that is reachable from the
+    /// network.
+    ///
+    /// Off by default, and the same shape as `[server] expose`: the local proxy
+    /// hands out the tunnel of a connection that has already authenticated, so
+    /// anything that reaches the port gets the tunnel without a credential.
+    /// Turning this on says that something else gates the port.
+    pub expose: Option<bool>,
     pub proxy_domains: Vec<String>,
     pub nodes: Option<Vec<LocalProxyNode>>,
     pub strategy: Option<String>,

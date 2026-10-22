@@ -51,6 +51,23 @@ fn debug_log_enabled() -> bool {
     false
 }
 
+/// Whether the local proxy may serve `bound`.
+///
+/// **Loopback only, unless the caller says otherwise.** The local proxy does
+/// not authenticate the peer that connects to it: it hands out the tunnel of a
+/// connection that has already authenticated, so whoever reaches the port gets
+/// the tunnel without a credential. That is the same reason the server's own
+/// plaintext listener is loopback-only unless it is explicitly exposed, and
+/// the desktop app already refuses a non-loopback address before it reaches
+/// this crate.
+///
+/// `exposed` is the caller's own answer to the same question: a deployment
+/// that puts something else in front of the port — a firewall, a container
+/// network — says so explicitly rather than by accident.
+pub fn may_bind_local_proxy(bound: SocketAddr, exposed: bool) -> bool {
+    exposed || bound.ip().is_loopback()
+}
+
 /// Headers whose value is a credential, and so never belongs in a log.
 const SENSITIVE_HEADERS: [&str; 5] = [
     "authorization",
@@ -250,10 +267,46 @@ pub struct LocalProxy {
 }
 
 impl LocalProxy {
+    /// Binds the local proxy on `listen_addr`.
+    ///
+    /// **The address has to be a loopback one.** The local proxy does not
+    /// authenticate the peer that connects to it: it hands out the tunnel of a
+    /// connection that has already authenticated, so whoever reaches the port
+    /// gets the tunnel without a credential. A non-loopback bind publishes
+    /// that to everyone who can reach the machine, so it is refused here
+    /// rather than left to the caller to think about.
+    ///
+    /// A deployment that puts something else in front of the port — a
+    /// firewall, a container network — says so with
+    /// [`LocalProxy::new_exposed`], which is the only way to bind
+    /// elsewhere.
     pub async fn new(
         listen_addr: &str,
         proxy_domains: Vec<String>,
         endpoint_group: Arc<EndpointGroup>,
+    ) -> Result<Self, ClientError> {
+        Self::bind(listen_addr, proxy_domains, endpoint_group, false).await
+    }
+
+    /// Binds the local proxy on `listen_addr`, even when it is not a loopback
+    /// address.
+    ///
+    /// The explicit opt-in, for a deployment that gates the port with
+    /// something else. The same shape as the server's `[server] expose`: a
+    /// setting that says "I know, and I have put something in front of it".
+    pub async fn new_exposed(
+        listen_addr: &str,
+        proxy_domains: Vec<String>,
+        endpoint_group: Arc<EndpointGroup>,
+    ) -> Result<Self, ClientError> {
+        Self::bind(listen_addr, proxy_domains, endpoint_group, true).await
+    }
+
+    async fn bind(
+        listen_addr: &str,
+        proxy_domains: Vec<String>,
+        endpoint_group: Arc<EndpointGroup>,
+        exposed: bool,
     ) -> Result<Self, ClientError> {
         #[cfg(feature = "jni")]
         jni_log!("[DEBUG:local-proxy] Binding to {}", listen_addr);
@@ -273,8 +326,19 @@ impl LocalProxy {
                 return Err(e.into());
             }
         };
+        // Judged by the address the socket actually became, so `0.0.0.0` and
+        // `[::]` are caught as what they are rather than as what was asked
+        // for — the same rule the server's plaintext listener follows.
+        let bound = listener.local_addr()?;
+        if !may_bind_local_proxy(bound, exposed) {
+            return Err(ClientError::InvalidConfig(format!(
+                "the local proxy would bind {bound}, which is reachable from the network, and it \
+                 hands out an already-authenticated tunnel to whoever connects. Use a loopback \
+                 address, or LocalProxy::new_exposed when something else gates the port"
+            )));
+        }
         #[cfg(feature = "tracing")]
-        tracing::info!("Local proxy listening on: {}", listen_addr);
+        tracing::info!("Local proxy listening on: {}", bound);
         Ok(Self::shared(
             Arc::new(listener),
             endpoint_group,
@@ -288,9 +352,17 @@ impl LocalProxy {
         conn_pool: IrohConnectionPool,
     ) -> Result<Self, ClientError> {
         let listener = TcpListener::bind(listen_addr).await?;
+        let bound = listener.local_addr()?;
+        if !may_bind_local_proxy(bound, false) {
+            return Err(ClientError::InvalidConfig(format!(
+                "the local proxy would bind {bound}, which is reachable from the network, and it \
+                 hands out an already-authenticated tunnel to whoever connects. Use a loopback \
+                 address"
+            )));
+        }
         let endpoint_group = EndpointGroup::new_with_single_pool(conn_pool).await;
         #[cfg(feature = "tracing")]
-        tracing::info!("Local proxy listening on: {}", listen_addr);
+        tracing::info!("Local proxy listening on: {}", bound);
         Ok(Self::shared(
             Arc::new(listener),
             Arc::new(endpoint_group),
@@ -1043,10 +1115,15 @@ where
             .unwrap_or(0);
 
         if first_line_end > 0 {
-            let request_line = &request_buf[..first_line_end];
-            let line_str = String::from_utf8_lossy(request_line);
-            if let Some((method_rest, version)) = line_str.rsplit_once(" HTTP/")
-                && let Some(method) = method_rest.split_whitespace().next()
+            // The method and the version come from the **parsed** request, not
+            // from the bytes: the request line is rebuilt here, and a raw slice
+            // of it carries whatever the client put there. A bare LF ends the
+            // line for a parser that accepts one, and the rest of it lands in
+            // the version token — straight into the request this proxy sends.
+            let method = request.method().as_str();
+            // `http::Version`'s Debug is the wire spelling — "HTTP/1.1" — and
+            // the request line wants exactly that.
+            let version = format!("{:?}", request.version());
             {
                 let path = request
                     .uri()
@@ -1056,15 +1133,20 @@ where
                 // Use http:// scheme (not ws://) — the backend handles
                 // the WebSocket upgrade via the Upgrade header, not the URI
                 let absolute_uri = format!("http://{}{}", host, path);
-                let new_line = format!("{} {} HTTP/{}\r\n", method, absolute_uri, version);
+                let new_line = format!("{} {} {}\r\n", method, absolute_uri, version);
 
                 let mut request_to_send =
                     Vec::with_capacity(new_line.len() + header_end - first_line_end);
                 request_to_send.extend_from_slice(new_line.as_bytes());
-                // Copy the rest of headers (skip the original request line)
+                // Copy the rest of headers (skip the original request line),
+                // minus the ones that must not be forwarded. `Upgrade` and
+                // `Connection` stay: the upgrade is the point of this request.
                 let rest_start = first_line_end + 2; // skip \r\n
                 if rest_start < header_end {
-                    request_to_send.extend_from_slice(&request_buf[rest_start..header_end]);
+                    request_to_send.extend_from_slice(&filter_request_headers(
+                        &request_buf[rest_start..header_end],
+                        true,
+                    ));
                 }
 
                 jni_log!(
@@ -1235,8 +1317,9 @@ where
     }
 
     // Regular HTTP path
-    // Remove cache validation headers to prevent 304 responses with empty body
-    let filtered_headers = remove_cache_validation_headers(&request_buf[..header_end]);
+    // The hop-by-hop headers go, and so do the cache validation headers that
+    // would make the origin answer with a 304 and an empty body.
+    let filtered_headers = filter_request_headers(&request_buf[..header_end], false);
     let mut request_to_send = filtered_headers;
     request_to_send.extend_from_slice(&request_buf[header_end..]);
 
@@ -1686,19 +1769,57 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     None
 }
 
-fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
+/// The header names a proxy must not forward.
+///
+/// RFC 9110 §7.6.1: these describe one connection rather than the message, so
+/// they belong to the hop the proxy is on and not to the one behind it.
+/// `Proxy-Authorization` is the one that matters most here — it is a
+/// credential for *this* proxy, and forwarding it hands that credential to a
+/// third-party server.
+///
+/// `Transfer-Encoding` is deliberately **not** in the list. It is hop-by-hop,
+/// and the rule says a proxy removes it — but only because the proxy is
+/// expected to re-frame the body. This one does not: the client's bytes cross
+/// the tunnel verbatim, so removing the header would leave a chunked body
+/// with nothing saying it is chunked.
+const HOP_BY_HOP_HEADERS: [&str; 8] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// The header block with the fields that must not be forwarded taken out.
+///
+/// `keep_upgrade` keeps `Upgrade` and `Connection`, which is what the
+/// WebSocket request is about: the upgrade is the point of it, and a backend
+/// that does not see it does not switch protocols.
+///
+/// The names `Connection` nominates go as well — RFC 9110 §7.6.1 makes that
+/// header a list of the names that are hop-by-hop for this message — so a
+/// `Connection: X-Secret` does not carry `X-Secret` on.
+///
+/// The two cache-validation headers go too: they make the origin answer with
+/// a 304 and an empty body, which the proxy has no way to fill.
+fn filter_request_headers(block: &[u8], keep_upgrade: bool) -> Vec<u8> {
+    let nominated = nominated_hop_by_hop(block);
+
     // The input always ends with \r\n\r\n (the HTTP header terminator,
-    // up to header_end). We iterate over each header line, strip the cache
-    // validation headers, and preserve the original \r\n\r\n terminator
-    // so the body (appended separately) starts at the right position.
-    let mut result = Vec::with_capacity(header_bytes.len());
+    // up to header_end). We iterate over each header line and preserve the
+    // original \r\n\r\n terminator, so the body (appended separately) starts
+    // at the right position.
+    let mut result = Vec::with_capacity(block.len());
     let mut start = 0;
 
-    while let Some(pos) = header_bytes[start..].windows(2).position(|w| w == b"\r\n") {
+    while let Some(pos) = block[start..].windows(2).position(|w| w == b"\r\n") {
         let line_end = start + pos;
-        let line = &header_bytes[start..line_end];
+        let line = &block[start..line_end];
 
-        if !is_cache_validation_header(line) {
+        if !is_dropped_header(line, keep_upgrade, &nominated) {
             result.extend_from_slice(line);
             result.extend_from_slice(b"\r\n");
         }
@@ -1708,6 +1829,84 @@ fn remove_cache_validation_headers(header_bytes: &[u8]) -> Vec<u8> {
 
     // Loop already preserved the \r\n\r\n terminator — don't add an extra one
     result
+}
+
+/// The header names `Connection` nominates as hop-by-hop.
+///
+/// RFC 9110 §7.6.1: `Connection` lists the names that are hop-by-hop for
+/// this message, so a `Connection: X-Secret` means `X-Secret` must not be
+/// forwarded either.
+fn nominated_hop_by_hop(block: &[u8]) -> Vec<Vec<u8>> {
+    let mut nominated = Vec::new();
+    let mut start = 0;
+
+    while let Some(pos) = block[start..].windows(2).position(|w| w == b"\r\n") {
+        let line_end = start + pos;
+        let line = &block[start..line_end];
+
+        if let Some(value) = header_value(line, b"connection") {
+            for token in value.split(|b| *b == b',') {
+                let token: Vec<u8> = token
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .collect();
+                if !token.is_empty() {
+                    nominated.push(token.to_ascii_lowercase());
+                }
+            }
+        }
+
+        start = line_end + 2;
+    }
+
+    nominated
+}
+
+/// The name of a header line, lower-cased, or `None` when the line is not a
+/// header.
+///
+/// A name with a space in it is not a name: the request line is the one line
+/// that can carry a colon without being a header (`GET /a:b HTTP/1.1`), and it
+/// is not a header at all.
+fn header_name(line: &[u8]) -> Option<Vec<u8>> {
+    let colon = line.iter().position(|b| *b == b':')?;
+    let name = &line[..colon];
+    if name.is_empty() || name.iter().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+/// The value of a header line, when the line is that header.
+fn header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let colon = line.iter().position(|b| *b == b':')?;
+    if !line[..colon].eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(&line[colon + 1..])
+}
+
+/// Whether a header line must not be forwarded.
+fn is_dropped_header(line: &[u8], keep_upgrade: bool, nominated: &[Vec<u8>]) -> bool {
+    if is_cache_validation_header(line) {
+        return true;
+    }
+
+    let Some(name) = header_name(line) else {
+        return false;
+    };
+
+    // The upgrade is the point of a WebSocket request, so it stays there.
+    if keep_upgrade && (name == b"upgrade" || name == b"connection") {
+        return false;
+    }
+
+    if HOP_BY_HOP_HEADERS.iter().any(|hop| name == hop.as_bytes()) {
+        return true;
+    }
+
+    nominated.iter().any(|token| token == &name)
 }
 
 /// Whether a header line is one of the two cache-validation headers.
@@ -2479,7 +2678,130 @@ mod tests {
 
     /// The headers a request keeps, as one string.
     fn kept_headers(request: &[u8]) -> String {
-        String::from_utf8(remove_cache_validation_headers(request)).expect("the headers are ASCII")
+        String::from_utf8(filter_request_headers(request, false)).expect("the headers are ASCII")
+    }
+
+    /// The headers a request keeps, as one string, with the upgrade kept.
+    fn kept_headers_with_upgrade(request: &[u8]) -> String {
+        String::from_utf8(filter_request_headers(request, true)).expect("the headers are ASCII")
+    }
+
+    /// The hop-by-hop headers do not cross the tunnel.
+    ///
+    /// `Proxy-Authorization` is the one that matters most: it is a credential
+    /// for *this* proxy, and forwarding it hands it to a third-party server.
+    #[test]
+    fn the_hop_by_hop_headers_do_not_cross_the_tunnel() {
+        let request = b"GET / HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        Proxy-Authorization: Basic c2VjcmV0\r\n\
+                        Proxy-Authenticate: Basic\r\n\
+                        Proxy-Connection: keep-alive\r\n\
+                        Keep-Alive: timeout=5\r\n\
+                        Te: trailers\r\n\
+                        Trailer: Expires\r\n\
+                        Accept: */*\r\n\r\n";
+
+        let kept = kept_headers(request).to_ascii_lowercase();
+
+        for header in [
+            "proxy-authorization",
+            "proxy-authenticate",
+            "proxy-connection",
+            "keep-alive",
+            "te:",
+            "trailer:",
+        ] {
+            assert!(!kept.contains(header), "{header} was forwarded:\n{kept}");
+        }
+        assert!(kept.contains("host: example.com"), "{kept}");
+        assert!(kept.contains("accept: */*"), "{kept}");
+    }
+
+    /// `Connection` nominates the names that are hop-by-hop for this message,
+    /// so a header it names must not be forwarded either.
+    #[test]
+    fn a_header_connection_nominates_does_not_cross_the_tunnel() {
+        let request = b"GET / HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        Connection: X-Secret, close\r\n\
+                        X-Secret: the-password\r\n\
+                        Accept: */*\r\n\r\n";
+
+        let kept = kept_headers(request);
+
+        assert!(!kept.to_ascii_lowercase().contains("x-secret"), "{kept}");
+        assert!(kept.contains("Accept: */*"), "{kept}");
+    }
+
+    /// The framing of the body is carried over verbatim, so the header that
+    /// describes it stays: a chunked body with nothing saying it is chunked is
+    /// a request the backend cannot read.
+    #[test]
+    fn the_transfer_encoding_stays_because_the_body_stays() {
+        let request = b"POST / HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        Transfer-Encoding: chunked\r\n\
+                        Accept: */*\r\n\r\n";
+
+        let kept = kept_headers(request);
+
+        assert!(
+            kept.to_ascii_lowercase().contains("transfer-encoding"),
+            "{kept}"
+        );
+    }
+
+    /// The upgrade is the point of a WebSocket request, so it stays.
+    #[test]
+    fn the_upgrade_stays_when_the_request_is_one() {
+        let request = b"GET /ws HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        Upgrade: websocket\r\n\
+                        Connection: Upgrade\r\n\
+                        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+
+        let kept = kept_headers_with_upgrade(request).to_ascii_lowercase();
+
+        assert!(kept.contains("upgrade: websocket"), "{kept}");
+        assert!(kept.contains("connection: upgrade"), "{kept}");
+        assert!(kept.contains("sec-websocket-key:"), "{kept}");
+    }
+
+    /// The request line is not a header, even when it carries a colon: it is
+    /// the one line that must survive the filter untouched.
+    #[test]
+    fn the_request_line_is_not_mistaken_for_a_header() {
+        let request = b"GET /a:b HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let kept = kept_headers(request);
+
+        assert!(kept.starts_with("GET /a:b HTTP/1.1\r\n"), "{kept}");
+    }
+
+    /// The local proxy hands out the tunnel of a connection that has already
+    /// authenticated, so it is loopback-only unless the caller says otherwise.
+    #[test]
+    fn the_local_proxy_is_loopback_only_unless_the_caller_says_otherwise() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("an address");
+        let v6_loopback: SocketAddr = "[::1]:8080".parse().expect("an address");
+        let lan: SocketAddr = "192.168.1.10:8080".parse().expect("an address");
+        let any: SocketAddr = "0.0.0.0:8080".parse().expect("an address");
+        let any_v6: SocketAddr = "[::]:8080".parse().expect("an address");
+
+        assert!(may_bind_local_proxy(loopback, false));
+        assert!(may_bind_local_proxy(v6_loopback, false));
+
+        for bound in [lan, any, any_v6] {
+            assert!(
+                !may_bind_local_proxy(bound, false),
+                "{bound} is reachable from the network"
+            );
+            assert!(
+                may_bind_local_proxy(bound, true),
+                "{bound} needs the explicit opt-in"
+            );
+        }
     }
 
     /// A conditional request loses the headers that would make the origin

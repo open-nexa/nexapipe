@@ -473,6 +473,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The WebSocket request line is rebuilt from the parsed request.** The
+  client rebuilt the line it sends from the raw bytes of the one it
+  received, and the HTTP version came out of that split — so a request line
+  carrying a bare LF put the rest of the line into the version token, and
+  the proxy sent a request whose first line a lenient parser would read as
+  two. The method and the version come from the parsed request now, where
+  both are validated.
 - **An invite's relay hint has to name a relay this client can reach.** The
   hint was accepted whenever the URL parser accepted it, so `ftp://`,
   `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
@@ -616,6 +623,26 @@ lookup, which is what a config written before the key existed does.
   at all.
 
 ### Security
+
+- **The local proxy does not hand out an authenticated tunnel to the
+  network.** The client library bound whatever address it was given, and it
+  does not authenticate the peer that connects to it — it hands out the tunnel
+  of a connection that has already authenticated. So a non-loopback bind
+  published that tunnel to everyone who could reach the machine, and the
+  server's `[local_proxy]` section passed the address through without
+  checking it. The library refuses a non-loopback address now, the same
+  shape as the server's own plaintext listener and as the desktop app's
+  `require_loopback`, and `[local_proxy] expose = true` is the explicit
+  opt-in for a deployment that puts something else in front of the port.
+- **A proxy credential no longer crosses the tunnel.** `Proxy-Authorization`
+  is a credential for *this* proxy, and it was forwarded to the backend
+  along with the rest of the hop-by-hop headers — on the client's side and on
+  the server's, in the WebSocket path as well as the ordinary one. The
+  client's bytes cross the tunnel verbatim, so the whole hop-by-hop set goes
+  now: `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+  `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`,
+  together with whatever `Connection` nominates. `Transfer-Encoding` stays,
+  because the body it describes is carried over unchanged.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
