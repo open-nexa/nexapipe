@@ -9,8 +9,8 @@
 #   1. Preflight  - ui-desktop present, crates/ path dependency reachable,
 #                   node/npm/cargo on PATH, rustup macOS target,
 #                   Tauri macOS deps (Xcode CLI tools) present.
-#   2. Frontend   - npm install (skipped when node_modules exists), then a probe
-#                   of the local @tauri-apps/cli; wipe & reinstall on failure.
+#   2. Frontend   - npm ci (always), then a probe of the local
+#                   @tauri-apps/cli; wipe & reinstall on failure.
 #   3. Override   - write .workbuddy/build-override.json that:
 #                   * enables only macOS bundle target (app dmg), drops
 #                     Windows/Linux ones so the build does not waste time
@@ -70,6 +70,18 @@ bad()  { printf '  %s[FAIL]%s %s\n'  "$C_RED"    "$C_RESET" "$*"; }
 info() { printf '  %s%s%s\n'         "$C_GRAY"   "$*"       "$C_RESET"; }
 die()  { bad "$*"; exit 1; }
 
+# Installs the frontend from the committed lockfile.
+#
+# `npm ci` and not `npm install`: a bundle has to be built from the tree that
+# is committed and audited, not from whatever the registry serves today.
+# `npm ci` fails when package-lock.json and package.json disagree, which is a
+# thing to fix in the lockfile rather than around it — so the message says so
+# instead of leaving npm's own error to explain it.
+install_frontend() {
+    npm ci --no-audit --no-fund \
+        || die "npm ci failed. Either package-lock.json and package.json disagree, or the registry is unreachable. If the lockfile is stale, run 'npm install' in ui-desktop and commit the updated package-lock.json."
+}
+
 usage() {
     cat <<'EOF'
 build_dmg.sh - build the nexa desktop macOS DMG (Tauri 2)
@@ -87,8 +99,8 @@ Options:
   --no-bundle            Build the binary only, skip packaging.
   --skip-type-check      Frontend build runs `npx vite build`, skipping vue-tsc.
   --skip-frontend        Do not rebuild the frontend at all; dist/ must be current.
-  --skip-install         Skip npm install even when node_modules is missing.
-  --force-install        Run npm install even when node_modules exists.
+  --skip-install         Skip the frontend install even when node_modules is missing.
+  --force-install        Accepted and ignored: the frontend install always runs.
   --no-sign              Never create updater artefacts, even with a signing key.
   --clean                Delete ui-desktop/dist and the bundle output before building.
   --check                Preflight only: print the resolved paths, versions, plan.
@@ -108,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --skip-type-check) SKIP_TYPE_CHECK=true; shift ;;
         --skip-frontend)   SKIP_FRONTEND=true; shift ;;
         --skip-install)    SKIP_INSTALL=true; shift ;;
+        # The install always runs now, so the flag is the default.
         --force-install)   FORCE_INSTALL=true; shift ;;
         --no-sign)         NO_SIGN=true; shift ;;
         --clean)           CLEAN=true; shift ;;
@@ -158,7 +171,7 @@ step "Preflight"
 [[ -f "$TAURI_DIR/Cargo.toml" ]]            || die "src-tauri/Cargo.toml missing"
 [[ -f "$TAURI_DIR/tauri.conf.json" ]]       || die "src-tauri/tauri.conf.json missing"
 
-# Everything past this point — the CLI probe, npm install and the build — expects
+# Everything past this point — the CLI probe, the frontend install and the build — expects
 # to run inside ui-desktop. The paths above are absolute, so entering it here is
 # safe and means the probe sees the same tree the build will.
 cd "$DESKTOP_DIR"
@@ -199,7 +212,7 @@ if ! tauri_cli_works; then
         die "Tauri CLI not runnable at $TAURI_BIN, drop --skip-install to let the script install it"
     fi
     warn "Tauri CLI not runnable yet — installing frontend dependencies"
-    npm install --no-audit --no-fund
+    install_frontend
     tauri_cli_works || die "Tauri CLI still not runnable after installing ($TAURI_BIN)"
 fi
 ok "tauri CLI $(tauri_cli_version)"
@@ -279,24 +292,32 @@ fi
 # Frontend dependencies (cwd is already ui-desktop, see preflight)
 # ---------------------------------------------------------------------------
 if $SKIP_INSTALL; then
-    step "Skipping npm install (--skip-install)"
-elif $FORCE_INSTALL || [[ ! -d node_modules ]]; then
-    step "Installing frontend dependencies"
-    npm install --no-audit --no-fund
+    step "Skipping the frontend install (--skip-install)"
 else
-    step "node_modules exists, skipping npm install (--force-install to rerun)"
+    # The install is unconditional, and that is the point: a `node_modules`
+    # that is already there may have been resolved from a different lockfile
+    # — a tree nobody committed and `npm audit` never saw — and a bundle
+    # built from it is a bundle nobody reviewed. `--skip-install` is the way
+    # out, for someone who knows what their tree is.
+    step "Installing frontend dependencies"
+    # npm ci, not npm install: the bundle has to be built from the committed
+    # lockfile, not from whatever the registry serves today. npm ci installs
+    # strictly from the lockfile and fails outright when package-lock.json and
+    # package.json disagree, which is the point.
+    install_frontend
 fi
 
 if ! tauri_cli_works; then
     if $SKIP_INSTALL; then
         die "Tauri CLI not runnable at $TAURI_BIN, drop --skip-install to let the script install it"
     fi
-    warn "Tauri CLI not runnable — wiping node_modules and reinstalling once"
-    # package-lock.json is deliberately left alone: it is the record of the tree
-    # that is supposed to resolve, and regenerating it would paper over the very
-    # mismatch this branch exists to repair.
-    rm -rf node_modules
-    npm install --no-audit --no-fund
+    # The lockfile is deliberately left alone: it is the record of the tree
+    # that is supposed to resolve, and regenerating it would paper over the
+    # very mismatch this branch exists to repair. Re-resolving it here would
+    # also put a tree nobody reviewed into a signed bundle.
+    warn "Tauri CLI not runnable — reinstalling from the committed lockfile once"
+    rm -rf "$DESKTOP_DIR/node_modules"
+    install_frontend
     tauri_cli_works || die "Tauri CLI still not runnable after reinstalling ($TAURI_BIN)"
 fi
 ok "tauri CLI $(tauri_cli_version)"
