@@ -15,7 +15,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use nexapipe::config::RouteMode;
 use nexapipe::lb::LoadBalancingStrategy;
-use nexapipe::routes::{Route, RoutingTable};
+use nexapipe::routes::{BackendLookup, Route, RoutingTable};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -33,12 +33,17 @@ const HOST: &str = "target.test";
 const PATH: &str = "/api/v1/things";
 
 /// A table of routes, the one that matches last.
+///
+/// The path pattern is `/`, which is the catch-all a route uses to say "any
+/// path". **`/*` is not a wildcard**: `path_suffix` treats it as a literal
+/// `/*` prefix, so a route with it matches no ordinary path at all — and a
+/// table of those matches nothing, which is a different measurement.
 fn table() -> RoutingTable {
     let mut routes: Vec<Route> = (0..ROUTES)
         .map(|i| {
             Route::new(
                 &format!("site{i}.test"),
-                "/*",
+                "/",
                 true,
                 vec!["http://127.0.0.1:1".to_string()],
                 LoadBalancingStrategy::RoundRobin,
@@ -49,7 +54,7 @@ fn table() -> RoutingTable {
         .collect();
     routes.push(Route::new(
         HOST,
-        "/*",
+        "/",
         true,
         vec!["http://127.0.0.1:1".to_string()],
         LoadBalancingStrategy::RoundRobin,
@@ -73,7 +78,16 @@ fn route_lookup(c: &mut Criterion) {
 
                 let start = Instant::now();
                 for _ in 0..iters {
-                    black_box(table.get_backend_with_acl(HOST, PATH, None, None).await);
+                    let found = table.get_backend_with_acl(HOST, PATH, None, None).await;
+                    // The bench measures a lookup that **matches**. It used
+                    // not to: every route's path pattern was `/*`, which
+                    // matches nothing, so the walk ended at the table's end
+                    // with no route taken — and the number said otherwise.
+                    assert!(
+                        matches!(&found, BackendLookup::Found(_)),
+                        "the last route should serve {HOST}{PATH}"
+                    );
+                    black_box(found);
                 }
                 start.elapsed()
             })
@@ -87,11 +101,16 @@ fn route_lookup(c: &mut Criterion) {
 
                 let start = Instant::now();
                 for _ in 0..iters {
-                    black_box(
-                        table
-                            .get_backend_with_acl("nowhere.test", PATH, None, None)
-                            .await,
+                    let found = table
+                        .get_backend_with_acl("nowhere.test", PATH, None, None)
+                        .await;
+                    // The other half of the same claim: a host no route
+                    // serves finds nothing, and says so.
+                    assert!(
+                        matches!(&found, BackendLookup::NoRoute),
+                        "no route should serve nowhere.test"
                     );
+                    black_box(found);
                 }
                 start.elapsed()
             })
