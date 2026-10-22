@@ -94,6 +94,16 @@ name = "forwarding_path"
 harness = false
 required-features = ["local-proxy"]
 
+# The local proxy on a plain HTTP request: the path a browser takes when it
+# uses the proxy for ordinary HTTP rather than for a tunnel. The CONNECT
+# tunnel is measured by `forwarding_path`; this is the other way a request
+# goes through the same proxy, and it is the one `forwarding_path` does not
+# cover.
+[[bench]]
+name = "local_request"
+harness = false
+required-features = ["local-proxy"]
+
 # The client asking whether a name is one of its own. It is a bench of its own
 # because it is the only place a long list of names is walked on every request.
 [[bench]]

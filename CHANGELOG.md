@@ -290,6 +290,23 @@ lookup, which is what a config written before the key existed does.
   the DNS forward branch, the idle wake-up rate, the per-flow memory, and
   both crates' HTTP request paths. Those are still expectations, and saying
   so is what keeps the ones that are results honest.
+- **The client's HTTP request path is measured too.** The benchmarks that
+  landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
+  cost, the server's routing table and the client's own name matching. They
+  did not measure the path a browser takes through the local proxy when it
+  uses it for ordinary HTTP rather than for a tunnel: the request head is
+  parsed, the `Host` header is found and checked against the domains the
+  client proxies, the forwarded headers are rewritten, a bi-stream is
+  opened, the request is written and the response is copied back. None of
+  that was in any of the numbers, and all of it happens on every request.
+  It is a benchmark of its own now, with two: **100 µs** from the
+  application sending to the response head arriving — the wait before a
+  page can start rendering — and **138 µs** for the whole request, from
+  before the connection is opened to after the proxy closes it.
+  It measures the client's half of a request. The far side of the bench is
+  an HTTP server over an iroh bi-stream on the same host, so what the
+  server does with the request is still not measured, and the list of what
+  is not measured says so.
 
 ### Changed
 
@@ -314,6 +331,27 @@ lookup, which is what a config written before the key existed does.
   unknown keys (`[auth]`, `[limits]` and `[peers]`) keep refusing them. A
   `config.toml` that only carries keys this build knows loads exactly as it
   did.
+- **A guess at a pending enrollment token no longer locks the client out of
+  authenticating.** A client id is not a secret: it is in the invite link, in
+  `nexapipe client list` and in whatever the operator pasted into a ticket. So
+  anybody who knew one could send enrollment attempts at a client that was
+  waiting to enroll — and, because those attempts were counted against the
+  client's own `failed_attempts`, lock out the devices that had already
+  enrolled, over a credential those devices were never sent.
+  The token keeps its ceiling: `max_attempts` wrong guesses close the
+  enrollment for the lockout window, and the right token is refused with it.
+  What changed is which counter pays. The guess moves the enrollment's own
+  `enrollment_failed_attempts` and `enrollment_locked_until`; the client's
+  `failed_attempts` and `locked_until` stay where they were. The two are
+  listed side by side in `GET /v1/clients`, and the enrollment's counter is
+  written to `state.toml` beside the client's — so it survives a restart
+  without ever touching the credential the devices hold. A successful
+  enrollment clears the guesses with the token it spent, and a config reload
+  carries the counter the server has been maintaining rather than the file's
+  older copy — except when the file carries a new token, which starts with its
+  own budget.
+  A client whose devices have already enrolled goes on authenticating
+  throughout.
 
 - **A route's `path_pattern` is a prefix in the path sense.**
   `path_pattern = "/api"` used to match `/apifoo` as well as `/api/x`: the
@@ -473,6 +511,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **Revoking one device says what the shared secret still is.** `client revoke
+  <id> --device <name>` strikes one device out and leaves the client's own
+  secret standing — and that secret is still a credential: a peer that names
+  no device answers with it, because `unnamed_device_allowed` is `true` by
+  default. The revoke said the secret was untouched; it did not say what that
+  means or how to change it. It names the setting now, and when the setting is
+  already off it says the untouched secret authenticates no one instead of
+  claiming it still does.
+- **The comments about the config file's permissions tell the truth.** The
+  startup refusal over a world-readable config was removed on purpose
+  (ROADMAP §3.5), so that a `0644` bind mount starts — but several comments
+  still described it, and one still said the server "refuses to *start*" over
+  one. What is left is a warning, and it is there: the config says so itself
+  now, in the places that used to claim otherwise.
 - **An invite's relay hint has to name a relay this client can reach.** The
   hint was accepted whenever the URL parser accepted it, so `ftp://`,
   `file:///etc/passwd` and a bare `http://` all passed. The scheme, the host
@@ -617,6 +669,24 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **A registration code no longer silently replaces a working credential.**
+  The Android app asked before an invite overwrote something that worked — but
+  the question was asked for a secret and for the relay, and a one-time
+  enrollment code was neither: it carries no secret, so it raised no conflict,
+  and it was applied with no confirmation at all. The credential the endpoint
+  already held went with it, and because the guard in `ProxyConnector` that
+  keeps an endpoint from spending a token it already has a credential for
+  looks at what the endpoint holds, the drop that came before it defeated the
+  guard. A registration code is exactly the artefact a user is primed to
+  accept — shared in a chat, pasted by an "operator", one tap from the
+  scanner — so this was a credential one accepted code could destroy.
+  The rule now names the enrollment, and it is a pure function with tests
+  beside it: `ui/InviteConflicts.kt`.
+- **The client id no longer reaches the log.** It is half of the 2FA
+  credential pair, and the app says so where it logs the other one — but the
+  invite import and the enrollment update both wrote it out in full, to the
+  on-screen log panel and to logcat. What kind of credential arrived is what
+  those lines are about; the id is not in them any more.
 - **A release is built from the committed dependency tree.** The desktop
   bundles were installed with `npm install`, and the release workflow had a
   fallback that deleted `package-lock.json` and re-resolved the whole frontend

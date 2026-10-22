@@ -265,8 +265,14 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             }
         }
         // An enrollment invite spends its token on the next connect, which is
-        // also when the credentials arrive — so nothing is written here but the
-        // token itself.
+        // also when the credentials arrive — so the token itself is the only
+        // thing written here.
+        //
+        // The credential this endpoint holds now goes with it, because what
+        // comes back replaces it: the server issues a fresh one and the old
+        // secret stops being a credential. That is a replacement of something
+        // that works, so `inviteConflicts` names it and the confirmation stands
+        // in front of it.
         invite.enrollment?.let { enrollment ->
             viewModel.updateNodeEnrollment(
                 nodeId,
@@ -274,9 +280,16 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             )
             viewModel.updateNodeTwoFactor(nodeId, null)
         }
+        // No client id in the log: debug builds expose Log.d, and the id is
+        // half of the 2FA credential pair. What kind of credential arrived is
+        // what the line is about.
+        val credential = when {
+            invite.totp != null -> "totp"
+            invite.enrollment != null -> "enrollment"
+            else -> "none"
+        }
         viewModel.addLog(
-            "Imported invite: node=$nodeId domains=${invite.domains.size} " +
-                "2FA=${invite.totp?.clientId ?: invite.enrollment?.clientId ?: "none"}"
+            "Imported invite: node=$nodeId domains=${invite.domains.size} 2FA=$credential"
         )
         Toast.makeText(
             context,
@@ -291,24 +304,27 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      *
      * Empty means the import only adds things, so it can go through without a
      * question; domains merging into an existing node is additive too.
+     *
+     * The rule itself is `inviteConflictKinds`, which is a pure function and
+     * is tested as one; this is the part that turns a conflict into the
+     * sentence the confirmation shows.
      */
-    fun inviteConflicts(invite: EndpointInvite): List<String> = buildList {
-        invite.totp?.let { otp ->
-            // Only this endpoint's credentials are replaced: 2FA belongs to
-            // the endpoint, so every other one is left alone.
-            val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }?.twoFactor
-            if (current != null && current.secret.isNotBlank() &&
-                (current.secret != otp.secret || current.clientId != otp.clientId)
-            ) {
-                val client = current.clientId.ifBlank {
-                    localizedContext.getString(R.string.invite_conflict_2fa_current_client)
+    fun inviteConflicts(invite: EndpointInvite): List<String> {
+        val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }
+        return inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
+            when (kind) {
+                InviteConflict.TwoFactor -> {
+                    val client = current?.twoFactor?.clientId?.ifBlank {
+                        localizedContext.getString(R.string.invite_conflict_2fa_current_client)
+                    } ?: localizedContext.getString(R.string.invite_conflict_2fa_current_client)
+                    localizedContext.getString(R.string.invite_conflict_2fa, client)
                 }
-                add(localizedContext.getString(R.string.invite_conflict_2fa, client))
-            }
-        }
-        invite.relay?.let { relay ->
-            if (relayMode != "custom" || (relayUrl.isNotBlank() && relayUrl != relay)) {
-                add(localizedContext.getString(R.string.invite_conflict_relay))
+                InviteConflict.EnrollmentReplacesTwoFactor ->
+                    localizedContext.getString(R.string.invite_conflict_enrollment)
+                InviteConflict.PendingEnrollment ->
+                    localizedContext.getString(R.string.invite_conflict_enrollment_pending)
+                InviteConflict.Relay ->
+                    localizedContext.getString(R.string.invite_conflict_relay)
             }
         }
     }
@@ -326,6 +342,9 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             )
         )
         val otp = invite.totp
+        // A local, so the branch below can smart-cast it: `invite.enrollment!!`
+        // was an assertion the compiler already knows is unnecessary.
+        val enrollment = invite.enrollment
         add(
             when {
                 otp != null -> localizedContext.getString(
@@ -333,9 +352,9 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     otp.clientId,
                     otp.algorithm.uppercase(Locale.ROOT)
                 )
-                invite.enrollment != null -> localizedContext.getString(
+                enrollment != null -> localizedContext.getString(
                     R.string.invite_summary_enrollment,
-                    invite.enrollment!!.clientId
+                    enrollment.clientId
                 )
                 else -> localizedContext.getString(R.string.invite_summary_2fa_none)
             }
