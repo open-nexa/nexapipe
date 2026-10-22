@@ -7,6 +7,8 @@ pub mod quit;
 pub mod service;
 pub mod status;
 pub mod tray;
+#[cfg(windows)]
+mod win;
 
 use error::{codes, AppError};
 use nexapipe_client::auth::DeviceKey;
