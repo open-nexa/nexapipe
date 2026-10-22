@@ -626,6 +626,15 @@ pub(crate) async fn open_stream_with_retry_until(
     let mut tried: Vec<EndpointId> = Vec::new();
 
     for _attempt in 1..=OPEN_ATTEMPTS {
+        // The budget is gone: another attempt would time out at once, and the
+        // backend it would be spent on is not the one that ran out of time.
+        // Stopping here keeps the health accounting honest — a backend that
+        // was never dialled must not be recorded as having failed.
+        if tokio::time::Instant::now() >= deadline {
+            last_err = Some(ClientError::TimeoutError);
+            break;
+        }
+
         let pooled_conn = match endpoint_group.get_connection(host).await {
             Ok(conn) => conn,
             Err(e) => {
