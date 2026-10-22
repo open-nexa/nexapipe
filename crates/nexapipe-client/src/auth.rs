@@ -250,31 +250,6 @@ enum Proof {
     Key(iroh::SecretKey),
 }
 
-/// Who a credential proves itself as: the client, and the device of it.
-///
-/// Owned, so that a connection can keep the identity it was authenticated as
-/// for as long as it lives: the credential that made it may be replaced long
-/// before the connection goes, and the pool has to be able to tell a
-/// connection of the identity that is gone from one of the identity that is
-/// current.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CredentialIdentity {
-    client_id: String,
-    device_id: Option<String>,
-}
-
-impl CredentialIdentity {
-    /// The client this identity belongs to.
-    pub fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
-    /// The device of it, when it named one.
-    pub fn device_id(&self) -> Option<&str> {
-        self.device_id.as_deref()
-    }
-}
-
 /// Client-side 2FA authenticator
 ///
 /// The `Debug` is written out for the same reason [`TwoFactorConfig`]'s is: the
@@ -409,11 +384,8 @@ impl TwoFactorAuth {
     /// connection authenticated as that account still stands for it. Two
     /// credentials with different identities are different accounts, and a
     /// connection authenticated as the old one is not the new one's.
-    pub fn identity(&self) -> CredentialIdentity {
-        CredentialIdentity {
-            client_id: self.client_id.clone(),
-            device_id: self.device_id.clone(),
-        }
+    pub fn identity(&self) -> (&str, Option<&str>) {
+        (self.client_id.as_str(), self.device_id.as_deref())
     }
 
     /// Generate current TOTP code
