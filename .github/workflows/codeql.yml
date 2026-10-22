@@ -27,10 +27,11 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    # A pull request that touches nothing but Markdown changes no code, so
-    # there is nothing here for it to catch.
+    # A pull request that touches nothing but documentation changes no code,
+    # so there is nothing here for it to catch.
     paths-ignore:
       - "**/*.md"
+      - "docs/**"
   schedule:
     # Weekly, Monday 04:17 UTC — off the hour so it does not queue behind other
     # scheduled workflows.
