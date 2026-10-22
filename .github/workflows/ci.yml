@@ -600,12 +600,17 @@ jobs:
   # It runs when the manifest or the lockfile changes, which is the only time
   # the answer can be a different one: a lockfile that installs on every
   # platform keeps installing on every platform until one of them changes.
+  #
+  # Pull requests only, like the image build below: the lockfile is checked
+  # on the pull request that changes it, and a push to main is already
+  # behind such a pull request. Six runners for a push that changed no
+  # lockfile is six runners spent on an answer nobody asked for.
   desktop-npm-ci:
     name: desktop npm ci (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     needs: changes
-    if: needs.changes.outputs.desktop_lockfile == 'true'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.desktop_lockfile == 'true'
 
     strategy:
       fail-fast: false
