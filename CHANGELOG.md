@@ -443,6 +443,14 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The L4 sniffer reads its buffer once.** Every chunk appended to that
+  side's buffer and then re-ran the decision over the **whole** buffer, so a
+  peer that opens a flow with something this proxy does not read — an SSH
+  banner, a database greeting — and then dribbles it out one byte at a time
+  made the sniffer rescan everything it had buffered, on every byte, up to
+  16 KiB: 268,451,840 bytes examined for 16,384 bytes of flow. The scan keeps
+  its position now, so the cost is linear. The answer does not change: the
+  bytes that were scanned and held no line are not looked at again.
 - **The desktop's DNS server keeps its sockets.** The desktop had a second
   DNS implementation — its own resolver chain, its own timeouts, its own
   socket handling — and like the client's it built **a new UDP socket for

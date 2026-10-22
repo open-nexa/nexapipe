@@ -97,11 +97,36 @@ enum BackendVerdict {
     Other,
 }
 
+/// How far the line scan has got, and what it has cost.
+///
+/// The scan does not start over between chunks: the bytes before `from` have
+/// been looked at and held no line, and looking at them again would make the
+/// cost of a flow quadratic in its bytes. A peer that opens a flow with
+/// something this proxy does not read — an SSH banner, a database greeting —
+/// and then dribbles it out one byte at a time would make every byte rescan
+/// everything buffered so far, up to the cap.
+///
+/// The answer is the same whatever the chunking: the bytes before `from` held
+/// no line, so the line is either in the part already scanned — in which case
+/// it would have been found — or it starts in the new part.
+#[derive(Debug, Default, Clone, Copy)]
+struct Scan {
+    /// The offset the next scan starts at.
+    from: usize,
+    /// How many bytes the scan has looked at, over the whole flow.
+    ///
+    /// It is here so that a test can say the work is linear rather than
+    /// quadratic: the alternative is a test that measures time, and a test
+    /// that measures time fails on a loaded machine.
+    examined: usize,
+}
+
 /// The client's side of the observation.
 #[derive(Debug, Default)]
 struct ClientSniff {
     bytes: Vec<u8>,
     verdict: ClientVerdict,
+    scan: Scan,
 }
 
 /// The backend's side of the observation.
@@ -109,6 +134,7 @@ struct ClientSniff {
 struct BackendSniff {
     bytes: Vec<u8>,
     verdict: BackendVerdict,
+    scan: Scan,
 }
 
 /// Watches the two ends of one flow and says what they said.
@@ -148,18 +174,26 @@ impl FlowSniffer {
         if self.client_done.load(Ordering::Relaxed) {
             return;
         }
-        let mut sniff = self.lock_client();
-        if !matches!(sniff.verdict, ClientVerdict::Undecided) {
+        // The three fields are taken apart rather than reached through the
+        // guard: the decision needs the bytes and the scan position at the
+        // same time, and a guard hands out borrows of the whole thing.
+        let mut guard = self.lock_client();
+        let ClientSniff {
+            bytes: buffered,
+            verdict,
+            scan,
+        } = &mut *guard;
+        if !matches!(*verdict, ClientVerdict::Undecided) {
             return;
         }
-        append_bounded(&mut sniff.bytes, bytes);
-        sniff.verdict = decide_client(&sniff.bytes);
-        if !matches!(sniff.verdict, ClientVerdict::Undecided) {
+        append_bounded(buffered, bytes);
+        *verdict = decide_client(buffered, scan);
+        if !matches!(*verdict, ClientVerdict::Undecided) {
             self.client_done.store(true, Ordering::Relaxed);
             // The answer is known and the bytes behind it are not needed any
             // more: a flow that lasts an hour must not hold the head of its
             // first packet for the whole hour.
-            sniff.bytes = Vec::new();
+            buffered.clear();
         }
     }
 
@@ -167,15 +201,20 @@ impl FlowSniffer {
         if self.backend_done.load(Ordering::Relaxed) {
             return;
         }
-        let mut sniff = self.lock_backend();
-        if !matches!(sniff.verdict, BackendVerdict::Undecided) {
+        let mut guard = self.lock_backend();
+        let BackendSniff {
+            bytes: buffered,
+            verdict,
+            scan,
+        } = &mut *guard;
+        if !matches!(*verdict, BackendVerdict::Undecided) {
             return;
         }
-        append_bounded(&mut sniff.bytes, bytes);
-        sniff.verdict = decide_backend(&sniff.bytes);
-        if !matches!(sniff.verdict, BackendVerdict::Undecided) {
+        append_bounded(buffered, bytes);
+        *verdict = decide_backend(buffered, scan);
+        if !matches!(*verdict, BackendVerdict::Undecided) {
             self.backend_done.store(true, Ordering::Relaxed);
-            sniff.bytes = Vec::new();
+            buffered.clear();
         }
     }
 
@@ -219,6 +258,17 @@ impl FlowSniffer {
         self.lock_client().bytes.len()
     }
 
+    /// How many bytes the line scan has looked at, over the whole flow.
+    ///
+    /// For the test that says the sniffer's work is linear in the bytes it is
+    /// shown, and not quadratic.
+    #[cfg(test)]
+    pub(crate) fn examined(&self) -> usize {
+        let client = self.lock_client();
+        let backend = self.lock_backend();
+        client.scan.examined + backend.scan.examined
+    }
+
     fn lock_client(&self) -> std::sync::MutexGuard<'_, ClientSniff> {
         self.client
             .lock()
@@ -249,7 +299,7 @@ fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8]) {
 ///
 /// Decided from the buffer alone, so the same bytes always give the same
 /// answer whether they arrived in one chunk or in thirty.
-fn decide_client(bytes: &[u8]) -> ClientVerdict {
+fn decide_client(bytes: &[u8], scan: &mut Scan) -> ClientVerdict {
     let Some(first) = bytes.first() else {
         return ClientVerdict::Undecided;
     };
@@ -274,7 +324,7 @@ fn decide_client(bytes: &[u8]) -> ClientVerdict {
 
     // Not TLS. The only other thing this proxy reads is a plaintext HTTP
     // request, and it starts with a request line.
-    let Some(line) = first_line(bytes) else {
+    let Some(line) = first_line(bytes, scan) else {
         return if bytes.len() >= MAX_SNIFF {
             ClientVerdict::Other
         } else {
@@ -295,8 +345,8 @@ fn decide_client(bytes: &[u8]) -> ClientVerdict {
 ///
 /// Only a status line counts. The backend of an HTTP flow answers with one,
 /// and the backend of anything else answers with whatever that protocol is.
-fn decide_backend(bytes: &[u8]) -> BackendVerdict {
-    let Some(line) = first_line(bytes) else {
+fn decide_backend(bytes: &[u8], scan: &mut Scan) -> BackendVerdict {
+    let Some(line) = first_line(bytes, scan) else {
         return if bytes.len() >= MAX_SNIFF {
             BackendVerdict::Other
         } else {
@@ -320,14 +370,28 @@ fn record_end(bytes: &[u8]) -> Option<usize> {
 /// The first line of the buffer, without its line ending.
 ///
 /// `None` while the line has not arrived yet.
-fn first_line(bytes: &[u8]) -> Option<&[u8]> {
-    let end = bytes.iter().position(|byte| *byte == b'\n')?;
-    let line = &bytes[..end];
-    // The ending may be CRLF or a bare LF; both are one line.
-    Some(match line.last() {
-        Some(b'\r') => &line[..line.len() - 1],
-        _ => line,
-    })
+fn first_line<'a>(bytes: &'a [u8], scan: &mut Scan) -> Option<&'a [u8]> {
+    let from = scan.from.min(bytes.len());
+    match bytes[from..].iter().position(|byte| *byte == b'\n') {
+        Some(offset) => {
+            let end = from + offset;
+            scan.examined += offset + 1;
+            scan.from = end + 1;
+            let line = &bytes[..end];
+            // The ending may be CRLF or a bare LF; both are one line.
+            Some(match line.last() {
+                Some(b'\r') => &line[..line.len() - 1],
+                _ => line,
+            })
+        }
+        None => {
+            // No line yet, and the bytes that are here have been looked at.
+            // The next chunk starts where this one ended.
+            scan.examined += bytes.len() - from;
+            scan.from = bytes.len();
+            None
+        }
+    }
 }
 
 /// Reads a request line: a method, a target and a version.
@@ -435,6 +499,80 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The sniffer's work is linear in the bytes it is shown.
+    ///
+    /// A peer that opens a flow with something this proxy does not read — an
+    /// SSH banner, a database greeting — and then dribbles it out one byte at
+    /// a time used to make every byte rescan everything buffered so far, up to
+    /// the cap: quadratic in the bytes of the flow, on the thread that copies
+    /// them.
+    ///
+    /// The verdict only becomes "something else" once the buffer reaches the
+    /// cap, so the buffer keeps growing and keeps being rescanned.
+    #[test]
+    fn a_flow_that_arrives_one_byte_at_a_time_costs_what_it_is_worth() {
+        let sniffer = FlowSniffer::new();
+        // A greeting with no line in it, so the scan never finds one and the
+        // buffer keeps growing to the cap.
+        let bytes = vec![b'x'; MAX_SNIFF];
+
+        for byte in &bytes {
+            sniffer.feed(Side::Client, std::slice::from_ref(byte));
+        }
+
+        let examined = sniffer.examined();
+        assert!(
+            examined <= bytes.len() * 2,
+            "the scan looked at {examined} bytes for {} bytes of flow",
+            bytes.len()
+        );
+    }
+
+    /// The same on the other side of the flow.
+    ///
+    /// The backend's first bytes are read the same way — a status line, or
+    /// whatever that protocol is — so the same cost applies to it.
+    #[test]
+    fn a_backend_that_answers_one_byte_at_a_time_costs_what_it_is_worth() {
+        let sniffer = FlowSniffer::new();
+        let bytes = vec![b'y'; MAX_SNIFF];
+
+        for byte in &bytes {
+            sniffer.feed(Side::Backend, std::slice::from_ref(byte));
+        }
+
+        let examined = sniffer.examined();
+        assert!(
+            examined <= bytes.len() * 2,
+            "the scan looked at {examined} bytes for {} bytes of flow",
+            bytes.len()
+        );
+    }
+
+    /// A flow that arrives in one piece costs the same as one that arrives a
+    /// byte at a time.
+    ///
+    /// The two shapes are the same bytes, and the sniffer must not care how
+    /// they were cut up.
+    #[test]
+    fn the_cost_does_not_depend_on_how_the_bytes_arrived() {
+        let bytes = vec![b'x'; 4096];
+
+        let whole = FlowSniffer::new();
+        whole.feed(Side::Client, &bytes);
+
+        let dribbled = FlowSniffer::new();
+        for byte in &bytes {
+            dribbled.feed(Side::Client, std::slice::from_ref(byte));
+        }
+
+        assert_eq!(
+            whole.examined(),
+            dribbled.examined(),
+            "the same bytes cost the same however they arrive"
+        );
+    }
 
     /// A `ClientHello` that asks for `name`.
     ///
