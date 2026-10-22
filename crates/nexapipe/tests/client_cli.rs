@@ -291,8 +291,9 @@ fn revoking_a_device_says_what_the_shared_secret_still_is() {
     );
 }
 
-/// With the shared secret already taken away, there is nothing left to warn
-/// about — so the hint is not printed.
+/// With `unnamed_device_allowed = false`, a peer that names no device is
+/// refused — so the untouched shared secret is not a credential, and the
+/// revoke must say that rather than claim it still answers.
 #[test]
 fn revoking_a_device_does_not_hint_at_a_credential_that_is_already_gone() {
     let (_dir, path) = scratch_config(
@@ -311,8 +312,16 @@ fn revoking_a_device_does_not_hint_at_a_credential_that_is_already_gone() {
     let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "laptop"]);
     assert!(ok, "revoking failed:\n{text}");
     assert!(
-        !text.contains("unnamed_device_allowed = false"),
+        !text.contains("Set unnamed_device_allowed = false"),
         "the hint is for a credential that is still a credential:\n{text}"
+    );
+    assert!(
+        !text.contains("one can still authenticate as this client"),
+        "the shared secret is refused when no device is named:\n{text}"
+    );
+    assert!(
+        text.contains("so that secret authenticates no one"),
+        "the revoke should say the untouched secret authenticates nobody:\n{text}"
     );
 }
 

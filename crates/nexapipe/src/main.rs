@@ -1344,23 +1344,29 @@ fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Re
                 cli.config
             );
             match others {
-                0 | 1 => {
-                    println!(
-                        "The client's own secret is untouched: that is the credential of the device \
-                         that names none, so one can still authenticate as this client."
-                    );
-                    // The hint is only worth giving while the shared secret is
-                    // still a credential: with `unnamed_device_allowed = false`
-                    // a peer that names no device is refused, and there is
-                    // nothing left to warn about.
-                    if client.is_none_or(|client| client.unnamed_device_allowed) {
+                // The shared secret is the credential of the peer that names no
+                // device, so whether it still authenticates anyone is exactly
+                // what `unnamed_device_allowed` decides.
+                0 | 1 => match client {
+                    Some(client) if !client.unnamed_device_allowed => println!(
+                        "The client's own secret is untouched, but unnamed_device_allowed = false \
+                         refuses a peer that names no device, so that secret authenticates no one."
+                    ),
+                    // `None` means the config could not be loaded: the counts
+                    // above are best-effort in that case, so the advice stays
+                    // the conservative one.
+                    _ => {
+                        println!(
+                            "The client's own secret is untouched: that is the credential of the \
+                             device that names none, so one can still authenticate as this client."
+                        );
                         println!(
                             "Set unnamed_device_allowed = false under [auth.clients.{}] to take \
                              that credential away as well.",
                             toml_key(client_id)
                         );
                     }
-                }
+                },
                 2 => println!("1 other device of it keeps its credential."),
                 left => println!("{} other devices of it keep their credentials.", left - 1),
             }

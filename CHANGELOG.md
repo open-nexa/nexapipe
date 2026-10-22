@@ -478,8 +478,9 @@ lookup, which is what a config written before the key existed does.
   secret standing — and that secret is still a credential: a peer that names
   no device answers with it, because `unnamed_device_allowed` is `true` by
   default. The revoke said the secret was untouched; it did not say what that
-  means or how to change it. It names the setting now, and stays quiet when
-  the shared secret is already gone.
+  means or how to change it. It names the setting now, and when the setting is
+  already off it says the untouched secret authenticates no one instead of
+  claiming it still does.
 - **The comments about the config file's permissions tell the truth.** The
   startup refusal over a world-readable config was removed on purpose
   (ROADMAP §3.5), so that a `0644` bind mount starts — but several comments
