@@ -107,22 +107,21 @@ jobs:
           # Drop this line to fall back to the default query suite.
           queries: security-extended
 
-      # One analyze step per language, each under its own category, so that
-      # the alerts of the three languages stay apart in the Security tab.
-      - name: Perform CodeQL Analysis (rust)
+      # One analyze step, and **no** category.
+      #
+      # The action has no input that picks a language: it writes one SARIF
+      # file per language, collects every SARIF file it finds and merges
+      # them into one upload. A `category` on the step is stamped onto
+      # **every** run in that upload, so three steps with three categories
+      # upload the same three languages three times, each under the wrong
+      # category, and run the query suite three times over.
+      #
+      # One step uploads the three languages once, and each run keeps the
+      # identifier the CLI gave it — which carries the language — so the
+      # alerts of the three languages stay apart in the Security tab without
+      # a category that would put them in each other's.
+      - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
-        with:
-          category: "/language:rust"
-
-      - name: Perform CodeQL Analysis (javascript-typescript)
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
-        with:
-          category: "/language:javascript-typescript"
-
-      - name: Perform CodeQL Analysis (actions)
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4 @ 2026-10-15
-        with:
-          category: "/language:actions"
 
   analyze-android:
     name: CodeQL (java-kotlin)
