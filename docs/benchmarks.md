@@ -247,7 +247,7 @@ It measures two things:
   the bench allocated itself.
 
 The second number is the one that does not move. It is reported as a duration
-in nanoseconds, so the report reads `49 ns` for a request that made 49
+in nanoseconds, so the report reads `33 ns` for a request that made 33
 allocations; that is the encoding, and it is deliberate, because the number
 belongs in the report next to the times.
 
