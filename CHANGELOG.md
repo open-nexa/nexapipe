@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty-six things land in this cycle so far: the device credential can be a **key**
+Twenty-seven things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -45,8 +45,8 @@ BBR rather than Cubic, the protocol's name on the wire is the name rather than
 a name with a control byte in front of it, a UDP flow's queue is bounded by
 bytes rather than only by datagrams, the local proxy holds two buffers per
 connection rather than three, a 2FA code from a step that has gone by is
-refused, and the price of a second connection is measured now — it comes to a
-handshake.
+refused, the price of a second connection is measured now — it comes to a
+handshake, and the protocol is chosen at the handshake.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -65,11 +65,11 @@ lookup, which is what a config written before the key existed does.
 ### Added
 
 - **What a second connection costs is measured now.** The protocol a stream
-  carries is chosen by its first byte today, so **one** connection carries
-  both the HTTP requests and the L4 tunnels a client makes to the same
-  endpoint. Choosing it at the handshake instead would give each protocol a
-  connection of its own, and a client that uses both would pay for a second
-  one — a number nobody had.
+  carries was chosen by its first byte, so **one** connection carried both the
+  HTTP requests and the L4 tunnels a client made to the same endpoint.
+  Choosing it at the handshake instead gives each protocol a connection of
+  its own, and a client that uses both pays for a second one — a number
+  nobody had.
   It is **796 µs** for a QUIC handshake and **555 µs** for a flow on a
   connection that is already open — measured twice on a quiet machine, and
   twice more on a busy one, where the handshake came out at 1,011 µs and
@@ -749,6 +749,25 @@ lookup, which is what a config written before the key existed does.
   The attempts themselves are unchanged — a dead pooled connection is still
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
+
+- **The protocol is chosen at the handshake.** A connection used to carry
+  everything — an HTTP request, an L4 tunnel, a TLS session — and the server
+  told them apart by **the first byte of each stream**: `0x05` is an L4
+  preface, `0x16` is a TLS ClientHello, anything else is a request line.
+  That is a **sniff**: the bytes have to be read before the connection's
+  purpose is known, and a codec that wants the whole head cannot have it
+  without the bytes being read and handed back.
+  A client may now name the protocol it wants — `nexapipe/http`,
+  `nexapipe/l4`, `nexapipe/tls` — and the server knows what it is serving
+  before it reads a byte of it. The old generic name still means "the first
+  byte decides", so a client that speaks it is served the way it always was,
+  and a client that predates the name it once spoke still reaches the server.
+  **The price is a connection per protocol.** A client that speaks HTTP and
+  L4 to the same server holds a connection for each, where it held one: one
+  handshake more, and one connection's buffers more — a connection is
+  **110 KiB** of heap, both ends of it together. That is the trade for a
+  server that knows what it is serving, and it is the thing the next step
+  (the tunnel path using hyper's own HTTP/1 codec) is worth.
 
 ### Changed
 

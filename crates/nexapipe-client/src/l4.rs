@@ -29,6 +29,7 @@ use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::local_proxy::open_stream_with_retry_until;
 use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
+use nexapipe_proto::protocol::Protocol;
 use std::sync::Arc;
 
 pub use nexapipe_proto::{L4Proto, Preface, Status};
@@ -137,6 +138,7 @@ async fn open(
             endpoint_group,
             host,
             Some(&preface),
+            Protocol::L4,
             deadline,
         )
         .await
