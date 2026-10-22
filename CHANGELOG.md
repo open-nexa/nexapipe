@@ -1047,6 +1047,33 @@ lookup, which is what a config written before the key existed does.
   invite import and the enrollment update both wrote it out in full, to the
   on-screen log panel and to logcat. What kind of credential arrived is what
   those lines are about; the id is not in them any more.
+- **A release is built from the committed dependency tree.** The desktop
+  bundles were installed with `npm install`, and the release workflow had a
+  fallback that deleted `package-lock.json` and re-resolved the whole frontend
+  tree from the registry at build time. A newly published malicious version of
+  any transitive package would have landed in a bundle that is then signed and
+  published as an official release — a tree nobody reviewed and `npm audit`
+  never saw. The release and the three local build scripts now install with
+  `npm ci`, and a platform whose native binary the lockfile does not carry
+  fails the build instead of re-resolving the tree.
+  The reason the fallback existed — that the lockfile recorded only one
+  platform's native binaries — stopped being true of this lockfile: it
+  carries every platform's `@tauri-apps/cli` with its integrity hash and its
+  `os`/`cpu` constraints, and npm filters optional dependencies by those at
+  install time. A new CI job checks that on each platform the release builds
+  on, so the claim is tested rather than asserted.
+- **The build context no longer carries the operator's credentials.**
+  `config.toml`, `secrets/` and the state file were absent from
+  `.dockerignore`. The Dockerfiles never `COPY` them, but `docker build`
+  sends the whole context to the daemon before that filtering applies, so a
+  remote or rootless buildx builder would have received the 2FA seeds, the
+  endpoint's private key and the relay bearer token, and may have kept them
+  in its build cache.
+- **The build tools are pinned like the actions are.** `cargo-ndk` and
+  `cross` were installed at whatever version the registry served that day,
+  while `cargo-audit` and `cargo-deny` in the same workflows were pinned. Both
+  now carry a version, so a compromised upstream release cannot change what
+  the runner that holds the signing keys executes.
 
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
