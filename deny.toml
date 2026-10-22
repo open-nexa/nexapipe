@@ -29,13 +29,17 @@ version = 2
 #
 # The advisory kinds that are not vulnerabilities are a different matter.
 # `cargo audit` reports an unmaintained or unsound crate as informational and
-# does not fail on it, and this file keeps that rule rather than inventing a
-# stricter one: the tree carries crates that are old rather than broken, and a
-# build that refuses to start because one of them is unmaintained is a gate
-# nobody asked for. They are still reported by the audit job, which is where
-# they are read.
+# does not fail on it, and this file keeps that rule for **unmaintained**:
+# the tree carries crates that are old rather than broken, and a build that
+# refuses to start because one of them is unmaintained is a gate nobody asked
+# for. They are still reported by the audit job, which is where they are read.
 unmaintained = "none"
-unsound = "none"
+# **Unsound is not the same as unmaintained.** An unmaintained crate is one
+# nobody is fixing; an unsound one has a construct the language does not
+# guarantee, and the code that uses it may misbehave in ways the compiler
+# cannot catch. The graph carries none, so refusing them costs nothing today
+# and the refusal is free insurance for the version that brings one.
+unsound = "all"
 # A version pulled from crates.io is worth saying out loud, but it is not a
 # reason to refuse to build: the lockfile pins a version that still exists.
 yanked = "warn"

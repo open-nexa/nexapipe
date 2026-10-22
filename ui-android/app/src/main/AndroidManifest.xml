@@ -30,7 +30,30 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Nexa"
         tools:targetApi="31">
-        
+
+        <!--
+            Backup is on, and what it carries is worth saying out loud rather
+            than leaving to be read out of the file names.
+
+            **The credentials are not in it.** The seeds, the enrollment
+            tokens and the device key live in `NexaPipeSecrets.xml`, and both
+            rule files exclude that one file. So does the name this install
+            answers as (`device_id`): a configuration restored onto another
+            phone must not turn up claiming to be the one it was copied from,
+            and it does not — the restored phone is a new device that has to
+            be enrolled again.
+
+            **What is in it is the configuration**: which endpoints this user
+            set up, the UI language, and a few choices they made. That is
+            what a backup is for.
+
+            The arrangement rests on one rule, and it is the rule the next
+            change has to keep: **a credential goes in `NexaPipeSecrets.xml`
+            and nowhere else.** A key written into the file named in
+            `backup_rules.xml` would ride along in the backup, and nothing
+            would say so.
+        -->
+
         <service
             android:name=".vpn.NexaVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

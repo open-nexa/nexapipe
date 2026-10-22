@@ -528,6 +528,49 @@ lookup, which is what a config written before the key existed does.
   retried on a fresh one, and a refusal is still final — and so is the
   health accounting.
 
+- **A header whose name says it carries a credential is no longer printed.**
+  The local proxy's debug log redacted five exact header names, so a header
+  an application invented for its own token — `X-Auth-Token`, `X-Api-Key`,
+  `X-Session-Id` — was printed in the clear, in a log that reaches logcat.
+  The names are matched by what they **carry** now rather than by what they
+  are: a name with `auth`, `token`, `secret`, `key`, `session` or `cookie` in
+  it is redacted. A name that merely contains one of those is hidden too —
+  `Sec-WebSocket-Key` is a nonce rather than a credential — which is the
+  right way round for a debug dump.
+- **The WebSocket debug dump cannot grow without end.** It assembles a
+  frame's bytes until the frame is whole, so a peer that sends a frame
+  header and then nothing had the bytes held for a frame that was never
+  coming. A megabyte is the ceiling now, and a frame that reaches it is
+  dropped with a line in the log saying so.
+- **An unsound crate is refused.** The dependency check refused a
+  vulnerability and left an unsound crate to a warning, on the grounds
+  that the tree carries crates that are old rather than broken. That is
+  true of an **unmaintained** crate, and it is not true of an unsound one:
+  an unsound crate has a construct the language does not guarantee, and the
+  code using it may misbehave in ways the compiler cannot catch. The graph
+  carries none, so the refusal costs nothing today.
+- **The macOS build no longer shadows the updater's settings.** The
+  platform config repeated the updater block without the signature key and
+  relied on the base config's key being merged in. A JSON merge patch
+  **removes** a key whose value is `null`, so the day somebody wrote
+  `"pubkey": null` into the platform config, the key would have gone
+  silently. The platform config says nothing about the updater now, and
+  the base config's block is used as it is.
+- **The exported 2FA secret is marked sensitive on the clipboard.** Copying
+  the `otpauth://` URI put the seed on the clipboard, which on Android 8
+  to 9 any app on the device could read. From Android 13 on the platform
+  takes a flag for exactly this, and it is set now: the value stays out of
+  the keyboard's preview and out of the clipboard's history. Below that
+  there is no flag and no restriction, and the warning in the dialog is
+  what says so.
+- **What the Android backup carries is now written down.** The seeds, the
+  enrollment tokens, the device key and the name the install answers as are
+  all excluded from it — a restored phone is a new device that has to be
+  enrolled again — and what is in it is the configuration: which endpoints
+  this user set up, the language, a few choices they made. The manifest
+  says so, and it says the rule the next change has to keep: a credential
+  goes into the excluded file and nowhere else.
+
 ### Changed
 
 - **The client speaks the binary form of the handshake.** A handshake with a
