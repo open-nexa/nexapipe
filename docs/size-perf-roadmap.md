@@ -501,12 +501,11 @@ items the numbers pointed at.
    turned retries on. A **chunked** body is still read whole: the proxy
    re-frames it as one buffer with a length of its own.
 9. **What a second connection costs.** **Added on 2026-10-22, and the number a
-   decision about choosing the protocol with ALPN needs.** The protocol is
-   chosen today by the first byte of each stream, so **one** connection
-   carries both the HTTP requests and the L4 tunnels a client makes to the
-   same endpoint. Choosing it at the handshake instead would give each
-   protocol a connection of its own, and a client that uses both would pay for
-   a second one.
+   decision about choosing the protocol with ALPN needed.** The protocol used
+   to be chosen by the first byte of each stream, so **one** connection
+   carried both the HTTP requests and the L4 tunnels a client made to the same
+   endpoint. Choosing it at the handshake gives each protocol a connection of
+   its own, and a client that uses both pays for a second one.
    **Measured** (`connection_cost`, two runs on a quiet machine): a QUIC
    handshake costs **796 µs** and **819 µs**, and a flow on a connection that is
    already open costs **555 µs** and **594 µs**. The two are **not
