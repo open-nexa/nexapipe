@@ -126,7 +126,7 @@ class InviteConflictsTest {
     fun an_enrollment_over_an_unspent_token_is_a_conflict() {
         assertEquals(
             listOf(InviteConflict.PendingEnrollment),
-            conflicts(node(enrollmentToken = "fedcba9876543210"), enrollmentInvite())
+            conflicts(node(enrollmentToken = "unspent-invite-token"), enrollmentInvite())
         )
     }
 
@@ -142,7 +142,7 @@ class InviteConflictsTest {
                 InviteConflict.PendingEnrollment
             ),
             conflicts(
-                node(secret = "JBSWY3DPEHPK3PXP", enrollmentToken = "fedcba9876543210"),
+                node(secret = "JBSWY3DPEHPK3PXP", enrollmentToken = "unspent-invite-token"),
                 enrollmentInvite()
             )
         )
