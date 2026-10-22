@@ -55,10 +55,17 @@ impl IrohProxyClient {
         Ok(response)
     }
 
-    /// Opens a bidirectional stream on a pooled connection and hands it to `f`.
+    /// Opens a bidirectional stream on a pooled connection and lends it to `f`.
     ///
     /// The connection goes back into the pool when `f` is done, whatever `f`
     /// does with the stream.
+    ///
+    /// The streams are borrowed rather than moved, so they cannot leave the
+    /// closure: the lease and the streams' lifetime are the same scope. A
+    /// stream that outlived the lease would sit on a pooled connection, which
+    /// the idle timeout may close underneath it. Use an async closure
+    /// (`async |send, recv| ...`); an `async move` block would capture the
+    /// borrows in a way the `AsyncFnOnce` bound cannot accept.
     ///
     /// It used to be `open_bi_stream`, which returned the two streams and
     /// dropped the connection: the pool never saw that connection again, so
@@ -68,14 +75,15 @@ impl IrohProxyClient {
     pub async fn with_stream<T, F>(&self, f: F) -> Result<T, ClientError>
     where
         F: AsyncFnOnce(
-            iroh::endpoint::SendStream,
-            iroh::endpoint::RecvStream,
+            &mut iroh::endpoint::SendStream,
+            &mut iroh::endpoint::RecvStream,
         ) -> Result<T, ClientError>,
     {
         let conn = self.conn_pool.get_connection().await?;
-        let (send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
-        let result = f(send, recv).await;
+        let result = f(&mut send, &mut recv).await;
+        drop((send, recv));
         self.conn_pool.return_connection(conn).await;
         result
     }
@@ -182,9 +190,10 @@ mod tests {
         for _ in 0..3 {
             client
                 .with_stream(
-                    |mut send: iroh::endpoint::SendStream, _recv: iroh::endpoint::RecvStream| async move {
+                    async |send: &mut iroh::endpoint::SendStream,
+                           _recv: &mut iroh::endpoint::RecvStream| {
                         let _ = send.finish();
-                        Ok(())
+                        Ok::<(), ClientError>(())
                     },
                 )
                 .await
