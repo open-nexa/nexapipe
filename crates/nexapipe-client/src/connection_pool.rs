@@ -281,7 +281,14 @@ fn is_measured_rtt(rtt: std::time::Duration) -> bool {
 
 struct PooledConnection {
     conn: Connection,
-    created_at: std::time::Instant,
+    /// When the connection was last handed back to the pool.
+    ///
+    /// Not when it was dialled: a connection that is used continuously comes
+    /// back every few seconds, and the idle timeout is about how long it has
+    /// been sitting unused — not how old it is. A connection in constant use
+    /// is not idle, and a ten-minute-old connection that was returned a
+    /// second ago is not either.
+    last_used: tokio::time::Instant,
 }
 
 impl PooledConnection {
@@ -293,8 +300,18 @@ impl PooledConnection {
     /// True if this connection has been sitting in the pool unused for at least
     /// `timeout`.
     fn is_idle_for(&self, timeout: tokio::time::Duration) -> bool {
-        self.created_at.elapsed() >= timeout
+        is_idle_since(self.last_used, timeout)
     }
+}
+
+/// Whether a connection that was last used at `last_used` has been sitting
+/// unused for at least `timeout`.
+///
+/// Free rather than a method, so that the rule can be tested without a live
+/// connection: reading it off one needs an endpoint, and the rule is the part
+/// that has to be right.
+fn is_idle_since(last_used: tokio::time::Instant, timeout: tokio::time::Duration) -> bool {
+    last_used.elapsed() >= timeout
 }
 
 /// Drops the connections that are closed or idle, closing the idle ones.
@@ -794,7 +811,7 @@ impl IrohConnectionPool {
         if connections.len() < MAX_CONNECTIONS {
             connections.push(PooledConnection {
                 conn,
-                created_at: std::time::Instant::now(),
+                last_used: tokio::time::Instant::now(),
             });
             return;
         }
@@ -1141,11 +1158,47 @@ pub fn parse_endpoint_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkKind, LinkStatus, encode_link_status, is_measured_rtt, may_publish};
+    use super::{
+        CONNECTION_IDLE_TIMEOUT, LinkKind, LinkStatus, encode_link_status, is_idle_since,
+        is_measured_rtt, may_publish,
+    };
     use std::time::Duration;
 
     /// A watcher that started before the network changed must not publish: the
     /// reading it holds is the round trip of the network that is gone.
+    /// A connection is idle since it was last used, not since it was dialled.
+    ///
+    /// The clock is paused so that "a moment ago" and "61 seconds ago" are
+    /// exact rather than approximate.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_is_idle_since_it_was_last_used() {
+        let now = tokio::time::Instant::now();
+
+        assert!(
+            !is_idle_since(now, CONNECTION_IDLE_TIMEOUT),
+            "a connection that was just handed back is not idle"
+        );
+
+        // Used for ten minutes, and handed back a second ago: the connection is
+        // old, and it is not idle. The timeout measures how long the connection
+        // has been sitting **unused**, not how old it is.
+        let ten_minutes_of_use = tokio::time::Duration::from_secs(600);
+        let handed_back_a_second_ago = now - tokio::time::Duration::from_secs(1);
+        assert!(
+            !is_idle_since(handed_back_a_second_ago, CONNECTION_IDLE_TIMEOUT),
+            "a connection that was used for {ten_minutes_of_use:?} and handed back a second ago \
+             is not idle"
+        );
+
+        assert!(
+            is_idle_since(
+                now - tokio::time::Duration::from_secs(61),
+                CONNECTION_IDLE_TIMEOUT
+            ),
+            "a connection that has been sitting for longer than the timeout is idle"
+        );
+    }
+
     #[test]
     fn a_watcher_from_an_older_generation_does_not_publish() {
         assert!(
