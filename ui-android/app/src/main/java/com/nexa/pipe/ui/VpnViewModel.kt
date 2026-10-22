@@ -770,7 +770,13 @@ class VpnViewModel : ViewModel() {
         val updated = nodes.value.toMutableList()
         updated[index] = updated[index].copy(enrollment = enrollment)
         publishNodes(updated)
-        addLog("Enrollment updated for " + nodeId.take(8) + ": " + (enrollment?.clientId ?: "none"))
+        // No client id in the log: debug builds expose Log.d, and the id is half
+        // of the 2FA credential pair. Whether there is one is what the line is
+        // about.
+        addLog(
+            "Enrollment updated for " + nodeId.take(8) + ": " +
+                if (enrollment?.token?.isNotBlank() == true) "pending" else "none"
+        )
     }
 
     /**

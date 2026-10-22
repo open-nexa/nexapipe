@@ -617,6 +617,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **A registration code no longer silently replaces a working credential.**
+  The Android app asked before an invite overwrote something that worked — but
+  the question was asked for a secret and for the relay, and a one-time
+  enrollment code was neither: it carries no secret, so it raised no conflict,
+  and it was applied with no confirmation at all. The credential the endpoint
+  already held went with it, and because the guard in `ProxyConnector` that
+  keeps an endpoint from spending a token it already has a credential for
+  looks at what the endpoint holds, the drop that came before it defeated the
+  guard. A registration code is exactly the artefact a user is primed to
+  accept — shared in a chat, pasted by an "operator", one tap from the
+  scanner — so this was a credential one accepted code could destroy.
+  The rule now names the enrollment, and it is a pure function with tests
+  beside it: `ui/InviteConflicts.kt`.
+- **The client id no longer reaches the log.** It is half of the 2FA
+  credential pair, and the app says so where it logs the other one — but the
+  invite import and the enrollment update both wrote it out in full, to the
+  on-screen log panel and to logcat. What kind of credential arrived is what
+  those lines are about; the id is not in them any more.
+
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
   RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
