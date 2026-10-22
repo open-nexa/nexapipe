@@ -28,7 +28,8 @@ have changed since are marked:
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
-| `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
+| `route_lookup/a_matching_host` | **732 ns** | the routing table's walk over 51 routes, **and** what taking the route it found costs. **Was 999 ns** before the bench's path pattern was fixed — and that number was a lookup that found *nothing*, so the half it claims to measure was never measured |
+| `route_lookup/a_host_nothing_serves` | **533 ns** | the same walk over the same 51 routes for a host no route serves: what the walk costs on its own. The difference between the two rows is what taking the route costs
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
@@ -128,6 +129,17 @@ that list is the one thing in the client whose length a request pays for.
 **`route_lookup`** is the server's routing table: every request asks it which
 route serves the request, and the answer is a walk over the routes until one
 matches. The backends are never dialled — the bench measures the lookup.
+
+It measures two: a host a route serves, and a host no route serves. The
+difference between them is what **taking** the route costs, which is the
+balancer's part — the part the walk alone does not include.
+
+The path pattern in the table is `/`, which is the catch-all a route uses to
+say "any path". **`/*` is not a wildcard**: `path_suffix` treats it as a
+literal `/*` prefix, so a route with it matches no ordinary path at all. The
+bench used to use it, which meant it measured a walk that found nothing — and
+said otherwise. It now asserts that the lookup matched, so the mistake cannot
+come back quietly.
 
 **`forwarding_path`** is the only bench that reflects what a user experiences:
 the request crosses the proxy's accept loop, the tunnel handshake, the tunnel

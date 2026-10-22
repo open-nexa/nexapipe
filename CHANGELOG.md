@@ -307,6 +307,30 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
+- **The routing table's benchmark measures a lookup that matches.** Its 51
+  routes all had the path pattern `/*`, which is not a wildcard — it is a
+  literal `/*` prefix, and a route with it serves no ordinary path at all.
+  The walk went over all 51 routes and ended at the table's end with **no
+  route taken**, while the benchmark's name and the documentation both said
+  it was measuring what taking the route costs. That half was never
+  measured.
+  The pattern is `/` now — the catch-all a route uses to say "any path" —
+  and the benchmark asserts that the lookup matched, so the mistake cannot
+  come back quietly. It measures two things now: **732 ns** for a host a
+  route serves, and **533 ns** for a host no route serves. The difference is
+  what taking the route costs, which is the balancer's part.
+  The number recorded before — 999 ns — was a lookup that found nothing, and
+  it is kept in the documentation marked as what it was.
+
+- **The host is folded once per request, not once per route.** The routing
+  table walks its routes until one matches, and every route in the walk was
+  folding the client's name again — trailing dots off, brackets off, case
+  folded — for the same name, over and over. The fold now happens once for
+  the whole walk, and the routes are handed the folded name.
+  It is the same name every time, so the fold is the same answer every time,
+  and doing it once is not a different answer: the HTTP path, the TLS
+  passthrough path and the L4 path all fold exactly as they did before, and
+  the tests that pin the matching rules still pass unchanged.
 
 ### Changed
 
