@@ -19,9 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty-three things land in this cycle so far: the device credential can be a **key**
-Twenty-four things land in this cycle so far: the device credential can be a **key**
-Twenty-five things land in this cycle so far: the device credential can be a **key**
+Twenty-seven things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -44,12 +42,11 @@ it serves now rewrites them for the tunnel as well, a request's body is
 forwarded to the backend while it is still arriving, and the Android client's
 tunnel descriptor is closed exactly once, the tunnel's congestion controller is
 BBR rather than Cubic, the protocol's name on the wire is the name rather than
-a name with a control byte in front of it, and a UDP flow's queue is bounded by
-bytes rather than only by datagrams.
 a name with a control byte in front of it, a UDP flow's queue is bounded by
 bytes rather than only by datagrams, the local proxy holds two buffers per
-connection rather than three, and a 2FA code from a step that has gone by is
-refused.
+connection rather than three, a 2FA code from a step that has gone by is
+refused, the price of a second connection is measured now — it comes to a
+handshake, and the protocol is chosen at the handshake.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -67,6 +64,30 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **What a second connection costs is measured now.** The protocol a stream
+  carries was chosen by its first byte, so **one** connection carried both the
+  HTTP requests and the L4 tunnels a client made to the same endpoint.
+  Choosing it at the handshake instead gives each protocol a connection of
+  its own, and a client that uses both pays for a second one — a number
+  nobody had.
+  It is **796 µs** for a QUIC handshake and **555 µs** for a flow on a
+  connection that is already open — measured twice on a quiet machine, and
+  twice more on a busy one, where the handshake came out at 1,011 µs and
+  3,347 µs and the flow at 739 µs and 673 µs. The two are **not
+  commensurable, and their difference is not a result**: a handshake is CPU
+  work — the key exchange and the packet protection — while a flow on an open
+  connection is a *wait*, for the far side to answer the preface and for the
+  task to be woken up. That wait belongs to the machine's scheduler rather
+  than to the protocol, and the handshake's work competes with everything else
+  for the machine's cores, so both numbers move with the machine's load, and
+  the difference between them moved with it — from about +230 µs to about
+  +2,700 µs. What a second connection costs is therefore **a handshake**, paid
+  once per endpoint and protocol, and then amortized over a connection the
+  pool keeps for hours — and it is the dearer of the two: it measured 1.4×
+  what the flow did.
+  The other half of the price is measured too: a connection holds **110 KiB**
+  of heap, counting both ends — a client's share is at most half of that. So
+  a second connection costs **a handshake and about fifty kilobytes**.
 - **A 2FA code from an earlier step is refused.** The server remembered
   nothing about the codes it had accepted, so a code from a step that had
   already gone by could still be used — it is inside the acceptance window,
