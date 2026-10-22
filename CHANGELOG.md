@@ -763,6 +763,26 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A relay token is no longer written in the clear by its own migration.**
+  The Android app moves a relay bearer token out of the backed-up preferences
+  and into the secrets file, which is excluded from the backup precisely
+  because it holds ciphertext. The move used `seal`, which hands the value
+  back in the clear on a device with no keystore — so on exactly the devices
+  that could not protect the token, the migration wrote it in the clear into
+  the file that says it holds none, and removed it from the file it came out
+  of. A token that cannot be sealed now moves nowhere: it stays where it is
+  until the keystore can hold it, and the decision is a tested function
+  rather than a line of bookkeeping.
+  "Where it is" is the **backed-up** preferences, so a token this device
+  cannot seal rides the backup for as long as the keystore is unavailable —
+  the trade is a credential that is preserved over one that never leaves the
+  device, and the migration moves it on the first start that can seal it.
+  Staying there keeps it usable as well as safe: the app reads the token
+  out of both files, so a token this device cannot seal is still the token
+  the tunnel authenticates with. The move is a write whose success is
+  checked now — the sealed copy is committed to the disk before the
+  cleartext one is taken off it, and a write that failed leaves the token
+  where it was instead of losing it from both files.
 - **A credential bought by an enrollment goes through the same check.** The
   enrollment writes the pool's credential itself, and it wrote it without the
   comparison that closes the connections of the identity that is gone: the
