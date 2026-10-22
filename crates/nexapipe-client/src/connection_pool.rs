@@ -981,6 +981,25 @@ impl IrohConnectionPool {
             ClientError::ConnectionFailed(e.to_string())
         })?;
 
+        // **What was negotiated**, which is not always what was asked for.
+        //
+        // A server that does not know the per-protocol names answers with the
+        // generic one, and a server built before the prefix byte was dropped
+        // answers with the older spelling. Both are served the way they always
+        // were — the first byte of each stream decides — so the connection
+        // works either way, and the bytes the client writes are the bytes the
+        // sniff looks for. It is a real fallback, and an implicit one, so it is
+        // worth saying out loud: a server that fell back is a server that is
+        // still sniffing.
+        if conn.alpn() != protocol.alpn() {
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                "the server negotiated {:?} rather than {}, and will decide by the first byte",
+                String::from_utf8_lossy(conn.alpn()),
+                protocol.name()
+            );
+        }
+
         // Enrollment first: a token is spent once and buys the credentials the
         // block below then uses, so it only runs while there are none.
         let enrollment = self.inner.enrollment.lock().await.clone();
@@ -1848,7 +1867,9 @@ mod tests {
     /// The client offers the current ALPN *and* the legacy one, so a server
     /// built before the prefix byte was dropped is still reachable. This is the
     /// client half of the compatibility the server's own test suite covers from
-    /// the other side.
+    /// the other side — `a_client_that_speaks_the_legacy_alpn_is_served`, in
+    /// `crates/nexapipe/tests/data_plane.rs`, is the server's half: the same
+    /// spelling, and the connection is not only made but **served**.
     #[tokio::test]
     async fn the_pool_reaches_a_server_that_speaks_only_the_legacy_alpn() {
         let server = Endpoint::builder(presets::N0)
@@ -1881,6 +1902,70 @@ mod tests {
         // after the client's handshake has already completed — so the count is
         // read only once the far side has answered a preface, which it does
         // only after it has counted the connection.
+        let (mut send, mut recv) = conn.conn.open_bi().await.expect("the flow opens");
+        let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
+            .to_bytes()
+            .expect("the preface encodes");
+        send.write_all(&preface)
+            .await
+            .expect("the preface is written");
+        let mut status = [0u8; 1];
+        recv.read_exact(&mut status)
+            .await
+            .expect("the far side answers the preface");
+        assert_eq!(status[0], 0x00, "the far side opened the flow");
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the far side took the connection"
+        );
+        drop(conn);
+    }
+
+    /// **The pool reaches a server that speaks only the generic ALPN, even
+    /// though the client asked for a protocol by name.**
+    ///
+    /// The per-protocol names are newer than the generic one, so a server that
+    /// predates them answers with the generic one — and a connection
+    /// negotiated with it is served the way it always was, by the first byte
+    /// of each stream. The bytes the client writes are the bytes the sniff
+    /// looks for, so the flow still opens.
+    ///
+    /// The fallback is real, and it is implicit: nothing says out loud that
+    /// the server fell back. This test is the proof that it works.
+    #[tokio::test]
+    async fn the_pool_reaches_a_server_that_speaks_only_the_generic_alpn() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_counting(server, accepted.clone()));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+
+        // The client asks for L4 by name; the server only knows the generic
+        // one, and the negotiation lands there.
+        let conn = pool
+            .get_connection(Protocol::L4)
+            .await
+            .expect("the pool reaches a server that speaks only the generic ALPN");
+
+        // The flow has to open, not merely be made: the bytes the client
+        // writes are the bytes the sniff looks for, so the generic path
+        // serves them the way it always did.
         let (mut send, mut recv) = conn.conn.open_bi().await.expect("the flow opens");
         let preface = Preface::new(L4Proto::Tcp, "db.test", 5432)
             .to_bytes()
