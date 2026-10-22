@@ -1164,8 +1164,6 @@ mod tests {
     };
     use std::time::Duration;
 
-    /// A watcher that started before the network changed must not publish: the
-    /// reading it holds is the round trip of the network that is gone.
     /// A connection is idle since it was last used, not since it was dialled.
     ///
     /// The clock is paused so that "a moment ago" and "61 seconds ago" are
@@ -1199,6 +1197,8 @@ mod tests {
         );
     }
 
+    /// A watcher that started before the network changed must not publish: the
+    /// reading it holds is the round trip of the network that is gone.
     #[test]
     fn a_watcher_from_an_older_generation_does_not_publish() {
         assert!(
