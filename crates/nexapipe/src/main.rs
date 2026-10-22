@@ -398,9 +398,9 @@ async fn main() {
 
     // The endpoint's identity, generated and written back to `config.toml` if it
     // has none. Before `log::init` would mean a warning nobody sees; after the
-    // permission check would mean writing a credential into a file that check
-    // is about to refuse. Here it sits in both gaps' place: logged, and before
-    // anything reads the file's mode.
+    // credential warning would mean writing a credential into a file that
+    // warning is about to name. Here it sits in both gaps' place: logged, and
+    // before anything reads the file's mode.
     //
     // Local-proxy mode is skipped: it is the client half, and the endpoint it
     // dials is somebody else's identity.
@@ -477,8 +477,8 @@ async fn run_server_mode(
     // On the *endpoint's* copy only. `proxy_config` stays as it was loaded,
     // because `holds_credentials()` is asked about the file on disk further
     // down and an ephemeral identity was never written there — folding it in
-    // would make a read-only deployment refuse to start over a key that is not
-    // in the file, which is the one case an ephemeral identity exists for.
+    // would warn about a key that is not in the file, which is the one case an
+    // ephemeral identity exists for.
     if let Some(identity) = identity {
         iroh_config.get_or_insert_with(Default::default).secret_key =
             Some(SecretString::new(identity.key().to_string()));
@@ -1344,10 +1344,29 @@ fn revoke_client(cli: &Cli, client_id: &str, device: Option<&str>) -> anyhow::Re
                 cli.config
             );
             match others {
-                0 | 1 => println!(
-                    "The client's own secret is untouched: that is the credential of the device \
-                     that names none, so one can still authenticate as this client."
-                ),
+                // The shared secret is the credential of the peer that names no
+                // device, so whether it still authenticates anyone is exactly
+                // what `unnamed_device_allowed` decides.
+                0 | 1 => match client {
+                    Some(client) if !client.unnamed_device_allowed => println!(
+                        "The client's own secret is untouched, but unnamed_device_allowed = false \
+                         refuses a peer that names no device, so that secret authenticates no one."
+                    ),
+                    // `None` means the config could not be loaded: the counts
+                    // above are best-effort in that case, so the advice stays
+                    // the conservative one.
+                    _ => {
+                        println!(
+                            "The client's own secret is untouched: that is the credential of the \
+                             device that names none, so one can still authenticate as this client."
+                        );
+                        println!(
+                            "Set unnamed_device_allowed = false under [auth.clients.{}] to take \
+                             that credential away as well.",
+                            toml_key(client_id)
+                        );
+                    }
+                },
                 2 => println!("1 other device of it keeps its credential."),
                 left => println!("{} other devices of it keep their credentials.", left - 1),
             }

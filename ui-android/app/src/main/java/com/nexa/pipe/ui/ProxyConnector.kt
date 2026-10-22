@@ -283,7 +283,12 @@ class ProxyConnector(private val log: ConnectionLog) {
         if (id == null) {
             throw Exception(AppStrings.get(R.string.error_start_iroh))
         }
-        log.log("Iroh started: $id")
+        // The node id is the endpoint's public identity, but the log panel
+        // keeps the last hundred lines and a screenshot of it is a screenshot
+        // of the machine's inventory. The first eight characters are enough to
+        // tell two endpoints apart, and every other node id in this app is
+        // logged the same way.
+        log.log("Iroh started: ${id.take(8)}")
         return true
     }
 

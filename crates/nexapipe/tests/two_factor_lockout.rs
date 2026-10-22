@@ -62,6 +62,8 @@ fn auth_config_with_client(max_attempts: u32, lockout_duration: u64) -> AuthConf
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         },
     );
     config
@@ -112,6 +114,8 @@ fn auth_config_with_devices(max_attempts: u32, lockout_duration: u64) -> AuthCon
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         },
     );
     config
@@ -367,6 +371,61 @@ fn persists_lockout_counters_across_a_reload() {
     assert!(entry.locked_until.is_none());
 }
 
+/// The enrollment's own counter survives a restart, and the client's own
+/// counter is not written for it.
+///
+/// A guess at a pending token is counted — the token needs a ceiling — but what
+/// it moves is the enrollment's counter. So the state file carries
+/// `enrollment_failed_attempts` and leaves `failed_attempts` alone: a client
+/// id is not a secret, and somebody who knows one must not be able to lock the
+/// client's own devices out of authenticating.
+#[test]
+fn the_enrollment_counter_survives_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap();
+    let state_path = dir.path().join("state.toml");
+    let state_path_str = state_path.to_str().unwrap();
+    let source = "[auth]\n\
+         enabled = true\n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         created_at = \"1723756800\"\n\
+         pending_enrollment = \"0123456789abcdef\"\n";
+    std::fs::write(&path, source).unwrap();
+
+    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let mut auth = auth.expect("the config declares [auth]");
+
+    // The rule the server applies to a wrong guess at a token, called the same
+    // way: the client id is not a secret, and the guess must not be paid for
+    // by the client's own devices.
+    nexapipe::conn::count_enrollment_failure(&mut auth, "client-001", 3, 60);
+    save_auth_state(state_path_str, &auth).unwrap();
+
+    let state = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        state.contains("enrollment_failed_attempts = 1"),
+        "the enrollment's counter was written: {state}"
+    );
+    assert!(
+        !state
+            .lines()
+            .any(|line| line.trim_start().starts_with("failed_attempts")),
+        "the client's own counter did not move: {state}"
+    );
+
+    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let reloaded = reloaded.unwrap();
+    let entry = reloaded.clients.get("client-001").unwrap();
+    assert_eq!(entry.enrollment_failed_attempts, 1);
+    assert_eq!(
+        entry.failed_attempts, 0,
+        "the client's own counter is untouched"
+    );
+    assert!(entry.locked_until.is_none(), "the client is not locked out");
+}
+
 /// A client the configuration does not have stays gone.
 ///
 /// The state file is the server's own bookkeeping, so it may carry a client
@@ -406,6 +465,8 @@ fn does_not_resurrect_a_client_removed_from_disk() {
             last_used: Some(1),
             failed_attempts: 1,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         },
     );
 

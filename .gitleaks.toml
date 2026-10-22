@@ -39,4 +39,13 @@ regexes = [
     # without validating the nonce, and the value is the one published in the
     # RFC.
     '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+
+    # `an_enrollment_over_an_unspent_token_is_a_conflict`
+    # (ui-android/app/src/test/java/com/nexa/pipe/ui/InviteConflictsTest.kt)
+    # gave an invite a sequential hex token to compare against. It is a
+    # placeholder in a test that never sends one anywhere, not a credential.
+    # It no longer appears in the tree — a later commit replaced it — but this
+    # branch's history still carries it, and the scan reads the commits a pull
+    # request adds as well as the tree it ends at.
+    '''^fedcba9876543210$''',
 ]
