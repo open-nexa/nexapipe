@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Nineteen things land in this cycle so far: the device credential can be a **key**
+Twenty things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -38,7 +38,8 @@ tunnelled flow was instead of only what the tunnel did with it, an app that
 is not written in Rust can configure a client through the UniFFI surface, the
 paths that carry the traffic can be measured instead of assumed, the first
 result of those measurements is written down, a route that rewrites the paths
-it serves now rewrites them for the tunnel as well, and the Android client's
+it serves now rewrites them for the tunnel as well, a request's body is
+forwarded to the backend while it is still arriving, and the Android client's
 tunnel descriptor is closed exactly once.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
@@ -57,6 +58,40 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **The request body is forwarded while it is still arriving, instead of
+  after all of it has arrived.** The server read a request's whole body into
+  memory — up to 64 MiB of it — before it contacted the backend at all, and
+  only then sent it. A backend therefore saw **nothing** of an upload until
+  the last byte was in, and the proxy held the entire upload for the whole
+  exchange.
+  A request that declares a `content-length` is forwarded **as it arrives**
+  now: the backend reads the body while the client is still sending it, and
+  the proxy holds a 16 KiB read buffer rather than the upload. A 64 MiB
+  upload costs the proxy tens of kilobytes where it cost 64 MiB, and the
+  process-wide byte budget counts the bytes that have **arrived** rather than
+  the ones the client **promised** — so a client that declares a large body
+  and sends nothing holds nothing, exactly as before.
+  The upload is bounded by the **body's** deadline (`[timeouts] body_secs`),
+  which is the one it always had, and not by the response deadline, which is
+  the backend's: a client that is still sending is not a backend that is slow
+  to answer. The backend's deadline runs from the moment the body has been
+  sent, as it did when the body was read whole before the request went out.
+  Three things come with it, and all three are worth knowing. A body that has
+  been **read** cannot be sent a second time — the bytes came off the
+  client's stream and there is no second copy of them — so a request with a
+  body that fails **after the body was sent** is **refused with an error**
+  rather than being tried again, where before the whole body was kept in
+  memory and sent again. A failure that happened **before** the body was
+  touched — a connection that was refused, say — is still tried on the next
+  backend, because the bytes are still on the client's stream.
+  `[retry] attempts` is 0 unless an operator asks for it, so this reaches
+  only a deployment that turned retries on. A body that **stops halfway** is a
+  broken request: the connection to the backend is closed rather than the
+  backend being handed a body that does not add up to its `content-length`.
+  And a **chunked** body — one with no `content-length` — is still read
+  whole, because the proxy re-frames it as a single buffer with a length of
+  its own. The 64 MiB limit is unchanged either way, and so is the
+  **plaintext** listener: it reads the body whole, as it always did.
 - **A header whose name says it carries a credential is no longer printed.**
   The local proxy's debug log redacted five exact header names, so a header
   an application invented for its own token — `X-Auth-Token`, `X-Api-Key`,
