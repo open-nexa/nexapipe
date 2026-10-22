@@ -57,6 +57,31 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A backend's name is resolved once, not once per flow.** Every L4 flow and
+  every TLS passthrough dials a backend by **name**, and the name was
+  resolved again for every one of them. The resolution is a `getaddrinfo` on a
+  blocking thread, and it sits on the critical path: the client waits for the
+  flow to be open before it sends anything, so every flow paid for a name
+  lookup that the flow before it had already paid for.
+  The answers are cached now. A name that resolved is remembered for thirty
+  seconds, and a name that does **not** exist is remembered for five — much
+  shorter, because a name that failed is often a backend that has just come
+  up and the next flow should find it. A resolver that could not answer at
+  all — a timeout, a SERVFAIL — is not remembered: the answer may be there in
+  a moment, and a remembered failure would keep the backend unreachable for
+  the whole negative TTL. The resolver's own message is what the flow fails
+  with, so a typo in the config and a DNS outage do not look the same in the
+  log.
+  Two flows that arrive together do not start two lookups: the second one
+  waits for the first and takes its answer.
+  The cache holds addresses, not flows: every TCP flow still opens its own
+  connection, so a cached address that has gone away fails the dial like any
+  other. A UDP flow is the exception — a UDP socket has no dial, so a stale
+  address would not fail loudly, it would open the flow and send every
+  datagram to an address that is no longer there. A UDP flow therefore
+  resolves its target every time it opens, the way it did before.
+  The port is not part of the cache's key, because a DNS answer is about the
+  name — `db.test:5432` and `db.test:5433` share one resolution.
 - **A name the configuration does not name exactly is found by an index.**
   The client kept a map of the configured domains, and a name that was not in
   it exactly — which is **every** name a TUN device asks about, since those
@@ -502,6 +527,7 @@ lookup, which is what a config written before the key existed does.
   The errors are the same ones, in the same words: a backend whose address
   does not parse, or names no host, is still reported when the request is
   built, where the operator reads it.
+
 - **Two of the TUN's per-packet costs are measured, and neither is worth
   changing.** The TUN copies every packet once on its way into the network
   stack, because the stack takes a `Vec<u8>` of its own and the buffer the
