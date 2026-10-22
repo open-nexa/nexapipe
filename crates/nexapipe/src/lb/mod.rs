@@ -676,6 +676,83 @@ mod tests {
         )
     }
 
+    /// The origin of a backend address: the scheme, the host and the port.
+    ///
+    /// These are the cases the request path depends on, and each of them
+    /// breaks in a way that only shows up at runtime: an IPv6 literal that
+    /// loses its brackets makes the URI invalid, and a host that loses its
+    /// port makes every request to that backend go to the wrong place.
+    #[test]
+    fn the_origin_keeps_the_scheme_the_host_and_the_port() {
+        assert_eq!(&*origin_of("http://host:8080").unwrap(), "http://host:8080");
+        assert_eq!(
+            &*origin_of("https://host:8443").unwrap(),
+            "https://host:8443"
+        );
+    }
+
+    /// A backend address with no port is on the port its scheme says.
+    ///
+    /// `http://host` is port 80, and `https://host` is port 443 — the same
+    /// rule `port_or_known_default()` applies, which is the rule the old
+    /// expression applied too.
+    #[test]
+    fn the_origin_fills_in_the_port_of_the_scheme() {
+        assert_eq!(&*origin_of("http://host").unwrap(), "http://host:80");
+        assert_eq!(&*origin_of("https://host").unwrap(), "https://host:443");
+    }
+
+    /// An IPv6 literal keeps its brackets.
+    ///
+    /// `http://[::1]:8080` is the address of a backend on the loopback, and
+    /// the origin has to keep the brackets: `http::Uri` reads
+    /// `http://::1:8080` as a host with a port and a path, and the request
+    /// never reaches the backend.
+    #[test]
+    fn the_origin_keeps_the_brackets_of_an_ipv6_literal() {
+        assert_eq!(
+            &*origin_of("http://[::1]:8080").unwrap(),
+            "http://[::1]:8080"
+        );
+        assert_eq!(
+            &*origin_of("http://[2001:db8::1]:80").unwrap(),
+            "http://[2001:db8::1]:80"
+        );
+    }
+
+    /// An address that does not parse is refused, and the reason says why.
+    #[test]
+    fn the_origin_refuses_an_address_that_does_not_parse() {
+        let reason = origin_of("not a url").expect_err("the address does not parse");
+        assert!(
+            reason.starts_with("invalid backend URL:"),
+            "the reason names the parse: {reason}"
+        );
+    }
+
+    /// An address that names no host is refused, and the reason says why.
+    ///
+    /// A scheme that is not one of the special ones parses without a host,
+    /// so this is the address that reaches the second failure.
+    #[test]
+    fn the_origin_refuses_an_address_that_names_no_host() {
+        let reason = origin_of("custom://").expect_err("the address names no host");
+        assert_eq!(reason, "backend URL missing host");
+    }
+
+    /// An address of a special scheme with no host does not parse at all.
+    ///
+    /// `http://` is refused by the parser, not by the host check, and the
+    /// reason says so.
+    #[test]
+    fn the_origin_refuses_an_address_that_does_not_parse_at_all() {
+        let reason = origin_of("http://").expect_err("the address does not parse");
+        assert!(
+            reason.starts_with("invalid backend URL:"),
+            "the reason names the parse: {reason}"
+        );
+    }
+
     /// Same pool with another strategy. Every test below is about one strategy's
     /// choice, so which one it is should be the only thing spelled at its top.
     fn pool_with(strategy: LoadBalancingStrategy, backends: &[&str]) -> BackendPool {

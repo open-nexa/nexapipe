@@ -328,7 +328,7 @@ lookup, which is what a config written before the key existed does.
   name matching. None of them measured what the server does for a request:
   the route lookup, the balancer, the URI the backend is reached at, and the
   round trip to it. That is a benchmark of its own now, and it comes with
-  the number the per-request work had never had — **49 allocations** for
+  the number the per-request work had never had — **42 allocations** for
   one request, from the lookup to the response head, counted by an
   allocator the bench installs.
   The count is the stable measurement: its interval is 0.2% wide, where the
@@ -337,9 +337,11 @@ lookup, which is what a config written before the key existed does.
   scheduler.
   It is the plaintext listener's path, and the difference is written down
   rather than left out: the QUIC tunnel reaches the same backend through
-  another function and shares every per-request cost, and what it adds is
-  the transport. So the server's own work for a request is a measurement
-  now; the transport's share of one is still an expectation.
+  another function and shares the part of the work this bench is about -- the
+  lookup, the balancer, the origin and the URI -- while the header copying
+  and the body handling are its own, and what it adds on top is the
+  transport. So the server's own work for a request is a measurement now; the
+  transport's share of one is still an expectation.
 - **The client's HTTP request path is measured too.** The benchmarks that
   landed with this cycle measured the CONNECT tunnel, the TUN's per-packet
   cost, the server's routing table and the client's own name matching. They
@@ -437,8 +439,8 @@ lookup, which is what a config written before the key existed does.
   vectors where one would do.
   The address and the health flag now sit on the entry, where reading them
   needs no lock, and the candidates are filtered **in place** rather than
-  copied into a new vector at each step. One request makes **46 allocations**
-  where it made **49**.
+  copied into a new vector at each step. One request makes **39 allocations**
+  where it made **42**.
   The health flag is an atomic now, so the operator's view and the request
   path cannot disagree about it: the flag is written once, and both read it.
 
@@ -451,7 +453,7 @@ lookup, which is what a config written before the key existed does.
   The origin is now parsed when the pool is built, and the request path
   borrows the answer. The address is **shared** rather than copied, so
   handing it to a request is a reference count.
-  One request makes **40 allocations** where it made **49** — nine fewer
+  One request makes **33 allocations** where it made **42** — nine fewer
   across the balancer's choice and the backend's address, both of which were
   doing per-request work for values that are fixed.
   The errors are the same ones, in the same words: a backend whose address

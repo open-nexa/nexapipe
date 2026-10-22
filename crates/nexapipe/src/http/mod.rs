@@ -763,6 +763,19 @@ where
     }
 }
 
+/// A message with its first letter capitalised.
+///
+/// The reasons the backend's address can fail with are written in the lower
+/// case, because the tunnel path says them in the lower case. This path says
+/// them with a capital, and the two are the same reason in two wordings.
+fn capitalised(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 /// One attempt at one backend: the answer, or the reason there was none.
 ///
 /// Split out of [`proxy_request`] so that the retry loop above it is about
@@ -788,9 +801,20 @@ async fn attempt_backend(
 
     // The origin was parsed when the pool was built, so this is a borrow of
     // it rather than a `Url::parse` per request.
+    //
+    // The reason is capitalised for this path: it said "Invalid backend URL"
+    // here and "invalid backend URL" on the tunnel path, and the operator
+    // reads both.
     let origin: &str = match &backend_info.origin {
         Ok(origin) => origin,
-        Err(reason) => return Err(anyhow::anyhow!("{}", reason).into()),
+        Err(reason) => return Err(anyhow::anyhow!("{}", capitalised(reason)).into()),
+    };
+
+    // The host and the port on their own, which is how this path named the
+    // backend that did not answer.
+    let host_and_port = match origin.split_once("://") {
+        Some((_, rest)) => rest,
+        None => origin,
     };
 
     let new_uri = format!("{origin}{rewritten_path}")
@@ -835,7 +859,9 @@ async fn attempt_backend(
             },
         }),
         Err(_) => Err(ProxyFailure {
-            error: anyhow::anyhow!("backend {origin} did not respond within {response_deadline:?}"),
+            error: anyhow::anyhow!(
+                "backend {host_and_port} did not respond within {response_deadline:?}"
+            ),
             partial: None,
             // The request was carried: the deadline expired after it went out.
             retry: Retryability::IfIdempotent,
@@ -2038,6 +2064,31 @@ pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Erro
 mod tests {
     use super::*;
     use crate::deadline::Deadlines;
+
+    /// A reason is capitalised for the path that said it that way.
+    ///
+    /// The backend's address can fail in two ways, and the two paths that
+    /// report it word it differently: the plaintext path says "Invalid
+    /// backend URL" and the tunnel path says "invalid backend URL". Both are
+    /// the same reason, and the operator reads both.
+    #[test]
+    fn a_reason_keeps_the_wording_of_the_path_that_says_it() {
+        assert_eq!(
+            capitalised("invalid backend URL: relative URL without a base"),
+            "Invalid backend URL: relative URL without a base"
+        );
+        assert_eq!(
+            capitalised("backend URL missing host"),
+            "Backend URL missing host"
+        );
+        // A message that is already capitalised is left alone.
+        assert_eq!(
+            capitalised("Backend URL missing host"),
+            "Backend URL missing host"
+        );
+        // And an empty one stays empty rather than panicking.
+        assert_eq!(capitalised(""), "");
+    }
 
     /// A request that names more than one host is refused.
     ///
