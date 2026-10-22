@@ -94,7 +94,9 @@ use netstack_smoltcp::udp::{ReadHalf as UdpReadHalf, UdpMsg, WriteHalf as UdpWri
 use netstack_smoltcp::{
     AnyIpPktFrame, Stack, StackBuilder, TcpListener as SmolTcpListener, TcpStream as SmolTcpStream,
 };
-use nexapipe_proto::{FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame};
+use nexapipe_proto::{
+    FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame, payload_fits_datagram,
+};
 use std::collections::HashMap;
 #[cfg(target_os = "android")]
 use std::io::{Read, Write};
@@ -1698,11 +1700,29 @@ async fn run_udp_flow(
 
                 let mut consumed = 0usize;
                 let mut tun_gone = false;
+                let mut oversized = false;
                 while let Frame::Ready {
                     payload,
                     consumed: frame_len,
                 } = decode_frame(&partial[consumed..])
                 {
+                    // A datagram larger than a UDP payload cannot be written to
+                    // the TUN: the IP header's total-length field is sixteen
+                    // bits wide, and the stack builds the packet from this
+                    // payload. The encoder on the other side refuses to
+                    // produce one, so a frame this size is a peer that is not
+                    // speaking the protocol — and the flow ends rather than
+                    // the packet going out truncated.
+                    if !payload_fits_datagram(payload) {
+                        jni_log!(
+                            "[tun-proxy] UDP frame of {} bytes from {}:{} exceeds the datagram limit, ending the flow",
+                            payload.len(),
+                            domain,
+                            port
+                        );
+                        oversized = true;
+                        break;
+                    }
                     // The reply comes *from* the address the application sent to,
                     // because the application's socket is often connected and a
                     // datagram from any other source is discarded.
@@ -1728,6 +1748,9 @@ async fn run_udp_flow(
                         "[tun-proxy] TUN writer is gone, ending UDP flow to {}",
                         domain
                     );
+                    break;
+                }
+                if oversized {
                     break;
                 }
             }
