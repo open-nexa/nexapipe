@@ -1,6 +1,6 @@
 use crate::config::CircuitBreaker;
 use rand;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::RwLock;
 
@@ -14,46 +14,40 @@ pub enum LoadBalancingStrategy {
     LeastConn,
 }
 
-#[derive(Debug, Clone)]
+/// What is known about a backend that is **not** on the request's path.
+///
+/// The address and the health flag are not here: both are read on every
+/// request, so they sit on the entry beside this, where reading them needs
+/// no lock at all. What is left is the bookkeeping — when the backend was
+/// last probed and how many times in a row it has failed — which is read by
+/// the operator's view and by nobody on the hot path.
+#[derive(Debug, Clone, Default)]
 pub struct BackendStatus {
-    url: String,
-    healthy: bool,
     last_check: Option<std::time::Instant>,
     consecutive_failures: usize,
 }
 
 impl BackendStatus {
-    pub fn new(url: String) -> Self {
-        BackendStatus {
-            url,
-            healthy: true,
-            last_check: None,
-            consecutive_failures: 0,
-        }
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    pub fn is_healthy(&self) -> bool {
-        self.healthy
-    }
-
+    /// The backend is up.
     pub fn mark_healthy(&mut self) {
-        self.healthy = true;
         self.consecutive_failures = 0;
         self.last_check = Some(std::time::Instant::now());
     }
 
+    /// The backend is down.
     pub fn mark_unhealthy(&mut self) {
-        self.healthy = false;
         self.consecutive_failures += 1;
         self.last_check = Some(std::time::Instant::now());
     }
 
+    /// How many times in a row it has failed.
     pub fn consecutive_failures(&self) -> usize {
         self.consecutive_failures
+    }
+
+    /// When it was last probed.
+    pub fn last_check(&self) -> Option<std::time::Instant> {
+        self.last_check
     }
 }
 
@@ -69,6 +63,12 @@ struct BackendEntry {
     /// The address, kept beside the health status so that the circuit can
     /// name the backend it is talking about without waiting on a lock.
     url: String,
+    /// Whether the backend is healthy.
+    ///
+    /// An **atomic**, because choosing a backend happens on every request and
+    /// it is a read: it used to take the status lock, so a route with one
+    /// backend paid a lock round trip per request for a flag.
+    healthy: AtomicBool,
     status: RwLock<BackendStatus>,
     in_flight: AtomicUsize,
     /// The circuit this backend's failures are counted on.
@@ -121,7 +121,8 @@ impl BackendEntry {
     fn new(url: String) -> Self {
         BackendEntry {
             url: url.clone(),
-            status: RwLock::new(BackendStatus::new(url)),
+            healthy: AtomicBool::new(true),
+            status: RwLock::new(BackendStatus::default()),
             in_flight: AtomicUsize::new(0),
             circuit: Mutex::new(CircuitState::new()),
             breaker: OnceLock::new(),
@@ -201,13 +202,15 @@ impl BackendEntry {
 /// stampedes when a lease is released too early.
 pub struct BackendLease {
     entry: Arc<BackendEntry>,
-    url: String,
 }
 
 impl BackendLease {
     /// The address this flow is to be forwarded to.
     pub fn url(&self) -> &str {
-        &self.url
+        // The entry holds the address, so this is a borrow of it: the lease
+        // used to keep a copy of its own, which was a heap allocation and a
+        // lock read on every request.
+        &self.entry.url
     }
 
     /// The backend answered.
@@ -233,7 +236,7 @@ impl BackendLease {
 impl std::fmt::Debug for BackendLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendLease")
-            .field("url", &self.url)
+            .field("url", &self.entry.url)
             .field("outstanding", &self.entry.in_flight.load(Ordering::Relaxed))
             .finish()
     }
@@ -351,9 +354,12 @@ impl BackendPool {
     /// again: there is no other answer to give, and a second attempt at the
     /// same backend is still better than none.
     pub async fn select_backend_excluding(&self, exclude: &[String]) -> Option<BackendLease> {
-        let mut healthy_backends = Vec::new();
+        // **One vector, filtered in place.** It used to be three — the healthy
+        // ones, the ones whose circuit is not open, and the ones that have not
+        // been tried — and each was a heap allocation on every request.
+        let mut healthy_backends: Vec<usize> = Vec::new();
         for (i, b) in self.backends.iter().enumerate() {
-            if b.status.read().await.is_healthy() {
+            if b.healthy.load(Ordering::Relaxed) {
                 healthy_backends.push(i);
             }
         }
@@ -363,7 +369,7 @@ impl BackendPool {
             // information here — it is a single backend that is either up, or
             // the only chance this request has.
             if self.backends.len() == 1 {
-                let url = self.backends[0].status.read().await.url.clone();
+                let url = self.backends[0].url.clone();
                 tracing::warn!(
                     "Backend {} is the only one behind this route and reports unhealthy; \
                      forwarding anyway, because refusing would answer for every request to it",
@@ -391,46 +397,37 @@ impl BackendPool {
         // a tried backend that is still serving would refuse a request that
         // has somewhere to go.
         let healthy_count = healthy_backends.len();
-        let serving: Vec<usize> = healthy_backends
-            .iter()
-            .copied()
-            .filter(|i| self.backends[*i].circuit_allows())
-            .collect();
-        if serving.len() < healthy_count {
+        healthy_backends.retain(|i| self.backends[*i].circuit_allows());
+        if healthy_backends.len() < healthy_count {
             tracing::warn!(
                 "{} of {healthy_count} healthy backend(s) behind this route are out of \
                  rotation; the circuit is open on them",
-                healthy_count - serving.len(),
+                healthy_count - healthy_backends.len(),
             );
         }
-        if serving.is_empty() {
+        if healthy_backends.is_empty() {
             // Every healthy backend has an open circuit. That is an answer:
             // the route is configured and nothing behind it is serving.
             return None;
         }
-        healthy_backends = serving;
 
         // The ones that have not been tried yet, when there are any. A pool
         // whose every serving backend is on the list falls back to the whole
         // set, because the alternative is not to try at all.
-        let mut untried: Vec<usize> = Vec::new();
-        for i in &healthy_backends {
-            let url = &self.backends[*i].status.read().await.url;
-            if !exclude.iter().any(|e| e == url) {
-                untried.push(*i);
-            }
+        //
+        // The address is the entry's own, so the comparison does not take the
+        // status lock — it used to, once per backend.
+        let any_untried = healthy_backends
+            .iter()
+            .any(|i| !exclude.iter().any(|e| e == &self.backends[*i].url));
+        if any_untried {
+            healthy_backends.retain(|i| !exclude.iter().any(|e| e == &self.backends[*i].url));
+        } else if !exclude.is_empty() {
+            tracing::debug!(
+                "Every serving backend behind this route has been tried; trying one of them \
+                 again, because there is nobody else to ask"
+            );
         }
-        let healthy_backends = if untried.is_empty() {
-            if !exclude.is_empty() {
-                tracing::debug!(
-                    "Every serving backend behind this route has been tried; trying one of them \
-                     again, because there is nobody else to ask"
-                );
-            }
-            healthy_backends
-        } else {
-            untried
-        };
 
         let idx = match self.strategy {
             LoadBalancingStrategy::RoundRobin => {
@@ -509,9 +506,8 @@ impl BackendPool {
         // this same vector in the caller, and an out-of-range one panics here
         // rather than being quietly read as "no backend available".
         let entry = Arc::clone(&self.backends[idx]);
-        let url = entry.status.read().await.url.clone();
         entry.in_flight.fetch_add(1, Ordering::Relaxed);
-        BackendLease { entry, url }
+        BackendLease { entry }
     }
 
     pub fn len(&self) -> usize {
@@ -529,7 +525,7 @@ impl BackendPool {
     pub async fn backends(&self) -> Vec<String> {
         let mut result = Vec::new();
         for b in &self.backends {
-            result.push(b.status.read().await.url.clone());
+            result.push(b.url.clone());
         }
         result
     }
@@ -543,7 +539,7 @@ impl BackendPool {
     pub async fn outstanding(&self, url: &str) -> usize {
         let mut count = 0;
         for backend in &self.backends {
-            if backend.status.read().await.url == url {
+            if backend.url == url {
                 count += backend.in_flight.load(Ordering::Relaxed);
             }
         }
@@ -559,7 +555,7 @@ impl BackendPool {
     pub async fn healthy_count(&self) -> usize {
         let mut count = 0;
         for backend in &self.backends {
-            if backend.status.read().await.is_healthy() {
+            if backend.healthy.load(Ordering::Relaxed) {
                 count += 1;
             }
         }
@@ -573,11 +569,14 @@ impl BackendPool {
         // entries were down and the balancer kept picking them.
         let mut matched = false;
         for backend in &self.backends {
-            let mut status = backend.status.write().await;
-            if status.url != url {
+            if backend.url != url {
                 continue;
             }
             matched = true;
+            // The flag first, then the bookkeeping: the flag is what the
+            // request path reads, and it is read without a lock.
+            backend.healthy.store(healthy, Ordering::Relaxed);
+            let mut status = backend.status.write().await;
             if healthy {
                 status.mark_healthy();
             } else {
@@ -599,8 +598,7 @@ impl BackendPool {
     pub async fn get_backend_statuses(&self) -> Vec<(String, bool)> {
         let mut result = Vec::new();
         for b in &self.backends {
-            let status = b.status.read().await;
-            result.push((status.url.clone(), status.healthy));
+            result.push((b.url.clone(), b.healthy.load(Ordering::Relaxed)));
         }
         result
     }

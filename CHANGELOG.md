@@ -343,6 +343,19 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **Choosing a backend takes no lock, and one allocation instead of three.**
+  The balancer's choice happens on every request, and it took the status lock
+  once per backend to read whether each was healthy, again to compare the
+  addresses, and once more to hand the lease out — and the lease kept a **copy**
+  of the address, although the entry already had it. It also built three
+  vectors where one would do.
+  The address and the health flag now sit on the entry, where reading them
+  needs no lock, and the candidates are filtered **in place** rather than
+  copied into a new vector at each step. One request makes **46 allocations**
+  where it made **49**.
+  The health flag is an atomic now, so the operator's view and the request
+  path cannot disagree about it: the flag is written once, and both read it.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of
