@@ -3,6 +3,7 @@ use crate::routes::{L4Options, Route};
 use crate::toml_zeroize::{ZeroizedValue, zeroize_document};
 use nexapipe_proto::secret::SecretString;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Address of the plaintext listener. **Absent means "do not bind it at
     /// all"**, and that is the default: every client that authenticates comes
@@ -58,6 +60,7 @@ pub struct ServerConfig {
 /// back would trip the watcher that reloads on the config's mtime. See
 /// [`crate::admin::token`].
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Address of the auxiliary listener. **Absent means "do not bind it"**,
     /// and that is the default: an instance that is not being scraped or
@@ -72,6 +75,7 @@ pub struct AdminConfig {
 /// mean a second build-and-test combination in CI and in every release for a
 /// decision a deployment makes per host.
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Serve `/metrics` on the `[admin]` listener. Default: `false`.
     ///
@@ -85,6 +89,7 @@ pub struct MetricsConfig {
 /// key it just generated. Every field is optional, so "all of them absent" is
 /// exactly what an empty `[iroh]` means.
 #[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
     pub relay_mode: Option<String>,
@@ -307,6 +312,7 @@ pub fn get_backend_protocol(value: &Option<String>) -> anyhow::Result<BackendPro
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RouteSpec {
     pub host_pattern: String,
     /// Defaults to `/`. Ignored when `mode = "passthrough"`.
@@ -362,6 +368,7 @@ fn default_path_pattern() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LocalProxyNode {
     pub server_node_id: Option<String>,
     pub server_ticket: Option<String>,
@@ -370,6 +377,7 @@ pub struct LocalProxyNode {
 
 /// Client-side 2FA credentials used by local-proxy mode.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LocalProxyTwoFactorConfig {
     pub enabled: Option<bool>,
     pub client_id: String,
@@ -391,6 +399,7 @@ impl std::fmt::Debug for LocalProxyTwoFactorConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LocalProxyConfig {
     pub enabled: bool,
     pub listen_addr: String,
@@ -421,6 +430,7 @@ pub struct LocalProxyConfig {
 /// Every field is optional; the defaults (see `log::init`) keep the previous
 /// behaviour of logging to stdout and add rotating files under `./logs`.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// Write the log to files. Default: `true`.
     pub file: Option<bool>,
@@ -482,6 +492,7 @@ pub struct LogConfig {
 /// Read once at startup, not live: these are handed to the HTTP client builder
 /// and to the stream handlers when they start, so an edit takes a restart.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct TimeoutsConfig {
     /// Seconds allowed for dialing a backend. Default: 10.
@@ -637,6 +648,7 @@ impl Default for Timeouts {
 /// existed. A backend that 404s, or answers any 2xx, is already counted healthy,
 /// so having no dedicated health endpoint is not on its own a reason to opt out.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct HealthCheckConfig {
     /// `false` disables probing entirely. Default: `true`.
@@ -665,7 +677,19 @@ impl Default for HealthCheckConfig {
     }
 }
 
+/// The whole configuration file.
+///
+/// **An unknown key is an error.** Every section refuses the keys it does not
+/// know, and so does the top level: a key that is not read is a key the
+/// operator believes is read, and a setting that silently does not apply
+/// looks exactly like a setting that is off. `exposee = true` under
+/// `[server]` used to be dropped without a word.
+///
+/// The two keys that exist only to be refused — `default_backend` and
+/// `[acme]` — are still parsed, so a config carrying one is told what to do
+/// with it instead of being accepted and ignored.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// **Removed.** Kept in the struct for exactly one reason: serde drops keys
     /// it does not know, so deleting this field would let a config that still
@@ -724,6 +748,21 @@ pub struct ProxyConfig {
     /// is, with the defaults.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    /// The `[auth]` section: a known key, and nothing else.
+    ///
+    /// The 2FA half of the file is parsed by [`Self::load_with_auth`], which
+    /// owns the seeds and the rules around them — this section is where they
+    /// are validated, where the enrollment tokens live and where the counters
+    /// are read. All this field does is say that the key is *known*: the top
+    /// level refuses the keys it does not know, and `[auth]` is not one of
+    /// them.
+    ///
+    /// The value is skipped rather than copied. `IgnoredAny` walks the table
+    /// and keeps none of it, which is what a TOTP seed needs: a copy of the
+    /// section inside this struct would be a second copy of every seed in the
+    /// file, held for as long as the configuration lives.
+    #[serde(default)]
+    auth: Option<IgnoredAny>,
 }
 
 /// The `[backends]` section: how the proxy reaches the backends themselves.
@@ -733,6 +772,7 @@ pub struct ProxyConfig {
 /// decided per route — an `http://` backend is fetched in the clear, an
 /// `https://` one over a TLS session this process originates.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct BackendsConfig {
     /// A PEM file of extra CA certificates to trust when verifying an
@@ -755,6 +795,7 @@ pub struct BackendsConfig {
 /// is not, unless the request was idempotent to begin with. What may be
 /// retried, and what may not, is spelled out in `crate::http`.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct RetryConfig {
     /// How many times a request may be tried again after it failed. Default: 0,
@@ -818,6 +859,7 @@ impl Default for Retry {
 /// a chance to come back. The two answer different questions and are meant to
 /// be on at the same time.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct CircuitBreakerConfig {
     /// `false` leaves every backend in rotation however it fails. Default:
@@ -1354,6 +1396,29 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
     }
 }
 
+/// Parses the configuration file's text, with an error that says what to do
+/// about a key this build does not know.
+///
+/// serde already names the key, and it already says which keys the section
+/// does have. What it cannot say is the one thing the operator can do about
+/// it, and it is the same either way: the key is a typo, or it belongs to a
+/// version of the file this build does not read. Both are fixed by removing it
+/// or by fixing its spelling.
+fn parse_config<T: serde::de::DeserializeOwned>(text: &str) -> anyhow::Result<T> {
+    match toml::from_str::<T>(text) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let message = error.to_string();
+            if error.message().contains("unknown field") {
+                anyhow::bail!(
+                    "{message}\n\nThis build does not know that key: remove it, or fix its spelling."
+                );
+            }
+            Err(anyhow::anyhow!("{message}"))
+        }
+    }
+}
+
 impl ProxyConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let path = Path::new(path);
@@ -1373,8 +1438,8 @@ impl ProxyConfig {
         );
 
         tracing::debug!("Config content read successfully, parsing TOML");
-        let mut config: Self = toml::from_str(content.expose_secret())
-            .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+        let mut config: Self = parse_config(content.expose_secret())
+            .map_err(|e| anyhow::anyhow!("Failed to parse config file: {e:#}"))?;
         config.resolve_external_credentials(path.parent())?;
 
         tracing::debug!("Config parsed successfully: {:?}", config);
@@ -1958,8 +2023,16 @@ impl ProxyConfig {
         let content = SecretString::new(std::fs::read_to_string(path)?);
 
         // Parse the base config
-        let mut base: Self = toml::from_str(content.expose_secret())?;
+        let mut base: Self = parse_config(content.expose_secret())
+            .map_err(|e| anyhow::anyhow!("Failed to parse config file: {e:#}"))?;
         base.resolve_external_credentials(Path::new(path).parent())?;
+
+        // No `[auth]` section: there is nothing to read out of one, and the
+        // tree that holds it does not have to be built. The top-level parse
+        // already knows whether the section is there.
+        if base.auth.is_none() {
+            return Ok((base, None));
+        }
 
         // Try to parse auth section separately
         // Note `toml::from_str`, not `str::parse`: `Value::from_str` reads a
