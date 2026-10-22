@@ -6,11 +6,11 @@
 //! the streams have to be presented as one of those before hyper's codec can
 //! be pointed at them.
 //!
-//! This is the same shape as [`DuplexIroh`], which presents the same pair as
-//! a tokio duplex stream. The two are kept apart because their traits are
-//! apart: tokio's `AsyncRead`/`AsyncWrite` and hyper's `Read`/`Write` say
-//! the same thing in different words, and a type that implements one does not
-//! implement the other.
+//! This is the same shape as [`crate::stream_util::DuplexIroh`], which presents
+//! the same pair as a tokio duplex stream. The two are kept apart because their
+//! traits are apart: tokio's `AsyncRead`/`AsyncWrite` and hyper's `Read`/`Write`
+//! say the same thing in different words, and a type that implements one does
+//! not implement the other.
 
 use std::io;
 use std::pin::Pin;
