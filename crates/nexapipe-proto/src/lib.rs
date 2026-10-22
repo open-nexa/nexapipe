@@ -16,6 +16,12 @@
 //! 0x05  L4 preface        -> TCP/UDP tunnel (this crate)
 //! ```
 //!
+//! That is what a connection negotiated with the **old** ALPN gets. A
+//! connection that names its protocol with ALPN says so at the handshake, and
+//! the server knows what it is serving before it reads a byte of it: see
+//! [`protocol`]. The old way still works, because a client that predates the
+//! ALPNs cannot be made to speak one.
+//!
 //! Unlike the TLS path, the L4 path is **not** sniffed: the client is our own code, so it
 //! states what it wants in a fixed preface instead of the server guessing from payload
 //! bytes. That is what makes UDP possible at all — a datagram has no `Host` header.
@@ -69,6 +75,7 @@ pub mod auth;
 pub mod deadline;
 mod host;
 mod preface;
+pub mod protocol;
 pub mod secret;
 mod udp;
 
