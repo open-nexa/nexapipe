@@ -7,7 +7,6 @@ pub mod deadline;
 pub mod dns;
 pub mod health;
 pub mod http;
-pub mod hyper_io;
 pub mod l4;
 pub mod lb;
 pub mod log;
