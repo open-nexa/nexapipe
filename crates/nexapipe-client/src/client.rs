@@ -269,9 +269,12 @@ mod tests {
             // **What was negotiated is what the connection is served as.** A
             // connection that named the HTTP protocol is served as a request,
             // and a preface is not a request — so the flow is refused, and
-            // the client never gets an answer. The stream is dropped without
-            // being finished, which resets it: the client hears at once
-            // rather than waiting for the connection to time out.
+            // the client never gets an answer.
+            //
+            // The refusal is loud rather than silent: the stream is dropped
+            // without being finished, and the connection is closed, so the
+            // client hears at once instead of waiting for the connection to
+            // time out.
             if connection.alpn() == Protocol::Http.alpn() {
                 drop((send, recv));
                 connection.close(VarInt::from_u32(0), b"a preface is not a request");
