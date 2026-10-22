@@ -12,7 +12,7 @@
 //! request that is forwarded wrongly — to the wrong backend, or not at all —
 //! shows up as a backend that saw nothing.
 
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{ConnectOptions, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::presets};
 use nexapipe::auth::{AuthConfig, ClientAuth, DeviceAuth};
 use nexapipe::config::{Retry, RouteMode, Timeouts};
@@ -32,7 +32,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// The ALPN the proxy endpoint is built with; iroh refuses a connection whose
 /// ALPN does not match, so the test client has to ask for the same one.
-const ALPN: &[u8] = b"\x05nexapipe";
+const ALPN: &[u8] = b"nexapipe";
+
+/// The ALPN clients built before the prefix byte was dropped use.
+const ALPN_LEGACY: &[u8] = b"\x05nexapipe";
 
 /// Ceiling for one reply. Far above anything these backends return, and it
 /// stops a test from waiting on a stream that never ends.
@@ -54,9 +57,17 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// the one option iroh requires and the rest of the presets come with network
 /// services this test must not depend on.
 async fn bind() -> Endpoint {
+    bind_with_alpns(vec![ALPN.to_vec()]).await
+}
+
+/// An endpoint that accepts exactly the ALPNs it is given.
+///
+/// The list matters: iroh negotiates the first protocol of the peer's offer that
+/// it also accepts, and refuses the connection when the two lists do not meet.
+async fn bind_with_alpns(alpns: Vec<Vec<u8>>) -> Endpoint {
     Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(alpns)
         .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .expect("loopback bind address")
         .bind()
@@ -2376,5 +2387,105 @@ async fn the_enrollment_token_has_a_ceiling_of_its_own() {
     assert!(
         client.locked_until.is_none(),
         "the client is not locked out: the devices that already enrolled go on authenticating"
+    );
+}
+
+/// Accepts connections and holds them open.
+///
+/// iroh completes an incoming handshake when the application accepts it, so a
+/// test that only asks whether the ALPN negotiation worked still has to run an
+/// accept loop — without one the client waits for a handshake nobody drives.
+fn spawn_acceptor(ep: Endpoint) {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            tokio::spawn(async move {
+                if let Ok(accepting) = incoming.accept() {
+                    let _ = accepting.await;
+                }
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// ALPN compatibility
+// ---------------------------------------------------------------------------
+
+/// A client built before the prefix byte was dropped speaks the legacy ALPN,
+/// and a proxy that speaks both still lets it in.
+///
+/// The proxy accepts the current ALPN and the legacy one, and the client only
+/// offers the legacy one — the negotiation has to meet on it.
+#[tokio::test]
+async fn a_client_that_speaks_the_legacy_alpn_still_reaches_a_proxy() {
+    let server = bind_with_alpns(vec![ALPN.to_vec(), ALPN_LEGACY.to_vec()]).await;
+    spawn_acceptor(server.clone());
+    let client = bind().await;
+
+    let conn = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        client.connect(dial_address(&server), ALPN_LEGACY),
+    )
+    .await
+    .expect("dialling the proxy timed out")
+    .expect("a proxy that speaks both ALPNs takes the legacy one");
+
+    // The connection is up; a stream on it is what the tunnel does next.
+    let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+    send.write_all(b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await
+        .expect("write request");
+}
+
+/// A proxy that speaks only the legacy ALPN still lets a current client in.
+///
+/// The current client offers the current ALPN *and* the legacy one, so the
+/// negotiation has a protocol in common.
+#[tokio::test]
+async fn a_client_that_offers_both_alpns_reaches_a_legacy_proxy() {
+    let server = bind_with_alpns(vec![ALPN_LEGACY.to_vec()]).await;
+    spawn_acceptor(server.clone());
+    let client = bind().await;
+
+    let conn = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        client.connect_with_opts(
+            dial_address(&server),
+            ALPN,
+            ConnectOptions::new().with_additional_alpns(vec![ALPN_LEGACY.to_vec()]),
+        ),
+    )
+    .await
+    .expect("dialling the proxy timed out")
+    .expect("the dial produced a connecting")
+    .await
+    .expect("a proxy that speaks the legacy ALPN takes the offer that carries it");
+
+    let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+    send.write_all(b"GET / HTTP/1.1\r\nHost: app.test\r\n\r\n")
+        .await
+        .expect("write request");
+}
+
+/// Accepting two ALPNs does not loosen the check: a proxy that speaks only the
+/// current one still refuses the legacy one.
+///
+/// Without this, the test above would pass even if the proxy accepted anything.
+#[tokio::test]
+async fn a_proxy_that_speaks_only_the_current_alpn_refuses_the_legacy_one() {
+    let server = bind_with_alpns(vec![ALPN.to_vec()]).await;
+    spawn_acceptor(server.clone());
+    let client = bind().await;
+
+    let outcome = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        client.connect(dial_address(&server), ALPN_LEGACY),
+    )
+    .await
+    .expect("dialling the proxy timed out");
+
+    assert!(
+        outcome.is_err(),
+        "a proxy that speaks only the current ALPN took the legacy one"
     );
 }

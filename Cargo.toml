@@ -52,6 +52,11 @@ strip = true
 [workspace.dependencies]
 iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
 iroh-tickets = { version = "1.0.0" }
+# The quinn fork iroh itself builds on. `iroh` depends on this exact crate, so the
+# `ControllerFactory` it re-exports and the concrete controllers below are the same
+# types. The workspace's older `quinn` alias is a different fork, and naming it
+# would give a trait that does not match.
+noq-proto = { version = "1.3.0", default-features = false }
 quinn = { version = "0.16", package = "iroh-quinn" }
 tokio = { version = "1.52.3", features = ["full"] }
 anyhow = "1.0.103"

@@ -27,7 +27,7 @@ The app is deliberately **not** a full-tunnel VPN:
       │  · DNS answers point the domain at the fake proxy IP
       │  · inner TCP is terminated locally; each connection = one QUIC bi-stream
       ▼
- iroh endpoint (ALPN b"\x05nexapipe") ── QUIC ──▶ nexapipe server ──▶ real backend
+ iroh endpoint (ALPN b"nexapipe") ── QUIC ──▶ nexapipe server ──▶ real backend
 ```
 
 Only the domains you configure are hijacked; everything else keeps using the

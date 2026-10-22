@@ -64,12 +64,14 @@
 //! produced an empty path, matched no route and was forwarded to `default_backend`.
 //! A preface that fails to decode is now a loud error instead of a silent default.
 
+pub mod alpn;
 pub mod auth;
 mod host;
 mod preface;
 pub mod secret;
 mod udp;
 
+pub use alpn::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_ALL, ALPN_NEXAPIPE_LEGACY};
 pub use auth::{
     Algorithm, AuthMessage, CodecError, Format, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN,
     VERSION_BINARY, VERSION_JSON, is_presentable_client_id, is_presentable_device_id,

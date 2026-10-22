@@ -13,7 +13,7 @@
 //! receive_window        = VarInt::MAX      (effectively unlimited — raised here)
 //! send_window           = 8 * 1.25 MB      = 10 MB
 //! initial_mtu/min_mtu   = 1200
-//! congestion controller = Cubic
+//! congestion controller = Cubic (overridden here — see below)
 //! ```
 //!
 //! Nexapipe maps **exactly one inner TCP connection onto one QUIC bi-stream**, so
@@ -50,6 +50,35 @@
 //! iroh's QUIC-multipath based NAT traversal. `QuicTransportConfig::builder()` seeds them with
 //! iroh's values and we never overwrite them.
 //!
+//! # Congestion control
+//!
+//! The controller is **BBR** (v3), not the Cubic the quinn fork defaults to. Cubic
+//! is a loss-based controller: it reads a loss as "the link is congested" and cuts
+//! its window. On a long international path the loss is usually *noise* rather than
+//! congestion — a router dropping a packet here and there, or a carrier shaping the
+//! flow — and each such loss costs Cubic a window it has to win back over the next
+//! round trip. That is the throughput cliff Cubic is known for, and it is amplified
+//! by the round trip time: at 200 ms every mistake costs a fifth of a second of
+//! recovery.
+//!
+//! BBR is model-based instead. It measures the bottleneck bandwidth and the minimum
+//! round trip time, and paces to `bandwidth x RTT` rather than to "how much can I send
+//! before I see a loss". Random loss does not move that estimate, so a shaped or lossy
+//! international link stays at its ceiling instead of falling off it.
+//!
+//! Two things this does **not** do, so that nobody expects more of it than it can
+//! deliver:
+//!
+//! * It does not change how the traffic looks on the wire. The tunnel is still a QUIC
+//!   stream to a peer, and an operator's policy that classifies it is unaffected.
+//! * It cannot lift a limit the operator imposed. If the flow is capped at N Mbps, BBR
+//!   gets the tunnel close to N; Cubic, on a jittery path, may not even reach half of it.
+//!
+//! The fork quinn builds on ships its BBRv3 implementation marked "Experimental! Use
+//! at your own risk.", and QUIC does not negotiate the controller — each end applies
+//! its own to the direction it sends in. The environment variable below is therefore
+//! both the A/B switch and the one-step rollback.
+//!
 //! # Overriding for A/B tests
 //!
 //! Values are read from the environment once per endpoint construction, so a tuning
@@ -63,10 +92,13 @@
 //! | `NEXAPIPE_QUIC_MAX_BIDI_STREAMS`  | 1024    | concurrent bi-streams a peer may open  |
 //! | `NEXAPIPE_QUIC_INITIAL_MTU`       | 0       | 0 = keep iroh's 1200; else 1200..=65535|
 //! | `NEXAPIPE_QUIC_KEEPALIVE_MS`      | 0       | 0 = keep iroh's 5s                     |
+//! | `NEXAPIPE_QUIC_CONGESTION`        | bbr     | `bbr` or `cubic`                       |
 //!
 //! Android has no useful environment, so it always runs the compiled-in defaults.
 
-use iroh::endpoint::{QuicTransportConfig, VarInt};
+use iroh::endpoint::{ControllerFactory, QuicTransportConfig, VarInt};
+use noq_proto::congestion::{Bbr3Config, CubicConfig};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Per-stream receive window. 4 MiB sustains ~160 Mbps at 200 ms RTT and ~320 Mbps at
@@ -138,6 +170,66 @@ const ENV_RECV_WINDOW: &str = "NEXAPIPE_QUIC_RECV_WINDOW";
 const ENV_MAX_BIDI_STREAMS: &str = "NEXAPIPE_QUIC_MAX_BIDI_STREAMS";
 const ENV_INITIAL_MTU: &str = "NEXAPIPE_QUIC_INITIAL_MTU";
 const ENV_KEEPALIVE_MS: &str = "NEXAPIPE_QUIC_KEEPALIVE_MS";
+const ENV_CONGESTION: &str = "NEXAPIPE_QUIC_CONGESTION";
+
+/// The congestion controller the endpoint uses unless the environment says otherwise.
+///
+/// BBR. The reasoning is in the module docs; the short version is that the loss on a
+/// long international path is usually noise rather than congestion, and a loss-based
+/// controller punishes noise twice.
+pub const DEFAULT_CONGESTION: Congestion = Congestion::Bbr;
+
+/// Which congestion controller quinn builds its per-path controller from.
+///
+/// QUIC does not negotiate this: each endpoint applies its own controller to the
+/// direction it sends in, so the two ends of a connection may run different ones
+/// without either of them being wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Congestion {
+    /// BBR — bottleneck bandwidth and round trip propagation time, version 3.
+    ///
+    /// Model-based: it measures the bottleneck and paces to `bandwidth x RTT`, so a
+    /// random loss does not shrink the window.
+    Bbr,
+    /// Cubic — quinn's own default, and the loss-based controller BBR replaces.
+    ///
+    /// Kept so that a run can be compared against it, and so that a rollback is one
+    /// environment variable away.
+    Cubic,
+}
+
+impl Congestion {
+    /// The name this controller is spelled with in the log and in the environment.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bbr => "bbr",
+            Self::Cubic => "cubic",
+        }
+    }
+
+    /// Reads the name, case-insensitively.
+    ///
+    /// `None` means the spelling is not one of ours; the caller warns and keeps the
+    /// default rather than guessing which controller was meant.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bbr" => Some(Self::Bbr),
+            "cubic" => Some(Self::Cubic),
+            _ => None,
+        }
+    }
+
+    /// The factory quinn builds this controller's per-path controller from.
+    ///
+    /// The trait is iroh's own re-export of quinn's, so the type here is the one
+    /// iroh's transport builder accepts.
+    pub fn controller_factory(self) -> Arc<dyn ControllerFactory + Send + Sync> {
+        match self {
+            Self::Bbr => Arc::new(Bbr3Config::default()),
+            Self::Cubic => Arc::new(CubicConfig::default()),
+        }
+    }
+}
 
 /// Tunable subset of [`QuicTransportConfig`] that nexapipe actually wants to control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +247,8 @@ pub struct TransportTuning {
     pub initial_mtu: Option<u16>,
     /// `None` keeps iroh's connection keep-alive (5 s).
     pub keep_alive_interval: Option<Duration>,
+    /// Which congestion controller to use. See [`Congestion`].
+    pub congestion: Congestion,
 }
 
 impl Default for TransportTuning {
@@ -166,6 +260,7 @@ impl Default for TransportTuning {
             max_concurrent_bidi_streams: DEFAULT_MAX_BIDI_STREAMS,
             initial_mtu: None,
             keep_alive_interval: None,
+            congestion: DEFAULT_CONGESTION,
         }
     }
 }
@@ -226,6 +321,12 @@ impl TransportTuning {
                 tuning.keep_alive_interval = None;
             }
         }
+        if let Some(raw) = env_string(ENV_CONGESTION) {
+            match Congestion::parse(&raw) {
+                Some(congestion) => tuning.congestion = congestion,
+                None => warn_ignored(ENV_CONGESTION, raw),
+            }
+        }
 
         tuning
     }
@@ -253,7 +354,8 @@ impl TransportTuning {
                 self.max_concurrent_bidi_streams,
                 ENV_MAX_BIDI_STREAMS,
                 DEFAULT_MAX_BIDI_STREAMS,
-            ));
+            ))
+            .congestion_controller_factory(self.congestion.controller_factory());
 
         if let Some(mtu) = self.initial_mtu {
             builder = builder.initial_mtu(mtu);
@@ -269,7 +371,7 @@ impl TransportTuning {
     pub fn describe(&self) -> String {
         format!(
             "stream_receive_window={}B send_window={}B receive_window={}B \
-             max_concurrent_bidi_streams={} initial_mtu={} keep_alive={}",
+             max_concurrent_bidi_streams={} initial_mtu={} keep_alive={} congestion={}",
             self.stream_receive_window,
             self.send_window,
             self.receive_window,
@@ -280,6 +382,7 @@ impl TransportTuning {
             self.keep_alive_interval
                 .map(|d| format!("{:?}", d))
                 .unwrap_or_else(|| "iroh-default".to_string()),
+            self.congestion.as_str(),
         )
     }
 }
@@ -307,6 +410,20 @@ fn env_u64(key: &str) -> Option<u64> {
             warn_ignored(key, trimmed);
             None
         }
+    }
+}
+
+/// Reads a non-empty environment value, trimmed.
+///
+/// An empty value is no value: the same way an empty `NEXAPIPE_QUIC_INITIAL_MTU`
+/// means "keep the default" rather than "set it to zero".
+fn env_string(key: &str) -> Option<String> {
+    let raw = std::env::var(key).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -373,11 +490,39 @@ mod tests {
         let _ = TransportTuning::default().transport_config();
     }
 
+    /// The default controller is BBR, not the Cubic quinn defaults to.
+    #[test]
+    fn the_default_controller_is_bbr() {
+        assert_eq!(TransportTuning::default().congestion, Congestion::Bbr);
+        assert_eq!(DEFAULT_CONGESTION, Congestion::Bbr);
+    }
+
+    /// The spelling is read case-insensitively, and anything else is refused rather
+    /// than guessed at.
+    #[test]
+    fn the_controller_name_is_read_case_insensitively() {
+        assert_eq!(Congestion::parse("bbr"), Some(Congestion::Bbr));
+        assert_eq!(Congestion::parse("BBR"), Some(Congestion::Bbr));
+        assert_eq!(Congestion::parse(" Cubic "), Some(Congestion::Cubic));
+        assert_eq!(Congestion::parse("reno"), None);
+        assert_eq!(Congestion::parse(""), None);
+    }
+
+    /// Both controllers build a factory quinn accepts. quinn's `TransportConfig`
+    /// does not print the factory in its `Debug`, so this is as far as a unit test
+    /// can reach — whether the controller is *used* is an A/B measurement.
+    #[test]
+    fn both_controllers_build_a_factory() {
+        let _ = Congestion::Bbr.controller_factory();
+        let _ = Congestion::Cubic.controller_factory();
+    }
+
     #[test]
     fn describe_is_stable() {
         let text = TransportTuning::default().describe();
         assert!(text.contains("stream_receive_window=4194304B"), "{text}");
         assert!(text.contains("initial_mtu=iroh-default"), "{text}");
+        assert!(text.contains("congestion=bbr"), "{text}");
     }
 
     /// The reader tells a measurement from quinn's guess by comparing against

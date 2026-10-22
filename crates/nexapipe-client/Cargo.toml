@@ -26,6 +26,10 @@ iroh = { version = "1.0.1", default-features = false, features = ["tls-ring"] }
 # server's tree is a mobile-only dependency in the server's build.
 ndk-context = { version = "0.1", optional = true }
 iroh-tickets = { version = "1.0.0" }
+# The quinn fork iroh itself builds on. The lock file resolves one copy of it, so
+# `noq_proto::congestion::Bbr3Config` and iroh's `ControllerFactory` are the same
+# types — needed for the congestion controller in `src/transport.rs`.
+noq-proto.workspace = true
 tokio = { version = "1.52.3", features = ["full"] }
 anyhow = "1.0.103"
 http = "1.4.2"

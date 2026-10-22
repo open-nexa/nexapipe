@@ -310,7 +310,16 @@ pub async fn run_proxy(
         }
     }
 
-    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN_NEXAPIPE.to_vec()]);
+    // Both ALPNs are accepted: the current one, and the one clients built before
+    // the prefix byte was dropped use.
+    //
+    // **This list is what decides.** QUIC's negotiation picks the first of the
+    // *accept side's* entries that the peer also offers — not the first of the
+    // peer's offer. So the order below is the preference order, and the
+    // current spelling has to be first. The client offers both, but the order
+    // it offers them in does not matter; what matters is that it offers both.
+    let mut builder = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN_NEXAPIPE.to_vec(), ALPN_NEXAPIPE_LEGACY.to_vec()]);
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
     // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).
@@ -1131,7 +1140,19 @@ pub async fn run_local_proxy(
     local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
 }
 
-const ALPN_NEXAPIPE: &[u8] = b"\x05nexapipe";
+// The ALPN this build speaks, and the one clients built before the prefix
+// byte was dropped use.
+//
+// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
+// starts with — in front of the name. That byte was never part of a length
+// encoding; it made the protocol name a nine-byte string that began with a
+// control byte, which is a fingerprint on the wire and nothing else. The name
+// is now the name.
+//
+// The constants live in `nexapipe-proto`, which the client links too: the two
+// ends have to agree on the name, and a name written down twice is a name
+// that eventually differs.
+use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
 
 #[cfg(test)]
 mod tests {
