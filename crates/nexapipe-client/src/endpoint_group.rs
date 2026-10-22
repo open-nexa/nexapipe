@@ -8,6 +8,7 @@ use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinB
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::{normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -356,7 +357,10 @@ impl DomainPools {
         )))
     }
 
-    pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
+    pub async fn get_connection(
+        &self,
+        protocol: Protocol,
+    ) -> Result<PooledConnection, ClientError> {
         let index = self.choose()?;
         let pool = &self.pools[index];
         let backend_id = pool.backend_id();
@@ -382,7 +386,7 @@ impl DomainPools {
         // side, which every pool says at once on shutdown and which is news
         // about nobody's backend. Calling it "down" would paint the whole node
         // list unreachable each time a tunnel stops.
-        match pool.get_connection().await {
+        match pool.get_connection(protocol).await {
             Ok(borrowed) => Ok(PooledConnection::tracked(
                 borrowed.conn,
                 index,
@@ -1049,7 +1053,11 @@ impl EndpointGroup {
         self.wildcards.get("")
     }
 
-    pub async fn get_connection(&self, domain: &str) -> Result<PooledConnection, ClientError> {
+    pub async fn get_connection(
+        &self,
+        domain: &str,
+        protocol: Protocol,
+    ) -> Result<PooledConnection, ClientError> {
         jni_log!(
             "[DEBUG:endpoint-group] Looking up connection for domain: '{}'",
             domain
@@ -1060,7 +1068,7 @@ impl EndpointGroup {
                 "[DEBUG:endpoint-group] Found mapping for domain: '{}'",
                 domain
             );
-            return pools.get_connection().await;
+            return pools.get_connection(protocol).await;
         }
 
         if let Some(default) = &self.default_pools {
@@ -1068,7 +1076,7 @@ impl EndpointGroup {
                 "[DEBUG:endpoint-group] Using default pools for domain: '{}'",
                 domain
             );
-            return default.get_connection().await;
+            return default.get_connection(protocol).await;
         }
 
         jni_log!(
@@ -2369,7 +2377,9 @@ mod tests {
         group.record_probe(backend, true);
 
         group.close_all().await;
-        let outcome = group.get_connection("whatever.example").await;
+        let outcome = group
+            .get_connection("whatever.example", Protocol::Http)
+            .await;
 
         assert!(
             outcome.is_err(),

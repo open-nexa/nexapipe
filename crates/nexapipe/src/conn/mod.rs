@@ -15,6 +15,7 @@ use ::http::Request;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, Incoming};
 use nexapipe_proto::auth::Format;
+use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
@@ -273,6 +274,7 @@ enum StreamHead {
 async fn read_stream_head<R>(
     recv: &mut R,
     budgets: &StreamBudgets,
+    protocol: Protocol,
 ) -> Result<StreamHead, anyhow::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -308,13 +310,24 @@ where
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
-                // An L4 tunnel says so in its first byte, so it is recognised
-                // rather than sniffed, and a TLS session is not a request at
-                // all. Both are handed on with the bytes they came with.
-                if buf
-                    .first()
-                    .is_some_and(|b| l4::is_l4_stream(*b) || passthrough::is_tls_handshake(*b))
-                {
+                // What the stream is, when the connection did not say at the
+                // handshake.
+                //
+                // A connection that named its protocol with ALPN already
+                // said: an L4 tunnel is an L4 tunnel, and a TLS session is
+                // not a request at all. Both are handed on with the bytes
+                // they came with.
+                //
+                // The old way is a **sniff**: the first byte is read and
+                // recognised, because the connection did not say.
+                let other = match protocol {
+                    Protocol::L4 | Protocol::Tls => true,
+                    Protocol::Http => false,
+                    Protocol::Legacy => buf
+                        .first()
+                        .is_some_and(|b| l4::is_l4_stream(*b) || passthrough::is_tls_handshake(*b)),
+                };
+                if other {
                     return Ok(StreamHead::Other(buf));
                 }
 
@@ -364,6 +377,9 @@ pub async fn handle_bidi_stream(
     // off, and for a library embedder that never built an `AuthState`, which is
     // what the access log prints nothing for.
     who: PeerIdentity,
+    // What the connection carries, from the handshake. A connection that
+    // named its protocol does not have to be sniffed.
+    protocol: Protocol,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
 
@@ -374,7 +390,7 @@ pub async fn handle_bidi_stream(
     let open = tokio::time::Instant::now();
     let budgets = StreamBudgets::new(&timeouts.deadlines, open);
 
-    let (buf, body_data) = match read_stream_head(&mut recv, &budgets).await {
+    let (buf, body_data) = match read_stream_head(&mut recv, &budgets, protocol).await {
         Ok(StreamHead::Request { head, body }) => (head, body),
 
         Ok(StreamHead::Other(bytes)) => {
@@ -383,7 +399,17 @@ pub async fn handle_bidi_stream(
             // loop: a preface is not a request line, and the client may send
             // its first payload in the same segment, which the bytes already
             // hold and must hand over intact.
-            if bytes.first().is_some_and(|b| l4::is_l4_stream(*b)) {
+            //
+            // **The connection said which it is**, so the first byte is only
+            // read when it has to be — on a connection that named the old
+            // ALPN and is served the way it always was.
+            let is_l4 = match protocol {
+                Protocol::L4 => true,
+                Protocol::Tls => false,
+                Protocol::Http => false,
+                Protocol::Legacy => bytes.first().is_some_and(|b| l4::is_l4_stream(*b)),
+            };
+            if is_l4 {
                 return l4::handle_iroh_stream(
                     send,
                     recv,
@@ -2578,6 +2604,35 @@ pub async fn handle_connection(
     let peer = peer_id.to_string();
     tracing::info!("New connection from peer: {}", peer_id);
 
+    // **What this connection carries**, from the handshake.
+    //
+    // A client that names its protocol with ALPN has said so before a byte
+    // was read, so the server does not have to guess: the first byte of a
+    // stream is the protocol's, and there is nothing to sniff. A client that
+    // named the old ALPN is served the way it always was, by the first byte
+    // of each stream.
+    let alpn = conn.alpn();
+    let protocol = if alpn.is_empty() {
+        // No ALPN at all: the peer named none, and the old way is the safe
+        // reading of that.
+        Protocol::Legacy
+    } else {
+        match Protocol::from_alpn(alpn) {
+            Some(protocol) => protocol,
+            None => {
+                // An ALPN this build does not know. The connection asked for
+                // something that cannot be served here, and serving it as
+                // something else would be guessing.
+                tracing::warn!(
+                    "Connection from {} speaks a protocol this server does not know; closing it",
+                    peer_id
+                );
+                return;
+            }
+        }
+    };
+    tracing::debug!("Connection from {} speaks {}", peer_id, protocol.name());
+
     // One counter for the whole connection: the L4 path hands out a slot per flow and
     // answers `TooManyFlows` once it is full, so a client with many UDP flows fails the
     // one that does not fit instead of blocking inside `open_bi`.
@@ -2833,6 +2888,7 @@ pub async fn handle_connection(
                         acl_clone,
                         &request_id,
                         who_clone,
+                        protocol,
                     )
                     .instrument(span)
                     .await
@@ -2930,6 +2986,7 @@ mod tests {
         persist_auth_state, read_stream_head, undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
+    use nexapipe_proto::protocol::Protocol;
     use nexapipe_proto::secret::SecretString;
     use std::collections::HashMap;
 
@@ -3003,7 +3060,7 @@ mod tests {
                 .await;
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets())
+        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
             .await
             .expect("the head");
 
@@ -3035,7 +3092,7 @@ mod tests {
             let _ = client.write_all(&bytes).await;
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets())
+        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
             .await
             .expect("the head");
 
@@ -3059,7 +3116,7 @@ mod tests {
             drop(client);
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets())
+        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
             .await
             .expect("the head");
 
@@ -3080,7 +3137,7 @@ mod tests {
             let _ = client.write_all(&[0x05, 0x01, 0x01, 0x00]).await;
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets())
+        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
             .await
             .expect("the head");
 
@@ -3093,6 +3150,104 @@ mod tests {
                 );
             }
             other => panic!("expected the preface to be handed on, got {other:?}"),
+        }
+    }
+
+    /// **The protocol the connection named decides what the stream is.**
+    ///
+    /// The same bytes — an L4 preface — are a tunnel on a connection that
+    /// named the L4 protocol, and a request that is not one on a connection
+    /// that named the HTTP one. A connection that named nothing is served the
+    /// way it always was: the first byte decides, and this first byte says
+    /// L4.
+    ///
+    /// This is the whole point of choosing the protocol at the handshake: the
+    /// server does not have to guess, and a stream that is not what the
+    /// connection said it is does not get served as if it were.
+    #[tokio::test]
+    async fn the_named_protocol_decides_what_the_stream_is() {
+        let preface = b"\x05\x01\x01\x00";
+
+        // A connection that named L4 hands the bytes on.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::L4)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                preface.to_vec(),
+                "the bytes are handed on as they came"
+            ),
+            other => panic!("expected the bytes to be handed on, got {other:?}"),
+        }
+
+        // A connection that named HTTP reads them as a request — which they
+        // are not, and which is refused.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+            drop(client);
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Http)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Incomplete => {}
+            StreamHead::Other(_) => {
+                panic!("a connection that named HTTP was served a tunnel anyway")
+            }
+            other => panic!("expected the preface not to be a request, got {other:?}"),
+        }
+
+        // A connection that named nothing is served the way it always was.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(preface).await;
+        });
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                preface.to_vec(),
+                "the first byte decides, and it says L4"
+            ),
+            other => panic!("expected the bytes to be handed on, got {other:?}"),
+        }
+    }
+
+    /// A connection that named the TLS protocol is not served a request.
+    ///
+    /// A TLS session is not a request, and the ClientHello that starts it is
+    /// not a request line — on a connection that named the protocol, the
+    /// server does not have to read the first byte to find that out.
+    #[tokio::test]
+    async fn a_connection_that_named_tls_is_not_read_as_a_request() {
+        let hello = [0x16u8, 0x03, 0x01, 0x00, 0x05];
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = client.write_all(&hello).await;
+        });
+
+        match read_stream_head(&mut server, &generous_budgets(), Protocol::Tls)
+            .await
+            .expect("the head")
+        {
+            StreamHead::Other(bytes) => assert_eq!(
+                bytes,
+                hello.to_vec(),
+                "the ClientHello is handed on as it came"
+            ),
+            other => panic!("expected the ClientHello to be handed on, got {other:?}"),
         }
     }
 
