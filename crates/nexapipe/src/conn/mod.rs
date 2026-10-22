@@ -835,6 +835,9 @@ fn build_websocket_upgrade_request(
         if name.as_str().to_lowercase() == "host" {
             continue;
         }
+        if !forwards_websocket_header(name.as_str()) {
+            continue;
+        }
         request_buf.extend_from_slice(name.as_str().as_bytes());
         request_buf.extend_from_slice(b": ");
         request_buf.extend_from_slice(value.as_bytes());
@@ -843,6 +846,30 @@ fn build_websocket_upgrade_request(
     request_buf.extend_from_slice(b"\r\n");
 
     request_buf
+}
+
+/// Whether a header may be forwarded in a WebSocket upgrade request.
+///
+/// The hop-by-hop set, except for the two the upgrade is made of: switching
+/// protocols is exactly what this request is asking the backend for, so
+/// `upgrade` and `connection` have to reach it.
+///
+/// Everything else goes — the proxy authentication headers most of all,
+/// because they are a credential for *this* proxy and the backend has no
+/// business seeing them.
+fn forwards_websocket_header(name: &str) -> bool {
+    ![
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "keep-alive",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "expect",
+    ]
+    .iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
 /// Returns the status the client was answered with: 101 once the tunnel is up,
@@ -3508,5 +3535,48 @@ mod tests {
             request_line, "GET /v2/socket HTTP/1.1",
             "the upgrade did not go out with the route's rewritten path"
         );
+    }
+
+    /// The upgrade is the point of the request, so `upgrade` and `connection`
+    /// have to reach the backend — and a credential for *this* proxy must not.
+    #[tokio::test]
+    async fn a_websocket_upgrade_carries_the_upgrade_and_not_the_proxy_credential() {
+        let config = route_table_with_rewrite("/api", "/v2{}");
+
+        let backend_info = config
+            .get_backend_with_acl("rewrite.test", "/api/socket", None, None)
+            .await
+            .backend()
+            .expect("a route for the host");
+
+        let request = ::http::Request::builder()
+            .method("GET")
+            .uri("http://rewrite.test/api/socket")
+            .header("host", "rewrite.test")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("proxy-authorization", "Basic c2VjcmV0")
+            .header("proxy-authenticate", "Basic")
+            .header("proxy-connection", "keep-alive")
+            .body(())
+            .expect("a request");
+
+        let request_buf = build_websocket_upgrade_request(&request, &backend_info, "127.0.0.1");
+        let sent = String::from_utf8_lossy(&request_buf).to_ascii_lowercase();
+
+        assert!(sent.contains("upgrade: websocket"), "{sent}");
+        assert!(sent.contains("connection: upgrade"), "{sent}");
+        assert!(sent.contains("sec-websocket-key:"), "{sent}");
+        for leaked in [
+            "proxy-authorization",
+            "proxy-authenticate",
+            "proxy-connection",
+        ] {
+            assert!(
+                !sent.contains(leaked),
+                "{leaked} reached the backend:\n{sent}"
+            );
+        }
     }
 }
