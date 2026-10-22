@@ -35,7 +35,8 @@
     "connected": "Nexa — Connected",
     "connecting": "Nexa — Connecting…",
     "disconnected": "Nexa — Not connected",
-    "failed": "Nexa — Connection failed"
+    "failed": "Nexa — Connection failed",
+    "unknown": "Nexa — State unknown"
   },
   "common": {
     "save": "Save",

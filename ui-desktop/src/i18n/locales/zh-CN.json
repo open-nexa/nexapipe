@@ -35,7 +35,8 @@
     "connected": "Nexa — 已连接",
     "connecting": "Nexa — 连接中…",
     "disconnected": "Nexa — 未连接",
-    "failed": "Nexa — 连接失败"
+    "failed": "Nexa — 连接失败",
+    "unknown": "Nexa — 状态未知"
   },
   "common": {
     "save": "保存",

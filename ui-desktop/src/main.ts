@@ -21,10 +21,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App.vue';
 import router from './router';
-import i18n, { currentLocale, resolveLocale, setI18nLocale, translate } from './i18n';
+import i18n, { currentLocale, resolveLocale, setI18nLocale } from './i18n';
 import { applyStoredTheme } from './composables/useTheme';
 import { initPlatform } from './composables/useWindowControls';
 import { readStoredLocale, usePrefsStore } from './stores/prefs';
+import { isBackgroundLaunch } from './api/autostart';
+import { setTrayLabels } from './api/tray';
 import { initProxyState, onAppFocused, refreshTrayStatus } from './stores/proxy';
 import { initGate, refreshGate } from './stores/gate';
 import { initConfigStore, initConfigStoreDeferred } from './stores/config';
@@ -160,41 +162,6 @@ async function isTrayAvailable(): Promise<boolean> {
     return await invoke<boolean>('is_tray_available');
   } catch {
     return false;
-  }
-}
-
-/**
- * Whether the machine started this app rather than a person.
- *
- * True when the start-up entry launched it. The answer is a failure by default — a launch that
- * cannot tell is a launch that shows its window, which is the ordinary case.
- *
- * What a machine-started launch does with its window is the user's preference rather than this
- * flag's: `silentStart` says whether it comes up quietly.
- */
-async function isBackgroundLaunch(): Promise<boolean> {
-  try {
-    return await invoke<boolean>('is_background_launch');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Writes the tray menu in the user's language.
- *
- * The translations live here and the tray lives in the backend, so the words are handed over
- * once the locale is known. Best effort: a tray whose menu is in the wrong language is still a
- * working tray, and the backend keeps English until it hears otherwise.
- */
-async function setTrayLabels(): Promise<void> {
-  try {
-    await invoke('set_tray_labels', {
-      showLabel: translate('tray.show'),
-      quitLabel: translate('tray.quit'),
-    });
-  } catch (error) {
-    console.debug('[tray] the menu labels could not be set:', error);
   }
 }
 

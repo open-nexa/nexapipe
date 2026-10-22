@@ -15,5 +15,14 @@ import { invoke } from '@tauri-apps/api/core';
  * not one: they are already looking at it, and it shows its window.
  */
 export async function isBackgroundLaunch(): Promise<boolean> {
-  return await invoke<boolean>('is_background_launch');
+  try {
+    return await invoke<boolean>('is_background_launch');
+  } catch {
+    // A failure is a "no": a launch that cannot tell is a launch that shows its
+    // window, which is the ordinary case. Both callers need that answer, so it
+    // is decided here rather than in each of them — and a launch the backend
+    // cannot answer for must neither take the window down with it nor let an
+    // automatic connection start on a guess.
+    return false;
+  }
 }

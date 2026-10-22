@@ -239,7 +239,11 @@ async function writeTrayStatus(): Promise<void> {
       ? translate('tray.connecting')
       : startupError.value
         ? translate('tray.failed')
-        : translate('tray.disconnected');
+        : // The state could not be read. The tray is the app's only always-on surface, so it
+          // must not claim the tunnel is down when this process cannot see it either.
+          state.mode === 'unknown'
+          ? translate('tray.unknown')
+          : translate('tray.disconnected');
 
   try {
     await setTrayStatus(text);
