@@ -667,6 +667,18 @@ jobs:
           path: ui-android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      # The release variant is the one R8 runs over, and a debug build never
+      # does. Without this step the proguard rules are only exercised when a
+      # tag is pushed, so a rule that keeps the app from building would be
+      # found by a release rather than by a pull request.
+      #
+      # No signing secrets are needed: the release build type binds a signing
+      # config only when all four release variables are present, so without
+      # them AGP produces an unsigned release APK and the build still
+      # succeeds.
+      - name: assembleRelease
+        run: ./gradlew --no-daemon --stacktrace assembleRelease
+
   android-lint:
     name: android lint
     runs-on: ubuntu-latest

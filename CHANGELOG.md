@@ -971,6 +971,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The Android release build is minified again.** It shipped with
+  `isMinifyEnabled = false` and a proguard file that was nothing but the
+  template's comments, so the release APK carried every class, every method
+  and every `Log.d` line under its own name. That is a map of the app for
+  whoever reads the APK, and the part of this app worth understanding before
+  attacking it is the credential handling. The release is shrunk and
+  obfuscated now, the debug logs are dropped, and the R8 rules that keep the
+  JNI bridge working are written down in `proguard-rules.pro`: the native
+  entry points are bound by name, so neither the class nor its `native`
+  methods may be renamed.
+  A CI job builds the release variant now, so the rules are exercised on every
+  pull request rather than only when a tag is pushed: a debug build never runs
+  R8, and a rule that keeps the app from building would otherwise be found by
+  a release.
 - **The local proxy does not hand out an authenticated tunnel to the
   network.** The client library bound whatever address it was given, and it
   does not authenticate the peer that connects to it — it hands out the tunnel
