@@ -444,18 +444,36 @@ class SettingsManager(context: Context) {
      * [prefs] whether or not the token is worth keeping, so a blank one — the
      * value saved whenever a relay needs no token — does not leave the file
      * marked as holding a credential.
+     *
+     * A token that *is* worth keeping moves only when it can be sealed. The
+     * decision is [relayTokenMove]'s; the point of the rule is that a token
+     * this device cannot seal moves nowhere, rather than into the file whose
+     * whole point is that it holds ciphertext.
      */
     private fun migrateRelayAuthToken() {
         if (!prefs.contains(KEY_RELAY_AUTH_TOKEN)) {
             return
         }
         val token = prefs.getString(KEY_RELAY_AUTH_TOKEN, "") ?: ""
-        prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
-        if (token.isBlank()) {
-            return
+        when (val move = relayTokenMove(token) { secrets.sealOrNull(it) }) {
+            RelayTokenMove.None -> {
+                // Not a credential: the value saved whenever a relay needs no
+                // token. The key goes anyway, so the file does not carry a key
+                // that looks like a credential.
+                prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
+            }
+            is RelayTokenMove.Move -> {
+                prefs.edit().remove(KEY_RELAY_AUTH_TOKEN).apply()
+                secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, move.sealed) }
+                Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
+            }
+            RelayTokenMove.Keep -> {
+                Log.w(
+                    TAG,
+                    "Left the relay auth token where it was: this device cannot seal it yet"
+                )
+            }
         }
-        secretPrefs.edit { putString(KEY_RELAY_AUTH_TOKEN, secrets.seal(token)) }
-        Log.i(TAG, "Moved the relay auth token out of the backed-up preferences")
     }
 
     /**

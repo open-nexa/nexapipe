@@ -655,6 +655,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A relay token is no longer written in the clear by its own migration.**
+  The Android app moves a relay bearer token out of the backed-up preferences
+  and into the secrets file, which is excluded from the backup precisely
+  because it holds ciphertext. The move used `seal`, which hands the value
+  back in the clear on a device with no keystore — so on exactly the devices
+  that could not protect the token, the migration wrote it in the clear into
+  the file that says it holds none, and removed it from the file it came out
+  of. A token that cannot be sealed now moves nowhere: it stays where it is
+  until the keystore can hold it, and the decision is a tested function
+  rather than a line of bookkeeping.
 - **The WebSocket request line is rebuilt from the parsed request.** The
   client rebuilt the line it sends from the raw bytes of the one it
   received, and the HTTP version came out of that split — so a request line
