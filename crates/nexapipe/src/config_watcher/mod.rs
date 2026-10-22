@@ -905,6 +905,8 @@ mod tests {
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         }
     }
 

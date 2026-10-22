@@ -293,6 +293,24 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A guess at a pending enrollment token no longer locks the client out of
+  authenticating.** A client id is not a secret: it is in the invite link, in
+  `nexapipe client list` and in whatever the operator pasted into a ticket. So
+  anybody who knew one could send enrollment attempts at a client that was
+  waiting to enroll — and, because those attempts were counted against the
+  client's own `failed_attempts`, lock out the devices that had already
+  enrolled, over a credential those devices were never sent.
+  The token keeps its ceiling: `max_attempts` wrong guesses close the
+  enrollment for the lockout window, and the right token is refused with it.
+  What changed is which counter pays. The guess moves the enrollment's own
+  `enrollment_failed_attempts` and `enrollment_locked_until`; the client's
+  `failed_attempts` and `locked_until` stay where they were. The two are
+  listed side by side in `GET /v1/clients`, and the enrollment's counter is
+  written to `state.toml` beside the client's — so it survives a restart
+  without ever touching the credential the devices hold.
+  A client whose devices have already enrolled goes on authenticating
+  throughout.
+
 - **A route's `path_pattern` is a prefix in the path sense.**
   `path_pattern = "/api"` used to match `/apifoo` as well as `/api/x`: the
   rule was `starts_with`, and a prefix that is not a prefix is a routing

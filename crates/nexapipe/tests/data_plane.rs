@@ -21,7 +21,7 @@ use nexapipe::http;
 use nexapipe::l4::FlowLimiter;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RoutingTable};
-use nexapipe_client::auth::{TotpAlgorithm as ClientTotpAlgorithm, TwoFactorAuth};
+use nexapipe_client::auth::{Enrollment, TotpAlgorithm as ClientTotpAlgorithm, TwoFactorAuth};
 use nexapipe_proto::auth::AuthMessage;
 use nexapipe_proto::secret::SecretString;
 use std::net::SocketAddr;
@@ -1260,8 +1260,25 @@ fn auth_config() -> AuthConfig {
             last_used: None,
             failed_attempts: 0,
             locked_until: None,
+            enrollment_failed_attempts: 0,
+            enrollment_locked_until: None,
         },
     );
+    config
+}
+
+/// The same configuration, with a token waiting to be spent.
+///
+/// A client with nothing pending cannot be enrolled at all, and a guess at it
+/// is a guess at nothing — so the enrollment counter only has something to
+/// count when the section below carries a token.
+fn auth_config_with_pending(token: &str) -> AuthConfig {
+    let mut config = auth_config();
+    let client = config
+        .clients
+        .get_mut(CLIENT_ID)
+        .expect("the client is there");
+    client.pending_enrollment = Some(SecretString::new(token.to_string()));
     config
 }
 
@@ -1473,5 +1490,97 @@ async fn a_device_key_gets_in() {
     assert!(
         matches!(answer, AuthMessage::Ok),
         "the handshake succeeded, got {answer:?}"
+    );
+}
+
+/// A guess at a pending enrollment token is counted — against the enrollment,
+/// and not against the client.
+///
+/// A client id is not a secret: it is in the invite link, in `nexapipe client
+/// list` and in whatever the operator pasted into a ticket. So anybody who
+/// knows one can send enrollment attempts at a client that is waiting to
+/// enroll. While those attempts were counted against the client's
+/// authentication counter, the devices that had already enrolled were locked
+/// out over a credential they were never sent.
+#[tokio::test]
+async fn a_wrong_enrollment_token_is_counted_against_the_enrollment_only() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config_with_pending("0123456789abcdef"));
+    let proxy =
+        spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    // The guess: a token that is not the one that is outstanding.
+    let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .exchange(&tunnel.conn)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a wrong token is refused, and no credential comes back"
+    );
+
+    // What the guess cost. The token's own counter moved; the client's did
+    // not, and the client is not locked out of anything.
+    let config = auth.config().read().await;
+    let client = &config.clients[CLIENT_ID];
+    assert_eq!(
+        client.enrollment_failed_attempts, 1,
+        "the enrollment's own counter moved"
+    );
+    assert_eq!(
+        client.failed_attempts, 0,
+        "the client's authentication counter did not: a client id is not a secret, and somebody \
+         who knows one must not be able to lock the client's own devices out"
+    );
+    assert!(
+        client.locked_until.is_none(),
+        "the client is not locked out"
+    );
+}
+
+/// The token keeps a ceiling: `max_attempts` wrong guesses close the
+/// enrollment for the window, and the right token is refused with it.
+///
+/// The ceiling is what makes the link unguessable rather than merely
+/// unshared — and it is the enrollment's ceiling, not the client's.
+#[tokio::test]
+async fn the_enrollment_token_has_a_ceiling_of_its_own() {
+    let backend = spawn_backend("hello").await;
+    let (auth, _dir) = auth_state(auth_config_with_pending("0123456789abcdef"));
+    let proxy =
+        spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
+
+    // A refusal closes the connection, so every guess is a new one.
+    for _ in 0..3 {
+        let tunnel = Tunnel::dial(proxy.addr.clone()).await;
+        let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+            .exchange(&tunnel.conn)
+            .await;
+        assert!(outcome.is_err(), "a wrong token is refused");
+    }
+
+    // The right token does not get in either: the slot is closed.
+    let tunnel = Tunnel::dial(proxy.addr.clone()).await;
+    let outcome = Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .exchange(&tunnel.conn)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "the enrollment slot is closed while the window runs"
+    );
+
+    let config = auth.config().read().await;
+    let client = &config.clients[CLIENT_ID];
+    assert!(
+        client.enrollment_locked_until.is_some(),
+        "the enrollment's own window is running"
+    );
+    assert_eq!(
+        client.failed_attempts, 0,
+        "the client's authentication counter did not move"
+    );
+    assert!(
+        client.locked_until.is_none(),
+        "the client is not locked out: the devices that already enrolled go on authenticating"
     );
 }
