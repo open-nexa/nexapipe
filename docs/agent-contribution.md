@@ -146,7 +146,7 @@ a behaviour change, and a test that was not run is not a test that passed.
 | `ui-android/` | `cd ui-android && ./gradlew :app:testDebugUnitTest :app:compileDebugKotlin` | `android (ndk + unit tests + lint)` |
 | `ui-desktop/` frontend | `cd ui-desktop && npm ci && npm run build && npm run lint:i18n && npm run lint:tokens` | `desktop (linux: rust + frontend)` |
 | `ui-desktop/src-tauri/` | `cd ui-desktop/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib` | `desktop (linux: rust + frontend)`, `desktop cargo check (macos-15 / windows-latest)` |
-| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high`; `cargo +<declared MSRV> check --workspace --all-targets --locked` when `rust-version` moves | `supply chain (audit, deny, secrets)`, `msrv` |
+| `Cargo.toml`, `Cargo.lock`, npm lockfiles | `cargo audit`; `cd ui-desktop/src-tauri && cargo audit`; `cd ui-desktop && npm audit --omit=dev --audit-level=high`; `cargo +<declared MSRV> check --workspace --all-targets --locked` when `rust-version` moves | `supply chain (audit, deny)`, `secrets (gitleaks + dependency review)`, `msrv` |
 | Docs only | No build. Every relative link resolves, the text is English, and the claims match the code | Nothing runs: the workflow does not start for a change that touches nothing but documentation |
 
 `rustfmt --edition 2024 <path>` on the files you touched, not `cargo fmt --all`:
