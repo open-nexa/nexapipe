@@ -85,13 +85,34 @@ fn request_line_end(request: &[u8]) -> usize {
     request.iter().position(|b| *b == b'\n').unwrap_or(0)
 }
 
-/// Headers whose value is a credential, and so never belongs in a log.
-const SENSITIVE_HEADERS: [&str; 5] = [
-    "authorization",
-    "proxy-authorization",
+/// The words in a header name that mean its value is a credential.
+///
+/// A list of exact names is a list that has to be extended every time an
+/// application invents its own header for a token — `X-Auth-Token`,
+/// `X-Session-Id`, `X-Api-Key` — and a debug log that prints those in the
+/// clear is the same leak the list was meant to stop. A name that carries one
+/// of these words is redacted whatever else it says.
+///
+/// The cost is that a name which merely *contains* one of them is redacted
+/// too: `Sec-WebSocket-Key` is a nonce rather than a credential, and it is
+/// hidden anyway. That is the right way round for a debug dump — a value
+/// that is hidden when it did not need to be costs an argument, and a value
+/// that is printed when it did costs a credential.
+///
+/// The words are the ones that name a credential outright. A name that says
+/// nothing of the sort — `X-Jwt`, `X-Otp`, `X-Csrf-Token` is caught by
+/// `token` but `X-Csrf` is not — is still printed, and that is the edge of
+/// the rule: a word list is a word list, and the point is that it no longer
+/// has to be a list of names.
+const SENSITIVE_HEADER_WORDS: [&str; 8] = [
+    "auth",
+    "token",
+    "secret",
+    "key",
+    "session",
     "cookie",
-    "set-cookie",
-    "x-api-key",
+    "password",
+    "credential",
 ];
 
 /// The headers of a request, with the values that carry credentials replaced.
@@ -102,7 +123,11 @@ const SENSITIVE_HEADERS: [&str; 5] = [
 fn redacted_headers(headers: &::http::HeaderMap) -> String {
     let mut out = String::from("{");
     for (name, value) in headers {
-        if SENSITIVE_HEADERS.contains(&name.as_str().to_lowercase().as_str()) {
+        let lowered = name.as_str().to_lowercase();
+        if SENSITIVE_HEADER_WORDS
+            .iter()
+            .any(|word| lowered.contains(word))
+        {
             out.push_str(&format!("{}: <redacted>, ", name));
         } else {
             out.push_str(&format!("{}: {:?}, ", name, value));
@@ -599,6 +624,31 @@ fn websocket_frame_preview(data: &[u8]) -> String {
         preview.push_str("...");
     }
     format!("{} bytes: {}", data.len(), preview)
+}
+
+/// How much of an unfinished WebSocket frame the debug dump keeps.
+///
+/// The dump assembles a frame's bytes until the frame is whole, and a peer
+/// that sends a frame header and then nothing would grow that without end:
+/// the bytes are held for a frame that is never completed. A megabyte is far
+/// more than the dump needs — it prints 256 bytes of a frame — and it is a
+/// ceiling rather than a limit.
+const WS_FRAME_BUFFER_LIMIT: usize = 1024 * 1024;
+
+/// Adds a chunk to the WebSocket debug buffer when it fits under the ceiling.
+///
+/// Returns `false` when the chunk would take the buffer past its ceiling, in
+/// which case the buffer is left as it was and the caller drops it.
+///
+/// The check is **before** the append, so the buffer never grows past the
+/// ceiling: a check after the append would let the last chunk take it
+/// `chunk.len()` bytes over, which is how a ceiling stops being one.
+fn ws_frame_buffer_append(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buffer.len().saturating_add(chunk.len()) > WS_FRAME_BUFFER_LIMIT {
+        return false;
+    }
+    buffer.extend_from_slice(chunk);
+    true
 }
 
 fn parse_websocket_frames(buffer: &mut Vec<u8>, frames: &mut Vec<(u8, Vec<u8>)>) {
@@ -1243,17 +1293,33 @@ where
                                 // logs. So the decode is part of what is
                                 // switched off with them.
                                 if debug_log_enabled() {
-                                    ws_buffer.extend_from_slice(&buf[..n]);
-                                    let mut frames = Vec::new();
-                                    parse_websocket_frames(&mut ws_buffer, &mut frames);
-                                    for (opcode, payload) in frames {
-                                        if opcode == 1 || opcode == 8 {
-                                            jni_log!(
-                                                "[DEBUG:local-proxy] WS client frame decoded (opcode {}): {}",
-                                                opcode,
-                                                String::from_utf8_lossy(&payload)
-                                            );
+                                    if ws_frame_buffer_append(&mut ws_buffer, &buf[..n]) {
+                                        let mut frames = Vec::new();
+                                        parse_websocket_frames(&mut ws_buffer, &mut frames);
+                                        for (opcode, payload) in frames {
+                                            if opcode == 1 || opcode == 8 {
+                                                jni_log!(
+                                                    "[DEBUG:local-proxy] WS client frame decoded \
+                                                     (opcode {}): {}",
+                                                    opcode,
+                                                    String::from_utf8_lossy(&payload)
+                                                );
+                                            }
                                         }
+                                    } else {
+                                        // The frame is never finished, so the
+                                        // bytes are held for a frame that will
+                                        // not arrive. They are dropped rather
+                                        // than kept: the dump is a preview of
+                                        // 256 bytes, and a peer that sends a
+                                        // header and then nothing would
+                                        // otherwise grow this without end.
+                                        ws_buffer.clear();
+                                        jni_log!(
+                                            "[DEBUG:local-proxy] WS client frame over {} bytes \
+                                             and never finished, dropping it",
+                                            WS_FRAME_BUFFER_LIMIT
+                                        );
                                     }
                                 }
                                 if let Err(e) = send.write_all(&buf[..n]).await {
@@ -2056,6 +2122,94 @@ mod tests {
     use iroh::Endpoint;
     use iroh::endpoint::presets;
     use std::time::Duration;
+
+    /// A header whose name says its value is a credential is not printed.
+    ///
+    /// The list used to be five exact names, so a header an application
+    /// invented for its own token — `X-Auth-Token`, `X-Api-Key`,
+    /// `X-Session-Id` — was printed in the clear, and the dump is a debug log
+    /// that reaches logcat. The names are matched by what they carry rather
+    /// than by what they are.
+    #[test]
+    fn a_header_that_carries_a_credential_is_not_printed() {
+        let mut headers = ::http::HeaderMap::new();
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "x-auth-token",
+            "x-session-id",
+            "x-custom-secret",
+            "x-user-password",
+            "x-aws-credential",
+        ] {
+            headers.insert(
+                ::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                ::http::HeaderValue::from_static("the value"),
+            );
+        }
+        headers.insert(
+            ::http::HeaderName::from_static("content-type"),
+            ::http::HeaderValue::from_static("application/json"),
+        );
+
+        let dumped = redacted_headers(&headers);
+
+        assert!(
+            !dumped.contains("the value"),
+            "a credential reached the dump: {dumped}"
+        );
+        assert!(
+            dumped.contains("content-type: \"application/json\""),
+            "a header that carries no credential is still what makes the dump useful: {dumped}"
+        );
+    }
+
+    /// The WebSocket debug buffer has a ceiling, and it is a ceiling.
+    ///
+    /// A peer that sends a frame header and then nothing would grow the
+    /// buffer without end, and the check has to be **before** the append: a
+    /// check after it would let the last chunk take the buffer past the line,
+    /// which is how a ceiling stops being one.
+    #[test]
+    fn the_websocket_debug_buffer_does_not_grow_past_its_ceiling() {
+        let chunk = vec![0u8; 32 * 1024];
+
+        let mut buffer = Vec::new();
+        loop {
+            let kept = ws_frame_buffer_append(&mut buffer, &chunk);
+            // The size is checked after **every** call, including the one
+            // that refuses the chunk: an implementation that appended before
+            // it checked would grow past the ceiling on exactly that call,
+            // and a check that only ran on the calls that kept the chunk
+            // would never see it.
+            assert!(
+                buffer.len() <= WS_FRAME_BUFFER_LIMIT,
+                "the buffer grew past its ceiling: {} bytes",
+                buffer.len()
+            );
+            if !kept {
+                break;
+            }
+        }
+
+        assert_eq!(
+            buffer.len(),
+            WS_FRAME_BUFFER_LIMIT,
+            "the buffer filled to the ceiling and stopped there"
+        );
+    }
+
+    /// The bytes that fit are kept.
+    #[test]
+    fn the_websocket_debug_buffer_keeps_what_fits() {
+        let mut buffer = Vec::new();
+
+        assert!(ws_frame_buffer_append(&mut buffer, &[1, 2, 3]));
+        assert_eq!(buffer, vec![1, 2, 3]);
+    }
 
     /// A proxy listening on an ephemeral port, with no backends behind it.
     ///
