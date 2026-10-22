@@ -83,6 +83,10 @@ impl Protocol {
 
     /// The protocol an ALPN names, if it names one.
     ///
+    /// The **legacy** spelling names the generic protocol: it is the same
+    /// "the first byte of each stream decides" the current generic name
+    /// means, and a client of that vintage is served the way it always was.
+    ///
     /// `None` for an ALPN this build does not know: the connection is
     /// refused rather than served as something it is not.
     pub fn from_alpn(alpn: &[u8]) -> Option<Self> {
@@ -91,6 +95,11 @@ impl Protocol {
             ALPN_L4 => Some(Protocol::L4),
             ALPN_TLS => Some(Protocol::Tls),
             crate::ALPN_NEXAPIPE => Some(Protocol::Legacy),
+            // The spelling that predates the prefix byte being dropped. The
+            // server's accept list carries it so that a client of that
+            // vintage still reaches it, and refusing it here would refuse
+            // exactly the client the accept list was there for.
+            crate::ALPN_NEXAPIPE_LEGACY => Some(Protocol::Legacy),
             _ => None,
         }
     }
@@ -139,5 +148,43 @@ mod tests {
     #[test]
     fn the_generic_name_is_the_generic_one() {
         assert_eq!(Protocol::Legacy.alpn(), b"nexapipe");
+    }
+
+    /// The spelling that predates the prefix byte names the generic
+    /// protocol too.
+    ///
+    /// The server's accept list carries it so that a client of that vintage
+    /// still reaches it. A protocol this build cannot name is a protocol it
+    /// refuses — and refusing this one would refuse exactly the client the
+    /// accept list was there for.
+    #[test]
+    fn the_legacy_spelling_names_the_generic_protocol() {
+        assert_eq!(
+            Protocol::from_alpn(crate::ALPN_NEXAPIPE_LEGACY),
+            Some(Protocol::Legacy),
+            "a client of the older vintage is served the way it always was"
+        );
+    }
+
+    /// Every ALPN the server accepts is one this build can name.
+    ///
+    /// The server's accept list is the set of names a connection may be
+    /// negotiated with, and a name that cannot be named is a connection that
+    /// is refused at the door — so the two lists have to agree.
+    #[test]
+    fn every_alpn_the_server_accepts_names_a_protocol() {
+        for alpn in [
+            crate::ALPN_NEXAPIPE,
+            crate::ALPN_NEXAPIPE_LEGACY,
+            ALPN_HTTP,
+            ALPN_L4,
+            ALPN_TLS,
+        ] {
+            assert!(
+                Protocol::from_alpn(alpn).is_some(),
+                "{:?} is on the server's accept list and names no protocol",
+                String::from_utf8_lossy(alpn)
+            );
+        }
     }
 }
