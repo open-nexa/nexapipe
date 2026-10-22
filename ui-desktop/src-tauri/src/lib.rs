@@ -486,6 +486,10 @@ async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyStatus, AppE
             Some(mode) => ProxyStatus::running_with(mode),
             None => ProxyStatus::starting(),
         },
+        // No manager here, and the service could not be asked: the tunnel may be the service's,
+        // and this process cannot say. "Stopped" would be a guess, and the guess is what starts a
+        // second tunnel over a live one — so the state is reported as unknown instead.
+        None if use_service => ProxyStatus::unknown(),
         None => ProxyStatus::stopped(),
     })
 }
@@ -1743,6 +1747,29 @@ async fn set_tray_labels(app: AppHandle, show_label: String, quit_label: String)
     }
 }
 
+/// Writes the connection state onto the tray icon.
+///
+/// The words come from the renderer, which is the only side that knows the status
+/// and the language it should be said in.
+///
+/// Refused rather than trimmed when the text is not one short line: the text goes
+/// straight to a native tooltip and a native title, and a caller that could put
+/// a newline or a control character there would be writing into another
+/// process's window.
+///
+/// Infallible on purpose, like [`set_tray_labels`]: the state on the tray is
+/// information, and a tray that cannot be written to is still a working tray.
+#[tauri::command]
+async fn set_tray_status(app: AppHandle, status: String) {
+    if !tray::is_writable_status(&status) {
+        tracing::warn!("the tray status was refused: it is not a single short line");
+        return;
+    }
+    if let Err(e) = tray::set_status(&app, &status) {
+        tracing::warn!("the tray status could not be written: {e}");
+    }
+}
+
 /// How long the window stays hidden waiting for the frontend to paint, before it is shown
 /// anyway.
 ///
@@ -1962,6 +1989,7 @@ pub fn run() {
             is_background_launch,
             is_tray_available,
             set_tray_labels,
+            set_tray_status,
             quit::finish_quit,
             quit::quit_guard_ready
         ]);
