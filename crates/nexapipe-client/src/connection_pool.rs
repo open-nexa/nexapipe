@@ -1819,8 +1819,8 @@ mod tests {
     use super::{
         ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
         IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL,
-        MAX_FLOWS_PER_CONNECTION, connections_for, encode_link_status, identity_changed,
-        is_idle_since, is_measured_rtt, may_pool, may_publish,
+        MAX_FLOWS_PER_CONNECTION, PoolRefusal, connections_for, encode_link_status,
+        identity_changed, is_idle_since, is_measured_rtt, may_pool, may_publish,
     };
     use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
     #[cfg(feature = "local-proxy")]
@@ -2678,6 +2678,81 @@ mod tests {
         assert!(!may_pool(Protocol::Http, both.iter().copied()));
         assert!(!may_pool(Protocol::L4, both.iter().copied()));
         assert!(may_pool(Protocol::Tls, both.iter().copied()));
+    }
+
+    /// **The pool's ceiling is counted per protocol, end to end.**
+    ///
+    /// The test above counts the pool's own bookkeeping; this one goes
+    /// through the pool itself — a connection is established, and the pool
+    /// decides whether to keep it. The refusal is checked for what it is: a
+    /// connection that was closed on the spot is refused too, and that is a
+    /// different failure with a different cause.
+    ///
+    /// The pool is filled by hand here rather than through `get_connection`,
+    /// because the ceiling is only reached when a protocol's connections are
+    /// all full — and a flow makes a connection full at two hundred.
+    #[tokio::test]
+    async fn the_ceiling_is_refused_for_that_protocol_alone() {
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_counting(server, Arc::new(AtomicUsize::new(0))));
+
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN_NEXAPIPE.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client.clone(), server_addr.clone());
+
+        // Fill the pool for one protocol.
+        for _ in 0..MAX_CONNECTIONS_PER_PROTOCOL {
+            let conn = client
+                .connect(server_addr.clone(), ALPN_NEXAPIPE)
+                .await
+                .expect("the connection opens");
+            assert!(
+                pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
+                    .await
+                    .is_ok(),
+                "the connection is pooled"
+            );
+        }
+
+        // The next one for that protocol is refused: its own ceiling is
+        // reached, and the refusal is the ceiling's and not a closed
+        // connection's.
+        let conn = client
+            .connect(server_addr.clone(), ALPN_NEXAPIPE)
+            .await
+            .expect("the connection opens");
+        assert!(
+            matches!(
+                pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
+                    .await,
+                Err(PoolRefusal::Full)
+            ),
+            "the protocol's own ceiling is reached"
+        );
+
+        // And another protocol is not refused: the ceiling was never global.
+        let conn = client
+            .connect(server_addr.clone(), ALPN_NEXAPIPE)
+            .await
+            .expect("the connection opens");
+        assert!(
+            pool.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::L4)
+                .await
+                .is_ok(),
+            "another protocol's ceiling is its own"
+        );
     }
 
     /// The count is of the connections of **that** protocol, and of no other.
