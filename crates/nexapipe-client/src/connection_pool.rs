@@ -277,7 +277,7 @@ pub struct LinkStatus {
     /// zero, and a UI must not draw it as one.
     ///
     /// The reading is also `None` while the path still carries quinn's initial
-    /// guess rather than a measurement — see [`rtt_of`].
+    /// guess rather than a measurement — see `rtt_of`.
     pub rtt: Option<std::time::Duration>,
 }
 
@@ -876,7 +876,7 @@ impl IrohConnectionPool {
 
     /// Configure a one-time enrollment token instead of credentials: the next
     /// connection spends it and comes back with the real secret in
-    /// [`Self::two_factor`].
+    /// `Self::two_factor`.
     ///
     /// What the server issues has to be persisted by the caller — see
     /// [`Self::take_issued_credential`] — because a token can only be spent
@@ -941,7 +941,7 @@ impl IrohConnectionPool {
     /// Takes the reason the backend last refused a connection for missing 2FA,
     /// and clears it.
     ///
-    /// Only ever set after a preconnect that ended in [`AUTH_REQUIRED_CLOSE_CODE`],
+    /// Only ever set after a preconnect that ended in `AUTH_REQUIRED_CLOSE_CODE`,
     /// i.e. when the server wants credentials this client does not have.
     pub async fn take_auth_required(&self) -> Option<String> {
         self.inner.auth_required.lock().await.take()
