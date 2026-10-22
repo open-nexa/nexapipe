@@ -109,7 +109,7 @@ use std::net::Ipv6Addr;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "android")]
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 #[cfg(target_os = "android")]
@@ -267,6 +267,19 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// allowed to lose datagrams, and buffering without bound would turn a stalled
 /// flow into memory growth.
 const UDP_FLOW_QUEUE: usize = 256;
+
+/// How many bytes of datagrams one flow may have waiting to go into the
+/// tunnel.
+///
+/// **The queue is bounded by bytes, not only by datagrams.** A datagram may be
+/// 65,507 bytes, so a queue of 256 of them is 16 MiB per flow — and there are
+/// 32 flows, so half a gigabyte of datagrams a device may have queued at
+/// once, for a queue that is meant to smooth a burst.
+///
+/// A megabyte is sixteen full-size datagrams, and thirty-two flows at that is
+/// 32 MiB: the same order as the TCP side's per-flow budget, and a sixteenth
+/// of what the datagram count alone allowed.
+const UDP_FLOW_QUEUE_BYTES: usize = 1024 * 1024;
 
 /// Datagrams on their way from the proxy to the application (DNS replies and
 /// every UDP flow's inbound traffic) queue here for the single TUN writer.
@@ -1364,7 +1377,112 @@ fn client_addr_hint(stream: &SmolTcpStream) -> String {
 type FlowKey = (SocketAddr, SocketAddr);
 
 /// The live UDP flows: their key, and the channel feeding datagrams into them.
-type FlowTable = Arc<Mutex<HashMap<FlowKey, mpsc::Sender<Vec<u8>>>>>;
+/// One flow's queue: the datagrams waiting to go into the tunnel, and how
+/// many bytes they are.
+///
+/// The count of datagrams is the channel's own bound; the count of **bytes**
+/// is this one, and it is the one that matters: a datagram may be 65,507
+/// bytes, so a bound on the number of them is not a bound on the memory.
+#[derive(Clone)]
+struct UdpQueue {
+    /// The datagrams waiting to go into the tunnel.
+    sender: mpsc::Sender<Vec<u8>>,
+    /// How many bytes are waiting.
+    ///
+    /// Shared with the demultiplexer, which adds to it, and with the flow,
+    /// which takes from it.
+    queued: Arc<AtomicUsize>,
+}
+
+impl UdpQueue {
+    /// A queue with nothing in it.
+    fn new(sender: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            sender,
+            queued: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Reserves room for `len` bytes, and says whether there was room.
+    ///
+    /// The bytes are counted **before** the datagram goes in, so the queue
+    /// cannot pass its bound between the check and the send. A reservation
+    /// that does not fit is given back at once, so a datagram that is dropped
+    /// for want of room leaves the count as it was.
+    fn reserve(&self, len: usize) -> bool {
+        let queued = self.queued.fetch_add(len, Ordering::Relaxed) + len;
+        if queued > UDP_FLOW_QUEUE_BYTES {
+            self.release(len);
+            return false;
+        }
+        true
+    }
+
+    /// Gives `len` bytes back to the queue.
+    ///
+    /// Called when a datagram leaves the queue — because the flow took it, or
+    /// because it never went in.
+    fn release(&self, len: usize) {
+        self.queued.fetch_sub(len, Ordering::Relaxed);
+    }
+
+    /// Puts a datagram into the queue, and says whether it went in.
+    ///
+    /// The bytes are reserved **before** the datagram goes in, so the queue
+    /// cannot pass its bound between the check and the send. A datagram that
+    /// does not go in gives its reservation back at once, so the budget the
+    /// queue holds is the budget it has — a reservation that was never given
+    /// back would shrink the queue a byte at a time until it was wedged.
+    ///
+    /// The three ways a datagram does not go in are told apart, because the
+    /// caller says something different about each: the queue's own byte bound
+    /// was reached, the channel's datagram count was reached, or the flow
+    /// ended.
+    fn send(&self, payload: Vec<u8>) -> Result<(), UdpSendError> {
+        let len = payload.len();
+        if !self.reserve(len) {
+            return Err(UdpSendError::NoRoom);
+        }
+        match self.sender.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.release(len);
+                Err(UdpSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.release(len);
+                Err(UdpSendError::Closed)
+            }
+        }
+    }
+
+    /// A datagram left the queue, so its bytes are no longer waiting for it.
+    ///
+    /// The datagram itself is passed in rather than its length, so the bytes
+    /// given back are the bytes that were taken in.
+    fn taken(&self, datagram: &[u8]) {
+        self.release(datagram.len());
+    }
+
+    /// How many bytes are waiting.
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+}
+
+type FlowTable = Arc<Mutex<HashMap<FlowKey, UdpQueue>>>;
+
+/// Why a datagram did not go into a flow's queue.
+#[derive(Debug, PartialEq, Eq)]
+enum UdpSendError {
+    /// The queue's byte budget was reached.
+    NoRoom,
+    /// The queue's datagram count was reached.
+    Full,
+    /// The flow ended before the datagram went in.
+    Closed,
+}
 
 /// Which side of a UDP flow spoke.
 #[derive(Debug)]
@@ -1505,20 +1623,21 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
         // written into a dead tunnel.
         let existing = lock_flows(&table)
             .get(&key)
-            .filter(|sender| !sender.is_closed())
+            .filter(|queue| !queue.sender.is_closed())
             .cloned();
 
-        let sender = match existing {
-            Some(sender) => sender,
+        let queue = match existing {
+            Some(queue) => queue,
             None => {
                 let (sender, receiver) = mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+                let queue = UdpQueue::new(sender);
                 let mut flows = lock_flows(&table);
 
                 if flows.len() >= MAX_UDP_FLOWS {
                     // A flow that has ended is still in the table until its
                     // task gets to `release_flow`, so the count is not the
                     // number of live flows — look again before refusing.
-                    flows.retain(|_, sender| !sender.is_closed());
+                    flows.retain(|_, queue| !queue.sender.is_closed());
                 }
                 if flows.len() >= MAX_UDP_FLOWS {
                     drop(flows);
@@ -1534,35 +1653,50 @@ async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 }
 
                 warned_full.store(false, Ordering::Relaxed);
-                flows.insert(key, sender.clone());
+                flows.insert(key, queue.clone());
                 drop(flows);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
                     key,
-                    sender.clone(),
+                    queue.clone(),
                     receiver,
                     domain,
                 ));
-                sender
+                queue
             }
         };
 
-        match sender.try_send(payload) {
+        // The bytes are reserved **before** the datagram goes in, so that the
+        // queue cannot pass its bound between the check and the send.
+        match queue.send(payload) {
             Ok(()) => {}
             // Datagrams arriving while the tunnel is still opening are the normal
             // case for the first few, so a full queue is not worth a log line —
             // printing one per dropped datagram would be its own problem under
             // load. Losing them is what UDP promises anyway.
-            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(UdpSendError::NoRoom | UdpSendError::Full) => {}
             // The flow ended between the lookup and the send. The next datagram
             // creates a new one.
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(UdpSendError::Closed) => {
                 jni_log!("[tun-proxy] UDP flow to {} closed", dst_addr);
             }
         }
     }
     jni_log!("[tun-proxy] UDP demux task exiting");
+}
+
+/// Takes a datagram out of a flow's queue, and gives its bytes back.
+///
+/// The bytes are given back **here**, where the datagram leaves the queue: the
+/// queue's budget is what the flow is holding, and a datagram that is no
+/// longer waiting is no longer part of it. One place does it, so that a call
+/// site cannot forget — a reservation that is never given back shrinks the
+/// budget a byte at a time until the flow is wedged and drops every datagram
+/// it is given.
+fn take_from_queue(queue: &UdpQueue, datagram: Vec<u8>) -> Vec<u8> {
+    queue.taken(&datagram);
+    datagram
 }
 
 /// Carry one UDP flow: datagrams in from the demultiplexer, frames out to the
@@ -1576,7 +1710,7 @@ async fn run_udp_flow(
     ctx: TunContext,
     table: FlowTable,
     key: FlowKey,
-    mine: mpsc::Sender<Vec<u8>>,
+    mine: UdpQueue,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     domain: std::sync::Arc<str>,
 ) {
@@ -1649,6 +1783,9 @@ async fn run_udp_flow(
             // The demultiplexer dropped our sender: the flow was replaced.
             Activity::Application(None) => break,
             Activity::Application(Some(datagram)) => {
+                // The datagram is out of the queue now, so its bytes are no
+                // longer waiting for it.
+                let datagram = take_from_queue(&mine, datagram);
                 encoded.clear();
                 match encode_frame(&datagram, &mut encoded) {
                     Ok(()) => {
@@ -1791,9 +1928,12 @@ async fn run_udp_flow(
 /// Only removes the entry if it is still *ours*: a flow that ends after the
 /// demultiplexer replaced it (which happens when the channel is closed) must not
 /// take the live flow's channel down with it.
-fn release_flow(table: &FlowTable, key: &FlowKey, mine: &mpsc::Sender<Vec<u8>>) {
+fn release_flow(table: &FlowTable, key: &FlowKey, mine: &UdpQueue) {
     let mut flows = lock_flows(table);
-    if flows.get(key).is_some_and(|entry| entry.same_channel(mine)) {
+    if flows
+        .get(key)
+        .is_some_and(|entry| entry.sender.same_channel(&mine.sender))
+    {
         flows.remove(key);
     }
 }
@@ -1801,7 +1941,7 @@ fn release_flow(table: &FlowTable, key: &FlowKey, mine: &mpsc::Sender<Vec<u8>>) 
 /// A poisoned lock still holds a usable table — every critical section is a
 /// handful of `HashMap` calls and nothing that can panic in between — so
 /// recovering beats taking the tunnel down.
-fn lock_flows(table: &FlowTable) -> MutexGuard<'_, HashMap<FlowKey, mpsc::Sender<Vec<u8>>>> {
+fn lock_flows(table: &FlowTable) -> MutexGuard<'_, HashMap<FlowKey, UdpQueue>> {
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2357,10 +2497,11 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 mod tests {
     use super::{
         Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
-        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UpstreamResolvers, answer_ttl,
-        answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at, handle_dns_query,
-        lock_cache, next_activity, parse_dns_query, read_u32, remember_answer, resolve_tcp_window,
-        set_answer_ttls, wait_for_stop,
+        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UDP_FLOW_QUEUE, UDP_FLOW_QUEUE_BYTES, UdpQueue,
+        UdpSendError, UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for,
+        cached_answer, cached_answer_at, handle_dns_query, lock_cache, next_activity,
+        parse_dns_query, read_u32, remember_answer, resolve_tcp_window, set_answer_ttls,
+        take_from_queue, wait_for_stop,
     };
     use crate::dns::resolver_scope;
     use std::sync::Arc;
@@ -2912,5 +3053,205 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), wait_for_stop(stopped))
             .await
             .expect("the watch does not wait for a flag that is already set");
+    }
+
+    /// The queue is bounded by **bytes**, not only by datagrams.
+    ///
+    /// A datagram may be 65,507 bytes, so a queue of 256 of them is 16 MiB
+    /// per flow. The bound is a megabyte, and the test says so: a megabyte
+    /// fits, one byte more does not, and the datagram that does not fit is
+    /// not counted against the queue.
+    #[tokio::test]
+    async fn the_udp_queue_is_bounded_by_bytes() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let chunk = 1024;
+        let mut reserved = 0;
+        while reserved + chunk <= UDP_FLOW_QUEUE_BYTES {
+            assert!(
+                queue.reserve(chunk),
+                "the queue has room for {chunk} more bytes"
+            );
+            reserved += chunk;
+        }
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE_BYTES,
+            "the queue holds exactly its bound"
+        );
+
+        // The next one does not fit, and it leaves the count as it was.
+        assert!(!queue.reserve(chunk), "the queue is full");
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE_BYTES,
+            "a datagram that did not fit is not counted"
+        );
+
+        // A datagram that leaves the queue gives its bytes back.
+        queue.release(chunk);
+        assert_eq!(queue.queued_bytes(), UDP_FLOW_QUEUE_BYTES - chunk);
+        assert!(queue.reserve(chunk), "there is room again");
+    }
+
+    /// A datagram that goes in and comes out leaves the queue empty.
+    ///
+    /// The arithmetic of the budget is one thing; the pairing is another. A
+    /// reservation that is never given back shrinks the queue a byte at a
+    /// time until it is wedged, and one that is given back twice takes the
+    /// count under the truth — the counter wraps rather than panicking, so the
+    /// cost is a flow that can never reserve anything again and drops every
+    /// datagram it is given.
+    ///
+    /// This drives the three steps the tunnel does: the datagram is put in,
+    /// the flow takes it out, and the bytes are given back. It is the same
+    /// code the demultiplexer and the flow run.
+    #[tokio::test]
+    async fn a_datagram_that_goes_in_and_comes_out_leaves_the_queue_empty() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let datagram = vec![7u8; 1400];
+        assert_eq!(queue.send(datagram.clone()), Ok(()), "the datagram goes in");
+        assert_eq!(
+            queue.queued_bytes(),
+            datagram.len(),
+            "the datagram's bytes are waiting for it"
+        );
+
+        // The flow takes it out of the queue.
+        let taken = receiver.recv().await.expect("the datagram is there");
+        assert_eq!(taken, datagram);
+        queue.taken(&taken);
+
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "the bytes are given back when the datagram leaves the queue"
+        );
+    }
+
+    /// A datagram that does not go in gives its bytes back.
+    ///
+    /// The other half of the pairing: a reservation taken for a datagram that
+    /// was then dropped must not stay taken. A flow whose tunnel is closing
+    /// drops datagrams all the time, and every one of them that kept its
+    /// reservation would eat into the budget of the next flow.
+    #[tokio::test]
+    async fn a_datagram_that_does_not_go_in_gives_its_bytes_back() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+        // The flow ended: the receiver is gone.
+        drop(receiver);
+
+        assert_eq!(
+            queue.send(vec![7u8; 1400]),
+            Err(UdpSendError::Closed),
+            "the datagram does not go into a flow that ended"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "a datagram that did not go in is not counted"
+        );
+
+        // And the same for the queue's own bounds: a datagram that does not
+        // fit in the byte budget is given back as well.
+        let (sender, _receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+        let big = vec![0u8; UDP_FLOW_QUEUE_BYTES + 1];
+        assert_eq!(
+            queue.send(big),
+            Err(UdpSendError::NoRoom),
+            "the datagram does not fit in the budget"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "a datagram that did not fit is not counted"
+        );
+    }
+
+    /// A datagram that the **count** bound turns away gives its bytes back.
+    ///
+    /// The third way a datagram does not go in: the queue had room in bytes
+    /// but the channel was already carrying as many datagrams as it takes.
+    /// The reservation was taken before the send, so it has to be given back
+    /// here as well — otherwise a full channel would eat the byte budget of
+    /// the flow a datagram at a time, and the flow would be wedged by a
+    /// condition that has nothing to do with bytes.
+    #[tokio::test]
+    async fn a_datagram_the_count_bound_turns_away_gives_its_bytes_back() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        // Fill the channel with datagrams that are small enough not to touch
+        // the byte bound, so that the count is the only bound left.
+        let small = vec![7u8; 16];
+        for _ in 0..UDP_FLOW_QUEUE {
+            assert_eq!(
+                queue.send(small.clone()),
+                Ok(()),
+                "the datagram goes in while there is room"
+            );
+        }
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE * small.len(),
+            "every datagram in the channel is counted"
+        );
+
+        // The channel is full now, so the next one does not go in — and the
+        // bytes it had reserved are given back.
+        assert_eq!(
+            queue.send(small.clone()),
+            Err(UdpSendError::Full),
+            "the datagram does not go into a channel that is full"
+        );
+        assert_eq!(
+            queue.queued_bytes(),
+            UDP_FLOW_QUEUE * small.len(),
+            "a datagram that did not go in is not counted"
+        );
+
+        // And the budget is intact: a datagram that is taken out of the
+        // channel makes room for another one.
+        let taken = receiver.recv().await.expect("a datagram is there");
+        queue.taken(&taken);
+        assert_eq!(queue.send(small.clone()), Ok(()), "there is room again");
+    }
+
+    /// The flow's own step gives the bytes back.
+    ///
+    /// The step the flow takes when a datagram comes out of the queue is the
+    /// one that gives the bytes back, and it is the one a mistake would be
+    /// made in: a flow that forwards a datagram without giving its bytes back
+    /// would shrink its own budget a datagram at a time until it dropped
+    /// everything it was given. This drives that step, so that the pairing
+    /// the budget depends on is pinned by a test rather than by a comment.
+    #[tokio::test]
+    async fn the_flow_gives_the_bytes_back_when_it_takes_a_datagram() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+
+        let datagram = vec![7u8; 1400];
+        assert_eq!(queue.send(datagram.clone()), Ok(()), "the datagram goes in");
+        assert_eq!(
+            queue.queued_bytes(),
+            datagram.len(),
+            "the datagram's bytes are waiting for it"
+        );
+
+        // The flow takes it out of the queue, and the bytes go back with it.
+        let taken = receiver.recv().await.expect("the datagram is there");
+        let datagram = take_from_queue(&queue, taken);
+        assert_eq!(datagram, vec![7u8; 1400], "the datagram is the one sent");
+
+        assert_eq!(
+            queue.queued_bytes(),
+            0,
+            "the bytes are given back when the datagram leaves the queue"
+        );
     }
 }
