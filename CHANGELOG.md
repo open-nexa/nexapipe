@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Twenty things land in this cycle so far: the device credential can be a **key**
+Twenty-two things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -40,7 +40,9 @@ paths that carry the traffic can be measured instead of assumed, the first
 result of those measurements is written down, a route that rewrites the paths
 it serves now rewrites them for the tunnel as well, a request's body is
 forwarded to the backend while it is still arriving, and the Android client's
-tunnel descriptor is closed exactly once.
+tunnel descriptor is closed exactly once, a UDP flow's queue is bounded by
+bytes rather than only by datagrams, and the local proxy holds two buffers per
+connection rather than three.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -58,6 +60,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **A UDP flow's queue is bounded by bytes, not only by datagrams.** A
+  flow's queue held up to 256 datagrams, and a datagram may be 65,507 bytes
+  — so one flow could have 16 MiB of datagrams waiting to go into the
+  tunnel, and there are 32 flows. A device could have **half a gigabyte**
+  queued at once, for a queue that exists to smooth a burst.
+  The queue now has a byte budget of its own — a megabyte per flow, which is
+  sixteen full-size datagrams, and 32 MiB for all the flows together. A
+  datagram that would take the queue past it is dropped, which is what UDP
+  promises anyway, and the count of datagrams stays as a second bound.
+  The bytes are reserved before the datagram goes in, so the queue cannot pass
+  its bound between the check and the send, and they are given back when the
+  flow takes the datagram out.
+  The queue on the other side — the one the TUN writer reads from, which
+  holds the datagrams coming back — is still bounded by their number alone.
+  This change bounds the queue a flow hands to the tunnel; that one is a
+  separate bound and is not touched here.
 - **The local proxy holds two buffers per connection, not three.** Reading a
   request's head allocated a second 32 KiB buffer — one for the first read and
   another for the rest of the head — and the first of them was then kept for
