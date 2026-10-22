@@ -731,7 +731,7 @@ async fn close_node_flows(
 /// nothing secret crosses either: the connection string is masked by
 /// [`credentials::mask`], and a TOTP secret or enrollment token a code carries is
 /// not handed to the renderer at all. Showing an invite needs neither, and
-/// [`accept_invite`] is what files them once the user says yes.
+/// `accept_invite` is what files them once the user says yes.
 ///
 /// The fields cross into TypeScript, where `InvitePayload` in `src/types/index.ts` spells them
 /// camelCase. Nothing in Tauri rewrites the keys of a command result — every struct has to ask
@@ -762,7 +762,7 @@ pub struct InvitePayload {
 /// The enrollment half of an invite: a token to spend, not a secret to keep.
 ///
 /// What crosses is *that* there is one and who it is for. The token itself is
-/// filed by [`accept_invite`] and never reaches the renderer.
+/// filed by `accept_invite` and never reaches the renderer.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteEnrollmentPayload {
@@ -784,7 +784,7 @@ pub struct InviteTotpPayload {
     pub issuer: String,
 }
 
-/// What [`accept_invite`] answers: which node an invite belongs to, and
+/// What `accept_invite` answers: which node an invite belongs to, and
 /// everything about it that is not a credential.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
