@@ -400,8 +400,10 @@ measures it: the plain HTTP path through the client's local proxy — the head,
 the domain check, the rewrite, the bi-stream, and the response back — which
 is the path `forwarding_path` does not cover, because that one is the CONNECT
 tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
-`first_byte` at **100 µs** (the time to the response head) and
-`request_response` at **138 µs** (the whole request). The far side of that
+`first_byte` at **107 µs** (the time to the response head) and
+`request_response` at **150 µs** (the whole request). Both are the median
+of several runs, and the runs are spread — 100 to 115 µs and 140 to 173 µs
+— so the numbers are a band rather than a point. The far side of that
 bench is an HTTP server over an iroh bi-stream on the same host, not the
 server crate's own request handling — so what is now measured is the
 client's half of a request, and the server's half is still an expectation.
@@ -464,10 +466,13 @@ items the numbers pointed at.
    it allocated **four**, and a connection holds **64 KiB** where it held
    **96 KiB** — 16 MiB at the cap rather than 24.
    The time is unchanged, which is what the change is for: the local proxy's
-   request path measures **150 µs** for the whole request and **106 µs** to
-   the response head, against **151 µs** and **107 µs** before. A benchmark
-   that runs the path four times — twice with the change and twice without —
-   puts the two within a percent of each other.
+   request path measures about **150 µs** for the whole request and about
+   **107 µs** to the response head. A benchmark that runs the path several
+   times — with the change and without it — puts the two in the same band,
+   and the band is wide: 140 to 173 µs for the whole request, 100 to 115 µs
+   for the response head. The bench does not resolve a percent, so the
+   honest reading is that the number does not move rather than that the
+   change is free.
    What is **not** in here is the other half of the item: the local proxy
    closes the connection after every response, so every request is a new
    socket, two new tasks and two new entries in the flow table. That is a
