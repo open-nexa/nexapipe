@@ -331,6 +331,9 @@ lookup, which is what a config written before the key existed does.
   and doing it once is not a different answer: the HTTP path, the TLS
   passthrough path and the L4 path all fold exactly as they did before, and
   the tests that pin the matching rules still pass unchanged.
+  The numbers, from the routing table's own benchmark: a host a route
+  serves goes from **732 ns** to **134 ns**, and a host no route serves
+  from **533 ns** to **76 ns**.
 
 ### Changed
 

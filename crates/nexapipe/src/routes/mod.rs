@@ -704,7 +704,9 @@ impl RoutingTable {
             // The host is folded once for the whole walk, rather than once
             // for every route in it.
             let folded = normalize_host(host);
-            best_match(&routes, RouteMode::Http, |route| route.serves_request(&folded, path))
+            best_match(&routes, RouteMode::Http, |route| {
+                route.serves_request(&folded, path)
+            })
         };
 
         let Some(route) = matched_route else {
