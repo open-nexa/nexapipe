@@ -33,37 +33,10 @@
 //! otherwise the switched-over system DNS queries would have nobody to answer them.
 
 use anyhow::Result;
+#[cfg(not(windows))]
 use std::process::Command;
-// `creation_flags` is a Windows-only extension method on `Command`; without this import the
-// helper below would have no way to reach it. Gated like the helper itself so the other
-// platforms do not carry an unused import.
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-/// Starts one of the Windows DNS tools without a console window.
-///
-/// `powershell.exe` and `netsh.exe` are console-subsystem programs, so a plain
-/// `Command::new` makes Windows allocate a console for them and flash it on screen. That is
-/// invisible in a release build, where `main.rs` puts the app itself in the GUI subsystem via
-/// `windows_subsystem = "windows"`, but a debug build has no such attribute, so the app *is* a
-/// console program and every child inherits a console of its own. The startup cleanup makes this
-/// obvious: the window is created hidden and painted a frame later, so for the second or so the
-/// cleanup runs there is nothing else on screen and the console is all the user sees.
-///
-/// `CREATE_NO_WINDOW` (0x0800_0000) is the documented way to ask for a child that has a console
-/// but no window. `platform.rs` already does this for the service helpers; these calls were
-/// simply never given it.
-///
-/// Only defined on Windows so the flag cannot be applied by mistake on a platform where the
-/// constant means something else, and so a call site that forgets the `#[cfg]` fails to compile
-/// rather than quietly doing nothing.
-#[cfg(windows)]
-fn win_console_tool(program: &str) -> Command {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-}
+use crate::win::hidden;
 
 // The candidate blocks, and the two tests that separate a stale hijack from a live
 // one, are shared by the platforms that write a DNS setting somewhere outside this
@@ -595,7 +568,7 @@ fn nrpt_namespaces_for(rules: &[NrptRule], dns_ip: &str) -> Vec<String> {
 /// partial result worth logging, not a failure of the whole command.
 #[cfg(windows)]
 fn windows_ps(script: &str) -> Result<String> {
-    let output = win_console_tool("powershell")
+    let output = hidden("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run powershell: {}", e))?;
@@ -861,7 +834,7 @@ fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()> {
     // Fallback: netsh sets IPv4 and resets IPv6 DNS separately. This works when running
     // elevated in process mode, but is a silent no-op under LocalSystem (exit 0, no
     // effect) — so verify the result instead of trusting the exit code.
-    let _ = win_console_tool("netsh")
+    let _ = hidden("netsh")
         .args([
             "interface",
             "ip",
@@ -872,7 +845,7 @@ fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()> {
             "primary",
         ])
         .output();
-    let _ = win_console_tool("netsh")
+    let _ = hidden("netsh")
         .args(["interface", "ipv6", "set", "dnsservers", "all", "dhcp"])
         .output();
     if windows_dns_points_at(dns_ip) {
@@ -906,7 +879,7 @@ fn set_system_windows_dns_ps(interface: &str, dns_ip: &str) -> Result<String> {
          Get-DnsClientServerAddress | Where-Object {{ $_.ServerAddresses }} | ForEach-Object {{ $_.InterfaceAlias + ' [' + $_.AddressFamily + ']: ' + ($_.ServerAddresses -join ',') }}",
         dns_ip, itf
     );
-    let output = win_console_tool("powershell")
+    let output = hidden("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run powershell: {}", e))?;
@@ -927,7 +900,7 @@ fn set_system_windows_dns_ps(interface: &str, dns_ip: &str) -> Result<String> {
 /// True when at least one adapter's effective IPv4 DNS list contains `dns_ip`.
 #[cfg(windows)]
 fn windows_dns_points_at(dns_ip: &str) -> bool {
-    let output = win_console_tool("powershell")
+    let output = hidden("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -948,7 +921,7 @@ fn windows_dns_points_at(dns_ip: &str) -> bool {
 /// process cannot dial without a scope id it does not have.
 #[cfg(windows)]
 fn current_dns_servers_windows() -> Vec<String> {
-    let output = Command::new("powershell")
+    let output = hidden("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -984,7 +957,7 @@ fn restore_system_dns_windows(interface: &str, _dns_ip: &str) -> Result<()> {
          Clear-DnsClientCache",
         itf
     );
-    let output = win_console_tool("powershell")
+    let output = hidden("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
         .output();
     match output {
@@ -1010,10 +983,10 @@ fn restore_system_dns_windows(interface: &str, _dns_ip: &str) -> Result<()> {
     }
 
     // Fallback via netsh (best effort; silent no-op under LocalSystem)
-    let _ = win_console_tool("netsh")
+    let _ = hidden("netsh")
         .args(["interface", "ip", "set", "dnsservers", "all", "dhcp"])
         .output();
-    let _ = win_console_tool("netsh")
+    let _ = hidden("netsh")
         .args(["interface", "ipv6", "set", "dnsservers", "all", "dhcp"])
         .output();
     tracing::info!("System DNS fallback netsh restore dhcp applied");
@@ -1200,7 +1173,7 @@ fn cleanup_stale_hijack_windows() {
          Write-Output ('stale NRPT rules removed: ' + $nrpt.Count)",
         list
     );
-    match win_console_tool("powershell")
+    match hidden("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
         .output()
     {

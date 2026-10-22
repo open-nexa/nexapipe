@@ -400,8 +400,10 @@ measures it: the plain HTTP path through the client's local proxy — the head,
 the domain check, the rewrite, the bi-stream, and the response back — which
 is the path `forwarding_path` does not cover, because that one is the CONNECT
 tunnel. Its two numbers, measured on 2026-10-22 on the same machine:
-`first_byte` at **100 µs** (the time to the response head) and
-`request_response` at **138 µs** (the whole request). The far side of that
+`first_byte` at **107 µs** (the time to the response head) and
+`request_response` at **150 µs** (the whole request). Both are the median
+of several runs, and the runs are spread — 100 to 115 µs and 140 to 173 µs
+— so the numbers are a band rather than a point. The far side of that
 bench is an HTTP server over an iroh bi-stream on the same host, not the
 server crate's own request handling — so what is now measured is the
 client's half of a request, and the server's half is still an expectation.
@@ -465,6 +467,28 @@ items the numbers pointed at.
    That is **110 KiB** of heap for the extra connection (both ends
    together) and one handshake more, paid once per endpoint and protocol.
    The time is unchanged — the same number of round trips, the same bytes.
+7. **The buffers a connection holds.** **Added on 2026-10-22, from the audit
+   rather than from a bench.** The local proxy read a request's head into one
+   32 KiB buffer, read the rest of it into **another** one, and then kept the
+   first for the whole connection while each of the two copy loops held
+   another: **three** 32 KiB buffers per connection, and up to 256
+   connections at once.
+   **Done**: the head is read into one buffer, and that buffer becomes the
+   client half's copy buffer. A request allocates **two** 32 KiB buffers where
+   it allocated **four**, and a connection holds **64 KiB** where it held
+   **96 KiB** — 16 MiB at the cap rather than 24.
+   The time is unchanged, which is what the change is for: the local proxy's
+   request path measures about **150 µs** for the whole request and about
+   **107 µs** to the response head. A benchmark that runs the path several
+   times — with the change and without it — puts the two in the same band,
+   and the band is wide: 140 to 173 µs for the whole request, 100 to 115 µs
+   for the response head. The bench does not resolve a percent, so the
+   honest reading is that the number does not move rather than that the
+   change is free.
+   What is **not** in here is the other half of the item: the local proxy
+   closes the connection after every response, so every request is a new
+   socket, two new tasks and two new entries in the flow table. That is a
+   change to the proxy's connection lifecycle, and it is a separate decision.
 8. **The request body is not held whole.** **Added on 2026-10-22, from the
    audit rather than from a bench.** The server read a request's whole body
    into memory — up to 64 MiB of it — before it contacted the backend, and

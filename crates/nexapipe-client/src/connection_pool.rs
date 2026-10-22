@@ -53,6 +53,7 @@ pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
     list.push(ALPN_NEXAPIPE_LEGACY.to_vec());
     list
 }
+
 /// What a dial produced: the connection and the state its flows share, or
 /// the failure that stopped it.
 ///

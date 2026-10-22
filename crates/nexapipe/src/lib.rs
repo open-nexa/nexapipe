@@ -6,6 +6,7 @@ pub mod conn;
 pub mod deadline;
 pub mod dns;
 pub mod health;
+pub mod hyper_io;
 pub mod http;
 pub mod l4;
 pub mod lb;
