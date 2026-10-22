@@ -325,6 +325,17 @@ lookup, which is what a config written before the key existed does.
   server does with the request is still not measured, and the list of what
   is not measured says so.
 
+- **The TUN's per-packet copy is measured, and it is 0.08% of the path.**
+  Every packet the TUN reads is copied once on its way into the network
+  stack, because the stack takes a `Vec<u8>` of its own and the buffer the
+  bytes were read into is reused. That copy — the allocation and the memcpy
+  together — costs **18 ns**, against the **23 µs** the whole per-packet path
+  takes. It is now a benchmark of its own, so the number is visible rather
+  than assumed, and a reader who thinks the copy is worth removing can see
+  what it costs.
+  It is not worth removing: a buffer pool would need a lock of its own, and
+  the lock would cost more than the allocation it replaces.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of

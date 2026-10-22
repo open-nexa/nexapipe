@@ -28,6 +28,7 @@ have changed since are marked:
 | `tun_pump/dns_query` | 174 ns | the cache path is fast |
 | `tun_pump/ip_mapping` | **291 ns** | **was 2,274 ns** at `7d24761`, before the mapping stopped copying names and scanning two maps: it is a hash lookup now, and the hotspot it was is gone |
 | `tun_pump/tun_packet` | 7,348 ns | the whole TUN path, per packet |
+| `tun_pump/packet_copy` | **18 ns** | the copy the TUN's inbound path makes for every packet — the bytes are read into a buffer that is reused, and the stack is handed a copy, because the frame it takes is a `Vec<u8>` of its own. **It is 0.08% of `tun_packet`**, so the allocation it costs is not worth a buffer pool |
 | `route_lookup/a_matching_host` | **999 ns** | the routing table's walk over 51 routes, and what taking the route it found costs |
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
@@ -109,7 +110,7 @@ payload does, so what it measures is the copy loop and not the price of
 opening a flow. The handshake is a fixed cost per flow rather than a rate,
 and the tests cover what it does.
 
-**`tun_pump`** has three parts, from the inside out:
+**`tun_pump`** has four parts, from the inside out:
 
 - `dns_query` — the query the system resolver sends, answered from the
   virtual address pool.
@@ -119,6 +120,11 @@ and the tests cover what it does.
 - `tun_packet` — the whole path, with the query arriving as an IP packet on
   the TUN device and the answer leaving as one. The stack in the middle is
   smoltcp's; what is measured around it is ours.
+- `packet_copy` — the copy that path makes for every packet on its way in: the
+  bytes are read into a buffer that is reused, and the stack is handed a
+  **copy**, because the frame it takes is a `Vec<u8>` of its own. It is here
+  on its own so that its share of the path is visible, because it is the one
+  per-packet cost a reader would think was worth removing.
 
 **`domain_match`** is the client asking whether a name is one of its own — the
 question every `CONNECT` and every DNS query asks, answered by walking the

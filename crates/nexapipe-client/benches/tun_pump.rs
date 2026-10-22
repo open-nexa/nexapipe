@@ -145,6 +145,27 @@ fn tun_pump(c: &mut Criterion) {
         })
     });
 
+    // The copy the TUN's inbound path makes for every packet: the bytes are
+    // read into a buffer that is reused, and the stack is handed a **copy**,
+    // because the frame it takes is a `Vec<u8>` of its own.
+    //
+    // It is here on its own so that its share of `tun_packet` is visible:
+    // the whole path is measured above, and this is the part of it that the
+    // allocator pays for.
+    group.bench_function("packet_copy", |b| {
+        b.iter_custom(|iters| {
+            let packet = dns_packet(&dns_query());
+            let mut buf = vec![0u8; 1500];
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                buf[..packet.len()].copy_from_slice(&packet);
+                let copy = buf[..packet.len()].to_vec();
+                black_box(&copy);
+            }
+            start.elapsed()
+        })
+    });
+
     group.bench_function("tun_packet", |b| {
         b.iter_custom(|iters| {
             runtime.block_on(async move {
