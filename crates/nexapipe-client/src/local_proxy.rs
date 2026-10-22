@@ -1892,7 +1892,7 @@ mod tests {
             .expect("the request is written");
 
         let mut answer = Vec::new();
-        let read = tokio::time::timeout(
+        let _read = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
             client.read_to_end(&mut answer),
         )

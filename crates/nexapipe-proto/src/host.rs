@@ -226,6 +226,43 @@ pub fn host_matches_any(patterns: &[String], host: &str) -> bool {
     })
 }
 
+/// The host a `Host` header names, and the port it names if it names one.
+///
+/// The port is `None` when the header names none: the request did not say
+/// which port it wanted, and the proxy routes by host alone, so there is no
+/// port to hold against the client that asked.
+///
+/// An IPv6 literal is bracketed, and the colons inside it belong to the
+/// address: `[::1]:8080` is the host `[::1]` and the port 8080, and
+/// `[::1]` is the host and no port. A bracket that is never closed is not a
+/// port separator, so nothing is taken off.
+///
+/// One rule, because the two sides of a request have to agree on where the
+/// host ends: the server routes by what this says, and the client decides
+/// whether to tunnel by what this says.
+pub fn host_and_port(host: &str) -> (&str, Option<u16>) {
+    if host.starts_with('[') {
+        match host.find(']') {
+            // Up to and including the closing bracket: a port can only follow
+            // it, and the colons inside belong to the address.
+            Some(end) => {
+                let port = host[end + 1..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse().ok());
+                (&host[..=end], port)
+            }
+            // A bracket that is never closed is not a port separator, so
+            // nothing is taken off.
+            None => (host, None),
+        }
+    } else {
+        match host.split_once(':') {
+            Some((name, port)) => (name, port.parse().ok()),
+            None => (host, None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,48 +427,6 @@ mod tests {
         assert_eq!(normalize_pattern("*."), "*.");
         assert_eq!(normalize_pattern("[*]"), "[*]");
     }
-}
-
-/// The host a `Host` header names, and the port it names if it names one.
-///
-/// The port is `None` when the header names none: the request did not say
-/// which port it wanted, and the proxy routes by host alone, so there is no
-/// port to hold against the client that asked.
-///
-/// An IPv6 literal is bracketed, and the colons inside it belong to the
-/// address: `[::1]:8080` is the host `[::1]` and the port 8080, and
-/// `[::1]` is the host and no port. A bracket that is never closed is not a
-/// port separator, so nothing is taken off.
-///
-/// One rule, because the two sides of a request have to agree on where the
-/// host ends: the server routes by what this says, and the client decides
-/// whether to tunnel by what this says.
-pub fn host_and_port(host: &str) -> (&str, Option<u16>) {
-    if host.starts_with('[') {
-        match host.find(']') {
-            // Up to and including the closing bracket: a port can only follow
-            // it, and the colons inside belong to the address.
-            Some(end) => {
-                let port = host[end + 1..]
-                    .strip_prefix(':')
-                    .and_then(|p| p.parse().ok());
-                (&host[..=end], port)
-            }
-            // A bracket that is never closed is not a port separator, so
-            // nothing is taken off.
-            None => (host, None),
-        }
-    } else {
-        match host.split_once(':') {
-            Some((name, port)) => (name, port.parse().ok()),
-            None => (host, None),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::host_and_port;
 
     /// The authority is taken apart by one rule, so the two sides of a request
     /// cannot disagree about where the host ends.
