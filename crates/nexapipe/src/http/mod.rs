@@ -705,7 +705,7 @@ where
                     failure.error,
                 );
 
-                tried.push(backend_info.url.clone());
+                tried.push(backend_info.url.to_string());
                 match config.get_backend_excluding(&host, &path, &tried).await {
                     BackendLookup::Found(info) => backend_info = info,
                     // Nobody else to ask. The failure is the answer: the pool
@@ -786,21 +786,16 @@ async fn attempt_backend(
 
     let rewritten_path = backend_info.rewritten_path(path);
 
-    let backend_url = url::Url::parse(&backend_info.url)
-        .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+    // The origin was parsed when the pool was built, so this is a borrow of
+    // it rather than a `Url::parse` per request.
+    let origin: &str = match &backend_info.origin {
+        Ok(origin) => origin,
+        Err(reason) => return Err(anyhow::anyhow!("{}", reason).into()),
+    };
 
-    let backend_scheme = backend_url.scheme();
-    let backend_host = backend_url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Backend URL missing host"))?;
-    let backend_port = backend_url.port_or_known_default().unwrap_or(80);
-
-    let new_uri = format!(
-        "{}://{}:{}{}",
-        backend_scheme, backend_host, backend_port, rewritten_path
-    )
-    .parse::<http::Uri>()
-    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+    let new_uri = format!("{origin}{rewritten_path}")
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
     let mut builder = Request::builder().method(method.clone()).uri(new_uri);
 
@@ -817,12 +812,9 @@ async fn attempt_backend(
     let proxied_req = builder.body(Full::new(body.clone()))?;
 
     tracing::debug!(
-        "Proxying request: {} {} -> {}://{}:{}",
+        "Proxying request: {} {} -> {origin}",
         proxied_req.method(),
         proxied_req.uri(),
-        backend_scheme,
-        backend_host,
-        backend_port
     );
 
     match tokio::time::timeout(response_deadline, client.request(proxied_req)).await {
@@ -843,9 +835,7 @@ async fn attempt_backend(
             },
         }),
         Err(_) => Err(ProxyFailure {
-            error: anyhow::anyhow!(
-                "backend {backend_host}:{backend_port} did not respond within {response_deadline:?}"
-            ),
+            error: anyhow::anyhow!("backend {origin} did not respond within {response_deadline:?}"),
             partial: None,
             // The request was carried: the deadline expired after it went out.
             retry: Retryability::IfIdempotent,
@@ -1347,14 +1337,12 @@ fn build_backend_request(
     backend_info: &BackendInfo,
     body: &RequestBody,
 ) -> Result<Request<Full<bytes::Bytes>>, anyhow::Error> {
-    let url = url::Url::parse(&backend_info.url)
-        .map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?
-        .to_string();
-    let port = url.port_or_known_default().unwrap_or(80);
+    // The origin was parsed when the pool was built, so this is a borrow of
+    // it rather than a `Url::parse` per request.
+    let origin: &str = match &backend_info.origin {
+        Ok(origin) => origin,
+        Err(reason) => return Err(anyhow::anyhow!("{}", reason)),
+    };
 
     let path = req
         .uri()
@@ -1364,7 +1352,7 @@ fn build_backend_request(
 
     let rewritten_path = backend_info.rewritten_path(path);
 
-    let new_uri = format!("{}://{}:{}{}", url.scheme(), host, port, rewritten_path)
+    let new_uri = format!("{origin}{rewritten_path}")
         .parse::<http::Uri>()
         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 

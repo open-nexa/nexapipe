@@ -51,6 +51,26 @@ impl BackendStatus {
     }
 }
 
+/// The scheme, the host and the port of a backend address, ready to be joined
+/// to a path.
+///
+/// Parsed **once**, when the pool is built. A backend does not move, so the
+/// answer does not either, and a `Url::parse` per request is a measurable
+/// share of what a request costs.
+///
+/// The two failures are kept as they were written, because the request path
+/// says them and the operator reads them there.
+fn origin_of(url: &str) -> Result<Arc<str>, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid backend URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "backend URL missing host".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Ok(Arc::from(
+        format!("{}://{host}:{port}", parsed.scheme()).as_str(),
+    ))
+}
+
 /// One backend in the pool: its health, and how much work it has outstanding.
 ///
 /// The two sit together because choosing between backends needs both, and not
@@ -62,7 +82,21 @@ impl BackendStatus {
 struct BackendEntry {
     /// The address, kept beside the health status so that the circuit can
     /// name the backend it is talking about without waiting on a lock.
-    url: String,
+    ///
+    /// Shared, so that handing it to a request is a reference count rather
+    /// than a copy: the address used to be cloned into every request that
+    /// chose this backend.
+    url: Arc<str>,
+    /// The scheme, the host and the port of the address, ready to be joined
+    /// to a path.
+    ///
+    /// **Parsed once, here**, when the pool is built: a backend does not
+    /// move, and a `Url::parse` per request is a measurable share of what a
+    /// request costs.
+    ///
+    /// The error is kept rather than thrown: a backend that cannot be parsed
+    /// is reported when a request is built, where the operator can read it.
+    origin: Result<Arc<str>, String>,
     /// Whether the backend is healthy.
     ///
     /// An **atomic**, because choosing a backend happens on every request and
@@ -119,8 +153,13 @@ impl CircuitState {
 
 impl BackendEntry {
     fn new(url: String) -> Self {
+        let origin = origin_of(&url);
         BackendEntry {
-            url: url.clone(),
+            url: Arc::from(url.as_str()),
+            origin: match origin {
+                Ok(origin) => Ok(origin),
+                Err(reason) => Err(reason),
+            },
             healthy: AtomicBool::new(true),
             status: RwLock::new(BackendStatus::default()),
             in_flight: AtomicUsize::new(0),
@@ -205,6 +244,22 @@ pub struct BackendLease {
 }
 
 impl BackendLease {
+    /// The scheme, the host and the port of the address, ready to be joined
+    /// to a path.
+    ///
+    /// Parsed once, when the pool was built.
+    pub fn origin(&self) -> &Result<Arc<str>, String> {
+        &self.entry.origin
+    }
+
+    /// The address this flow is to be forwarded to, shared.
+    ///
+    /// A reference to the pool's own copy, so that handing it to a request
+    /// is a reference count and not a copy of the address.
+    pub fn shared_url(&self) -> &Arc<str> {
+        &self.entry.url
+    }
+
     /// The address this flow is to be forwarded to.
     pub fn url(&self) -> &str {
         // The entry holds the address, so this is a borrow of it: the lease
@@ -417,11 +472,17 @@ impl BackendPool {
         //
         // The address is the entry's own, so the comparison does not take the
         // status lock — it used to, once per backend.
-        let any_untried = healthy_backends
-            .iter()
-            .any(|i| !exclude.iter().any(|e| e == &self.backends[*i].url));
+        let any_untried = healthy_backends.iter().any(|i| {
+            !exclude
+                .iter()
+                .any(|e| e.as_str() == &*self.backends[*i].url)
+        });
         if any_untried {
-            healthy_backends.retain(|i| !exclude.iter().any(|e| e == &self.backends[*i].url));
+            healthy_backends.retain(|i| {
+                !exclude
+                    .iter()
+                    .any(|e| e.as_str() == &*self.backends[*i].url)
+            });
         } else if !exclude.is_empty() {
             tracing::debug!(
                 "Every serving backend behind this route has been tried; trying one of them \
@@ -525,7 +586,7 @@ impl BackendPool {
     pub async fn backends(&self) -> Vec<String> {
         let mut result = Vec::new();
         for b in &self.backends {
-            result.push(b.url.clone());
+            result.push(b.url.to_string());
         }
         result
     }
@@ -539,7 +600,7 @@ impl BackendPool {
     pub async fn outstanding(&self, url: &str) -> usize {
         let mut count = 0;
         for backend in &self.backends {
-            if backend.url == url {
+            if &*backend.url == url {
                 count += backend.in_flight.load(Ordering::Relaxed);
             }
         }
@@ -569,7 +630,7 @@ impl BackendPool {
         // entries were down and the balancer kept picking them.
         let mut matched = false;
         for backend in &self.backends {
-            if backend.url != url {
+            if &*backend.url != url {
                 continue;
             }
             matched = true;
@@ -598,7 +659,7 @@ impl BackendPool {
     pub async fn get_backend_statuses(&self) -> Vec<(String, bool)> {
         let mut result = Vec::new();
         for b in &self.backends {
-            result.push((b.url.clone(), b.healthy.load(Ordering::Relaxed)));
+            result.push((b.url.to_string(), b.healthy.load(Ordering::Relaxed)));
         }
         result
     }

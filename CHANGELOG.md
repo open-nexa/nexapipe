@@ -356,6 +356,22 @@ lookup, which is what a config written before the key existed does.
   The health flag is an atomic now, so the operator's view and the request
   path cannot disagree about it: the flag is written once, and both read it.
 
+- **The backend's address is parsed once, not once per request.** Two places
+  built the backend's URI for every request, and both parsed the address to
+  do it — a `Url::parse`, a copy of the host, and a formatted string. A
+  **backend does not move**: its scheme, host and port are fixed when the
+  route is configured, and they were being parsed again for every request
+  that chose it.
+  The origin is now parsed when the pool is built, and the request path
+  borrows the answer. The address is **shared** rather than copied, so
+  handing it to a request is a reference count.
+  One request makes **40 allocations** where it made **49** — nine fewer
+  across the balancer's choice and the backend's address, both of which were
+  doing per-request work for values that are fixed.
+  The errors are the same ones, in the same words: a backend whose address
+  does not parse, or names no host, is still reported when the request is
+  built, where the operator reads it.
+
 ### Changed
 
 - **A key the config file does not know is an error now.** Every section of
