@@ -311,7 +311,8 @@ mod tests {
             serde_json::to_string(&status).unwrap(),
             r#"{"running":false,"mode":"unknown"}"#
         );
-        let parsed: ProxyStatus = serde_json::from_str(r#"{"running":false,"mode":"unknown"}"#).unwrap();
+        let parsed: ProxyStatus =
+            serde_json::from_str(r#"{"running":false,"mode":"unknown"}"#).unwrap();
         assert_eq!(parsed.mode, ProxyModeKind::Unknown);
     }
 

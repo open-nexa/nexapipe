@@ -134,8 +134,7 @@ const MAX_STATUS_LEN: usize = 64;
 /// code. A status that is refused is dropped rather than trimmed, because a
 /// trimmed status says something the caller did not.
 pub fn is_writable_status(status: &str) -> bool {
-    status.chars().count() <= MAX_STATUS_LEN
-        && !status.chars().any(|c| c.is_control())
+    status.chars().count() <= MAX_STATUS_LEN && !status.chars().any(|c| c.is_control())
 }
 
 /// Writes the connection state onto the tray icon.
