@@ -59,12 +59,12 @@ lookup, which is what a config written before the key existed does.
 
 - **Three small things on the server's response path.**
   The **WebSocket's copy loop** moved 8 KiB at a time where the HTTP path
-  coalesces into 64 KiB, and it had **no bound at all** -- only the handshake
+  coalesces into 64 KiB, and it had **no bound at all** — only the handshake
   was bounded, so a WebSocket whose two sides both went quiet kept a backend
   connection, a task and a stream slot for as long as the process lived. It
   now moves 64 KiB and is bounded by the same `response_idle` deadline the
   HTTP path uses. The bound is on the **session**, not on a side of it: a
-  WebSocket that is quiet in one direction is still a WebSocket -- a client
+  WebSocket that is quiet in one direction is still a WebSocket — a client
   that only listens to a feed the backend keeps pushing has nothing to say --
   and what ends the session is neither side having moved for a whole window.
   The window is measured with a **monotonic** clock: the wall clock steps with
@@ -73,7 +73,7 @@ lookup, which is what a config written before the key existed does.
   The copy buffer is 64 KiB of **heap** per direction rather than 8 KiB of
   stack, so a session costs 128 KiB where it cost 16 KiB.
   Every **response header's name** was copied to lower case, once per header
-  per response -- for a name that was already lower case, because HTTP header
+  per response — for a name that was already lower case, because HTTP header
   names are case-insensitive and the parser folds them.
   The **connection pool's idle reaper** had no clock: the timer that was set
   is the h2 half's, and the pool's own 120-second idle timeout was only
@@ -360,8 +360,8 @@ lookup, which is what a config written before the key existed does.
   scheduler.
   It is the plaintext listener's path, and the difference is written down
   rather than left out: the QUIC tunnel reaches the same backend through
-  another function and shares the part of the work this bench is about -- the
-  lookup, the balancer, the origin and the URI -- while the header copying
+  another function and shares the part of the work this bench is about — the
+  lookup, the balancer, the origin and the URI — while the header copying
   and the body handling are its own, and what it adds on top is the
   transport. So the server's own work for a request is a measurement now; the
   transport's share of one is still an expectation.

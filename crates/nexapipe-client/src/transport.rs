@@ -10,7 +10,7 @@
 //! EXPECTED_RTT        = 100 ms
 //! MAX_STREAM_BANDWIDTH= 12.5 MB/s
 //! stream_receive_window = 12.5 MB/s * 100 ms = 1.25 MB
-//! receive_window        = VarInt::MAX      (effectively unlimited -- raised here)
+//! receive_window        = VarInt::MAX      (effectively unlimited — raised here)
 //! send_window           = 8 * 1.25 MB      = 10 MB
 //! initial_mtu/min_mtu   = 1200
 //! congestion controller = Cubic
