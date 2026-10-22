@@ -798,6 +798,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A `[local_proxy] strategy` the client cannot honour stops the local proxy
+  instead of being ignored.** The local proxy balances over a list of
+  *servers* and picks one of them for a connection, so the strategies it has
+  are `round_robin` and `random`. `least_conn` — which picks the backend of a
+  route with the fewest requests outstanding to it — is the server's own
+  strategy, and it means nothing to a client that is choosing between servers
+  it does not measure.
+  It used to answer **every** name it did not have with round-robin: a
+  `[local_proxy] strategy = "least_conn"`, or a misspelling of a name that
+  does exist, produced a proxy that ran round-robin while the file said
+  something else, and nothing reported the difference. The name is refused now,
+  the message says which names there are, and the process says so instead of
+  running on a strategy the file did not ask for.
+  The **routes'** own `strategy` key is untouched: `least_conn` is still what
+  it means there, and still what it does.
+
 - **The tunnel's congestion controller is BBR rather than Cubic.** Cubic is a
   loss-based controller: it reads a loss as "the link is congested" and cuts its
   window. On a long international path the loss is usually *noise* rather than
