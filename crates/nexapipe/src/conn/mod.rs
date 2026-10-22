@@ -108,6 +108,22 @@ pub struct AuthState {
     config: Arc<tokio::sync::RwLock<AuthConfig>>,
     path: String,
     state_path: String,
+    /// How many enrollments have been applied to the live config.
+    ///
+    /// The configuration watcher reads the file **before** it takes the lock
+    /// that guards the live config, and an enrollment that lands in between
+    /// would be undone by the merge: it spends a token by changing the live
+    /// state and only then writing the change back, so a snapshot taken a
+    /// moment earlier still carries the spent token and the pre-enrollment
+    /// secret.
+    ///
+    /// This counter is the witness. It is sampled before the read and compared
+    /// under the lock, and the two cannot disagree about what happened — which
+    /// holds only because the counter moves **after** the enrollment's write
+    /// has landed, still under the lock. A counter bumped at the start of an
+    /// enrollment could be sampled by a reload that then read the file before
+    /// the write, and the stale snapshot would look current.
+    enroll_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AuthState {
@@ -121,7 +137,28 @@ impl AuthState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             path,
             state_path,
+            enroll_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// How many enrollments have been applied to the live config so far.
+    ///
+    /// Sampled before a read of the file and compared under the lock, to see
+    /// whether an enrollment landed while the file was being read.
+    pub fn enroll_epoch(&self) -> u64 {
+        self.enroll_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records that an enrollment has been applied to the live config.
+    ///
+    /// Called under the same lock the enrollment itself holds, and only after
+    /// the enrollment's write to the config file has landed: the watcher
+    /// samples this before it reads that file, so a bump that came first would
+    /// let the read see the file as it was before the enrollment and still
+    /// look current.
+    pub fn bump_enroll_epoch(&self) {
+        self.enroll_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The shared config to validate against.
@@ -1558,6 +1595,14 @@ async fn enroll_client(
         .map_err(AuthFailure::NotStarted)?;
         return Err(AuthFailure::Rejected(reason));
     }
+
+    // The file carries the enrollment now, so this is the moment the watcher
+    // has to be able to see it. Still under the lock the enrollment holds: a
+    // reload samples the epoch before it reads the file and compares it here,
+    // and a bump placed any earlier — before the write — could be sampled by a
+    // reload that then read the pre-enrollment file and merged it back over
+    // the top of this enrollment.
+    auth.bump_enroll_epoch();
 
     // Presenting the token is proof the invite reached the right hands, so a
     // counter left over from failed guesses is cleared: a client that just
