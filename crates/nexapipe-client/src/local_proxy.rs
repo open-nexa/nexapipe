@@ -981,10 +981,27 @@ where
         return Ok(());
     }
 
+    // A request that names more than one host is refused here, the same rule
+    // the server applies. The route and the access check read the first `Host`
+    // header and the backend would be handed all of them, so the request that
+    // is authorised and the request that is served would be two different
+    // requests — and the failure showed up as the server's 400, which looks
+    // like a proxy bug rather than a request that cannot be answered.
+    if request.headers().get_all("host").iter().count() > 1 {
+        jni_log!(
+            "[local-proxy] refusing a request that names more than one host: {}",
+            redacted_headers(request.headers())
+        );
+        return write_proxy_error(&mut stream, "400 Bad Request").await;
+    }
+
     let mut target_host = None;
     for header in request.headers().get_all("host") {
         if let Ok(h) = header.to_str() {
-            let h = h.split(':').next().unwrap_or(h);
+            // The authority is split the way the server splits it, so
+            // `[::1]:8080` keeps its address and `example.com:` does not
+            // silently become `example.com`.
+            let (h, _port) = nexapipe_proto::host_and_port(h);
             jni_log!("[DEBUG:local-proxy] Found Host header: '{}'", h);
             if should_proxy_domain(h, &proxy_domains) {
                 target_host = Some(h.to_string());
@@ -1801,6 +1818,14 @@ mod tests {
     /// dialling one. Built through `shared` rather than `new` because the test
     /// needs the address `new` keeps to itself.
     async fn listening_proxy() -> (LocalProxy, std::net::SocketAddr) {
+        listening_proxy_for(&[]).await
+    }
+
+    /// A proxy that serves the domains it is given, and no backends behind it.
+    ///
+    /// The domains matter: a request that names one goes on to dial, so a
+    /// refusal has to be the client's own rather than the absence of a route.
+    async fn listening_proxy_for(domains: &[&str]) -> (LocalProxy, std::net::SocketAddr) {
         let ep = Endpoint::builder(presets::N0)
             .bind()
             .await
@@ -1821,7 +1846,11 @@ mod tests {
             .local_addr()
             .expect("a bound listener has an address");
         (
-            LocalProxy::shared(Arc::new(listener), Arc::new(group), Vec::new()),
+            LocalProxy::shared(
+                Arc::new(listener),
+                Arc::new(group),
+                domains.iter().map(|d| d.to_string()).collect(),
+            ),
             addr,
         )
     }
@@ -1839,6 +1868,47 @@ mod tests {
 
     /// The port it asks for.
     const PORT: u16 = 5432;
+
+    /// A request that names more than one host is refused here.
+    ///
+    /// The route and the access check read the first `Host` header and the
+    /// backend would be handed all of them, so the request that is authorised
+    /// and the request that is served would be two different requests.
+    ///
+    /// The server refuses it with a 400; refusing it at the client says the
+    /// same thing without a round trip, and says it where the user can act on
+    /// it — a 400 from the far end looks like a proxy bug.
+    #[tokio::test]
+    async fn a_request_that_names_more_than_one_host_is_refused() {
+        let (proxy, addr) = listening_proxy_for(&["db.test"]).await;
+        let runner = spawn_run(&proxy);
+
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the proxy is listening");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: db.test\r\nHost: other.test\r\n\r\n")
+            .await
+            .expect("the request is written");
+
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            client.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the client read never returned")
+        .expect("the client read failed");
+
+        proxy.stop();
+        let _ = runner.await;
+
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.starts_with("HTTP/1.1 400"),
+            "the request was refused with: {answer}"
+        );
+    }
 
     /// The far side of the tunnel: a server that waits for the client's
     /// half-close before it answers.

@@ -74,7 +74,9 @@ pub use auth::{
     AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, is_presentable_client_id,
     is_presentable_device_id,
 };
-pub use host::{host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error};
+pub use host::{
+    host_and_port, host_matches, host_matches_any, normalize_host, normalize_pattern, pattern_error,
+};
 pub use preface::{
     L4Proto, MAX_HOST_LEN, MAX_PREFACE_LEN, PREFACE_MAGIC, PREFACE_VERSION, Preface, Status,
     is_l4_preface,
