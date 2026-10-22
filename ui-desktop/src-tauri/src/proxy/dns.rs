@@ -164,11 +164,14 @@ async fn handle_dns_query(
         return Ok(());
     }
 
-    // Parse the DNS query
-    let query = match parse_dns_query(data) {
-        Ok(q) => q,
-        Err(e) => {
-            tracing::debug!("Failed to parse DNS query: {}", e);
+    // Parse the DNS query. The codec is the client's, which runs a DNS server
+    // of its own for the TUN: one copy of what a question is and what an
+    // answer looks like, so the two cannot answer the same question
+    // differently.
+    let query = match nexapipe_client::dns::parse_query(data) {
+        Some(q) => q,
+        None => {
+            tracing::debug!("Failed to parse DNS query");
             return Ok(());
         }
     };
@@ -193,13 +196,13 @@ async fn handle_dns_query(
         let response = match answer {
             Some(address) => {
                 tracing::info!("DNS hijack: {} -> {}", query.domain, address);
-                build_dns_response(data, &query, address)
+                nexapipe_client::dns::build_response(&query, address)
             }
             None => {
                 // Every other type (AAAA with no IPv6 pool, MX, ...) gets an empty NOERROR
                 // reply so the query is not leaked upstream and browser resolution is not
                 // disturbed.
-                build_empty_dns_response(&query)
+                nexapipe_client::dns::build_empty_response(&query)
             }
         };
         socket.send_to(&response, client_addr).await?;
@@ -338,152 +341,6 @@ async fn forward_to_upstream(
     Ok(())
 }
 
-/// How many compression pointers one name may follow before it is declared
-/// unreadable. A real name needs one; more than that is a loop.
-const MAX_DNS_POINTER_JUMPS: usize = 4;
-
-/// Parsed DNS query
-#[derive(Debug)]
-struct DnsQuery {
-    id: u16,
-    domain: String,
-    qtype: u16,
-    question_section: Vec<u8>,
-}
-
-/// Parses a DNS query from a raw packet
-fn parse_dns_query(data: &[u8]) -> Result<DnsQuery> {
-    if data.len() < 12 {
-        return Err(anyhow::anyhow!("DNS packet too short"));
-    }
-
-    let id = u16::from_be_bytes([data[0], data[1]]);
-    let qdcount = u16::from_be_bytes([data[4], data[5]]);
-
-    if qdcount == 0 {
-        return Err(anyhow::anyhow!("No question in DNS query"));
-    }
-
-    let mut offset = 12;
-    let mut labels = Vec::new();
-    let question_start = offset;
-    // Where the rest of the question sits once the name is over. It follows the
-    // terminating zero byte for an uncompressed name, but the two pointer bytes
-    // when the name jumped (RFC 1035 4.1.4): the labels those bytes point at
-    // live somewhere else, and reading on from them lands in another section.
-    let mut after_name: Option<usize> = None;
-    let mut jumps = 0usize;
-
-    loop {
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("DNS packet truncated"));
-        }
-
-        let label_len = data[offset] as usize;
-        if label_len == 0 {
-            offset += 1;
-            break;
-        }
-
-        // A compression pointer, not a length: the two top bits are set and the
-        // rest, with the byte after, is an offset into the message. Read as a
-        // length it gives a nonsense label, and from there a nonsense domain —
-        // which decides whether the name is proxied.
-        if label_len & 0xC0 == 0xC0 {
-            if offset + 1 >= data.len() {
-                return Err(anyhow::anyhow!("DNS compression pointer truncated"));
-            }
-            let target = ((label_len & 0x3F) << 8) | data[offset + 1] as usize;
-            if target >= data.len() {
-                return Err(anyhow::anyhow!("DNS compression pointer out of bounds"));
-            }
-            // A pointer to another pointer forever is a loop.
-            jumps += 1;
-            if jumps > MAX_DNS_POINTER_JUMPS {
-                return Err(anyhow::anyhow!("DNS compression pointer loops"));
-            }
-            if after_name.is_none() {
-                after_name = Some(offset + 2);
-            }
-            offset = target;
-            continue;
-        }
-
-        // The two remaining label types are reserved or unused; a name that
-        // uses one cannot be read as text.
-        if label_len & 0xC0 != 0 {
-            return Err(anyhow::anyhow!("unsupported DNS label type"));
-        }
-
-        if offset + 1 + label_len > data.len() {
-            return Err(anyhow::anyhow!("DNS label out of bounds"));
-        }
-
-        let label = std::str::from_utf8(&data[offset + 1..offset + 1 + label_len])
-            .map_err(|_| anyhow::anyhow!("Invalid DNS label"))?;
-        labels.push(label.to_string());
-        offset += 1 + label_len;
-    }
-
-    let type_at = after_name.unwrap_or(offset);
-    if type_at + 4 > data.len() {
-        return Err(anyhow::anyhow!("DNS query type/class truncated"));
-    }
-
-    let qtype = u16::from_be_bytes([data[type_at], data[type_at + 1]]);
-    let question_end = type_at + 4;
-
-    Ok(DnsQuery {
-        id,
-        domain: labels.join("."),
-        qtype,
-        question_section: data[question_start..question_end].to_vec(),
-    })
-}
-
-/// Builds a DNS response containing one address record: A for an IPv4 address,
-/// AAAA for an IPv6 one.
-fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: std::net::IpAddr) -> Vec<u8> {
-    let (rtype, rdata): (u16, &[u8]) = match ip {
-        std::net::IpAddr::V4(v4) => (1, &v4.octets()),
-        std::net::IpAddr::V6(v6) => (28, &v6.octets()),
-    };
-
-    let mut response = Vec::with_capacity(query.len() + rdata.len() + 16);
-
-    // Header
-    response.extend_from_slice(&dns_query.id.to_be_bytes()); // ID
-                                                             // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
-    response.extend_from_slice(&[0x81, 0x80]);
-    // QDCOUNT=1
-    response.extend_from_slice(&1u16.to_be_bytes());
-    // ANCOUNT=1
-    response.extend_from_slice(&1u16.to_be_bytes());
-    // NSCOUNT=0
-    response.extend_from_slice(&0u16.to_be_bytes());
-    // ARCOUNT=0
-    response.extend_from_slice(&0u16.to_be_bytes());
-
-    // Question section (copied verbatim from the original query's question)
-    response.extend_from_slice(&dns_query.question_section);
-
-    // Answer section
-    // Name pointer (points at the domain name in the question section)
-    response.extend_from_slice(&[0xC0, 0x0C]);
-    // TYPE=A (1) or AAAA (28)
-    response.extend_from_slice(&rtype.to_be_bytes());
-    // CLASS=IN
-    response.extend_from_slice(&1u16.to_be_bytes());
-    // TTL=60
-    response.extend_from_slice(&60u32.to_be_bytes());
-    // RDLENGTH=4 for A, 16 for AAAA
-    response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    // RDATA=IP
-    response.extend_from_slice(rdata);
-
-    response
-}
-
 /// A configured proxy domain reduced to the bare suffix it covers: no leading
 /// `*`, no leading or trailing dot, lower case.
 ///
@@ -566,21 +423,6 @@ fn is_scoped_domain(domain: &str) -> bool {
 /// question could answer differently for the same config.
 fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     nexapipe_client::should_proxy_domain(host, proxy_domains)
-}
-
-/// Builds an empty NOERROR reply (for non-A queries such as AAAA on hijacked domains)
-fn build_empty_dns_response(dns_query: &DnsQuery) -> Vec<u8> {
-    let mut response = Vec::with_capacity(dns_query.question_section.len() + 16);
-    // Header: ID + QR=1, RD=1, RA=1, RCODE=0 + QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
-    response.extend_from_slice(&dns_query.id.to_be_bytes());
-    response.extend_from_slice(&[0x81, 0x80]);
-    response.extend_from_slice(&1u16.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
-    // Question section (copied verbatim)
-    response.extend_from_slice(&dns_query.question_section);
-    response
 }
 
 #[cfg(test)]

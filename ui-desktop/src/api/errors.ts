@@ -16,6 +16,7 @@ export const ERROR_CODES = [
   // proxy
   'proxy.no_nodes',
   'proxy.invalid_load_balancing',
+  'proxy.invalid_dns_strategy',
   'proxy.start_failed',
   'proxy.no_reachable_backend',
   'proxy.two_factor_required',

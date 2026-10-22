@@ -186,6 +186,194 @@ fn check_acl_alignment() {
     std::process::exit(1);
 }
 
+/// Fail the build if the three lists of error codes disagree.
+///
+/// The codes are a contract between three places: the Rust side that raises
+/// them (`src/error.rs`), the frontend list that recognises them
+/// (`../src/api/errors.ts`), and the locale files that give them a message
+/// (`../src/i18n/locales/*.json`). Each of the three was maintained by hand,
+/// and they drifted: a code the Rust side raises that the frontend list does
+/// not know is a failure the UI renders as "unknown", and a locale key with
+/// no code behind it is a message no failure can ever show.
+///
+/// The check runs from `build.rs` so it covers every platform the workspace
+/// compiles for, and it reports *which* side is missing *which* entry. The
+/// relationship is `error.rs == errors.ts` and `error.rs == locales - {unknown}`:
+/// `unknown` is the fallback the frontend shows for a failure it cannot name,
+/// so it has no code on the Rust side.
+fn check_error_code_alignment() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is set by Cargo during build script execution");
+    let manifest_dir = Path::new(&manifest_dir);
+    let frontend_dir = manifest_dir.join("..").join("src");
+
+    // 1. The codes the Rust side raises.
+    let error_rs_path = manifest_dir.join("src").join("error.rs");
+    let error_rs = std::fs::read_to_string(&error_rs_path).unwrap_or_else(|e| {
+        panic!(
+            "error code check could not read {}: {e}",
+            error_rs_path.display()
+        )
+    });
+    let mut rust_codes = BTreeSet::new();
+    for line in error_rs.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("pub const ") {
+            continue;
+        }
+        // `pub const NAME: &str = "the.code";`
+        let Some(open) = trimmed.find('"') else {
+            continue;
+        };
+        let Some(close) = trimmed[open + 1..].find('"') else {
+            continue;
+        };
+        rust_codes.insert(trimmed[open + 1..open + 1 + close].to_string());
+    }
+
+    // 2. The list the frontend recognises.
+    let errors_ts_path = frontend_dir.join("api").join("errors.ts");
+    let errors_ts = std::fs::read_to_string(&errors_ts_path).unwrap_or_else(|e| {
+        panic!(
+            "error code check could not read {}: {e}",
+            errors_ts_path.display()
+        )
+    });
+    let marker = "ERROR_CODES = [";
+    let open = errors_ts.find(marker).unwrap_or_else(|| {
+        panic!(
+            "error code check: {} does not declare `ERROR_CODES = [ ... ]`",
+            errors_ts_path.display()
+        )
+    }) + marker.len();
+    let block = match errors_ts[open..].find(']') {
+        Some(end) => &errors_ts[open..open + end],
+        None => panic!(
+            "error code check: `ERROR_CODES = [` in {} has no matching `]`",
+            errors_ts_path.display()
+        ),
+    };
+    // The list is one code per line, grouped by comments. The comments are
+    // lines of their own, so the file is read a line at a time: a chunk split
+    // on commas would carry the comment that introduces a group onto the
+    // first code of it, and that code would be read as part of the comment.
+    let mut ts_codes = BTreeSet::new();
+    for line in block.lines() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with("//") {
+            continue;
+        }
+        let Some(value) = entry.strip_prefix('\'') else {
+            continue;
+        };
+        let Some(end) = value.find('\'') else {
+            continue;
+        };
+        ts_codes.insert(value[..end].to_string());
+    }
+
+    // 3. The messages the locale files give them. Each locale holds the same
+    //    `error` object, keyed by the code's own shape: `error.proxy.no_nodes`.
+    fn locale_codes(path: &Path) -> BTreeSet<String> {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("error code check could not read {}: {e}", path.display()));
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("error code check: parse {}: {e}", path.display()));
+        let mut out = BTreeSet::new();
+        fn walk(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            for (key, child) in object {
+                let path = format!("{prefix}.{key}");
+                if child.is_object() {
+                    walk(child, &path, out);
+                } else {
+                    out.insert(path);
+                }
+            }
+        }
+        if let Some(error) = value.get("error") {
+            walk(error, "error", &mut out);
+        }
+        out
+    }
+
+    let locales_dir = frontend_dir.join("i18n").join("locales");
+    let en = locale_codes(&locales_dir.join("en.json"));
+    let zh = locale_codes(&locales_dir.join("zh-CN.json"));
+
+    // The frontend's fallback for a failure it cannot name has no code on the
+    // Rust side, so it is the one entry allowed to be there alone.
+    let mut en_expected = en.clone();
+    en_expected.remove("error.unknown");
+    let mut zh_expected = zh.clone();
+    zh_expected.remove("error.unknown");
+
+    let rust_as_locale: BTreeSet<String> = rust_codes
+        .iter()
+        .map(|code| format!("error.{code}"))
+        .collect();
+
+    // The frontend's files are outside this package, so cargo does not know
+    // that a change to them has to run this script again. Without these lines
+    // the check only ever sees the state of the frontend at the first build,
+    // and a drift introduced afterwards reaches the next release unnoticed.
+    for path in [
+        &error_rs_path,
+        &errors_ts_path,
+        &locales_dir.join("en.json"),
+        &locales_dir.join("zh-CN.json"),
+    ] {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    let missing_in_ts: Vec<&String> = rust_codes.difference(&ts_codes).collect();
+    let extra_in_ts: Vec<&String> = ts_codes.difference(&rust_codes).collect();
+    if !missing_in_ts.is_empty() || !extra_in_ts.is_empty() {
+        problems.push(format!(
+            "src/api/errors.ts and src/error.rs disagree:\n  in error.rs but not in errors.ts: {missing_in_ts:?}\n  in errors.ts but not in error.rs: {extra_in_ts:?}"
+        ));
+    }
+
+    for (name, locale) in [("en.json", &en_expected), ("zh-CN.json", &zh_expected)] {
+        let missing: Vec<&String> = rust_as_locale.difference(locale).collect();
+        let extra: Vec<&String> = locale.difference(&rust_as_locale).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            problems.push(format!(
+                "src/i18n/locales/{name} and src/error.rs disagree:\n  in error.rs but not in {name}: {missing:?}\n  in {name} but not in error.rs: {extra:?}"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        println!(
+            "cargo:info=error code check passed: {} codes, agreed by src/error.rs, src/api/errors.ts and both locale files",
+            rust_codes.len()
+        );
+        return;
+    }
+
+    eprintln!(
+        "\n[error-code-check] ui-desktop/src-tauri error code alignment failed.\n\
+         \n\
+         The check enforces `src/error.rs == src/api/errors.ts` and `src/error.rs == locales - {{unknown}}`.\n\
+         A code the Rust side raises that the frontend does not know is a failure the UI renders as\n\
+         \"unknown\", and a locale key with no code behind it is a message no failure can show.\n"
+    );
+    for problem in &problems {
+        eprintln!("  {problem}");
+    }
+    eprintln!();
+    eprintln!("Fix: add the code to src/error.rs, list it in src/api/errors.ts, and give it an `error.<code>` key in both locale files.");
+    std::process::exit(1);
+}
+
 fn main() {
     // No custom app manifest: Tauri's default already requests `asInvoker`, which is what the
     // service flow depends on — the app runs as the invoking user and only `sc.exe` is
@@ -193,6 +381,7 @@ fn main() {
     // broken the binary with side-by-side error 14001.
     tauri_build::build();
     check_acl_alignment();
+    check_error_code_alignment();
 
     #[cfg(target_os = "windows")]
     {

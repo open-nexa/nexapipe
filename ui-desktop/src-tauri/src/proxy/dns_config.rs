@@ -32,11 +32,11 @@
 //! Note: the local DNS server (proxy/dns.rs) must be started before `set_system_dns`,
 //! otherwise the switched-over system DNS queries would have nobody to answer them.
 
+#[cfg(windows)]
+use crate::win::hidden;
 use anyhow::Result;
 #[cfg(not(windows))]
 use std::process::Command;
-#[cfg(windows)]
-use crate::win::hidden;
 
 // The candidate blocks, and the two tests that separate a stale hijack from a live
 // one, are shared by the platforms that write a DNS setting somewhere outside this

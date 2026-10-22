@@ -52,7 +52,7 @@
 
 use crate::ClientError;
 use crate::EndpointGroup;
-use crate::dns::UpstreamResolvers;
+use crate::dns::{self, DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, UpstreamResolvers};
 use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
 use crate::local_proxy::{
@@ -1992,10 +1992,12 @@ pub async fn handle_dns_query(
     resolvers: &UpstreamResolvers,
     ip_mapping: &IpMapping,
 ) -> Option<Vec<u8>> {
-    let (domain, qtype, qclass) = match parse_dns_query(query) {
-        Some(d) => d,
+    let parsed = match dns::parse_query(query) {
+        Some(q) => q,
         None => return None,
     };
+    let domain = parsed.domain.as_str();
+    let (qtype, qclass) = (parsed.qtype, parsed.qclass);
     if domain.is_empty() {
         return None;
     }
@@ -2005,7 +2007,7 @@ pub async fn handle_dns_query(
     // iroh infrastructure domains are not proxied through the TUN — iroh's own traffic goes via addDisallowedApplication.
     let is_iroh = domain_lower.ends_with(".iroh.link") || domain_lower.ends_with(".n0.iroh.link");
 
-    let is_proxy = !is_iroh && should_proxy_domain(&domain, proxy_domains);
+    let is_proxy = !is_iroh && should_proxy_domain(domain, proxy_domains);
 
     if is_proxy {
         // Only an A or an AAAA query **in the Internet class** gets an address,
@@ -2018,17 +2020,17 @@ pub async fn handle_dns_query(
         // Just as important, none of them consumes an address for a name
         // nothing may ever connect to.
         if qclass != DNS_CLASS_IN || (qtype != DNS_TYPE_A && qtype != DNS_TYPE_AAAA) {
-            return Some(build_empty_dns_response(query));
+            return Some(dns::build_empty_response(&parsed));
         }
 
         let answer = match qtype {
-            DNS_TYPE_A => Some(IpAddr::V4(ip_mapping.allocate(&domain))),
+            DNS_TYPE_A => Some(IpAddr::V4(ip_mapping.allocate(domain))),
             DNS_TYPE_AAAA => {
                 // `None` when the TUN has no IPv6 block to route — the
                 // desktop's interface may have refused the address. An empty
                 // answer is then the honest one: the resolver falls back to A,
                 // whereas an address nothing routes is a connection that hangs.
-                let v6 = ip_mapping.allocate_v6(&domain);
+                let v6 = ip_mapping.allocate_v6(domain);
                 if v6.is_none() {
                     jni_log!("[tun-proxy] DNS: no IPv6 pool, answering AAAA with nothing");
                 }
@@ -2037,184 +2039,19 @@ pub async fn handle_dns_query(
             _ => None,
         };
         let Some(answer) = answer else {
-            return Some(build_empty_dns_response(query));
+            return Some(dns::build_empty_response(&parsed));
         };
 
         // The name is deliberately left out: this runs for every name the
         // device resolves, so logging it turns logcat into a record of where
         // the user goes. What debugging needs is the decision, not the name.
         jni_log!("[tun-proxy] DNS: proxying a query -> {}", answer);
-        Some(build_dns_response(query, answer, qtype))
+        Some(dns::build_response(&parsed, answer))
     } else {
         // Forward to the real DNS.
         jni_log!("[tun-proxy] DNS: forwarding a query (qtype={})", qtype);
-        forward_dns_query(query, &domain, qtype, qclass, resolvers).await
+        forward_dns_query(query, domain, qtype, qclass, resolvers).await
     }
-}
-
-/// How many compression pointers one name may follow before the name is
-/// declared unreadable. A real name needs one; more than that is a loop.
-const MAX_DNS_POINTER_JUMPS: usize = 4;
-
-/// The only QCLASS this proxy answers: everything it serves — a virtual address,
-/// or a record forwarded from a real resolver — belongs to it.
-const DNS_CLASS_IN: u16 = 1;
-
-/// The two QTYPEs this proxy answers itself: A and AAAA.
-const DNS_TYPE_A: u16 = 1;
-const DNS_TYPE_AAAA: u16 = 28;
-
-/// The `u16` at `pos`, or 0 when the packet is too short to hold one.
-fn read_u16(payload: &[u8], pos: usize) -> u16 {
-    if pos + 2 <= payload.len() {
-        u16::from_be_bytes([payload[pos], payload[pos + 1]])
-    } else {
-        0
-    }
-}
-
-/// Parse a DNS query, returning (domain, QTYPE, QCLASS).
-/// QTYPE: 1=A, 28=AAAA. QCLASS: 1=IN. Returns None on parse failure.
-fn parse_dns_query(payload: &[u8]) -> Option<(String, u16, u16)> {
-    if payload.len() < 12 {
-        return None;
-    }
-
-    // DNS header: ID(2) + flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
-    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-    if qdcount == 0 {
-        return None;
-    }
-
-    // Parse the Question section's domain name (length-prefixed labels).
-    let mut pos = 12;
-    let mut labels: Vec<&str> = Vec::new();
-    let mut jumps = 0usize;
-    // Where QTYPE sits once the name is over. It follows the terminating zero
-    // byte for an uncompressed name, but the two pointer bytes when the name
-    // jumped: the labels those bytes point at are somewhere else entirely, so
-    // reading on from there would land inside another section.
-    let mut after_name: Option<usize> = None;
-
-    while pos < payload.len() {
-        let len = payload[pos] as usize;
-
-        if len == 0 {
-            pos += 1; // Skip the null terminator.
-            break;
-        }
-
-        // A compression pointer (RFC 1035 4.1.4): the two top bits are set and
-        // the rest, with the byte after, is an offset into the message — an
-        // earlier label list that this name continues with. Reading it as a
-        // length gives a nonsense label, and from there a nonsense domain: what
-        // decides whether the name is proxied was silently wrong. Rare in a
-        // query, legal, and some stacks do it.
-        if len & 0xC0 == 0xC0 {
-            if pos + 1 >= payload.len() {
-                return None;
-            }
-            let offset = ((len & 0x3F) << 8) | payload[pos + 1] as usize;
-            if offset >= payload.len() {
-                return None;
-            }
-            // A pointer that points at another pointer forever is a loop; stop
-            // after a few hops rather than spin.
-            jumps += 1;
-            if jumps > MAX_DNS_POINTER_JUMPS {
-                return None;
-            }
-            if after_name.is_none() {
-                after_name = Some(pos + 2);
-            }
-            pos = offset;
-            continue;
-        }
-
-        // The remaining two label types (0x40, 0x80) are reserved or unused;
-        // a name using one cannot be read as text.
-        if len & 0xC0 != 0 {
-            return None;
-        }
-
-        // Prevent out-of-bounds access.
-        if pos + 1 + len > payload.len() {
-            return None;
-        }
-        let label = std::str::from_utf8(&payload[pos + 1..pos + 1 + len]).ok()?;
-        labels.push(label);
-        pos += 1 + len;
-    }
-
-    let qtype_pos = after_name.unwrap_or(pos);
-    // QTYPE first, then QCLASS — two pairs that sit together after the name.
-    // The class is read rather than assumed: an answer cached for `IN` must not
-    // answer a query made in another class, and a key without it cannot tell
-    // those apart.
-    Some((
-        labels.join("."),
-        read_u16(payload, qtype_pos),
-        read_u16(payload, qtype_pos + 2),
-    ))
-}
-
-/// Build a DNS response resolving the queried name to `addr`.
-///
-/// The record type follows the address: an IPv4 address answers an A query with
-/// 4 bytes of RDATA, an IPv6 address answers an AAAA query with 16. Anything
-/// else — an AAAA question answered from the IPv4 pool, an MX, a type this
-/// proxy has no address for — gets an empty answer (ANCOUNT=0) so the client
-/// falls back to a query it can use.
-fn build_dns_response(query: &[u8], addr: IpAddr, qtype: u16) -> Vec<u8> {
-    let (rtype, rdata): (u16, &[u8]) = match (addr, qtype) {
-        (IpAddr::V4(ip), DNS_TYPE_A) => (DNS_TYPE_A, &ip.octets()),
-        (IpAddr::V6(ip), DNS_TYPE_AAAA) => (DNS_TYPE_AAAA, &ip.octets()),
-        _ => return build_empty_dns_response(query),
-    };
-
-    let mut response = Vec::with_capacity(query.len() + rdata.len() + 16);
-    response.extend_from_slice(query);
-
-    // Set flags: QR=1, Opcode=0, AA=0, TC=0, RD=1(copied), RA=1
-    response[2] = 0x81;
-    response[3] = 0x80;
-    // ANCOUNT = 1
-    response[6] = 0x00;
-    response[7] = 0x01;
-
-    // Answer section:
-    // Name: compression pointer 0xC00C → points to offset 12 (the Question section's domain name)
-    response.push(0xC0);
-    response.push(0x0C);
-    // TYPE: A = 1, AAAA = 28
-    response.extend_from_slice(&rtype.to_be_bytes());
-    // CLASS: IN = 1
-    response.push(0x00);
-    response.push(0x01);
-    // TTL: 60 seconds (0x0000003C)
-    response.push(0x00);
-    response.push(0x00);
-    response.push(0x00);
-    response.push(0x3C);
-    // RDLENGTH: 4 for an A record, 16 for an AAAA one.
-    let rdlength = rdata.len() as u16;
-    response.extend_from_slice(&rdlength.to_be_bytes());
-    // RDATA: the address, in network order, which is what `octets()` already is.
-    response.extend_from_slice(rdata);
-
-    response
-}
-
-/// Build an empty DNS answer: QR=1, RA=1, RCODE=0 (NoError), ANCOUNT=0.
-/// Used for "query type not supported" or "no address of the matching type".
-fn build_empty_dns_response(query: &[u8]) -> Vec<u8> {
-    let mut response = query.to_vec();
-    response[2] = 0x81;
-    response[3] = 0x80;
-    // ANCOUNT = 0
-    response[6] = 0x00;
-    response[7] = 0x00;
-    response
 }
 
 /// Forward a DNS query to the real DNS server and return the response as-is.
@@ -2496,14 +2333,13 @@ fn skip_dns_name(payload: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, DNS_CLASS_IN, DNS_TYPE_A,
-        DNS_TYPE_AAAA, IpMapping, MIN_TCP_WINDOW, UDP_FLOW_QUEUE, UDP_FLOW_QUEUE_BYTES, UdpQueue,
-        UdpSendError, UpstreamResolvers, answer_ttl, answer_ttl_offsets, cacheable_for,
-        cached_answer, cached_answer_at, handle_dns_query, lock_cache, next_activity,
-        parse_dns_query, read_u32, remember_answer, resolve_tcp_window, set_answer_ttls,
-        take_from_queue, wait_for_stop,
+        Activity, CacheKey, CachedAnswer, DEFAULT_TCP_WINDOW, IpMapping, MIN_TCP_WINDOW,
+        UDP_FLOW_QUEUE, UDP_FLOW_QUEUE_BYTES, UdpQueue, UdpSendError, UpstreamResolvers,
+        answer_ttl, answer_ttl_offsets, cacheable_for, cached_answer, cached_answer_at,
+        handle_dns_query, lock_cache, next_activity, read_u32, remember_answer, resolve_tcp_window,
+        set_answer_ttls, take_from_queue, wait_for_stop,
     };
-    use crate::dns::resolver_scope;
+    use crate::dns::{DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, parse_query, resolver_scope};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -2589,10 +2425,10 @@ mod tests {
         let name = [
             0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
         ];
-        let (domain, qtype, qclass) = parse_dns_query(&query(&name, 1)).unwrap();
-        assert_eq!(domain, "example.com");
-        assert_eq!(qtype, 1);
-        assert_eq!(qclass, DNS_CLASS_IN);
+        let parsed = parse_query(&query(&name, 1)).unwrap();
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.qtype, 1);
+        assert_eq!(parsed.qclass, DNS_CLASS_IN);
     }
 
     /// The bug: read as a length, the pointer's 0xC0 became a 192-byte label
@@ -2600,30 +2436,30 @@ mod tests {
     /// the routing decision that follows the name was silently wrong.
     #[test]
     fn follows_a_compression_pointer_to_the_rest_of_the_name() {
-        let (domain, qtype, _) = parse_dns_query(&query_with_partly_compressed_name(1)).unwrap();
-        assert_eq!(domain, "www.example.com");
-        assert_eq!(qtype, 1);
+        let parsed = parse_query(&query_with_partly_compressed_name(1)).unwrap();
+        assert_eq!(parsed.domain, "www.example.com");
+        assert_eq!(parsed.qtype, 1);
     }
 
     /// QTYPE follows the pointer, not the labels it points at: reading on from
     /// the pointed-to name's terminator would land in the tail of the packet.
     #[test]
     fn reads_the_qtype_where_the_pointer_ended() {
-        let (_, qtype, _) = parse_dns_query(&query_with_partly_compressed_name(28)).unwrap();
-        assert_eq!(qtype, 28);
+        let parsed = parse_query(&query_with_partly_compressed_name(28)).unwrap();
+        assert_eq!(parsed.qtype, 28);
     }
 
     #[test]
     fn refuses_a_pointer_that_loops() {
         // 0xC00C points at offset 12, which is this very pointer.
         let name = [0xC0, 0x0C];
-        assert!(parse_dns_query(&query(&name, 1)).is_none());
+        assert!(parse_query(&query(&name, 1)).is_none());
     }
 
     #[test]
     fn refuses_a_pointer_outside_the_packet() {
         let name = [0x03, b'a', b'b', b'c', 0xC0, 0xF0];
-        assert!(parse_dns_query(&query(&name, 1)).is_none());
+        assert!(parse_query(&query(&name, 1)).is_none());
     }
 
     /// An answer with two A records: the same header and question, then two
