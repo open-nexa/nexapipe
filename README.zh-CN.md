@@ -1656,8 +1656,12 @@ Cargo feature：
 
 ### macOS 首次启动
 
-GitHub Releases 中的桌面端安装包尚未做代码签名与公证。Safari 会给下载的 DMG 以及
-从中拷贝出来的应用打上 quarantine 标记，导致首次打开时 macOS 提示：
+GitHub Releases 中的桌面端安装包，**在发布流水线持有签名凭据时**会做代码签名与公证；
+没有凭据时则不会。已签名并已公证的安装包在从未打开过它的 Mac 上可以直接运行，用户
+不会被要求做任何降低安全设置的操作。
+
+没有凭据时安装包未签名，Safari 会给下载的 DMG 以及从中拷贝出来的应用打上
+quarantine 标记，导致首次打开时 macOS 提示：
 
 > “nexa” is damaged and can't be opened. You should move it to the Trash.
 
@@ -1669,6 +1673,37 @@ xattr -cr /Applications/nexa.app
 
 右键 →“打开”无法绕过这条提示；每次重新安装后都需要再执行一次。从源码本地构建
 （`build_dmg.sh`）不会带上 quarantine 标记。
+
+#### 打开签名与公证
+
+当仓库里配置了下列凭据时，发布工作流会对 macOS 安装包签名并公证：
+
+| 存放位置 | 名称 | 内容 |
+|---|---|---|
+| secret | `APPLE_CERTIFICATE` | Developer ID `.p12` 的 base64 |
+| secret | `APPLE_CERTIFICATE_PASSWORD` | 该 `.p12` 的密码 |
+| secret | `APPLE_APP_SPECIFIC_PASSWORD` | 用于公证的 app 专用密码 |
+| variable | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <名称> (<TEAMID>)` |
+| variable | `APPLE_ID` | Apple ID 邮箱 |
+| variable | `APPLE_TEAM_ID` | 团队 ID |
+
+证书必须是 “Developer ID Application” 类型，而不是 “Apple Development”：后者无法
+公证，而 Apple 要求分发给开发者本人机器之外的软件必须经过公证。从钥匙串导出
+`.p12` 并做 base64：
+
+```bash
+openssl base64 -A -in /path/to/developer-id.p12 -out certificate-base64.txt
+```
+
+证书导入和公证都由 Tauri 完成；工作流只负责把变量交给它，然后在日志里明确说出
+产出的安装包是否带有有效签名、Gatekeeper 是否接受它。没有凭据时构建出的安装包
+不会有任何签名，这一点会写进任务日志，而不是悄悄发布一个未签名的应用。
+
+**本地**构建时，证书通常已经在你自己的钥匙串里，此时给出身份即可：
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: <名称> (<TEAMID>)" ./build_dmg.sh
+```
 
 ---
 

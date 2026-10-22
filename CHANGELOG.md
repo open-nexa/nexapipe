@@ -634,6 +634,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The macOS bundles can be signed and notarized.** The desktop builds
+  attached to GitHub releases were neither: an unsigned app is quarantined by
+  Gatekeeper, and the only ways through it — "Control-click → Open" or
+  `xattr -dr com.apple.quarantine` — both ask the user to weaken the OS gate
+  for that application permanently, and a bundle with no signature cannot be
+  told apart from a look-alike.
+  The release workflow now signs with a Developer ID certificate and
+  notarizes, when the repository holds the credentials for it, and says out
+  loud in the job log whether the bundle it produced carries a valid
+  signature and whether Gatekeeper accepts it. A release built without the
+  credentials is signed by nothing and says so rather than quietly shipping
+  an unsigned app. The README names the secrets and the variables.
+  The updater path was never affected: the minisign signature is verified
+  against a pinned key before anything is extracted or installed, so an
+  update could not be swapped even though the initial download could.
+
 - **The certificate verifier and the bundled roots were patched.** Three new
   RustSec advisories landed against crates this tree already carried:
   RUSTSEC-2026-0382 (`rustls-webpki`), RUSTSEC-2026-0381 (`webpki-roots`) and
