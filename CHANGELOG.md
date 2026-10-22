@@ -696,6 +696,10 @@ lookup, which is what a config written before the key existed does.
   JNI bridge working are written down in `proguard-rules.pro`: the native
   entry points are bound by name, so neither the class nor its `native`
   methods may be renamed.
+  A CI job builds the release variant now, so the rules are exercised on every
+  pull request rather than only when a tag is pushed: a debug build never runs
+  R8, and a rule that keeps the app from building would otherwise be found by
+  a release.
 - **A registration code no longer silently replaces a working credential.**
   The Android app asked before an invite overwrote something that worked — but
   the question was asked for a secret and for the relay, and a one-time
