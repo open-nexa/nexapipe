@@ -54,8 +54,15 @@
 //! The preface carries a host name, and both sides have to agree on what a
 //! name means: the client decides whether a name is one it proxies, the
 //! server decides whether a name is one a route serves. That agreement is one
-//! rule, and it lives here — see [`host`] for the rule itself and for why it
-//! used to be three.
+//! rule, and it lives here — see [`host_matches`] for the rule itself.
+//!
+//! It used to be three questions, and they were answered three ways: the
+//! server's rule was strict — `*.example.com` is the subdomains and not the
+//! apex — while the client's was loose, so a bare `example.com` meant the
+//! apex *and* every subdomain. A name the client decided to tunnel could
+//! then be a name the server had no route for, and the failure looked like a
+//! broken tunnel rather than like two halves spelling the pattern
+//! differently.
 //!
 //! # First byte back
 //!

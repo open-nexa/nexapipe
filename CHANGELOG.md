@@ -1004,6 +1004,15 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The crate's own documentation builds without a warning.** `cargo doc -p
+  nexapipe-proto` reported five: two links to an `ALPN_LEGACY` that the crate
+  never had — the constants are `ALPN_NEXAPIPE` and `ALPN_NEXAPIPE_LEGACY`,
+  and the two name different spellings — one to the private `preface` module,
+  one to a private `host`, and one to a `PREFACE_MAGIC` that was not in scope
+  where it was named. The links now point at the names that are really there,
+  and the prose says which spelling is the generic one and which is the one
+  that predates the prefix byte.
+
 - **The protocol's name on the wire is the name.** The ALPN was
   `"\x05nexapipe"` — the byte the L4 preface starts with, in front of the name.
   That byte was never part of a length encoding; it made the protocol name a

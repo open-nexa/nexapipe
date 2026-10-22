@@ -9,10 +9,12 @@
 //! line.
 //!
 //! That works, and it is what the server still does for a client that asks
-//! for [`ALPN_LEGACY`]. But it makes the server **sniff**: the first bytes
-//! have to be read before the connection's purpose is known, and a codec
-//! that wants the whole head — [`hyper`](https://docs.rs/hyper) — cannot
-//! have it without the bytes being read and handed back.
+//! for [`crate::ALPN_NEXAPIPE`] — the generic name, and the older spelling
+//! [`crate::ALPN_NEXAPIPE_LEGACY`] alike, since both name that protocol. But
+//! it makes the server **sniff**: the first bytes have to be read before the
+//! connection's purpose is known, and a codec that wants the whole head —
+//! [`hyper`](https://docs.rs/hyper) — cannot have it without the bytes being
+//! read and handed back.
 //!
 //! Choosing the protocol with ALPN says the same thing at the handshake,
 //! where it belongs, and the server knows what a connection is before a
@@ -27,9 +29,9 @@
 //!
 //! # The old one
 //!
-//! [`ALPN_LEGACY`] is what the client used before this, and it keeps
-//! working: a connection negotiated with it is served the way it always
-//! was, by the first byte of each stream. It is not removed — a client
+//! [`crate::ALPN_NEXAPIPE_LEGACY`] is what the client used before this, and
+//! it keeps working: a connection negotiated with it is served the way it
+//! always was, by the first byte of each stream. It is not removed — a client
 //! that predates this cannot be made to speak a protocol it does not know.
 
 /// The ALPN of a connection that carries HTTP requests.
@@ -52,7 +54,7 @@ pub enum Protocol {
     /// HTTP requests.
     Http,
     /// L4 tunnels: a TCP or UDP stream to a backend, framed by the preface
-    /// in [`crate::preface`].
+    /// ([`crate::Preface`]).
     L4,
     /// A TLS session, terminated by the backend and routed on its SNI.
     Tls,
