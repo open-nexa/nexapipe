@@ -1128,6 +1128,7 @@ request would put two different units in the same number.
 [local_proxy]
 enabled = true
 listen_addr = "127.0.0.1:8081"
+expose = false
 proxy_domains = ["app.example.com"]
 strategy = "round_robin"
 
@@ -1139,6 +1140,15 @@ domains = ["app.example.com"]
 The same domain may appear on several nodes; that is how you load balance across
 servers. `server_ticket` and `server_node_id` at the `[local_proxy]` level still
 work but are deprecated — prefer `[[local_proxy.nodes]]`.
+
+**The local proxy does not authenticate the peer that connects to it**: it hands
+out the tunnel of a connection that has already authenticated, so whoever
+reaches the port gets that tunnel without a credential. `listen_addr` therefore
+has to name a loopback address, and a non-loopback one is refused at startup —
+judged by the address the socket actually became, so `0.0.0.0` and `[::]` are
+caught too. `expose = true` is the explicit opt-in for a deployment that puts
+something else in front of the port — a firewall, a container network — and it
+means the same thing as `[server] expose`.
 
 ### `[peers]` — which Node IDs may connect at all
 

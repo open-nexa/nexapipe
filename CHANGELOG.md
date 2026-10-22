@@ -63,19 +63,24 @@ lookup, which is what a config written before the key existed does.
   server reads all of them: a client that speaks one form and a server that
   speaks another still complete the handshake, and the answers come back in
   the form the client asked in.
-  **The client does not use the binary form yet.** It is turned on one side at
-  a time, so that an old client keeps working against a new server and a new
-  client keeps working against an old one — the case that decides the whole
-  order of the change.
+  **The client uses the binary form now.** It announces the version it speaks
+  inside the first message — the JSON one, where a server that predates the
+  version byte ignores the field — and the exchange from the challenge onwards
+  is in that form. A client that announces nothing is still answered in the
+  JSON it asked for, so an old client keeps working against a new server and a
+  new client keeps working against an old one.
+
 - **The authentication handshake has a binary form.** The message the client
   and the server exchange now has two forms: the JSON one every peer already
   speaks, and a binary one that is a third of the size where the bytes are —
   a nonce and a signature are arrays of decimal numbers in JSON, so each byte
   of either costs three. One handshake — a start, a challenge, a response and
   an answer — is 427 bytes of JSON and 124 of binary.
-  The binary form is **not on the wire yet**: the peers keep speaking JSON,
-  and it is turned on one side at a time, so an old client keeps working
-  against a new server and a new client keeps working against an old one.
+  The binary form is **on the wire for a client that asks for it**: a client
+  announces the version it speaks inside its first message, and the exchange
+  from the challenge onwards is in that form. A client that announces nothing
+  still gets the JSON it asked for, so an old client keeps working against a
+  new server and a new client keeps working against an old one.
   A payload's first byte says which form it is in, and a payload that does
   not start with a version byte is the JSON one — which is what every peer
   sent before the version byte existed.
@@ -334,20 +339,41 @@ lookup, which is what a config written before the key existed does.
   an HTTP server over an iroh bi-stream on the same host, so what the
   server does with the request is still not measured, and the list of what
   is not measured says so.
-- **The connections a client's flows cost are measured.** The client keeps a
-  pool of connections to each backend, and a flow takes one **out** of it and
-  hands it back when it ends. That sounds like pooling, and it is — but
-  while a flow is running its connection is not in the pool, so a hundred
-  concurrent flows need a hundred connections, and each of them pays for a
-  QUIC handshake on the way.
-  The number is **100 connections for 100 concurrent flows**, and it does not
-  move: every sample was exactly 100. Opening those hundred flows takes
-  **1.05 seconds**, against a transport built to carry 1024 bi-streams on one
-  connection.
-  The far side counts its own accepts, so the number does not depend on
+- **A flow borrows a connection now, instead of taking it out of the pool.**
+  The client keeps a pool of connections to each backend, and a flow used to
+  take one out of it and hold it until the flow ended — so while a flow was
+  running its connection was not in the pool, and a hundred concurrent flows
+  needed a hundred connections. The transport is built for the opposite: one
+  connection carries 1024 bi-streams.
+  A flow **borrows** a connection now. The pool keeps it; the flow holds a
+  handle to it, and iroh's connection handle is a cheap clone — *"may be
+  cloned to obtain another handle to the same connection"* — so a hundred
+  flows share one connection and a flow that ends has nothing to give back.
+  A **dial is shared** too: everything that asks for a connection while one
+  is in progress waits for that one rather than starting its own, so a
+  hundred flows arriving together make one connection between them and not a
+  hundred. That matters most when the backend is down: one failed dial is
+  paid for once, not once per flow.
+  The numbers: a hundred concurrent flows now open **one** connection where
+  they opened a hundred, and they open it in **5 milliseconds** where it
+  took **1.05 seconds**. Two hundred and five times faster, and a hundred
+  fewer handshakes for the peer to make. The number is measured, not read off
+  the code: the far side counts its own accepts, so it does not depend on
   anything the client reports about itself, and each round runs on a fresh
   pool so that the count is what that round needed rather than what a
   previous round left behind.
+  Three things about it are worth knowing. A connection with a flow on it is
+  **not idle**, so the pool's idle timeout no longer closes it underneath
+  the flow — the pool counts the flows riding each connection for exactly
+  that, and the last-use stamp moves when the last of them ends, so a
+  connection that has just carried a ten-minute flow is fresh for another
+  minute. The server counts the flows on a connection as well and refuses
+  the one that does not fit, so the client keeps below that ceiling itself
+  and opens another connection rather than piling every flow onto one; a
+  refusal is tried again on a connection of its own instead of failing the
+  flow. And a connection that turns out to be broken is closed, which now
+  takes the other flows on it down with it; they retry, and they retry on a
+  new connection.
 - **The routing table's benchmark measures a lookup that matches.** Its 51
   routes all had the path pattern `/*`, which is not a wildcard — it is a
   literal `/*` prefix, and a route with it serves no ordinary path at all.
@@ -385,6 +411,23 @@ lookup, which is what a config written before the key existed does.
   the answer is the same every time it is asked.
   It is read once now, and looked up.
 
+- **Two of the TUN's per-packet costs are measured, and neither is worth
+  changing.** The TUN copies every packet once on its way into the network
+  stack, because the stack takes a `Vec<u8>` of its own and the buffer the
+  bytes were read into is reused. That copy — the allocation and the memcpy
+  together — costs **18 ns**, against the **7.3 µs** the whole per-packet path
+  takes: **0.24%**. A buffer pool would need a lock of its own, and the lock
+  would cost more than the allocation it replaces.
+  The reverse lookup takes the mapping's lock **exclusively**, so the lookups
+  of several flows serialise. Making it a read lock was tried, and it is
+  **worse**: moving the clock and the "last used" out of the (serialising)
+  lock puts eight cores on the same two cache lines, and the lookup went from
+  **97 ns to 357 ns**. The critical section is far too short for the
+  parallelism to pay for the contention.
+  Both are benchmarks now, so the numbers are visible rather than assumed —
+  and the next person to look at either one finds the measurement instead of
+  the guess.
+
 - **The connection-level receive window has a ceiling.** The transport gave
   every stream a 4 MiB receive window and left the **connection's** window at
   `VarInt::MAX` — which is no limit at all. A peer with a thousand streams
@@ -403,7 +446,30 @@ lookup, which is what a config written before the key existed does.
   server move together, and `NEXAPIPE_QUIC_RECV_WINDOW` sets it for whoever
   wants another number.
 
+- **Opening a flow gets one budget, not a timeout per attempt.** Two retry
+  loops sat inside each other and each attempt had a timeout of its own, so a
+  CONNECT that could not be opened had **nine** thirty-second timeouts to
+  spend and could take **six minutes** to say so. The budget is taken once
+  now, at the start, and every attempt inside it shares what is left:
+  **ninety seconds**, which is what the three outer attempts were each
+  reaching for anyway.
+  The attempts themselves are unchanged — a dead pooled connection is still
+  retried on a fresh one, and a refusal is still final — and so is the
+  health accounting.
+
 ### Changed
+
+- **The client speaks the binary form of the handshake.** A handshake with a
+  server that knows it is 189 bytes instead of 427: the message is a binary
+  form with a version byte in front of it, and the bytes that cost three
+  bytes each — the nonce and the signature, which the JSON writes as arrays of
+  decimal numbers — cost one each.
+  **A client against a server that does not know it still works.** The first
+  message says which version the client speaks, inside the JSON, where a
+  server that predates the version byte drops the field it does not know; the
+  answers then come back in the old form and the client answers in the old
+  form. The version byte is a discriminator and not a negotiation: a message
+  says what it is, and the other end reads it.
 
 - **A key the config file does not know is an error now.** Every section of
   `config.toml` refuses the keys it does not have, and so does the top level:
@@ -606,6 +672,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The WebSocket request line is rebuilt from the parsed request.** The
+  client rebuilt the line it sends from the raw bytes of the one it
+  received, and the HTTP version came out of that split — so a request line
+  carrying a bare LF put the rest of the line into the version token, and
+  the proxy sent a request whose first line a lenient parser would read as
+  two. The method and the version come from the parsed request now, where
+  both are validated.
 - **Replacing a credential no longer leaves the old identity connected.** The
   handshake runs once per connection, so a connection made under the previous
   credential kept serving traffic under the previous identity after the
@@ -779,6 +852,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The local proxy does not hand out an authenticated tunnel to the
+  network.** The client library bound whatever address it was given, and it
+  does not authenticate the peer that connects to it — it hands out the tunnel
+  of a connection that has already authenticated. So a non-loopback bind
+  published that tunnel to everyone who could reach the machine, and the
+  server's `[local_proxy]` section passed the address through without
+  checking it. The library refuses a non-loopback address now, the same
+  shape as the server's own plaintext listener and as the desktop app's
+  `require_loopback`, and `[local_proxy] expose = true` is the explicit
+  opt-in for a deployment that puts something else in front of the port.
+- **A proxy credential no longer crosses the tunnel.** `Proxy-Authorization`
+  is a credential for *this* proxy, and it was forwarded to the backend
+  along with the rest of the hop-by-hop headers — on the client's side and on
+  the server's, in the WebSocket path as well as the ordinary one. The
+  client's bytes cross the tunnel verbatim, so the whole hop-by-hop set goes
+  now: `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+  `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`,
+  together with whatever `Connection` nominates. `Transfer-Encoding` stays,
+  because the body it describes is carried over unchanged.
 - **The webview is granted less than it was.** The desktop app's capability
   granted the whole of `core:default`, the whole of `opener:default` and the
   whole of `updater:default` to the renderer, and the renderer used almost

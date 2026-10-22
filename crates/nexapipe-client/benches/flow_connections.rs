@@ -1,14 +1,15 @@
 //! How many QUIC connections a hundred concurrent flows open.
 //!
-//! The client keeps a pool of connections to each backend, and a flow takes
-//! one out of it and hands it back when it ends. That sounds like pooling, and
-//! it is — but while a flow is running the connection is **out of the pool**,
-//! so a hundred concurrent flows need a hundred connections, and each of them
-//! pays for a QUIC handshake and a path validation on the way.
+//! The client keeps a pool of connections to each backend, and a flow
+//! **borrows** one of them: the pool keeps the connection, and the flow
+//! holds a handle to it until the flow ends. iroh's connection handle is a
+//! cheap clone — *"may be cloned to obtain another handle to the same
+//! connection"* — so a hundred flows share one connection, and a flow that
+//! ends has nothing to give back.
 //!
-//! The transport is built for the opposite: one connection can carry 1024
-//! bi-streams. So the number of connections a client opens is a property of
-//! the flow model, not of the network, and it is worth having a number for.
+//! That is the number worth having. The transport is built for it: one
+//! connection can carry 1024 bi-streams, so the number of connections a
+//! client opens is a property of the flow model, not of the network.
 //!
 //! This bench opens a hundred concurrent L4 flows to one backend and counts
 //! the connections the far side is given. The far side counts its own
@@ -16,7 +17,8 @@
 //! about itself.
 //!
 //! It also measures the time those flows take to open, because that is what
-//! the number costs: today every one of them pays a handshake.
+//! the number costs: before a flow borrowed its connection, every one of
+//! them paid for a QUIC handshake.
 //!
 //! The far side is an iroh endpoint on this host, bound to the loopback
 //! interface, so the bench needs no network and no relay.
@@ -167,35 +169,18 @@ struct Harness {
     client: Endpoint,
     /// The far side's endpoint.
     ///
-    /// Held so that it is closed when the harness is dropped. The accept loop
-    /// never returns on its own, so without this every round of every sample
-    /// would leave a bound UDP socket, an iroh endpoint driver and an accept
-    /// task behind for the life of the process.
+    /// Kept here so that the harness can close it: the accept loop below
+    /// owns a copy of it, and an endpoint that is only released when a task
+    /// that never ends is dropped stays open — with its socket — for the life
+    /// of the process. One of those per iteration is a leak that grows with
+    /// the sample count.
     server: Endpoint,
+    /// The far side's accept task, stopped when the harness is stopped.
+    server_task: tokio::task::JoinHandle<()>,
     /// Where the far side is.
     server_addr: iroh::EndpointAddr,
     /// How many connections the far side has been given.
     connections: Arc<AtomicUsize>,
-    /// The task that accepts on the far side.
-    server_task: tokio::task::JoinHandle<()>,
-}
-
-impl Harness {
-    /// Closes the far side and ends the accept loop.
-    ///
-    /// The accept loop waits on the endpoint forever, so the task is aborted
-    /// rather than left to notice the close on its own. The close itself is
-    /// bounded: it waits for the endpoint to drain, and a bench must not hang
-    /// on that.
-    async fn close(self) {
-        let Harness {
-            server,
-            server_task,
-            ..
-        } = self;
-        server_task.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(5), server.close()).await;
-    }
 }
 
 impl Harness {
@@ -224,10 +209,20 @@ impl Harness {
         Self {
             client,
             server,
+            server_task,
             server_addr,
             connections,
-            server_task,
         }
+    }
+
+    /// Stops the far side: the accept task ends and the endpoint closes.
+    ///
+    /// The task owns a copy of the endpoint and loops on `accept()` for as
+    /// long as it is open, so the two have to go together — the task would
+    /// otherwise keep the accept loop running on a closed endpoint.
+    async fn stop(self) {
+        self.server_task.abort();
+        self.server.close().await;
     }
 
     /// One round: a hundred flows opened at once, and how many connections
@@ -267,11 +262,9 @@ impl Harness {
         // read would not be one the round needed.
         let after = settled(&self.connections, before).await;
         let opened = after - before;
-
-        // A round whose connections were never accepted measured nothing.
-        // Criterion would see a zero-time sample and abort the analysis with
-        // a message about a zero measurement; the cause is that the far side
-        // accepted nothing, and that is what this says.
+        // A round that opened no connection has measured nothing, and
+        // criterion would report it as a zero-time sample — a diagnosis that
+        // names the symptom rather than the cause. The cause is here.
         assert!(
             opened > 0,
             "the far side accepted no connection: the round measured nothing"
@@ -308,17 +301,16 @@ fn flow_connections(c: &mut Criterion) {
                 }
                 black_box(&harness);
 
+                // The far side is stopped here, not left to the end of the
+                // process: criterion calls this once per sample, and every
+                // one of them would otherwise leave an endpoint and an
+                // accept task behind.
+                harness.stop().await;
+
                 // The count is the result. It is returned as nanoseconds so
                 // that it lands in criterion's report next to the times, and
                 // the encoding is written down in this file's own header.
-                let result = Duration::from_nanos(total as u64);
-
-                // The far side goes away with the round: an accept loop that
-                // never returns would leave an endpoint, a driver and a task
-                // behind for every round of every sample.
-                harness.close().await;
-
-                result
+                Duration::from_nanos(total as u64)
             })
         })
     });
@@ -335,8 +327,7 @@ fn flow_connections(c: &mut Criterion) {
                 }
                 black_box(&harness);
 
-                // The far side goes away with the round, as above.
-                harness.close().await;
+                harness.stop().await;
 
                 total
             })
