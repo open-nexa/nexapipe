@@ -293,6 +293,27 @@ lookup, which is what a config written before the key existed does.
 
 ### Changed
 
+- **A key the config file does not know is an error now.** Every section of
+  `config.toml` refuses the keys it does not have, and so does the top level:
+  `exposee = true` under `[server]` used to be dropped without a word, and the
+  server it produced was exactly a server with the key left out — for a key
+  that gates reachability, a typo and "off" were the same deployment. The
+  error names the key and says what to do about it: remove it, or fix its
+  spelling.
+  One key is worth naming, because a config can carry it today: `[admin]
+  token` is not a key. The admin token is generated into
+  `<config>.admin-token`, and that file is the only source of it, so a config
+  that names a token is refused rather than parsed and dropped — the operator
+  finds out that the token they set is not the token in use, instead of
+  finding it out when the management surface answers 401.
+  The keys that were *removed* rather than misspelled keep working:
+  `tls_enabled`, `tls_listen_addr`, `cert_path` and `key_path` under
+  `[server]` — and the same two under a route — are still parsed and still
+  warned about, `default_backend` is still refused by name, and `[acme]` is
+  still ignored with a warning. The three sections that already refused
+  unknown keys (`[auth]`, `[limits]` and `[peers]`) keep refusing them. A
+  `config.toml` that only carries keys this build knows loads exactly as it
+  did.
 - **A guess at a pending enrollment token no longer locks the client out of
   authenticating.** A client id is not a secret: it is in the invite link, in
   `nexapipe client list` and in whatever the operator pasted into a ticket. So
