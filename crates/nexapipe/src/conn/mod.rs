@@ -14,6 +14,7 @@ use crate::shutdown::InFlightGuard;
 use ::http::Request;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, Incoming};
+use nexapipe_proto::auth::Format;
 use nexapipe_proto::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
@@ -1461,6 +1462,7 @@ async fn enroll_client(
     token: &str,
     device: Option<&str>,
     public_key: Option<&str>,
+    format: Format,
     send: &mut iroh::endpoint::SendStream,
 ) -> Result<(), AuthFailure> {
     // One reply for every way this can fail, for the same reason AUTH_FAILED
@@ -1519,6 +1521,7 @@ async fn enroll_client(
             &AuthMessage::EnrollFailed {
                 reason: REFUSED.to_string(),
             },
+            format,
         )
         .await
         .map_err(AuthFailure::NotStarted)?;
@@ -1567,6 +1570,7 @@ async fn enroll_client(
                     client_id,
                     "a public key has to be issued to a named device; the unnamed credential is \
                      the client's own shared secret",
+                    format,
                 )
                 .await);
             };
@@ -1577,7 +1581,9 @@ async fn enroll_client(
                 Ok(key) => crate::auth::public_key_hex(&key),
                 Err(why) => {
                     let reason = why.to_string();
-                    return Err(refuse_unrecordable_enrollment(send, client_id, &reason).await);
+                    return Err(
+                        refuse_unrecordable_enrollment(send, client_id, &reason, format).await,
+                    );
                 }
             };
             IssuedCredential::DeviceKey {
@@ -1629,6 +1635,7 @@ async fn enroll_client(
             &AuthMessage::EnrollFailed {
                 reason: reason.clone(),
             },
+            format,
         )
         .await
         .map_err(AuthFailure::NotStarted)?;
@@ -1715,6 +1722,7 @@ async fn enroll_client(
             // a client that predates the table reads that as "the shared one".
             device_id,
         },
+        format,
     )
     .await
     .map_err(AuthFailure::NotStarted)
@@ -1729,12 +1737,14 @@ async fn refuse_unrecordable_enrollment(
     send: &mut iroh::endpoint::SendStream,
     client_id: &str,
     reason: &str,
+    format: Format,
 ) -> AuthFailure {
     if let Err(e) = write_auth_message(
         send,
         &AuthMessage::EnrollFailed {
             reason: reason.to_string(),
         },
+        format,
     )
     .await
     {
@@ -1868,9 +1878,10 @@ fn config_write_gate() -> &'static tokio::sync::Mutex<()> {
 async fn write_auth_message(
     send: &mut iroh::endpoint::SendStream,
     message: &AuthMessage,
+    format: Format,
 ) -> Result<(), String> {
     let bytes = message
-        .to_bytes()
+        .to_payload(format)
         .map_err(|e| format!("failed to serialize {}: {}", message_kind(message), e))?;
     let len = bytes.len() as u32;
     send.write_all(&len.to_le_bytes())
@@ -1879,6 +1890,21 @@ async fn write_auth_message(
     send.write_all(&bytes)
         .await
         .map_err(|e| format!("failed to send {}: {}", message_kind(message), e))
+}
+
+/// The form the answer to a message is in.
+///
+/// The client that asked is answered in the form it asked in — and, when it
+/// announced a version, in that version. Nothing is negotiated and nothing is
+/// remembered: the message says what it is, and the answer says the same.
+///
+/// A version this build does not know is answered in the form the client
+/// asked in, which is a form the client can read by definition.
+fn reply_format(message: &AuthMessage, asked_in: Format) -> Format {
+    message
+        .announced_version()
+        .and_then(Format::from_version)
+        .unwrap_or(asked_in)
 }
 
 /// The wire name of a message, for errors that name what was being sent.
@@ -1934,9 +1960,12 @@ async fn perform_authentication(
         .await
         .map_err(AuthFailure::NotStarted)?;
 
-    let start_msg = AuthMessage::from_bytes(&start_bytes).map_err(|_| {
+    // The payload's first byte says which form it is in, and the answers go
+    // back in the form the client asked in.
+    let (start_msg, start_format) = AuthMessage::from_payload(&start_bytes).map_err(|_| {
         AuthFailure::NotStarted("the first stream is not an AUTH_START".to_string())
     })?;
+    let mut format = reply_format(&start_msg, start_format);
 
     // Checked before the id is used for anything, because the first thing it is
     // used for is being printed: the log line for a refusal, a lockout or an
@@ -1986,6 +2015,7 @@ async fn perform_authentication(
                 token.expose_secret(),
                 device_id.as_deref(),
                 public_key.as_deref(),
+                format,
                 &mut send,
             )
             .await?;
@@ -1993,9 +2023,19 @@ async fn perform_authentication(
             let start_after_enroll = read_auth_message(&mut recv)
                 .await
                 .map_err(AuthFailure::NotStarted)?;
-            match AuthMessage::from_bytes(&start_after_enroll) {
-                Ok(AuthMessage::Start { client_id: id, .. }) if id == client_id => client_id,
-                Ok(AuthMessage::Start { client_id: id, .. }) => {
+            let (start_after_enroll_msg, asked_in) = AuthMessage::from_payload(&start_after_enroll)
+                .map_err(|_| {
+                    AuthFailure::NotStarted("expected AUTH_START after ENROLL_START".to_string())
+                })?;
+            // The client may announce its version here, so this message is
+            // what settles the form of the answers.
+            let answer_format = reply_format(&start_after_enroll_msg, asked_in);
+            match start_after_enroll_msg {
+                AuthMessage::Start { client_id: id, .. } if id == client_id => {
+                    format = answer_format;
+                    client_id
+                }
+                AuthMessage::Start { client_id: id, .. } => {
                     return Err(AuthFailure::Rejected(format!(
                         "AUTH_START names client '{id}' but the enrollment was for '{client_id}'"
                     )));
@@ -2020,23 +2060,16 @@ async fn perform_authentication(
         nonce: nonce.clone(),
     };
 
-    let challenge_bytes = challenge_msg
-        .to_bytes()
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to serialize challenge: {}", e)))?;
-    let len = challenge_bytes.len() as u32;
-    send.write_all(&len.to_le_bytes())
+    write_auth_message(&mut send, &challenge_msg, format)
         .await
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to send challenge: {}", e)))?;
-    send.write_all(&challenge_bytes)
-        .await
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to send challenge: {}", e)))?;
+        .map_err(AuthFailure::NotStarted)?;
 
     // Step 3: Receive AUTH_RESPONSE
     let response_bytes = read_auth_message(&mut recv)
         .await
         .map_err(AuthFailure::NotStarted)?;
 
-    let response_msg = AuthMessage::from_bytes(&response_bytes)
+    let (response_msg, response_format) = AuthMessage::from_payload(&response_bytes)
         .map_err(|_| AuthFailure::NotStarted("expected AUTH_RESPONSE message".to_string()))?;
 
     let (resp_client_id, resp_device_id, resp_timestamp, signature, totp_code) = match response_msg
@@ -2282,16 +2315,9 @@ async fn perform_authentication(
         }
     };
 
-    let result_bytes = result_msg
-        .to_bytes()
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to serialize auth result: {}", e)))?;
-    let len = result_bytes.len() as u32;
-    send.write_all(&len.to_le_bytes())
+    write_auth_message(&mut send, &result_msg, response_format)
         .await
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to send auth result: {}", e)))?;
-    send.write_all(&result_bytes)
-        .await
-        .map_err(|e| AuthFailure::NotStarted(format!("failed to send auth result: {}", e)))?;
+        .map_err(AuthFailure::NotStarted)?;
     send.finish()
         .map_err(|e| AuthFailure::NotStarted(format!("failed to finish auth stream: {}", e)))?;
 
