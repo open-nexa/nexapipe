@@ -78,7 +78,8 @@
   "status": {
     "running": "Running",
     "stopped": "Stopped",
-    "starting": "Starting…"
+    "starting": "Starting…",
+    "unknown": "State unknown"
   },
   "mode": {
     "tun": "TUN",

@@ -486,6 +486,10 @@ async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyStatus, AppE
             Some(mode) => ProxyStatus::running_with(mode),
             None => ProxyStatus::starting(),
         },
+        // No manager here, and the service could not be asked: the tunnel may be the service's,
+        // and this process cannot say. "Stopped" would be a guess, and the guess is what starts a
+        // second tunnel over a live one — so the state is reported as unknown instead.
+        None if use_service => ProxyStatus::unknown(),
         None => ProxyStatus::stopped(),
     })
 }

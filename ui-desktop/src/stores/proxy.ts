@@ -581,7 +581,12 @@ async function start(): Promise<void> {
     if (status.value.mode !== requestedMode.value) {
       toast.warning(
         translate('connect.modeMismatch', {
-          mode: translate(`mode.${status.value.mode}`),
+          // "Unknown" is not a mode: it is the absence of an answer, and it is said the same
+          // way the rest of the app says it.
+          mode:
+            status.value.mode === 'unknown'
+              ? translate('status.unknown')
+              : translate(`mode.${status.value.mode}`),
         }),
       );
       return;
@@ -921,7 +926,10 @@ async function autoConnectIfWanted(): Promise<void> {
 async function serviceReportsStopped(): Promise<boolean> {
   try {
     const result = await invoke<ProxyStatus>('get_proxy_status', { useService: true });
-    return !result.running;
+    // "Stopped" is a statement the service made. Running, starting and unknown are not
+    // statements that it is stopped, and a question that is open must not be answered with
+    // "stopped": that answer is what starts a second tunnel over a live one.
+    return result.mode === 'stopped';
   } catch (error) {
     console.error('[proxy] the service did not report its status:', error);
     return false;

@@ -78,7 +78,8 @@
   "status": {
     "running": "运行中",
     "stopped": "已停止",
-    "starting": "启动中…"
+    "starting": "启动中…",
+    "unknown": "状态未知"
   },
   "mode": {
     "tun": "TUN 模式",

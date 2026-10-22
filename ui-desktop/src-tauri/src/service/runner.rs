@@ -606,6 +606,13 @@ impl ServiceRunner {
 
         {
             let mut pm = proxy_manager.write().await;
+            // The previous manager is stopped before the new one takes the slot. It may own a
+            // tunnel, and a tunnel that is still up under a manager that is no longer registered
+            // is a tunnel nobody can stop: the status reads "stopped" while the traffic is
+            // still flowing, and the stop command has nothing to stop.
+            if let Some(previous) = pm.as_ref() {
+                previous.stop().await;
+            }
             *pm = Some(manager.clone());
         }
 
@@ -622,8 +629,16 @@ impl ServiceRunner {
                 };
                 *startup_error_slot().write().await =
                     Some(AppError::with_detail(code, e.to_string()));
+                // Cleared only when the slot still holds this manager: a newer start has
+                // replaced it, and clearing the slot then would unregister a manager that is
+                // running. Same guard as the desktop's own path.
                 let mut pm = proxy_manager_clone.write().await;
-                *pm = None;
+                if pm
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &manager))
+                {
+                    *pm = None;
+                }
             }
         });
 
