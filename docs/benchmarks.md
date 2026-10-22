@@ -272,6 +272,23 @@ round trip more than a flow does**, so the price of a second connection is
 one handshake, paid once per endpoint and protocol, and then amortized over a
 connection the pool keeps for hours.
 
+**The other half of the price is memory**, and it is an example rather than a
+bench — `crates/nexapipe-client/examples/connection_memory.rs` counts the heap
+while connections are open:
+
+```bash
+cargo run --release -p nexapipe-client --example connection_memory
+```
+
+**110 KiB per connection, counting both ends** (measured on 2026-10-22 with
+sixteen connections, twice within a kilobyte of itself). The far side runs in
+the same process, so a client's share is **at most half** of that — and the
+server's share is a cost of its own, whatever the client does.
+
+The per-connection readings that example prints are **bursty** — a connection's
+buffers are not all allocated when it opens — so the number to read is the
+total divided by the count, and that one is stable.
+
 It is the server's **plaintext listener** path, driven through
 `http::proxy_request`. The QUIC tunnel path reaches the same backend through
 `http::proxy_to_backend_streaming` and shares the part of the work this bench

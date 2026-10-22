@@ -559,8 +559,9 @@ lookup, which is what a config written before the key existed does.
   microseconds: **a connection costs about one round trip more than a flow
   does**, paid once per endpoint and protocol, and then amortized over a
   connection the pool keeps for hours.
-  The half that is **not** measured is the second connection's **memory**,
-  and it is the half that weighs most on a phone.
+  The other half of the price is measured too: a connection holds **110 KiB**
+  of heap, counting both ends — a client's share is at most half of that. So
+  a second connection costs **under a millisecond and about fifty kilobytes**.
 
 ### Changed
 

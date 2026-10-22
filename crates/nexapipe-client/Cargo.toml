@@ -131,3 +131,9 @@ required-features = ["local-proxy"]
 [[example]]
 name = "tun_flow_memory"
 required-features = ["tun-proxy"]
+
+# What one connection costs in memory. An example for the same reason: the
+# number is memory, not time, and the time is the benchmark's job.
+[[example]]
+name = "connection_memory"
+

@@ -465,10 +465,12 @@ items the numbers pointed at.
    is about a hundred microseconds: **a connection costs about one round trip
    more than a flow does** — paid once per endpoint and protocol, and then
    amortized over a connection the pool keeps for hours.
-   **What it does not say**: the price of the second connection's **memory**,
-   which is not measured yet, and which is the half of the decision that
-   weighs most on a phone. It is the same open question as the client's
-   per-connection buffer footprint above.
+   **And the other half of the price is measured too**: a connection holds
+   **110 KiB** of heap, counting both ends (`connection_memory`; the client's
+   share is at most half). The number to read there is the total divided by
+   the count: the per-connection readings are bursty, and the total is stable.
+   So a second connection costs **under a millisecond and about fifty
+   kilobytes** — a small price for a protocol that is known at the handshake.
 
 ### F3 — A performance budget (P2, after F1)
 
@@ -518,6 +520,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 | The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source — and the `median` column where that run was in Flat mode, which computes no slope |
 | `ip_mapping` is a third of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns — the first bench measures an allocation and a reverse lookup, and only the lookup runs on every packet |
 | The price of a second connection | `connection_cost/open_connection` **911 µs** and `connection_cost/open_flow` **809 µs**, measured on 2026-10-22 with `cargo bench -p nexapipe-client --features local-proxy --bench connection_cost`; the mean column of `target/criterion/connection_cost/<bench>/new/estimates.json` is the source — and the flow measure asserts that the connection was reused, so it is a flow and not a handshake |
+| The memory a connection holds | `cargo run --release -p nexapipe-client --example connection_memory`, measured on 2026-10-22 with sixteen connections: **110 KiB per connection, both ends**; the total is the number to read (the per-connection readings are bursty) and it came out within a kilobyte of itself on two runs |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |
 | The local bundle is stale | `ui-desktop/src-tauri/target/release/bundle/dmg/nexa_0.1.0_aarch64.dmg` (dated 2026-10-07, 22 MB) against `version = "0.6.0"` |
