@@ -10,8 +10,8 @@
 //! would be chosen at the handshake, so a client that speaks both HTTP and L4
 //! would hold **two** connections to the same server where it holds one today.
 //! The time that costs is measured by the `connection_cost` benchmark — a
-//! handshake is about one round trip more than a flow — and this is the other
-//! half of the same question.
+//! second connection costs a handshake, and that is the dearer of the two — and
+//! this is the other half of the same question.
 //!
 //! ```text
 //! cargo run --release -p nexapipe-client --example connection_memory

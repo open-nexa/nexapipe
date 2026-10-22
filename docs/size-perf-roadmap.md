@@ -483,23 +483,31 @@ items the numbers pointed at.
    same endpoint. Choosing it at the handshake instead would give each
    protocol a connection of its own, and a client that uses both would pay for
    a second one.
-   **Measured**: a QUIC handshake costs **911 µs**, and a flow on a connection
-   that is already open costs **809 µs** (`connection_cost`). The two are
-   **not commensurable, and their difference is not a result**: a handshake is
-   CPU work — the key exchange and the packet protection — while a flow on an
+   **Measured** (`connection_cost`, two runs on a quiet machine): a QUIC
+   handshake costs **796 µs** and **819 µs**, and a flow on a connection that is
+   already open costs **555 µs** and **594 µs**. The two are **not
+   commensurable, and their difference is not a result**: a handshake is CPU
+   work — the key exchange and the packet protection — while a flow on an
    open connection is a *wait*, for the far side to answer the preface and for
-   the task to be woken up. That wait belongs to the machine's scheduler, so
-   it moves with the machine's load: the flow's run-to-run spread is larger
-   than the difference between the two numbers, and the sign of that difference
-   changes between runs. What a second connection costs is therefore **a
+   the task to be woken up. That wait belongs to the machine's scheduler, and
+   the handshake's work competes with everything else for the machine's cores,
+   so both numbers move with the machine's load: two earlier runs of the same
+   bench on the same machine while it was busy put the handshake at
+   **1,011 µs** and **3,347 µs** and the flow at **739 µs** and **673 µs**.
+   The difference between the two numbers moved with the load as well — from
+   about **+230 µs** to about **+2,700 µs** — so it is a property of the
+   machine's state rather than of the protocol, and it is not a round trip: a
+   handshake completes in one round trip exactly as a flow does, and the extra
+   is the key exchange. What a second connection costs is therefore **a
    handshake** — paid once per endpoint and protocol, and then amortized over a
-   connection the pool keeps for hours.
+   connection the pool keeps for hours — and it is the dearer of the two: it
+   measured **1.4×** what the flow did.
    **And the other half of the price is measured too**: a connection holds
    **110 KiB** of heap, counting both ends (`connection_memory`; the client's
    share is at most half). The number to read there is the total divided by
    the count: the per-connection readings are bursty, and the total is stable.
-   So a second connection costs **under a millisecond and about fifty
-   kilobytes** — a small price for a protocol that is known at the handshake.
+   So a second connection costs **a handshake and about fifty kilobytes** — a
+   small price for a protocol that is known at the handshake.
 
 ### F3 — A performance budget (P2, after F1)
 
@@ -548,7 +556,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 | Benchmarks exist (as of 2026-10-21) | `crates/nexapipe/benches/l4_forward.rs`, `crates/nexapipe-client/benches/tun_pump.rs`, `crates/nexapipe-client/benches/forwarding_path.rs`; `criterion` in `Cargo.lock`; the `bench` job in `ci.yml` |
 | The numbers in F1's table | measured at `7d24761` on 2026-10-21 with `cargo bench --workspace --features nexapipe-client/tun-proxy --locked`, on an Apple M4 / 16 GB / macOS 27.0.1 with `rustc 1.99.1`; the `slope` column of `target/criterion/<group>/<bench>/new/estimates.json` is the source — and the `median` column where that run was in Flat mode, which computes no slope |
 | `ip_mapping` is a third of the per-packet path | the same run: `tun_pump/ip_mapping` 2,274 ns against `tun_pump/tun_packet` 7,348 ns — the first bench measures an allocation and a reverse lookup, and only the lookup runs on every packet |
-| The price of a second connection | `connection_cost/open_connection` **911 µs** and `connection_cost/open_flow` **809 µs**, measured on 2026-10-22 with `cargo bench -p nexapipe-client --features local-proxy --bench connection_cost`; the mean column of `target/criterion/connection_cost/<bench>/new/estimates.json` is the source — and the flow measure asserts that the connection was reused, so it is a flow and not a handshake. **The two numbers are not commensurable**: the handshake is CPU work and the flow is a wait on the machine's scheduler, so their difference is not a result |
+| The price of a second connection | `connection_cost/open_connection` **796 µs** and **819 µs**, and `connection_cost/open_flow` **555 µs** and **594 µs** — two runs of the same bench on 2026-10-22 with `cargo bench -p nexapipe-client --features local-proxy --bench connection_cost`, on a quiet machine (load average 3.1 to 3.4); the mean column of `target/criterion/connection_cost/<bench>/new/estimates.json` is the source — and the flow measure asserts that the connection was reused, so it is a flow and not a handshake. **The two numbers are not commensurable**: the handshake is CPU work and the flow is a wait on the machine's scheduler, so their difference is not a result — it moved from about **+230 µs** on a quiet machine to about **+2,700 µs** on a busy one |
 | The memory a connection holds | `cargo run --release -p nexapipe-client --example connection_memory`, measured on 2026-10-22 with sixteen connections: **110 KiB per connection, both ends**; the total is the number to read (the per-connection readings are bursty) and it came out within a kilobyte of itself on two runs |
 | The frontend is 444 KB and fine | `ui-desktop/dist`, measured with `du -sh`; `vite.config.ts` is 32 lines with no `build` section |
 | The 152 KB `useToast` chunk is not a bug | `ui-desktop/src/composables/useToast.ts` is 122 lines / 3.4 KB; Vite's default chunking, and the total is under half a megabyte |

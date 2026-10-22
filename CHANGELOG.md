@@ -64,19 +64,24 @@ lookup, which is what a config written before the key existed does.
   endpoint. Choosing it at the handshake instead would give each protocol a
   connection of its own, and a client that uses both would pay for a second
   one — a number nobody had.
-  It is **911 µs** for a QUIC handshake and **809 µs** for a flow on a
-  connection that is already open. The two are **not commensurable, and their
-  difference is not a result**: a handshake is CPU work — the key exchange and
-  the packet protection — while a flow on an open connection is a *wait*, for
-  the far side to answer the preface and for the task to be woken up. That
-  wait belongs to the machine's scheduler rather than to the protocol, so it
-  moves with the machine's load, and the flow's run-to-run spread is larger
-  than the difference between the two numbers. What a second connection costs
-  is therefore **a handshake**, paid once per endpoint and protocol, and then
-  amortized over a connection the pool keeps for hours.
+  It is **796 µs** for a QUIC handshake and **555 µs** for a flow on a
+  connection that is already open — measured twice on a quiet machine, and
+  twice more on a busy one, where the handshake came out at 1,011 µs and
+  3,347 µs and the flow at 739 µs and 673 µs. The two are **not
+  commensurable, and their difference is not a result**: a handshake is CPU
+  work — the key exchange and the packet protection — while a flow on an open
+  connection is a *wait*, for the far side to answer the preface and for the
+  task to be woken up. That wait belongs to the machine's scheduler rather
+  than to the protocol, and the handshake's work competes with everything else
+  for the machine's cores, so both numbers move with the machine's load, and
+  the difference between them moved with it — from about +230 µs to about
+  +2,700 µs. What a second connection costs is therefore **a handshake**, paid
+  once per endpoint and protocol, and then amortized over a connection the
+  pool keeps for hours — and it is the dearer of the two: it measured 1.4×
+  what the flow did.
   The other half of the price is measured too: a connection holds **110 KiB**
   of heap, counting both ends — a client's share is at most half of that. So
-  a second connection costs **under a millisecond and about fifty kilobytes**.
+  a second connection costs **a handshake and about fifty kilobytes**.
 
 - **The request body is forwarded while it is still arriving, instead of
   after all of it has arrived.** The server read a request's whole body into

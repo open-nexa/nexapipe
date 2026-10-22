@@ -34,8 +34,37 @@ have changed since are marked:
 | `domain_match/in_the_list` | **467 ns** | was 951 ns before the fold stopped copying names: a walk over 51 patterns, asked for every `CONNECT` and every DNS query |
 | `l4_forward/tcp_flow` | 42,059 ns | 64 KiB through the copy loop: the copy loop is not where the time is |
 | `forwarding_path/connect_tunnel` | 834,955 ns | the same 64 KiB over an established tunnel: the rate it moves at, not the cost of opening it |
-| `connection_cost/open_connection` | **910,820 ns** | one QUIC handshake: **what a second connection would cost** if the protocol were chosen with ALPN |
-| `connection_cost/open_flow` | **809,230 ns** | a flow on a connection that is already open: the round trip a flow pays. **The two rows are not commensurable** — see the note below |
+
+The two `connection_cost` rows were measured on **2026-10-22**, on the same
+machine and the same toolchain, and are listed separately because they are a
+different kind of question from the rest: one of them is a **cost** and the
+other is a **wait**, and the two are not commensurable.
+
+| Bench | run 1 | run 2 | The one-line reading |
+|---|---|---|---|
+| `connection_cost/open_connection` | **796 µs** [706 – 880 µs] | **819 µs** [747 – 903 µs] | one QUIC handshake: **what a second connection would cost** if the protocol were chosen with ALPN. The work is CPU — the key exchange and the packet protection — so the number is the work itself, and it competes with the rest of the machine's load for the cores it runs on |
+| `connection_cost/open_flow` | **555 µs** [376 – 729 µs] | **594 µs** [475 – 721 µs] | a flow on a connection that is already open: the preface and the status byte, one round trip, and no handshake. Most of it is the **wait** for the far side's status byte and for this task to be woken up, so it is the machine's scheduler rather than the protocol that this number reports on |
+
+Both runs were on a **quiet** machine — load average 3.1 to 3.4 — and they
+agree to within 3% and 7%. **They are not the whole story**, though: two
+earlier runs of the same bench on the same machine while it was busy (load
+average 11 to 14, other builds running) put the handshake at **1,011 µs** and
+**3,347 µs** and the flow at **739 µs** and **673 µs**. So between the quiet
+machine and the busy one the handshake moved by **4×** and the flow by **1.3×**,
+and the difference between the two moved with them: **+241 µs** and **+225 µs**
+on the quiet machine, **+272 µs** and **+2,674 µs** on the busy one.
+
+**That difference is a property of the machine's state, not a protocol
+constant, and it is not a round trip.** A handshake completes in one round
+trip exactly as a flow does; the extra is the key exchange, which is CPU work.
+So the bench does not report a difference, and the difference must not be read
+as what splitting the protocol would cost. What a second connection costs is
+**a handshake** — about 800 µs on a quiet machine and up to 3.3 ms on a busy
+one — paid once per endpoint and protocol.
+
+What the bench does establish is **which of the two is dearer**: a handshake is
+not cheaper than a flow. It measured **1.4×** what the flow did in both quiet
+runs (796 µs against 555 µs, and 819 µs against 594 µs).
 
 The two `route_lookup` rows were measured on **2026-10-22**, on the same
 machine and the same toolchain, and are listed separately because they were
@@ -282,18 +311,20 @@ The two are **not commensurable, and their difference is not a result.** A
 handshake is CPU work — the key exchange and the packet protection — and it is
 what a second connection would cost. A flow on an open connection is a *wait*:
 for the far side to answer the preface, and for this task to be woken up. That
-wait belongs to the machine's scheduler rather than to the protocol, so it
-moves with the machine's load: the same code comes out several times larger
-in its median iteration than in its best one, while the handshake's number
-stays in the same band. The flow's own run-to-run spread is larger than the
-difference between the two rows, and the sign of that difference changes
-between runs.
+wait belongs to the machine's scheduler rather than to the protocol, and the
+handshake's work competes with everything else for the machine's cores, so
+both numbers move with the machine's load. On a quiet machine two runs agreed
+to within 3% and 7%; on a busy one the handshake came out **4×** larger and
+the difference between the two moved from about **+230 µs** to about
+**+2,700 µs**. Neither is stable enough to be subtracted from the other.
 
 So the pair says what each of the two costs **on its own**. It does **not** say
-that one is "a round trip more" than the other, and the difference between the
-two must not be read as what splitting the protocol would cost. What a second
-connection costs is **a handshake**, paid once per endpoint and protocol, and
-then amortized over a connection the pool keeps for hours.
+that one is "a round trip more" than the other — a handshake completes in one
+round trip exactly as a flow does, and the extra is the key exchange, which is
+CPU work — and the difference between the two must not be read as what
+splitting the protocol would cost. What a second connection costs is **a
+handshake**, paid once per endpoint and protocol, and then amortized over a
+connection the pool keeps for hours.
 
 **The other half of the price is memory**, and it is an example rather than a
 bench — `crates/nexapipe-client/examples/connection_memory.rs` counts the heap

@@ -32,9 +32,11 @@
 //! protection — and it is what a second connection would cost. A flow on an
 //! open connection is a *wait*: for the far side to answer the preface, and
 //! for this task to be woken up. That wait belongs to the machine's scheduler
-//! rather than to the protocol, so it moves with the machine's load: the same
-//! code comes out several times larger in its median iteration than in its
-//! best one, while the handshake's number stays in the same band.
+//! rather than to the protocol, so it moves with the machine's load — and so
+//! does the handshake's work, which competes with everything else for the
+//! machine's cores. Neither of the two is stable enough to be subtracted from
+//! the other: on one busy machine the same code moved several times between
+//! two runs, and the difference between the two moved with it.
 //!
 //! So the pair says what each of the two costs on its own. It does **not**
 //! say that one is "a round trip more" than the other, and the difference
@@ -183,7 +185,8 @@ impl Harness {
     /// connection costs.
     ///
     /// The work is CPU — the key exchange and the packet protection — so the
-    /// number stays in the same band whether the machine is busy or quiet.
+    /// number is the work itself, competing with the rest of the machine's
+    /// load for the cores it runs on.
     async fn open_connection(&self) -> Duration {
         let start = Instant::now();
         let connection = self
