@@ -328,9 +328,12 @@ lookup, which is what a config written before the key existed does.
   name matching. None of them measured what the server does for a request:
   the route lookup, the balancer, the URI the backend is reached at, and the
   round trip to it. That is a benchmark of its own now, and it comes with
-  the number the per-request work had never had — **49 allocations** for
+  the number the per-request work had never had — **42 allocations** for
   one request, from the lookup to the response head, counted by an
   allocator the bench installs.
+  The count is the server's own work and nothing else: the counter is read
+  around the request the server answers, so neither the request the bench
+  builds nor the response body it drains is part of it.
   The count is the stable measurement: its interval is 0.2% wide, where the
   time beside it — 50 µs for the whole request, backend round trip
   included — runs from 37 to 69 µs, because the round trip goes through the

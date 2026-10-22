@@ -51,7 +51,7 @@ pair of questions from the rest:
 |---|---|---|
 | `local_request/first_byte` | **100 µs** | the time from "the application sends" to "the response head has arrived": what the application waits before it can start rendering |
 | `local_request/request_response` | **138 µs** | the whole request: a connection, the request, the response, and the proxy closing it |
-| `request_path/allocations_per_request` | **49** | **49 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number |
+| `request_path/allocations_per_request` | **42** | **42 allocations** for one request, from the route lookup to the response head: the per-request work is not free, and now it has a number |
 | `request_path/request` | **50 µs** | the whole of the server's work for one request, backend round trip included. The interval is wide — 37 to 69 µs — because the round trip goes through the scheduler; the allocation count beside it is the one that does not move |
 
 Those numbers are what F2's candidate list is checked against, and the same
@@ -205,7 +205,7 @@ It measures two things:
   the bench allocated itself.
 
 The second number is the one that does not move. It is reported as a duration
-in nanoseconds, so the report reads `49 ns` for a request that made 49
+in nanoseconds, so the report reads `42 ns` for a request that made 42
 allocations; that is the encoding, and it is deliberate, because the number
 belongs in the report next to the times.
 
