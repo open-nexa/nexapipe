@@ -558,12 +558,15 @@ fn the_admin_and_metrics_sections_round_trip_through_the_config_file() {
     );
 }
 
-/// The token is never the one written in the config, because there is no token
-/// key to write it in — `[admin]` is lenient about stray keys like every other
-/// section, so a `token` there is ignored rather than refused, and the
-/// generated file is the only source.
+/// A token in the config is refused, not ignored.
+///
+/// The `[admin]` section has no `token` key: the token is generated into
+/// `<config>.admin-token`, and that file is the only source of it. A config
+/// that names a token is a config whose operator believes they set one, so it
+/// is refused at load rather than parsed and dropped — the difference between
+/// "the token you set is not the one in use" and "the config does not start".
 #[test]
-fn a_token_in_the_config_is_never_the_token_that_is_used() {
+fn a_token_in_the_config_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(
@@ -571,11 +574,16 @@ fn a_token_in_the_config_is_never_the_token_that_is_used() {
         "[admin]\nlisten_addr = \"127.0.0.1:9090\"\ntoken = \"from-the-config\"\n",
     )
     .unwrap();
-    // Proves the config was even read: a token key would not survive a parse
-    // that refused it, and then there would be nothing to show.
-    let config = ProxyConfig::from_file(path.to_str().unwrap()).expect("the config parses");
-    assert!(config.admin.is_some(), "[admin] was not read");
 
+    let error = ProxyConfig::from_file(path.to_str().unwrap())
+        .expect_err("a config that names a token does not parse");
+    assert!(
+        error.to_string().contains("token"),
+        "the error names the key: {error:#}"
+    );
+
+    // The generated file is still the only source of the token: a config that
+    // names one never reaches the code that would have read it.
     let token = admin::token::load_or_create(path.to_str().unwrap()).expect("a token is generated");
     assert_ne!(token.expose_secret(), "from-the-config");
     assert_eq!(
