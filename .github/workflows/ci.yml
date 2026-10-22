@@ -88,6 +88,7 @@ jobs:
       android: ${{ steps.paths.outputs.android }}
       desktop: ${{ steps.paths.outputs.desktop }}
       image: ${{ steps.paths.outputs.image }}
+      dependencies: ${{ steps.paths.outputs.dependencies }}
       desktop_lockfile: ${{ steps.paths.outputs.desktop_lockfile }}
       codeql: ${{ steps.paths.outputs.codeql }}
 
@@ -239,7 +240,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # The five optional-dependency sets of the client crate. A change to the
+    # server crate cannot break them, so they do not run for one.
+    if: needs.changes.outputs.client == 'true'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
@@ -340,9 +343,14 @@ jobs:
   # desktop frontend, the secrets in the history and the advisories a pull
   # request introduces.
   supply-chain:
-    name: supply chain (audit, deny, secrets)
+    name: supply chain (audit, deny)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: changes
+    # The audits read the lockfiles and the policy, so they run when one of
+    # those changed and not otherwise: a pull request that touches neither
+    # cannot have moved an advisory.
+    if: needs.changes.outputs.dependencies == 'true'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
@@ -390,6 +398,25 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: ui-desktop
         run: npm audit --omit=dev --audit-level=high
+
+  # The secret scan and the dependency review.
+  #
+  # They are not gated on what the pull request touches: the secret scan
+  # reads every commit, and a secret is a secret whether or not the change
+  # that brought it looks like one — a line added to a fixture, a key in a
+  # script. The dependency review answers "what does this pull request
+  # introduce", which is a question about the pull request and not about the
+  # tree.
+  secrets:
+    name: secrets (gitleaks + dependency review)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+        with:
+          # The secret scan reads every commit, so it needs the history.
+          fetch-depth: 0
       # Free for public repositories. If a repo ever becomes private, add
       # GITLEAKS_LICENSE (orgs need a paid licence) as a secret.
       #

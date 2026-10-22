@@ -13,6 +13,7 @@
 #   android           the client crate and the Android app
 #   desktop           the client crate and the desktop app
 #   image             the Dockerfiles and the docker ignore file
+#   dependencies      the lockfiles and the policy the audits read
 #   desktop_lockfile  the desktop package.json and the lockfile that pins it
 #   codeql            everything CodeQL reads: the Rust, the TypeScript and
 #                     the workflow files
@@ -85,7 +86,13 @@ emit() {
 
 # The workspace, the vendored patch it builds against, and the files that
 # decide which dependencies it pulls in.
-emit rust '^(crates/|third_party/|Cargo\.toml$|Cargo\.lock$|deny\.toml$)'
+#
+# The example configurations are in it because three of the server's
+# integration tests read them: `config.toml.example` is the file an
+# operator copies before their first run, and `config.toml.2fa.example` is
+# what the two-factor and the ACL/ports tests parse. A change to either one
+# has to run the tests that read it.
+emit rust '^(crates/|third_party/|examples/|Cargo\.toml$|Cargo\.lock$|deny\.toml$|config\.toml(\.[A-Za-z0-9-]+)?\.example$)'
 
 # The client crate and the wire format crate it shares with the server. The
 # desktop app and the Android app both link it, so a change here is a change
@@ -98,10 +105,18 @@ emit desktop '^(crates/nexapipe-(client|proto)/|ui-desktop/)'
 # The container image is built from the Dockerfiles at the root.
 emit image '^(Dockerfile[^/]*|\.dockerignore$)'
 
-# The desktop frontend's dependency tree. Its lockfile records each
-# platform's native optional package, so it is what decides whether the
-# release can install the frontend on that platform.
-emit desktop_lockfile '^ui-desktop/package(-lock)?\.json$'
+# The dependency tree, in every place it is pinned: the workspace's
+# lockfile, the policy the audits read, and the two the desktop app has.
+# The audits are the jobs that read these, so a change to one of them is
+# what makes them worth running.
+emit dependencies '^(Cargo\.toml$|Cargo\.lock$|deny\.toml$|ui-desktop/package(-lock)?\.json$|ui-desktop/src-tauri/Cargo\.lock$)'
+
+# The desktop frontend's dependency tree, and the release scripts that
+# install it. The lockfile records each platform's native optional package,
+# so it is what decides whether the release can install the frontend on that
+# platform — and the scripts are what install it, so a change to one of them
+# has to run the check that installs it.
+emit desktop_lockfile '^(ui-desktop/package(-lock)?\.json$|build_deb\.sh$|build_dmg\.sh$|build_windows\.ps1$)'
 
 # What CodeQL reads: the Rust in crates/, the TypeScript in ui-desktop/ and
 # the workflow files in .github/. A change to ui-android/ alone is Kotlin,
