@@ -2035,7 +2035,11 @@ mod tests {
             .expect("the L4 connection opens");
 
         // The far side counts its own accepts, so the number does not depend
-        // on anything the client reports about itself.
+        // on anything the client reports about itself. The count is read
+        // after a wait for it: the connection is made on this side, and the
+        // far side counts its accepts in its own task, so a count read
+        // straight after the dial can be one short.
+        wait_for_accepted(&accepted, 2).await;
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             2,
