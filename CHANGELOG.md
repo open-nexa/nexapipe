@@ -459,6 +459,22 @@ lookup, which is what a config written before the key existed does.
   The errors are the same ones, in the same words: a backend whose address
   does not parse, or names no host, is still reported when the request is
   built, where the operator reads it.
+- **Two of the TUN's per-packet costs are measured, and neither is worth
+  changing.** The TUN copies every packet once on its way into the network
+  stack, because the stack takes a `Vec<u8>` of its own and the buffer the
+  bytes were read into is reused. That copy — the allocation and the memcpy
+  together — costs **18 ns**, against the **7.3 µs** the whole per-packet path
+  takes: **0.24%**. A buffer pool would need a lock of its own, and the lock
+  would cost more than the allocation it replaces.
+  The reverse lookup takes the mapping's lock **exclusively**, so the lookups
+  of several flows serialise. Making it a read lock was tried, and it is
+  **worse**: moving the clock and the "last used" out of the (serialising)
+  lock puts eight cores on the same two cache lines, and the lookup went from
+  **97 ns to 357 ns**. The critical section is far too short for the
+  parallelism to pay for the contention.
+  Both are benchmarks now, so the numbers are visible rather than assumed —
+  and the next person to look at either one finds the measurement instead of
+  the guess.
 
 - **The connection-level receive window has a ceiling.** The transport gave
   every stream a 4 MiB receive window and left the **connection's** window at
@@ -704,6 +720,13 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The WebSocket request line is rebuilt from the parsed request.** The
+  client rebuilt the line it sends from the raw bytes of the one it
+  received, and the HTTP version came out of that split — so a request line
+  carrying a bare LF put the rest of the line into the version token, and
+  the proxy sent a request whose first line a lenient parser would read as
+  two. The method and the version come from the parsed request now, where
+  both are validated.
 - **Replacing a credential no longer leaves the old identity connected.** The
   handshake runs once per connection, so a connection made under the previous
   credential kept serving traffic under the previous identity after the
@@ -877,6 +900,25 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The local proxy does not hand out an authenticated tunnel to the
+  network.** The client library bound whatever address it was given, and it
+  does not authenticate the peer that connects to it — it hands out the tunnel
+  of a connection that has already authenticated. So a non-loopback bind
+  published that tunnel to everyone who could reach the machine, and the
+  server's `[local_proxy]` section passed the address through without
+  checking it. The library refuses a non-loopback address now, the same
+  shape as the server's own plaintext listener and as the desktop app's
+  `require_loopback`, and `[local_proxy] expose = true` is the explicit
+  opt-in for a deployment that puts something else in front of the port.
+- **A proxy credential no longer crosses the tunnel.** `Proxy-Authorization`
+  is a credential for *this* proxy, and it was forwarded to the backend
+  along with the rest of the hop-by-hop headers — on the client's side and on
+  the server's, in the WebSocket path as well as the ordinary one. The
+  client's bytes cross the tunnel verbatim, so the whole hop-by-hop set goes
+  now: `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+  `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`,
+  together with whatever `Connection` nominates. `Transfer-Encoding` stays,
+  because the body it describes is carried over unchanged.
 - **The webview is granted less than it was.** The desktop app's capability
   granted the whole of `core:default`, the whole of `opener:default` and the
   whole of `updater:default` to the renderer, and the renderer used almost
