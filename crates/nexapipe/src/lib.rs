@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_watcher;
 pub mod conn;
 pub mod deadline;
+pub mod dns;
 pub mod health;
 pub mod http;
 pub mod l4;
