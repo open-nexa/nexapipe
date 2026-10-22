@@ -55,13 +55,37 @@ impl IrohProxyClient {
         Ok(response)
     }
 
-    pub async fn open_bi_stream(
-        &self,
-    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), ClientError> {
+    /// Opens a bidirectional stream on a pooled connection and lends it to `f`.
+    ///
+    /// The connection goes back into the pool when `f` is done, whatever `f`
+    /// does with the stream.
+    ///
+    /// The streams are borrowed rather than moved, so they cannot leave the
+    /// closure: the lease and the streams' lifetime are the same scope. A
+    /// stream that outlived the lease would sit on a pooled connection, which
+    /// the idle timeout may close underneath it. Use an async closure
+    /// (`async |send, recv| ...`); an `async move` block would capture the
+    /// borrows in a way the `AsyncFnOnce` bound cannot accept.
+    ///
+    /// It used to be `open_bi_stream`, which returned the two streams and
+    /// dropped the connection: the pool never saw that connection again, so
+    /// every call dialled a new one and the pool lost a slot each time. The
+    /// streams go **into** the closure rather than out of it, so a connection
+    /// cannot escape the pool with its slot already spent.
+    pub async fn with_stream<T, F>(&self, f: F) -> Result<T, ClientError>
+    where
+        F: AsyncFnOnce(
+            &mut iroh::endpoint::SendStream,
+            &mut iroh::endpoint::RecvStream,
+        ) -> Result<T, ClientError>,
+    {
         let conn = self.conn_pool.get_connection().await?;
-        let (send, recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow::anyhow!(e))?;
 
-        Ok((send, recv))
+        let result = f(&mut send, &mut recv).await;
+        drop((send, recv));
+        self.conn_pool.return_connection(conn).await;
+        result
     }
 
     pub async fn close(&self) {
@@ -105,4 +129,83 @@ pub async fn create_client(
 ) -> Result<IrohProxyClient, ClientError> {
     let endpoint_addr = crate::connection_pool::parse_endpoint_addr(server_node_id, server_ticket)?;
     IrohProxyClient::new(endpoint_addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::Endpoint;
+    use iroh::endpoint::presets;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The ALPN the tunnel speaks. The same bytes the client uses.
+    const ALPN: &[u8] = b"\x05nexapipe";
+
+    /// The connection comes back to the pool.
+    ///
+    /// It used to be dropped: `open_bi_stream` returned the two streams and
+    /// let the connection go, so the pool never saw that connection again —
+    /// every call dialled a new one, and the pool lost a slot each time.
+    ///
+    /// The far side's count of accepted connections is the outside view of
+    /// that: one connection for three streams, or three.
+    #[tokio::test]
+    async fn a_stream_leaves_the_connection_in_the_pool() {
+        // The far side: an endpoint that accepts and holds its connections.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let Ok(accepting) = incoming.accept() else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // Hold the connection open for the rest of the test.
+                    let _conn = accepting.await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        // This side: an endpoint, a pool over it, and the client.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let client = IrohProxyClient::new_with_pool(pool).await;
+
+        for _ in 0..3 {
+            client
+                .with_stream(
+                    async |send: &mut iroh::endpoint::SendStream,
+                           _recv: &mut iroh::endpoint::RecvStream| {
+                        let _ = send.finish();
+                        Ok::<(), ClientError>(())
+                    },
+                )
+                .await
+                .expect("the stream opens");
+        }
+
+        // Give the far side a moment to count what it was sent.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the three streams shared one connection"
+        );
+    }
 }
