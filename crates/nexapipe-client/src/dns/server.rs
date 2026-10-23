@@ -409,7 +409,7 @@ mod tests {
     use super::*;
     use crate::dns::resolver_scope;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     /// The resolvers every test answer claims to have come from. What matters
