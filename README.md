@@ -2010,6 +2010,15 @@ accepts each of them. A release built without the credentials is signed by
 nothing and says so in the job log rather than quietly shipping an unsigned
 app.
 
+To find out whether the repository holds the material a release needs, before
+starting one, dispatch the release workflow with **signing_only** ticked. That
+run checks the signing material and nothing else — the Android release
+keystore, the macOS Developer ID certificate, the Windows Authenticode
+certificate — and it builds and publishes nothing. A value that is missing
+fails the run and is named in the log, so the answer is a yes or a no. A
+platform listed in the workflow's `allow_unsigned` input is reported as the one
+that would be published unsigned instead of failing the run.
+
 To sign a **local** build, the certificate is normally already in your own
 keychain, and the identity alone is enough:
 
