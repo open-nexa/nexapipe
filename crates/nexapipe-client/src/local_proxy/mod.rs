@@ -2,7 +2,7 @@ use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::endpoint_group::EndpointGroup;
 use crate::flow::{FlowKind, FlowMeta};
-use crate::http::{is_websocket_request_static, parse_http_request_legacy};
+use crate::http::{Body, is_websocket_request_static, parse_http_request_legacy};
 use nexapipe_proto::protocol::Protocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -129,6 +129,17 @@ const REJECTED_LOG_EVERY: usize = 100;
 /// 120 s by default — so the two ends of a tunnel give up at about the same
 /// moment.
 const RESPONSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(120);
+
+/// How many bytes are read and thrown away when a client sends more than its
+/// request.
+///
+/// The connection carries one request, so the bytes that came after it are
+/// not part of the exchange — but they are still in the socket, and a socket
+/// that is closed with unread data in it is reset rather than closed, and a
+/// reset costs the client the answer it was already sent. The bytes are read
+/// away so the socket closes with nothing left in it; the ceiling is what
+/// stops a client that keeps sending from being read forever.
+const TRAILING_BYTES_CEILING: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct LocalProxy {
@@ -1065,6 +1076,38 @@ where
     }
 
     // Regular HTTP path
+    //
+    // **The bytes that came with the head are the body's, or they are a
+    // second request.**
+    //
+    // The head says which: a request that declares a body has one, and the
+    // bytes that came with the head are its first ones. A request that
+    // declares no body has none, so the bytes that came with the head are
+    // the head of another request.
+    //
+    // The server serves keep-alive requests on one stream, so a second
+    // request that reaches it is answered by it — while the list of proxied
+    // domains, which is the boundary the user believes they have, was
+    // consulted about the first request only. A name the user excluded would
+    // go through the tunnel anyway.
+    //
+    // So the second request is refused here rather than forwarded: the
+    // refusal says what happened, and it happens before anything is on its
+    // way to the backend. Letting the server answer it would leave the
+    // boundary in the server's hands, where the user's list is not the rule
+    // that applies.
+    let mut body = Body::declared(&request);
+    let carried = &request_buf[header_end..];
+    let carried_body = body.take(carried);
+    if carried_body < carried.len() {
+        jni_log!(
+            "[local-proxy] refusing a request that carries a second request: {} bytes of another \
+             request came with the head of this one",
+            carried.len() - carried_body
+        );
+        return write_proxy_error(&mut stream, "400 Bad Request").await;
+    }
+
     // The hop-by-hop headers go, and so do the cache validation headers that
     // would make the origin answer with a 304 and an empty body.
     let filtered_headers = filter_request_headers(&request_buf[..header_end], false);
@@ -1105,15 +1148,39 @@ where
     let client_to_backend = async move {
         let mut buf = header_buf;
         loop {
+            // The request is out: the head has gone, and the body with it.
+            // Nothing else may follow it on this connection.
+            if body.is_complete() {
+                break;
+            }
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Err(e) = send.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Client to backend write error: {}", e);
+                    // **Only the body's own bytes go on.**
+                    //
+                    // The bytes past the body are not the body's: they are
+                    // the head of another request, and the list of proxied
+                    // domains was consulted about the first one only. So
+                    // they are not relayed — the connection is refused
+                    // instead, which is what the refusal at the head does
+                    // with a request that arrives carrying another one.
+                    let body_bytes = body.take(&buf[..n]);
+                    if body_bytes > 0 {
+                        if let Err(e) = send.write_all(&buf[..body_bytes]).await {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Client to backend write error: {}", e);
+                            break;
+                        }
+                        count_to_backend.record_sent(body_bytes as u64);
+                    }
+                    if body_bytes < n {
+                        jni_log!(
+                            "[local-proxy] refusing a second request on a connection that carries one \
+                             request: {} bytes of another request came after the body",
+                            n - body_bytes
+                        );
                         break;
                     }
-                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     #[cfg(feature = "tracing")]
@@ -1122,7 +1189,37 @@ where
                 }
             }
         }
+        // The request is over, and the server is told so. The stream it
+        // serves the request on ends with the answer, and the connection
+        // this handler holds ends with it: one request, one connection.
         let _ = send.finish();
+
+        // **What the client sent after its request is read and thrown away.**
+        //
+        // The connection carries one request, so the bytes that came after
+        // it are not part of the exchange — but they are still in the socket,
+        // and the socket is closed when the answer is on its way.
+        //
+        // A socket that is closed with unread data in it is reset rather
+        // than closed, and a reset costs the client the answer it was
+        // already sent: Windows throws away the data that was received and
+        // not yet read when the reset arrives. The request was served, and
+        // the client is entitled to the answer — so the bytes are read away
+        // here, before the answer is written, and the socket closes with
+        // nothing left in it.
+        //
+        // The reading stops at the end of the stream or at the ceiling; a
+        // client that keeps sending is not read forever. The handler aborts
+        // this task when the answer has been relayed, which is what ends a
+        // reading that is still waiting for a client that will not close.
+        let mut thrown_away = 0usize;
+        while thrown_away < TRAILING_BYTES_CEILING {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => thrown_away += n,
+                Err(_) => break,
+            }
+        }
     };
 
     let backend_to_client = async move {
@@ -1180,6 +1277,12 @@ where
     // iroh connection is released immediately. Aborting also closes the client
     // TCP socket (HTTP/1.1 allows the server to close after the response),
     // so a keep-alive client socket can't pin this task.
+    //
+    // **One request, one connection.** The client is told so by the close:
+    // the request it sent is the only one this connection carries, and a
+    // client that wants another one opens another connection. The list of
+    // proxied domains is checked per request, and this is what makes the
+    // check mean what it says.
     client_task.abort();
 
     jni_log!("[DEBUG:local-proxy] Connection closed");
