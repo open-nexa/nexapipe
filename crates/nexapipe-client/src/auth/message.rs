@@ -5,6 +5,8 @@
 //! message gets refused rather than believed.
 
 use nexapipe_proto::auth::{AuthMessage, Format};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use zeroize::Zeroizing;
 
 use crate::ClientError;
 
@@ -27,9 +29,35 @@ pub(super) async fn write_message(
 }
 
 /// Reads one length-prefixed message.
-pub(super) async fn read_message(
-    recv: &mut iroh::endpoint::RecvStream,
-) -> Result<(AuthMessage, Format), ClientError> {
+///
+/// Generic on purpose: `tokio::io::duplex` gives a test both ends of the
+/// framing in one process, so what a peer sends can be read without an iroh
+/// endpoint behind it — the same reason the L4 tunnel is written this way.
+pub(super) async fn read_message<R>(recv: &mut R) -> Result<(AuthMessage, Format), ClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    let bytes = read_message_bytes(recv).await?;
+    // The message is parsed out of the buffer, and the parsed message holds a
+    // copy of its own: a `SecretString` is built from the bytes, so the copy
+    // in the buffer is the redundant one — and the buffer wipes it.
+    AuthMessage::from_payload(&bytes[..])
+        .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))
+}
+
+/// Reads one length-prefixed message's bytes.
+///
+/// **The buffer wipes itself when it goes out of scope.** A message may carry
+/// a credential — the secret an `ENROLL_ISSUE` hands out is the one that
+/// matters — and this buffer holds it in the clear until it is dropped. A
+/// plain `Vec<u8>` would leave those bytes in the heap for the allocator to
+/// hand out again, which is where a core dump, a swap file or a read of
+/// `/proc/<pid>/mem` finds them: the credential outlives the handshake that
+/// needed it.
+pub(super) async fn read_message_bytes<R>(recv: &mut R) -> Result<Zeroizing<Vec<u8>>, ClientError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.map_err(|e| {
         ClientError::ConnectionFailed(format!("Failed to read message length: {e}"))
@@ -42,12 +70,11 @@ pub(super) async fn read_message(
             "auth message length {msg_len} is out of range"
         )));
     }
-    let mut msg_buf = vec![0u8; msg_len];
-    recv.read_exact(&mut msg_buf)
+    let mut msg_buf = Zeroizing::new(vec![0u8; msg_len]);
+    recv.read_exact(&mut msg_buf[..])
         .await
         .map_err(|e| ClientError::ConnectionFailed(format!("Failed to read message: {e}")))?;
-    AuthMessage::from_payload(&msg_buf)
-        .map_err(|e| ClientError::Other(format!("Deserialization error: {}", e)))
+    Ok(msg_buf)
 }
 
 /// The `type` tag of a message, for errors that name what arrived.
