@@ -360,6 +360,13 @@ async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
                 "created_at": client.created_at,
                 "allow_hosts": client.allow_hosts,
                 "allow_ports": client.allow_ports,
+                // Which of the two port rules the list above is held against.
+                // The flag is not in the name of the setting and the two rules
+                // refuse different requests, so the list on its own says
+                // nothing about how narrow it is. The field name is the one
+                // `nexapipe client list --json` uses, so the two answers read
+                // the same.
+                "allow_ports_strict": client.allow_ports_strict,
                 "last_used": client.last_used,
                 "failed_attempts": client.failed_attempts,
                 "locked_until": client.locked_until,
