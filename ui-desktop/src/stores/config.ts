@@ -1015,6 +1015,13 @@ export function useConfigStore() {
    * Creates a node. Private on purpose: a node is something an invite brings, so there is no
    * longer any code path that can add an empty one (the old `addNode()` used to be wired to a
    * button on the Config page).
+   *
+   * What it hands back is the node *as the configuration holds it* — the proxy the array hands
+   * out — and not the object that was pushed into it. A caller that writes to the raw object
+   * writes straight past Vue: nothing is notified, and the page keeps rendering what it had.
+   * That is not a detail: the Config page shows a node only once it has a connection string, so
+   * a node whose string was filled in on the raw object stayed invisible — the import had
+   * worked, and the page had not been told.
    */
   function createNode(node: Partial<NodeConfig> & { connectionType: ConnectionType }): NodeConfig {
     const created: NodeConfig = {
@@ -1025,9 +1032,14 @@ export function useConfigStore() {
       domains: node.domains ? [...node.domains] : [],
       ...(node.name ? { name: node.name } : {}),
       ...(node.twoFactor ? { twoFactor: node.twoFactor } : {}),
+      ...(node.enrollment ? { enrollment: node.enrollment } : {}),
+      ...(node.deviceKey ? { deviceKey: node.deviceKey } : {}),
+      ...(node.publicKey ? { publicKey: node.publicKey } : {}),
     };
     config.nodes.push(created);
-    return created;
+    // Read back out of the array, so what the caller gets is the proxy: the same node, and the
+    // one whose changes reach the page.
+    return config.nodes[config.nodes.length - 1];
   }
 
   /**
@@ -1058,7 +1070,64 @@ export function useConfigStore() {
     // comparison that decides "new node or an existing one" is made where the values are.
     const accepted = await acceptInvite(uri);
 
+    // Read back the one credential the renderer still has to hold: `start_proxy` takes the
+    // connection string as an argument, and the mirror below has to agree with the store or the
+    // next save would delete what was just filed. This answers only for the node the invite
+    // was accepted for, and only once, so it is not a way back into the store.
+    //
+    // Read *before* the node is in the configuration, not after. A node that is in the
+    // configuration without a connection string looks exactly like a node whose credential was
+    // cleared, and the mirror that answers that question would take the credential the invite
+    // had just filed back out of the store.
+    const stored = await takeInvitedNodeCredentials(accepted.nodeId);
+
+    // The name this machine answers as, asked for before the node is in the configuration. It is
+    // what makes the credential that comes back this machine's and nobody else's, and asking for
+    // it writes the configuration when the name had to be generated — a save that ran while the
+    // node was in the configuration but had no enrollment on it yet would take the pending token
+    // back out of the store.
+    const device = accepted.enrollment ? await ensureDeviceId() : '';
+
     const name = accepted.name?.trim() || undefined;
+
+    // The credentials belong to the server this invite came from, so they land on its node and
+    // nowhere else — a second server keeps whatever it was given before. What is set here is the
+    // *shape*: the secret and the token are already in the store, and keeping them out of this
+    // object is the whole point of `accept_invite`.
+    // No `device` on this branch, on purpose: what a plain invite carries is the client's own
+    // secret, which the server files under the client and not under any device. Claiming a
+    // name while answering with that secret would make the server look up a device's secret
+    // and refuse, for a reason no side would name. A per-device credential is what a
+    // *registration* invite issues, and only that.
+    const twoFactor = accepted.totp
+      ? {
+          clientId: accepted.totp.clientId,
+          secret: '',
+          algorithm: accepted.totp.algorithm,
+        }
+      : undefined;
+
+    // A registration invite carries a token instead: it is spent on the next connection, which
+    // answers with the secret this node is to keep. Stored on the node rather than applied to
+    // `twoFactor` because a token is not a credential — writing it there would make the node
+    // present the token as its TOTP secret and be refused.
+    const enrollment = accepted.enrollment
+      ? {
+          clientId: accepted.enrollment.clientId,
+          token: '',
+          device,
+          // The public half of the key the backend minted for this enrollment. The
+          // private one never comes here — it is in the store, and the enrollment
+          // offers it from there.
+          ...(accepted.publicKey ? { publicKey: accepted.publicKey } : {}),
+        }
+      : undefined;
+
+    const ticket = stored.ticket ?? '';
+    const endpointId = stored.endpoint ?? '';
+    const deviceKey = stored.deviceKey ?? '';
+    const publicKey = stored.publicKey ?? accepted.publicKey ?? '';
+
     let outcome: 'added' | 'merged';
     let node: NodeConfig | undefined = config.nodes.find((n) => n.id === accepted.nodeId);
 
@@ -1066,12 +1135,40 @@ export function useConfigStore() {
       outcome = 'merged';
       // A name already typed here wins: it is the label the user chose for this endpoint.
       if (name && !node.name) node.name = name;
+
+      // The connection string the node reaches its server by, and the device key the backend
+      // minted for this enrollment, with the public half of it. The private half is a credential
+      // like the connection string: it lives in the store, and the proxy reads it back from
+      // there.
+      node.ticket = ticket;
+      node.endpointId = endpointId;
+      node.deviceKey = deviceKey;
+      node.publicKey = publicKey;
+
+      if (twoFactor) {
+        node.twoFactor = twoFactor;
+        delete node.enrollment;
+      } else if (enrollment) {
+        node.enrollment = enrollment;
+        delete node.twoFactor;
+      }
     } else {
       node = createNode({
         id: accepted.nodeId,
         connectionType: accepted.connectionType,
+        // The node is born complete: a node that is in the configuration without its
+        // connection string is invisible on the page, and is indistinguishable from one whose
+        // credential was cleared. A node that is born half-made is a node the page has to be
+        // told about later — and a write that does not reach the page is a write that did not
+        // happen as far as the page is concerned.
+        ticket,
+        endpointId,
         domains: [],
         ...(name ? { name } : {}),
+        ...(twoFactor ? { twoFactor } : {}),
+        ...(enrollment ? { enrollment } : {}),
+        ...(deviceKey ? { deviceKey } : {}),
+        ...(publicKey ? { publicKey } : {}),
       });
       outcome = 'added';
     }
@@ -1089,59 +1186,6 @@ export function useConfigStore() {
       // is dropped, unless it was issued for that relay in the first place.
       setRelayUrl(accepted.relay);
     }
-
-    // The credentials belong to the server this invite came from, so they land on its node and
-    // nowhere else — a second server keeps whatever it was given before. What is set here is the
-    // *shape*: the secret and the token are already in the store, and keeping them out of this
-    // object is the whole point of `accept_invite`.
-    // No `device` on this branch, on purpose: what a plain invite carries is the client's own
-    // secret, which the server files under the client and not under any device. Claiming a
-    // name while answering with that secret would make the server look up a device's secret
-    // and refuse, for a reason no side would name. A per-device credential is what a
-    // *registration* invite issues, and only that.
-    if (accepted.totp) {
-      node.twoFactor = {
-        clientId: accepted.totp.clientId,
-        secret: '',
-        algorithm: accepted.totp.algorithm,
-      };
-      delete node.enrollment;
-    }
-
-    // A registration invite carries a token instead: it is spent on the next connection, which
-    // answers with the secret this node is to keep. Stored on the node rather than applied to
-    // `twoFactor` because a token is not a credential — writing it there would make the node
-    // present the token as its TOTP secret and be refused.
-    if (accepted.enrollment) {
-      // The name is asked for here, at the moment the token is filed: it is what makes the
-      // credential that comes back this machine's and nobody else's, and enrolling without one
-      // is how a device ends up sharing the client's secret — which is the thing that makes
-      // revoking one rotate every other one.
-      const device = await ensureDeviceId();
-      node.enrollment = {
-        clientId: accepted.enrollment.clientId,
-        token: '',
-        device,
-        // The public half of the key the backend minted for this enrollment. The
-        // private one never comes here — it is in the store, and the enrollment
-        // offers it from there.
-        ...(accepted.publicKey ? { publicKey: accepted.publicKey } : {}),
-      };
-      delete node.twoFactor;
-    }
-
-    // Read back the one credential the renderer still has to hold: `start_proxy` takes the
-    // connection string as an argument, and the mirror below has to agree with the store or the
-    // next save would delete what was just filed. This answers only for the node the invite
-    // was accepted for, and only once, so it is not a way back into the store.
-    const stored = await takeInvitedNodeCredentials(node.id);
-    node.ticket = stored.ticket ?? '';
-    node.endpointId = stored.endpoint ?? '';
-    // The device key the backend minted for this enrollment, and the public
-    // half of it. The private half is a credential like the connection string
-    // above: it lives in the store, and the proxy reads it back from there.
-    node.deviceKey = stored.deviceKey ?? '';
-    node.publicKey = stored.publicKey ?? accepted.publicKey ?? '';
 
     await refreshConnectionMasks();
     return outcome;
