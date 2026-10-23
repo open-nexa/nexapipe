@@ -448,6 +448,11 @@ fn revoking_an_id_the_server_would_refuse_is_an_error() {
 /// The empty list matters most here — it is the strictest setting there is,
 /// and a line that only shows up for a non-empty list hides it exactly where
 /// it matters.
+///
+/// The rule the list is held against matters just as much: a list checked
+/// against the port a client *names* is a weaker restriction than one checked
+/// against the port the request is *served from*, and the two look the same
+/// in a config file.
 #[test]
 fn the_port_acl_is_visible_in_the_client_list() {
     let (_dir, path) = scratch_config(
@@ -462,7 +467,8 @@ fn the_port_acl_is_visible_in_the_client_list() {
          [auth.clients.strict]\n\
          secret = \"MFRGGZDFMZTWQ2LK\"\n\
          allow_hosts = []\n\
-         allow_ports = []\n",
+         allow_ports = []\n\
+         allow_ports_strict = true\n",
     );
 
     let (ok, text) = run(&path, &["client", "list", "--json"]);
@@ -478,11 +484,21 @@ fn the_port_acl_is_visible_in_the_client_list() {
         serde_json::json!([443, 8443]),
         "{acme}"
     );
+    assert_eq!(
+        acme["allow_ports_strict"],
+        serde_json::json!(false),
+        "the rule the list is held against is part of the list: {acme}"
+    );
     let strict = clients
         .iter()
         .find(|client| client["id"] == "strict")
         .expect("the strict client");
     assert_eq!(strict["allow_ports"], serde_json::json!([]), "{strict}");
+    assert_eq!(
+        strict["allow_ports_strict"],
+        serde_json::json!(true),
+        "{strict}"
+    );
 
     let (ok, text) = run(&path, &["client", "list"]);
     assert!(ok, "{text}");
@@ -497,5 +513,19 @@ fn the_port_acl_is_visible_in_the_client_list() {
     assert!(
         text.contains("allow hosts none, every host is denied"),
         "the empty host list has to be visible:\n{text}"
+    );
+    // And the rule the port list is held against, which the list on its own
+    // does not say.
+    assert!(
+        text.contains("port rule   allow_ports_strict = false"),
+        "the weaker rule has to be named:\n{text}"
+    );
+    assert!(
+        text.contains("port rule   allow_ports_strict = true"),
+        "the stronger rule has to be named:\n{text}"
+    );
+    assert!(
+        text.contains("a request that names no port is not checked at all"),
+        "what the weaker rule does not check has to be said:\n{text}"
     );
 }

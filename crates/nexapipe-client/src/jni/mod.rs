@@ -10,6 +10,14 @@
 //! error the app has not read yet. It is here because it is the state of the
 //! whole process rather than of one of them, and because a half-initialised
 //! state is what a call into a module that is not there yet would look like.
+//!
+//! And they share one rule: every one of them catches a panic before it
+//! leaves the frame. Unwinding out of an `extern "system"` frame is a native
+//! crash on Android, not a Java exception, so a panic that reaches the
+//! boundary takes the whole app down rather than the one call failing. Each
+//! entry point therefore wraps its *whole* body in exactly one barrier:
+//! `with_env_or` for the ones that need an `Env` first, `catching_panic`
+//! for the ones that do not.
 
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::discovery::DiscoveryMode;
@@ -415,6 +423,10 @@ where
             // the frame, which on Android is a native crash rather than
             // something the JVM can report.
             jni_log!("[WARN:jni] a native method panicked");
+            // The reason is left behind as well: the entry points that answer
+            // with a bare `jint` have nowhere else to put it, and the app
+            // reads it back through `nativeTakeLastError`.
+            set_last_error("a native method panicked");
             failure
         }
     }
@@ -446,3 +458,57 @@ pub(crate) fn device_id() -> Option<String> {
 // ============================================================
 // TUN proxy (smoltcp user-space TCP/IP stack) — Android tun-proxy feature only
 // ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two tests below share one global — the last error — so they take a
+    /// turn rather than race over it.
+    static LAST_ERROR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// An entry point whose body panics answers with the failure value
+    /// instead of unwinding.
+    ///
+    /// Unwinding out of an `extern "system"` frame is a native crash on
+    /// Android: the app goes down, not the one call. So the barrier an entry
+    /// point puts around its body has to turn a panic into the value that
+    /// entry point answers with — and this is that shape, with the body
+    /// panicking on purpose.
+    #[test]
+    fn an_entry_point_whose_body_panics_answers_the_failure_value() {
+        let _turn = LAST_ERROR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let code: jint = catching_panic("nativeStartProxy", || -> jint {
+            panic!("the body panicked on purpose");
+        })
+        .unwrap_or(-1);
+
+        assert_eq!(code, -1, "the failure value answers the panic");
+    }
+
+    /// A panic is not a value: `catching_panic` turns one into `None` and
+    /// leaves the reason behind. The entry points that answer with a bare
+    /// `jint` have nowhere else to put it, and the app reads it back through
+    /// `nativeTakeLastError`.
+    #[test]
+    fn catching_panic_turns_a_panic_into_none_and_records_the_reason() {
+        let _turn = LAST_ERROR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_last_error();
+
+        let value = catching_panic("nativeStartProxy", || -> jint {
+            panic!("the body panicked on purpose");
+        });
+
+        assert!(value.is_none(), "a panic is not a value");
+        assert_eq!(
+            take_last_error().as_deref(),
+            Some("nativeStartProxy panicked"),
+            "the reason is left behind for the app to read"
+        );
+    }
+}
