@@ -465,7 +465,19 @@ pub async fn proxy_to_backend(
     // (`[timeouts] response_secs`): the backend may take that long to answer,
     // and that clock runs from the moment the body was sent, because a backend
     // cannot answer before it has the body.
-    let answer_deadline_at = body_deadline_at + timeouts.response;
+    //
+    // **A body that is already here is a different case.** It was read from
+    // the client before this point, so there is no upload left to bound and
+    // the upload deadline must not be polled: it would fire on a body that
+    // was never going to be uploaded, and it would cut the request off with a
+    // message about a body that had already arrived. The answer's clock
+    // starts now instead — the body goes out as the request does.
+    let streaming = matches!(body, crate::http::server::RequestBody::Streaming(_));
+    let answer_deadline_at = if streaming {
+        body_deadline_at + timeouts.response
+    } else {
+        tokio::time::Instant::now() + timeouts.response
+    };
 
     let mut request = Box::pin(client.request(proxied_req));
     let mut upload_deadline = Box::pin(tokio::time::sleep_until(body_deadline_at));
@@ -519,8 +531,10 @@ pub async fn proxy_to_backend(
             answer_armed = true;
         }
 
-        // The upload's own deadline: the body has to be finished by then.
-        if upload_deadline.as_mut().poll(cx).is_ready() {
+        // The upload's own deadline: the body has to be finished by then. Only a
+        // body that is still on the client's stream has an upload to wait
+        // for.
+        if streaming && upload_deadline.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(ProxyFailure::unanswered(
                 anyhow::anyhow!(
                     "the request body did not finish in time (the body's deadline is {:?})",

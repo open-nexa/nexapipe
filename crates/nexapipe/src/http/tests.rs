@@ -11,6 +11,7 @@ use super::response::*;
 
 use ::http::StatusCode;
 use futures_util::StreamExt;
+use http_body_util::BodyExt;
 use http_body_util::Full;
 /// A reason is capitalised for the path that said it that way.
 ///
@@ -295,6 +296,73 @@ async fn a_backend_that_drips_within_the_idle_deadline_stays_open() {
         DrippingBody::new(std::time::Duration::from_secs(100)),
         idle,
     ));
+
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+            .await
+            .expect("a frame must arrive")
+            .expect("the body must not end");
+        assert!(
+            frame.is_ok(),
+            "a frame within the idle deadline must pass through: {frame:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tunnel_path_ends_a_silent_backend_at_the_idle_deadline() {
+    // The tunnel path has a body of its own — the one the answer is handed
+    // to the client in — and it has a bound of its own, and this test is
+    // here because that bound did not work: the timer was reset before it
+    // was polled, so the deadline was always in the future when it was
+    // checked and the bound never fired. A backend that sent the head and
+    // then went silent held the slot and its backend lease for as long as
+    // the peer kept the stream open.
+    let idle = std::time::Duration::from_secs(120);
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut body = crate::http::server::CountedBody::new(
+        StallingBody { frames: 1, sent: 0 },
+        bytes_sent,
+        idle,
+        None,
+    )
+    .into_data_stream();
+
+    // The frame the backend did send arrives.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+        .await
+        .expect("the frame must arrive")
+        .expect("the body must not end");
+    assert!(
+        first.is_ok(),
+        "the frame the backend sent must pass through: {first:?}"
+    );
+
+    // Then the backend goes silent, and the gap is bounded.
+    let second = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())
+        .await
+        .expect("the idle deadline must end the body")
+        .expect("the body must not end");
+    match second {
+        Err(BodyError::Idle(d)) => assert_eq!(d, idle),
+        other => panic!("expected an idle failure, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tunnel_path_lets_a_dripping_backend_stay_open() {
+    // The other half of the same rule on the tunnel path: the bound is the
+    // gap between two frames, so a backend that keeps saying something is
+    // not cut off.
+    let idle = std::time::Duration::from_secs(120);
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut body = crate::http::server::CountedBody::new(
+        DrippingBody::new(std::time::Duration::from_secs(100)),
+        bytes_sent,
+        idle,
+        None,
+    )
+    .into_data_stream();
 
     for _ in 0..3 {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(200), body.next())

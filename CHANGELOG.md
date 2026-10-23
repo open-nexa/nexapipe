@@ -822,8 +822,11 @@ lookup, which is what a config written before the key existed does.
   the access check read the first one, so the host that was authorised and
   the host that would be served would be two different hosts.
 
-  The refusals are the codec's own now: a head over 64 KiB is a 431, a head
-  that never finishes is a 408, and a request hyper cannot parse is a 400.
+  The refusals are the codec's own now: a head over 64 KiB is a 431 and a
+  request hyper cannot parse is a 400. A head that never finishes is not a
+  refusal but an end: hyper's header-read timeout closes the connection
+  without an answer, so the client sees the connection close rather than a
+  status line.
 
 ### Changed
 

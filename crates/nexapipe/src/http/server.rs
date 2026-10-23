@@ -126,7 +126,22 @@ pub async fn serve(
 }
 
 /// The service: one request, one answer.
+///
+/// The status the client was told is recorded on the request's span, because
+/// what the client was told is part of what the request was: the plaintext
+/// listener and the L4 tunnel both record it, and a span that never gets a
+/// status is a span that says the request never finished.
 async fn handle(
+    req: Request<Incoming>,
+    ctx: Arc<Context>,
+) -> Result<Response<crate::http::body::ProxyBody>, Infallible> {
+    let response = handle_one(req, ctx).await?;
+    tracing::Span::current().record("status", response.status().as_u16() as u64);
+    Ok(response)
+}
+
+/// One request, one answer.
+async fn handle_one(
     req: Request<Incoming>,
     ctx: Arc<Context>,
 ) -> Result<Response<crate::http::body::ProxyBody>, Infallible> {
@@ -327,6 +342,7 @@ async fn upgrade(
 ) -> Response<crate::http::body::ProxyBody> {
     let (parts, body) = request.into_parts();
     let head = Request::from_parts(parts.clone(), ());
+    let started = std::time::Instant::now();
 
     // Hyper hands the client's side over once the `101` is written, so this
     // has to be asked for **before** the answer goes out.
@@ -369,6 +385,20 @@ async fn upgrade(
             handshake.status
         );
         crate::metrics::METRICS.record_request(handshake.status, 0);
+        // The access log says what the client was told, and here the client
+        // was told what the backend said: a refused upgrade is an ordinary
+        // response, and a log with no line for it is a log that cannot say
+        // which upgrades were refused.
+        crate::log::log_access(
+            &ctx.request_id,
+            &ctx.peer,
+            head.method().as_str(),
+            head.uri().path(),
+            handshake.status,
+            started.elapsed().as_millis() as u64,
+            0,
+            Some(&ctx.who),
+        );
         return handshake.refusal_response();
     }
 
@@ -387,6 +417,19 @@ async fn upgrade(
     });
 
     crate::metrics::METRICS.record_request(101, 0);
+    // The session is not a request any more — it has no end this log can
+    // describe — but the answer that started it is one, and the line for it
+    // says the tunnel came up.
+    crate::log::log_access(
+        &ctx.request_id,
+        &ctx.peer,
+        head.method().as_str(),
+        head.uri().path(),
+        101,
+        started.elapsed().as_millis() as u64,
+        0,
+        Some(&ctx.who),
+    );
     response
 }
 
@@ -870,9 +913,9 @@ pub struct AccessReport {
 /// The count is what the access log reports, and it is taken at the write
 /// rather than at the format: a body that died half way is reported as the
 /// half that arrived, not as the whole that was intended.
-pub struct CountedBody {
+pub struct CountedBody<B = Incoming> {
     /// The backend's own stream.
-    inner: Incoming,
+    inner: B,
     /// The bytes that reached the client.
     bytes_sent: Arc<AtomicUsize>,
     /// How long the backend may be silent before the answer is cut.
@@ -884,15 +927,19 @@ pub struct CountedBody {
     /// backend lease forever.
     idle: Duration,
     /// The timer that ends the answer when the backend goes quiet.
-    timer: Pin<Box<tokio::time::Sleep>>,
+    ///
+    /// Armed on the first poll and re-armed after every frame: what it
+    /// bounds is the gap between two frames, not the time since the answer
+    /// was created.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
     /// What the access log says, once the answer is over.
     report: Option<AccessReport>,
 }
 
-impl CountedBody {
+impl<B> CountedBody<B> {
     /// The answer, and where the count is kept.
     pub fn new(
-        inner: Incoming,
+        inner: B,
         bytes_sent: Arc<AtomicUsize>,
         idle: Duration,
         report: Option<AccessReport>,
@@ -901,13 +948,13 @@ impl CountedBody {
             inner,
             bytes_sent,
             idle,
-            timer: Box::pin(tokio::time::sleep(idle)),
+            timer: None,
             report,
         }
     }
 }
 
-impl Drop for CountedBody {
+impl<B> Drop for CountedBody<B> {
     fn drop(&mut self) {
         // The answer is over: whatever reached the client is what the line
         // says, and a body that died half way is reported as the half that
@@ -929,7 +976,11 @@ impl Drop for CountedBody {
     }
 }
 
-impl hyper::body::Body for CountedBody {
+impl<B> hyper::body::Body for CountedBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send + 'static,
+    B::Error: Into<BodyError>,
+{
     type Data = bytes::Bytes;
     type Error = BodyError;
 
@@ -943,15 +994,28 @@ impl hyper::body::Body for CountedBody {
         // without the timer the check below would run only when the backend
         // sends something, so a backend that goes quiet would never be given
         // up on.
-        this.timer
-            .as_mut()
-            .reset(tokio::time::Instant::now() + this.idle);
-        if this.timer.as_mut().poll(cx).is_ready() {
+        //
+        // **The bound is checked before the timer is re-armed.** A timer that
+        // is reset and then polled is always in the future, so the check
+        // below could never fire: the bound would be a comment, and a backend
+        // that accepted the request and then went quiet would hold this slot
+        // and its backend lease for as long as the peer kept the stream open.
+        // The timer is re-armed when a frame arrives instead — the gap
+        // between two frames is what is bounded, so a backend that keeps
+        // talking is never cut off.
+        let timer = this
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.idle)));
+        if timer.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Some(Err(BodyError::Idle(this.idle))));
         }
 
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
+                // The backend is talking, so the next gap starts now.
+                timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
                 if let Some(data) = frame.data_ref() {
                     this.bytes_sent.fetch_add(data.len(), Ordering::Relaxed);
                     // The process-wide total counts what left for the client,
@@ -960,7 +1024,7 @@ impl hyper::body::Body for CountedBody {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BodyError::from(e)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
