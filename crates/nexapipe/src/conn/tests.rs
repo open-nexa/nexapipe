@@ -58,7 +58,7 @@ async fn the_state_file_carries_the_counters_as_of_the_write() {
         .await
         .expect("the state is written");
 
-    let state = std::fs::read_to_string(dir.path().join("state.toml")).unwrap();
+    let state = std::fs::read_to_string(dir.path().join("config.state.toml")).unwrap();
     assert!(
         state.contains("failed_attempts = 2"),
         "the file carries the count as of the write, not as of an earlier moment: {state}"
