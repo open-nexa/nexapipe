@@ -598,6 +598,30 @@ where
         let count_to_backend = flow.counter();
         let count_from_backend = flow.counter();
 
+        // **The bytes that came with the head are the tunnel's first payload.**
+        //
+        // The head reader keeps everything it read, so a client that wrote the
+        // CONNECT head and the first bytes of the tunnel in one go has both in
+        // the buffer by the time the head is complete. This branch used to
+        // read the socket again from there and drop them: the copy loop below
+        // starts at the socket, and the socket had already given these up.
+        //
+        // The ordinary HTTP path forwards them (see below); this one did not,
+        // and the difference was a tunnel that began in the middle of whatever
+        // the client had sent — a TLS client that pipelined its first record
+        // into the CONNECT got a stream the far side could not read.
+        let carried = &request_buf[header_end..];
+        if !carried.is_empty() {
+            if let Err(e) = send.write_all(carried).await {
+                jni_log!(
+                    "[DEBUG:local-proxy] CONNECT: writing the bytes that came with the head failed: {}",
+                    e
+                );
+                return Ok(());
+            }
+            count_to_backend.record_sent(carried.len() as u64);
+        }
+
         let (mut client_read, mut client_write) = tokio::io::split(stream);
         client_write
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -823,6 +847,12 @@ where
                         true,
                     ));
                 }
+                // **The bytes that came with the head are the session's first
+                // frame**, and they go out with the request: the copy loop
+                // starts at the socket, and the socket has already given these
+                // up. A client that wrote the upgrade and its first frame in
+                // one go lost that frame here.
+                request_to_send.extend_from_slice(&request_buf[header_end..]);
 
                 jni_log!(
                     "[DEBUG:local-proxy] Rewrote WebSocket request line: {}",
