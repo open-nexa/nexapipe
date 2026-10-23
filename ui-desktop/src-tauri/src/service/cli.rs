@@ -64,13 +64,7 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             // install does, and the install is what the elevated child runs.
             let leave_stopped = args.iter().any(|arg| arg == LEAVE_STOPPED_ARG);
             let keep_owner = args.iter().any(|arg| arg == KEEP_OWNER_ARG);
-            let outcome = if keep_owner {
-                platform::install_service_keeping_owner(leave_stopped)
-            } else if leave_stopped {
-                platform::install_service_without_starting()
-            } else {
-                platform::install_service()
-            };
+            let outcome = platform::install_service_with(leave_stopped, keep_owner);
 
             elevate::report_result(result_file.as_deref(), &outcome);
             true

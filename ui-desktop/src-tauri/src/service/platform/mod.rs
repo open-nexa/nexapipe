@@ -66,11 +66,7 @@ use std::path::{Path, PathBuf};
 
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
-    #[cfg(windows)]
-    return install(account::AccountId::current(), false, false);
-
-    #[cfg(not(windows))]
-    return install_elevated();
+    install_service_with(false, false)
 }
 
 /// Registers the service and leaves it stopped.
@@ -83,26 +79,33 @@ pub fn install_service() -> Result<(), AppError> {
 /// Windows only in its effect. The Unix half starts the service through its own service
 /// manager, and the installer that asks for this is the Windows one.
 pub fn install_service_without_starting() -> Result<(), AppError> {
-    #[cfg(windows)]
-    return install(account::AccountId::current(), true, false);
-
-    #[cfg(not(windows))]
-    return install_elevated();
+    install_service_with(true, false)
 }
 
-/// Registers the service the way an upgrade needs it.
+/// Registers the service, with the two choices an install has to make about the machine it
+/// finds.
 ///
-/// The account the service serves is kept: an upgrade is not where that choice is made, and
-/// the account the service was installed for is the one the user picked. The service is left
-/// down when the caller says so, for the same reason the installer says so.
+/// `leave_stopped` leaves the service down instead of starting it, and `keep_owner` leaves
+/// the account it serves alone instead of recording the one that happens to run the
+/// install. Both are what an upgrade asks for: an upgrade replaces the service binary and
+/// nothing else, so the start type the user gave the service and the account it serves are
+/// the user's own business. The UI's own install asks for neither.
 ///
-/// Windows only in its effect, like [`install_service_without_starting`].
-pub fn install_service_keeping_owner(leave_stopped: bool) -> Result<(), AppError> {
+/// Windows only in its effect: the Unix half registers the service through its own service
+/// manager and records the account in a root-owned file, so neither of the two is the
+/// installer's to decide there.
+pub fn install_service_with(leave_stopped: bool, keep_owner: bool) -> Result<(), AppError> {
     #[cfg(windows)]
-    return install(account::AccountId::current(), leave_stopped, true);
-
+    {
+        install(account::AccountId::current(), leave_stopped, keep_owner)
+    }
     #[cfg(not(windows))]
-    return install_elevated();
+    {
+        // Neither of the two is the Unix installer's to decide: it registers the service
+        // through its own service manager and records the account in a root-owned file.
+        let _ = (leave_stopped, keep_owner);
+        install_elevated()
+    }
 }
 
 /// Removes the service.
