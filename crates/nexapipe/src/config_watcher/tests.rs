@@ -368,6 +368,16 @@ fn config_with(clients: &[(&str, ClientAuth)]) -> AuthConfig {
 
 /// A watcher over a config file, with the 2FA state it guards.
 fn watcher_for(state: AuthState, path: &str) -> ConfigWatcher {
+    watcher_with_peers(state, path, Arc::new(PeerRegistry::new()))
+}
+
+/// A watcher over a config file, with the 2FA state it guards and the peer
+/// registry its revocations reach.
+///
+/// The registry is handed in rather than made here, because what most of the
+/// tests below are about is which connections a reload reaches — and that is
+/// only visible from the registry the reload closes through.
+fn watcher_with_peers(state: AuthState, path: &str, peers: Arc<PeerRegistry>) -> ConfigWatcher {
     ConfigWatcher::new(
         path.to_string(),
         Arc::new(RoutingTable::new(Vec::new())),
@@ -378,8 +388,32 @@ fn watcher_for(state: AuthState, path: &str) -> ConfigWatcher {
         Arc::new(Mutex::new(HealthProbes::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         Some(state),
-        Arc::new(PeerRegistry::new()),
+        peers,
     )
+}
+
+/// A connection in the registry, the way the handshake registers one, and the
+/// channel that says it was told to stop.
+///
+/// The identity is what tells the connections apart: one that authenticated
+/// carries the client id it authenticated as, and one that never did carries
+/// none.
+fn connected(
+    peers: &PeerRegistry,
+    seed: u8,
+    identity: PeerIdentity,
+) -> (
+    tokio::sync::watch::Receiver<bool>,
+    crate::conn::peers::PeerGuard,
+) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let guard = peers.insert(
+        iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+        crate::metrics::PathKind::Direct,
+        identity,
+        tx,
+    );
+    (rx, guard)
 }
 
 /// A snapshot the caller read is merged as it is, and the file is not read
@@ -653,6 +687,188 @@ fn a_new_invite_starts_with_its_own_budget() {
         "the guesses went with the token they were made at"
     );
     assert_eq!(client.enrollment_locked_until, None);
+}
+
+/// The configuration file an invite is written into: one client, one pending
+/// enrollment token.
+fn config_with_pending_token(path: &std::path::Path, token: &str) {
+    std::fs::write(
+        path,
+        format!(
+            "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
+             pending_enrollment = \"{token}\"\n"
+        ),
+    )
+    .expect("the config is written");
+}
+
+/// The state file beside the configuration, carrying what the guesses at a
+/// token cost.
+///
+/// Written through the server's own writer, so the file is the one a running
+/// server would have left behind: the count of the guesses and the lockout
+/// window they earned. It is put where the server looks for it — the path
+/// the state itself names — rather than at a name spelled out here.
+fn state_file_with_enrollment_counters(config_path: &str, attempts: u32, locked_until: u64) {
+    let mut clients = HashMap::new();
+    clients.insert(
+        "client-001".to_string(),
+        crate::auth::state::ClientState {
+            enrollment_failed_attempts: attempts,
+            enrollment_locked_until: Some(locked_until),
+            ..Default::default()
+        },
+    );
+    let path = crate::auth::state::path_for(config_path);
+    crate::auth::state::save(&path, &crate::auth::state::RuntimeState { clients })
+        .expect("the state file is written");
+}
+
+/// A lockout window that has not run out yet.
+fn a_live_lockout_window() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .as_secs()
+        + 3600
+}
+
+/// A rotated invite starts with its own budget.
+///
+/// The counters are the guesses at a **token**, and a token that is replaced
+/// is a different credential. The merge used to keep the file's copy of them,
+/// and the file's copy is the state file's — so an invite that was rotated
+/// while the old token had guesses against it inherited them, and the lockout
+/// the old token had earned closed the new invite's slot.
+///
+/// The file is read the way the watcher reads it: through the loader that
+/// applies the state file beside it, so the snapshot the merge sees is the one
+/// a running server would see.
+#[tokio::test]
+async fn a_rotated_invite_starts_with_its_own_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "old-token");
+    state_file_with_enrollment_counters(&path_str, 3, a_live_lockout_window());
+
+    // The live state the server started with: the old token, and the counters
+    // the state file carries for it.
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let state = AuthState::new(
+        auth.expect("the config declares an [auth] section"),
+        &path_str,
+    );
+    let watcher = watcher_for(state.clone(), &path_str);
+
+    // The operator rotates the invite: the file carries a new token.
+    config_with_pending_token(&path, "new-token");
+
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client
+            .pending_enrollment
+            .as_ref()
+            .map(|token| token.expose_secret().as_str()),
+        Some("new-token"),
+        "the new invite is the live one"
+    );
+    assert_eq!(
+        client.enrollment_failed_attempts, 0,
+        "the guesses were paid for by the token that is gone"
+    );
+    assert_eq!(
+        client.enrollment_locked_until, None,
+        "and so was the lockout that token earned"
+    );
+}
+
+/// An unchanged token keeps the counters that are live.
+///
+/// The live counter is the newer one — a failure counted since the last flush
+/// to the state file — so the merge keeps it, the way it keeps the client's
+/// own lockout.
+#[tokio::test]
+async fn an_unchanged_token_keeps_its_live_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "token");
+    let window = a_live_lockout_window();
+    state_file_with_enrollment_counters(&path_str, 3, window);
+
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let state = AuthState::new(
+        auth.expect("the config declares an [auth] section"),
+        &path_str,
+    );
+    let watcher = watcher_for(state.clone(), &path_str);
+
+    // A guess counted in memory since the last flush: the file is behind.
+    {
+        let mut live = state.config().write().await;
+        let client = live
+            .clients
+            .get_mut("client-001")
+            .expect("the client is there");
+        client.enrollment_failed_attempts = 5;
+    }
+
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 5,
+        "the live counter is newer than the file's"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
+}
+
+/// The state file's counters are still honoured for a token that did not
+/// change.
+///
+/// The rule is about the token being replaced, not about the counters: a
+/// client whose invite is the same one keeps what the state file carries for
+/// it, and a reload that leaves the token alone keeps them too.
+#[tokio::test]
+async fn the_state_file_counters_are_honoured_for_an_unchanged_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "token");
+    let window = a_live_lockout_window();
+    state_file_with_enrollment_counters(&path_str, 3, window);
+
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let auth = auth.expect("the config declares an [auth] section");
+    let client = &auth.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 3,
+        "the state file's counter is honoured on the way in"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
+
+    let state = AuthState::new(auth, &path_str);
+    let watcher = watcher_for(state.clone(), &path_str);
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 3,
+        "a reload that leaves the token alone keeps the counter"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
 }
 
 /// A server started with no `[auth]` section at all can still switch 2FA on
@@ -1086,5 +1302,301 @@ async fn a_reload_closes_the_connection_authenticated_as_a_removed_device() {
     assert!(
         !*phone_rx.borrow_and_update(),
         "a device that is still in the file must not be closed along with it"
+    );
+}
+
+/// A config file carrying one client and the hosts it may reach.
+fn file_for(client_id: &str, secret: &str, hosts: &[&str]) -> String {
+    let hosts = hosts
+        .iter()
+        .map(|host| format!("\"{host}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[auth]\n\
+         [auth.clients.{client_id}]\n\
+         secret = \"{secret}\"\n\
+         allow_hosts = [{hosts}]\n"
+    )
+}
+
+/// The authorization a list of hosts and a list of ports grants.
+fn authorization(hosts: Option<&[&str]>, ports: Option<&[u16]>) -> ClientAuthorization {
+    ClientAuthorization {
+        hosts: hosts.map(|hosts| hosts.iter().map(|host| host.to_string()).collect()),
+        ports: ports.map(|ports| ports.to_vec()),
+        strict_ports: false,
+    }
+}
+
+/// A host list that lost one of its entries is a tightening.
+#[test]
+fn a_narrowed_host_list_is_a_tightening() {
+    let live = authorization(Some(&["a.test", "b.test"]), None);
+    let incoming = authorization(Some(&["a.test"]), None);
+    assert!(live.tightened_by(&incoming));
+}
+
+/// A host list that gained an entry is a widening, and a widening closes
+/// nothing: the connections that are open carry an authorization that is
+/// still valid.
+#[test]
+fn a_widened_host_list_is_not_a_tightening() {
+    let live = authorization(Some(&["a.test"]), None);
+    let incoming = authorization(Some(&["a.test", "b.test"]), None);
+    assert!(!live.tightened_by(&incoming));
+}
+
+/// The same list twice is not a tightening either, so a reload that changes
+/// nothing does not drop a connection.
+#[test]
+fn an_unchanged_host_list_is_not_a_tightening() {
+    let live = authorization(Some(&["a.test", "b.test"]), None);
+    let incoming = authorization(Some(&["a.test", "b.test"]), None);
+    assert!(!live.tightened_by(&incoming));
+}
+
+/// A list that lost one host and gained another is a tightening: the host it
+/// lost is one the client may no longer reach.
+#[test]
+fn a_host_list_that_swapped_a_host_is_a_tightening() {
+    let live = authorization(Some(&["a.test", "b.test"]), None);
+    let incoming = authorization(Some(&["a.test", "c.test"]), None);
+    assert!(live.tightened_by(&incoming));
+}
+
+/// A client that was allowed every host and is given a list has had hosts
+/// taken away: the list is not every host.
+#[test]
+fn an_unrestricted_client_is_tightened_by_a_host_list() {
+    let live = authorization(None, None);
+    let incoming = authorization(Some(&["a.test"]), None);
+    assert!(live.tightened_by(&incoming));
+}
+
+/// The other way round is a widening: a list that is replaced by "every host"
+/// takes nothing away.
+#[test]
+fn a_host_list_is_not_tightened_by_every_host() {
+    let live = authorization(Some(&["a.test"]), None);
+    let incoming = authorization(None, None);
+    assert!(!live.tightened_by(&incoming));
+}
+
+/// A wildcard covers the names under it, so replacing it with one of them
+/// takes the rest away.
+#[test]
+fn a_wildcard_replaced_by_one_of_its_names_is_a_tightening() {
+    let live = authorization(Some(&["*.example.com"]), None);
+    let incoming = authorization(Some(&["app.example.com"]), None);
+    assert!(live.tightened_by(&incoming));
+}
+
+/// The other way round is not: a name under a wildcard keeps everything the
+/// wildcard allowed.
+#[test]
+fn a_name_under_a_wildcard_is_not_taken_away_by_it() {
+    let live = authorization(Some(&["app.example.com"]), None);
+    let incoming = authorization(Some(&["*.example.com"]), None);
+    assert!(!live.tightened_by(&incoming));
+}
+
+/// A port that was allowed and is no longer listed is a tightening.
+#[test]
+fn a_narrowed_port_list_is_a_tightening() {
+    let live = authorization(None, Some(&[80, 443]));
+    let incoming = authorization(None, Some(&[443]));
+    assert!(live.tightened_by(&incoming));
+}
+
+/// A port list that gained a port is a widening.
+#[test]
+fn a_widened_port_list_is_not_a_tightening() {
+    let live = authorization(None, Some(&[443]));
+    let incoming = authorization(None, Some(&[443, 80]));
+    assert!(!live.tightened_by(&incoming));
+}
+
+/// A reload that turns 2FA on closes the connections that never
+/// authenticated.
+///
+/// A connection that was opened while 2FA was off never did a handshake, so it
+/// carries no credential at all: the registry lists it with no client id.
+/// Turning the gate on did not reach it — the reload used to say nothing
+/// about those connections at all — and a WebSocket session or an L4 tunnel
+/// opened before the change went on serving with nothing behind it for as
+/// long as it lived.
+#[tokio::test]
+async fn a_reload_that_turns_2fa_on_closes_the_connections_that_never_authenticated() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().expect("utf-8 path").to_string();
+
+    // 2FA is off, so the connection below is served without a handshake.
+    std::fs::write(&path, "[auth]\nenabled = false\n").expect("write the config");
+    let state = AuthState::new(AuthConfig::default(), path_str.clone());
+    let peers = Arc::new(PeerRegistry::new());
+    let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
+
+    let (mut anonymous, _guard) = connected(&peers, 1, PeerIdentity::default());
+
+    // The operator turns 2FA on.
+    std::fs::write(&path, "[auth]\nenabled = true\n").expect("rewrite the config");
+    watcher.reload_config().await;
+
+    assert!(
+        *anonymous.borrow_and_update(),
+        "a connection that never authenticated must be closed when the gate comes on"
+    );
+}
+
+/// The connections that did authenticate are left alone by the same reload.
+///
+/// They carry the authorization they were given when they connected, and that
+/// authorization is still valid — the gate is on for the connections opened
+/// from here on, and the ones that are open keep working.
+#[tokio::test]
+async fn a_reload_that_turns_2fa_on_leaves_the_authenticated_connections_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().expect("utf-8 path").to_string();
+
+    std::fs::write(&path, "[auth]\nenabled = false\n").expect("write the config");
+    let state = AuthState::new(AuthConfig::default(), path_str.clone());
+    let peers = Arc::new(PeerRegistry::new());
+    let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
+
+    let (mut alice, _guard) = connected(
+        &peers,
+        2,
+        PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: None,
+        },
+    );
+
+    std::fs::write(&path, "[auth]\nenabled = true\n").expect("rewrite the config");
+    watcher.reload_config().await;
+
+    assert!(
+        !*alice.borrow_and_update(),
+        "a connection that authenticated must not be closed by the reload that turned 2FA on"
+    );
+}
+
+/// A reload that tightens a client's authorization closes its connections.
+///
+/// The ACL is snapshotted at the handshake and never read again, so a client
+/// whose host list was narrowed would go on reaching the host that was taken
+/// away — on every connection it already had, for as long as they live.
+#[tokio::test]
+async fn a_reload_that_tightens_a_client_closes_its_connections() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().expect("utf-8 path").to_string();
+
+    std::fs::write(&path, file_for("alice", "ALICEALICEALICEA", &["a.test"]))
+        .expect("write the config");
+
+    // The live client may reach both hosts.
+    let mut alice = client("ALICEALICEALICEA");
+    alice.allow_hosts = Some(vec!["a.test".to_string(), "b.test".to_string()]);
+    let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+    let peers = Arc::new(PeerRegistry::new());
+    let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
+
+    let (mut connection, _guard) = connected(
+        &peers,
+        3,
+        PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: None,
+        },
+    );
+
+    watcher.reload_config().await;
+
+    assert!(
+        *connection.borrow_and_update(),
+        "a client that was given a tighter authorization must not keep the connections it had"
+    );
+}
+
+/// A reload that widens the list closes nothing.
+///
+/// The connections that are open carry an authorization that is still valid —
+/// the new list allows everything the old one did — so dropping them would
+/// take a working session down over an edit that loosened the rules.
+#[tokio::test]
+async fn a_reload_that_widens_a_client_leaves_its_connections_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().expect("utf-8 path").to_string();
+
+    std::fs::write(
+        &path,
+        file_for("alice", "ALICEALICEALICEA", &["a.test", "b.test"]),
+    )
+    .expect("write the config");
+
+    // The live client may reach one host only.
+    let mut alice = client("ALICEALICEALICEA");
+    alice.allow_hosts = Some(vec!["a.test".to_string()]);
+    let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+    let peers = Arc::new(PeerRegistry::new());
+    let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
+
+    let (mut connection, _guard) = connected(
+        &peers,
+        4,
+        PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: None,
+        },
+    );
+
+    watcher.reload_config().await;
+
+    assert!(
+        !*connection.borrow_and_update(),
+        "a client that was given a wider authorization must keep the connections it had"
+    );
+}
+
+/// A client that is gone from the file still has its connections closed.
+///
+/// This is the case the removal path has always covered, and the tightening
+/// pass must not take it over: a removed client is not in the file at all, so
+/// there is nothing to compare it against.
+#[tokio::test]
+async fn a_reload_that_removes_a_client_closes_its_connections() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().expect("utf-8 path").to_string();
+
+    // The file has no clients at all.
+    std::fs::write(&path, "[auth]\n").expect("write the config");
+
+    let state = AuthState::new(
+        config_with(&[("alice", client("ALICEALICEALICEA"))]),
+        path_str.clone(),
+    );
+    let peers = Arc::new(PeerRegistry::new());
+    let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
+
+    let (mut connection, _guard) = connected(
+        &peers,
+        5,
+        PeerIdentity {
+            client_id: Some("alice".to_string()),
+            device: None,
+        },
+    );
+
+    watcher.reload_config().await;
+
+    assert!(
+        *connection.borrow_and_update(),
+        "a client that is no longer in [auth] must not keep the connections it had"
     );
 }

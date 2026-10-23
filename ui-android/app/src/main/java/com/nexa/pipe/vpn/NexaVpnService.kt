@@ -58,7 +58,11 @@ class NexaVpnService : VpnService() {
     }
 
     private val TAG = "NexaVpnService"
-    private var vpnInterface: ParcelFileDescriptor? = null
+    // The TUN descriptor is not held in a field: it belongs to the establish
+    // that opened it, from establish() until the native side takes it, and
+    // that is also where it is closed when it never gets that far. See
+    // establishVpnInternal.
+
     // @Volatile: written from the main thread (onStartCommand/onRevoke) and
     // read from IO coroutines (reconnect logic).
     @Volatile private var isRunning = false
@@ -180,6 +184,13 @@ class NexaVpnService : VpnService() {
         wasRevoked = false
         lastRevokeReason = null
 
+        // The tunnel of this session is not up yet, whatever an earlier
+        // session left behind: the flag says a tunnel is there, and it has
+        // to mean *this* one — a UI that reads it while this session is
+        // still being built would call a tunnel that is not there a
+        // connected one.
+        isServiceActive = false
+
         // A new session clears the teardown marker: the same service instance
         // is reused when the user stops and starts again without the process
         // being recreated, and an establish must be allowed to run then.
@@ -201,6 +212,9 @@ class NexaVpnService : VpnService() {
             // still running leaves a live connection to the relay behind
             // nothing that the user can see or stop.
             releaseNativeResources()
+            // The start is over and there is no tunnel: whoever asked for
+            // it is waiting for exactly this answer.
+            notifyStartOutcome(false)
             shutdownService()
             return
         }
@@ -239,7 +253,7 @@ class NexaVpnService : VpnService() {
             // boot path, and that path ends the service when it cannot bring
             // a tunnel up — so nothing is left running over a tunnel that is
             // not there.
-            startForegroundForBoot()
+            startForegroundConnecting()
             bootConnectJob = serviceScope.launch {
                 bootConnect()
             }
@@ -253,6 +267,15 @@ class NexaVpnService : VpnService() {
                 // another VPN app. Absent means no: a start that carries no
                 // such answer must not revoke anything.
                 val takeover = intent.getBooleanExtra(EXTRA_ALLOW_TAKEOVER, false)
+                // The same obligation the boot path meets, and for the same
+                // reason: a service started with startForegroundService() has
+                // five seconds to call startForeground(), and the system takes
+                // the app down when it does not. Everything startVPN() does
+                // before its own startForeground() — the consent check, the
+                // establish, and the wait for Android to register the VPN
+                // network — can take longer than that, so the obligation is
+                // met here, before any of it.
+                startForegroundConnecting()
                 startVPN(domains.toSet(), takeover)
             }
             ACTION_STOP -> {
@@ -268,7 +291,7 @@ class NexaVpnService : VpnService() {
                 // with the text that says what is happening rather than
                 // the one that says the tunnel is up, because it is not
                 // yet.
-                startForegroundForBoot()
+                startForegroundConnecting()
                 bootConnectJob = serviceScope.launch {
                     bootConnect()
                 }
@@ -282,11 +305,16 @@ class NexaVpnService : VpnService() {
      * has: it has five seconds to call `startForeground()`, and the system
      * takes the app down when it does not.
      *
+     * Every path that starts the service meets it here, before anything that
+     * can take longer than five seconds: the boot path waits for a network,
+     * and the start path waits for the consent check, for `establish()` and
+     * for Android to register the VPN network.
+     *
      * The text says what is true: the tunnel is not up yet. A refusal is not
      * swallowed — the service never enters the foreground state that way, and
      * the log is what says why.
      */
-    private fun startForegroundForBoot() {
+    private fun startForegroundConnecting() {
         runCatching {
             createNotificationChannel()
             startForeground(
@@ -294,7 +322,7 @@ class NexaVpnService : VpnService() {
                 createNotification(getString(R.string.notification_text_connecting))
             )
         }.onFailure { error ->
-            Log.w(TAG, "boot: the foreground was refused: ${error.message}")
+            Log.w(TAG, "the foreground was refused: ${error.message}")
         }
     }
 
@@ -418,6 +446,9 @@ class NexaVpnService : VpnService() {
         isRunning = false
         tunProxyStarted = false
         isServiceActive = false
+        // The session is over, and no tunnel is coming up for it: whoever is
+        // waiting for one is told now rather than at the end of its wait.
+        notifyStartOutcome(false)
         ownVpnNetworks = emptySet()
         ownVpnUnidentified = false
         wasRevoked = true
@@ -489,10 +520,11 @@ class NexaVpnService : VpnService() {
             Log.e(TAG, "nativeStopTunProxy failed: ${e.message}")
         }
 
-        // vpnInterface already went through detachFd, so the fd is owned by
-        // Rust and must not be closed here. Just drop the reference.
-        vpnInterface = null
-
+        // Nothing to close here: by the time the TUN proxy runs, the
+        // descriptor belongs to Rust — nativeStartTunProxy took it at the JNI
+        // boundary and nativeStopTunProxy above closed it. A descriptor that
+        // was never handed over was closed by the establish that still held
+        // it, which is the path this function used to leave open.
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
@@ -509,6 +541,10 @@ class NexaVpnService : VpnService() {
             if (!establishVpnInternal(allowTakeover)) {
                 Log.d(TAG, "VPN establishment failed")
                 isRunning = false
+                // The start is over and there is no tunnel: whoever asked for
+                // it is waiting for exactly this answer, and the attempt has
+                // to be retried rather than announced as a success.
+                notifyStartOutcome(false)
                 // Nothing left to shut down when the service is already going
                 // away: startForeground() after stopSelf() is what throws
                 // ForegroundServiceDidNotStartInTimeException, and the service
@@ -535,6 +571,18 @@ class NexaVpnService : VpnService() {
         // TUN slot.
         if (isStopping) {
             Log.d(TAG, "Establish skipped: the service is stopping")
+            return false
+        }
+
+        // The native library has to be there before a TUN is established.
+        // Without it the calls below raise an UnsatisfiedLinkError — an
+        // Error, not an Exception — which would escape the catch at the end
+        // of this function and take the process with it. Establishing the TUN
+        // first would be worse: the routes and the DNS server of the VPN
+        // point into a TUN that nothing ever reads, so the device would be
+        // left without DNS. Refuse before the TUN exists.
+        if (!IrohProxy.isNativeLoaded()) {
+            Log.e(TAG, "Establish failed: the native library is not loaded")
             return false
         }
 
@@ -566,6 +614,26 @@ class NexaVpnService : VpnService() {
         // Snapshot before establish(): the VPN network that appears on top of
         // this is the one Android created for us.
         val vpnNetworksBefore = cm?.let { UnderlyingNetworkSelector.vpnNetworks(it) }.orEmpty()
+
+        // The TUN descriptor's owner, tracked explicitly because it changes
+        // hands three times below:
+        //
+        //   PFD   — Android opened it in establish(); the ParcelFileDescriptor
+        //           owns it until detachFd() is called.
+        //   LOCAL — after detachFd() this function owns the raw int.
+        //   RUST  — once nativeStartTunProxy() has been entered the native
+        //           side owns it and closes it on every path.
+        //
+        // Only one of the two variables below is ever set: the
+        // ParcelFileDescriptor while it still owns the descriptor, the
+        // detached int while this function owns it, and neither of them once
+        // the native side has taken it. The descriptor has to be closed
+        // exactly once — a second close of a number the process has already
+        // handed on closes whatever holds that number now, and the failure is
+        // silent — so the finally at the end of this function closes only
+        // what is still ours.
+        var tunPfd: ParcelFileDescriptor? = null
+        var tunFd: Int? = null
 
         return try {
             // The block the tunnel claims, and the addresses inside it. The
@@ -612,17 +680,32 @@ class NexaVpnService : VpnService() {
                 Log.d(TAG, "No underlying network from callback, skipping setUnderlyingNetworks")
             }
 
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
+            val pfd = builder.establish()
+            if (pfd == null) {
                 Log.d(TAG, "Failed to establish VPN")
                 return false
             }
+            // The ParcelFileDescriptor owns the descriptor from here until
+            // detachFd() below.
+            tunPfd = pfd
+
+            // A suspension point, and the only one between the TUN coming up
+            // and the descriptor changing hands: the coroutine can be
+            // cancelled here — the user taps Disconnect while a network
+            // switch is rebuilding, or the service is destroyed — and the
+            // ParcelFileDescriptor is then the only thing holding the
+            // descriptor. The finally below closes it. Without that the TUN
+            // would stay established with nobody reading it while its routes
+            // and its DNS server still point the device's DNS into it: a
+            // device-wide DNS blackhole, with the foreground notification
+            // taken away at the same time.
             trackOwnVpnNetwork(vpnNetworksBefore)
 
             // Transfer TUN fd ownership to Rust (the PFD is no longer usable
             // after detachFd).
-            val fd = vpnInterface!!.detachFd()
-            vpnInterface = null  // the PFD is invalid now, drop the reference
+            val fd = pfd.detachFd()
+            tunPfd = null
+            tunFd = fd
 
             val proxyDomainsStr = allowedDomains.joinToString(",")
 
@@ -662,13 +745,21 @@ class NexaVpnService : VpnService() {
             } catch (e: Throwable) {
                 if (e is LinkageError) {
                     Log.e(TAG, "nativeStartTunProxy could not be called at all", e)
-                    try {
-                        ParcelFileDescriptor.adoptFd(fd).close()
-                    } catch (_: Exception) {}
+                    // The native method was never entered, so it took the
+                    // descriptor nowhere: it is still ours, and this is the
+                    // only place that may close it.
+                    closeTunFd(tunFd)
                 } else {
                     Log.e(TAG, "nativeStartTunProxy threw after taking the fd", e)
                 }
                 throw e
+            } finally {
+                // The native side owns the descriptor from here on: it took it
+                // at the JNI boundary and closes it on every path, including
+                // the ones that fail. The LinkageError above is the one case
+                // where it did not, and that branch closed it itself — so
+                // there is nothing left here for the finally below.
+                tunFd = null
             }
 
             if (result != 0) {
@@ -691,6 +782,11 @@ class NexaVpnService : VpnService() {
 
             tunProxyStarted = true
             isServiceActive = true
+            // The tunnel is up, and whoever asked for it is waiting for
+            // exactly this answer. The flag above is already true, so a
+            // reader that looks at it now and one that is woken by this
+            // call see the same thing.
+            notifyStartOutcome(true)
             Log.d(
                 TAG,
                 "VPN + TUN proxy established successfully (routing ${block.network} and " +
@@ -710,10 +806,55 @@ class NexaVpnService : VpnService() {
             // The tunnel is up, so the counters mean something: start showing them.
             startTrafficPolling()
             true
+        } catch (e: TimeoutCancellationException) {
+            // The budget of the reconnect that called this ran out. It has to
+            // leave the coroutine the way it found it: the caller decides what
+            // a timeout means (a retry), and turning it into a plain failure
+            // here would swallow it.
+            throw e
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A deliberate cancellation — the user disconnected, or the
+            // service is being destroyed. It is not a failure of the
+            // establish and must not become one: the descriptor is cleaned up
+            // on the way out, and the caller has to see the cancellation
+            // rather than a `false` that leaves the session flags standing
+            // over a tunnel that is not there.
+            Log.d(TAG, "Establish cancelled")
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "VPN establishment failed: ${e.message}", e)
             tunProxyStarted = false
             false
+        } finally {
+            // Close the descriptor if it is still ours to close: the
+            // ParcelFileDescriptor while it still owns it, the detached int
+            // while this function owns it, and nothing at all once the native
+            // side has taken it. Only one of the two is ever set, so this
+            // closes the descriptor exactly once.
+            tunPfd?.let { owned ->
+                try {
+                    owned.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not close the TUN descriptor: ${e.message}")
+                }
+            }
+            closeTunFd(tunFd)
+        }
+    }
+
+    /**
+     * Closes a descriptor this side still owns.
+     *
+     * Only for a descriptor that was never handed to the native side: closing
+     * a number the process has already handed on closes whatever holds that
+     * number now, and the failure is silent.
+     */
+    private fun closeTunFd(fd: Int?) {
+        if (fd == null) return
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not close the TUN descriptor $fd: ${e.message}")
         }
     }
 
@@ -1310,6 +1451,43 @@ class NexaVpnService : VpnService() {
          */
         private fun notifyBroken(reason: String) {
             brokenListener?.invoke(reason)
+        }
+
+        /**
+         * Push channel for the outcome of a start.
+         *
+         * The service is the only side that knows it: the request to start
+         * says nothing about the tunnel — `startForegroundService()` returns
+         * as soon as the request is delivered — and only the establish says
+         * whether the tunnel is up. The listener is told so once per start:
+         * true when the tunnel is up, false when the start failed.
+         *
+         * Registered for the duration of one start, so a start nobody is
+         * waiting for is reported to nobody.
+         */
+        @Volatile
+        @JvmStatic
+        private var startOutcomeListener: ((Boolean) -> Unit)? = null
+
+        fun setStartOutcomeListener(listener: ((Boolean) -> Unit)?) {
+            startOutcomeListener = listener
+        }
+
+        /**
+         * Removes the listener, unless it is already another one.
+         *
+         * The check is what keeps a caller that has given up from removing
+         * the listener of a start that came after it.
+         */
+        fun clearStartOutcomeListener(listener: (Boolean) -> Unit) {
+            if (startOutcomeListener === listener) startOutcomeListener = null
+        }
+
+        /**
+         * Reports the outcome of the start that is running.
+         */
+        private fun notifyStartOutcome(up: Boolean) {
+            startOutcomeListener?.invoke(up)
         }
     }
 }

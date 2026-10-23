@@ -22,6 +22,7 @@ import com.nexa.pipe.vpn.VpnSlot
 import com.nexa.pipe.vpn.VpnTakeoverChoice
 import com.nexa.pipe.vpn.VpnTakeoverDecision
 import com.nexa.pipe.vpn.VpnTakeoverPolicy
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -109,6 +110,146 @@ data class NodeConfig(
     val enrollment: NodeEnrollment? = null
 )
 
+/**
+ * The bearer token of a custom relay, and the relay it was issued for.
+ *
+ * A token is issued by one relay and is good for that relay alone: it is a
+ * bearer credential, and a relay that is handed a token it never issued
+ * learns it — and can use it against the relay that did issue it. So the
+ * token is kept together with the URL of the relay it belongs to, and that
+ * URL is what decides whether the token may still be sent.
+ *
+ * The URL is the one the token was issued for, not the one in use: a mode
+ * that does not use a relay URL at all leaves the token alone.
+ */
+data class RelayToken(
+    /** The token itself. Empty when there is none. */
+    val token: String = "",
+    /** The URL of the relay the token was issued for. Empty when there is none. */
+    val relayUrl: String = ""
+)
+
+/**
+ * What a change of the relay configuration does to the token.
+ *
+ * Named rather than a nullable string, because "the token stays" and "the
+ * token goes" are two different things and a caller has to say which one it
+ * means. A parameter that defaulted to the stored token carried a credential
+ * over to whatever relay came next — which is how an invite could take a
+ * bearer token to a host of its choosing.
+ */
+sealed interface RelayTokenChange {
+    /**
+     * The token stays bound to the relay it was issued for.
+     *
+     * It is kept while that relay is the one being configured, and dropped
+     * when the configuration names another relay: a token does not follow a
+     * change of relay.
+     */
+    data object Bound : RelayTokenChange
+
+    /**
+     * The token goes, whatever the relay is.
+     *
+     * For a change that brings no token of its own: an invite names a relay
+     * and carries no token for it, so the token this phone holds goes with
+     * the import rather than travelling to the relay the invite names.
+     */
+    data object Drop : RelayTokenChange
+
+    /** The token is this one, and it was issued for the relay being configured. */
+    data class Set(val token: String) : RelayTokenChange
+}
+
+/**
+ * The token that goes with a relay after a change of the configuration.
+ *
+ * The rule: a token belongs to the relay it was issued for, so it survives
+ * only while that relay is the one being configured. An explicit token
+ * belongs to the relay it comes with — that is where the user typed it — and
+ * a change that brings no token of its own takes the stored one with it.
+ *
+ * The URL is compared trimmed, because that is how the native side reads it:
+ * two spellings of one URL are one relay, and a token that goes to a
+ * different spelling of the same relay goes to the same relay.
+ */
+internal fun relayTokenAfter(
+    /** The URL of the relay being configured. */
+    url: String,
+    /** The token as it stands, and the relay it was issued for. */
+    stored: RelayToken,
+    /** What the change does to the token. */
+    change: RelayTokenChange
+): RelayToken {
+    val token = when (change) {
+        is RelayTokenChange.Set -> change.token
+        RelayTokenChange.Drop -> ""
+        RelayTokenChange.Bound ->
+            if (stored.token.isNotBlank() && stored.relayUrl.trim() == url.trim()) {
+                stored.token
+            } else {
+                ""
+            }
+    }
+    return RelayToken(token = token, relayUrl = if (token.isBlank()) "" else url.trim())
+}
+
+/**
+ * The token to hand to the native side for a relay.
+ *
+ * A token is sent to the relay it was issued for and to no other: one whose
+ * relay is not the one being configured is not sent at all. The native side
+ * has no way of knowing which relay issued a token, so the answer has to be
+ * given here.
+ */
+internal fun relayTokenToSend(stored: RelayToken, url: String): String =
+    if (stored.relayUrl.trim() == url.trim()) stored.token else ""
+
+/**
+ * Whether the tunnel of a start is up.
+ *
+ * The two things that say so, and only them: the service reported the
+ * establish as done, and the service's own flag says a tunnel is there.
+ *
+ * The request being delivered says nothing — `startForegroundService()`
+ * returns as soon as the request is delivered — and treating it as a tunnel
+ * is what made the UI say "connected" over a tunnel that was never
+ * established, and keep saying it when the establish failed.
+ *
+ * @param reportedUp what the service reported about the establish.
+ * @param serviceActive whether the service says a tunnel is there.
+ */
+internal fun tunnelIsUp(reportedUp: Boolean, serviceActive: Boolean): Boolean =
+    reportedUp && serviceActive
+
+/**
+ * Waits for the service to report whether the tunnel it was asked to build
+ * came up.
+ *
+ * Bounded, because a service that says nothing at all must not leave the UI
+ * saying "connecting" forever — and because a start nobody answered is not a
+ * tunnel: the attempt is a failure and is retried like any other.
+ *
+ * @param outcome what the service will report about the start.
+ * @param timeoutMs how long to wait for that report.
+ * @param log where the line about a wait that ran out goes.
+ * @return what the service reported: true when the tunnel is up.
+ */
+internal suspend fun awaitTunnelUp(
+    outcome: CompletableDeferred<Boolean>,
+    timeoutMs: Long,
+    log: (String) -> Unit
+): Boolean {
+    return try {
+        withTimeout(timeoutMs) { outcome.await() }
+    } catch (e: TimeoutCancellationException) {
+        // The service was asked and never answered. Not a cancellation of
+        // the caller: the wait is over, and the attempt failed.
+        log("The tunnel did not come up within ${timeoutMs}ms")
+        false
+    }
+}
+
 class VpnViewModel : ViewModel() {
     private val TAG = "VpnViewModel"
     private var settingsManager: SettingsManager? = null
@@ -123,6 +264,26 @@ class VpnViewModel : ViewModel() {
     val nodes = kotlinx.coroutines.flow.MutableStateFlow<List<NodeConfig>>(emptyList())
     val logMessages = kotlinx.coroutines.flow.MutableStateFlow<List<String>>(emptyList())
     val errorMessage = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    /**
+     * A message for the user about something the settings did.
+     *
+     * Set when a change of the relay configuration dropped a credential: the
+     * user has to know, because the relay that credential was issued for is
+     * not the one this phone talks to any more — and only the user can enter
+     * the token the new relay asks for.
+     */
+    val notice = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+
+    /**
+     * Takes the notice away once it has been shown.
+     *
+     * A message that is left behind is a message that is not shown the next
+     * time it is raised: the same text twice is the same value, and a state
+     * that does not change does not speak again.
+     */
+    fun clearNotice() {
+        notice.value = null
+    }
     val connectionStatusText = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val vpnPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
     val notificationPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
@@ -131,13 +292,25 @@ class VpnViewModel : ViewModel() {
     // no stable way to stop it promoting a connection to a direct path, so a switch that
     // claimed to would be a lie.
     val relayMode = kotlinx.coroutines.flow.MutableStateFlow("pinned") // "pinned", "default", "disabled", "custom"
+    /**
+     * The custom relay this phone is configured for.
+     *
+     * Kept whatever the mode is: the mode says whether that relay is in use,
+     * and dropping the URL would lose the user's relay — and the token issued
+     * for it — every time they looked at another mode.
+     */
     val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
     // Whether this device may ask n0 where a peer is. "n0" (the default) or
     // "none" — the second one costs the ability to reach a peer by Node ID
     // alone, because a ticket is what carries an address.
     val discoveryMode = kotlinx.coroutines.flow.MutableStateFlow("n0")
-    // Bearer token for a custom relay that asks for one. Never logged.
-    val relayAuthToken = kotlinx.coroutines.flow.MutableStateFlow("")
+    /**
+     * The bearer token of the custom relay, and the relay it was issued for.
+     *
+     * Never logged, and never sent to a relay other than the one it was
+     * issued for — see [relayTokenToSend].
+     */
+    val relayToken = kotlinx.coroutines.flow.MutableStateFlow(RelayToken())
 
     /**
      * What this install calls itself when it authenticates.
@@ -464,6 +637,14 @@ class VpnViewModel : ViewModel() {
         private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
         private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
 
+        // How long the UI waits for the service to report that the tunnel it
+        // asked for is up. Generous, because the establish waits for Android
+        // to register the VPN network and for the native side to take the
+        // descriptor — and because this budget is only reached when the
+        // service says nothing at all: a start that fails is reported, not
+        // waited out.
+        private const val TUNNEL_UP_TIMEOUT_MS = 60_000L
+
         // `error_vpn_taken_over` is what is shown when another proxy app (e.g.
         // Clash) owns the single tunnel slot Android allows per user.
 
@@ -486,9 +667,15 @@ class VpnViewModel : ViewModel() {
             val loadedNodes = manager.loadNodes()
             nodes.value = loadedNodes
             relayMode.value = manager.loadRelayMode()
-            relayUrl.value = manager.loadRelayUrl()
+            val loadedRelayUrl = manager.loadRelayUrl()
+            relayUrl.value = loadedRelayUrl
             discoveryMode.value = manager.loadDiscoveryMode()
-            relayAuthToken.value = manager.loadRelayAuthToken()
+            // The token and the relay it was issued for are stored together,
+            // so the URL it was saved with is the relay it belongs to.
+            relayToken.value = RelayToken(
+                token = manager.loadRelayAuthToken(),
+                relayUrl = loadedRelayUrl
+            )
             vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
             autoConnectOnBoot.value = manager.autoConnectOnBoot()
             vpnConsentMissing.value = manager.vpnConsentMissing()
@@ -582,7 +769,10 @@ class VpnViewModel : ViewModel() {
                 nodes = nodes.value,
                 relayMode = relayMode.value,
                 relayUrl = relayUrl.value,
-                relayToken = relayAuthToken.value,
+                // The token is stored with the relay it belongs to, and only
+                // with that one: a token that does not belong to the relay
+                // being stored is not stored at all.
+                relayToken = relayTokenToSend(relayToken.value, relayUrl.value),
                 discoveryMode = discoveryMode.value
             )
         )
@@ -729,14 +919,35 @@ class VpnViewModel : ViewModel() {
         addLog("Discovery mode updated: $mode")
     }
 
-    fun updateRelayConfig(mode: String, url: String, authToken: String = relayAuthToken.value) {
+    /**
+     * Sets the relay configuration.
+     *
+     * [token] says what happens to the token, and every caller says it: a
+     * token is issued by one relay and is good for that relay alone, so it
+     * does not follow a change of relay. The parameter that used to default
+     * to the stored token carried a bearer credential over to whatever relay
+     * came next — which is how an invite could take it to a host of its
+     * choosing.
+     *
+     * The URL is kept whatever the mode is: it names the custom relay this
+     * phone is configured for, and the mode says whether that relay is in
+     * use. A mode that does not use a relay URL at all leaves the token
+     * alone — changing the mode is not changing the relay.
+     */
+    fun updateRelayConfig(mode: String, url: String, token: RelayTokenChange) {
+        val before = relayToken.value
         relayMode.value = mode
-        // A URL only means anything in "custom"; keeping one around after a switch to
-        // another mode would leave a stale field behind.
-        relayUrl.value = if (mode == "custom") url else ""
-        relayAuthToken.value = if (mode == "custom") authToken else ""
+        relayUrl.value = url
+        val after = relayTokenAfter(url, before, token)
+        relayToken.value = after
         saveSettings()
-        addLog("Relay config updated: mode=${mode}, url=${relayUrl.value}")
+        addLog("Relay config updated: mode=$mode, url=$url")
+        if (before.token.isNotBlank() && after.token.isBlank()) {
+            addLog("Relay auth token cleared: a token belongs to the relay it was issued for")
+            // Empty only before the application has put its context in place.
+            val message = AppStrings.get(R.string.relay_token_cleared_notice)
+            if (message.isNotEmpty()) notice.value = message
+        }
     }
 
     /**
@@ -1243,9 +1454,10 @@ class VpnViewModel : ViewModel() {
 
                 var lastError: Exception? = null
 
-                // Retry loop: every attempt has an overall timeout of
-                // ATTEMPT_TIMEOUT_MS; on timeout or failure all resources are
-                // released before the next attempt.
+                // Retry loop: the proxy preparation of an attempt is bounded
+                // by ATTEMPT_TIMEOUT_MS and the wait for the tunnel by
+                // TUNNEL_UP_TIMEOUT_MS; on timeout or failure all resources
+                // are released before the next attempt.
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
                         withTimeout(ATTEMPT_TIMEOUT_MS) {
@@ -1258,7 +1470,13 @@ class VpnViewModel : ViewModel() {
                                     nodes = nodes.value,
                                     relayMode = relayMode.value,
                                     relayUrl = relayUrl.value,
-                                    relayAuthToken = relayAuthToken.value,
+                                    // The token goes to the relay it was issued
+                                    // for, and to no other: this is the last
+                                    // place where it can be held back.
+                                    relayAuthToken = relayTokenToSend(
+                                        relayToken.value,
+                                        relayUrl.value
+                                    ),
                                     // Whether this device may ask n0 where a peer
                                     // is. The plan carries it rather than the
                                     // connector reading the view model's state, so
@@ -1303,7 +1521,32 @@ class VpnViewModel : ViewModel() {
                             // thing that lets establish() past its own guard.
                             putExtra(NexaVpnService.EXTRA_ALLOW_TAKEOVER, allowTakeover)
                         }
-                        context.startForegroundService(intent)
+                        // The tunnel is up only when the service says so:
+                        // startForegroundService() delivers the request and
+                        // returns, so nothing is known about the tunnel until
+                        // the establish has finished. The listener is
+                        // registered before the request is sent, because the
+                        // service may finish the establish before this
+                        // coroutine gets to wait for the answer.
+                        val outcome = CompletableDeferred<Boolean>()
+                        val listener: (Boolean) -> Unit = { up -> outcome.complete(up) }
+                        NexaVpnService.setStartOutcomeListener(listener)
+                        try {
+                            context.startForegroundService(intent)
+                            val reportedUp = awaitTunnelUp(
+                                outcome,
+                                TUNNEL_UP_TIMEOUT_MS
+                            ) { Log.w(TAG, it) }
+                            if (!tunnelIsUp(reportedUp, NexaVpnService.isServiceActive)) {
+                                // The attempt is over and there is no tunnel:
+                                // the same thing a failed proxy preparation
+                                // is, and retried the same way.
+                                throw Exception(tunnelUpFailedMessage())
+                            }
+                        } finally {
+                            NexaVpnService.clearStartOutcomeListener(listener)
+                        }
+
                         isVpnRunning.value = true
                         addLog("Connected successfully (attempt $attempt/$MAX_CONNECT_ATTEMPTS)")
                         // The tunnel is up: start reporting how each backend is reached, and
@@ -1349,6 +1592,17 @@ class VpnViewModel : ViewModel() {
             }
         }
     }
+
+    /**
+     * What to tell the user when a start did not bring the tunnel up.
+     *
+     * The reason the service refused with, when there is one: another VPN
+     * app owning the slot is something the user can act on, and a generic
+     * "connection failed" would hide it.
+     */
+    private fun tunnelUpFailedMessage(): String =
+        NexaVpnService.lastRevokeReason
+            ?: AppStrings.get(R.string.error_connection_failed)
 
     fun disconnect(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {

@@ -8,6 +8,7 @@ use crate::service::ipc::{
     IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, BUILD_VERSION, IPC_SOCKET_PATH,
     MAX_IPC_LINE,
 };
+use crate::service::platform::account::AccountId;
 use crate::status::{ActiveFlowPage, ProxyStatus, FLOW_PAGE_LIMIT};
 use anyhow::{Context, Result};
 use std::fmt;
@@ -64,6 +65,14 @@ pub async fn await_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
 
 pub struct ServiceRunner {
     proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+
+    /// The account this service was installed for, when it knows one.
+    ///
+    /// Read once, at startup: the record is written by the install and cannot
+    /// change while the service runs. `None` when there is no record, and then
+    /// the service serves the account that owns the token it reads — which is
+    /// weaker than serving one account, and says so in the log.
+    installed_by: Option<AccountId>,
 }
 
 impl Default for ServiceRunner {
@@ -74,8 +83,20 @@ impl Default for ServiceRunner {
 
 impl ServiceRunner {
     pub fn new() -> Self {
+        let installed_by = crate::service::platform::install_owner::read_installed_by();
+        match &installed_by {
+            Some(account) => {
+                tracing::info!("This service serves the account it was installed for: {account}")
+            }
+            None => tracing::warn!(
+                "No installing account is on file: this service will serve any local account that \
+                 owns the token it reads. Reinstall the service to bind it to one account."
+            ),
+        }
+
         Self {
             proxy_manager: Arc::new(tokio::sync::RwLock::new(None)),
+            installed_by,
         }
     }
 
@@ -104,6 +125,10 @@ impl ServiceRunner {
             crate::service::ipc_token::service_token_paths()
         );
 
+        // The account this service was installed for. It cannot change while the service runs,
+        // so it is read once here and every connection is checked against it.
+        let installed_by = self.installed_by.clone();
+
         loop {
             let (mut stream, _) = listener
                 .accept()
@@ -112,8 +137,11 @@ impl ServiceRunner {
             tracing::debug!("Client connected");
 
             let proxy_manager = self.proxy_manager.clone();
+            let installed_by = installed_by.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(&mut stream, proxy_manager).await {
+                if let Err(e) =
+                    Self::handle_client(&mut stream, proxy_manager, installed_by.as_ref()).await
+                {
                     tracing::error!("Client handler error: {}", e);
                 }
             });
@@ -202,6 +230,7 @@ impl ServiceRunner {
     async fn handle_client(
         stream: &mut tokio::net::TcpStream,
         proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+        installed_by: Option<&AccountId>,
     ) -> Result<()> {
         // Nothing is served before the caller authenticates: this process runs
         // elevated, and a loopback socket says nothing about who dialled it.
@@ -300,10 +329,10 @@ impl ServiceRunner {
                 };
 
                 // Every published token is a candidate: the service cannot tell which account
-                // dialled it, so which one happens to be found first says nothing about which
-                // one the caller holds. The answer is bound to both nonces, so a recorded one
-                // is worth nothing on the next connection.
-                let known = crate::service::ipc_token::read_tokens()?;
+                // dialled it by looking at the socket, so it asks the kernel instead. The
+                // answer is bound to both nonces, so a recorded one is worth nothing on the
+                // next connection.
+                let known = crate::service::ipc_token::read_candidates()?;
                 let matched = crate::service::ipc_token::token_for_auth(
                     &known,
                     &service_nonce,
@@ -311,11 +340,53 @@ impl ServiceRunner {
                     &presented,
                 );
 
-                let token = match matched {
-                    Some(token) => {
+                // Who is on the other end of the socket. A loopback connection says nothing
+                // about that, and this process does root things on the caller's word, so the
+                // account has to be asked of the operating system rather than assumed.
+                let peer = match AccountId::peer_of(reader.get_mut()) {
+                    Some(account) => account,
+                    None => {
+                        tracing::warn!(
+                            "Refusing an IPC client whose account could not be identified"
+                        );
+                        let response = IpcResponse::Error(AppError::with_detail(
+                            codes::SERVICE_UNAUTHORIZED,
+                            "the account behind this connection could not be identified",
+                        ));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                };
+
+                let candidate = match matched {
+                    Some(candidate) => {
+                        // The token was right; the account has to be right too. This service
+                        // serves the account it was installed for and nobody else, because
+                        // what it does on the caller's word — the TUN device, the
+                        // machine-wide routes, the DNS hijack — is the machine's.
+                        let allowed = crate::service::platform::account::allows(
+                            installed_by,
+                            &peer,
+                            &candidate.owner,
+                        );
+                        if !allowed {
+                            tracing::warn!(
+                                "Refusing an IPC client that is not the account this service \
+                                 serves: the caller is {peer}, its token belongs to {}, and \
+                                 this service is installed for {installed_by:?}",
+                                candidate.owner
+                            );
+                            let response = IpcResponse::Error(AppError::with_detail(
+                                codes::SERVICE_UNAUTHORIZED,
+                                "this service is installed for another account",
+                            ));
+                            Self::write_response(reader.get_mut(), &response).await?;
+                            break;
+                        }
+
                         authenticated = true;
                         tracing::debug!("IPC client authenticated");
-                        token
+                        candidate
                     }
                     None if known.is_empty() => {
                         // No token published yet means no desktop session has asked for the
@@ -339,8 +410,11 @@ impl ServiceRunner {
 
                 // The caller proved itself; now this side proves itself back, so a caller
                 // that connected to something else on the port finds out.
-                let proof =
-                    crate::service::ipc_token::proof_mac(&token, &service_nonce, &caller_nonce);
+                let proof = crate::service::ipc_token::proof_mac(
+                    &candidate.token,
+                    &service_nonce,
+                    &caller_nonce,
+                );
                 Self::write_response(reader.get_mut(), &IpcResponse::AuthOk { mac: proof }).await?;
                 continue;
             }
@@ -579,6 +653,14 @@ impl ServiceRunner {
         };
 
         let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
+
+        // The interface name is checked here as well as on the desktop's side: this
+        // process is the one that runs it, as LocalSystem, and it does not trust a
+        // message from another process — the desktop is a peer, not a guarantee, and
+        // it may be an older build that never had this check.
+        if let Err(e) = require_tun_name(&tun_name) {
+            return IpcResponse::Error(e);
+        }
 
         // Explicit forwarding mode, same contract as process mode: requested TUN is honoured or
         // refused, never silently replaced by a local proxy.
@@ -896,10 +978,162 @@ pub fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
     }
 }
 
+/// The longest a TUN interface name may be.
+///
+/// One rule for every platform, so the desktop and the service cannot disagree
+/// about a name: they are the same machine, and a rule that differed between
+/// them would let a name through on one side and be refused on the other. 64 is
+/// a comfortable length for a Windows adapter alias. Linux's own limit
+/// (`IFNAMSIZ`, 16 with the terminator, so 15 usable) still applies there, and
+/// the kernel reports its own clear error when a name is too long for it — which
+/// is a better answer than a rule that would refuse a name Windows accepts.
+const MAX_TUN_NAME_LEN: usize = 64;
+
+/// Refuses `name` unless it is a name an interface can carry.
+///
+/// The name used to be written into a PowerShell script inside single quotes, in
+/// the service, which runs as LocalSystem: a quote in it ended the string, and
+/// what followed was PowerShell source. The rule here is deliberately narrow —
+/// letters, digits, `-`, `_` and `.`, and short — because the name is an
+/// identifier, not a text anybody has a reason to put punctuation in.
+///
+/// Shared by both start paths, like [`require_loopback`]: the desktop checks it
+/// so the caller gets the precise error, and the service checks it again because
+/// it is a separate process, on its own version, and it does not trust the
+/// desktop's answer.
+pub fn require_tun_name(name: &str) -> Result<(), AppError> {
+    let len = name.chars().count();
+
+    if len == 0 {
+        return Err(tun_name_refused("it is empty", len));
+    }
+    if len > MAX_TUN_NAME_LEN {
+        return Err(tun_name_refused(
+            &format!("it is {len} characters long, more than the {MAX_TUN_NAME_LEN} allowed"),
+            len,
+        ));
+    }
+    if let Some((at, _)) = name.char_indices().find(|(_, c)| !is_tun_name_char(*c)) {
+        return Err(tun_name_refused(
+            &format!(
+                "character {} is not a letter, a digit, '-', '_' or '.'",
+                at + 1
+            ),
+            len,
+        ));
+    }
+    // A leading dash is read as an option by the tools the name is handed to
+    // (`ip route … dev <name>`, `netsh … name=<name>`).
+    if name.starts_with('-') {
+        return Err(tun_name_refused(
+            "it starts with '-', which a tool could read as an option",
+            len,
+        ));
+    }
+    // "." and ".." are path names, not interface names.
+    if name.chars().all(|c| c == '.') {
+        return Err(tun_name_refused("it consists of dots only", len));
+    }
+
+    Ok(())
+}
+
+/// The characters a TUN interface name may be made of.
+fn is_tun_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// The error a refused interface name produces.
+///
+/// The value is not in the message, only its shape: the name is caller-supplied
+/// text, and a message that quotes it quotes whatever the caller put there.
+/// There is no credential in a name today, and the rule is worth keeping that
+/// way.
+fn tun_name_refused(reason: &str, len: usize) -> AppError {
+    AppError::with_detail(
+        codes::PROXY_START_FAILED,
+        format!(
+            "the TUN interface name is refused: {reason}. A name must be 1 to {MAX_TUN_NAME_LEN} \
+             characters long, made only of ASCII letters, digits, '-', '_' and '.', must not start \
+             with '-', and must not consist of dots only; the name given is {len} characters long"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{require_loopback, require_tun_subnet, IpcReadError, ServiceRunner, MAX_IPC_LINE};
+    use super::{
+        require_loopback, require_tun_name, require_tun_subnet, IpcReadError, ServiceRunner,
+        MAX_IPC_LINE,
+    };
     use crate::error::codes;
+
+    /// The interface name reaches a PowerShell script in the service, which runs as
+    /// LocalSystem. A name that is not a name must never get that far, and a name
+    /// that is one must still be accepted — the default is "nexa-tun".
+    #[test]
+    fn an_interface_name_that_is_not_a_name_is_refused() {
+        for accepted in [
+            "nexa-tun",
+            "nexa_tun",
+            "tun.0",
+            "TUN-0",
+            "a",
+            "0",
+            &"a".repeat(64),
+        ] {
+            assert!(
+                require_tun_name(accepted).is_ok(),
+                "{accepted:?} is a name and must be accepted"
+            );
+        }
+
+        for refused in [
+            "",
+            "ne'; whoami #",
+            "ne`n",
+            "ne$(whoami)",
+            "ne; whoami",
+            "ne\nmore",
+            "ne\r\nmore",
+            "ne x",
+            "ne/x",
+            "-ne",
+            ".",
+            "..",
+            "naïve",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                require_tun_name(refused).is_err(),
+                "{refused:?} is not a name and must be refused"
+            );
+        }
+    }
+
+    /// The error has to say what the rule is without repeating the value: the name
+    /// is caller-supplied text, and a message that quotes it quotes whatever the
+    /// caller put there.
+    #[test]
+    fn a_refused_interface_name_says_the_rule_and_not_the_value() {
+        let hostile = "ne'; a-secret";
+        let err = require_tun_name(hostile).expect_err("a name with a quote is refused");
+        let detail = err.detail.unwrap_or_default();
+
+        assert_eq!(err.code, codes::PROXY_START_FAILED);
+        assert!(
+            detail.contains("64"),
+            "the rule is not in the message: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("{} characters long", hostile.chars().count())),
+            "the shape is not in the message: {detail}"
+        );
+        assert!(
+            !detail.contains(hostile) && !detail.contains("a-secret"),
+            "the message repeats the value: {detail}"
+        );
+    }
 
     /// A caller that has not authenticated yet must not be able to make this
     /// buffer grow, which is the whole reason the reader is capped.
@@ -941,7 +1175,9 @@ mod tests {
         let manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::ProxyManager>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
         let handler =
-            tokio::spawn(async move { ServiceRunner::handle_client(&mut server, manager).await });
+            tokio::spawn(
+                async move { ServiceRunner::handle_client(&mut server, manager, None).await },
+            );
 
         // The service speaks first. Take the challenge and then send nothing at all.
         let mut challenge = Vec::new();

@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-three things land in this cycle so far: the device credential can be a **key**
+Thirty-four things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -51,7 +51,8 @@ connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
 handshake, the protocol is chosen at the handshake, the pool's ceiling
 is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
-codec, and a TLS hello that arrives in pieces is read until it is whole.
+codec, and a TLS hello that arrives in pieces is read until it is whole, and
+the TLS tunnel half-closes in both directions.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1079,6 +1080,24 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The TLS tunnel half-closes in both directions.** The tunnel's two
+  directions were raced against each other with a `select!`, and `select!`
+  cancels the branch that loses the race. A client that shut its write side
+  down — a half-close, which is a request and not an ending — ended the
+  direction that carried its bytes, and the direction carrying the backend's
+  answer was dropped a microsecond later. The client never saw the answer it
+  was waiting for, and the backend saw the connection disappear rather than a
+  clean end of stream.
+
+  The two directions are joined now rather than raced: each one shuts the
+  peer's write side down as it ends, and the tunnel waits for both. A
+  half-close is a request, not an ending, so the answer that follows it still
+  arrives. A direction that **fails** ends the tunnel at once — the transport
+  is broken and there is nothing to wait for — and a direction that ends
+  cleanly is given thirty seconds to finish before the tunnel gives up on it.
+  The idle window is measured over both directions, so a direction that is
+  quiet on its own does not end a tunnel the other one is still using.
+
 - **A TLS `ClientHello` that arrives in pieces is read until it is whole.** The
   record's length is in its first five bytes, so a hello whose first read
   carried fewer than five had nothing to measure — and the reading stopped
@@ -1451,6 +1470,20 @@ lookup, which is what a config written before the key existed does.
   at all.
 
 ### Security
+
+- **The constant-time utility crate is patched.** `ctutils` picked up an
+  advisory (RUSTSEC-2026-0385): the mask generation of `ctutils::Choice` was
+  `const fn` and so could not reuse the `asm!`-backed mask generation the
+  `cmov` crate uses, and the code it produced could include a branch on a
+  secret value on commonly used platforms. The `u128` comparisons it offers
+  branched as well on 32-bit targets. A branch on a secret is a covert channel,
+  and a covert channel is a way to read a secret.
+  Both lockfiles now pin 0.4.5, the release that carries the fix — it routes
+  the mask generation through `Choice::to_u8()`, which is an optimisation
+  barrier, and it special-cases the `u128` comparisons on 32-bit targets. The
+  crate reaches both trees through `digest` -> `curve25519-dalek` ->
+  `ed25519-dalek` -> `iroh`, and the supply chain job audits both of them.
+  Nothing else in either lockfile moves.
 
 - **The macOS bundles can be signed and notarized.** The desktop builds
   attached to GitHub releases were neither: an unsigned app is quarantined by

@@ -15,9 +15,13 @@
 pub const SERVICE_NAME: &str = "nexa-service";
 pub const SERVICE_DISPLAY_NAME: &str = "Nexa Service";
 
+pub mod account;
+pub mod install_owner;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::service::platform::account::AccountId;
 
 /// What the service manager says about the service — the three states the UI shows and the ones
 /// that decide which of install / start / stop / uninstall is offered.
@@ -53,13 +57,17 @@ pub fn service_state() -> ServiceState {
 
 #[cfg(not(windows))]
 use crate::error::codes;
-#[cfg(not(windows))]
+// The elevation channel is Unix's, but the argument that names the account the
+// service is installed for is read on every platform: the elevated child is
+// the one that reads it back, and it is the same child on all of them.
 use crate::service::elevate;
+#[cfg(any(windows, test))]
+use std::path::{Path, PathBuf};
 
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
     #[cfg(windows)]
-    return install();
+    return install(account::AccountId::current());
 
     #[cfg(not(windows))]
     return install_elevated();
@@ -160,6 +168,81 @@ fn sc_state(query_output: &str) -> ScState {
     }
 }
 
+// ==========================================================================
+// Windows: the binary the service control manager starts
+// ==========================================================================
+
+/// The name of the service binary, in the app's own directory and in the
+/// system-wide one alike.
+#[cfg(any(windows, test))]
+pub(crate) const SERVICE_BINARY_NAME: &str = "nexa-service.exe";
+
+/// The directory the service binary is copied into when the service is
+/// registered.
+///
+/// Under `C:\Program Files`, whose permissions give an ordinary user read and
+/// execute and nothing else. The control manager starts the file it is
+/// pointed at as SYSTEM without asking anybody, so *where* that file lives
+/// decides whether the user who installed the app can replace it — and a
+/// replaced service binary is a program of the user's choosing running as
+/// SYSTEM.
+#[cfg(any(windows, test))]
+pub(crate) fn system_service_dir(program_files: &Path) -> PathBuf {
+    program_files.join("Nexa").join("Service")
+}
+
+/// The system-wide copy of the service binary: the one the control manager is
+/// pointed at.
+#[cfg(any(windows, test))]
+pub(crate) fn system_service_binary(program_files: &Path) -> PathBuf {
+    system_service_dir(program_files).join(SERVICE_BINARY_NAME)
+}
+
+/// The binary the control manager is pointed at.
+///
+/// The system-wide copy, and never the app's own. The app installs itself per
+/// user, so the directory the per-user copy lives in belongs to the user who
+/// installed it — and the control manager starts what it is pointed at as
+/// SYSTEM, without asking anyone. An install that cannot put the binary
+/// somewhere the user cannot write has to fail rather than register a path the
+/// user owns, so there is deliberately no fallback to the per-user copy: that
+/// one is what the system-wide copy is made *from*.
+#[cfg(any(windows, test))]
+pub(crate) fn scm_service_binary(system: &Path, _per_user: &Path) -> PathBuf {
+    system.to_path_buf()
+}
+
+/// The app's own copies of the service binary, in the order they are tried.
+///
+/// The `resources` directory the app ships the binary in first, then the
+/// directory the app binary itself is in. Neither of them is what the control
+/// manager runs — see [`scm_service_binary`] — they are what the system-wide
+/// copy is made from.
+#[cfg(any(windows, test))]
+pub(crate) fn per_user_service_candidates(app_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        app_dir.join("resources").join(SERVICE_BINARY_NAME),
+        app_dir.join(SERVICE_BINARY_NAME),
+    ]
+}
+
+/// The first of `candidates` that is there, or `fallback` when none of them is.
+///
+/// `exists` is a parameter so the rule can be read on a machine that has none
+/// of those files.
+#[cfg(any(windows, test))]
+pub(crate) fn pick_service_binary(
+    candidates: &[PathBuf],
+    fallback: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    candidates
+        .iter()
+        .find(|candidate| exists(candidate))
+        .cloned()
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
 // The three halves of the registration. Each one is compiled only where it
 // applies — except for the two that the tests read on every platform, which
 // is why the module gates say `test` as well: the launchd plist and the
@@ -185,10 +268,75 @@ use windows::*;
 fn install_elevated() -> Result<(), AppError> {
     if elevate::is_privileged() {
         let exe_path = current_exe_string()?;
-        return dispatch_install(&exe_path);
+        let installing_by = installing_account();
+        return dispatch_install(&exe_path, installing_by.as_ref());
     }
 
-    elevate::run_self_elevated(&["--install"])
+    // The account the service is being installed for, named on the command
+    // line of the elevated child. The child cannot work it out for itself: it
+    // runs as root, and so does the account that asked for the elevation as
+    // far as the child is concerned.
+    let mut args: Vec<String> = vec!["--install".to_string()];
+    if let Some(account) = AccountId::current() {
+        args.push(elevate::INSTALL_AS_ARG.to_string());
+        args.push(account.to_text());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    elevate::run_self_elevated(&borrowed)
+}
+
+/// The account the service is being installed for, as far as this process can
+/// tell.
+///
+/// The elevated child is told on the command line; failing that, the elevation
+/// channel says so itself — `pkexec` sets `PKEXEC_UID` and `sudo` sets
+/// `SUDO_UID`, both to the user id of the account that asked for the
+/// elevation, and neither can be set by anybody but the channel itself.
+///
+/// `None` when nothing says, and then the service is installed without an
+/// account to serve: it falls back to serving the account that owns the token
+/// it reads, and says so loudly.
+#[cfg(not(windows))]
+fn installing_account() -> Option<AccountId> {
+    installing_account_from_args(std::env::args_os().skip(1)).or_else(installing_account_from_env)
+}
+
+/// The account named on the command line, if any.
+///
+/// Public so that the parsing can be checked on any platform, including the
+/// ones whose elevation channel has no environment variable to fall back on.
+pub fn installing_account_from_args<I>(args: I) -> Option<AccountId>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg.as_os_str() == std::ffi::OsStr::new(elevate::INSTALL_AS_ARG) {
+            return args
+                .next()
+                .and_then(|value| value.to_str().and_then(AccountId::parse));
+        }
+    }
+    None
+}
+
+/// The account the elevation channel says asked for it.
+///
+/// The channel is unix's, but the function is not unix's alone: the rest of
+/// the elevation path is `not(windows)`, and a target that is neither unix
+/// nor windows would not compile if this one were unix-only.
+#[cfg(not(windows))]
+fn installing_account_from_env() -> Option<AccountId> {
+    for name in ["PKEXEC_UID", "SUDO_UID"] {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        if let Ok(uid) = value.trim().parse::<u32>() {
+            return Some(AccountId::Unix(uid));
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -255,17 +403,17 @@ fn current_exe_string() -> Result<String, AppError> {
 }
 
 #[cfg(target_os = "linux")]
-fn dispatch_install(exe_path: &str) -> Result<(), AppError> {
-    install_service_linux(exe_path)
+fn dispatch_install(exe_path: &str, installing_by: Option<&AccountId>) -> Result<(), AppError> {
+    install_service_linux(exe_path, installing_by)
 }
 
 #[cfg(target_os = "macos")]
-fn dispatch_install(exe_path: &str) -> Result<(), AppError> {
-    install_service_macos(exe_path)
+fn dispatch_install(exe_path: &str, installing_by: Option<&AccountId>) -> Result<(), AppError> {
+    install_service_macos(exe_path, installing_by)
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn dispatch_install(_exe_path: &str) -> Result<(), AppError> {
+fn dispatch_install(_exe_path: &str, _installing_by: Option<&AccountId>) -> Result<(), AppError> {
     Err(AppError::new(codes::SERVICE_UNSUPPORTED_PLATFORM))
 }
 
@@ -317,9 +465,58 @@ fn dispatch_stop() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        linux_activation_args, macos_install_commands, macos_job_target, macos_plist_content,
-        sc_state, ScState, SERVICE_NAME,
+        installing_account_from_args, linux_activation_args, linux_service_exec_with,
+        linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
+        per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
+        system_service_binary, system_service_dir, ScState, SERVICE_BINARY_NAME, SERVICE_NAME,
     };
+    use crate::service::elevate;
+    use crate::service::platform::account::AccountId;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    /// systemd splits the `ExecStart=` line on whitespace, so a path with a space in it
+    /// arrives as two arguments and the unit fails to start — with `status=203/EXEC`,
+    /// which names neither the path nor the space that caused it.
+    ///
+    /// The macOS plist and the Windows `binPath` both carry such a path correctly. This is
+    /// the third spelling of the same thing, and it was the one that did not.
+    #[test]
+    fn the_systemd_unit_quotes_a_path_with_a_space_in_it() {
+        let unit = linux_unit_content("/home/me/My Apps/nexa");
+
+        let exec_start = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .expect("the unit carries an ExecStart");
+
+        assert!(
+            exec_start.starts_with("\"/home/me/My Apps/nexa\""),
+            "the path is not quoted: {exec_start}"
+        );
+    }
+
+    /// The same, for the development build that hosts the service itself instead of a
+    /// dedicated binary beside it: the argument after the path has to survive the quoting
+    /// too, or it becomes part of the path.
+    #[test]
+    fn the_systemd_exec_keeps_its_argument_outside_the_quotes() {
+        let exec = linux_service_exec_with("/home/me/My Apps/nexa", false);
+
+        assert_eq!(exec, "\"/home/me/My Apps/nexa\" --foreground");
+    }
+
+    /// A path with a quote or a backslash in it has to come out of the quoting unchanged:
+    /// systemd reads the line with its own word splitter, and inside double quotes a
+    /// backslash escapes the character after it.
+    #[test]
+    fn the_quoting_escapes_what_systemd_would_otherwise_take() {
+        // The packaged install points at the service binary beside the desktop
+        // executable, so the file name is replaced before the quoting.
+        let exec = linux_service_exec_with("/home/me/My \"Apps\"/nexa", true);
+
+        assert_eq!(exec, "\"/home/me/My \\\"Apps\\\"/nexa-service\"");
+    }
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
     /// "system-defined" and is shorter than the teardown allows itself — 5s on this
@@ -468,7 +665,9 @@ SERVICE_NAME: nexa-service
         assert_eq!(sc_state(query_running()), ScState::Running);
 
         assert_eq!(
-            sc_state("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"),
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"
+            ),
             ScState::Absent
         );
     }
@@ -504,5 +703,193 @@ SERVICE_NAME: nexa-service
 
         assert!(plist.contains(&format!("<string>{path}</string>")));
         assert!(plist.contains(&format!("com.nexa.{SERVICE_NAME}")));
+    }
+
+    /// The account the elevated copy is told about comes back off the command
+    /// line.
+    ///
+    /// The flag is the only channel macOS has: `do shell script … with
+    /// administrator privileges` carries no `PKEXEC_UID` and no `SUDO_UID`, so
+    /// a silent parse failure here installs the service for nobody — and a
+    /// service with no account is one that serves every local account that
+    /// owns a token.
+    ///
+    /// The flag comes after the verb, which is what the elevated child is
+    /// started with.
+    #[test]
+    fn the_install_as_flag_names_the_account() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from("1000"),
+        ]);
+
+        #[cfg(unix)]
+        assert_eq!(account, Some(AccountId::Unix(1000)));
+        #[cfg(windows)]
+        assert_eq!(account, Some(AccountId::Windows("1000".to_string())));
+    }
+
+    /// A flag with no value behind it names nobody.
+    ///
+    /// The value is what says which account; a flag on its own is a flag
+    /// somebody typed, and the install it starts has no account to serve.
+    #[test]
+    fn the_install_as_flag_with_no_value_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// An empty value names nobody either.
+    ///
+    /// Empty is the one value that is not an account on either platform: a
+    /// Unix account is a number and a Windows account is a non-empty string.
+    #[test]
+    fn the_install_as_flag_with_an_empty_value_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from(""),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// A value that is not an account at all names nobody.
+    ///
+    /// This is the Unix half of the rule: a uid is a number, and a string that
+    /// is not one is not an account. Every non-empty string is a spelling of a
+    /// SID on Windows, so there the equivalent is the empty value above.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_as_flag_that_is_not_a_uid_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from("not-a-uid"),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// A command line without the flag names nobody.
+    ///
+    /// The install that falls back to the environment variables is the Unix
+    /// one; the flag is what carries the account where there is no
+    /// environment variable to carry it.
+    #[test]
+    fn the_install_as_flag_that_is_not_there_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from("--elevated"),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// The directory the service binary is copied into, and the per-user copy it
+    /// is copied from.
+    ///
+    /// The two are what the whole fix is about: the control manager has to be
+    /// pointed at the first and never at the second, because the app installs
+    /// itself per user and the second therefore belongs to the user who
+    /// installed it.
+    fn windows_service_paths() -> (PathBuf, PathBuf) {
+        let program_files = Path::new("/Program Files");
+        let app_dir = Path::new("/home/user/AppData/Local/Programs/nexa");
+
+        (
+            system_service_binary(program_files),
+            app_dir.join(SERVICE_BINARY_NAME),
+        )
+    }
+
+    /// The path the control manager is given has to be the system-wide one.
+    ///
+    /// The control manager starts what it is pointed at as SYSTEM, without
+    /// asking anyone, so a path the user can write is a path that hands SYSTEM
+    /// to whoever writes there: the user who installed the app replaces the
+    /// binary and the next start of the service runs their program as SYSTEM.
+    #[test]
+    fn the_control_manager_is_pointed_at_the_system_wide_copy() {
+        let (system, per_user) = windows_service_paths();
+
+        let pointed_at = scm_service_binary(&system, &per_user);
+
+        assert_eq!(
+            pointed_at, system,
+            "the control manager has to run the copy in Program Files"
+        );
+        assert_ne!(
+            pointed_at, per_user,
+            "the per-user copy is in a directory the user owns; the control manager \
+             would run whatever they put there, as SYSTEM"
+        );
+    }
+
+    /// The resolution the control manager's path goes through prefers the
+    /// system-wide copy.
+    ///
+    /// The app's own copy is right there — it is what the system-wide one is
+    /// made from — and the answer is still the one the user cannot replace.
+    /// There is no "fall back to the per-user copy" case: an install that
+    /// cannot put the binary somewhere the user cannot write has to fail.
+    #[test]
+    fn the_service_binary_resolution_prefers_the_system_wide_copy() {
+        let (system, per_user) = windows_service_paths();
+        let app_dir = Path::new("/home/user/AppData/Local/Programs/nexa");
+
+        // The per-user copies are the source the system-wide one is made from.
+        let candidates = per_user_service_candidates(app_dir);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].file_name().and_then(|name| name.to_str()),
+            Some(SERVICE_BINARY_NAME)
+        );
+        assert!(
+            candidates[0]
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                == Some("resources"),
+            "the copy the app ships in its resources directory comes first"
+        );
+
+        // Both the system-wide copy and the app's own copy are there, and the
+        // resolution still picks the system-wide one.
+        let both = [system.clone(), per_user.clone()];
+        let picked = pick_service_binary(&both, &app_dir.join("nexa"), |path| {
+            path == system || path == per_user
+        });
+
+        assert_eq!(picked, system);
+    }
+
+    /// The system-wide copy lives under `Program Files`, in a directory of its
+    /// own.
+    ///
+    /// `Program Files` is the one place Windows already keeps the way this fix
+    /// needs: an ordinary user may read and execute what is in it, and may
+    /// not write to it.
+    #[test]
+    fn the_system_wide_copy_lives_under_program_files() {
+        let program_files = Path::new("/Program Files");
+
+        let dir = system_service_dir(program_files);
+        assert_eq!(
+            dir.strip_prefix(program_files).unwrap(),
+            Path::new("Nexa").join("Service"),
+            "the copy is not in the app's own directory, which the user owns"
+        );
+        assert_eq!(
+            system_service_binary(program_files)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(SERVICE_BINARY_NAME)
+        );
     }
 }

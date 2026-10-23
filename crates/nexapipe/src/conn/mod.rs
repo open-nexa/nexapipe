@@ -348,6 +348,28 @@ pub async fn handle_connection(
     let (mut revoked_rx, _peer) = match registered {
         Some((guard, revoked)) => (revoked, guard),
         None => {
+            // **The gate may have come on since the check above.** A reload
+            // that turns 2FA on closes the connections that never
+            // authenticated, and this one is not in the registry yet — so it
+            // has to be refused here, or it would go on serving with no
+            // credential at all.
+            //
+            // The value is read again rather than carried from the check
+            // above: that check is what decided this connection skipped the
+            // handshake, and it is stale by the time the handshake would
+            // have been over.
+            let gated_now = match &auth_state {
+                Some(auth) => auth.config().read().await.enabled,
+                None => false,
+            };
+            if gated_now {
+                tracing::warn!(
+                    "Connection from {} refused, 2FA was turned on while it was connecting",
+                    peer_id
+                );
+                conn.close(auth_close_code::REQUIRED.into(), b"2FA required");
+                return;
+            }
             let (revoked_tx, revoked_rx) = tokio::sync::watch::channel(false);
             (
                 revoked_rx,
@@ -421,16 +443,23 @@ pub async fn handle_connection(
                 // Cloned per stream rather than shared, because the task owns
                 // everything it reads.
                 let who_clone = identity.clone();
-                // One id per request, and one span wrapping it. Both are made
-                // here rather than inside the handler: `method`, `uri` and
-                // `status` are not known until the head has been read, and a
-                // span opened after that would not cover the part where the
-                // request is routed and admitted. The handler fills them in on
-                // `Span::current()` as it learns them.
-                let request_id = crate::log::next_request_id();
+                // One id and one span per **stream**.
+                //
+                // A stream is not a request: the L4 tunnel and the TLS
+                // session carry a flow, and the flow is what this id and this
+                // span describe. The L4 path fills `method`, `uri` and
+                // `status` in on `Span::current()` as it learns them.
+                //
+                // **The request path does not use this id.** Hyper serves
+                // keep-alive requests on one stream, so one stream may carry
+                // several requests, and an id minted here would be the id of
+                // every one of them. The request path mints an id per request
+                // instead — see `http::server::serve`, which does it in the
+                // service closure hyper calls once per request.
+                let stream_id = crate::log::next_request_id();
                 let span = tracing::info_span!(
-                    "request",
-                    id = %request_id,
+                    "stream",
+                    id = %stream_id,
                     method = tracing::field::Empty,
                     uri = tracing::field::Empty,
                     status = tracing::field::Empty,
@@ -449,7 +478,7 @@ pub async fn handle_connection(
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,
-                        &request_id,
+                        &stream_id,
                         who_clone,
                         protocol,
                     )
