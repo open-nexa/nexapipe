@@ -52,6 +52,7 @@ mod network;
 mod proxy;
 mod routing;
 mod status;
+#[cfg(all(feature = "tun-proxy", target_os = "android"))]
 mod tun;
 
 pub(crate) static RUNTIME: OnceCell<Runtime> = OnceCell::new();

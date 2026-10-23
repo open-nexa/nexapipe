@@ -4,6 +4,14 @@
 //! open the descriptor — and the virtual addresses are what the names inside
 //! the tunnel resolve to.
 
+use crate::jni_log;
+
+use jni::objects::{JClass, JString};
+use jni::sys::{jint, jstring};
+use jni::{Env, EnvUnowned};
+
+use super::*;
+
 /// The blocks the tunnel may claim, comma-separated: `198.18.0.0,198.19.0.0,…`.
 ///
 /// The list lives in the client library so both clients walk the same one: the
