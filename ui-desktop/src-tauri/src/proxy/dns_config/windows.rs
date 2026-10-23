@@ -193,18 +193,19 @@ pub(super) fn nrpt_remove_script(dns_ip: &str) -> String {
 /// internal resolvers, and another tunnel's, if one is running. No adapter is
 /// touched, so there is no IPv6 race to lose either.
 ///
-/// `Ok(false)` means "not installed", which is a call to fall back to the
-/// global hijack rather than a failure: whatever was added up to that point is
-/// taken back first, so the two cannot be in place at once — and taken back
-/// *for certain*, because the global restore resets the adapters and leaves the
-/// table alone. A rule that survives the fallback keeps its domains pointed at
-/// a resolver nothing answers from once the tunnel is down.
+/// `Ok(false)` means "not installed", which is a failure and not a downgrade:
+/// the caller refuses the scoped strategy rather than reaching for the global
+/// one. Whatever was added up to that point is taken back first, so the
+/// machine's own resolver is left in place — and taken back *for certain*,
+/// because the global restore resets the adapters and leaves the table alone.
+/// A rule that survives this keeps its domains pointed at a resolver nothing
+/// answers from once the tunnel is down.
 #[cfg(windows)]
 pub(super) fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> {
     let Some(domains) = crate::proxy::dns::scoped_domains(proxy_domains) else {
         tracing::info!(
             "the configured domains cannot each be given a rule of their own; \
-             every query goes to the TUN instead"
+             the scoped DNS strategy could not be installed"
         );
         return Ok(false);
     };
@@ -219,7 +220,8 @@ pub(super) fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> 
         Ok(dump) => dump,
         Err(e) => {
             tracing::warn!(
-                "Add-DnsClientNrptRule failed: {} — every query goes to the TUN instead",
+                "Add-DnsClientNrptRule failed: {} — the scoped DNS strategy could not be \
+                 installed",
                 e
             );
             clean_nrpt_rules(dns_ip)?;
@@ -229,7 +231,8 @@ pub(super) fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> 
     let routed = nrpt_namespaces_for(&parse_nrpt_rules(&dump), dns_ip);
     if !routes_every_domain(&routed, &namespaces) {
         tracing::warn!(
-            "{} of {} namespace(s) route to {} — every query goes to the TUN instead: {}",
+            "{} of {} namespace(s) route to {} — the scoped DNS strategy could not be \
+             installed: {}",
             routed.len(),
             namespaces.len(),
             dns_ip,
@@ -249,7 +252,7 @@ pub(super) fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> 
             if !routes_every_domain(&effective, &namespaces) {
                 tracing::warn!(
                     "{} of {} namespace(s) are routed to {} by the effective NRPT policy — \
-                     every query goes to the TUN instead: {}",
+                     the scoped DNS strategy could not be installed: {}",
                     effective.len(),
                     namespaces.len(),
                     dns_ip,
@@ -261,8 +264,8 @@ pub(super) fn set_scoped_dns_windows(dns_ip: &str, proxy_domains: &[String]) -> 
         }
         Err(e) => {
             tracing::warn!(
-                "the effective NRPT policy could not be read: {} — every query goes to the \
-                 TUN instead",
+                "the effective NRPT policy could not be read: {} — the scoped DNS strategy \
+                 could not be installed",
                 e
             );
             clean_nrpt_rules(dns_ip)?;
@@ -307,8 +310,9 @@ pub(super) fn remove_nrpt_rules(dns_ip: &str) -> Result<()> {
 /// The one attempt is not enough to trust: a rule can be held by a policy that
 /// has not reapplied yet, or by a table another process is writing. So it is
 /// tried twice, and a table that is still not clean afterwards is an error
-/// rather than a silent fallback — see [`set_scoped_dns_windows`], whose global
-/// fallback would otherwise inherit rules it cannot later remove.
+/// rather than a silent fallback — see [`set_scoped_dns_windows`], where a rule
+/// that survives keeps its domains pointed at a resolver nothing answers from
+/// once the tunnel is down.
 #[cfg(windows)]
 pub(super) fn clean_nrpt_rules(dns_ip: &str) -> Result<()> {
     match remove_nrpt_rules(dns_ip) {

@@ -31,9 +31,10 @@ pub(super) const DEFAULT_ROUTE_DOMAIN: &str = ".";
 /// answering it.
 ///
 /// `Ok(false)` means "not installed" — no resolved on this machine, or the
-/// setting did not take — which is a call to fall back rather than a failure.
-/// Whatever was set is reverted first, so the fallback starts from the machine's
-/// own configuration instead of from a half-installed hijack.
+/// setting did not take — which is a failure and not a downgrade: the caller
+/// refuses the scoped strategy rather than reaching for the global one.
+/// Whatever was set is reverted first, so the machine is left with its own
+/// configuration instead of with a half-installed hijack.
 #[cfg(target_os = "linux")]
 pub(super) fn set_scoped_dns_linux(
     interface: &str,
@@ -43,7 +44,7 @@ pub(super) fn set_scoped_dns_linux(
     let Some(domains) = crate::proxy::dns::scoped_domains(proxy_domains) else {
         tracing::info!(
             "the configured domains cannot each be routed to a link of their own; \
-             every query goes to the TUN instead"
+             the scoped DNS strategy could not be installed"
         );
         return Ok(false);
     };
@@ -62,7 +63,7 @@ pub(super) fn set_scoped_dns_linux(
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 tracing::warn!(
-                    "resolvectl {}: {} — every query goes to the TUN instead",
+                    "resolvectl {}: {} — the scoped DNS strategy could not be installed",
                     args.join(" "),
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
@@ -105,7 +106,8 @@ pub(super) fn set_scoped_dns_linux(
     if !resolver_in_place || !routed {
         revert_resolvectl(interface);
         tracing::warn!(
-            "the TUN link does not answer the configured domains — every query goes to the TUN instead"
+            "the TUN link does not answer the configured domains — the scoped DNS strategy \
+             could not be installed"
         );
         return Ok(false);
     }

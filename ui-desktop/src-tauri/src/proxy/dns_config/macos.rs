@@ -182,22 +182,23 @@ pub(super) fn resolver_nameserver(contents: &str) -> Option<String> {
 
 /// Points the configured domains at the TUN resolver, one file per domain.
 ///
-/// `Ok(false)` means "not installed", which is a call to fall back to the global
-/// hijack rather than a failure: whatever was written up to that point is taken
-/// back first, so the two cannot be in place at once.
+/// `Ok(false)` means "not installed", which is a failure and not a downgrade:
+/// the caller refuses the scoped strategy rather than reaching for the global
+/// one. Whatever was written up to that point is taken back first, so the
+/// machine's own resolver is left in place.
 #[cfg(target_os = "macos")]
 pub(super) fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Result<bool> {
     let Some(domains) = crate::proxy::dns::scoped_domains(proxy_domains) else {
         tracing::info!(
             "the configured domains cannot each be given a resolver of their own; \
-             every query goes to the TUN instead"
+             the scoped DNS strategy could not be installed"
         );
         return Ok(false);
     };
 
     if let Err(e) = std::fs::create_dir_all(RESOLVER_DIR) {
         tracing::warn!(
-            "could not create {}: {} — every query goes to the TUN instead",
+            "could not create {}: {} — the scoped DNS strategy could not be installed",
             RESOLVER_DIR,
             e
         );
@@ -210,12 +211,13 @@ pub(super) fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Re
     // resolver owned by somebody else, and this run leaves those alone by
     // choice, so nothing was taken over: reporting success would leave the UI
     // saying "running" while every domain the proxy exists for resolves at its
-    // real address and leaves in the clear. Falling back is the honest answer —
+    // real address and leaves in the clear. Failing is the honest answer —
     // it is also the same answer a failed install gives.
     if install.meant_to_write == 0 {
         tracing::warn!(
             "none of the {} configured domain(s) could be given a resolver of their own — \
-             another resolver already owns all of them; every query goes to the TUN instead",
+             another resolver already owns all of them; the scoped DNS strategy could not \
+             be installed",
             domains.len()
         );
         return Ok(false);
@@ -235,7 +237,8 @@ pub(super) fn set_scoped_dns_macos(dns_ip: &str, proxy_domains: &[String]) -> Re
             let _ = std::fs::remove_file(path);
         }
         tracing::warn!(
-            "{} of {} resolver(s) under {} took effect — every query goes to the TUN instead",
+            "{} of {} resolver(s) under {} took effect — the scoped DNS strategy could not \
+             be installed",
             install.in_effect,
             install.meant_to_write,
             RESOLVER_DIR
