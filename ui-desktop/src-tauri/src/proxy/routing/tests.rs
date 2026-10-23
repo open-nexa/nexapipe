@@ -37,13 +37,13 @@ fn a_foreign_address_inside_a_candidate_block_is_collected() {
     // Plain `ip addr show`, plus the trailing colon older iproute2 keeps even under `-o`:
     // an unindented header names the interface, indented lines carry the addresses.
     let multiline = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
-inet 127.0.0.1/8 scope host lo
+    inet 127.0.0.1/8 scope host lo
 2: enp3s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
-inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0
+    inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0
 9: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 9000
-inet 198.18.0.1/30 scope global tun0
+    inet 198.18.0.1/30 scope global tun0
 10: nexa-tun: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400
-inet 198.18.0.254/24 scope global nexa-tun
+    inet 198.18.0.254/24 scope global nexa-tun
 ";
     for text in [oneline, multiline] {
         let foreign = super::parse_ip_addr_addresses(text, "nexa-tun");

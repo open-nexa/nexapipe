@@ -55,8 +55,8 @@ impl Call {
 pub(super) fn has_ipv6_script() -> String {
     format!(
         "(Get-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -AddressFamily IPv6 \
-         -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} \
-         | Measure-Object).Count -gt 0"
+             -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} \
+             | Measure-Object).Count -gt 0"
     )
 }
 
@@ -66,7 +66,7 @@ pub(super) fn set_ipv6_script() -> String {
 
     format!(
         "New-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -IPAddress $env:{ADDRESS_VAR} \
-         -PrefixLength {TUN_V6_PREFIX_LEN} -ErrorAction Stop"
+             -PrefixLength {TUN_V6_PREFIX_LEN} -ErrorAction Stop"
     )
 }
 
@@ -74,8 +74,8 @@ pub(super) fn set_ipv6_script() -> String {
 pub(super) fn remove_ipv6_script() -> String {
     format!(
         "Get-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -AddressFamily IPv6 \
-         -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} | \
-         Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
+             -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} | \
+             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
     )
 }
 
