@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 /// How long a client may take to spell out a complete preface.
 ///
@@ -435,7 +435,8 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
-    let mut backend_stream = match connect(&host, port, connect_timeout).await {
+    let mut backend_stream = match crate::backend_conn::connect(&host, port, connect_timeout).await
+    {
         Ok(s) => s,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
@@ -682,62 +683,6 @@ where
     Ok(())
 }
 
-/// Dials a backend within `[timeouts] connect_secs`.
-///
-/// One deadline for every tunnel and every passthrough, because they are the
-/// same action: one TCP dial toward one backend. They used to carry three copies
-/// of ten seconds, kept in step by whoever happened to look.
-async fn connect(host: &str, port: u16, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
-    // The name is resolved through the cache, so this dial does not wait for a
-    // `getaddrinfo` that the flow before it already paid for. The addresses
-    // are then tried in turn, which is what `TcpStream::connect((host, port))`
-    // did too.
-    // One deadline for the whole thing — the resolution and every address it
-    // names — so a backend with many addresses cannot multiply the budget.
-    let deadline = tokio::time::Instant::now() + connect_timeout;
-    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out resolving backend {host}:{port}"))?
-        // The resolver's own words are part of the message the log prints —
-        // it prints the top-level message — and the error they came from
-        // stays the source of the chain.
-        .map_err(|e| {
-            let message = format!("cannot resolve backend {host}:{port}: {e}");
-            e.context(message)
-        })?;
-
-    connect_addrs(&addrs, deadline).await.map_err(|e| {
-        let message = format!("failed to connect to backend {host}:{port}: {e}");
-        e.context(message)
-    })
-}
-
-/// Tries the addresses in turn, under one deadline.
-///
-/// The deadline is handed in rather than computed here: the resolution that
-/// produced the addresses is inside the same budget, so a backend with many
-/// addresses cannot multiply it.
-async fn connect_addrs(
-    addrs: &[SocketAddr],
-    deadline: tokio::time::Instant,
-) -> anyhow::Result<TcpStream> {
-    let mut failure = None;
-    for addr in addrs {
-        match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                // A tunnel carries data with its own request/response pacing;
-                // Nagle would only add latency.
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => failure = Some(anyhow::anyhow!("{addr}: {e}")),
-            Err(_) => failure = Some(anyhow::anyhow!("{addr}: timed out")),
-        }
-    }
-
-    Err(failure.unwrap_or_else(|| anyhow::anyhow!("there was no address to try")))
-}
-
 /// The address a UDP flow sends its datagrams to.
 ///
 /// Resolved every time, and not through the cache. A UDP socket has no dial:
@@ -765,29 +710,12 @@ async fn resolve_udp_target(host: &str, port: u16) -> anyhow::Result<SocketAddr>
 /// which port it dials, because guessing it would be a silent misconfiguration.
 /// `config::validate_backend` rejects a backend that leaves the port out, so failing
 /// here means the config was never validated.
+///
+/// The same parser the passthrough uses reads it, with the other reading of
+/// what a backend without a port means — see
+/// [`crate::backend_conn::PortDefault`].
 fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
-    let backend = backend.trim();
-    if backend.is_empty() {
-        return None;
-    }
-
-    if backend.contains("://") {
-        let url = url::Url::parse(backend).ok()?;
-        let host = url.host_str()?;
-        if host.is_empty() {
-            return None;
-        }
-        return url.port().map(|port| (host.to_string(), port));
-    }
-
-    let (host, port) = backend.rsplit_once(':')?;
-    if host.is_empty() {
-        return None;
-    }
-    // A configured IPv6 literal is written `[::1]:5432`; the resolver wants it bare,
-    // and `Url` already hands it back that way for the `scheme://` spelling.
-    let host = host.trim_matches(['[', ']']);
-    port.parse().ok().map(|port| (host.to_string(), port))
+    crate::backend_conn::parse_backend_addr(backend, crate::backend_conn::PortDefault::Required)
 }
 
 async fn write_status<W>(writer: &mut W, status: Status) -> io::Result<()>

@@ -12,10 +12,10 @@
 //! an HTTP request can never start with it.
 
 use crate::auth::ClientAcl;
+use crate::backend_conn::PortDefault;
 use crate::routes::RoutingTable;
 use crate::stream_util::{DuplexIroh, copy_both_ways, read_more_by};
 use std::io;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -54,7 +54,7 @@ pub async fn handle_iroh_stream(
         return Ok(());
     };
 
-    let mut backend = connect(&host, port, config.timeouts().connect).await?;
+    let mut backend = crate::backend_conn::connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
     // Read off the client before the copy below ever saw the stream, so no
     // funnel is going to do it: without this line the ClientHello — the only
@@ -101,7 +101,7 @@ pub async fn handle_tcp_stream(
         return Ok(());
     };
 
-    let mut backend = connect(&host, port, config.timeouts().connect).await?;
+    let mut backend = crate::backend_conn::connect(&host, port, config.timeouts().connect).await?;
     backend.write_all(&handshake).await?;
 
     // The same copy as the iroh path above, with the same reasoning: the wait
@@ -137,62 +137,6 @@ where
         }
         Err(e) => Err(e.into()),
     }
-}
-
-/// One TCP dial toward one backend, under `[timeouts] connect_secs`.
-async fn connect(
-    host: &str,
-    port: u16,
-    connect_timeout: Duration,
-) -> anyhow::Result<tokio::net::TcpStream> {
-    // The name is resolved through the cache, so this dial does not wait for a
-    // `getaddrinfo` that the connection before it already paid for. The
-    // addresses are then tried in turn, which is what
-    // `TcpStream::connect((host, port))` did too.
-    // One deadline for the whole thing — the resolution and every address it
-    // names — so a backend with many addresses cannot multiply the budget.
-    let deadline = tokio::time::Instant::now() + connect_timeout;
-    let addrs = tokio::time::timeout_at(deadline, crate::dns::resolve_to(host, port))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out resolving backend {}:{}", host, port))?
-        // The resolver's own words are part of the message the log prints —
-        // it prints the top-level message — and the error they came from
-        // stays the source of the chain.
-        .map_err(|e| {
-            let message = format!("cannot resolve backend {}:{}: {}", host, port, e);
-            e.context(message)
-        })?;
-
-    connect_addrs(&addrs, deadline).await.map_err(|e| {
-        let message = format!("failed to connect to backend {}:{}: {}", host, port, e);
-        e.context(message)
-    })
-}
-
-/// Tries the addresses in turn, under one deadline.
-///
-/// The deadline is handed in rather than computed here: the resolution that
-/// produced the addresses is inside the same budget, so a backend with many
-/// addresses cannot multiply it.
-async fn connect_addrs(
-    addrs: &[SocketAddr],
-    deadline: tokio::time::Instant,
-) -> anyhow::Result<tokio::net::TcpStream> {
-    let mut failure = None;
-    for addr in addrs {
-        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                // The tunnel carries TLS records; Nagle would only add latency
-                // here.
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => failure = Some(anyhow::anyhow!("{}: {}", addr, e)),
-            Err(_) => failure = Some(anyhow::anyhow!("{}: timed out", addr)),
-        }
-    }
-
-    Err(failure.unwrap_or_else(|| anyhow::anyhow!("there was no address to try")))
 }
 
 /// Reads until the first TLS record is complete.
@@ -335,55 +279,17 @@ async fn resolve_backend(
 /// speaks TLS itself — so it is accepted and ignored, which keeps the backend
 /// list in the same shape as the HTTP routes.
 ///
+/// A backend that does not name a port gets the scheme's own, and a bare host
+/// gets the TLS port: the bytes are forwarded to a listener that terminates
+/// TLS, and `https://host` is the HTTPS port. The L4 path reads the same
+/// address and refuses that reading — see [`crate::backend_conn::PortDefault`]
+/// — but it reads it from the same parser.
+///
 /// Public because the config check uses it too: the route is dialled with this
 /// function, so validating with anything else is how a backend passes at
 /// startup and fails on the first connection.
 pub fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
-    let backend = backend.trim();
-    if backend.is_empty() {
-        return None;
-    }
-
-    if backend.contains("://") {
-        let url = url::Url::parse(backend).ok()?;
-        let host = url.host_str()?.to_string();
-        let port = url.port_or_known_default()?;
-        return Some((strip_ipv6_brackets(&host).to_string(), port));
-    }
-
-    // A bracketed IPv6 literal: the colons inside the address come before the
-    // one that separates the port, so the brackets have to go first.
-    if let Some(rest) = backend.strip_prefix('[') {
-        let Some((host, tail)) = rest.split_once(']') else {
-            // An unclosed bracket is not a host name anyone can resolve.
-            return None;
-        };
-        if host.is_empty() {
-            return None;
-        }
-        return match tail.strip_prefix(':') {
-            Some(port) => port.parse().ok().map(|p| (host.to_string(), p)),
-            // No port: the TLS port, the same default a bare host gets.
-            None => Some((host.to_string(), 443)),
-        };
-    }
-
-    match backend.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => port.parse().ok().map(|p| (host.to_string(), p)),
-        // A bare host means the TLS port, which is the only thing a
-        // passthrough route ever points at.
-        _ => Some((backend.to_string(), 443)),
-    }
-}
-
-/// Drops the brackets around an IPv6 literal.
-///
-/// Both forms a config can use keep them — `Url::host_str()` hands back
-/// `[::1]`, and so does splitting `[::1]:443` on the colon — and leaving them
-/// on makes the resolver look for a host actually called `[::1]`, which no
-/// backend ever is. The L4 path already did this.
-fn strip_ipv6_brackets(host: &str) -> &str {
-    host.trim_matches(['[', ']'])
+    crate::backend_conn::parse_backend_addr(backend, PortDefault::SchemeOrBare { bare: 443 })
 }
 
 #[cfg(test)]
@@ -392,6 +298,7 @@ mod tests {
     use crate::config::{RouteMode, Timeouts, TimeoutsConfig};
     use crate::lb::LoadBalancingStrategy;
     use crate::routes::Route;
+    use std::net::SocketAddr;
 
     #[tokio::test]
     async fn the_configured_tls_hello_deadline_closes_a_stalled_hello() {
@@ -699,7 +606,7 @@ mod tests {
         let refused = refusing_addr().await;
 
         let started = std::time::Instant::now();
-        let stream = connect_addrs(
+        let stream = crate::backend_conn::connect_addrs(
             &[refused, accepting],
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
         )
