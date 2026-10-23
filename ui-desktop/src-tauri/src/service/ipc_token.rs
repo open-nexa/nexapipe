@@ -1,12 +1,13 @@
 //! The shared secret an IPC client must present before the service obeys it.
 //!
-//! `ServiceRunner` listens on a loopback TCP port and runs elevated — SYSTEM on
-//! Windows, root under systemd/launchd — while every IPC message is either
-//! harmless (`GetStatus`) or drastic (`StartProxy` with `use_tun`, which takes
-//! over routing and DNS). Nothing about a loopback socket identifies its peer,
-//! so a message arriving here used to be obeyed on trust: **any** process the
-//! user ran could ask the elevated service to rewrite that user's routing
-//! table. The token is what replaces that trust.
+//! `ServiceRunner` listens on a socket and runs elevated — SYSTEM on Windows,
+//! root under systemd/launchd — while every IPC message is either harmless
+//! (`GetStatus`) or drastic (`StartProxy` with `use_tun`, which takes over
+//! routing and DNS). Nothing about the connection identifies its peer, so a
+//! message arriving here used to be obeyed on trust: **any** process the user
+//! ran could ask the elevated service to rewrite that user's routing table.
+//! The token is what replaces that trust, and the account behind the
+//! connection is what says whose traffic it may carry.
 //!
 //! # Who owns the token
 //!
@@ -91,6 +92,21 @@ pub fn token_path() -> PathBuf {
     base.join(TOKEN_DIR).join(TOKEN_FILE)
 }
 
+/// A file in the app's per-user runtime directory, beside the token.
+///
+/// The single-instance guard's files live here too: the token is what the
+/// elevated service reads, and the guard is what keeps a second copy of the
+/// app from starting. Both are per-user state, and one directory keeps them
+/// together — and keeps them apart from each other, because they are
+/// different files that never touch the same bytes.
+pub fn runtime_file(name: &str) -> PathBuf {
+    let token = token_path();
+    match token.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 /// The token this desktop session uses, generating one if there is none yet.
 ///
 /// Called by the UI before its first IPC request. An existing file is reused so
@@ -166,11 +182,52 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
-        // It was already there. Whether that directory is private enough is
-        // the service's rule to refuse, not this one's to change.
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        // It was already there — possibly left by an older build that made it
+        // with `create_dir_all`, which leaves it at 0777 minus the umask.
+        // Under a umask of 002 that is 0775, and the service then refuses the
+        // token it is reading, so the account that owns the directory is
+        // locked out of its own service until it runs `chmod` by hand and
+        // finds the warning in the service log first.
+        //
+        // The directory is the account's own, so it may be tightened: the
+        // mode the service insists on is asked for. A directory somebody else
+        // owns is left exactly as it is — that one is the service's rule to
+        // refuse, not this one's to change.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => tighten_private_dir(path),
         Err(e) => Err(e),
     }
+}
+
+/// Tightens a directory the account owns to the mode the service insists on.
+///
+/// Only a directory this account owns is touched, and only when it is
+/// writable by group or other: a directory that is already private keeps the
+/// mode it has, so a stricter one set by hand survives.
+///
+/// A directory that cannot be stat'ed is not touched, and the error is
+/// reported: the caller asked for a directory it could not make private, and
+/// saying so is better than a token written into a directory whose mode
+/// nobody knows.
+#[cfg(unix)]
+fn tighten_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    // A symlink is not a directory, and following it would tighten whatever
+    // it points at rather than the name the token is written under.
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    // Not ours: the service's rule to refuse, not this one's to change.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Ok(());
+    }
+    // Already private — a stricter mode than the one asked for is kept.
+    if metadata.permissions().mode() & 0o022 == 0 {
+        return Ok(());
+    }
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// The token's directory on Windows is the account's own, and its access is
@@ -831,15 +888,64 @@ mod tests {
         assert_eq!(candidate.path, path);
     }
 
+    /// A directory the desktop owns and that an older build left writable by
+    /// others is tightened, so that the account is not locked out of its own
+    /// service.
+    ///
+    /// Older builds made the directory with `create_dir_all`, which leaves it
+    /// at 0777 minus the umask — 0775 under the umask of 002 that a
+    /// user-private-group account has. The service refuses a token in such a
+    /// directory, and the only sign of that was a warning in the service log
+    /// that the account had to find and act on by hand.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_desktop_owns_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nexapipe-open-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The mode an older build left behind: writable by group and other.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let path = dir.join("ipc.token");
+        ensure_token_at(&path).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a directory the account owns must be made private to it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A token in a directory another account can write into is not a
     /// candidate at all: the service would be reading a file that account
     /// could have put there.
+    ///
+    /// The directory the desktop owns is tightened, but the directory *above*
+    /// it is not the desktop's to change — and one that is world-writable
+    /// lets another account replace the directories below it, which would
+    /// make the rule about the token's own directory a statement about a
+    /// directory the attacker owns.
     #[cfg(unix)]
     #[test]
     fn a_token_in_a_world_writable_directory_is_not_a_candidate() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("nexapipe-open-{}", fastrand::u64(..)));
+        // `/tmp` is world-writable on both platforms the desktop ships for,
+        // and it is the case that matters: it is where a service with neither
+        // `HOME` nor `XDG_RUNTIME_DIR` ends up.
+        let root = std::path::Path::new("/tmp");
+        assert!(
+            std::fs::metadata(root)
+                .map(|m| m.permissions().mode() & 0o002 != 0)
+                .unwrap_or(false),
+            "this test needs a world-writable directory to sit in"
+        );
+
+        let dir = root.join(format!("nexapipe-open-{}", fastrand::u64(..)));
         std::fs::create_dir_all(&dir).unwrap();
         // The mode the service refuses: writable by group and other.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -849,7 +955,7 @@ mod tests {
 
         assert!(
             super::read_candidate_at(&path).unwrap().is_none(),
-            "a token in a directory anybody may write into is not a candidate"
+            "a token under a world-writable directory is not a candidate"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1052,5 +1158,76 @@ mod tests {
         );
         // The misleading one is still tried — it costs a directory scan and nothing else.
         assert!(roots.contains(&PathBuf::from(r"C:\Windows\System32\config")));
+    }
+
+    /// A directory an older build left group-writable is tightened to the
+    /// mode the service insists on.
+    ///
+    /// Older builds made the directory with `create_dir_all`, which leaves it
+    /// at 0777 minus the umask — 0775 under the umask of 002 that a
+    /// user-private-group account has — and the service then refuses the
+    /// token it finds there. The account that owns the directory is locked
+    /// out of its own service until it runs `chmod` by hand, and the only
+    /// sign of that is a warning in the service log.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_an_older_build_left_group_writable_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("nexapipe-private-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a directory for the test");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775))
+            .expect("the directory is made group-writable");
+
+        super::create_private_dir(&directory).expect("the directory is made private");
+
+        let mode = std::fs::metadata(&directory)
+            .expect("the directory is stat'ed")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the directory must be private to the account that owns it"
+        );
+
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    /// A directory that is already private keeps the mode it has, so a
+    /// stricter one set by hand is not undone.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_is_already_private_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "nexapipe-private-dir-strict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a directory for the test");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .expect("the directory is made read-only");
+
+        super::create_private_dir(&directory).expect("the directory is left as it is");
+
+        let mode = std::fs::metadata(&directory)
+            .expect("the directory is stat'ed")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o500,
+            "a stricter mode than the one asked for must survive"
+        );
+
+        // The directory was made read-only, so it is made writable again
+        // before it is removed.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made writable again");
+        let _ = std::fs::remove_dir(&directory);
     }
 }

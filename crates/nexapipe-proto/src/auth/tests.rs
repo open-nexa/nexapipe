@@ -12,8 +12,9 @@ use crate::secret::SecretString;
 /// credential is a block the credential survived in.
 mod heap {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::fmt;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// The bytes the probe is watching for.
     ///
@@ -40,6 +41,12 @@ mod heap {
 
     /// Whether the needle was seen in a block on its way out.
     static FOUND: AtomicBool = AtomicBool::new(false);
+
+    /// The size of the block the needle was seen in.
+    static FOUND_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+    /// The offset of the needle in that block.
+    static FOUND_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
     /// The allocator that watches.
     struct Probe;
@@ -74,7 +81,7 @@ mod heap {
     /// never written, and a reference to it would be a reference to
     /// uninitialized memory.
     fn scan(ptr: *mut u8, len: usize) {
-        if !WATCHING.load(Ordering::Relaxed) || len < NEEDLE.len() {
+        if len < NEEDLE.len() {
             return;
         }
         let needle = NEEDLE.as_bytes();
@@ -93,20 +100,62 @@ mod heap {
                 }
             }
             if matched {
+                if std::env::var_os("NEXAPIPE_HEAP_TRACE").is_some() {
+                    eprintln!(
+                        "PROBE: needle in a freed block of {len} bytes at offset {start} (watching={})",
+                        WATCHING.load(Ordering::Relaxed)
+                    );
+                }
                 FOUND.store(true, Ordering::SeqCst);
+                FOUND_SIZE.store(len, Ordering::SeqCst);
+                FOUND_OFFSET.store(start, Ordering::SeqCst);
                 return;
             }
         }
     }
 
-    /// Runs `body` with the heap watched, and says whether the needle was
-    /// left behind in it.
-    pub fn watched<R>(body: impl FnOnce() -> R) -> bool {
+    /// Where the needle was found.
+    ///
+    /// The size of the block and the offset of the needle in it: the two
+    /// numbers that say which allocation it was. A block of a few dozen
+    /// bytes is a secret's own string; a block of a few thousand is a
+    /// buffer a message was written into.
+    #[derive(Debug)]
+    pub struct Residue {
+        /// The size of the block the needle was found in.
+        pub size: usize,
+        /// The offset of the needle in that block.
+        pub offset: usize,
+    }
+
+    impl fmt::Display for Residue {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "a block of {} bytes, the credential {} bytes into it",
+                self.size, self.offset
+            )
+        }
+    }
+
+    /// Runs `body` with the heap watched, and says what was left behind.
+    ///
+    /// `None` is the answer a test wants: nothing that holds the needle
+    /// was let go without being wiped. `Some` says where the needle was
+    /// found.
+    pub fn watched<R>(body: impl FnOnce() -> R) -> Option<Residue> {
         WATCHING.store(true, Ordering::SeqCst);
         FOUND.store(false, Ordering::SeqCst);
         body();
         WATCHING.store(false, Ordering::SeqCst);
-        !FOUND.load(Ordering::SeqCst)
+        if FOUND.load(Ordering::SeqCst) {
+            Some(Residue {
+                size: FOUND_SIZE.load(Ordering::SeqCst),
+                offset: FOUND_OFFSET.load(Ordering::SeqCst),
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -351,7 +400,7 @@ fn the_serialized_credential_does_not_survive_in_the_heap() {
         public_key: None,
     };
 
-    let clean = heap::watched(|| {
+    let residue = heap::watched(|| {
         // Every form a message travels in, and the message itself.
         drop(start.to_bytes().expect("serializable"));
         drop(start.to_payload(Format::Json).expect("writable"));
@@ -368,8 +417,12 @@ fn the_serialized_credential_does_not_survive_in_the_heap() {
     });
 
     assert!(
-        clean,
-        "the credential was still in a freed block of the heap"
+        residue.is_none(),
+        "the credential was still in a freed block of the heap: {}",
+        residue
+            .as_ref()
+            .map(heap::Residue::to_string)
+            .unwrap_or_default()
     );
 }
 
@@ -396,7 +449,7 @@ fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
         public_key: None,
     };
 
-    let clean = heap::watched(|| {
+    let residue = heap::watched(|| {
         let result = start.to_payload(Format::Binary);
         assert!(result.is_err(), "the message is too long to be written");
         drop(result);
@@ -404,8 +457,13 @@ fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
     });
 
     assert!(
-        clean,
-        "the credential was still in a freed block of the heap after the serialization failed"
+        residue.is_none(),
+        "the credential was still in a freed block of the heap after the \
+         serialization failed: {}",
+        residue
+            .as_ref()
+            .map(heap::Residue::to_string)
+            .unwrap_or_default()
     );
 }
 
@@ -435,14 +493,26 @@ fn the_received_credential_does_not_survive_in_the_heap() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let json = format!(
-        r#"{{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"{secret}","algorithm":"sha1","digits":6,"period":30}}"#,
-        secret = heap::NEEDLE
-    );
+    // The credential this test reads is a credential in the heap like any
+    // other, and it is wiped when it goes out of scope. A block that
+    // still holds it would be handed back by the allocator with the
+    // credential in it, and the next test's probe would find it there
+    // and report a leak that is not one.
+    //
+    // The buffers are given the room they need up front, so that they do
+    // not grow: a buffer that grows hands the block it outgrows back to
+    // the allocator, and that block holds the credential too.
+    let mut json = Zeroizing::new(String::with_capacity(160));
+    json.push_str(r#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":""#);
+    json.push_str(heap::NEEDLE);
+    json.push_str(r#"","algorithm":"sha1","digits":6,"period":30}"#);
 
     // The binary form, written out by hand: an ENROLL_ISSUE, the client
     // id, the secret, the algorithm, the digits and the period.
-    let mut binary = vec![VERSION_BINARY, kind::ENROLL_ISSUE, 0x00];
+    let mut binary = Zeroizing::new(Vec::with_capacity(64));
+    binary.push(VERSION_BINARY);
+    binary.push(kind::ENROLL_ISSUE);
+    binary.push(0x00);
     binary.extend_from_slice(&10u16.to_le_bytes());
     binary.extend_from_slice(b"client-001");
     binary.extend_from_slice(&(heap::NEEDLE.len() as u16).to_le_bytes());
@@ -451,14 +521,26 @@ fn the_received_credential_does_not_survive_in_the_heap() {
     binary.extend_from_slice(&6u32.to_le_bytes());
     binary.extend_from_slice(&30u64.to_le_bytes());
 
-    let clean = heap::watched(|| {
+    // Neither buffer grew. A buffer that grew has handed the block it
+    // outgrew back to the allocator, and that block holds the credential,
+    // and the allocator hands the block out again to whoever asks for
+    // one of that size — so the credential is in the heap for as long as
+    // the process lives, and the next test's probe finds it there.
+    assert_eq!(json.capacity(), 160, "the JSON buffer grew");
+    assert_eq!(binary.capacity(), 64, "the binary buffer grew");
+
+    let residue = heap::watched(|| {
         drop(AuthMessage::from_bytes(json.as_bytes()).expect("the JSON form parses"));
         drop(AuthMessage::from_payload(&binary).expect("the binary form parses"));
     });
 
     assert!(
-        clean,
-        "the credential was still in a freed block of the heap"
+        residue.is_none(),
+        "the credential was still in a freed block of the heap: {}",
+        residue
+            .as_ref()
+            .map(heap::Residue::to_string)
+            .unwrap_or_default()
     );
 }
 

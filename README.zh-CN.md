@@ -106,8 +106,8 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `third_party/smoltcp` | 内置的 smoltcp 0.12，附带序列号下溢 panic 的补丁。通过 `[patch.crates-io]` 接入。不要改动。 |
 | `ui-android/` | Android 应用（Kotlin + Compose）。 |
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
-| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端，2FA 关闭）。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
-| `config.toml.2fa.example` | 同上，但启用 2FA 并带有 `[auth.clients]` 条目。 |
+| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
+| `config.toml.2fa.example` | 同一个文件，但更短：它不含日志、健康检查和指标这三段，并带有一个 `[auth.clients]` 条目 —— 一个已经 enrolled 的客户端。两份示例都是 2FA 开启。 |
 | `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat）。 |
 
 ---
@@ -128,8 +128,13 @@ nexapipe                                # 默认读取 ./config.toml
 
 三行就是一个能跑的服务端：一条全捕获路由、一个后端，其余配置全部取默认值。客户端
 同样只需要几行，见[最小配置](#最小配置)（那里也列出了每个省略的键默认是什么）。
-想要每个配置段都写出来的版本请从 `config.toml.example` 开始，想开启 2FA 则从
-`config.toml.2fa.example` 开始。
+想要每个配置段都写出来的版本请从 `config.toml.example` 开始，想要一个已经 enrolled
+的客户端则从 `config.toml.2fa.example` 开始。
+
+这份示例是 2FA 开启且没有 enrolled 客户端的，所以在第一个客户端存在之前谁都连不上 ——
+用 `nexapipe --generate-invite client-001 --create-client` 注册它。运行时的默认值仍然是
+2FA **关闭**：没有 `[auth]` 段的配置保持关闭，所以升级中的部署不会突然被要求一个它的
+客户端从未拿到过的凭证。示例文件才是全新安装的默认值所在之处。
 
 完全不写这个文件也可以：服务端会自己生成一份最简的 `config.toml`，而不是直接拒绝启动 ——
 2FA 开启、没有路由、没有 enrolled 客户端。它是一个供你编辑的起点，还不是能用的服务：
@@ -209,8 +214,18 @@ mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 sudo chown -R 1000:1000 config secrets logs # 镜像以 uid 1000 运行
 docker compose up -d --build
+# 示例出厂即开启 2FA，所以在 enrolled 一个客户端之前没有任何连接能进来。
+# 这一条会打印可扫描的邀请链接。
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --create-client
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
+
+示例出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此服务端会启动，然后拒绝所有
+连接，直到有一个客户端被 enrolled —— 上面的 `--generate-invite client-001
+--create-client` 就是 enrolled 第一个客户端的命令。它会把客户端写进配置文件，并
+在链接里打印一个一次性的 enrollment token；第一个扫描它的设备用该 token 换取一个
+只属于自己的 secret，而链接从那一刻起就不再是凭据。
 
 `docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）、
 存放端点身份的 `secrets/` 目录和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向
@@ -344,6 +359,17 @@ sudo chmod 700 /etc/nexapipe
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
+示例出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此服务会启动，然后拒绝所有
+连接，直到有一个客户端被 enrolled。在把设备指过去之前先 enrolled 第一个：
+
+```bash
+sudo -u nexapipe nexapipe \
+    --config /etc/nexapipe/config.toml --generate-invite client-001 --create-client
+```
+
+它必须以服务运行所用的账号执行：配置文件的写入方式是先写一个新文件再改名覆盖，
+因此以 root 写出的文件属于 root，而读不到自己配置的服务就是停着的服务。
+
 然后写 `/etc/systemd/system/nexapipe.service`：
 
 ```ini
@@ -462,8 +488,8 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 | `--qr-format <FMT>` | `unicode`（默认）、`plain`、`ascii`、`svg`、`none`。 |
 | `--qr-invert` | 反色绘制二维码（深底浅色）。 |
 | `--qr-out <PATH>` | 同时把二维码写入文件（`.svg` → SVG，其他 → ASCII）。 |
-| `--generate-invite [CLIENT_ID]` | 打印可扫描的 `nexapipe://` 邀请码。带 `CLIENT_ID` 时把 2FA 密钥也放进去；不带时只携带端点与域名。 |
-| `--registration` | 配合 `--generate-invite CLIENT_ID`：用一次性注册令牌代替密钥。 |
+| `--generate-invite [CLIENT_ID]` | 打印可扫描的 `nexapipe://` 邀请码。带 `CLIENT_ID` 时也带上该客户端的 2FA 凭证 —— 对已存在的客户端是长期密钥，对同一次运行中 `--create-client` 新建的客户端则是一次性注册令牌；不带时只携带端点与域名。 |
+| `--registration` | 配合 `--generate-invite CLIENT_ID`：用一次性注册令牌代替密钥。同一次运行中 `--create-client` 新建的客户端默认拿到的就是这个。 |
 | `--create-client` | 配合 `--generate-invite CLIENT_ID`：客户端尚不存在时创建它，并在同一次运行中生成并写入其密钥。 |
 | `--invite-domains <LIST>` | 邀请码中的域名，逗号分隔（默认：`[local_proxy] proxy_domains`，否则取路由主机名）。 |
 | `--invite-name <NAME>` | 与端点一同保存的标签。 |
@@ -1466,15 +1492,19 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 
 `--generate-invite CLIENT_ID` 交出的是某个客户端*已经拥有*的密钥，因此不在
 `[auth.clients]` 中的 `CLIENT_ID` 会被拒绝。`--create-client` 把"创建"与"邀请"合为
-一次运行 —— 密钥被生成、写入配置并放进邀请码：
+一次运行 —— 密钥被生成并写入配置，邀请码里放的则是它的**一次性注册令牌**：
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --create-client
 cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
 ```
 
+- **链接里是令牌，不是密钥。** 那把密钥刚刚生成出来，还不在任何人手里，所以第一台设备
+  扫描链接时用令牌换一份属于自己的密钥 —— 邀请码就此不再是凭证。若 `[auth] enabled = false`，
+  令牌永远换不到东西，于是仍然使用密钥形式，输出也会说明这一点。
 - **它绝不触碰已存在的客户端。** 对已配置的客户端运行会复用已存的密钥，而不是再生
-  成一个 —— 后者会让所有已用第一个密钥注册的设备全部被锁在外面。轮换仍然是显式的
+  成一个 —— 后者会让所有已用第一个密钥注册的设备全部被锁在外面。这种链接仍然携带密钥
+  —— 只要那把密钥还在，它就一直是凭证 —— 输出也会这样说明。轮换仍然是显式的
   `--generate-2fa CLIENT_ID --force`。
 - **它只补全完全缺失的客户端。** 一个存在但没有 `secret` 的 `[auth.clients.x]` 段
   是坏文件，不是一个待填的空白。
@@ -1488,7 +1518,8 @@ cargo run -p nexapipe -- --generate-invite client-001 --create-client --registra
 ### 注册邀请码（`--registration`）
 
 上面那个码的问题在于：只要密钥还在，它就一直是凭证。`--registration` 改为在链接中
-放入一个**一次性注册令牌**：
+放入一个**一次性注册令牌** —— 而对同一次运行中 `--create-client` 新建的客户端来说，
+链接里放的本来就已经是这个了：
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --registration

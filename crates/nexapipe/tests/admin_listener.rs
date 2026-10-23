@@ -433,6 +433,13 @@ async fn clients_are_listed_without_their_secrets() {
 
 /// The port ACL is listed with the clients: the management surface is where an
 /// operator looks to find out what a client may reach.
+///
+/// The **rule** is listed with it, because the list alone does not say what it
+/// means: `allow_ports_strict` off means the list is checked against the port
+/// the client named — and a request that named none is not checked at all —
+/// while on means it is checked against the port the request is actually
+/// served from. A list without the rule is a list an operator has to guess
+/// the meaning of.
 #[tokio::test]
 async fn the_port_acl_is_listed_with_the_clients() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -440,7 +447,8 @@ async fn the_port_acl_is_listed_with_the_clients() {
     std::fs::write(
         &path,
         "[auth]\nenabled = true\n\n[auth.clients.alice]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
-         created_at = \"2026-09-29T00:00:00Z\"\nallow_ports = [443, 8443]\n",
+         created_at = \"2026-09-29T00:00:00Z\"\nallow_ports = [443, 8443]\n\
+         allow_ports_strict = true\n",
     )
     .expect("write the config");
     let path = path.to_string_lossy().into_owned();
@@ -463,6 +471,11 @@ async fn the_port_acl_is_listed_with_the_clients() {
         clients[0]["allow_ports"],
         serde_json::json!([443, 8443]),
         "{body}"
+    );
+    assert_eq!(
+        clients[0]["allow_ports_strict"],
+        serde_json::json!(true),
+        "the rule the list is read under is listed with it: {body}"
     );
 
     admin.stop();
