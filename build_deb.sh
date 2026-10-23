@@ -20,7 +20,7 @@
 #                   than at build time. On failure node_modules is wiped and the
 #                   committed lockfile is installed once more; the lockfile
 #                   itself is never re-resolved.
-#   3. Override   - writes ui-desktop/.workbuddy/build-override.json (git-ignored) with:
+#   3. Override   - writes ui-desktop/src-tauri/target/build-override.json (git-ignored) with:
 #                   * bundle.resources = []          - wintun.dll is Windows only; a
 #                     missing resource path aborts the bundle step
 #                   * bundle.createUpdaterArtifacts  - enabled only when
@@ -188,9 +188,9 @@ SRC_TAURI_DIR="$DESKTOP_DIR/src-tauri"
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
 # src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 CLIENT_CRATE="$REPO_ROOT/crates/nexapipe-client/Cargo.toml"
-# The generated override lands in ui-desktop/.workbuddy, which ui-desktop/.gitignore
+# The generated override lands in src-tauri/target, which the root .gitignore
 # already ignores, so it never shows up in git status.
-OVERRIDE_DIR="$DESKTOP_DIR/.workbuddy"
+OVERRIDE_DIR="$SRC_TAURI_DIR/target"
 OVERRIDE_FILE="$OVERRIDE_DIR/build-override.json"
 PROFILE_DIR="$SRC_TAURI_DIR/target/$TRIPLE/$CARGO_PROFILE"
 BUNDLE_DIR="$PROFILE_DIR/bundle"

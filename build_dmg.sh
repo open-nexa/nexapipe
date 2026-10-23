@@ -11,7 +11,7 @@
 #                   Tauri macOS deps (Xcode CLI tools) present.
 #   2. Frontend   - npm ci (always), then a probe of the local
 #                   @tauri-apps/cli; wipe & reinstall on failure.
-#   3. Override   - write .workbuddy/build-override.json that:
+#   3. Override   - write src-tauri/target/build-override.json that:
 #                   * enables only macOS bundle target (app dmg), drops
 #                     Windows/Linux ones so the build does not waste time
 #                   * disables updater signing unless both signing vars set
@@ -139,7 +139,7 @@ DESKTOP_DIR="$ROOT_DIR/ui-desktop"
 TAURI_DIR="$DESKTOP_DIR/src-tauri"
 BUNDLE_DIR="$TAURI_DIR/target"
 PROFILE_DIR="$BUNDLE_DIR"
-OVERRIDE_DIR="$DESKTOP_DIR/.workbuddy"
+OVERRIDE_DIR="$TAURI_DIR/target"
 OVERRIDE_FILE="$OVERRIDE_DIR/build-override.json"
 
 # The Tauri CLI as installed in ui-desktop, addressed by absolute path.
