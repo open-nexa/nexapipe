@@ -195,14 +195,24 @@ fn stop_if_running() -> Result<(), AppError> {
 }
 
 pub fn uninstall() -> Result<(), AppError> {
-    let program_files = program_files()?;
-    let dir = system_service_dir(&program_files);
-    let system = system_service_binary(&program_files);
+    // The system-wide copy lives under Program Files, and an uninstall that
+    // cannot find that directory cannot remove the copy — but it can still
+    // remove the entry that points at it. Failing the whole uninstall over a
+    // missing environment variable would leave the service registered, which
+    // is worse than leaving a file behind.
+    let system_copy = program_files().ok().map(|program_files| {
+        let dir = system_service_dir(&program_files);
+        let system = system_service_binary(&program_files);
+        (dir, system)
+    });
 
     if !service_exists() {
         // Nothing is registered, but the system-wide copy may still be there:
         // it is what the entry pointed at, and it is not the user's to keep.
-        return remove_system_copy(&dir, &system);
+        return match system_copy {
+            Some((dir, system)) => remove_system_copy(&dir, &system),
+            None => Ok(()),
+        };
     }
 
     // Stopped, and confirmed stopped, before it is deleted. `sc delete` would stop
@@ -251,7 +261,10 @@ pub fn uninstall() -> Result<(), AppError> {
     .and_then(|()| verify_absent())
     // The entry is gone, so nothing is running the file any more and it can
     // be taken off the disk.
-    .and_then(|()| remove_system_copy(&dir, &system))
+    .and_then(|()| match system_copy {
+        Some((dir, system)) => remove_system_copy(&dir, &system),
+        None => Ok(()),
+    })
 }
 
 /// Removes the system-wide copy of the service binary, and the directory it
@@ -278,7 +291,11 @@ fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
             ]
         },
         "service uninstall (remove the system copy)",
-        Escalation::Always,
+        // The copy is under Program Files, so the delete is usually refused
+        // for an ordinary user — and it is refused *then*, not before: the
+        // other steps of the uninstall ask for elevation the same way, and a
+        // prompt here as well would be a second one for the same operation.
+        Escalation::OnAccessDenied,
         codes::SERVICE_UNINSTALL_FAILED,
     )
 }
