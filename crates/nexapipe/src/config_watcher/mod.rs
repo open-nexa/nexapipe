@@ -456,6 +456,17 @@ impl ConfigWatcher {
                 .map(|(id, client)| (id.clone(), client.devices.keys().cloned().collect()))
                 .collect();
 
+            // The same for the authorization, and for the same reason: the
+            // merge takes each client's host and port lists from the file, so
+            // after it there is nothing left to compare the file's list
+            // against, and a client whose list was tightened would not be
+            // noticed at all — it is neither added nor removed.
+            let before_auth: HashMap<String, ClientAuthorization> = live
+                .clients
+                .iter()
+                .map(|(id, client)| (id.clone(), ClientAuthorization::of(client)))
+                .collect();
+
             let Some(new_auth) = snapshot else {
                 // The section is gone while 2FA is live: treat that as a bad edit,
                 // not as "disable everything", the same way an unparsable route
@@ -480,10 +491,23 @@ impl ConfigWatcher {
             {
                 tracing::error!("{refusal}");
             } else if apply_auth_enabled(&mut live, &new_auth) == Some(true) {
+                // A connection that was opened while 2FA was off never did a
+                // handshake, so it carries no credential at all — the registry
+                // lists it with no client id, and that is how the two are told
+                // apart. Those connections are closed here: the gate is on
+                // now, and a WebSocket session or an L4 tunnel that was
+                // opened before it would go on serving with nothing behind it
+                // for as long as it lives.
+                //
+                // The connections that did authenticate are left alone: they
+                // carry the authorization they were given when they
+                // connected, and that authorization is still valid.
+                let closed = self.peers.close_unauthenticated();
                 tracing::warn!(
                     "[auth] enabled is now true: connections opened from here on must complete \
-                 the 2FA handshake. Connections that are already authenticated keep working — \
-                 they carry the authorization they were given when they connected"
+                     the 2FA handshake. Connections that never authenticated are closed ({closed}); \
+                     the ones that authenticated keep working — they carry the authorization they \
+                     were given when they connected"
                 );
             }
 
@@ -536,6 +560,40 @@ impl ConfigWatcher {
                 if closed > 0 {
                     tracing::info!(
                         "Closed {} connection(s) authenticating as a device that is no longer in [auth]",
+                        closed
+                    );
+                }
+            }
+
+            // A client whose authorization was tightened has connections that
+            // are carrying a permission the operator has taken away: the ACL
+            // is snapshotted at the handshake and never read again, so the
+            // list that is live now is not the list those connections are
+            // serving under. They are closed, so that the new list is what
+            // applies from here on.
+            let tightened: Vec<String> = new_auth
+                .clients
+                .iter()
+                .filter_map(|(id, incoming_client)| {
+                    let live_auth = before_auth.get(id)?;
+                    live_auth
+                        .tightened_by(&ClientAuthorization::of(incoming_client))
+                        .then(|| id.clone())
+                })
+                .collect();
+
+            for id in &tightened {
+                tracing::info!("2FA client '{id}' was given a tighter authorization by the reload");
+            }
+            if !tightened.is_empty() {
+                let closed = self.peers.close_where(|identity| {
+                    tightened
+                        .iter()
+                        .any(|id| identity.client_id.as_deref() == Some(id))
+                });
+                if closed > 0 {
+                    tracing::info!(
+                        "Closed {} connection(s) whose client's authorization the reload tightened",
                         closed
                     );
                 }
@@ -774,6 +832,143 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
 
     live.clients = merged;
     (added, removed)
+}
+
+/// What a client was allowed to reach, reduced to the three values that decide
+/// it.
+///
+/// The authorization a connection carries is snapshotted at its handshake and
+/// never read again, so a reload that takes something away does not reach the
+/// connections that are already open. This is what the live entry and the
+/// file's are compared through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientAuthorization {
+    /// The host patterns. `None` is every host.
+    hosts: Option<Vec<String>>,
+    /// The ports. `None` is every port.
+    ports: Option<Vec<u16>>,
+    /// Whether the port list is also checked against the port a request is
+    /// served from.
+    strict_ports: bool,
+}
+
+impl ClientAuthorization {
+    /// The authorization a client's entry grants.
+    fn of(client: &ClientAuth) -> Self {
+        ClientAuthorization {
+            hosts: client.allow_hosts.clone(),
+            ports: client.allow_ports.clone(),
+            strict_ports: client.allow_ports_strict,
+        }
+    }
+
+    /// Whether the incoming authorization takes anything away from this one.
+    ///
+    /// The rule is one-directional on purpose, and it is about what is **left**
+    /// rather than about what changed: a reload only tightens when the
+    /// incoming list no longer allows something this one allowed. A list that
+    /// gained a host is a widening, and the connections that are open carry an
+    /// authorization that is still valid — so they keep working, and an
+    /// unrelated edit does not drop them.
+    ///
+    /// A list that lost one entry and gained another is a tightening as well:
+    /// the entry it lost is a host the client may no longer reach, and the
+    /// connections that are open would go on reaching it.
+    fn tightened_by(&self, incoming: &ClientAuthorization) -> bool {
+        self.hosts_taken_away(incoming.hosts.as_deref())
+            || self.ports_taken_away(incoming.ports.as_deref())
+            || self.ports_checked_stricter(incoming)
+    }
+
+    /// Whether a host this authorization allowed is one the incoming one does
+    /// not.
+    fn hosts_taken_away(&self, incoming: Option<&[String]>) -> bool {
+        match (&self.hosts, incoming) {
+            // Every host was allowed and every host is allowed again.
+            (None, None) => false,
+            // Every host was allowed; a list that replaces it is not every
+            // host, and every host the client may reach is one of them.
+            (None, Some(_)) => true,
+            // A list was allowed and every host is allowed again: a widening.
+            (Some(_), None) => false,
+            // Two lists: a pattern of the old one that the new one does not
+            // cover is a host that was taken away.
+            (Some(live), Some(incoming)) => live
+                .iter()
+                // A pattern the configuration refused matches nothing, so it
+                // allowed nothing and nothing was taken away.
+                .filter(|pattern| crate::routes::pattern_error(pattern).is_none())
+                .any(|pattern| !incoming.iter().any(|other| pattern_covers(other, pattern))),
+        }
+    }
+
+    /// Whether a port this authorization allowed is one the incoming one does
+    /// not.
+    fn ports_taken_away(&self, incoming: Option<&[u16]>) -> bool {
+        match (&self.ports, incoming) {
+            (None, None) => false,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(live), Some(incoming)) => live.iter().any(|port| !incoming.contains(port)),
+        }
+    }
+
+    /// Whether the port list started being checked against the port a request
+    /// is served from.
+    ///
+    /// That check takes away the requests that named a port the list allows
+    /// and were served from one it does not — so it only counts when there is
+    /// a list to check against.
+    fn ports_checked_stricter(&self, incoming: &ClientAuthorization) -> bool {
+        !self.strict_ports && incoming.strict_ports && incoming.ports.is_some()
+    }
+}
+
+/// Whether every host `pattern` matches is also matched by `other`.
+///
+/// The patterns the rule knows are a name, `*.suffix` and the catch-all, and
+/// the answer follows from those three:
+///
+/// - the catch-all covers everything;
+/// - a name is covered by itself and by a wildcard it sits under;
+/// - a wildcard is covered by the same wildcard and by one that reaches
+///   further out — `*.example.com` covers `*.a.example.com`, because
+///   everything under the narrower one is under the wider one too.
+///
+/// The label boundary is the same one the matcher uses: `example.com` is not
+/// under `*.example.com`, and `notexample.com` is not either.
+fn pattern_covers(other: &str, pattern: &str) -> bool {
+    let other = crate::routes::normalize_pattern(other);
+    let pattern = crate::routes::normalize_pattern(pattern);
+
+    match (other.strip_prefix('*'), pattern.strip_prefix('*')) {
+        // The catch-all covers everything.
+        (Some(""), _) => true,
+        // Neither is a wildcard: a name is covered by the same name.
+        (None, None) => other == pattern,
+        // A name is covered by a wildcard when it sits under it.
+        (Some(rest), None) => match rest.strip_prefix('.') {
+            Some(suffix) => pattern
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('.')),
+            // A wildcard that is not `*.suffix` matches nothing.
+            None => false,
+        },
+        // A name covers no wildcard.
+        (None, Some(_)) => false,
+        // Two wildcards: the wider one covers the narrower one.
+        (Some(other_rest), Some(pattern_rest)) => {
+            match (other_rest.strip_prefix('.'), pattern_rest.strip_prefix('.')) {
+                (Some(other_suffix), Some(pattern_suffix)) => {
+                    pattern_suffix == other_suffix
+                        || pattern_suffix
+                            .strip_suffix(other_suffix)
+                            .is_some_and(|head| head.ends_with('.'))
+                }
+                _ => false,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
