@@ -164,6 +164,20 @@ export interface ProxyConfig {
   /** Bearer token for a custom relay that requires one. */
   relayAuthToken: string;
   /**
+   * The relay the stored token was issued for.
+   *
+   * A token is issued by one relay and is good for that relay alone: it is a
+   * bearer credential, and a relay that is handed a token it never issued
+   * learns it — and can use it against the relay that did issue it. So the
+   * token is kept together with the URL of the relay it belongs to, and that
+   * URL is what decides whether the token may still be sent.
+   *
+   * Empty when there is no token. It is not a secret, so it is persisted
+   * beside the token itself, which is not; see `relayTokenAfter` in the
+   * config store for the rule that keeps the two together.
+   */
+  relayAuthTokenRelay: string;
+  /**
    * The name this machine answers as, once per installation rather than once per server: the
    * device is the machine, and every node belongs to it.
    *

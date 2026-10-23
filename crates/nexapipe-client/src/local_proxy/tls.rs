@@ -20,6 +20,49 @@ use super::tunnel::open_stream_with_retry;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// What a read of the `ClientHello` gave.
+enum HelloRead {
+    /// More bytes arrived.
+    More,
+    /// The stream ended.
+    Ended,
+    /// The read failed.
+    Failed,
+    /// The deadline passed.
+    TimedOut,
+}
+
+/// Reads more of the `ClientHello`.
+///
+/// The deadline is the hello's, and it covers the whole hello rather than
+/// each read: a peer that dribbles a byte at a time must not hold the
+/// connection open by renewing the deadline on every read.
+async fn read_more_of_the_hello<S>(
+    stream: &mut S,
+    data: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> HelloRead
+where
+    S: AsyncRead + Unpin,
+{
+    let mut extra = [0u8; 4096];
+    match tokio::time::timeout_at(deadline, stream.read(&mut extra)).await {
+        Ok(Ok(0)) => HelloRead::Ended,
+        Ok(Ok(n)) => {
+            data.extend_from_slice(&extra[..n]);
+            HelloRead::More
+        }
+        Ok(Err(_)) => HelloRead::Failed,
+        Err(_) => {
+            jni_log!(
+                "[DEBUG:local-proxy] TLS ClientHello took longer than its deadline, \
+                 closing connection"
+            );
+            HelloRead::TimedOut
+        }
+    }
+}
+
 /// Handle a raw TLS tunnel connection via SNI extraction.
 ///
 /// When a client connects to the VPN's virtual proxy IP on port 443, it sends
@@ -53,24 +96,33 @@ where
     // every few seconds would otherwise hold the connection open indefinitely —
     // this read had no bound at all before.
     let mut data = initial_data;
+    let hello_deadline =
+        tokio::time::Instant::now() + crate::deadline::Deadlines::default().tls_hello;
+
+    // **The record's head first.**
+    //
+    // The record's length is in its first five bytes, so a hello that has
+    // not arrived that far yet cannot be measured — and a first read of one
+    // to four bytes used to end the reading there, because the loop that
+    // reads the rest was inside the check. The truncated hello was then
+    // parsed as if it were the whole one, which is a hello with no name in
+    // it, and the session was closed with no retry.
+    while data.len() < 5 {
+        match read_more_of_the_hello(&mut stream, &mut data, hello_deadline).await {
+            HelloRead::More => {}
+            HelloRead::Ended | HelloRead::Failed => break,
+            HelloRead::TimedOut => return Ok(()),
+        }
+    }
+
     if data.len() >= 5 {
         let record_len = ((data[3] as usize) << 8) | (data[4] as usize);
         let total_needed = 5 + record_len;
-        let hello_deadline =
-            tokio::time::Instant::now() + crate::deadline::Deadlines::default().tls_hello;
         while data.len() < total_needed {
-            let mut extra = [0u8; 4096];
-            match tokio::time::timeout_at(hello_deadline, stream.read(&mut extra)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => data.extend_from_slice(&extra[..n]),
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    jni_log!(
-                        "[DEBUG:local-proxy] TLS ClientHello took longer than its deadline, \
-                         closing connection"
-                    );
-                    return Ok(());
-                }
+            match read_more_of_the_hello(&mut stream, &mut data, hello_deadline).await {
+                HelloRead::More => {}
+                HelloRead::Ended | HelloRead::Failed => break,
+                HelloRead::TimedOut => return Ok(()),
             }
         }
     }

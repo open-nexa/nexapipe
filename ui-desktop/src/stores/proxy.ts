@@ -27,7 +27,7 @@ import type {
   TrafficRate,
   TrafficTotals,
 } from '../types';
-import { useConfigStore } from './config';
+import { relayTokenToSend, useConfigStore } from './config';
 import { usePrefsStore } from './prefs';
 import { isBackgroundLaunch } from '../api/autostart';
 import { setTrayStatus } from '../api/tray';
@@ -552,7 +552,13 @@ async function start(): Promise<void> {
       useTun: wantTun,
       relayMode: config.relayMode,
       relayUrl: config.relayUrl,
-      relayAuthToken: config.relayAuthToken,
+      // The token goes to the relay it was issued for and to no other: the
+      // backend cannot know which relay issued a token, so the answer is
+      // given here, where the relay being configured is known.
+      relayAuthToken: relayTokenToSend(
+        { token: config.relayAuthToken, relay: config.relayAuthTokenRelay },
+        config.relayUrl,
+      ),
     });
 
     await waitForStart();
