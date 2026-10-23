@@ -8,6 +8,8 @@ case "${1:-}" in
     remove|purge)
         rm -f "/etc/systemd/system/$SERVICE"
         rm -f /run/nexa-service.was-active
+        # The service's own copy of the binary, for the same reason the unit goes.
+        rm -f /usr/libexec/nexa-service
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
         fi

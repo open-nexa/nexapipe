@@ -10,6 +10,10 @@ case "${1:-}" in
             systemctl stop "$SERVICE" || true
             systemctl disable "$SERVICE" || true
             rm -f "/etc/systemd/system/$SERVICE"
+            # The service's own copy of the binary goes with the unit that ran it: a
+            # service that is no longer installed has no binary to run, and a copy left
+            # behind is one nothing will ever replace.
+            rm -f /usr/libexec/nexa-service
             systemctl daemon-reload || true
         fi
         ;;
