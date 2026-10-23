@@ -729,7 +729,18 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
                 let replaces_token = client.pending_enrollment != existing.pending_enrollment;
                 client.failed_attempts = existing.failed_attempts;
                 client.locked_until = existing.locked_until;
-                if !replaces_token {
+                if replaces_token {
+                    // The counters the file carries were paid for by the token
+                    // that is gone. The file's half of them comes from the
+                    // state file, which holds what the guesses at the **old**
+                    // token cost; keeping them would hand the new invite the
+                    // old token's count and its lockout, and a stranger who
+                    // guessed at a token that no longer exists could close the
+                    // slot of the invite that replaced it. The new token
+                    // starts with nothing spent on it.
+                    client.enrollment_failed_attempts = 0;
+                    client.enrollment_locked_until = None;
+                } else {
                     client.enrollment_failed_attempts = existing.enrollment_failed_attempts;
                     client.enrollment_locked_until = existing.enrollment_locked_until;
                 }

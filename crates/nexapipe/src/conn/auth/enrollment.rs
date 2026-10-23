@@ -1,7 +1,6 @@
 //! The enrollment: a client that asks for a credential, and what it gets.
 
 use crate::auth::{AuthConfig, AuthMessage, ClientAcl, DeviceAuth};
-use crate::config_watcher::save_auth_state;
 use crate::conn::peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use crate::metrics;
 
@@ -12,7 +11,7 @@ use std::sync::Arc;
 
 use super::constant_time_eq;
 use super::handshake::write_auth_message;
-use super::state::{AuthState, blocking_config_write};
+use super::state::{AuthState, blocking_config_write, persist_auth_state};
 
 /// Why a 2FA handshake did not produce an authenticated client.
 ///
@@ -413,24 +412,32 @@ pub(super) async fn enroll_client(
                  --force`"
             );
         }
+        // Whether the counters have moved and the state file has to be
+        // written. The write itself happens after the lock is released.
+        let mut state_dirty = false;
         if verdict.counted() {
             let (max_attempts, lockout_duration) = (cfg.max_attempts, cfg.lockout_duration);
             count_enrollment_failure(&mut cfg, client_id, max_attempts, lockout_duration);
-            let snapshot = cfg.counter_snapshot();
-            if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-                save_auth_state(path, &snapshot)
-            })
-            .await
-            {
-                tracing::warn!(
-                    "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
-                    client_id,
-                    auth.state_path(),
-                    e
-                );
-            }
+            // The counters have moved; the file that carries them is written
+            // below, with the lock released.
+            state_dirty = true;
         }
         drop(cfg);
+
+        // The state file is written with the auth lock released, the same way
+        // the handshake writes it: a write lock held across a disk write
+        // stalls every connection that is authenticating, not only this one.
+        // The path is reachable by anyone who knows a client id, so the stall
+        // is one a stranger can ask for.
+        if state_dirty && let Err(e) = persist_auth_state(auth).await {
+            tracing::warn!(
+                "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
+                client_id,
+                auth.state_path(),
+                e
+            );
+        }
+
         write_auth_message(
             send,
             &AuthMessage::EnrollFailed {
@@ -512,6 +519,11 @@ pub(super) async fn enroll_client(
     // Persisted before anything is promised to the client: a credential that is
     // live in memory but missing from disk is one that silently reverts on the
     // next restart, which would put the old one back in service.
+    //
+    // This write stays **under** the lock, unlike the state file's write
+    // below. It carries the enrollment itself, and the epoch bump that follows
+    // it is the interlock that stops a reload from merging a pre-enrollment
+    // snapshot back over the top of it — see the note there.
     let enrollment_path = auth.path().to_string();
     let enrolled_client = client_id.to_string();
     let persisted = issued.clone();
@@ -578,26 +590,29 @@ pub(super) async fn enroll_client(
             || c.enrollment_failed_attempts != 0
             || c.enrollment_locked_until.is_some()
     });
-    if dirty {
-        if let Some(client) = cfg.clients.get_mut(client_id) {
-            client.record_success();
-            client.record_enrollment_success();
-        }
-        let snapshot = cfg.counter_snapshot();
-        if let Err(e) = blocking_config_write(auth.state_path().to_string(), move |path| {
-            save_auth_state(path, &snapshot)
-        })
-        .await
-        {
-            tracing::warn!(
-                "2FA: failed to persist the cleared counter for '{}' to {}: {}",
-                client_id,
-                auth.state_path(),
-                e
-            );
-        }
+    if dirty && let Some(client) = cfg.clients.get_mut(client_id) {
+        client.record_success();
+        client.record_enrollment_success();
     }
     drop(cfg);
+
+    // The state file is written with the auth lock released, the same way the
+    // handshake writes it. The counters it carries are read at write time, so
+    // they are the ones as of now.
+    //
+    // The **configuration** file's write is the one that stays under the lock,
+    // and it has to: it carries the enrollment itself, and the epoch bump above
+    // is the interlock that stops a reload from merging a pre-enrollment
+    // snapshot back over the top of it. Moving that write out of the lock
+    // would reopen the race the epoch exists to prevent.
+    if dirty && let Err(e) = persist_auth_state(auth).await {
+        tracing::warn!(
+            "2FA: failed to persist the cleared counter for '{}' to {}: {}",
+            client_id,
+            auth.state_path(),
+            e
+        );
+    }
 
     match &issued {
         IssuedCredential::DeviceKey { name, .. } => tracing::info!(

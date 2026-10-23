@@ -655,6 +655,188 @@ fn a_new_invite_starts_with_its_own_budget() {
     assert_eq!(client.enrollment_locked_until, None);
 }
 
+/// The configuration file an invite is written into: one client, one pending
+/// enrollment token.
+fn config_with_pending_token(path: &std::path::Path, token: &str) {
+    std::fs::write(
+        path,
+        format!(
+            "[auth]\nenabled = true\n\n[auth.clients.client-001]\nsecret = \"JBSWY3DPEHPK3PXP\"\n\
+             pending_enrollment = \"{token}\"\n"
+        ),
+    )
+    .expect("the config is written");
+}
+
+/// The state file beside the configuration, carrying what the guesses at a
+/// token cost.
+///
+/// Written through the server's own writer, so the file is the one a running
+/// server would have left behind: the count of the guesses and the lockout
+/// window they earned. It is put where the server looks for it — the path
+/// the state itself names — rather than at a name spelled out here.
+fn state_file_with_enrollment_counters(config_path: &str, attempts: u32, locked_until: u64) {
+    let mut clients = HashMap::new();
+    clients.insert(
+        "client-001".to_string(),
+        crate::auth::state::ClientState {
+            enrollment_failed_attempts: attempts,
+            enrollment_locked_until: Some(locked_until),
+            ..Default::default()
+        },
+    );
+    let path = crate::auth::state::path_for(config_path);
+    crate::auth::state::save(&path, &crate::auth::state::RuntimeState { clients })
+        .expect("the state file is written");
+}
+
+/// A lockout window that has not run out yet.
+fn a_live_lockout_window() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .as_secs()
+        + 3600
+}
+
+/// A rotated invite starts with its own budget.
+///
+/// The counters are the guesses at a **token**, and a token that is replaced
+/// is a different credential. The merge used to keep the file's copy of them,
+/// and the file's copy is the state file's — so an invite that was rotated
+/// while the old token had guesses against it inherited them, and the lockout
+/// the old token had earned closed the new invite's slot.
+///
+/// The file is read the way the watcher reads it: through the loader that
+/// applies the state file beside it, so the snapshot the merge sees is the one
+/// a running server would see.
+#[tokio::test]
+async fn a_rotated_invite_starts_with_its_own_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "old-token");
+    state_file_with_enrollment_counters(&path_str, 3, a_live_lockout_window());
+
+    // The live state the server started with: the old token, and the counters
+    // the state file carries for it.
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let state = AuthState::new(
+        auth.expect("the config declares an [auth] section"),
+        &path_str,
+    );
+    let watcher = watcher_for(state.clone(), &path_str);
+
+    // The operator rotates the invite: the file carries a new token.
+    config_with_pending_token(&path, "new-token");
+
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client
+            .pending_enrollment
+            .as_ref()
+            .map(|token| token.expose_secret().as_str()),
+        Some("new-token"),
+        "the new invite is the live one"
+    );
+    assert_eq!(
+        client.enrollment_failed_attempts, 0,
+        "the guesses were paid for by the token that is gone"
+    );
+    assert_eq!(
+        client.enrollment_locked_until, None,
+        "and so was the lockout that token earned"
+    );
+}
+
+/// An unchanged token keeps the counters that are live.
+///
+/// The live counter is the newer one — a failure counted since the last flush
+/// to the state file — so the merge keeps it, the way it keeps the client's
+/// own lockout.
+#[tokio::test]
+async fn an_unchanged_token_keeps_its_live_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "token");
+    let window = a_live_lockout_window();
+    state_file_with_enrollment_counters(&path_str, 3, window);
+
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let state = AuthState::new(
+        auth.expect("the config declares an [auth] section"),
+        &path_str,
+    );
+    let watcher = watcher_for(state.clone(), &path_str);
+
+    // A guess counted in memory since the last flush: the file is behind.
+    {
+        let mut live = state.config().write().await;
+        let client = live
+            .clients
+            .get_mut("client-001")
+            .expect("the client is there");
+        client.enrollment_failed_attempts = 5;
+    }
+
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 5,
+        "the live counter is newer than the file's"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
+}
+
+/// The state file's counters are still honoured for a token that did not
+/// change.
+///
+/// The rule is about the token being replaced, not about the counters: a
+/// client whose invite is the same one keeps what the state file carries for
+/// it, and a reload that leaves the token alone keeps them too.
+#[tokio::test]
+async fn the_state_file_counters_are_honoured_for_an_unchanged_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "token");
+    let window = a_live_lockout_window();
+    state_file_with_enrollment_counters(&path_str, 3, window);
+
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let auth = auth.expect("the config declares an [auth] section");
+    let client = &auth.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 3,
+        "the state file's counter is honoured on the way in"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
+
+    let state = AuthState::new(auth, &path_str);
+    let watcher = watcher_for(state.clone(), &path_str);
+    watcher.reload_config().await;
+
+    let live = state.config().read().await;
+    let client = &live.clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 3,
+        "a reload that leaves the token alone keeps the counter"
+    );
+    assert_eq!(client.enrollment_locked_until, Some(window));
+}
+
 /// A server started with no `[auth]` section at all can still switch 2FA on
 /// while it runs.
 ///
