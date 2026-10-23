@@ -1,10 +1,11 @@
 //! The `[peers]` allow-list, end to end through the config file.
 //!
-//! The unit tests in `config.rs` cover the parse; this covers the same question
-//! from outside the crate, where a change to `PeersConfig`'s field names or to
-//! `ProxyConfig`'s own shape would show up. The failure this guards against is
-//! the quiet one: a section that stops parsing into the right set means the
-//! listener is less restricted than the operator wrote, and nothing says so.
+//! The unit tests in `config/tests.rs` cover the parse; this covers the same
+//! question from outside the crate, where a change to `PeersConfig`'s field
+//! names or to `ProxyConfig`'s own shape would show up. The failure this
+//! guards against is the quiet one: a section that stops parsing into the
+//! right set means the listener is less restricted than the operator wrote,
+//! and nothing says so.
 
 use nexapipe::config::ProxyConfig;
 
