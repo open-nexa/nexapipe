@@ -359,45 +359,125 @@ fn remove_ipv6_linux(interface: &str) -> Result<()> {
     Ok(())
 }
 
+// ==========================================================================
+// Windows PowerShell
+//
+// The interface name and the address are handed to PowerShell through the
+// environment and read back as `$env:<NAME>`. They used to be written into the
+// script inside single quotes, which made a quote in the name the end of the
+// string: everything after it was PowerShell source, and this runs in the
+// service, as LocalSystem.
+//
+// The environment is the channel that keeps the value out of the script.
+// `powershell.exe -Command "<script>" <value>` does not pass `<value>` as an
+// argument: the documented behaviour is that "all arguments following it are
+// interpreted as part of the command to execute", so a value handed over that
+// way is source again — and `$args` would not hold it either. `-File` does pass
+// its arguments literally, but it needs a script file on disk.
+//
+// The module is not gated on Windows alone so that the shape of the call can be
+// asserted on any host: the scripts and the environment they read are the part
+// that has to hold.
+// ==========================================================================
+
+#[cfg(any(windows, test))]
+mod powershell {
+    /// The variable the scripts read the interface name from.
+    pub(super) const INTERFACE_VAR: &str = "NEXA_TUN_INTERFACE";
+    /// The variable the scripts read the TUN's IPv6 address from.
+    pub(super) const ADDRESS_VAR: &str = "NEXA_TUN_ADDRESS";
+
+    /// A PowerShell call: the script to run, and the environment it reads its
+    /// inputs from.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Call {
+        /// The script. It never holds the interface name or the address.
+        pub script: String,
+        /// The variables the script reads its inputs from.
+        pub env: Vec<(&'static str, String)>,
+    }
+
+    impl Call {
+        /// A call that runs `script` with the interface name and the address in
+        /// its environment.
+        pub(super) fn new(script: String, interface: &str, addr: &str) -> Self {
+            Self {
+                script,
+                env: vec![
+                    (INTERFACE_VAR, interface.to_string()),
+                    (ADDRESS_VAR, addr.to_string()),
+                ],
+            }
+        }
+    }
+
+    /// Whether the interface already holds the address.
+    pub(super) fn has_ipv6_script() -> String {
+        format!(
+            "(Get-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -AddressFamily IPv6 \
+             -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} \
+             | Measure-Object).Count -gt 0"
+        )
+    }
+
+    /// Assigns the address to the interface.
+    pub(super) fn set_ipv6_script() -> String {
+        use crate::proxy::tun_proxy::TUN_V6_PREFIX_LEN;
+
+        format!(
+            "New-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -IPAddress $env:{ADDRESS_VAR} \
+             -PrefixLength {TUN_V6_PREFIX_LEN} -ErrorAction Stop"
+        )
+    }
+
+    /// Removes the address from the interface.
+    pub(super) fn remove_ipv6_script() -> String {
+        format!(
+            "Get-NetIPAddress -InterfaceAlias $env:{INTERFACE_VAR} -AddressFamily IPv6 \
+             -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq $env:{ADDRESS_VAR} }} | \
+             Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
+        )
+    }
+
+    /// Runs the call, with the interface name and the address in the child's
+    /// environment.
+    #[cfg(windows)]
+    pub(super) fn run(call: &Call) -> std::io::Result<std::process::Output> {
+        let mut command = crate::win::hidden("powershell");
+        for (name, value) in &call.env {
+            command.env(name, value);
+        }
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &call.script]);
+        command.output()
+    }
+}
+
 /// `New-NetIPAddress` rather than the IP Helper API the IPv4 side uses: the
 /// failure this has to survive is the address already being there, which the
 /// cmdlet reports as an error we can simply look up, whereas the FFI path would
 /// need a second unsafe call to ask the same question.
 #[cfg(windows)]
 fn configure_ipv6_windows(interface: &str) -> bool {
-    use crate::proxy::tun_proxy::{tun_v6_ip, TUN_V6_PREFIX_LEN};
+    use crate::proxy::tun_proxy::tun_v6_ip;
 
     let addr = tun_v6_ip().to_string();
     // Already there is success — every command here is idempotent.
-    let present = hidden("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "(Get-NetIPAddress -InterfaceAlias '{interface}' -AddressFamily IPv6 \
-                 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{addr}' }} \
-                 | Measure-Object).Count -gt 0"
-            ),
-        ])
-        .output();
+    let present = powershell::run(&powershell::Call::new(
+        powershell::has_ipv6_script(),
+        interface,
+        &addr,
+    ));
     if let Ok(out) = &present {
         if String::from_utf8_lossy(&out.stdout).trim() == "True" {
             return true;
         }
     }
 
-    let out = hidden("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "New-NetIPAddress -InterfaceAlias '{interface}' -IPAddress '{addr}' \
-                 -PrefixLength {TUN_V6_PREFIX_LEN} -ErrorAction Stop"
-            ),
-        ])
-        .output();
+    let out = powershell::run(&powershell::Call::new(
+        powershell::set_ipv6_script(),
+        interface,
+        &addr,
+    ));
     match out {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
@@ -420,19 +500,11 @@ fn configure_ipv6_windows(interface: &str) -> bool {
 fn remove_ipv6_windows(interface: &str) -> Result<()> {
     use crate::proxy::tun_proxy::tun_v6_ip;
 
-    let _ = hidden("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Get-NetIPAddress -InterfaceAlias '{interface}' -AddressFamily IPv6 \
-                 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{}' }} | \
-                 Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue",
-                tun_v6_ip()
-            ),
-        ])
-        .output();
+    let _ = powershell::run(&powershell::Call::new(
+        powershell::remove_ipv6_script(),
+        interface,
+        &tun_v6_ip().to_string(),
+    ));
     Ok(())
 }
 
@@ -1554,6 +1626,83 @@ broadcast 10.0.0.255 dev eth0 table local proto kernel scope link src 10.0.0.83
                 super::route_claiming_block(&routes, base),
                 None,
                 "{base}/24 was claimed by a route that owns every destination"
+            );
+        }
+    }
+
+    /// The interface name used to be written into a PowerShell script inside single
+    /// quotes, in the service, which runs as LocalSystem: a quote in the name ended the
+    /// string and everything after it was PowerShell source. The name now travels in the
+    /// environment instead, so it is data — and no name can change what the script says.
+    #[test]
+    fn the_interface_name_is_data_and_never_source() {
+        use super::powershell;
+
+        // Everything a PowerShell string could be talked into: the closing quote, a
+        // subexpression, a statement separator, an escape character and a newline.
+        let hostile = "ne'; Write-Output $(whoami); `n #\r\nne";
+
+        for script in [
+            powershell::has_ipv6_script(),
+            powershell::set_ipv6_script(),
+            powershell::remove_ipv6_script(),
+        ] {
+            let call = powershell::Call::new(script, hostile, "fd00:198:18::fe");
+
+            // The script reads its inputs from the environment…
+            assert!(
+                call.script
+                    .contains(&format!("$env:{}", powershell::INTERFACE_VAR)),
+                "the script does not read the interface name: {}",
+                call.script
+            );
+            assert!(
+                call.script
+                    .contains(&format!("$env:{}", powershell::ADDRESS_VAR)),
+                "the script does not read the address: {}",
+                call.script
+            );
+
+            // …and holds neither of them.
+            assert!(
+                !call.script.contains(hostile) && !call.script.contains("whoami"),
+                "the script carries the name: {}",
+                call.script
+            );
+            assert!(
+                !call.script.contains("fd00:198:18::fe"),
+                "the script carries the address: {}",
+                call.script
+            );
+
+            // The name travels beside the script, unchanged: what PowerShell reads is
+            // the name itself, not a spelling of it.
+            assert_eq!(
+                call.env
+                    .iter()
+                    .find(|(name, _)| *name == powershell::INTERFACE_VAR)
+                    .map(|(_, value)| value.as_str()),
+                Some(hostile)
+            );
+        }
+    }
+
+    /// The scripts have no quoted string left for a value to be spliced into: the
+    /// interface name and the address are read from the environment, and nothing else
+    /// is interpolated. A script with a literal in it is a script a name could break
+    /// out of.
+    #[test]
+    fn no_script_has_a_quoted_string_left_to_break_out_of() {
+        use super::powershell;
+
+        for script in [
+            powershell::has_ipv6_script(),
+            powershell::set_ipv6_script(),
+            powershell::remove_ipv6_script(),
+        ] {
+            assert!(
+                !script.contains('\''),
+                "the script still quotes something: {script}"
             );
         }
     }
