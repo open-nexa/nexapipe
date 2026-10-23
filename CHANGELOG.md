@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-six things land in this cycle so far: the device credential can be a **key**
+Thirty-seven things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -54,7 +54,8 @@ is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
 codec, and a TLS hello that arrives in pieces is read until it is whole, and
 the TLS tunnel half-closes in both directions, and every JNI entry point
 catches a panic before it leaves the frame, and the elevated service names
-the account that dialled it.
+the account that dialled it, and the service an upgrade leaves behind is
+visible instead of silent.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1090,6 +1091,41 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **A service left behind by an upgrade read as a service that was running.**
+  An app upgrade replaces the app's own files and leaves the system service
+  running the build it was started with: launchd and systemd read a job
+  definition once, and the path the service runs from does not change, so
+  nothing restarts it. The two then no longer speak the same protocol, the
+  desktop cannot ask the service anything, and the panel showed a service that
+  was *running* — with the TUN switch greyed out and every button that could
+  have fixed it hidden.
+
+  The install records the build it installed, beside the record of the account
+  the service serves, and the panel compares that with the app's own build. A
+  service manager that says "running" while nothing answers the IPC is read as
+  the drift it is; the install button is offered for a service that is already
+  there; and the Connect page says what is actually wrong rather than "install
+  the service first" about a service that is installed.
+
+- **The daemon ran a program out of the app's own directory, and on macOS an
+  install over a running service could leave the machine with none at all.**
+  The job pointed at the desktop app's own binary, in a directory the local
+  accounts own — and a privileged service must not run a program they can
+  replace: launchd refuses to spawn one outright, so an install could fail
+  with "Bootstrap failed" and leave the machine with no service at all. The
+  install now copies the service binary into a root-owned directory
+  (`/Library/Application Support/Nexa` on macOS, `/usr/libexec` on Linux),
+  checks that the copy is the file it was asked to copy, and points the job at
+  that: the app can be replaced under the service manager without taking the
+  program out from under the running service.
+
+  The install also waits for launchd to *release* the old job rather than for
+  its process to be gone. A bootstrap issued in the window between the two is
+  refused — "Bootstrap failed: 5: Input/output error" — which is how an
+  install could report a failure and leave the machine with no service at all.
+  An install that registered a job which then refused to start is a failure
+  too, and is reported as one.
 
 - **A device that had just registered was left without a working connection.**
   The enrollment already ends with the ordinary handshake, on the stream the

@@ -18,6 +18,7 @@ use super::{
 use crate::error::{codes, AppError};
 use crate::service::platform::account::AccountId;
 use crate::service::platform::install_owner;
+use crate::service::platform::install_version;
 
 /// Text `services.msc` shows for the entry.
 const SERVICE_DESCRIPTION: &str =
@@ -295,6 +296,24 @@ fn install_batch(
         (None, _) => tracing::warn!(
             "Installing the service without naming the account it is for: it will serve \
              any local account that owns the token it reads"
+        ),
+    }
+
+    // Which build this service is, kept in the service's own registry key beside the
+    // account it serves. The desktop reads it to tell an old service from its own — a
+    // question the service itself cannot answer once an upgrade has left it behind,
+    // because the two no longer speak the same protocol.
+    //
+    // Written on an upgrade as well as on a first install: the build the service is
+    // being registered from is the build it will be running.
+    match install_version::record_command(crate::service::ipc::BUILD_VERSION) {
+        Some(command) => {
+            lines.push(command);
+            lines.push("if errorlevel 1 exit /b %errorlevel%".to_string());
+        }
+        None => tracing::warn!(
+            "Not recording which build the service is: the version cannot be written \
+             into the install safely"
         ),
     }
 

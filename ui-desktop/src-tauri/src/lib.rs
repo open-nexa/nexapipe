@@ -776,6 +776,7 @@ pub fn run() {
             commands::service::stop_service,
             commands::service::get_service_status,
             commands::service::get_service_version,
+            commands::service::get_service_installed_version,
             commands::service::is_service_running,
             commands::logs::get_startup_error,
             commands::logs::get_logs,

@@ -5,9 +5,20 @@ set -e
 SERVICE=nexa-service.service
 STATE_FILE=/run/nexa-service.was-active
 
+# The unit runs the service's own copy of the binary, not the app's — the unit runs as
+# root, and a program the local accounts can replace is a program they own. The copy is
+# refreshed by the app when it installs the service; this refreshes it on a package
+# upgrade, so that a unit the package restarts does not come back on the build it had
+# before the upgrade.
+APP=/usr/bin/nexa
+COPY=/usr/libexec/nexa-service
+
 case "${1:-}" in
     configure)
         if command -v systemctl >/dev/null 2>&1; then
+            if [ -x "$APP" ]; then
+                install -D -m 0755 "$APP" "$COPY" || true
+            fi
             systemctl daemon-reload || true
             if [ -f "$STATE_FILE" ]; then
                 rm -f "$STATE_FILE"

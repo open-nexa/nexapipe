@@ -4,6 +4,108 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::service::platform::account::AccountId;
+#[cfg(target_os = "macos")]
+use crate::service::platform::service_copy;
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
+
+/// Whether the job is still registered with launchd.
+///
+/// Not the same question as "is it running": after a bootout the process is gone long
+/// before launchd has finished removing the job, and a bootstrap issued in that window
+/// is refused — the label is still being torn down.
+#[cfg(target_os = "macos")]
+fn is_job_registered_macos() -> bool {
+    use std::process::Command;
+
+    Command::new("launchctl")
+        .args(["print", &macos_job_target()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Waits for launchd to let go of the job.
+///
+/// The removal is not the same event as the exit: the process is down first, and the
+/// job disappears a moment later. A bootstrap issued in between is refused — the label
+/// is still being torn down — and an install refused that way leaves the machine with
+/// no service at all, which is worse than the stale one it was replacing.
+#[cfg(target_os = "macos")]
+fn wait_for_job_release() {
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(15);
+
+    let deadline = Instant::now() + TIMEOUT;
+    while is_job_registered_macos() {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "launchd still holds the job {}s after it was booted out; the install may \
+                 be refused with \"Bootstrap failed\"",
+                TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Puts the daemon's own copy of the service binary in place, and returns where it is.
+///
+/// The copy is what the service manager runs: the app's own binary sits in a directory
+/// the local accounts own, and a privileged service must not run a program they can
+/// replace. See [`service_copy`].
+#[cfg(target_os = "macos")]
+fn install_service_binary(source: &Path) -> Result<PathBuf, AppError> {
+    let destination = service_binary_path();
+
+    // The install was started from the copy itself — which is what happens when the
+    // service binary is asked to install the service. There is nothing to copy then.
+    if source == destination {
+        return Ok(destination);
+    }
+
+    // The directory is root's, and not writable by anybody else: it holds the program a
+    // privileged service runs, so an account that can write it can replace it.
+    let directory = service_binary_path()
+        .parent()
+        .ok_or_else(|| {
+            AppError::with_detail(
+                codes::SERVICE_DEFINITION_FAILED,
+                format!("{} has no parent directory", destination.display()),
+            )
+        })?
+        .to_path_buf();
+    std::fs::create_dir_all(&directory).map_err(|e| {
+        AppError::cause(
+            codes::SERVICE_DEFINITION_FAILED,
+            format!("cannot create {}: {e}", directory.display()),
+        )
+    })?;
+    service_copy::set_mode(&directory, 0o755)?;
+
+    service_copy::copy_verified(source, &destination)?;
+    tracing::info!(
+        "The service runs {} (copied from {})",
+        destination.display(),
+        source.display()
+    );
+
+    Ok(destination)
+}
+
+/// Removes the daemon's own copy of the service binary.
+///
+/// A service that is no longer installed has no binary to run, and a copy left behind
+/// is one nothing will ever replace.
+#[cfg(target_os = "macos")]
+fn remove_service_binary() {
+    let _ = std::fs::remove_file(service_binary_path());
+    if let Some(directory) = service_binary_path().parent() {
+        let _ = std::fs::remove_dir(directory);
+    }
+}
 
 /// The launchd job definition.
 ///
@@ -97,9 +199,16 @@ pub fn install_service_macos(
     use std::path::Path;
     use std::process::Command;
 
+    // The program the daemon runs: the install's own copy of the service binary, in a
+    // directory only root can write. The app's own binary is not it — that one lives
+    // where the local accounts can replace it, and launchd will not run a privileged
+    // service out of a directory they own.
+    let source = service_copy::service_source(Path::new(exe_path));
+    let program = install_service_binary(&source)?;
+
     let plist_path =
         Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
-    let plist_content = macos_plist_content(exe_path);
+    let plist_content = macos_plist_content(&program.to_string_lossy());
 
     let [bootout, bootstrap] = macos_install_commands(plist_path.to_str().unwrap_or_default());
 
@@ -108,9 +217,15 @@ pub fn install_service_macos(
     let _ = Command::new("launchctl").args(&bootout).output();
 
     // `bootout` stops the job with SIGTERM, and the teardown that restores the system DNS is
-    // what answers it — see `uninstall_service_macos`, which waits for the same reason. This
-    // wait is also what makes the write safe: nothing races an incoming definition against a
-    // process that is still coming down from the old one.
+    // what answers it — see `uninstall_service_macos`, which waits for the same reason.
+    //
+    // What is waited for is the job being *released*, not the process being gone: launchd
+    // removes the job a moment after the process is down, and a bootstrap issued in that
+    // window is refused ("Bootstrap failed: 5: Input/output error") because the label is
+    // still being torn down. An install refused that way leaves the machine with no
+    // service at all — which is what happened to the first attempt at installing over a
+    // service that was still running.
+    wait_for_job_release();
     wait_for_service_exit(|| !is_service_running_macos());
 
     fs::create_dir_all("/Library/LaunchDaemons")
@@ -135,12 +250,25 @@ pub fn install_service_macos(
         );
     }
 
+    // Which build this service is, written beside the account record. The desktop reads it
+    // to tell an old service from its own — a question the service itself cannot answer
+    // once it has been left behind by an upgrade, because the two no longer speak the same
+    // protocol.
+    install_version::record_installed_version(crate::service::ipc::BUILD_VERSION)?;
+
     let output = Command::new("launchctl")
         .args(&bootstrap)
         .output()
         .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
 
     if output.status.success() {
+        // The bootstrap answers as soon as the job is registered; the process is
+        // spawned a moment later, and a program launchd will not run — one whose
+        // signature it refuses, or one that sits in a directory the local accounts
+        // own — is refused at that point: the job is registered and nothing is
+        // running. An install that reported success over that is an install that
+        // left the machine with no service at all.
+        verify_started()?;
         Ok(())
     } else {
         Err(AppError::with_detail(
@@ -148,6 +276,31 @@ pub fn install_service_macos(
             String::from_utf8_lossy(&output.stderr),
         ))
     }
+}
+
+/// Checks that the job came up.
+#[cfg(target_os = "macos")]
+fn verify_started() -> Result<(), AppError> {
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !is_service_running_macos() {
+        if Instant::now() >= deadline {
+            return Err(AppError::with_detail(
+                codes::SERVICE_INSTALL_FAILED,
+                format!(
+                    "the service was registered but did not come up within {}s; \
+                     the service log says why",
+                    TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -172,9 +325,18 @@ pub fn uninstall_service_macos() -> Result<(), AppError> {
 
     let _ = fs::remove_file(&plist_path);
 
+    // The daemon's own copy of the service binary goes with it: a service that is no
+    // longer installed has no binary to run, and a copy left behind is one nothing
+    // will ever replace.
+    remove_service_binary();
+
     // The record of which account the service served goes with it: a service
     // that is no longer installed has no account to serve.
     install_owner::forget_installed_by();
+    // And so does the record of which build it was: a service that is gone has
+    // no build, and a version left behind would be read as the version of a
+    // service that is not there.
+    install_version::forget_installed_version();
 
     Ok(())
 }

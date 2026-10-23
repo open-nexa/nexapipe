@@ -39,6 +39,7 @@ const {
   startupError,
   serviceRunning,
   serviceInstalled,
+  serviceStale,
   endpointLinks,
   stale,
   canStart,
@@ -90,9 +91,14 @@ const linkInfo = computed(() => {
   return { label: 'Mixed', icon: 'link-relay', tone: 'mixed' };
 });
 
-const tunHint = computed(() =>
-  serviceRunning.value ? t('connect.tunHint') : t('connect.tunRequiresService'),
-);
+const tunHint = computed(() => {
+  // A service that is registered but not answering this app is not a service that is
+  // missing: it is one running a build this app cannot talk to, and the way out is a
+  // reinstall. Saying "install the service first" about one that is already installed
+  // sends the user looking for the wrong thing.
+  if (serviceStale.value) return t('connect.tunServiceStale');
+  return serviceRunning.value ? t('connect.tunHint') : t('connect.tunRequiresService');
+});
 
 /**
  * Flipping the mode while the proxy is up is a restart, not a toggle: the backend only reads
@@ -101,7 +107,9 @@ const tunHint = computed(() =>
  */
 async function setTun(enabled: boolean): Promise<void> {
   if (enabled && !serviceRunning.value) {
-    toast.warning(t('connect.tunRequiresService'));
+    toast.warning(
+      serviceStale.value ? t('connect.tunServiceStale') : t('connect.tunRequiresService'),
+    );
     return;
   }
 
@@ -135,11 +143,17 @@ const tunModel = computed({
 /**
  * Installing the service from here rather than sending the user to Settings: the switch they
  * just tried to flip is the thing that needs it, and the elevation prompt explains itself.
+ *
+ * A service that is registered but not answering this app gets the same button, worded for
+ * what it is: that one is not missing, it is out of date, and installing over it is what
+ * replaces it with this build.
  */
 async function installServiceForTun(): Promise<void> {
   const ok = await confirm({
-    title: t('connect.tunInstallTitle'),
-    message: t('connect.tunInstallMessage'),
+    title: serviceStale.value ? t('connect.tunReinstallTitle') : t('connect.tunInstallTitle'),
+    message: serviceStale.value
+      ? t('connect.tunReinstallMessage')
+      : t('connect.tunInstallMessage'),
   });
   if (!ok) return;
 
@@ -271,13 +285,13 @@ async function copyNodeId(): Promise<void> {
       </div>
 
       <AppButton
-        v-if="!serviceInstalled"
+        v-if="!serviceInstalled || serviceStale"
         size="sm"
         tone="ghost"
         :loading="installing"
         @click="installServiceForTun"
       >
-        {{ t('service.install') }}
+        {{ serviceStale ? t('service.upgrade') : t('service.install') }}
       </AppButton>
 
       <AppToggle v-model="tunModel" :disabled="!serviceRunning" :label="t('connect.tunToggle')" />

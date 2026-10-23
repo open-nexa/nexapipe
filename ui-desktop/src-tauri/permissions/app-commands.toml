@@ -97,6 +97,11 @@ description = "Enables the get_proxy_status command without any pre-configured s
 commands.allow = ["get_proxy_status"]
 
 [[permission]]
+identifier = "allow-get-service-installed-version"
+description = "Enables the get_service_installed_version command without any pre-configured scope."
+commands.allow = ["get_service_installed_version"]
+
+[[permission]]
 identifier = "allow-get-service-status"
 description = "Enables the get_service_status command without any pre-configured scope."
 commands.allow = ["get_service_status"]

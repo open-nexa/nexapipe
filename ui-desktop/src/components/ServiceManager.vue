@@ -33,6 +33,15 @@ const appVersion = ref("");
 /// instead, which is the case the notice is for.
 const serviceVersion = ref<string | null>(null);
 
+/// Which build the service was *installed* from, read from the record the install wrote.
+///
+/// The answer the service itself gives is the better one, but it needs the IPC to work — and
+/// the case this is for is the one where it does not: a service left behind by an upgrade
+/// keeps running while the app has been replaced, and the two no longer speak the same
+/// protocol. The record is on disk (or in the registry) either way, so the panel can still
+/// say which build is out there.
+const installedVersion = ref<string | null>(null);
+
 /**
  * The timer that takes a success message off the screen.
  *
@@ -81,6 +90,13 @@ async function refresh() {
     console.error("[service] failed to read the service version:", errorDetail(e));
     serviceVersion.value = null;
   }
+
+  try {
+    installedVersion.value = await invoke<string | null>("get_service_installed_version");
+  } catch (e) {
+    console.error("[service] failed to read the installed service version:", errorDetail(e));
+    installedVersion.value = null;
+  }
 }
 
 /// The service is up and said which build it is, and that build is not this app's. The single
@@ -114,15 +130,70 @@ const versionUnknown = computed(
     serviceVersion.value === null,
 );
 
-/// Either drift state warrants the banner; the wording is what tells them apart.
-const needsUpgrade = computed(
-  () => versionMismatch.value || versionUnknown.value,
+/// The build the service was installed from is not this build.
+///
+/// The comparison the panel cannot make any other way once the IPC is down: the service that
+/// cannot answer is exactly the one whose version has to be read from the record the install
+/// left behind.
+///
+/// The record says which build was *registered*, and it is the right answer only when the
+/// service cannot speak for itself: a service that is answering has already said which build
+/// it is, and a record left behind by a service that was removed out of band asserts a drift
+/// on a machine that has no service at all.
+const installedVersionMismatch = computed(
+  () =>
+    state.value !== "not_installed" &&
+    !serviceRunning.value &&
+    appVersion.value !== "" &&
+    installedVersion.value !== null &&
+    installedVersion.value !== appVersion.value,
 );
 
-const needsUpgradeMessage = computed(() =>
-  serviceVersion.value
-    ? t("service.versionMismatch", { service: serviceVersion.value, app: appVersion.value })
-    : t("service.versionUnknown", { app: appVersion.value }),
+/// The service manager says the service is running, and nothing is answering on the IPC.
+///
+/// Two facts from two places, which only coincide when the service is the build this app
+/// expects. A service left behind by an upgrade keeps running — the job is fine, the
+/// protocol is not — and this is the one signal that says so without the service having to
+/// answer anything.
+const serviceUnreachable = computed(
+  () => state.value === "running" && !serviceRunning.value,
+);
+
+/// Any drift state warrants the banner; the wording is what tells them apart.
+const needsUpgrade = computed(
+  () =>
+    versionMismatch.value ||
+    versionUnknown.value ||
+    installedVersionMismatch.value ||
+    serviceUnreachable.value,
+);
+
+const needsUpgradeMessage = computed(() => {
+  // On the *mismatch*, not on any answer: a service that reported this app's own build is
+  // not a mismatch, and saying so with the same string on both sides reads as nonsense.
+  if (versionMismatch.value) {
+    return t("service.versionMismatch", { service: serviceVersion.value, app: appVersion.value });
+  }
+  if (installedVersionMismatch.value) {
+    return t("service.installedVersionMismatch", {
+      service: installedVersion.value,
+      app: appVersion.value,
+    });
+  }
+  if (serviceUnreachable.value) {
+    return t("service.notAnswering");
+  }
+  return t("service.versionUnknown", { app: appVersion.value });
+});
+
+/// What the install button says: putting a service on the machine, or replacing the one that
+/// is on it.
+///
+/// The same command either way — an install re-points the service at this build and restarts
+/// it — and the second is the only way out of a service that is running a build this app
+/// cannot talk to.
+const installLabel = computed(() =>
+  state.value === "not_installed" ? t("service.install") : t("service.upgrade"),
 );
 
 /**
@@ -172,7 +243,12 @@ async function run(
 }
 
 function installService() {
-  return run("install", "install_service", "service.installed", "error.service.install_failed");
+  // The same command either way: an install re-points the service at this build and
+  // restarts it. What the panel says afterwards depends on what it found — a service that
+  // was not there, or one that is being replaced.
+  const successKey =
+    state.value === "not_installed" ? "service.installed" : "service.upgraded";
+  return run("install", "install_service", successKey, "error.service.install_failed");
 }
 
 /// Reinstalling *is* the upgrade: installing re-points the service at this build and restarts
@@ -273,19 +349,28 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="service-actions">
+      <!--
+        Hidden while the notice above is up: that one carries the same action, and two
+        buttons that do the same thing under the same label are one too many.
+      -->
       <button
+        v-if="!needsUpgrade"
         class="btn btn-outline"
-        :disabled="isLoading || state !== 'not_installed'"
+        :disabled="isLoading"
         @click="installService"
       >
         <svg v-if="busyWith === 'install'" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="10"/>
         </svg>
-        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <svg v-else-if="state === 'not_installed'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 5v14"/>
           <path d="M5 12h14"/>
         </svg>
-        <span>{{ busyWith === 'install' ? t("service.installing") : t("service.install") }}</span>
+        <svg v-else class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/>
+          <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
+        </svg>
+        <span>{{ busyWith === 'install' ? t("service.installing") : installLabel }}</span>
       </button>
 
       <button

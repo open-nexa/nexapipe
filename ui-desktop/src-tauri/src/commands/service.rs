@@ -79,6 +79,21 @@ pub(crate) async fn get_service_version() -> Option<String> {
     }
 }
 
+/// The build the installed service is, read from the record the install wrote.
+///
+/// Not from the service: asking the service which build it is needs the IPC to work, and
+/// the case this exists for is the one where it does not — a service left behind by an
+/// upgrade keeps running while the app has been replaced, and the two no longer speak the
+/// same protocol. The record is written by the install, so it answers the question even
+/// then.
+///
+/// `None` when there is no record: a machine that never had the service installed, or one
+/// whose service predates the record.
+#[tauri::command]
+pub(crate) async fn get_service_installed_version() -> Option<String> {
+    service::platform::install_version::read_installed_version()
+}
+
 /// Starts the service, asking for administrator rights when the unprivileged call is refused.
 #[tauri::command]
 pub(crate) async fn start_service() -> Result<(), AppError> {
