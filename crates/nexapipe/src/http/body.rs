@@ -310,6 +310,17 @@ pub fn full_body(bytes: bytes::Bytes) -> HttpBody {
     UnsyncBoxBody::new(inner)
 }
 
+/// A body with nothing in it.
+///
+/// What an answer that is not a body at all carries: a refusal, and a `101` —
+/// the upgrade has no body of its own, and the bytes that follow it are the
+/// session's.
+pub fn empty_body() -> ProxyBody {
+    let empty = http_body_util::Empty::<bytes::Bytes>::new()
+        .map_err(|never: std::convert::Infallible| -> BodyError { match never {} });
+    UnsyncBoxBody::new(empty)
+}
+
 /// What the proxy knows about a body that is still on the client's stream.
 ///
 /// Shared between the body the request carries and the request that owns it:

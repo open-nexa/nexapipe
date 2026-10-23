@@ -184,7 +184,7 @@ impl AuthState {
 /// the bytes before it were already scanned on an earlier read, so without it
 /// every read rescanned the whole buffer, and a head delivered one segment at
 /// a time cost a full pass per segment.
-fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
     buf.get(from..)?
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -959,7 +959,7 @@ const WS_COPY_BUFFER: usize = 64 * 1024;
 /// interval, and the wall clock can step. A step backwards would suspend the
 /// bound — the session would never be found quiet — and a step forwards
 /// would end a session that was still carrying traffic.
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     static BASE: OnceLock<std::time::Instant> = OnceLock::new();
     let base = BASE.get_or_init(std::time::Instant::now);
     base.elapsed().as_millis() as u64

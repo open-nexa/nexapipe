@@ -117,7 +117,7 @@ async fn handle(
     ctx: Arc<Context>,
 ) -> Result<Response<crate::http::body::ProxyBody>, Infallible> {
     let (parts, body) = req.into_parts();
-    let request = Request::from_parts(parts, ());
+    let request = Request::from_parts(parts.clone(), ());
 
     // The head's size, as far as the proxy can tell: hyper parsed the head
     // and does not hand the raw bytes over. What it parsed is what went on
@@ -189,6 +189,14 @@ async fn handle(
         backend_info.url
     );
 
+    // A WebSocket upgrade: the client wants the connection to become a
+    // conversation rather than a request. It is answered before the body is
+    // read — there is no body — and the session that follows is two byte
+    // streams moved either way.
+    if crate::http::websocket::is_upgrade(&request) {
+        return Ok(upgrade(Request::from_parts(parts, body), ctx, backend_info).await);
+    }
+
     let started = std::time::Instant::now();
     let method = request.method().clone();
     let request_target = request.uri().to_string();
@@ -241,6 +249,81 @@ async fn handle(
             ))
         }
     }
+}
+
+/// A WebSocket upgrade, answered.
+///
+/// Hyper hands the client's side of the connection over once the `101` is
+/// written, so the answer and the session are two things: the answer is what
+/// the client is waiting for, and the session is what happens after it.
+async fn upgrade(
+    request: Request<Incoming>,
+    ctx: Arc<Context>,
+    backend_info: BackendInfo,
+) -> Response<crate::http::body::ProxyBody> {
+    let (parts, body) = request.into_parts();
+    let head = Request::from_parts(parts.clone(), ());
+
+    // Hyper hands the client's side over once the `101` is written, so this
+    // has to be asked for **before** the answer goes out.
+    let upgraded = hyper::upgrade::on(Request::from_parts(parts, body));
+
+    let handshake = match crate::http::websocket::handshake(
+        &ctx.clients,
+        &backend_info,
+        &head,
+        ctx.config.timeouts(),
+    )
+    .await
+    {
+        Ok(handshake) => handshake,
+        Err(failure) => {
+            tracing::warn!("The WebSocket upgrade failed: {}", failure.error);
+            crate::metrics::METRICS.record_request(502, 0);
+            crate::log::log_access(
+                &ctx.request_id,
+                &ctx.peer,
+                head.method().as_str(),
+                &head.uri().path().to_string(),
+                502,
+                0,
+                0,
+                Some(&ctx.who),
+            );
+            return crate::http::response::create_error_response(
+                StatusCode::BAD_GATEWAY,
+                "502 Bad Gateway",
+            );
+        }
+    };
+
+    // The backend refused the upgrade: the client gets the backend's own
+    // answer, which is an ordinary response and not a session.
+    if handshake.status != 101 {
+        tracing::debug!(
+            "WebSocket handshake failed with backend, status: {}",
+            handshake.status
+        );
+        crate::metrics::METRICS.record_request(handshake.status, 0);
+        return handshake.refusal_response();
+    }
+
+    let response = handshake.upgrade_response();
+    let backend = handshake.backend;
+    let trailing = handshake.trailing;
+    let idle = ctx.config.timeouts().deadlines.response_idle;
+
+    // The session, in its own task: it outlives the answer, and the answer is
+    // what the client is waiting for.
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(client) => crate::http::websocket::pump(client, backend, trailing, idle).await,
+            Err(e) => tracing::debug!("The upgraded stream did not arrive: {e}"),
+        }
+    });
+
+    crate::metrics::METRICS.record_request(101, 0);
+    response
 }
 
 /// The retry loop, and the answer it produced.
