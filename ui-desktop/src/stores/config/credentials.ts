@@ -20,6 +20,7 @@ import {
   takeRuntimeCredentials,
 } from '../../api/credentials';
 import type { NodeConfig, ProxyConfig } from '../../types';
+import { isKeyNode } from './keys';
 import { relayTokenRelayFor } from './relay';
 
 /**
@@ -72,10 +73,16 @@ export async function persistCredentials(config: ProxyConfig): Promise<void> {
       await deleteCredential('totp', node.id);
     } else if (node.twoFactor.secret.trim()) {
       await putCredential('totp', node.twoFactor.secret, node.id);
-    } else if (node.deviceKey?.trim()) {
+    } else if (isKeyNode(node)) {
       // A key node stores no seed: a secret left in the store would be a
       // credential the server never issued this device, and the one thing
       // that store is for is answering with what the server holds.
+      //
+      // **The node's own key, not the one it answers with.** Every node of a
+      // machine that has a key carries it, so a node whose credential is a
+      // secret carries one too — and asking "does this node have a key?" of
+      // that would have deleted the seed the invite had just filed, leaving
+      // the node with no credential at all.
       await deleteCredential('totp', node.id);
     }
 
@@ -91,8 +98,11 @@ export async function persistCredentials(config: ProxyConfig): Promise<void> {
     // of its own when it had not.
     //
     // What is left is the deletion: a node whose key was cleared here must
-    // not leave one behind in the store.
-    if (!node.deviceKey && !node.enrollment) {
+    // not leave one behind in the store. And "whose key was cleared" is
+    // about the node's own key: the machine's is not this node's to drop,
+    // and a node that never had one of its own has nothing of its own
+    // filed here.
+    if (!isKeyNode(node) && !node.enrollment) {
       await deleteCredential('devicekey', node.id);
     }
 
