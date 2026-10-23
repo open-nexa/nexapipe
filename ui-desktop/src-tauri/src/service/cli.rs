@@ -10,6 +10,29 @@ use crate::service::elevate;
 use crate::service::platform;
 use crate::service::runner::ServiceRunner;
 
+/// Flag that tells the install to leave the service stopped, as `--leave-stopped`.
+///
+/// For the installer: an upgrade has to leave the machine the way it found it, and a service
+/// the user had stopped is not theirs to start behind their back. The registration itself is
+/// the same either way — the entry, the binary under Program Files, the account it serves —
+/// only the service is left down.
+///
+/// Windows only in its effect. The Unix install starts the service through its own service
+/// manager, and the installer that asks for this is the Windows one.
+pub const LEAVE_STOPPED_ARG: &str = "--leave-stopped";
+
+/// Flag that tells the install to keep the account the service already serves, as
+/// `--keep-owner`.
+///
+/// For the installer: an upgrade re-registers the service, and re-registering it is not how
+/// the account it serves is chosen. The account the service was installed for is the one the
+/// user picked, and an upgrade that quietly moved the service to whoever happened to run the
+/// installer would change which account the service serves without saying so.
+///
+/// Windows only in its effect. The Unix half records the account in a root-owned file that
+/// the installer of the upgrade never writes.
+pub const KEEP_OWNER_ARG: &str = "--keep-owner";
+
 /// Consumes the service-management verbs.
 ///
 /// Returns `true` when `args` named one of them and the process should exit
@@ -36,7 +59,14 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             // The guard is held to the end of the arm, so the message is
             // flushed before the process reports its outcome and exits.
             let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
-            elevate::report_result(result_file.as_deref(), &platform::install_service());
+
+            // Read here rather than in the elevated child: the decision changes what the
+            // install does, and the install is what the elevated child runs.
+            let leave_stopped = args.iter().any(|arg| arg == LEAVE_STOPPED_ARG);
+            let keep_owner = args.iter().any(|arg| arg == KEEP_OWNER_ARG);
+            let outcome = platform::install_service_with(leave_stopped, keep_owner);
+
+            elevate::report_result(result_file.as_deref(), &outcome);
             true
         }
         "--uninstall" => {
