@@ -12,7 +12,7 @@ use tracing;
 
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use nexapipe_proto::protocol::Protocol;
+use nexapipe_proto::protocol::{Protocol, offered_alpns};
 
 mod borrow;
 mod link_status;
@@ -24,22 +24,6 @@ use link_status::measured_rtt;
 pub use link_status::{LinkKind, LinkStatus, encode_link_status};
 use nexapipe_proto::secret::SecretString;
 use std::collections::HashMap;
-
-// The ALPN this build speaks, and the one servers built before the prefix
-// byte was dropped accept.
-//
-// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
-// starts with — in front of the name. That byte was never part of a length
-// encoding; it made the protocol name a nine-byte string that began with a
-// control byte, which is a fingerprint on the wire and nothing else. The name
-// is now the name.
-//
-// The constants live in `nexapipe-proto`, which the server links too: the two
-// ends have to agree on the name, and a name written down twice is a name
-// that eventually differs.
-#[cfg(test)]
-use nexapipe_proto::ALPN_NEXAPIPE;
-use nexapipe_proto::ALPN_NEXAPIPE_LEGACY;
 
 /// The ALPNs this client offers the server.
 ///
@@ -53,13 +37,10 @@ use nexapipe_proto::ALPN_NEXAPIPE_LEGACY;
 /// offers — so what matters is that the server's list has the per-protocol
 /// names in front of the generic one, and that the client offers the one it
 /// wants.
+///
+/// The list itself is written down once, in the crate the server links too.
 pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
-    let mut list = vec![protocol.alpn().to_vec()];
-    if protocol != Protocol::Legacy {
-        list.push(Protocol::Legacy.alpn().to_vec());
-    }
-    list.push(ALPN_NEXAPIPE_LEGACY.to_vec());
-    list
+    offered_alpns(protocol)
 }
 
 /// What a dial produced: the connection and the state its flows share, or
