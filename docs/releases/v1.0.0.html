@@ -545,6 +545,12 @@ grep nexapipe-1.0.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       same way:
       <pre>unknown field `stray_key`, expected one of `default_backend`, `debug`, `routes`, `server`, `iroh`, ...
 This build does not know that key: remove it, or fix its spelling.</pre>
+      One key is worth naming in advance, because a config can carry it today:
+      <strong><code>[admin] token</code> is not a key.</strong> The admin token is generated into
+      <code>&lt;config&gt;.admin-token</code> and that file is the only source of it, so a config that
+      names a token is refused rather than parsed and dropped &mdash; the operator finds out that the
+      token they set is not the token in use, instead of finding out when the management surface
+      answers 401.
     </li>    <li><strong>The runtime state moves into a file of its own.</strong> The counters and the TOTP
       step memories are written to a file named after the configuration &mdash;
       <code>config.toml</code> puts its state in <code>config.state.toml</code>. The old
