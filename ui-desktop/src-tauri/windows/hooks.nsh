@@ -83,6 +83,14 @@ ${UnStrRep}
 ; `service::cli::LEAVE_STOPPED_ARG` in the app says the same thing; the two have to stay
 ; in sync.
 !define NEXAPIPE_LEAVE_STOPPED_ARG "--leave-stopped"
+; The argument that tells the app to leave the account the service serves alone.
+; `service::cli::KEEP_OWNER_ARG` in the app says the same thing; the two have to stay
+; in sync.
+!define NEXAPIPE_KEEP_OWNER_ARG "--keep-owner"
+; The name of the registry value the app writes the account the service serves into.
+; `install_owner::OWNER_VALUE` in the app says the same thing; the two have to stay in
+; sync. It lives in the service's own key, which both halves can read.
+!define NEXAPIPE_OWNER_VALUE "ServiceOwner"
 
 ; Scratch files for the elevated steps. Nothing of this survives the run.
 ;
@@ -136,6 +144,76 @@ Var /GLOBAL NEXAPIPE_QUERY_LOG
   Pop $0
 !macroend
 
+; Reads the first line of `file` into `out`, without the line break.
+;
+; The break is part of what comes back: `FileRead` hands over the line as it was written,
+; CR and LF included, so a comparison with the bare word is never equal. A log that says
+; "0" reads as "0" and two characters nobody wrote, and a check that asks "is this the word
+; RUNNING?" is answered "no" every time - which is how a log can say the service was
+; running and still not be believed. The ending is taken off here, once, so that every
+; comparison below compares words.
+;
+; A file that cannot be read leaves `out` empty, which is what a missing log is: no answer,
+; and the caller decides what that means.
+;
+; `out` must not be one of $3, $4 or $5: those are the scratch the macro works in, and they
+; are put back the way they were found - which is what keeps the answer in `out` the one
+; thing the macro leaves changed.
+!macro NEXAPIPE_READ_LINE file out
+  Push $3
+  Push $4
+  Push $5
+
+  StrCpy ${out} ""
+  ClearErrors
+  FileOpen $3 ${file} r
+  ${IfNot} ${Errors}
+    FileRead $3 $4
+    FileClose $3
+    ; Whichever way the line was ended, the ending is not part of the word.
+    ${StrRep} $5 $4 "$\r" ""
+    ${StrRep} $4 $5 "$\n" ""
+    StrCpy ${out} $4
+  ${EndIf}
+
+  Pop $5
+  Pop $4
+  Pop $3
+!macroend
+
+; Whether the log says the service is running, and leaves the answer in `out` (1 or 0).
+;
+; The word is compared without the line it was written on: `FileRead` hands the break
+; over as part of the value, so the first characters are the answer and the rest is the
+; end of the line. Seven is the length of the word - `RUNNING`.
+;
+; The comparison is done this way rather than by stripping the break off, because this
+; macro is used by the uninstaller as well as by the installer, and the uninstaller may
+; only call the functions of its own.
+;
+; `out` must not be one of $3, $4 or $5 - the scratch the macro works in.
+!macro NEXAPIPE_LOG_SAYS_RUNNING log out
+  Push $3
+  Push $4
+  Push $5
+
+  StrCpy ${out} 0
+  ClearErrors
+  FileOpen $3 ${log} r
+  ${IfNot} ${Errors}
+    FileRead $3 $4
+    FileClose $3
+    StrCpy $5 $4 7
+    ${If} $5 == "RUNNING"
+      StrCpy ${out} 1
+    ${EndIf}
+  ${EndIf}
+
+  Pop $5
+  Pop $4
+  Pop $3
+!macroend
+
 ; Where the uninstaller leaves its note about the service it is about to drop, for the install
 ; that follows to pick up. The two product names are spelled out rather than read from
 ; MANUFACTURER / PRODUCTNAME, which installer.nsi defines below this include. Nothing in either
@@ -179,6 +257,20 @@ Var /GLOBAL NEXAPIPE_BACKUP_SCRIPT
 Var /GLOBAL NEXAPIPE_BACKUP_LOG
 Var /GLOBAL NEXAPIPE_ROLLBACK_SCRIPT
 Var /GLOBAL NEXAPIPE_ROLLBACK_SERVICE_SCRIPT
+; The logs the two halves of the rollback leave their outcome in: the user's own files
+; first, then the copy under Program Files and the entry that points at it. A rollback
+; that could not run is not a rollback, and the user is the one who has to decide what to
+; do about the machine they are left with.
+Var /GLOBAL NEXAPIPE_ROLLBACK_LOG
+Var /GLOBAL NEXAPIPE_ROLLBACK_SERVICE_LOG
+; Whether the rollback put the machine back, and what it says if it did not.
+Var /GLOBAL NEXAPIPE_ROLLBACK_FAILED
+Var /GLOBAL NEXAPIPE_ROLLBACK_REASON
+; The start type the entry had before the upgrade - 2 automatic, 3 manual, 4 disabled -
+; and the account it served. An upgrade changes neither, and a rollback puts both back
+; if anything did.
+Var /GLOBAL NEXAPIPE_OLD_START_TYPE
+Var /GLOBAL NEXAPIPE_OLD_OWNER
 ; Where the app leaves the outcome of the re-registration.
 Var /GLOBAL NEXAPIPE_RESULT_FILE
 ; Whether the copies could be taken. An upgrade that cannot be put back must not go ahead.
@@ -267,6 +359,41 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   ${EndIf}
 !macroend
 
+; Reads the two settings of the entry that an upgrade changes without being asked to: the
+; start type, and the account the service serves.
+;
+; The start type is the number the control manager keeps - 2 automatic, 3 manual, 4
+; disabled - and it is read out of the entry itself. The account is a value in the same
+; key, written there by the app when it registered the service.
+;
+; Both are read without elevation: the service key is readable by anybody, and an upgrade
+; that had to ask for administrator rights before it could look would put a prompt in
+; front of every user to learn something the installer already knows.
+;
+; The app does not change either of them when it re-registers the service - that is what
+; `--keep-owner` and the missing `start=` in its install are for - so what is read here is
+; what the rollback puts back if anything did change them.
+!macro NEXAPIPE_READ_ENTRY_SETTINGS
+  Push $0
+  Push $1
+
+  StrCpy $NEXAPIPE_OLD_START_TYPE ""
+  StrCpy $NEXAPIPE_OLD_OWNER ""
+
+  ReadRegStr $0 HKLM "${NEXAPIPE_SERVICE_KEY}" "Start"
+  ${If} $0 != ""
+    StrCpy $NEXAPIPE_OLD_START_TYPE $0
+  ${EndIf}
+
+  ReadRegStr $0 HKLM "${NEXAPIPE_SERVICE_KEY}" "${NEXAPIPE_OWNER_VALUE}"
+  ${If} $0 != ""
+    StrCpy $NEXAPIPE_OLD_OWNER $0
+  ${EndIf}
+
+  Pop $1
+  Pop $0
+!macroend
+
 ; Asks what is registered and whether it is running, and writes the answer
 ; down for the rest of the run: whether the entry existed at all, whether the
 ; service was running, and which file the control manager runs.
@@ -285,6 +412,9 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
 
   !insertmacro NEXAPIPE_READ_IMAGE_PATH
   !insertmacro NEXAPIPE_PARSE_IMAGE_PATH
+  ; The two settings an upgrade has no business changing are read now, while the entry is
+  ; still the one the user had.
+  !insertmacro NEXAPIPE_READ_ENTRY_SETTINGS
   ${If} $NEXAPIPE_OLD_BINPATH != ""
     StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 1
     StrCpy $NEXAPIPE_SERVICE_IS_REGISTERED 1
@@ -340,15 +470,9 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ; and a UAC prompt in front of every upgrade would be a poor trade for the answer.
     ExecShellWait "open" "$SYSDIR\cmd.exe" '/c "$NEXAPIPE_QUERY_SCRIPT"' SW_HIDE
 
-    ClearErrors
-    FileOpen $0 $NEXAPIPE_QUERY_LOG r
-    ${IfNot} ${Errors}
-      ; FileRead stops at the line break, so the word comes back without it.
-      FileRead $0 $1
-      FileClose $0
-      ${If} $1 == "RUNNING"
-        StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1
-      ${EndIf}
+    !insertmacro NEXAPIPE_LOG_SAYS_RUNNING $NEXAPIPE_QUERY_LOG $1
+    ${If} $1 == 1
+      StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1
     ${EndIf}
   ${EndIf}
 
@@ -527,14 +651,53 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
 !macroend
 
 ; Writes into the batch file currently open on $0 the copy that puts one file
-; back where it was.
+; back where it was, and leaves the outcome in `log`.
 ;
 ; Only a copy that was actually taken is put back. The name was reserved by the
 ; OS whether the copy worked or not, and an empty file is not the previous
 ; version of anything - so the size is what says whether there is something to
 ; put back.
-!macro NEXAPIPE_WRITE_RESTORE source destination
-  FileWrite $0 'for %%A in ("${source}") do if exist "%%~fA" if %%~zA GTR 0 copy /y "%%~fA" "${destination}" >nul 2>&1$\r$\n'
+;
+; The outcome is written down because a copy that was refused leaves the machine
+; in a state nobody was told about: a file that is still open - which is what a
+; running application does to its own executable - cannot be put back, and a
+; rollback that cannot be seen is a rollback nobody can believe.
+!macro NEXAPIPE_WRITE_RESTORE source destination log
+  FileWrite $0 'for %%A in ("${source}") do if exist "%%~fA" if %%~zA GTR 0 (copy /y "%%~fA" "${destination}" >nul 2>&1 && echo 0 >> "${log}" || echo 1 >> "${log}")$\r$\n'
+!macroend
+
+; Leaves 1 in `out` when the log holds a line that says a copy failed.
+;
+; A log that is not there at all is not a failure here: it says the script never
+; ran, which the caller asks about on its own - a declined prompt and a refused
+; copy are different problems with different answers.
+!macro NEXAPIPE_LOG_HAS_FAILURE log out
+  Push $3
+  Push $4
+  Push $5
+
+  StrCpy ${out} 0
+  ClearErrors
+  FileOpen $3 ${log} r
+  ${IfNot} ${Errors}
+    ${Do}
+      FileRead $3 $4
+      ${If} $4 == ""
+        ${Break}
+      ${EndIf}
+      ; The line break is not part of the word - see NEXAPIPE_READ_LINE.
+      ${StrRep} $5 $4 "$\r" ""
+      ${StrRep} $4 $5 "$\n" ""
+      ${If} $4 == "1"
+        StrCpy ${out} 1
+      ${EndIf}
+    ${LoopUntil} $4 == ""
+    FileClose $3
+  ${EndIf}
+
+  Pop $5
+  Pop $4
+  Pop $3
 !macroend
 
 ; Copies the files this upgrade replaces somewhere they can be put back from.
@@ -562,11 +725,19 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   StrCpy $NEXAPIPE_BACKUP_FAILED 0
 
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_SCRIPT ".cmd"
+  ; The log is reserved with the rest of them, and it has to be: the batch writes its
+  ; outcome into it, and a redirection into `""` is refused by `cmd`, so a log that was
+  ; never given a name would leave the batch with nothing to say and every upgrade
+  ; looking like a failure.
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_LOG ".log"
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_APP ".bak"
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_SERVICE ".bak"
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_UNINSTALLER ".bak"
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_BACKUP_SYSTEM ".bak"
 
+  ; Every name above is reserved or left empty, and an empty one means the reservation
+  ; failed. The tests are ORed rather than ANDed - that is what `${OrIf}` means - so the
+  ; block below runs when any of them is empty, which is the failure this is looking for.
   ${If} $NEXAPIPE_BACKUP_SCRIPT == ""
   ${OrIf} $NEXAPIPE_BACKUP_LOG == ""
   ${OrIf} $NEXAPIPE_BACKUP_APP == ""
@@ -616,12 +787,7 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ; The log says whether the copies were taken. A log that is not there at
     ; all means the script never ran, which is a failure as much as a "1" is.
     StrCpy $1 1
-    ClearErrors
-    FileOpen $0 $NEXAPIPE_BACKUP_LOG r
-    ${IfNot} ${Errors}
-      FileRead $0 $1
-      FileClose $0
-    ${EndIf}
+    !insertmacro NEXAPIPE_READ_LINE $NEXAPIPE_BACKUP_LOG $1
     ${If} $1 != "0"
       DetailPrint "Could not copy the installed files aside; not continuing."
       StrCpy $NEXAPIPE_BACKUP_FAILED 1
@@ -680,20 +846,19 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ; The app is started the way the shell starts it, without a window: the
     ; outcome comes back through the result file, so the exit code is of no use
     ; here, and `ExecWait` would flash a console window on the user's screen.
+    ;
+    ; `--keep-owner` is in both: the account the service serves is the one the user
+    ; chose when they installed it, and an upgrade that quietly moved the service to
+    ; whoever happened to run the installer would change that without saying so.
     ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
-      ExecShellWait "open" "$INSTDIR\${NEXAPIPE_APP_EXE}" "--install --result-file $\"$NEXAPIPE_RESULT_FILE$\"" SW_HIDE
+      ExecShellWait "open" "$INSTDIR\${NEXAPIPE_APP_EXE}" "--install ${NEXAPIPE_KEEP_OWNER_ARG} --result-file $\"$NEXAPIPE_RESULT_FILE$\"" SW_HIDE
     ${Else}
-      ExecShellWait "open" "$INSTDIR\${NEXAPIPE_APP_EXE}" "--install ${NEXAPIPE_LEAVE_STOPPED_ARG} --result-file $\"$NEXAPIPE_RESULT_FILE$\"" SW_HIDE
+      ExecShellWait "open" "$INSTDIR\${NEXAPIPE_APP_EXE}" "--install ${NEXAPIPE_KEEP_OWNER_ARG} ${NEXAPIPE_LEAVE_STOPPED_ARG} --result-file $\"$NEXAPIPE_RESULT_FILE$\"" SW_HIDE
     ${EndIf}
 
     ; The app writes one line: OK: when the service was registered, ERR: and
     ; the reason when it was not.
-    ClearErrors
-    FileOpen $1 $NEXAPIPE_RESULT_FILE r
-    ${IfNot} ${Errors}
-      FileRead $1 $2
-      FileClose $1
-    ${EndIf}
+    !insertmacro NEXAPIPE_READ_LINE $NEXAPIPE_RESULT_FILE $2
 
     ${If} $2 == "OK:"
       DetailPrint "The ${NEXAPIPE_SERVICE_NAME} now runs the new service binary."
@@ -746,29 +911,51 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
 ; that points at it, which are the administrator's: one elevated run does both,
 ; and starts the service again when it was running to begin with.
 ;
+; What that elevated run achieved is written down in a log, because nothing comes
+; back through "runas". A rollback that could not run - a declined prompt, a copy
+; refused because the service was still holding the file open - is not a rollback,
+; and the message the user reads has to say which of the two happened rather than
+; claim a machine that is in a state nobody checked.
 !macro NEXAPIPE_ROLLBACK
   Push $0
   Push $1
   Push $2
 
+  StrCpy $NEXAPIPE_ROLLBACK_FAILED 0
+  StrCpy $NEXAPIPE_ROLLBACK_REASON ""
+
   ; The user's own files.
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SCRIPT ".cmd"
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_LOG ".log"
   ${If} $NEXAPIPE_ROLLBACK_SCRIPT != ""
+  ${AndIf} $NEXAPIPE_ROLLBACK_LOG != ""
     FileOpen $0 $NEXAPIPE_ROLLBACK_SCRIPT w
     FileWrite $0 "@echo off$\r$\n"
-    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_APP" "$INSTDIR\${NEXAPIPE_APP_EXE}"
-    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_SERVICE" "$INSTDIR\${NEXAPIPE_SERVICE_EXE}"
-    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_UNINSTALLER" "$INSTDIR\uninstall.exe"
+    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_APP" "$INSTDIR\${NEXAPIPE_APP_EXE}" "$NEXAPIPE_ROLLBACK_LOG"
+    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_SERVICE" "$INSTDIR\${NEXAPIPE_SERVICE_EXE}" "$NEXAPIPE_ROLLBACK_LOG"
+    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_UNINSTALLER" "$INSTDIR\uninstall.exe" "$NEXAPIPE_ROLLBACK_LOG"
     FileWrite $0 "exit /b 0$\r$\n"
     FileClose $0
 
     !insertmacro NEXAPIPE_RUN_UNELEVATED $NEXAPIPE_ROLLBACK_SCRIPT
     Delete $NEXAPIPE_ROLLBACK_SCRIPT
+
+    ; Whether the user's own files are back. An application that is still running holds
+    ; its own executable open, and that file cannot be put back while it runs - which is
+    ; a state the user has to be told about rather than one a message can call a
+    ; rollback.
+    !insertmacro NEXAPIPE_LOG_HAS_FAILURE $NEXAPIPE_ROLLBACK_LOG $1
+    ${If} $1 = 1
+      StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The application's own files could not all be put back - close the application and run the installer again."
+    ${EndIf}
   ${EndIf}
 
   ; The copy under Program Files, and the entry that points at it.
   !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT ".cmd"
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_LOG ".log"
   ${If} $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT != ""
+  ${AndIf} $NEXAPIPE_ROLLBACK_SERVICE_LOG != ""
     ; The entry is only put back when the app moved it: the registration points
     ; the control manager at the copy under Program Files, and an entry that
     ; already pointed there is left as it is.
@@ -778,25 +965,95 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
       StrCpy $1 1
       ; `sc config` takes the value the way `sc create` does: the executable in
       ; quotes, with the quotes escaped, so that a path with a space in it
-      ; survives. The start type is not mentioned, so it is left as it is.
+      ; survives.
       ${StrRep} $2 $NEXAPIPE_OLD_BINPATH '"' '\"'
     ${EndIf}
 
     FileOpen $0 $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT w
     FileWrite $0 "@echo off$\r$\n"
-    !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_SYSTEM" "$NEXAPIPE_SYSTEM_BINARY"
+
+    ; The service comes down before the copy. It is what holds the file open, and a
+    ; copy refused for that reason is a copy that does not happen - which is exactly
+    ; how the new binary would have stayed in place while the installer said it had
+    ; been put back.
+    !insertmacro NEXAPIPE_WRITE_STOP_WAIT
+
+    ; The old copy, and its outcome. A copy that was needed and did not work stops the
+    ; rollback here, and the log says so: the new binary is still under Program Files,
+    ; and the control manager is still running it.
+    FileWrite $0 'if not exist "$NEXAPIPE_BACKUP_SYSTEM" goto :nexapipe_system_copied$\r$\n'
+    FileWrite $0 'copy /y "$NEXAPIPE_BACKUP_SYSTEM" "$NEXAPIPE_SYSTEM_BINARY" >nul 2>&1$\r$\n'
+    FileWrite $0 "if errorlevel 1 goto :nexapipe_restore_failed$\r$\n"
+    FileWrite $0 ":nexapipe_system_copied$\r$\n"
+
     ${If} $1 = 1
       FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} binPath= "$2" >nul 2>&1$\r$\n'
     ${EndIf}
+
+    ; The start type, if the entry had one: when the user's service comes up is the
+    ; user's decision, and a rollback that leaves the entry starting by itself has not
+    ; put the machine back.
+    ${If} $NEXAPIPE_OLD_START_TYPE == "2"
+      FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} start= auto >nul 2>&1$\r$\n'
+    ${ElseIf} $NEXAPIPE_OLD_START_TYPE == "3"
+      FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} start= manual >nul 2>&1$\r$\n'
+    ${ElseIf} $NEXAPIPE_OLD_START_TYPE == "4"
+      FileWrite $0 'sc.exe config ${NEXAPIPE_SERVICE_NAME} start= disabled >nul 2>&1$\r$\n'
+    ${EndIf}
+
+    ; The account the service serves, if there was one. The app is told not to change
+    ; it, but a rollback that cannot put it back is a rollback that does not put the
+    ; machine back.
+    ${If} $NEXAPIPE_OLD_OWNER != ""
+      FileWrite $0 'reg.exe add "HKLM\${NEXAPIPE_SERVICE_KEY}" /v ${NEXAPIPE_OWNER_VALUE} /t REG_SZ /d "$NEXAPIPE_OLD_OWNER" /f >nul 2>&1$\r$\n'
+    ${EndIf}
+
     ${If} $NEXAPIPE_SERVICE_WAS_RUNNING = 1
       FileWrite $0 'sc.exe start ${NEXAPIPE_SERVICE_NAME} >nul 2>&1$\r$\n'
       ; Already running is the state that was asked for, not a failure of it.
-      FileWrite $0 "if %errorlevel%==1056 exit /b 0$\r$\n"
+      FileWrite $0 "if %errorlevel%==1056 goto :nexapipe_restored$\r$\n"
+      ; Started, and up: the machine is back the way it was.
+      FileWrite $0 "if %errorlevel%==0 goto :nexapipe_restored$\r$\n"
+      ; Neither: the old build is back and the service did not come up again.
+      FileWrite $0 '> "$NEXAPIPE_ROLLBACK_SERVICE_LOG" echo 2$\r$\n'
+      FileWrite $0 "exit /b 2$\r$\n"
     ${EndIf}
+
+    FileWrite $0 ":nexapipe_restored$\r$\n"
+    FileWrite $0 '> "$NEXAPIPE_ROLLBACK_SERVICE_LOG" echo 0$\r$\n'
     FileWrite $0 "exit /b 0$\r$\n"
+    FileWrite $0 ":nexapipe_restore_failed$\r$\n"
+    FileWrite $0 '> "$NEXAPIPE_ROLLBACK_SERVICE_LOG" echo 1$\r$\n'
+    FileWrite $0 "exit /b 1$\r$\n"
     FileClose $0
 
     !insertmacro NEXAPIPE_RUN_ELEVATED $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT
+
+    ; What the elevated run achieved. A log that is not there at all means the run never
+    ; happened - a declined prompt, most of the time - and nothing was put back.
+    !insertmacro NEXAPIPE_READ_LINE $NEXAPIPE_ROLLBACK_SERVICE_LOG $1
+
+    ${If} $1 == "1"
+      DetailPrint "The old ${NEXAPIPE_SERVICE_NAME} binary could not be put back."
+      StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The copy under Program Files is still the new one, and the service may still be running it."
+    ${ElseIf} $1 == "2"
+      DetailPrint "The old ${NEXAPIPE_SERVICE_NAME} binary is back, but the service did not start again."
+      StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The old build is back, but the service is not running."
+    ${ElseIf} $1 == ""
+      DetailPrint "The rollback did not run; the request for administrator rights was declined."
+      StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "Nothing was put back."
+    ${EndIf}
+  ${EndIf}
+
+  ; Neither scratch file outlives the rollback.
+  ${If} $NEXAPIPE_ROLLBACK_LOG != ""
+    Delete $NEXAPIPE_ROLLBACK_LOG
+  ${EndIf}
+  ${If} $NEXAPIPE_ROLLBACK_SERVICE_LOG != ""
+    Delete $NEXAPIPE_ROLLBACK_SERVICE_LOG
   ${EndIf}
 
   ; The copies have served their purpose.
@@ -867,14 +1124,11 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
         ; `cmd.exe` wrote `sc.exe`'s answer into the log, which is the only way to learn anything
         ; from an elevated child: nothing comes back through "runas", and DetailPrint is where
         ; whoever has to debug this will look.
-        ClearErrors
-        FileOpen $0 "$NEXAPIPE_RESTORE_LOG" r
-        ${IfNot} ${Errors}
-          FileRead $0 $1
-          ${If} $1 != ""
-            DetailPrint "${NEXAPIPE_SERVICE_NAME}: $1"
-          ${EndIf}
-          FileClose $0
+        !insertmacro NEXAPIPE_READ_LINE "$NEXAPIPE_RESTORE_LOG" $1
+        ${If} $1 != ""
+          DetailPrint "${NEXAPIPE_SERVICE_NAME}: $1"
+        ${EndIf}
+        ${If} $NEXAPIPE_RESTORE_LOG != ""
           Delete "$NEXAPIPE_RESTORE_LOG"
         ${EndIf}
       ${Else}
@@ -1016,6 +1270,10 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ; administrator rights.
     !insertmacro NEXAPIPE_BACKUP_UPGRADE
     ${If} $NEXAPIPE_BACKUP_FAILED = 1
+      ; Nothing has been changed yet, so the copies that were taken - or part of them -
+      ; are of no use to anybody. Leaving them in the temporary directory would leave
+      ; a copy of the user's own files there for no reason at all.
+      !insertmacro NEXAPIPE_DROP_BACKUPS
       MessageBox MB_OK|MB_ICONSTOP "The installed files could not be copied aside, so an upgrade that goes wrong could not be put back.$\r$\n$\r$\nNothing has been changed. Please close the application and run the installer again." /SD IDOK
       SetErrorLevel 1
       Quit
@@ -1046,7 +1304,14 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
       ; new app is the failure this whole arrangement exists to prevent, and
       ; reporting success over one leaves the user with no way to tell.
       !insertmacro NEXAPIPE_ROLLBACK
-      MessageBox MB_OK|MB_ICONSTOP "The upgrade could not replace the ${NEXAPIPE_SERVICE_NAME}.$\r$\n$\r$\nThe installation has been stopped. The service has been put back to the build it ran before, and it is running again if it was running before.$\r$\n$\r$\nRun the installer again to finish the upgrade.$\r$\n$\r$\nThe installer says why in its log:$\r$\n$NEXAPIPE_REPLACEMENT_REASON" /SD IDOK
+      ${If} $NEXAPIPE_ROLLBACK_FAILED = 0
+        MessageBox MB_OK|MB_ICONSTOP "The upgrade could not replace the ${NEXAPIPE_SERVICE_NAME}.$\r$\n$\r$\nThe installation has been stopped. The service has been put back to the build it ran before, and it is running again if it was running before.$\r$\n$\r$\nRun the installer again to finish the upgrade.$\r$\n$\r$\nThe installer says why in its log:$\r$\n$NEXAPIPE_REPLACEMENT_REASON" /SD IDOK
+      ${Else}
+        ; The machine could not be put back. Saying that it was would be the one
+        ; thing this whole arrangement exists to avoid: a user who is told the
+        ; machine is as it was will not look at it.
+        MessageBox MB_OK|MB_ICONSTOP "The upgrade could not replace the ${NEXAPIPE_SERVICE_NAME}, and the machine could not be put back either.$\r$\n$\r$\n$NEXAPIPE_ROLLBACK_REASON$\r$\n$\r$\nThe installation has been stopped. Run the installer again to finish the upgrade.$\r$\n$\r$\nThe installer says why in its log:$\r$\n$NEXAPIPE_REPLACEMENT_REASON" /SD IDOK
+      ${EndIf}
       SetErrorLevel 1
       Quit
     ${EndIf}

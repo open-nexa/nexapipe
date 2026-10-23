@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
     #[cfg(windows)]
-    return install(account::AccountId::current(), false);
+    return install(account::AccountId::current(), false, false);
 
     #[cfg(not(windows))]
     return install_elevated();
@@ -84,7 +84,22 @@ pub fn install_service() -> Result<(), AppError> {
 /// manager, and the installer that asks for this is the Windows one.
 pub fn install_service_without_starting() -> Result<(), AppError> {
     #[cfg(windows)]
-    return install(account::AccountId::current(), true);
+    return install(account::AccountId::current(), true, false);
+
+    #[cfg(not(windows))]
+    return install_elevated();
+}
+
+/// Registers the service the way an upgrade needs it.
+///
+/// The account the service serves is kept: an upgrade is not where that choice is made, and
+/// the account the service was installed for is the one the user picked. The service is left
+/// down when the caller says so, for the same reason the installer says so.
+///
+/// Windows only in its effect, like [`install_service_without_starting`].
+pub fn install_service_keeping_owner(leave_stopped: bool) -> Result<(), AppError> {
+    #[cfg(windows)]
+    return install(account::AccountId::current(), leave_stopped, true);
 
     #[cfg(not(windows))]
     return install_elevated();

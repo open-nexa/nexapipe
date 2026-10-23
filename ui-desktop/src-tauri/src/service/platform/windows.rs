@@ -118,9 +118,18 @@ enum Escalation {
 ///
 /// `leave_stopped` is what the installer uses: an upgrade has to leave the machine the way it
 /// found it, and a service the user had stopped is not theirs to start behind their back.
+///
+/// `keep_owner` is the other half of that: an upgrade does not decide which account the
+/// service serves either. The account it was installed for is the one the user chose, and
+/// the installer is not the place to change it — so the record is left as it is.
+///
 /// The registration itself is the same either way — the entry, the binary under Program
-/// Files, the account it serves — only the service is left down.
-pub fn install(installing_by: Option<AccountId>, leave_stopped: bool) -> Result<(), AppError> {
+/// Files, the account it serves — only the service is left down and the account untouched.
+pub fn install(
+    installing_by: Option<AccountId>,
+    leave_stopped: bool,
+    keep_owner: bool,
+) -> Result<(), AppError> {
     // A record that is still marked for deletion has to be gone before a new service can take
     // the name, so this waits for it rather than letting `sc create` refuse.
     wait_for_deletable_record()?;
@@ -155,73 +164,18 @@ pub fn install(installing_by: Option<AccountId>, leave_stopped: bool) -> Result<
     // failure look like a declined prompt.
     run(
         |log| {
-            let redirect = format!("> \"{}\" 2>&1", log.display());
-            let mut lines = vec![
-                // The system-wide copy is made before the entry exists, and the
-                // entry is only pointed at it once it is there. A copy that
-                // cannot be made, or a directory whose permissions cannot be
-                // locked down, stops the install here — a service that cannot
-                // be installed safely is better than one that hands SYSTEM to
-                // whoever can write the directory.
-                format!("mkdir \"{}\"", dir.display()),
-                format!("if not exist \"{}\" exit /b 1", dir.display()),
-                format!("icacls \"{}\" {DIRECTORY_ACL}", dir.display()),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-                format!("copy /y \"{source}\" \"{}\"", system.display()),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-                // The copy is a promise until it has been checked. The control
-                // manager keeps running whatever was copied the day the service
-                // was registered, so a copy that did not land is a service that
-                // goes on running the old build while the app is new — and the
-                // user has no way to tell. Compared here, in the same elevated
-                // run and before the entry is touched, so a copy that is not
-                // the binary that was asked for stops the install outright.
-                format!("fc /b \"{source}\" \"{}\"", system.display()),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-                format!("icacls \"{}\" {FILE_ACL}", system.display()),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-                format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
-                format!(
-                    "if errorlevel 1 (sc.exe create {SERVICE_NAME} binPath= \"{bin_path}\" start= auto DisplayName= \"{SERVICE_DISPLAY_NAME}\" {redirect}) else (sc.exe config {SERVICE_NAME} binPath= \"{bin_path}\" start= auto {redirect})"
-                ),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-                format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
-                "if errorlevel 1 exit /b %errorlevel%".to_string(),
-            ];
-
-            // Which account this service is installed for, kept in the service's own
-            // registry key: the one place on Windows that only SYSTEM and the
-            // administrators may write, so the unprivileged desktop cannot move the
-            // service onto another account. Written after the key exists and before the
-            // service starts, because the service reads it as it comes up.
-            match installing_by.as_ref() {
-                Some(account) => {
-                    lines.push(install_owner::record_command(account));
-                    lines.push("if errorlevel 1 exit /b %errorlevel%".to_string());
-                }
-                None => tracing::warn!(
-                    "Installing the service without naming the account it is for: it will serve \
-                     any local account that owns the token it reads"
-                ),
-            }
-
-            if !leave_stopped {
-                lines.extend([
-                    format!("sc.exe start {SERVICE_NAME}"),
-                    // Nothing should be up at this point — [`stop_if_running`] brought the old
-                    // process down first — so 1056 means the service was started again by
-                    // something else, which is still the state the install asked for.
-                    tolerate(ALREADY_RUNNING),
-                    "exit /b %errorlevel%".to_string(),
-                ]);
-            } else {
-                // Left down on purpose: the service was stopped before the upgrade and has to
-                // stay stopped. The entry still says `start= auto`, so the next boot brings it
-                // up — the service manager's own answer, not this installer's.
-                lines.push("exit /b 0".to_string());
-            }
-
-            lines
+            install_batch(
+                InstallPaths {
+                    log,
+                    dir: &dir,
+                    source: &source,
+                    system: &system,
+                    bin_path: &bin_path,
+                },
+                installing_by.as_ref(),
+                leave_stopped,
+                keep_owner,
+            )
         },
         "service install",
         Escalation::Always,
@@ -243,6 +197,124 @@ pub fn install(installing_by: Option<AccountId>, leave_stopped: bool) -> Result<
             settle(ServiceState::Running, codes::SERVICE_START_FAILED)
         }
     })
+}
+
+/// The paths an install works on.
+///
+/// Gathered into one value so that the batch can be built from them without a list of
+/// arguments long enough to be read wrong.
+struct InstallPaths<'a> {
+    /// Where the elevated run leaves its output.
+    log: &'a Path,
+    /// The system-wide directory the service binary is copied into.
+    dir: &'a Path,
+    /// The service binary the app ships.
+    source: &'a str,
+    /// The copy of it the control manager runs.
+    system: &'a Path,
+    /// The value the control manager's `binPath` is given.
+    bin_path: &'a str,
+}
+
+/// The batch the elevated install runs.
+///
+/// Split out of [`install`] so that what it says about the service can be read without a
+/// service manager: an upgrade is allowed to replace the binary and to leave the service
+/// alone, and nothing else. What it says about the entry is the whole of that, so it is
+/// worth being able to look at.
+fn install_batch(
+    paths: InstallPaths<'_>,
+    installing_by: Option<&AccountId>,
+    leave_stopped: bool,
+    keep_owner: bool,
+) -> Vec<String> {
+    let InstallPaths {
+        log,
+        dir,
+        source,
+        system,
+        bin_path,
+    } = paths;
+    let redirect = format!("> \"{}\" 2>&1", log.display());
+    let mut lines = vec![
+        // The system-wide copy is made before the entry exists, and the
+        // entry is only pointed at it once it is there. A copy that
+        // cannot be made, or a directory whose permissions cannot be
+        // locked down, stops the install here — a service that cannot
+        // be installed safely is better than one that hands SYSTEM to
+        // whoever can write the directory.
+        format!("mkdir \"{}\"", dir.display()),
+        format!("if not exist \"{}\" exit /b 1", dir.display()),
+        format!("icacls \"{}\" {DIRECTORY_ACL}", dir.display()),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!("copy /y \"{source}\" \"{}\"", system.display()),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        // The copy is a promise until it has been checked. The control
+        // manager keeps running whatever was copied the day the service
+        // was registered, so a copy that did not land is a service that
+        // goes on running the old build while the app is new — and the
+        // user has no way to tell. Compared here, in the same elevated
+        // run and before the entry is touched, so a copy that is not
+        // the binary that was asked for stops the install outright.
+        format!("fc /b \"{source}\" \"{}\"", system.display()),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!("icacls \"{}\" {FILE_ACL}", system.display()),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
+        // `start=` is written only where the service is created. An entry that is already
+        // there keeps the start type it has: when the user's service comes up is the user's
+        // decision, and an app that is reinstalled is not a reason for a service that was set
+        // to start by hand to start by itself from then on.
+        format!(
+            "if errorlevel 1 (sc.exe create {SERVICE_NAME} binPath= \"{bin_path}\" start= auto DisplayName= \"{SERVICE_DISPLAY_NAME}\" {redirect}) else (sc.exe config {SERVICE_NAME} binPath= \"{bin_path}\" {redirect})"
+        ),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+    ];
+
+    // Which account this service is installed for, kept in the service's own
+    // registry key: the one place on Windows that only SYSTEM and the
+    // administrators may write, so the unprivileged desktop cannot move the
+    // service onto another account. Written after the key exists and before the
+    // service starts, because the service reads it as it comes up.
+    //
+    // An upgrade does not write it: the account the service serves is the one the
+    // user chose when they installed it, and re-registering the service is not
+    // how that choice is changed.
+    match (installing_by, keep_owner) {
+        (Some(account), false) => {
+            lines.push(install_owner::record_command(account));
+            lines.push("if errorlevel 1 exit /b %errorlevel%".to_string());
+        }
+        (Some(_), true) => {
+            tracing::info!(
+                "Keeping the account the service already serves; the install leaves it alone."
+            );
+        }
+        (None, _) => tracing::warn!(
+            "Installing the service without naming the account it is for: it will serve \
+             any local account that owns the token it reads"
+        ),
+    }
+
+    if !leave_stopped {
+        lines.extend([
+            format!("sc.exe start {SERVICE_NAME}"),
+            // Nothing should be up at this point — [`stop_if_running`] brought the old
+            // process down first — so 1056 means the service was started again by
+            // something else, which is still the state the install asked for.
+            tolerate(ALREADY_RUNNING),
+            "exit /b %errorlevel%".to_string(),
+        ]);
+    } else {
+        // Left down on purpose: the service was stopped before the upgrade and has to
+        // stay stopped. The entry keeps the start type it had, so the next boot brings
+        // it up — the service manager's own answer, not this installer's.
+        lines.push("exit /b 0".to_string());
+    }
+
+    lines
 }
 
 /// Checks that the copy that was made is the file that was asked for.
@@ -1029,9 +1101,15 @@ mod tests {
         std::fs::write(&different, b"the service binarY").expect("the third file");
         std::fs::write(&shorter, b"the service binar").expect("the fourth file");
 
-        assert!(files_match(&left, &right), "the same bytes are the same file");
+        assert!(
+            files_match(&left, &right),
+            "the same bytes are the same file"
+        );
         assert!(!files_match(&left, &different), "one byte is one byte");
-        assert!(!files_match(&left, &shorter), "a shorter file is not the file");
+        assert!(
+            !files_match(&left, &shorter),
+            "a shorter file is not the file"
+        );
         assert!(
             !files_match(&left, &missing),
             "a file that is not there is not a match"
@@ -1070,6 +1148,77 @@ mod tests {
         // A line that already redirects keeps its own and gets no second one.
         assert!(script.contains("sc.exe query nexa-service >nul 2>&1\r\n"));
         assert_eq!(script.matches("sc.exe query nexa-service").count(), 1);
+    }
+
+    /// The script an install runs, as the batch file it would become.
+    fn install_script(leave_stopped: bool, keep_owner: bool) -> String {
+        let account = AccountId::Windows("S-1-5-21-1-2-3-1001".to_string());
+        let lines = install_batch(
+            InstallPaths {
+                log: Path::new(r"C:\Temp\out.log"),
+                dir: Path::new(r"C:\Program Files\Nexa\Service"),
+                source: r"C:\App\nexa-service.exe",
+                system: Path::new(r"C:\Program Files\Nexa\Service\nexa-service.exe"),
+                bin_path: r#"\"C:\Program Files\Nexa\Service\nexa-service.exe\" --service"#,
+            },
+            Some(&account),
+            leave_stopped,
+            keep_owner,
+        );
+
+        with_logging(&lines, Path::new(r"C:\Temp\out.log"))
+    }
+
+    /// When the user's service comes up is the user's decision, and an app that is
+    /// reinstalled is not a reason for a service that was set to start by hand to start
+    /// by itself from then on.
+    ///
+    /// Only the entry that is created gets a start type; an entry that is already there
+    /// keeps the one it has.
+    #[test]
+    fn an_existing_service_keeps_the_start_type_it_has() {
+        let script = install_script(false, false);
+
+        // The two branches are one line, so the part that has to be free of a start type
+        // is the part after `sc.exe config`.
+        let config = script
+            .lines()
+            .find(|line| line.contains("sc.exe config"))
+            .expect("the entry is re-pointed at the new binary");
+        let config_branch = config
+            .split("sc.exe config")
+            .nth(1)
+            .expect("the config branch is there");
+        assert!(
+            !config_branch.contains("start="),
+            "an entry that is already there keeps its start type: {config}"
+        );
+
+        assert!(
+            script.contains("sc.exe create nexa-service binPath="),
+            "a service that does not exist yet is created"
+        );
+        assert!(
+            script.contains("start= auto DisplayName="),
+            "a service that is created starts by itself"
+        );
+    }
+
+    /// The account the service serves is the one the user picked when they installed it.
+    /// An upgrade re-registers the service, and that is not how the account is chosen.
+    #[test]
+    fn an_upgrade_leaves_the_account_the_service_serves_alone() {
+        let upgrade = install_script(false, true);
+        assert!(
+            !upgrade.contains("ServiceOwner"),
+            "the account the service serves is not written again:\n{upgrade}"
+        );
+
+        let ordinary = install_script(false, false);
+        assert!(
+            ordinary.contains("ServiceOwner"),
+            "a service that is installed for an account records it:\n{ordinary}"
+        );
     }
 }
 

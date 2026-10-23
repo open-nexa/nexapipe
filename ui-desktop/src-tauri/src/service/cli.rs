@@ -21,6 +21,18 @@ use crate::service::runner::ServiceRunner;
 /// manager, and the installer that asks for this is the Windows one.
 pub const LEAVE_STOPPED_ARG: &str = "--leave-stopped";
 
+/// Flag that tells the install to keep the account the service already serves, as
+/// `--keep-owner`.
+///
+/// For the installer: an upgrade re-registers the service, and re-registering it is not how
+/// the account it serves is chosen. The account the service was installed for is the one the
+/// user picked, and an upgrade that quietly moved the service to whoever happened to run the
+/// installer would change which account the service serves without saying so.
+///
+/// Windows only in its effect. The Unix half records the account in a root-owned file that
+/// the installer of the upgrade never writes.
+pub const KEEP_OWNER_ARG: &str = "--keep-owner";
+
 /// Consumes the service-management verbs.
 ///
 /// Returns `true` when `args` named one of them and the process should exit
@@ -51,7 +63,10 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             // Read here rather than in the elevated child: the decision changes what the
             // install does, and the install is what the elevated child runs.
             let leave_stopped = args.iter().any(|arg| arg == LEAVE_STOPPED_ARG);
-            let outcome = if leave_stopped {
+            let keep_owner = args.iter().any(|arg| arg == KEEP_OWNER_ARG);
+            let outcome = if keep_owner {
+                platform::install_service_keeping_owner(leave_stopped)
+            } else if leave_stopped {
                 platform::install_service_without_starting()
             } else {
                 platform::install_service()
