@@ -190,6 +190,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodeTwoFactor(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    // The body takes three locks and clears three tables, and none of that can
+    // fail on its own — but the frame it runs in cannot survive an unwind, so
+    // the catch is here all the same: a panic must be a failed call rather
+    // than a dead process.
+    catching_panic("nativeClearNodeTwoFactor", clear_node_two_factor).unwrap_or(-1)
+}
+
+/// The body of `nativeClearNodeTwoFactor`, split out so the catch has
+/// something to wrap.
+fn clear_node_two_factor() -> jint {
     if let Ok(mut map) = NODE_TWO_FACTOR.lock() {
         map.clear();
     }
@@ -228,43 +238,40 @@ fn take_issued_credential(env: &mut Env<'_>) -> jstring {
         None => return std::ptr::null_mut(),
     };
 
-    // Caught rather than let out of the frame: this blocks on the runtime, and
-    // a panic there unwinds through an `extern "system"` boundary, which on
-    // Android is a native crash instead of something the JVM can report.
-    let issued = match catching_panic("nativeTakeIssuedCredential", || {
-        runtime.block_on(async {
-            // The endpoint group is where a start with several nodes keeps its pools; the
-            // single-pool legacy path keeps the same answer one level down.
-            if let Some(state) = get_state() {
-                let group = {
-                    let guard = match state.lock() {
-                        Ok(g) => g,
-                        Err(_) => return None,
-                    };
-                    guard.endpoint_group.clone()
+    // No catch of its own: the entry point that calls this one has the
+    // barrier around it, and this blocks on the runtime — so a panic here
+    // unwinds through an `extern "system"` boundary, which on Android is a
+    // native crash instead of something the JVM can report. The catch at the
+    // entry point is what stops it.
+    let issued = runtime.block_on(async {
+        // The endpoint group is where a start with several nodes keeps its pools; the
+        // single-pool legacy path keeps the same answer one level down.
+        if let Some(state) = get_state() {
+            let group = {
+                let guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => return None,
                 };
-                if let Some(group) = group
-                    && let Some(issued) = group.take_issued_credential().await
-                {
-                    return Some(issued);
-                }
-                let pool = {
-                    let guard = match state.lock() {
-                        Ok(g) => g,
-                        Err(_) => return None,
-                    };
-                    guard.conn_pool.clone()
-                };
-                if let Some(pool) = pool {
-                    return pool.take_issued_credential().await;
-                }
+                guard.endpoint_group.clone()
+            };
+            if let Some(group) = group
+                && let Some(issued) = group.take_issued_credential().await
+            {
+                return Some(issued);
             }
-            None
-        })
-    }) {
-        Some(issued) => issued,
-        None => return std::ptr::null_mut(),
-    };
+            let pool = {
+                let guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => return None,
+                };
+                guard.conn_pool.clone()
+            };
+            if let Some(pool) = pool {
+                return pool.take_issued_credential().await;
+            }
+        }
+        None
+    });
 
     let Some(issued) = issued else {
         return std::ptr::null_mut();

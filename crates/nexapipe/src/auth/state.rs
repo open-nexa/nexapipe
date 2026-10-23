@@ -41,7 +41,7 @@
 //! existed keeps its lockouts; they are simply no longer written there, and
 //! the state file is what decides once it has an entry for that client.
 
-use super::config::AuthConfig;
+use super::config::{AuthConfig, ClientAuth};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,24 @@ pub struct ClientState {
     /// When the enrollment lockout runs out, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment_locked_until: Option<u64>,
+    /// The fingerprint of the pending enrollment token the two counters above
+    /// were paid for.
+    ///
+    /// The counters belong to a **token**, not to the client: a guess at one
+    /// invite says nothing about the next one, and a token that was rotated
+    /// away must not hand its count to the token that replaced it. The file
+    /// says which token paid, so the file and the configuration can be
+    /// compared on the next start and the counters can be left behind when
+    /// the two no longer name the same token.
+    ///
+    /// A digest rather than the token: the token is a credential, and the
+    /// state file is not where credentials go.
+    ///
+    /// `None` means the file does not say — a state file written before this
+    /// rule existed. Such a file keeps its counters, so that an upgrade does
+    /// not hand every lockout back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token_fingerprint: Option<String>,
     /// When the client last authenticated, as a Unix timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,
@@ -164,6 +182,34 @@ pub struct DeviceState {
 /// less than one that says nothing.
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// The fingerprint of an enrollment token.
+///
+/// A digest, not the token: the state file says which token its enrollment
+/// counters were paid for, and it says it without writing a second copy of a
+/// credential down. SHA-256, cut to sixteen bytes — enough that two tokens do
+/// not share one, and short enough that the file does not grow a line per
+/// client.
+fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(token.as_bytes());
+    hex::encode(&digest[..16])
+}
+
+/// The fingerprint of the token a client's enrollment counters were paid for.
+///
+/// `None` when the client is not waiting to enroll, or when the counters say
+/// nothing: a fingerprint without a counter behind it binds nothing.
+fn enrollment_fingerprint(client: &ClientAuth) -> Option<String> {
+    if client.enrollment_failed_attempts == 0 && client.enrollment_locked_until.is_none() {
+        return None;
+    }
+    client
+        .pending_enrollment
+        .as_ref()
+        .map(|token| token_fingerprint(token.expose_secret()))
 }
 
 /// The file on disk, in the shape it is written.
@@ -309,6 +355,7 @@ pub fn snapshot(config: &AuthConfig) -> RuntimeState {
             locked_until: client.locked_until,
             enrollment_failed_attempts: client.enrollment_failed_attempts,
             enrollment_locked_until: client.enrollment_locked_until,
+            enrollment_token_fingerprint: enrollment_fingerprint(client),
             last_used: client.last_used,
             last_used_step: client.last_used_step,
             devices,
@@ -343,6 +390,14 @@ fn is_empty(state: &ClientState) -> bool {
 /// A client the state file has but the configuration does not is ignored: the
 /// operator removed it, and a counter nobody can authenticate against is
 /// nothing to keep.
+///
+/// The **enrollment** counters are the ones that need a second look. They
+/// were paid for a token, and the file says which one; when the configuration
+/// names a different token — or none — the count belongs to an invite that no
+/// longer exists, and it is left behind rather than handed to the invite that
+/// replaced it. A file that does not say which token it means is a file
+/// written before the rule existed, and it keeps its counters: an upgrade must
+/// not hand every lockout back.
 pub fn apply(state: &RuntimeState, config: &mut AuthConfig) {
     for (id, client) in &mut config.clients {
         let Some(client_state) = state.clients.get(id) else {
@@ -350,8 +405,10 @@ pub fn apply(state: &RuntimeState, config: &mut AuthConfig) {
         };
         client.failed_attempts = client_state.failed_attempts;
         client.locked_until = client_state.locked_until;
-        client.enrollment_failed_attempts = client_state.enrollment_failed_attempts;
-        client.enrollment_locked_until = client_state.enrollment_locked_until;
+        if enrollment_counters_belong_to_this_token(client_state, client) {
+            client.enrollment_failed_attempts = client_state.enrollment_failed_attempts;
+            client.enrollment_locked_until = client_state.enrollment_locked_until;
+        }
         client.last_used = client_state.last_used;
         client.last_used_step = client_state.last_used_step;
 
@@ -362,6 +419,28 @@ pub fn apply(state: &RuntimeState, config: &mut AuthConfig) {
             }
         }
     }
+}
+
+/// Whether the enrollment counters in the file are the ones this client owes.
+///
+/// The file says which token paid for them; the client says which token it is
+/// waiting to enroll with. The two have to be the same token, or the counters
+/// are about an invite that is gone.
+///
+/// A file that does not say which token it means — one written before the
+/// fingerprint was recorded — keeps its counters. The alternative would reset
+/// every lockout a deployment holds the first time it is upgraded, which is
+/// the one thing a lockout is not allowed to do.
+fn enrollment_counters_belong_to_this_token(state: &ClientState, client: &ClientAuth) -> bool {
+    let Some(recorded) = &state.enrollment_token_fingerprint else {
+        return true;
+    };
+    let Some(pending) = client.pending_enrollment.as_ref() else {
+        // The client is not waiting to enroll at all, so the invite the
+        // counters were paid for is gone.
+        return false;
+    };
+    recorded == &token_fingerprint(pending.expose_secret())
 }
 
 #[cfg(test)]
@@ -390,6 +469,16 @@ mod tests {
             enrollment_failed_attempts: 0,
             enrollment_locked_until: None,
         }
+    }
+
+    /// A client that is waiting to enroll, with the counters the guesses at
+    /// that token cost.
+    fn client_waiting_for(token: &str, enrollment_failed_attempts: u32) -> ClientAuth {
+        let mut client = client(0, None, None);
+        client.pending_enrollment =
+            Some(nexapipe_proto::secret::SecretString::new(token.to_string()));
+        client.enrollment_failed_attempts = enrollment_failed_attempts;
+        client
     }
 
     /// The step memory survives a write and a read.
@@ -717,6 +806,7 @@ mod tests {
                 locked_until: None,
                 enrollment_failed_attempts: 0,
                 enrollment_locked_until: None,
+                enrollment_token_fingerprint: None,
                 last_used: Some(1699999999),
                 last_used_step: None,
                 devices: HashMap::new(),
@@ -742,6 +832,7 @@ mod tests {
                 locked_until: None,
                 enrollment_failed_attempts: 0,
                 enrollment_locked_until: None,
+                enrollment_token_fingerprint: None,
                 last_used: None,
                 last_used_step: None,
                 devices: HashMap::new(),
@@ -755,5 +846,187 @@ mod tests {
             "a client the operator removed stays removed: {:?}",
             config.clients
         );
+    }
+
+    /// The file says which token its enrollment counters were paid for.
+    ///
+    /// Without that, a rotated token inherits the count of the one it
+    /// replaced, and the file cannot tell the two apart on the next start.
+    #[test]
+    fn the_file_says_which_token_the_enrollment_counters_were_paid_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client_waiting_for("old-token", 5));
+
+        save(&path, &snapshot(&config)).expect("the write succeeds");
+        let state = load(&path).expect("the file reads back");
+
+        let alice = &state.clients["alice"];
+        assert_eq!(alice.enrollment_failed_attempts, 5);
+        assert_eq!(
+            alice.enrollment_token_fingerprint,
+            Some(token_fingerprint("old-token")),
+            "the file names the token the count was paid for"
+        );
+    }
+
+    /// The token itself is not written down.
+    ///
+    /// The fingerprint says which token the counters belong to; the token is a
+    /// credential, and the state file is not where credentials go.
+    #[test]
+    fn the_file_does_not_carry_the_token_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client_waiting_for("old-token", 5));
+
+        save(&path, &snapshot(&config)).expect("the write succeeds");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("old-token"), "{on_disk}");
+    }
+
+    /// The counters a token was paid for do not follow the token that
+    /// replaced it.
+    ///
+    /// This is the whole point: the operator rotates the invite, and the new
+    /// invite starts with nothing spent on it — even across a restart, which
+    /// is where the file's half of the counters used to come back from.
+    #[test]
+    fn the_counters_do_not_follow_a_replaced_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client_waiting_for("old-token", 5));
+
+        save(&path, &snapshot(&config)).expect("the write succeeds");
+        let state = load(&path).expect("the file reads back");
+
+        // The operator rotated the invite while the server was not running.
+        let mut rotated = AuthConfig::default();
+        rotated
+            .clients
+            .insert("alice".to_string(), client_waiting_for("new-token", 0));
+
+        apply(&state, &mut rotated);
+
+        assert_eq!(
+            rotated.clients["alice"].enrollment_failed_attempts, 0,
+            "the new invite starts with nothing spent on it"
+        );
+    }
+
+    /// The counters stay with the token they were paid for.
+    ///
+    /// The other half of the rule: a client that is still waiting to enroll
+    /// with the same token keeps its lockout.
+    #[test]
+    fn the_counters_stay_with_the_token_they_were_paid_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client_waiting_for("the-token", 3));
+
+        save(&path, &snapshot(&config)).expect("the write succeeds");
+        let state = load(&path).expect("the file reads back");
+
+        let mut restored = AuthConfig::default();
+        restored
+            .clients
+            .insert("alice".to_string(), client_waiting_for("the-token", 0));
+
+        apply(&state, &mut restored);
+
+        assert_eq!(
+            restored.clients["alice"].enrollment_failed_attempts, 3,
+            "the lockout survives the restart"
+        );
+    }
+
+    /// A file that does not say which token it means keeps its counters.
+    ///
+    /// A state file written before the fingerprint was recorded says nothing,
+    /// and the alternative would reset every lockout a deployment holds the
+    /// first time it is upgraded — which is the one thing a lockout is not
+    /// allowed to do.
+    #[test]
+    fn a_file_that_does_not_say_keeps_its_counters() {
+        let mut state = RuntimeState::default();
+        state.clients.insert(
+            "alice".to_string(),
+            ClientState {
+                failed_attempts: 0,
+                locked_until: None,
+                enrollment_failed_attempts: 4,
+                enrollment_locked_until: Some(1700000000),
+                enrollment_token_fingerprint: None,
+                last_used: None,
+                last_used_step: None,
+                devices: HashMap::new(),
+            },
+        );
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client_waiting_for("some-token", 0));
+
+        apply(&state, &mut config);
+
+        assert_eq!(
+            config.clients["alice"].enrollment_failed_attempts, 4,
+            "an upgrade does not hand every lockout back"
+        );
+        assert_eq!(
+            config.clients["alice"].enrollment_locked_until,
+            Some(1700000000)
+        );
+    }
+
+    /// The counters of an invite that is gone do not come back.
+    ///
+    /// The token was spent, or the operator withdrew the invite: either way
+    /// there is no invite left to lock out, and the count that was paid for it
+    /// has nothing to say about the client.
+    #[test]
+    fn the_counters_of_an_invite_that_is_gone_do_not_come_back() {
+        let mut state = RuntimeState::default();
+        state.clients.insert(
+            "alice".to_string(),
+            ClientState {
+                failed_attempts: 0,
+                locked_until: None,
+                enrollment_failed_attempts: 4,
+                enrollment_locked_until: Some(1700000000),
+                enrollment_token_fingerprint: Some(token_fingerprint("old-token")),
+                last_used: None,
+                last_used_step: None,
+                devices: HashMap::new(),
+            },
+        );
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client(0, None, None));
+
+        apply(&state, &mut config);
+
+        assert_eq!(config.clients["alice"].enrollment_failed_attempts, 0);
+        assert_eq!(config.clients["alice"].enrollment_locked_until, None);
     }
 }

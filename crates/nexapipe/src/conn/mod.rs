@@ -38,6 +38,11 @@ use limits::Limiters;
 // reached through `conn`: the state a connection authenticates against, and
 // the count of the failures against it.
 pub use auth::{AuthState, count_enrollment_failure};
+// The writer for the state file. The configuration watcher needs it as well:
+// a reload that resets a client's enrollment counters has to reach the file
+// the next start reads, or the reset is lost on the next restart. It is not
+// public API — only the crate's own two halves write that file.
+pub(crate) use auth::persist_auth_state;
 
 use auth::{AuthFailure, PeerRegistration, perform_authentication};
 
