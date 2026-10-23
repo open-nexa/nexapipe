@@ -57,6 +57,16 @@ fn check_acl_alignment() {
     //    Stripped by hand rather than via regex so the `build-dependencies` list stays small;
     //    the only macro with this signature in the file is the one to find.
     let lib_rs_path = manifest_dir.join("src").join("lib.rs");
+    // The command list is in `src/lib.rs`, so a change to it has to run this
+    // check again — and Cargo does not know that on its own. The build script
+    // emits `cargo:rerun-if-changed` for the files it watches, and once it has
+    // emitted one, Cargo re-runs the script for those files and for nothing
+    // else: the default "re-run when anything in the package changes" is gone.
+    // Without this line the check sees the command list as it was when the
+    // script last ran, and a command that was added without its permission
+    // reaches the next release unnoticed — which is the failure this check
+    // exists to catch.
+    println!("cargo:rerun-if-changed={}", lib_rs_path.display());
     let lib_rs = std::fs::read_to_string(&lib_rs_path).unwrap_or_else(|e| {
         panic!(
             "ACL alignment check could not read {}: {e}",
