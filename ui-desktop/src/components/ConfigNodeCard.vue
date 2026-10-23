@@ -232,7 +232,12 @@ function updateNodeDomainsText(nodeId: string, text: string): void {
           {{ twoFactorStateLabel }}
         </span>
       </button>
-      <div v-if="node.twoFactor" class="node-2fa-fields">
+      <!-- The fields are for a credential the node holds. A node that is still
+           waiting to enroll has none yet — it has a token — so the wait is what
+           is shown, and the fields would be editing a credential that is not
+           there. The toggle above is disabled in that state for the same
+           reason. -->
+      <div v-if="node.twoFactor && !node.enrollment" class="node-2fa-fields">
         <div class="node-2fa-field">
           <label class="form-label">{{ t('node.twoFactorClientId') }}</label>
           <input
