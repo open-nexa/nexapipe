@@ -126,6 +126,7 @@
     <string name="two_factor_title">两步验证</string>
     <string name="two_factor_on">开</string>
     <string name="two_factor_off">关</string>
+    <string name="two_factor_pending">等待注册</string>
     <string name="two_factor_off_body">连接该端点时不做身份验证；要求两步验证的服务器会拒绝建立隧道。</string>
     <string name="two_factor_enrollment_pending">等待以 %1$s 完成注册：下次连接时服务端会下发该端点的凭证。</string>
     <string name="two_factor_client_id">客户端 ID</string>

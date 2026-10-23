@@ -10,6 +10,7 @@
  * behind the credential door and forgets them when the door shuts.
  */
 import { useI18n } from "vue-i18n";
+import { computed } from "vue";
 import type { ConnectionType, NodeConfig, TwoFactorAlgorithm } from "../types";
 import { useConfigStore } from "../stores/config";
 import { useNodeCredentials } from "../composables/useNodeCredentials";
@@ -33,7 +34,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { setNodeTwoFactor, clearNodeTwoFactor, hasTwoFactor, updateNodeDomains } = useConfigStore();
+const { setNodeTwoFactor, clearNodeTwoFactor, twoFactorState, updateNodeDomains } = useConfigStore();
 const {
   revealedSecrets,
   secretMask,
@@ -58,16 +59,36 @@ function getNodeTypeLabel(type: ConnectionType): string {
 /**
  * Credentials live on the node, so the toggle is per node: turning it on gives this server an
  * empty pair to fill in, turning it off puts it back to "no handshake".
+ *
+ * A node that is waiting to enroll is left alone: the token is armed and the credential comes
+ * with the next connect, so writing an empty pair over it would replace a registration that is
+ * about to succeed with a credential that has nothing in it.
  */
 function toggleTwoFactor(nodeId: string): void {
   const node = props.node;
   if (!node) return;
-  if (hasTwoFactor(node)) {
+  const state = twoFactorState(node);
+  if (state === "pending") return;
+  if (state === "on") {
     clearNodeTwoFactor(nodeId);
   } else {
     setNodeTwoFactor(nodeId, {});
   }
 }
+
+/**
+ * What the 2FA line reads.
+ *
+ * A node that is waiting to enroll says so: it is not 2FA-off, it is 2FA that has not been
+ * answered yet, and reading it as "disabled" is what made a scanned invite look like it had not
+ * been applied at all.
+ */
+const twoFactorStateLabel = computed(() => {
+  const state = twoFactorState(props.node);
+  if (state === "on") return t("common.enabled");
+  if (state === "pending") return t("node.twoFactorPending");
+  return t("common.disabled");
+});
 
 /**
  * Text for a node's domains box, derived from the store on every render.
@@ -193,14 +214,22 @@ function updateNodeDomainsText(nodeId: string, text: string): void {
     </div>
 
     <div class="node-2fa-section">
-      <button type="button" class="node-2fa-toggle" @click="toggleTwoFactor(node.id)">
+      <button
+        type="button"
+        class="node-2fa-toggle"
+        :disabled="twoFactorState(node) === 'pending'"
+        @click="toggleTwoFactor(node.id)"
+      >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="3" y="11" width="18" height="11" rx="2"/>
           <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
         </svg>
         <span class="node-2fa-title">{{ t('node.twoFactor') }}</span>
-        <span class="node-2fa-state" :class="{ on: hasTwoFactor(node) }">
-          {{ hasTwoFactor(node) ? t('common.enabled') : t('common.disabled') }}
+        <span
+          class="node-2fa-state"
+          :class="{ on: twoFactorState(node) === 'on', pending: twoFactorState(node) === 'pending' }"
+        >
+          {{ twoFactorStateLabel }}
         </span>
       </button>
       <div v-if="node.twoFactor" class="node-2fa-fields">
@@ -324,6 +353,17 @@ function updateNodeDomainsText(nodeId: string, text: string): void {
   color: var(--text-primary);
 }
 
+/* A node that is waiting to enroll cannot be toggled: the token is armed, and
+   the credential comes with the next connect. */
+.node-2fa-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.node-2fa-toggle:disabled:hover {
+  color: var(--text-secondary);
+}
+
 .node-2fa-toggle svg {
   width: 14px;
   height: 14px;
@@ -340,6 +380,11 @@ function updateNodeDomainsText(nodeId: string, text: string): void {
 
 .node-2fa-state.on {
   color: var(--success);
+}
+
+/* Waiting for the server to answer the enrollment: neither on nor off. */
+.node-2fa-state.pending {
+  color: var(--warning);
 }
 
 .node-2fa-fields {

@@ -50,6 +50,7 @@ import {
   hasTwoFactor,
   removeNode,
   setNodeTwoFactor,
+  twoFactorState,
   updateNode,
   updateNodeDomains,
 } from './nodes';
@@ -235,6 +236,7 @@ export function useConfigStore() {
     setNodeTwoFactor,
     clearNodeTwoFactor,
     hasTwoFactor,
+    twoFactorState,
     setLoadBalancing,
     resetConfig,
   };
