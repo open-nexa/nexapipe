@@ -184,6 +184,11 @@ jobs:
       # bindings, the UniFFI surface, the TUN proxy — so a build with the
       # default features never looks at their documentation at all. One build
       # with all of them on does.
+      #
+      # The features are not the whole story: `TunProxy::new` and the JNI
+      # bindings that call it are behind `target_os = "android"`, so this
+      # step — which runs on ubuntu — never compiles them. The Android half
+      # is documented in the `android` job, which has the NDK.
       - name: cargo doc (the client's features)
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
@@ -801,6 +806,31 @@ jobs:
               --features "jni local-proxy tun-proxy" \
               --config "target.${TRIPLE}.linker='${LINKER}'"
           done
+
+      # The documentation of the Android half of the client crate.
+      #
+      # `TunProxy::new` and the JNI bindings around it are behind
+      # `target_os = "android"`, so the `docs (rustdoc links)` job — which runs
+      # on ubuntu — never compiles them: the client's features hide the
+      # modules, and the operating system hides what the features leave. A
+      # link in that half is therefore only ever checked here.
+      #
+      # `cargo ndk` points the build at the NDK's clang, which `ring` needs to
+      # compile for the target; the check step above needs the same for the
+      # same reason.
+      - name: cargo doc (the Android target)
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: |
+          set -euo pipefail
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TRIPLE="aarch64-linux-android"
+          LINKER="${NDK_BIN}/${TRIPLE}26-clang"
+          cargo ndk --target arm64-v8a --platform 26 doc \
+            -p nexapipe-client --no-deps --locked \
+            --features "jni local-proxy tun-proxy uniffi webpki-roots" \
+            --config "target.${TRIPLE}.linker='${LINKER}'"
 
       - name: Unit tests
         if: ${{ !cancelled() }}
