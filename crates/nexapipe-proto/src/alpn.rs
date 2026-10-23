@@ -36,12 +36,20 @@ pub const ALPN_NEXAPIPE: &[u8] = b"nexapipe";
 /// vintage. Drop it once neither is true.
 pub const ALPN_NEXAPIPE_LEGACY: &[u8] = b"\x05nexapipe";
 
-/// Both spellings, current first.
+/// The two generic names, current first.
 ///
-/// The **server's** order is what decides the negotiation: QUIC picks the first
-/// of the accept side's entries that the peer also offers. So the current
-/// spelling has to be first here, and the client's own offer order does not
-/// matter — what the client does is *offer* both.
+/// The generic names are the ones a connection that names no protocol in
+/// particular is served with, and both of them are in the server's accept
+/// list: the current spelling and the one that predates the prefix byte
+/// being dropped.
+///
+/// **The server's order is what decides the negotiation**: QUIC picks the
+/// first of the accept side's entries that the peer also offers. So the
+/// current spelling has to be first here, and the client's own offer order
+/// does not matter — what the client does is *offer* both.
+///
+/// The two lists this is a part of are written down once, in
+/// [`crate::protocol::accepted_alpns`] and [`crate::protocol::offered_alpns`].
 pub const ALPN_NEXAPIPE_ALL: [&[u8]; 2] = [ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY];
 
 #[cfg(test)]

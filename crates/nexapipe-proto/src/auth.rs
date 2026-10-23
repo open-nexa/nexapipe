@@ -99,10 +99,12 @@
 //!   sent before.
 
 use std::fmt;
+use std::io;
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::Sha256;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::secret::SecretString;
 
@@ -420,10 +422,116 @@ pub fn is_presentable_device_id(id: &str) -> bool {
     is_presentable_id(id, MAX_DEVICE_ID_LEN)
 }
 
+/// The room a serialized message is given up front.
+///
+/// A handshake message is a few hundred bytes at most, so the buffer is given
+/// room for one and does not have to grow in the ordinary case. It is only an
+/// optimisation: the buffer wipes the block it leaves behind when it does
+/// grow, so the size of a message is not a limit on the guarantee.
+const SERIALIZED_CAPACITY: usize = 4096;
+
+/// A buffer that wipes the block it leaves behind.
+///
+/// A `Vec` that grows hands the old block back to the allocator without
+/// wiping it, and that block held part of the credential: the allocator is
+/// where a core dump, a swap file or a read of `/proc/<pid>/mem` finds it.
+/// This one copies what it holds into the new block, wipes the old one, and
+/// only then lets it go.
+///
+/// The buffer that comes out of it is a [`Zeroizing`], so the copy the caller
+/// holds is wiped when it goes out of scope as well.
+struct WipingBuffer {
+    bytes: Vec<u8>,
+}
+
+impl WipingBuffer {
+    /// A buffer with room for `capacity` bytes.
+    fn with_capacity(capacity: usize) -> Self {
+        WipingBuffer {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Makes room for `extra` more bytes.
+    ///
+    /// The old block is wiped before it goes back to the allocator, so the
+    /// bytes that were in it are gone even where the block itself is not.
+    fn reserve_for(&mut self, extra: usize) {
+        if self.bytes.capacity() - self.bytes.len() >= extra {
+            return;
+        }
+        let wanted = self.bytes.len() + extra;
+        let mut fresh = Vec::with_capacity(wanted.next_power_of_two());
+        fresh.extend_from_slice(&self.bytes);
+        self.bytes.zeroize();
+        self.bytes = fresh;
+    }
+
+    /// A byte at the end.
+    fn push(&mut self, byte: u8) {
+        self.reserve_for(1);
+        self.bytes.push(byte);
+    }
+
+    /// Bytes at the end.
+    fn extend_from_slice(&mut self, other: &[u8]) {
+        self.reserve_for(other.len());
+        self.bytes.extend_from_slice(other);
+    }
+
+    /// The bytes written, in a buffer that wipes itself.
+    fn into_wiped(mut self) -> Zeroizing<Vec<u8>> {
+        // The buffer is taken rather than moved out of: a type with a `Drop`
+        // cannot have its fields moved out of it. The empty vector that takes
+        // its place is wiped by the `Drop` below, which is a no-op on an empty
+        // one.
+        Zeroizing::new(std::mem::take(&mut self.bytes))
+    }
+}
+
+/// The buffer wipes itself when it goes out of scope.
+///
+/// The writer is dropped when a serialization fails — the `?` in
+/// [`AuthMessage::to_bytes`] and [`AuthMessage::to_payload`] drops the buffer
+/// on the way out — and by then it may already hold the credential: a message
+/// that fails halfway through has written the token before it fails on the
+/// field behind it. Without this, the bytes of that credential go back to the
+/// allocator unwiped, which is the very thing the buffer exists to prevent.
+impl Drop for WipingBuffer {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+/// The JSON encoder writes into the buffer, so the buffer writes.
+impl io::Write for WipingBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl AuthMessage {
-    /// Serialize message to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    /// Serialize message to bytes.
+    ///
+    /// The buffer is wiped when it goes out of scope. A message may carry a
+    /// credential — the enrollment token of an [`AuthMessage::EnrollStart`],
+    /// the secret an [`AuthMessage::EnrollIssue`] hands out — and the
+    /// serialized copy of it used to be a plain `Vec<u8>`: the caller wrote it
+    /// to the socket and dropped it, and the bytes stayed in the heap for the
+    /// allocator to hand out again.
+    ///
+    /// The credential itself is a [`SecretString`], and that one *is* wiped —
+    /// but only the copy the wrapper holds. This is the copy that never left
+    /// the process, and it was the one nobody remembered.
+    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+        let mut bytes = WipingBuffer::with_capacity(SERIALIZED_CAPACITY);
+        serde_json::to_writer(&mut bytes, self)?;
+        Ok(bytes.into_wiped())
     }
 
     /// Deserialize message from bytes
@@ -435,20 +543,24 @@ impl AuthMessage {
     ///
     /// The version byte is part of the payload: the frame around it is
     /// `[u32le length][payload]`, and the length covers the byte.
-    pub fn to_payload(&self, format: Format) -> Result<Vec<u8>, CodecError> {
+    ///
+    /// The payload is wiped when it goes out of scope, for the same reason
+    /// [`AuthMessage::to_bytes`] wipes its buffer: two of the messages carry a
+    /// credential.
+    pub fn to_payload(&self, format: Format) -> Result<Zeroizing<Vec<u8>>, CodecError> {
         match format {
-            Format::LegacyJson => serde_json::to_vec(self).map_err(CodecError::Json),
+            Format::LegacyJson => self.to_bytes().map_err(CodecError::Json),
             Format::Json => {
-                let mut payload = Vec::new();
+                let mut payload = WipingBuffer::with_capacity(SERIALIZED_CAPACITY);
                 payload.push(VERSION_JSON);
-                payload.extend(serde_json::to_vec(self).map_err(CodecError::Json)?);
-                Ok(payload)
+                serde_json::to_writer(&mut payload, self).map_err(CodecError::Json)?;
+                Ok(payload.into_wiped())
             }
             Format::Binary => {
-                let mut payload = Vec::new();
-                payload.push(VERSION_BINARY);
-                payload.extend(self.to_binary()?);
-                Ok(payload)
+                let mut writer = Writer::default();
+                writer.u8(VERSION_BINARY);
+                self.write_binary(&mut writer)?;
+                Ok(writer.into_bytes())
             }
         }
     }
@@ -484,9 +596,11 @@ impl AuthMessage {
         }
     }
 
-    /// The message in the binary form, without the version byte.
-    fn to_binary(&self) -> Result<Vec<u8>, CodecError> {
-        let mut writer = Writer::default();
+    /// The message in the binary form, written into the writer.
+    ///
+    /// The buffer is wiped when it goes out of scope, like the JSON form's:
+    /// the binary form carries the same credential.
+    fn write_binary(&self, writer: &mut Writer) -> Result<(), CodecError> {
         match self {
             AuthMessage::Start {
                 client_id,
@@ -600,7 +714,7 @@ impl AuthMessage {
                 writer.string(reason)?;
             }
         }
-        Ok(writer.into_bytes())
+        Ok(())
     }
 
     /// The message a binary payload carries.
@@ -753,9 +867,21 @@ fn allowed_flags(kind: u8) -> u8 {
 }
 
 /// Writes the binary form, a field at a time.
-#[derive(Default)]
+///
+/// The buffer is a [`WipingBuffer`]: the binary form carries a credential —
+/// the enrollment token, the secret the server issues — and the bytes of it
+/// are wiped when the writer goes out of scope, and when it outgrows the
+/// block it is in.
 struct Writer {
-    bytes: Vec<u8>,
+    bytes: WipingBuffer,
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Writer {
+            bytes: WipingBuffer::with_capacity(SERIALIZED_CAPACITY),
+        }
+    }
 }
 
 impl Writer {
@@ -811,8 +937,9 @@ impl Writer {
         Ok(())
     }
 
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    /// The bytes written, in a buffer that wipes itself.
+    fn into_bytes(self) -> Zeroizing<Vec<u8>> {
+        self.bytes.into_wiped()
     }
 }
 
@@ -985,6 +1112,172 @@ type HmacSha256 = Hmac<Sha256>;
 mod tests {
     use super::*;
 
+    /// The heap, watched.
+    ///
+    /// The defect this fixes is a credential that survives in the heap after
+    /// the message that carried it is gone, and the only way to *show* that it
+    /// does not survive is to look at the memory after it is freed. The
+    /// allocator is where that memory comes back from, so the allocator is
+    /// where the proof is: a block on its way out that still holds the
+    /// credential is a block the credential survived in.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::fmt;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// The bytes the probe is watching for.
+        ///
+        /// A string no other test uses, so a block that holds it is one this
+        /// test made.
+        pub const NEEDLE: &str = "nexapipe-heap-probe-4f2a9c";
+
+        /// The turn the tests that watch the heap take.
+        ///
+        /// The probe watches every block the allocator frees, in the whole
+        /// process, and the tests that use it share one needle. Two of them
+        /// watching at once would see each other's blocks: the bytes a test
+        /// reads are dropped outside its own watched window — a test that
+        /// reads a message off the wire holds those bytes for the length of
+        /// the test — and the other test, watching at that moment, finds the
+        /// needle in them and reports a leak that is not there.
+        ///
+        /// The turn is held for the whole test, so the needle-bearing data of
+        /// one test is gone before the next one starts watching.
+        pub static LOCK: Mutex<()> = Mutex::new(());
+
+        /// Whether the probe is watching.
+        static WATCHING: AtomicBool = AtomicBool::new(false);
+
+        /// Whether the needle was seen in a block on its way out.
+        static FOUND: AtomicBool = AtomicBool::new(false);
+
+        /// The size of the block the needle was seen in.
+        static FOUND_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+        /// The offset of the needle in that block.
+        static FOUND_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+        /// The allocator that watches.
+        struct Probe;
+
+        unsafe impl GlobalAlloc for Probe {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                scan(ptr, layout.size());
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                scan(ptr, layout.size());
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static PROBE: Probe = Probe;
+
+        /// Looks for the needle in a block that is about to be freed.
+        ///
+        /// The block is read a byte at a time with `read_volatile` rather
+        /// than through a slice: the tail of a buffer past its length was
+        /// never written, and a reference to it would be a reference to
+        /// uninitialized memory.
+        fn scan(ptr: *mut u8, len: usize) {
+            if len < NEEDLE.len() {
+                return;
+            }
+            let needle = NEEDLE.as_bytes();
+            for start in 0..=(len - needle.len()) {
+                let mut matched = true;
+                for (offset, expected) in needle.iter().enumerate() {
+                    // SAFETY: `ptr` is the block that is being freed, `start`
+                    // is at most `len - needle.len()` and `offset` is at most
+                    // `needle.len() - 1`, so the byte read is inside the
+                    // block. The read is volatile, so the compiler does not
+                    // assume anything about the bytes it reads.
+                    let byte = unsafe { ptr.add(start + offset).read_volatile() };
+                    if byte != *expected {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    if std::env::var_os("NEXAPIPE_HEAP_TRACE").is_some() {
+                        eprintln!(
+                            "PROBE: needle in a freed block of {len} bytes at offset {start} (watching={})",
+                            WATCHING.load(Ordering::Relaxed)
+                        );
+                    }
+                    FOUND.store(true, Ordering::SeqCst);
+                    FOUND_SIZE.store(len, Ordering::SeqCst);
+                    FOUND_OFFSET.store(start, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+
+        /// Where the needle was found.
+        ///
+        /// The size of the block and the offset of the needle in it: the two
+        /// numbers that say which allocation it was. A block of a few dozen
+        /// bytes is a secret's own string; a block of a few thousand is a
+        /// buffer a message was written into.
+        #[derive(Debug)]
+        pub struct Residue {
+            /// The size of the block the needle was found in.
+            pub size: usize,
+            /// The offset of the needle in that block.
+            pub offset: usize,
+        }
+
+        impl fmt::Display for Residue {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a block of {} bytes, the credential {} bytes into it",
+                    self.size, self.offset
+                )
+            }
+        }
+
+        /// Runs `body` with the heap watched, and says what was left behind.
+        ///
+        /// `None` is the answer a test wants: nothing that holds the needle
+        /// was let go without being wiped. `Some` says where the needle was
+        /// found.
+        pub fn watched<R>(body: impl FnOnce() -> R) -> Option<Residue> {
+            WATCHING.store(true, Ordering::SeqCst);
+            FOUND.store(false, Ordering::SeqCst);
+            body();
+            WATCHING.store(false, Ordering::SeqCst);
+            if FOUND.load(Ordering::SeqCst) {
+                Some(Residue {
+                    size: FOUND_SIZE.load(Ordering::SeqCst),
+                    offset: FOUND_OFFSET.load(Ordering::SeqCst),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The JSON of a message, as text.
+    ///
+    /// The buffer a message is serialized into wipes itself, so a test that
+    /// wants to read the JSON copies it out — which is what a test may do and
+    /// what the code may not.
+    fn json_of(message: &AuthMessage) -> String {
+        String::from_utf8(message.to_bytes().expect("serializable").to_vec()).expect("utf-8")
+    }
+
     /// The wire format, byte for byte.
     ///
     /// The handshake used to be written down twice, and these strings are what
@@ -1098,7 +1391,7 @@ mod tests {
         ];
 
         for (message, wire) in messages {
-            let json = String::from_utf8(message.to_bytes().expect("serializable")).expect("utf-8");
+            let json = json_of(&message);
             assert_eq!(json, wire, "the wire format of {message:?} changed");
         }
     }
@@ -1115,7 +1408,7 @@ mod tests {
             device_id: None,
             public_key: None,
         };
-        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        let json = json_of(&start);
         assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
         assert_eq!(
             AuthMessage::from_bytes(json.as_bytes())
@@ -1133,13 +1426,13 @@ mod tests {
             period: 30,
             device_id: None,
         };
-        let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+        let json = json_of(&issue);
         assert!(json.contains(r#""type":"ENROLL_ISSUE""#), "{json}");
 
         let failed = AuthMessage::EnrollFailed {
             reason: "no".to_string(),
         };
-        let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
+        let json = json_of(&failed);
         assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
     }
 
@@ -1157,7 +1450,7 @@ mod tests {
             device_id: None,
             public_key: None,
         };
-        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        let json = json_of(&start);
         assert!(json.contains(r#""token":"tok""#), "{json}");
 
         let issue = AuthMessage::EnrollIssue {
@@ -1168,8 +1461,197 @@ mod tests {
             period: 30,
             device_id: None,
         };
-        let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+        let json = json_of(&issue);
         assert!(json.contains(r#""secret":"JBSWY3DPEHPK3PXP""#), "{json}");
+    }
+
+    /// The credential does not survive in the buffer it was serialized into.
+    ///
+    /// The credential is a `Secret`, and the `Secret` wipes itself — but the
+    /// *serialized* copy was a plain `Vec<u8>` that nobody wiped. The caller
+    /// wrote it to the socket and dropped it, and the bytes stayed in the heap
+    /// for the allocator to hand out again: a core dump, a swap file or a read
+    /// of `/proc/<pid>/mem` finds the token there long after the handshake
+    /// that needed it.
+    ///
+    /// This is the proof that it does not: the heap is watched while the
+    /// message is serialized and dropped, and a block on its way out that
+    /// still holds the credential fails the test.
+    #[test]
+    fn the_serialized_credential_does_not_survive_in_the_heap() {
+        // The turn is taken before anything else, so it is given up last:
+        // the data this test holds has to be gone before another test starts
+        // watching.
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new(heap::NEEDLE.to_string()),
+            device_id: None,
+            public_key: None,
+        };
+        let issue = AuthMessage::EnrollIssue {
+            client_id: "client-001".to_string(),
+            secret: SecretString::new(heap::NEEDLE.to_string()),
+            algorithm: Algorithm::Sha1,
+            digits: 6,
+            period: 30,
+            device_id: None,
+        };
+        // A credential long enough that the buffer has to grow while it is
+        // written — the case where a `Vec` hands the block it outgrows back to
+        // the allocator without wiping it.
+        let long = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new(heap::NEEDLE.repeat(400)),
+            device_id: None,
+            public_key: None,
+        };
+
+        let residue = heap::watched(|| {
+            // Every form a message travels in, and the message itself.
+            drop(start.to_bytes().expect("serializable"));
+            drop(start.to_payload(Format::Json).expect("writable"));
+            drop(start.to_payload(Format::Binary).expect("writable"));
+            drop(issue.to_bytes().expect("serializable"));
+            drop(issue.to_payload(Format::Json).expect("writable"));
+            drop(issue.to_payload(Format::Binary).expect("writable"));
+            drop(long.to_bytes().expect("serializable"));
+            drop(long.to_payload(Format::Json).expect("writable"));
+            drop(long.to_payload(Format::Binary).expect("writable"));
+            drop(start);
+            drop(issue);
+            drop(long);
+        });
+
+        assert!(
+            residue.is_none(),
+            "the credential was still in a freed block of the heap: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
+        );
+    }
+
+    /// The credential does not survive when the serialization fails either.
+    ///
+    /// A message can fail halfway through being written: the credential is
+    /// written first, and the field behind it can be one the wire format
+    /// cannot hold. The buffer is dropped on the way out of that failure, and
+    /// a buffer that is only wiped on the success path leaves the credential
+    /// in the heap — which is the one thing the buffer is here to prevent.
+    ///
+    /// The failure is forced with a device id too long for the wire format:
+    /// it is written after the token, and the length check fails on it.
+    #[test]
+    fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new(heap::NEEDLE.to_string()),
+            device_id: Some("x".repeat(70_000)),
+            public_key: None,
+        };
+
+        let residue = heap::watched(|| {
+            let result = start.to_payload(Format::Binary);
+            assert!(result.is_err(), "the message is too long to be written");
+            drop(result);
+            drop(start);
+        });
+
+        assert!(
+            residue.is_none(),
+            "the credential was still in a freed block of the heap after the \
+             serialization failed: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
+        );
+    }
+
+    /// The credential does not survive in the heap on the way in either.
+    ///
+    /// The JSON form is the one that has to be checked: `AuthMessage` is a
+    /// tagged enum, and a tagged enum is read by buffering the fields before
+    /// the variant is known — so the question is whether the buffered value
+    /// reaches the [`SecretString`] by a copy or by a move. It is a move:
+    /// serde hands the buffered string straight to the wrapper, and the one
+    /// allocation that holds the credential is the wrapper's, which wipes
+    /// itself.
+    ///
+    /// The binary form is read the same way: the reader copies the bytes out
+    /// of the payload and hands them to the wrapper, and there is no third
+    /// copy of it anywhere.
+    ///
+    /// What this does *not* cover is the caller's own buffer: the payload the
+    /// message was read out of belongs to whoever read it off the socket, and
+    /// wiping that is that reader's business.
+    #[test]
+    fn the_received_credential_does_not_survive_in_the_heap() {
+        // The turn is taken before the bytes this test reads are built, so
+        // they are dropped while this test still holds it — they hold the
+        // needle, and another test watching the heap would find it in them.
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // The credential this test reads is a credential in the heap like any
+        // other, and it is wiped when it goes out of scope. A block that
+        // still holds it would be handed back by the allocator with the
+        // credential in it, and the next test's probe would find it there
+        // and report a leak that is not one.
+        //
+        // The buffers are given the room they need up front, so that they do
+        // not grow: a buffer that grows hands the block it outgrows back to
+        // the allocator, and that block holds the credential too.
+        let mut json = Zeroizing::new(String::with_capacity(160));
+        json.push_str(r#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":""#);
+        json.push_str(heap::NEEDLE);
+        json.push_str(r#"","algorithm":"sha1","digits":6,"period":30}"#);
+
+        // The binary form, written out by hand: an ENROLL_ISSUE, the client
+        // id, the secret, the algorithm, the digits and the period.
+        let mut binary = Zeroizing::new(Vec::with_capacity(64));
+        binary.push(VERSION_BINARY);
+        binary.push(kind::ENROLL_ISSUE);
+        binary.push(0x00);
+        binary.extend_from_slice(&10u16.to_le_bytes());
+        binary.extend_from_slice(b"client-001");
+        binary.extend_from_slice(&(heap::NEEDLE.len() as u16).to_le_bytes());
+        binary.extend_from_slice(heap::NEEDLE.as_bytes());
+        binary.push(Algorithm::Sha1.to_byte());
+        binary.extend_from_slice(&6u32.to_le_bytes());
+        binary.extend_from_slice(&30u64.to_le_bytes());
+
+        // Neither buffer grew. A buffer that grew has handed the block it
+        // outgrew back to the allocator, and that block holds the credential,
+        // and the allocator hands the block out again to whoever asks for
+        // one of that size — so the credential is in the heap for as long as
+        // the process lives, and the next test's probe finds it there.
+        assert_eq!(json.capacity(), 160, "the JSON buffer grew");
+        assert_eq!(binary.capacity(), 64, "the binary buffer grew");
+
+        let residue = heap::watched(|| {
+            drop(AuthMessage::from_bytes(json.as_bytes()).expect("the JSON form parses"));
+            drop(AuthMessage::from_payload(&binary).expect("the binary form parses"));
+        });
+
+        assert!(
+            residue.is_none(),
+            "the credential was still in a freed block of the heap: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
+        );
     }
 
     /// A peer on either side of this change has to be able to talk to one on
@@ -1198,17 +1680,12 @@ mod tests {
         // And it goes back out the way it came in, so the two peers agree on
         // what a handshake between them looks like.
         assert_eq!(
-            String::from_utf8(
-                AuthMessage::Start {
-                    client_id,
-                    timestamp,
-                    device_id,
-                    version,
-                }
-                .to_bytes()
-                .unwrap()
-            )
-            .unwrap(),
+            json_of(&AuthMessage::Start {
+                client_id,
+                timestamp,
+                device_id,
+                version,
+            }),
             wire,
         );
     }
@@ -1219,18 +1696,13 @@ mod tests {
     /// keeps nobody having to negotiate a version.
     #[test]
     fn an_unnamed_device_sends_no_device_id_at_all() {
-        let json = String::from_utf8(
-            AuthMessage::Response {
-                client_id: "client-001".to_string(),
-                timestamp: 1,
-                totp_code: "123456".to_string(),
-                signature: vec![7],
-                device_id: None,
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .unwrap();
+        let json = json_of(&AuthMessage::Response {
+            client_id: "client-001".to_string(),
+            timestamp: 1,
+            totp_code: "123456".to_string(),
+            signature: vec![7],
+            device_id: None,
+        });
 
         assert!(!json.contains("device_id"), "{json}");
     }
@@ -1271,7 +1743,7 @@ mod tests {
 
         for message in &messages {
             let bytes = message.to_bytes().expect("serializable");
-            let json = String::from_utf8(bytes.clone()).unwrap();
+            let json = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(json.contains(r#""device_id":"laptop""#), "{json}");
 
             let back = AuthMessage::from_bytes(&bytes).expect("parses");
@@ -1318,7 +1790,7 @@ mod tests {
             public_key: Some(key.clone()),
         };
 
-        let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+        let json = json_of(&start);
         assert!(json.contains(&format!(r#""public_key":"{key}""#)), "{json}");
 
         let back = AuthMessage::from_bytes(json.as_bytes()).expect("parses");
@@ -1339,17 +1811,12 @@ mod tests {
         assert_eq!(public_key, None, "no key sent is a secret-based device");
 
         assert_eq!(
-            String::from_utf8(
-                AuthMessage::EnrollStart {
-                    client_id: "client-001".to_string(),
-                    token: SecretString::new("tok".to_string()),
-                    device_id: Some("laptop".to_string()),
-                    public_key: None,
-                }
-                .to_bytes()
-                .unwrap()
-            )
-            .unwrap(),
+            json_of(&AuthMessage::EnrollStart {
+                client_id: "client-001".to_string(),
+                token: SecretString::new("tok".to_string()),
+                device_id: Some("laptop".to_string()),
+                public_key: None,
+            }),
             wire,
         );
     }
