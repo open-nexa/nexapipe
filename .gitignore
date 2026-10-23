@@ -1,5 +1,9 @@
 target
 .workbuddy
+# The same scratch under its other name. A pattern of `.workbuddy` matches
+# that directory and not this one, and `git add -A` in a checkout that holds
+# both would sweep this one in.
+.workbuddy-ai
 
 # Working branches are checked out inside the repository, under .worktrees/.
 # Each one is a separate git repository, so the parent must not track it.

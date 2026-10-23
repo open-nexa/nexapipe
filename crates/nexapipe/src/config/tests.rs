@@ -1375,7 +1375,9 @@ fn a_second_device_enrolling_leaves_the_first_one_alone() {
     let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
     let auth = auth.expect("auth is enabled");
     let devices = &auth.clients["alice"].devices;
-    assert_eq!(devices.len(), 2, "{devices:?}");
+    // The count, not the map: the map carries each device's secret, and a
+    // failing assertion would render it into the CI log.
+    assert_eq!(devices.len(), 2, "both devices are enrolled");
     assert_eq!(devices["laptop"].secret.as_str(), "LAPTOPSECRET");
     assert_eq!(devices["phone"].secret.as_str(), "PHONESECRET");
 }
@@ -1904,9 +1906,12 @@ fn a_missing_key_file_is_generated_into() {
         ProxyConfig::from_file(path.to_str().expect("utf-8 path")).expect("the config loads");
     let identity = ProxyConfig::ensure_iroh_secret_key(path.to_str().expect("utf-8 path"), &config)
         .expect("the identity resolves");
+    // Compare instead of formatting: the identity is the endpoint's private
+    // key, and it does not belong in a message that CI keeps — even though
+    // `EndpointIdentity`'s `Debug` redacts it.
     assert!(
         matches!(identity, EndpointIdentity::Generated(_)),
-        "a first start generates into the pointed-to file, got {identity:?}"
+        "a first start generates into the pointed-to file"
     );
 
     // Compare and measure without formatting the key: a failing
@@ -3153,9 +3158,12 @@ fn an_unwritable_config_still_resolves_an_identity() {
     let identity = ProxyConfig::ensure_iroh_secret_key(&path, &parse("debug = true\n"))
         .expect("a file the server cannot write must not stop it: the key is generated either way");
 
+    // Compare instead of formatting: the identity is the endpoint's private
+    // key, and it does not belong in a message that CI keeps — even though
+    // `EndpointIdentity`'s `Debug` redacts it.
     assert!(
         matches!(identity, EndpointIdentity::Ephemeral(_)),
-        "a failed write has to degrade to a throwaway identity, got {identity:?}"
+        "a failed write has to degrade to a throwaway identity"
     );
     // Still a usable key, or the server would be refusing connections for a
     // reason that has nothing to do with why the write failed.
