@@ -185,9 +185,17 @@ async fn handle_dns_query(
         // route (see routing::configure_ipv6). Without it the honest answer is
         // the empty NOERROR that sends the resolver back to A, not an address
         // that leads nowhere.
+        //
+        // The **class** is part of the question too, and what goes back is an IN
+        // record: handing one out for a CH or ANY question answers something
+        // that was not asked. Only a question in the Internet class gets an
+        // address — and the client says the same thing, which is the point of
+        // the codec being the client's: one rule, or two answers to one
+        // question.
+        let in_class = query.qclass == nexapipe_client::dns::DNS_CLASS_IN;
         let answer = match query.qtype {
-            1 => Some(std::net::IpAddr::V4(ip_mapping.allocate(&query.domain))),
-            28 => ip_mapping
+            1 if in_class => Some(std::net::IpAddr::V4(ip_mapping.allocate(&query.domain))),
+            28 if in_class => ip_mapping
                 .allocate_v6(&query.domain)
                 .map(std::net::IpAddr::V6),
             _ => None,
@@ -530,15 +538,90 @@ mod tests {
         }
     }
 
-    /// A DNS query for `example.com`.
+    /// A DNS query for `example.com` in the Internet class.
     fn a_query() -> Vec<u8> {
+        a_query_in_class(1)
+    }
+
+    /// A DNS query for `example.com` in a given class.
+    fn a_query_in_class(class: u16) -> Vec<u8> {
         let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         packet.extend_from_slice(&[
             0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
         ]);
         packet.extend_from_slice(&1u16.to_be_bytes());
-        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&class.to_be_bytes());
         packet
+    }
+
+    /// The number of records in an answer.
+    fn answer_count(answer: &[u8]) -> u16 {
+        u16::from_be_bytes([answer[6], answer[7]])
+    }
+
+    /// The class is part of the question, and what goes back is an IN record.
+    ///
+    /// A question asked in another class must not be answered with one: the
+    /// client refuses it, and the codec is the client's — one rule, or two
+    /// answers to the same question.
+    #[tokio::test]
+    async fn a_question_in_another_class_is_answered_with_nothing() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
+        let client_addr = client.local_addr().expect("the address it got");
+        let resolvers = UpstreamResolvers::new(&[], Arc::new(AtomicBool::new(false)));
+        let mapping = IpMapping::new();
+        let domains = vec!["example.com".to_string()];
+
+        // The Internet class gets an address.
+        handle_dns_query(
+            &socket,
+            &a_query(),
+            client_addr,
+            &resolvers,
+            &domains,
+            &mapping,
+        )
+        .await
+        .expect("the query is answered");
+        let mut buf = [0u8; 512];
+        let (read, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("an answer arrives")
+        .expect("the answer is received");
+        assert_eq!(
+            answer_count(&buf[..read]),
+            1,
+            "a question in the Internet class is answered with an address"
+        );
+
+        // Another class gets nothing.
+        handle_dns_query(
+            &socket,
+            &a_query_in_class(3),
+            client_addr,
+            &resolvers,
+            &domains,
+            &mapping,
+        )
+        .await
+        .expect("the query is answered");
+        let mut buf = [0u8; 512];
+        let (read, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("an answer arrives")
+        .expect("the answer is received");
+        assert_eq!(
+            answer_count(&buf[..read]),
+            0,
+            "a question in another class is answered with nothing"
+        );
     }
 
     /// Every query leaves from the same socket.
