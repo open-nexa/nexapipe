@@ -91,6 +91,9 @@ ${UnStrRep}
 ; `install_owner::OWNER_VALUE` in the app says the same thing; the two have to stay in
 ; sync. It lives in the service's own key, which both halves can read.
 !define NEXAPIPE_OWNER_VALUE "ServiceOwner"
+; The marker the restore of the user's own files writes when it gets to its end. A log
+; without it is a log of a script that did not finish.
+!define NEXAPIPE_RESTORE_DONE "done"
 
 ; Scratch files for the elevated steps. Nothing of this survives the run.
 ;
@@ -666,17 +669,21 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   FileWrite $0 'for %%A in ("${source}") do if exist "%%~fA" if %%~zA GTR 0 (copy /y "%%~fA" "${destination}" >nul 2>&1 && echo 0 >> "${log}" || echo 1 >> "${log}")$\r$\n'
 !macroend
 
-; Leaves 1 in `out` when the log holds a line that says a copy failed.
+; Reads the log the restore of the user's own files left behind.
 ;
-; A log that is not there at all is not a failure here: it says the script never
-; ran, which the caller asks about on its own - a declined prompt and a refused
-; copy are different problems with different answers.
-!macro NEXAPIPE_LOG_HAS_FAILURE log out
+; `failed` is 1 when the log holds a line that says a copy did not work, and `ran` is 1
+; when the log holds the marker the script writes when it gets to its end. A log without
+; that marker says the script never finished - which is not the same as "there was
+; nothing to put back", and must not be read as a success.
+;
+; `failed` and `ran` must not be one of $3, $4 or $5 - the scratch the macro works in.
+!macro NEXAPIPE_READ_RESTORE_LOG log failed ran
   Push $3
   Push $4
   Push $5
 
-  StrCpy ${out} 0
+  StrCpy ${failed} 0
+  StrCpy ${ran} 0
   ClearErrors
   FileOpen $3 ${log} r
   ${IfNot} ${Errors}
@@ -689,7 +696,12 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
       ${StrRep} $5 $4 "$\r" ""
       ${StrRep} $4 $5 "$\n" ""
       ${If} $4 == "1"
-        StrCpy ${out} 1
+        StrCpy ${failed} 1
+      ${EndIf}
+      ; The marker is written last, so a log that has it is a log of a script that got to
+      ; the end.
+      ${If} $4 == "${NEXAPIPE_RESTORE_DONE}"
+        StrCpy ${ran} 1
       ${EndIf}
     ${LoopUntil} $4 == ""
     FileClose $3
@@ -902,6 +914,38 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   ${EndIf}
 !macroend
 
+; Reserves the four scratch files the rollback needs: the batch file that puts the user's
+; own files back and the log it says so in, and the batch file that puts the copy under
+; Program Files back and the log it says so in.
+;
+; All four are reserved before anything is written into any of them, because a name that
+; was not reserved means a half of the rollback that cannot run.
+!macro NEXAPIPE_RESERVE_ROLLBACK_NAMES
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SCRIPT ".cmd"
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_LOG ".log"
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT ".cmd"
+  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_LOG ".log"
+!macroend
+
+; Whether every one of the four names the rollback needs was reserved, and leaves the
+; answer in `out` (1 or 0).
+;
+; The tests are ORed rather than ANDed - that is what `${OrIf}` means - so the answer is 0
+; when any one of them is empty. That is the shape the check has to have: a name that was
+; not reserved leaves a half of the rollback that cannot run, and a half of a rollback that
+; cannot run is a machine nobody has put back.
+;
+; `out` must not be $3, $4 or $5 - the scratch the other macros work in.
+!macro NEXAPIPE_ROLLBACK_NAMES_READY script log service_script service_log out
+  StrCpy ${out} 1
+  ${If} ${script} == ""
+  ${OrIf} ${log} == ""
+  ${OrIf} ${service_script} == ""
+  ${OrIf} ${service_log} == ""
+    StrCpy ${out} 0
+  ${EndIf}
+!macroend
+
 ; Puts the machine back the way the upgrade found it.
 ;
 ; The app's own files first: they are the user's to write, so they are put back
@@ -924,38 +968,55 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   StrCpy $NEXAPIPE_ROLLBACK_FAILED 0
   StrCpy $NEXAPIPE_ROLLBACK_REASON ""
 
-  ; The user's own files.
-  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SCRIPT ".cmd"
-  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_LOG ".log"
-  ${If} $NEXAPIPE_ROLLBACK_SCRIPT != ""
-  ${AndIf} $NEXAPIPE_ROLLBACK_LOG != ""
+  ; All four names are reserved before anything is written, because the whole of the
+  ; rollback depends on them: a name that could not be reserved means a half of it that
+  ; cannot run, and a rollback that could not run is not a rollback.
+  !insertmacro NEXAPIPE_RESERVE_ROLLBACK_NAMES
+  !insertmacro NEXAPIPE_ROLLBACK_NAMES_READY $NEXAPIPE_ROLLBACK_SCRIPT $NEXAPIPE_ROLLBACK_LOG $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT $NEXAPIPE_ROLLBACK_SERVICE_LOG $0
+
+  ${If} $0 == 0
+    ; Which half could not run decides what the user is told: a machine left with the new
+    ; app files and a machine left with the new service binary are different problems,
+    ; and the message has to say which one this is.
+    ${If} $NEXAPIPE_ROLLBACK_SCRIPT == ""
+    ${OrIf} $NEXAPIPE_ROLLBACK_LOG == ""
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The rollback could not run: the application's own files were not put back."
+    ${Else}
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The rollback could not run: the copy under Program Files is still the new one, and the service may still be running it."
+    ${EndIf}
+    StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+  ${Else}
+    ; The user's own files.
     FileOpen $0 $NEXAPIPE_ROLLBACK_SCRIPT w
     FileWrite $0 "@echo off$\r$\n"
     !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_APP" "$INSTDIR\${NEXAPIPE_APP_EXE}" "$NEXAPIPE_ROLLBACK_LOG"
     !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_SERVICE" "$INSTDIR\${NEXAPIPE_SERVICE_EXE}" "$NEXAPIPE_ROLLBACK_LOG"
     !insertmacro NEXAPIPE_WRITE_RESTORE "$NEXAPIPE_BACKUP_UNINSTALLER" "$INSTDIR\uninstall.exe" "$NEXAPIPE_ROLLBACK_LOG"
+    ; The marker says the script got to its end. A log without it is a log of a script
+    ; that was cut short, which is not the same as a log of a script that had nothing to
+    ; put back.
+    FileWrite $0 '>> "$NEXAPIPE_ROLLBACK_LOG" echo ${NEXAPIPE_RESTORE_DONE}$\r$\n'
     FileWrite $0 "exit /b 0$\r$\n"
     FileClose $0
 
     !insertmacro NEXAPIPE_RUN_UNELEVATED $NEXAPIPE_ROLLBACK_SCRIPT
-    Delete $NEXAPIPE_ROLLBACK_SCRIPT
 
     ; Whether the user's own files are back. An application that is still running holds
     ; its own executable open, and that file cannot be put back while it runs - which is
     ; a state the user has to be told about rather than one a message can call a
     ; rollback.
-    !insertmacro NEXAPIPE_LOG_HAS_FAILURE $NEXAPIPE_ROLLBACK_LOG $1
+    !insertmacro NEXAPIPE_READ_RESTORE_LOG $NEXAPIPE_ROLLBACK_LOG $1 $2
     ${If} $1 = 1
       StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
       StrCpy $NEXAPIPE_ROLLBACK_REASON "The application's own files could not all be put back - close the application and run the installer again."
+    ${ElseIf} $2 = 0
+      ; The script never got to its end: it did not run, or it was cut short. Either way
+      ; the files are not known to be back.
+      StrCpy $NEXAPIPE_ROLLBACK_FAILED 1
+      StrCpy $NEXAPIPE_ROLLBACK_REASON "The rollback did not run: the application's own files were not put back."
     ${EndIf}
-  ${EndIf}
 
-  ; The copy under Program Files, and the entry that points at it.
-  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT ".cmd"
-  !insertmacro NEXAPIPE_TEMP_FILE $NEXAPIPE_ROLLBACK_SERVICE_LOG ".log"
-  ${If} $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT != ""
-  ${AndIf} $NEXAPIPE_ROLLBACK_SERVICE_LOG != ""
+    ; The copy under Program Files, and the entry that points at it.
     ; The entry is only put back when the app moved it: the registration points
     ; the control manager at the copy under Program Files, and an entry that
     ; already pointed there is left as it is.
@@ -1048,9 +1109,16 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ${EndIf}
   ${EndIf}
 
-  ; Neither scratch file outlives the rollback.
+  ; No scratch file outlives the rollback, whichever way it went: the names that were
+  ; reserved but not used are of no use to anybody.
+  ${If} $NEXAPIPE_ROLLBACK_SCRIPT != ""
+    Delete $NEXAPIPE_ROLLBACK_SCRIPT
+  ${EndIf}
   ${If} $NEXAPIPE_ROLLBACK_LOG != ""
     Delete $NEXAPIPE_ROLLBACK_LOG
+  ${EndIf}
+  ${If} $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT != ""
+    Delete $NEXAPIPE_ROLLBACK_SERVICE_SCRIPT
   ${EndIf}
   ${If} $NEXAPIPE_ROLLBACK_SERVICE_LOG != ""
     Delete $NEXAPIPE_ROLLBACK_SERVICE_LOG
