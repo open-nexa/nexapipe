@@ -20,8 +20,8 @@
 //! The framing is the WebSocket's own and is not touched here: the bytes are
 //! moved as they are, and the end of the session is the end of a stream.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::HeaderMap;
@@ -145,15 +145,12 @@ pub async fn handshake(
 
     let request_buf = build_upgrade_request(request, backend_info, &host);
 
-    backend_stream
-        .write_all(&request_buf)
-        .await
-        .map_err(|e| {
-            ProxyFailure::unanswered(
-                anyhow::anyhow!("failed to write the WebSocket upgrade: {e}"),
-                Retryability::Always,
-            )
-        })?;
+    backend_stream.write_all(&request_buf).await.map_err(|e| {
+        ProxyFailure::unanswered(
+            anyhow::anyhow!("failed to write the WebSocket upgrade: {e}"),
+            Retryability::Always,
+        )
+    })?;
 
     let mut response_buf = Vec::with_capacity(8192);
     let mut trailing = Vec::new();
@@ -187,7 +184,9 @@ pub async fn handshake(
                 }
                 Err(e) => {
                     tracing::debug!("Failed to read from backend stream: {e}");
-                    return Err(anyhow::anyhow!("failed to read the handshake response: {e}"));
+                    return Err(anyhow::anyhow!(
+                        "failed to read the handshake response: {e}"
+                    ));
                 }
             }
         }
@@ -239,11 +238,11 @@ pub async fn pump(
 
     // The bytes that came after the handshake belong to the session, not to
     // the handshake: they are the backend's first frames.
-    if !trailing.is_empty() {
-        if let Err(e) = client_write.write_all(&trailing).await {
-            tracing::debug!("WebSocket: writing the backend's first frames failed: {e}");
-            return;
-        }
+    if !trailing.is_empty()
+        && let Err(e) = client_write.write_all(&trailing).await
+    {
+        tracing::debug!("WebSocket: writing the backend's first frames failed: {e}");
+        return;
     }
 
     // When the last byte moved on this tunnel, in milliseconds since the
@@ -318,9 +317,7 @@ pub async fn pump(
         reason = client_to_backend => ("client_to_backend", reason),
         reason = backend_to_client => ("backend_to_client", reason),
     };
-    tracing::debug!(
-        "WebSocket tunnel closed first by {closed_direction}, reason: {close_reason}"
-    );
+    tracing::debug!("WebSocket tunnel closed first by {closed_direction}, reason: {close_reason}");
 }
 
 /// The upgrade request that goes to the backend.

@@ -1263,6 +1263,50 @@ async fn a_tunneled_request_whose_body_was_read_is_not_tried_again() {
     );
 }
 
+/// **A WebSocket over the connection that named the HTTP protocol.**
+///
+/// The same upgrade the legacy path carries, over a connection that said what
+/// it carries: hyper's own codec hands the connection over when the `101` is
+/// written, and the session that follows is two byte streams moved either way.
+#[tokio::test]
+async fn a_websocket_over_the_named_http_protocol() {
+    use nexapipe_proto::protocol::ALPN_HTTP;
+
+    let backend = spawn_websocket_backend(Duration::from_millis(50)).await;
+    let proxy = spawn_proxy_that_reads_the_protocol(vec![http_route("ws.test", &backend)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr.clone(), ALPN_HTTP).await;
+
+    let (_send, mut recv) = tunnel
+        .upgrade_and_keep_open(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: ws.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    let Ok(Ok(Some(n))) = read else {
+        panic!("the upgrade never came back");
+    };
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected the backend's upgrade, got {head:?}"
+    );
+
+    // The session is what the upgrade is for: the backend keeps pushing, and
+    // the bytes have to reach the client.
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    let Ok(Ok(Some(n))) = read else {
+        panic!("the session carried nothing");
+    };
+    assert!(n > 0, "the session carried no bytes");
+}
+
 /// A WebSocket owns its connection, but an `https://` backend is still reached
 /// over a TLS session the proxy originates and verifies.
 #[tokio::test]

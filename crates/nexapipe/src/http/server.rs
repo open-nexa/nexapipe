@@ -107,6 +107,13 @@ pub async fn serve(
         // that a half-close is a thing.
         .half_close(true)
         .serve_connection(io, service)
+        // **`with_upgrades`, not the plain connection.** The plain one refuses
+        // to hand a connection over: an upgrade it cannot follow ends the
+        // connection with "upgrade expected but low level API in use". The
+        // upgradeable one gives the stream to whoever asked for it — here,
+        // the task that runs the WebSocket session — and keeps the bytes that
+        // were read past the head.
+        .with_upgrades()
         .await
         .map_err(|e| anyhow::anyhow!("the connection ended in error: {e}"))
 }
@@ -284,7 +291,7 @@ async fn upgrade(
                 &ctx.request_id,
                 &ctx.peer,
                 head.method().as_str(),
-                &head.uri().path().to_string(),
+                head.uri().path(),
                 502,
                 0,
                 0,
