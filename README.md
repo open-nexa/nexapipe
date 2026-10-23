@@ -1786,10 +1786,14 @@ question:
   is not held against it. Two services of one host are separated by the
   tunnel, not by the list.
 
-The limits that remain are deliberate: a revocation (a deleted client, a rotated
-secret, an edited `allow_hosts` or `allow_ports`) takes effect on *new*
-connections only, because a connection snapshots its authorization when it
-authenticates; 2FA is a
+The limits that remain are deliberate: a revocation that takes something away
+(a deleted client, a deleted device, or an `allow_hosts` or `allow_ports` list
+that was narrowed) closes the connections that are open, so the list that is
+live now is the list those connections are serving under. A rotated secret
+takes effect on *new* connections only, because a connection snapshots its
+authorization when it authenticates; turning 2FA *on* ends the connections
+that never authenticated, since a session or a tunnel opened while it was off
+would go on serving with nothing behind it; 2FA is a
 symmetric shared secret, so anyone who scans an invite becomes a legitimate
 client; and turning 2FA *off* is refused on a running server — restart to
 disable it.
