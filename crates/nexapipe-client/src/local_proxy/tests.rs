@@ -3,12 +3,18 @@
 //! They live in their own file because there are more of them than there is
 //! code to test, and because a file that is mostly tests hides the code it is
 //! testing.
-use super::http_head::{MAX_REQUEST_HEADER, header_over_limit};
+use super::http_head::{
+    HeaderOutcome, MAX_REQUEST_HEADER, filter_request_headers, header_over_limit, read_http_header,
+    redacted_headers, request_line_end,
+};
+use super::response::{ResponseRelay, relay_the_response};
+use super::websocket::{WS_FRAME_BUFFER_LIMIT, ws_frame_buffer_append};
 use super::*;
 use crate::LoadBalancingStrategy;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// A header whose name says its value is a credential is not printed.
 ///
