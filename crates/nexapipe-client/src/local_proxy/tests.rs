@@ -1868,3 +1868,82 @@ async fn a_body_after_the_head_is_forwarded() {
     proxy.stop();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
 }
+
+/// A backend that goes quiet ends the response, and the exchange with it.
+///
+/// The bound is a **quiet window** and not a total: a backend that stops
+/// talking for a whole window is cut, and it is cut at the *gap* — not at
+/// some total measured from the moment the request went out. A backend that
+/// has been silent for two minutes is dead, not slow.
+///
+/// The clock is paused, so "a whole window" is exact rather than
+/// approximate, and the test does not sit out the window to find out.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_goes_quiet_ends_the_response() {
+    let (mut backend, mut origin) = tokio::io::duplex(4096);
+
+    // The origin answers and then says nothing more. Its side stays open:
+    // the backend is quiet, not gone.
+    tokio::spawn(async move {
+        let _ = origin
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\nthe first chunk")
+            .await;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+
+    let mut relayed = Vec::new();
+    let outcome = relay_the_response(&mut backend, &mut relayed, RESPONSE_IDLE, &mut |_| {}).await;
+
+    assert!(
+        matches!(outcome, ResponseRelay::Quiet),
+        "a backend that went quiet must end the exchange: {outcome:?}"
+    );
+    assert_eq!(
+        relayed, b"HTTP/1.1 200 OK\r\n\r\nthe first chunk",
+        "the bytes that did arrive have to reach the client"
+    );
+}
+
+/// A backend that keeps sending is not cut off, however long it takes.
+///
+/// The bound is a quiet window and not a clock over the whole exchange, so a
+/// response that keeps arriving keeps the exchange alive: the total here is
+/// several times the window, and every gap between two chunks is shorter
+/// than it. A total bound would have cut this exchange in the middle.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_keeps_sending_is_not_cut_off() {
+    let (mut backend, mut origin) = tokio::io::duplex(4096);
+
+    /// How many chunks the origin sends.
+    const CHUNKS: usize = 10;
+    /// The gap between two chunks: shorter than the window, so no chunk is
+    /// ever late.
+    const GAP: Duration = Duration::from_secs(30);
+
+    tokio::spawn(async move {
+        for i in 0..CHUNKS {
+            let _ = origin.write_all(format!("chunk {i}\n").as_bytes()).await;
+            tokio::time::sleep(GAP).await;
+        }
+        let _ = origin.shutdown().await;
+    });
+
+    let mut relayed = Vec::new();
+    let outcome = relay_the_response(&mut backend, &mut relayed, RESPONSE_IDLE, &mut |_| {}).await;
+
+    assert!(
+        matches!(outcome, ResponseRelay::Complete),
+        "a backend that kept sending must not be cut off: {outcome:?}"
+    );
+    let relayed = String::from_utf8_lossy(&relayed);
+    for i in 0..CHUNKS {
+        assert!(
+            relayed.contains(&format!("chunk {i}\n")),
+            "the chunk {i} did not arrive: {relayed}"
+        );
+    }
+    assert!(
+        CHUNKS as u64 * GAP.as_secs() > RESPONSE_IDLE.as_secs(),
+        "the exchange has to outlast the window, or the test proves nothing"
+    );
+}
