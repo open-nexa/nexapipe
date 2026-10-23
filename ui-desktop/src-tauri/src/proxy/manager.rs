@@ -1,11 +1,10 @@
 use crate::proxy::dns::DnsServerConfig;
 use crate::proxy::dns_config::DnsStrategy;
 use crate::proxy::local_proxy::LocalProxyWrapper;
-use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, tun_ip};
+use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use nexapipe_client::LinkStatus;
 use nexapipe_client::auth::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
@@ -15,6 +14,7 @@ use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig, NodeHealth};
 use nexapipe_client::lb::LoadBalancingStrategy;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
+use nexapipe_client::LinkStatus;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -190,33 +190,6 @@ fn key_for(node: &ProxyNodeConfig) -> Option<iroh::SecretKey> {
     Some(key.secret_key().clone())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProxyLoadBalancingStrategy {
-    RoundRobin,
-    Random,
-}
-
-impl std::str::FromStr for ProxyLoadBalancingStrategy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "round_robin" => Ok(Self::RoundRobin),
-            "random" => Ok(Self::Random),
-            _ => Err(format!("Unknown load balancing strategy: {}", s)),
-        }
-    }
-}
-
-impl From<ProxyLoadBalancingStrategy> for LoadBalancingStrategy {
-    fn from(strategy: ProxyLoadBalancingStrategy) -> Self {
-        match strategy {
-            ProxyLoadBalancingStrategy::RoundRobin => LoadBalancingStrategy::RoundRobin,
-            ProxyLoadBalancingStrategy::Random => LoadBalancingStrategy::Random,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ProxyManagerConfig {
     pub nodes: Vec<ProxyNodeConfig>,
@@ -227,7 +200,7 @@ pub struct ProxyManagerConfig {
     /// through untouched: a machine that cannot honour it says so rather than
     /// having its whole DNS replaced.
     pub dns_strategy: DnsStrategy,
-    pub load_balancing: ProxyLoadBalancingStrategy,
+    pub load_balancing: LoadBalancingStrategy,
     pub tun_name: String,
     /// Forwarding mode, chosen by the user, not probed: `true` requests TUN (and fails if the
     /// process cannot create it), `false` runs the local proxy. There is no automatic mode
@@ -434,7 +407,7 @@ impl ProxyManager {
         let endpoint_group = EndpointGroup::new_with_nodes_and_endpoint(
             nodes.clone(),
             None,
-            self.config.load_balancing.into(),
+            self.config.load_balancing,
             iroh_endpoint,
         )
         .await

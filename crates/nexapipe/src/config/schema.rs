@@ -153,7 +153,7 @@ pub struct IrohConfig {
     /// [`Self::secret_key_file`] for the relay bearer token.
     pub relay_auth_token_file: Option<String>,
     /// Where `secret_key` was resolved from. Filled by
-    /// [`ProxyConfig::resolve_external_credentials`] during the load; not
+    /// `ProxyConfig::resolve_external_credentials` during the load; not
     /// spelled in the file, so `serde` skips it.
     #[serde(skip)]
     pub secret_key_source: CredentialSource,

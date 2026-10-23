@@ -545,7 +545,7 @@ impl ProxyConfig {
     /// device to trade the same link for the same credential.
     ///
     /// The entry lands where [`Self::write_device_credential`] puts one: both
-    /// writers go through [`device_table`] and [`device_entry`], so a device
+    /// writers go through `device_table` and `device_entry`, so a device
     /// that spent a token and one an operator wrote by hand are the same shape
     /// on disk.
     pub fn complete_device_enrollment(

@@ -9,11 +9,11 @@
 //!   an explicit `replace` acts as a fallback)
 //! - macOS:   ifconfig / route (utun interfaces need an explicit IP and route)
 
+#[cfg(windows)]
+use crate::win::hidden;
 use anyhow::Result;
 #[cfg(not(windows))]
 use std::process::Command;
-#[cfg(windows)]
-use crate::win::hidden;
 
 #[cfg(windows)]
 use crate::proxy::tun_proxy::{set_tun_base, tun_network, TUN_BASE_CANDIDATES, TUN_NETMASK};
