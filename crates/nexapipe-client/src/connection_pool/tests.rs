@@ -3,11 +3,12 @@
 //! They live in their own file because there are more of them than there is
 //! code to test, and because a file that is mostly tests hides the code it is
 //! testing.
+use super::borrow::{MAX_FLOWS_PER_CONNECTION, is_idle_since};
+use super::link_status::is_measured_rtt;
 use super::{
     ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
-    IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL,
-    MAX_FLOWS_PER_CONNECTION, PoolRefusal, connections_for, encode_link_status, identity_changed,
-    is_idle_since, is_measured_rtt, may_pool, may_publish,
+    IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL, PoolRefusal,
+    connections_for, encode_link_status, identity_changed, may_pool, may_publish,
 };
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 #[cfg(feature = "local-proxy")]

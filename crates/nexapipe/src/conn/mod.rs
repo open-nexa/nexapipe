@@ -29,6 +29,9 @@ pub mod peers;
 mod auth;
 mod stream;
 
+#[cfg(test)]
+mod tests;
+
 use limits::Limiters;
 
 // The two-factor half is a module of its own, and what it holds is still

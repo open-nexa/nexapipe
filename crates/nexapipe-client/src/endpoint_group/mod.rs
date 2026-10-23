@@ -4,7 +4,7 @@ use crate::connection_pool::{
     Borrow, IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT,
 };
 use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
-use crate::lb::{LoadBalancer, LoadBalancingStrategy, RandomBalancer, RoundRobinBalancer};
+use crate::lb::LoadBalancingStrategy;
 use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use std::time::Instant;
 
 #[cfg(feature = "jni")]
 use crate::jni_log;
@@ -33,6 +32,15 @@ macro_rules! jni_log {
         }
     };
 }
+
+mod domain_pools;
+mod health;
+
+// The pools of one domain and what the panel says about a node are modules
+// of their own, and what they hold is still reached through `endpoint_group`.
+pub use domain_pools::DomainPools;
+use domain_pools::record_outcome;
+pub use health::{HealthSnapshot, NodeHealth, PreconnectReport};
 
 /// A connection the group handed out, and the borrow it was handed out under.
 ///
@@ -196,220 +204,6 @@ impl PooledConnection {
     }
 }
 
-/// Folds one answer, or one failure, into the health table, logging the changes.
-///
-/// Two callers, one fact: the background probe asks every backend whether it
-/// still answers, and a request that could not be served after spending every
-/// attempt it had says the same thing
-/// about the same backend. Keeping them in one place is what stops
-/// `health_snapshot()` from having two meanings of "down".
-///
-/// Not reachable from a connection: the two callers are the probe task and the
-/// retry loop that ran out of attempts, and both already hold the group.
-fn record_outcome(
-    health: &Mutex<HashMap<EndpointId, NodeHealth>>,
-    backend_id: EndpointId,
-    answered: bool,
-) {
-    let mut health = health
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = health.entry(backend_id).or_insert(NodeHealth {
-        node: backend_id,
-        // Not "unknown": a backend that has not been probed has not answered,
-        // and the caller asking is about to be told so.
-        reachable: false,
-        consecutive_failures: 0,
-        last_ok: None,
-        last_probe: None,
-    });
-
-    let was_reachable = entry.reachable;
-    entry.last_probe = Some(Instant::now());
-
-    if answered {
-        entry.consecutive_failures = 0;
-        entry.last_ok = Some(Instant::now());
-        entry.reachable = true;
-        if !was_reachable {
-            jni_log!("[health] Node {} answers again", backend_id);
-            #[cfg(feature = "tracing")]
-            tracing::info!("backend {} answers again", backend_id);
-        }
-        return;
-    }
-
-    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-    entry.reachable = false;
-    // The first failure is news. So is every tenth one — a backend that has
-    // been down for an hour has failed a hundred times, and a log line per
-    // failure would bury everything else.
-    if was_reachable || entry.consecutive_failures % PROBE_REMINDER_EVERY == 1 {
-        jni_log!(
-            // Not "probes in a row": this counter also counts requests that got
-            // nowhere, and calling those probes would make an operator looking
-            // into one failed request go and read the probe instead.
-            "[health] Node {} did not answer ({} failures in a row)",
-            backend_id,
-            entry.consecutive_failures
-        );
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
-            "backend {} did not answer ({} failures in a row)",
-            backend_id,
-            entry.consecutive_failures
-        );
-    }
-}
-
-pub struct DomainPools {
-    pools: Vec<Arc<IrohConnectionPool>>,
-    balancer: Box<dyn LoadBalancer + Sync + Send>,
-    /// What the probe last found, shared with the group rather than copied.
-    ///
-    /// One domain's pools are a subset of the group's backends, and the probe
-    /// asks each backend once whoever serves it, so there is one table and
-    /// every domain reads it.
-    health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
-    /// Same sharing, same reason: a backend is charged by whoever served it,
-    /// so its counters live with the group and not with this domain.
-    traffic: TrafficTable,
-    /// Where the flows opened through these pools are listed. Shared with the
-    /// group for the same reason the traffic table is: one backend's flows are
-    /// one fact, and a domain is only ever a subset of the backends.
-    flows: Arc<FlowRegistry>,
-}
-
-impl DomainPools {
-    pub fn new(
-        pools: Vec<Arc<IrohConnectionPool>>,
-        strategy: LoadBalancingStrategy,
-        health: Arc<Mutex<HashMap<EndpointId, NodeHealth>>>,
-        traffic: TrafficTable,
-        flows: Arc<FlowRegistry>,
-    ) -> Self {
-        let balancer: Box<dyn LoadBalancer + Sync + Send> = match strategy {
-            LoadBalancingStrategy::RoundRobin => Box::new(RoundRobinBalancer::new()),
-            LoadBalancingStrategy::Random => Box::new(RandomBalancer::new()),
-        };
-        Self {
-            pools,
-            balancer,
-            health,
-            traffic,
-            flows,
-        }
-    }
-
-    /// Which backends may be handed out: every one the health table does not
-    /// say is down.
-    ///
-    /// A backend that has never been asked is included — "not asked" is not
-    /// "not answering", and refusing on it would leave the group unusable for
-    /// the interval before the first probe round and after every restart.
-    fn candidates(&self) -> Vec<bool> {
-        let health = self
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.pools
-            .iter()
-            .map(|pool| {
-                health
-                    .get(&pool.backend_id())
-                    .is_none_or(|node| node.reachable)
-            })
-            .collect()
-    }
-
-    /// Which pool serves the next request. Decided here, and only here, because
-    /// every caller reaches a backend through this one method.
-    ///
-    /// A domain with several backends and nothing answering refuses without
-    /// dialling: the answer is already known, and a connect timeout would only
-    /// deliver this refusal late. A domain with one is handed out anyway —
-    /// refusing the only backend there is buys nothing and turns every request
-    /// into a failure, which is the rule the server already follows for the
-    /// same case.
-    fn choose(&self) -> Result<usize, ClientError> {
-        if self.pools.is_empty() {
-            return Err(ClientError::InvalidConfig(
-                "No endpoint pools configured".to_string(),
-            ));
-        }
-
-        let candidates = self.candidates();
-        if let Some(index) = self.balancer.select(&candidates) {
-            return Ok(index);
-        }
-
-        if self.pools.len() == 1 {
-            return Ok(0);
-        }
-
-        Err(ClientError::ConnectionFailed(format!(
-            "no backend is answering: {}",
-            self.node_ids()
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
-    }
-
-    pub async fn get_connection(
-        &self,
-        protocol: Protocol,
-    ) -> Result<PooledConnection, ClientError> {
-        let index = self.choose()?;
-        let pool = &self.pools[index];
-        let backend_id = pool.backend_id();
-
-        // Said here rather than left to the caller, because this is the only
-        // place that knows which backend refused — the caller gets an error
-        // without a name in it — and because nobody else says it: the retry
-        // loops above only ever observe connections that were handed to them.
-        //
-        // A backend that cannot be dialled leaves no connection to discover
-        // later, so without this line failure to reach one would never reach
-        // the health table at all: another request would come along and spend a
-        // full connect timeout on the same backend before trying a different
-        // one, which is exactly the cost health-aware routing exists to avoid.
-        //
-        // Counting failure to connect, or to authenticate, as "down" reads as
-        // harsh, and it is the same verdict the probe reaches: `preconnect`
-        // connects and authenticates too, from the same pool, so nothing here
-        // can mark a backend down that the next probe then marks back up.
-        //
-        // Not `InvalidConfig`, which is the only way this pool reports the
-        // endpoint being gone: that is this process having let go of its own
-        // side, which every pool says at once on shutdown and which is news
-        // about nobody's backend. Calling it "down" would paint the whole node
-        // list unreachable each time a tunnel stops.
-        match pool.get_connection(protocol).await {
-            Ok(borrowed) => Ok(PooledConnection::tracked(
-                borrowed.conn,
-                index,
-                backend_id,
-                self.traffic.clone(),
-                self.flows.clone(),
-                borrowed.borrow,
-            )),
-            Err(e @ ClientError::InvalidConfig(_)) => Err(e),
-            Err(e) => {
-                record_outcome(&self.health, backend_id, false);
-                Err(e)
-            }
-        }
-    }
-
-    /// The backend node IDs this domain load-balances across (the configured
-    /// `server_node_id`s), one per pool.
-    pub fn node_ids(&self) -> Vec<EndpointId> {
-        self.pools.iter().map(|p| p.backend_id()).collect()
-    }
-}
-
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
     /// The domains that serve a name by **pattern**, keyed by the name the
@@ -531,123 +325,6 @@ const PROBE_JITTER: Duration = Duration::from_secs(5);
 /// scheduling and for assembling the report, not for more dialling.
 pub(crate) const PRECONNECT_PHASE_CAP: Duration =
     PRECONNECT_TIMEOUT.saturating_add(Duration::from_secs(2));
-
-/// A persistently dead backend is reported once, then every this-many probes.
-///
-/// A backend that has been down for an hour has failed a hundred probes. Saying
-/// so a hundred times buries everything else in the log; saying it once hides
-/// the fact that it is still down.
-const PROBE_REMINDER_EVERY: u32 = 10;
-
-/// What the last probe of one backend found.
-#[derive(Debug, Clone)]
-pub struct NodeHealth {
-    /// The backend this describes.
-    pub node: EndpointId,
-    /// Whether it answered the last time it was asked.
-    pub reachable: bool,
-    /// How many failures in a row it has had. Zero since the last success.
-    ///
-    /// Not only probes: a request that spent every attempt it had without being
-    /// served counts too, and reaches this counter from the same place.
-    pub consecutive_failures: u32,
-    /// When it last answered — `None` when it never has.
-    pub last_ok: Option<Instant>,
-    /// When it was last asked — `None` before the first probe.
-    pub last_probe: Option<Instant>,
-}
-
-impl NodeHealth {
-    /// How long ago it last answered, if it ever has.
-    ///
-    /// "It has been down for twenty minutes" is the question a UI actually asks;
-    /// a timestamp makes every caller do this subtraction and get the direction
-    /// wrong at least once.
-    pub fn down_for(&self) -> Option<Duration> {
-        self.last_ok.map(|ok| ok.elapsed())
-    }
-}
-
-/// Every backend's health at one moment, for a UI that polls.
-#[derive(Debug, Clone, Default)]
-pub struct HealthSnapshot {
-    pub nodes: Vec<NodeHealth>,
-}
-
-impl HealthSnapshot {
-    /// How many backends answered their last probe.
-    pub fn reachable(&self) -> usize {
-        self.nodes.iter().filter(|n| n.reachable).count()
-    }
-
-    /// Whether anything at all answered. False means the tunnel has nowhere to
-    /// send anything.
-    pub fn any_reachable(&self) -> bool {
-        self.reachable() > 0
-    }
-
-    /// The backends that did not answer, as a comma-separated list.
-    pub fn unreachable_ids(&self) -> String {
-        self.nodes
-            .iter()
-            .filter(|n| !n.reachable)
-            .map(|n| n.node.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-/// Which configured backends answered a reachability probe.
-///
-/// Building an `EndpointGroup` never dials anything: a well-formed but
-/// nonexistent `server_node_id` passes every setup call, and only an actual
-/// connection attempt reveals that nothing is there. This report is that
-/// attempt, per backend, so a caller can refuse to call a start "successful"
-/// when it reached no backend at all.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PreconnectReport {
-    /// Backend nodes that accepted a connection.
-    pub reachable: Vec<EndpointId>,
-    /// Backend nodes that refused, were unreachable, or timed out.
-    pub unreachable: Vec<EndpointId>,
-    /// Backend nodes that answered the QUIC handshake and then refused the
-    /// connection because this client has no 2FA credentials.
-    ///
-    /// A client without credentials cannot fail the 2FA handshake — it never
-    /// starts one — so as far as QUIC is concerned these backends are up. They
-    /// are listed here as well as in `unreachable`, so the caller can say *why*
-    /// a backend that answered is not going to serve anything.
-    pub auth_required: Vec<EndpointId>,
-}
-
-impl PreconnectReport {
-    /// How many distinct backends were probed. Zero means none was configured.
-    pub fn total(&self) -> usize {
-        self.reachable.len() + self.unreachable.len()
-    }
-
-    /// True when at least one configured backend answered.
-    pub fn any_reachable(&self) -> bool {
-        !self.reachable.is_empty()
-    }
-
-    /// True when at least one backend demanded 2FA credentials this client does
-    /// not have. Such a backend answers, then refuses to serve anything.
-    pub fn any_auth_required(&self) -> bool {
-        !self.auth_required.is_empty()
-    }
-
-    /// The unreachable backends as a comma-separated list, for error details.
-    ///
-    /// Empty when everything answered.
-    pub fn unreachable_ids(&self) -> String {
-        self.unreachable
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
 
 impl EndpointGroup {
     /// Builds a group that binds its **own** iroh endpoints, one per distinct backend.

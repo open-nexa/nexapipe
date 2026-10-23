@@ -3,6 +3,7 @@
 //! They live in their own file because there are more of them than there is
 //! code to test, and because a file that is mostly tests hides the code it is
 //! testing.
+use super::http_head::{MAX_REQUEST_HEADER, header_over_limit};
 use super::*;
 use crate::LoadBalancingStrategy;
 use iroh::Endpoint;

@@ -2,9 +2,8 @@ use iroh::endpoint::presets;
 use iroh::endpoint::{ConnectError, ConnectOptions, Connection};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, watch};
 use tokio_stream::StreamExt;
 
@@ -14,6 +13,15 @@ use tracing;
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
 use nexapipe_proto::protocol::Protocol;
+
+mod borrow;
+mod link_status;
+
+// The status of a link and the borrow of a connection are modules of their
+// own, and what they hold is still reached through `connection_pool`.
+pub use borrow::{Borrow, BorrowState, BorrowedConnection};
+use link_status::measured_rtt;
+pub use link_status::{LinkKind, LinkStatus, encode_link_status};
 use nexapipe_proto::secret::SecretString;
 use std::collections::HashMap;
 
@@ -83,20 +91,6 @@ const MAX_CONNECTIONS_PER_PROTOCOL: usize = 10;
 const CONNECTION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Idle connections older than this are evicted when a new connection is requested.
 const CONNECTION_IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
-/// How many flows may ride one connection at the same time.
-///
-/// The server counts the L4 flows on a connection and refuses the one that
-/// does not fit (`Status::TooManyFlows`), so a client that piles every flow
-/// onto one connection runs into a ceiling it cannot see. The pool keeps
-/// below that ceiling itself and opens another connection instead.
-///
-/// The server's ceiling is 256 L4 flows per connection
-/// (`DEFAULT_MAX_FLOWS_PER_CONNECTION` in `crates/nexapipe/src/l4/mod.rs`).
-/// This number counts **every** flow on the connection — HTTP and L4 alike —
-/// so it has to stay below the server's, and it stays below it with room to
-/// spare: the two counters are not the same one, and the server's lags by a
-/// flow or two while a flow is ending.
-const MAX_FLOWS_PER_CONNECTION: usize = 200;
 /// Interval of the background watcher that removes closed/stale connections from the pool.
 const CONNECTION_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 /// How often the round-trip time is re-read.
@@ -181,201 +175,6 @@ fn may_pool(protocol: Protocol, held: impl Iterator<Item = Protocol>) -> bool {
     connections_for(protocol, held) < MAX_CONNECTIONS_PER_PROTOCOL
 }
 
-/// How traffic currently reaches a backend: direct, or through a relay.
-///
-/// iroh keeps several paths open per connection and marks exactly one of them *selected* — the
-/// path application data actually takes. That, and not "a direct path exists", decides the
-/// label: a connection that has opened a UDP path but still routes over the relay is a relay
-/// connection until iroh promotes it.
-///
-/// This is the **runtime** answer on purpose. The relay URL in the configuration (or in an
-/// invite) only names a relay that *may* be used; it says nothing about whether the hole punch
-/// succeeded, so a UI must never infer the icon from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LinkKind {
-    /// The selected path is a direct UDP path to the backend.
-    Direct,
-    /// The selected path goes through a relay server.
-    Relay,
-    /// No path is known: nothing has connected yet, or the connection has no path.
-    #[default]
-    Unknown,
-}
-
-impl LinkKind {
-    /// The stable name sent across the JNI and Tauri boundaries.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Relay => "relay",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Tolerant by design: this only ever feeds an icon, so an unfamiliar spelling means
-    /// [`Self::Unknown`] rather than an error.
-    pub fn parse(text: &str) -> Self {
-        match text.trim() {
-            "direct" => Self::Direct,
-            "relay" => Self::Relay,
-            _ => Self::Unknown,
-        }
-    }
-
-    /// Reads the kind off a live connection.
-    ///
-    /// A closed connection has no path left to report, so the caller gets [`Self::Unknown`]
-    /// instead of a stale answer.
-    pub fn of(conn: &Connection) -> Self {
-        if conn.close_reason().is_some() {
-            return Self::Unknown;
-        }
-
-        let paths = conn.paths();
-        for path in paths.iter() {
-            if path.is_selected() {
-                return if path.is_ip() {
-                    Self::Direct
-                } else if path.is_relay() {
-                    Self::Relay
-                } else {
-                    Self::Unknown
-                };
-            }
-        }
-
-        // Paths are open but none is selected (the handshake is still settling). A direct path,
-        // once opened, is the one iroh will promote, so it outranks an also-open relay path.
-        let mut has_relay = false;
-        for path in paths.iter() {
-            if path.is_ip() {
-                return Self::Direct;
-            }
-            has_relay |= path.is_relay();
-        }
-        if has_relay {
-            Self::Relay
-        } else {
-            Self::Unknown
-        }
-    }
-}
-
-/// How a backend is reached right now, and how long a round trip takes.
-///
-/// The two belong together: the round trip is only meaningful for the path
-/// that is carrying the traffic, and the path can change under the reading —
-/// a direct path that opens replaces a relay one, and with it the latency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LinkStatus {
-    /// Whether traffic goes straight to the peer or through a relay.
-    pub kind: LinkKind,
-    /// The round-trip time of the path carrying the traffic.
-    ///
-    /// `None` means "not measured": a connection that has just opened has no
-    /// sample yet, a closed one has none either, and a path iroh cannot
-    /// measure — a relay that does not report — has none at all. It is not a
-    /// zero, and a UI must not draw it as one.
-    ///
-    /// The reading is also `None` while the path still carries quinn's initial
-    /// guess rather than a measurement — see `rtt_of`.
-    pub rtt: Option<std::time::Duration>,
-}
-
-impl LinkStatus {
-    /// Reads both halves off a live connection.
-    ///
-    /// A closed connection has no path left to report, so the caller gets
-    /// [`LinkStatus::default`] rather than a stale answer.
-    pub fn of(conn: &Connection) -> Self {
-        let kind = LinkKind::of(conn);
-        if kind == LinkKind::Unknown {
-            return Self::default();
-        }
-        Self {
-            kind,
-            rtt: rtt_of(conn),
-        }
-    }
-}
-
-/// The wire form of one link reading: `<endpoint id>=<kind>/<rtt in ms>`.
-///
-/// The JNI boundary carries the readings in this form and the Kotlin side reads
-/// them back: the id, the kind, and the round trip in whole milliseconds.
-/// `-` stands for a reading with no sample, so that an unmeasured path is not
-/// read as a round trip of zero milliseconds.
-///
-/// A function of its own so that the form is testable without an endpoint:
-/// the Kotlin decoder has its own tests, and the two halves of a contract
-/// that only one side tests can drift apart without anything failing.
-pub fn encode_link_status(id: &EndpointId, status: &LinkStatus) -> String {
-    let rtt = match status.rtt {
-        Some(rtt) => rtt.as_millis().to_string(),
-        None => "-".to_string(),
-    };
-    format!("{}={}/{}", id, status.kind.as_str(), rtt)
-}
-
-/// The round-trip time of the path carrying the traffic, if it can be read.
-///
-/// The selected path is the one the traffic takes, so that is the one whose
-/// latency is worth showing.
-///
-/// Two readings are not measurements, and are reported as `None` rather than
-/// as a number:
-///
-/// - **quinn's guess.** The RTT estimator of a path starts at the transport's
-///   [`INITIAL_RTT`](crate::transport::INITIAL_RTT) and holds it until the
-///   path has something to say. A path selected a moment ago — a direct path
-///   that just won hole punching, a relay path that just became the selected
-///   one — therefore reads as the guess, which is a number nobody measured.
-/// - **anything below a millisecond.** The UI draws whole milliseconds, and a
-///   reading that rounds to zero is drawn as a number nobody made.
-///
-/// The guess is recognised by its value, and quinn leaves it in more than one
-/// way. A path validation measures the round trip of its challenge and puts
-/// that in its place, which is a measurement of its own and is reported as
-/// one; a path opened for the same peer address while another validated path
-/// to that address exists starts from that path's conservative estimate rather
-/// than from the initial RTT — quinn looks for a validated path on the same
-/// network path, so a direct path and a relay path do not seed each other. A
-/// round trip that happens to land exactly on the initial RTT is reported as
-/// no measurement at all.
-fn rtt_of(conn: &Connection) -> Option<std::time::Duration> {
-    let paths = conn.paths();
-    for path in paths.iter() {
-        if path.is_selected() {
-            let rtt = conn.rtt(path.id())?;
-            return measured_rtt(rtt);
-        }
-    }
-    None
-}
-
-/// The round trip of a path, when it is a measurement rather than a guess.
-///
-/// Split out of [`rtt_of`] so that a reading can be taken off a path the
-/// caller names rather than off whichever one is selected now: the two halves
-/// of a reading describe one path, and the selection can move under the
-/// reading.
-fn measured_rtt(rtt: std::time::Duration) -> Option<std::time::Duration> {
-    is_measured_rtt(rtt).then_some(rtt)
-}
-
-/// Whether `rtt` is a measured round-trip time rather than a guess.
-///
-/// Split out from [`rtt_of`] so the rule can be tested without a live
-/// connection: reading it off a connection needs an endpoint, and the rule is
-/// the part that has to be right.
-///
-/// The rule is the value, so it is exact in one direction only: a round trip
-/// that lands exactly on the initial RTT is reported as no measurement.
-fn is_measured_rtt(rtt: std::time::Duration) -> bool {
-    rtt != crate::transport::INITIAL_RTT && rtt >= std::time::Duration::from_millis(1)
-}
-
 /// Why a connection could not be put in the pool.
 ///
 /// The two are different failures and they read differently: one is a
@@ -419,200 +218,6 @@ impl PooledConnection {
     }
 }
 
-/// What the pool and the flows on one connection share: how many flows are
-/// riding it, when it was last used, and whether the server has said the
-/// connection is full.
-///
-/// The count is shared because the pool has to be able to tell a connection
-/// nobody is using from one that a flow is still riding — and closing the
-/// second would take that flow down with it.
-///
-/// The last-use stamp is shared for the same reason: it is stamped when the
-/// **last** borrow goes, which is a moment only the borrower can see. A
-/// connection that has just carried a ten-minute flow is fresh for another
-/// minute, and a connection that is still carrying one is not idle at all.
-#[derive(Debug)]
-pub struct BorrowState {
-    /// How many flows are on the connection right now.
-    borrows: AtomicUsize,
-    /// When the connection was last used.
-    ///
-    /// Not when it was dialled: a connection that is used continuously is
-    /// handed out every few seconds, and the idle timeout is about how long
-    /// it has been sitting unused — not how old it is. A connection in
-    /// constant use is not idle, and a ten-minute-old connection that was
-    /// handed out a second ago is not either.
-    last_used: StdMutex<tokio::time::Instant>,
-    /// Whether the server has refused a flow on this connection because it
-    /// was already carrying as many as it allows.
-    ///
-    /// Set when the server answers `Status::TooManyFlows`, and **not** cleared
-    /// when the last flow on the connection ends: the server counts its own
-    /// flows, and the flow that was refused is not one of them — so a
-    /// connection the server has called full stays out of circulation, and
-    /// the next flow is given a connection of its own.
-    saturated: AtomicBool,
-}
-
-impl BorrowState {
-    fn new() -> Self {
-        Self {
-            borrows: AtomicUsize::new(0),
-            last_used: StdMutex::new(tokio::time::Instant::now()),
-            saturated: AtomicBool::new(false),
-        }
-    }
-
-    /// How many flows are on the connection right now.
-    fn borrow_count(&self) -> usize {
-        self.borrows.load(Ordering::Acquire)
-    }
-
-    /// Whether another flow may ride this connection.
-    fn has_room(&self) -> bool {
-        !self.saturated.load(Ordering::Acquire) && self.borrow_count() < MAX_FLOWS_PER_CONNECTION
-    }
-
-    /// Takes a borrow, if there is room for one.
-    ///
-    /// The check and the count are one atomic step, so two callers cannot
-    /// both see the last seat and both take it.
-    fn try_borrow(self: &Arc<Self>) -> Option<Borrow> {
-        if self.saturated.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut current = self.borrows.load(Ordering::Acquire);
-        loop {
-            if current >= MAX_FLOWS_PER_CONNECTION {
-                return None;
-            }
-            match self.borrows.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // The connection is in use again, so it is not idle
-                    // however long ago it was last used.
-                    self.touch();
-                    return Some(Borrow {
-                        state: Some(self.clone()),
-                    });
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    /// Gives a borrow back.
-    ///
-    /// The last-use stamp moves when the **last** borrow goes: a connection
-    /// that has just carried a flow is fresh for another minute, and the
-    /// moment it became idle is a moment only the last borrower sees.
-    fn release(&self) {
-        let mut current = self.borrows.load(Ordering::Acquire);
-        loop {
-            if current == 0 {
-                // A borrow is given back exactly once, so this cannot
-                // happen — and wrapping the counter would hide the bug
-                // behind a count of billions.
-                debug_assert!(false, "a borrow was given back that was never taken");
-                return;
-            }
-            match self.borrows.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if current == 1 {
-                        // The last flow on this connection ended: it is idle
-                        // from now on.
-                        self.touch();
-                    }
-                    return;
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    /// Stamps the connection as used right now.
-    fn touch(&self) {
-        let mut last_used = self
-            .last_used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *last_used = tokio::time::Instant::now();
-    }
-
-    /// When the connection was last used.
-    fn last_used(&self) -> tokio::time::Instant {
-        *self
-            .last_used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Whether the connection has been sitting unused for at least `timeout`.
-    fn is_idle_for(&self, timeout: tokio::time::Duration) -> bool {
-        is_idle_since(self.last_used(), timeout)
-    }
-
-    /// Marks the connection as carrying as many flows as the server allows.
-    fn saturate(&self) {
-        self.saturated.store(true, Ordering::Release);
-    }
-}
-
-/// One flow's borrow on a connection.
-///
-/// The borrow is given back when the guard is dropped, and `Drop` is what
-/// covers every way a flow ends: EOF, an error, a cancellation. The guard is
-/// the only thing that gives a borrow back, so a borrow cannot be forgotten
-/// on one path and given back twice on another.
-#[derive(Debug)]
-pub struct Borrow {
-    /// The state the borrow belongs to.
-    ///
-    /// `None` once the borrow has been handed on, so that a hand-over does
-    /// not give it back a second time.
-    state: Option<Arc<BorrowState>>,
-}
-
-impl Borrow {
-    /// Marks the connection as carrying as many flows as the server allows.
-    ///
-    /// The server refused a flow with `TooManyFlows`, which is a statement
-    /// about the connection rather than about the flow: the pool must stop
-    /// handing that connection out, or the next flow is refused the same way.
-    pub fn saturate(&self) {
-        if let Some(state) = &self.state {
-            state.saturate();
-        }
-    }
-}
-
-impl Drop for Borrow {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.take() {
-            state.release();
-        }
-    }
-}
-
-/// Whether a connection that was last used at `last_used` has been sitting
-/// unused for at least `timeout`.
-///
-/// Free rather than a method, so that the rule can be tested without a live
-/// connection: reading it off one needs an endpoint, and the rule is the part
-/// that has to be right.
-fn is_idle_since(last_used: tokio::time::Instant, timeout: tokio::time::Duration) -> bool {
-    last_used.elapsed() >= timeout
-}
-
 /// Drops the connections that are closed or idle, closing the idle ones.
 ///
 /// A connection that is only dropped stays open as far as QUIC is concerned:
@@ -643,24 +248,6 @@ fn drop_stale_connections(connections: &mut Vec<PooledConnection>) {
     for conn in idle {
         conn.close(0u32.into(), b"idle");
     }
-}
-
-/// A connection borrowed from the pool, and the borrow that says how many
-/// flows are on it.
-///
-/// The borrow is given back when this value is dropped, which is what makes
-/// the count true: a flow that ends in any way — EOF, an error, a
-/// cancellation — drops it.
-///
-/// The state behind the borrow is shared with the pool's own entry for the
-/// connection, so the pool can tell a connection nobody is using from one
-/// that a flow is still riding.
-pub struct BorrowedConnection {
-    /// The connection itself. A cheap clonable handle: iroh's `Connection`
-    /// may be cloned to get another handle to the same connection.
-    pub conn: Connection,
-    /// The borrow this connection is held under.
-    pub borrow: Borrow,
 }
 
 #[derive(Clone)]
