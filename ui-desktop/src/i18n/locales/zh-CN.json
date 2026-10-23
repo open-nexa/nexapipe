@@ -216,6 +216,12 @@
     "hintProduction": "生产环境建议使用服务模式"
   },
   "config": {
+    "tabs": {
+      "nodes": "节点",
+      "network": "网络",
+      "relay": "中继"
+    },
+    "tabsLabel": "配置分区",
     "noNodes": "还没有节点",
     "noNodesHint": "节点来自邀请，导入一个即可开始转发域名。",
     "nodeConfiguration": "节点配置",
@@ -253,8 +259,22 @@
     "relayAuthTokenHint": "仅当中继需要时才填写；服务端需要使用相同的令牌。令牌只属于签发它的中继：改了上面的中继，令牌就会被清除。",
     "relayAuthTokenBoundTo": "签发给 {relay}。",
     "relayTokenCleared": "中继鉴权令牌已清除：令牌只属于签发它的中继。如果这个中继需要令牌，请重新填写。",
-    "loadExample": "载入示例",
+    "restoreDefaults": "恢复默认",
+    "restoreDefaultsHint": "把三个地址和负载均衡策略恢复为全新安装时的值。",
+    "networkDefaultsRestored": "三个地址和负载均衡策略已恢复为默认值。",
     "clearConfig": "清空配置",
+    "clearConfigTitle": "清空配置？",
+    "clearConfigMessage": "所有节点、地址和中继设置都会消失，本机保存的凭据也会一并删除。此操作无法撤销。",
+    "dangerZone": "危险操作",
+    "dangerZoneHint": "清空所有节点、地址和中继设置，并删除本机保存的凭据。",
+    "expandNode": "展开该节点",
+    "collapseNode": "收起该节点",
+    "removeNode": "移除节点",
+    "removeNodeTitle": "移除 {name}？",
+    "removeNodeMessage": "节点来自邀请，无法手工重新填写。移除 {name} 会连带删除本机保存的连接字符串和两步验证凭据；要让代理再用上它，必须重新导入邀请。",
+    "removeLastNodeTitle": "移除最后一个节点？",
+    "removeLastNodeMessage": "这是唯一的节点，代理将没有任何可拨的目标，在导入新的邀请之前无法启动。移除它同样会删除本机保存的连接字符串和两步验证凭据。",
+    "nodeRemoved": "已移除 {name}。",
     "nodeFallback": "节点 {index}"
   },
   "settings": {
@@ -328,6 +348,7 @@
     "enrolled": "已作为 {client} 完成注册，并保存下发的凭证。"
   },
   "node": {
+    "connection": "连接字符串",
     "connectionHint": "节点来自邀请，因此无法在这里修改连接目标。",
     "reveal": "显示",
     "hide": "隐藏",

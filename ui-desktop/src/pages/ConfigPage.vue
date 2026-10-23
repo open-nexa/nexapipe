@@ -3,15 +3,22 @@
  * The configuration screen: the relay this machine dials, the nodes it dials, and the settings
  * both of them are reached through.
  *
+ * The page is three tabs — the nodes, the network, the relay — because the three are three
+ * things to do rather than one long list of fields. The credential door stands in front of all
+ * of them, and the tab strip stays on screen so that the door does too.
+ *
  * The page itself is the composition — the door in front of it, and the sections behind the door.
  * What belongs to the screen rather than to a section lives in [`useConfigPage`]; what belongs to
  * a section lives in that section.
  */
-import { computed, onMounted, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useConfigStore } from "../stores/config";
 import { useCredentialGate, clearRefusal } from "../stores/gate";
 import { useConfigPage } from "../composables/useConfigPage";
+import AppButton from "../components/base/AppButton.vue";
+import AppIcon from "../components/base/AppIcon.vue";
+import AppTabStrip from "../components/base/AppTabStrip.vue";
 import CredentialLock from "../components/CredentialLock.vue";
 import InviteImportDialog from "../components/InviteImportDialog.vue";
 import ConfigNodeList from "../components/ConfigNodeList.vue";
@@ -19,7 +26,7 @@ import ConfigDomainOverview from "../components/ConfigDomainOverview.vue";
 import ConfigNetwork from "../components/ConfigNetwork.vue";
 import ConfigLoadBalancing from "../components/ConfigLoadBalancing.vue";
 import ConfigRelay from "../components/ConfigRelay.vue";
-import ConfigActions from "../components/ConfigActions.vue";
+import ConfigDangerZone from "../components/ConfigDangerZone.vue";
 
 const { config } = useConfigStore();
 
@@ -41,7 +48,7 @@ const {
   dnsAddr,
   upstreamDns,
   loadBalancing,
-  loadExampleConfig,
+  restoreDefaultNetworkSettings,
   clearConfig,
   showInviteDialog,
   inviteDraft,
@@ -53,6 +60,17 @@ const {
   updateRelayAuthToken,
   commitRelayAuthToken,
 } = useConfigPage();
+
+/** The three parts of the screen. */
+type ConfigTab = "nodes" | "network" | "relay";
+
+const activeTab = ref<ConfigTab>("nodes");
+
+const tabs = computed(() => [
+  { id: "nodes", label: t("config.tabs.nodes") },
+  { id: "network", label: t("config.tabs.network") },
+  { id: "relay", label: t("config.tabs.relay") },
+]);
 
 /**
  * Re-read the door every time the page is opened.
@@ -91,82 +109,130 @@ watch(unlocked, (isUnlocked) => {
 });
 
 /**
- * The two colours a node's badge is drawn in: one for a node reached by a ticket, one for a node
- * reached by an endpoint id.
+ * A new tab starts at the top of the page.
  *
- * They are raw values, and the token guard allows those only in this file, so they are written
- * down here and handed to the section that draws the badges rather than being repeated there.
+ * The scroll container is the shell's, not this page's: the shell owns the one scroll area the
+ * app has, and this page is content inside it. The class name is the only handle on it from
+ * here, which is why this is a lookup and not a `closest()` buried in a handler.
  */
-const nodeTypeColors = { ticket: "#8b5cf6", endpoint: "#0ea5e9" } as const;
+const pageRoot = ref<HTMLElement | null>(null);
+
+watch(activeTab, () => {
+  pageRoot.value?.closest(".page-shell__body")?.scrollTo({ top: 0 });
+});
 </script>
 
 <template>
-  <div class="config-page">
-    <!-- The door comes first, because it decides whether there is a page under it. -->
-    <div class="config-lockbar">
-      <CredentialLock :reason="t('gate.reasonConfig')" />
+  <div ref="pageRoot" class="config-page">
+    <!--
+      The one row that stays on screen: the tabs are how a reader moves between three long
+      sections, and the door is how they shut them — so both belong where scrolling cannot
+      take them away.
+    -->
+    <div class="config-tabs">
+      <AppTabStrip
+        v-if="unlocked"
+        v-model="activeTab"
+        :tabs="tabs"
+        :label="t('config.tabsLabel')"
+        id-prefix="config"
+      />
+      <span class="config-tabs__lock">
+        <CredentialLock :reason="t('gate.reasonConfig')" />
+      </span>
     </div>
 
     <div v-if="!unlocked" class="config-locked">
       <span class="config-locked__icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="11" width="18" height="11" rx="2"/>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-        </svg>
+        <AppIcon name="lock" :size="26" />
       </span>
-      <h2 class="config-locked__title">{{ t('gate.lockedTitle') }}</h2>
+      <h2 class="config-locked__title">{{ t("gate.lockedTitle") }}</h2>
       <p class="config-locked__body">{{ lockedBody }}</p>
       <!-- What the last attempt came back with. Said here because the button that
            was pressed is here: a press that does nothing has to answer for itself. -->
       <p v-if="refusal" class="config-locked__error" role="alert">{{ refusal }}</p>
-      <button
+      <AppButton
         v-if="canAuthenticate"
-        type="button"
-        class="config-locked__action"
-        :disabled="pending"
+        tone="primary"
+        icon="unlock"
+        :loading="pending"
         @click="unlockPage"
       >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="11" width="18" height="11" rx="2"/>
-          <path d="M7 11V7a4 4 0 0 1 7.5-2"/>
-        </svg>
-        {{ pending ? t('gate.confirming') : t('gate.unlock') }}
-      </button>
+        {{ pending ? t("gate.confirming") : t("gate.unlock") }}
+      </AppButton>
     </div>
 
     <!-- Behind the door, so a locked page renders none of it: what is not on the
-         screen cannot be read out of it, which is the whole point. -->
+         screen cannot be read out of it, which is the whole point.
+
+         Only the tab on screen is rendered. A panel that is not on screen is not
+         in the document at all, so the credentials a node holds cannot still be
+         sitting in the other tab. -->
     <template v-if="unlocked">
-      <ConfigNodeList
-        :nodes="config.nodes"
-        :type-colors="nodeTypeColors"
-        @import-invite="openInviteDialog"
-        @reenroll="showInviteDialog = true"
-      />
+      <div
+        v-if="activeTab === 'nodes'"
+        id="config-panel-nodes"
+        class="config-panel"
+        role="tabpanel"
+        aria-labelledby="config-tab-nodes"
+      >
+        <ConfigNodeList
+          :nodes="config.nodes"
+          @import-invite="openInviteDialog"
+          @reenroll="showInviteDialog = true"
+        />
 
-      <ConfigDomainOverview :nodes="config.nodes" />
+        <ConfigDomainOverview :nodes="config.nodes" />
 
-      <ConfigNetwork
-        v-model:local-addr="localAddr"
-        v-model:dns-addr="dnsAddr"
-        v-model:upstream-dns="upstreamDns"
-      />
+        <ConfigDangerZone @clear-config="clearConfig" />
+      </div>
 
-      <ConfigLoadBalancing v-model:load-balancing="loadBalancing" />
+      <div
+        v-else-if="activeTab === 'network'"
+        id="config-panel-network"
+        class="config-panel"
+        role="tabpanel"
+        aria-labelledby="config-tab-network"
+      >
+        <ConfigNetwork
+          v-model:local-addr="localAddr"
+          v-model:dns-addr="dnsAddr"
+          v-model:upstream-dns="upstreamDns"
+        />
 
-      <ConfigRelay
-        :relay-mode="config.relayMode"
-        :relay-url="config.relayUrl"
-        :relay-auth-token="config.relayAuthToken"
-        :relay-auth-token-relay="config.relayAuthTokenRelay"
-        @update:relay-mode="updateRelayMode"
-        @update:relay-url="updateRelayUrl"
-        @commit:relay-url="commitRelayUrl"
-        @update:relay-auth-token="updateRelayAuthToken"
-        @commit:relay-auth-token="commitRelayAuthToken"
-      />
+        <ConfigLoadBalancing v-model:load-balancing="loadBalancing" />
 
-      <ConfigActions @load-example="loadExampleConfig" @clear-config="clearConfig" />
+        <div class="config-panel__footer">
+          <AppButton
+            tone="ghost"
+            icon="refresh"
+            @click="restoreDefaultNetworkSettings"
+          >
+            {{ t("config.restoreDefaults") }}
+          </AppButton>
+          <span class="config-panel__footer-hint">{{ t("config.restoreDefaultsHint") }}</span>
+        </div>
+      </div>
+
+      <div
+        v-else
+        id="config-panel-relay"
+        class="config-panel"
+        role="tabpanel"
+        aria-labelledby="config-tab-relay"
+      >
+        <ConfigRelay
+          :relay-mode="config.relayMode"
+          :relay-url="config.relayUrl"
+          :relay-auth-token="config.relayAuthToken"
+          :relay-auth-token-relay="config.relayAuthTokenRelay"
+          @update:relay-mode="updateRelayMode"
+          @update:relay-url="updateRelayUrl"
+          @commit:relay-url="commitRelayUrl"
+          @update:relay-auth-token="updateRelayAuthToken"
+          @commit:relay-auth-token="commitRelayAuthToken"
+        />
+      </div>
     </template>
 
     <InviteImportDialog
@@ -182,30 +248,47 @@ const nodeTypeColors = { ticket: "#8b5cf6", endpoint: "#0ea5e9" } as const;
 .config-page {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  height: 100%;
-  overflow-y: auto;
-  padding-right: 4px;
+  gap: var(--space-4);
 }
 
-.config-page::-webkit-scrollbar {
-  width: 4px;
-}
-
-.config-page::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.config-page::-webkit-scrollbar-thumb {
-  background: var(--border-color);
-  border-radius: 2px;
-}
-
-/* The door, as the page's first row: right-aligned, because it is a state and an action rather
-   than a section of its own. */
-.config-lockbar {
+/*
+ * The row that stays on screen.
+ *
+ * It is pinned to the top of the shell's scroll area rather than to the top of the window, so
+ * it sits where the page begins and stays there while the section below it is read.
+ */
+.config-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  background: var(--bg-app);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.config-tabs__lock {
+  margin-left: auto;
+}
+
+.config-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.config-panel__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.config-panel__footer-hint {
+  font-size: var(--font-size-12);
+  color: var(--text-muted);
 }
 
 /* What a shut page is. The sections are not rendered at all while it shows, so there is nothing
@@ -214,12 +297,11 @@ const nodeTypeColors = { ticket: "#8b5cf6", endpoint: "#0ea5e9" } as const;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  padding: 48px 24px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-light);
+  gap: var(--space-2);
+  padding: var(--space-12) var(--space-6);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-card);
   text-align: center;
 }
 
@@ -227,72 +309,35 @@ const nodeTypeColors = { ticket: "#8b5cf6", endpoint: "#0ea5e9" } as const;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 56px;
-  height: 56px;
+  width: 48px;
+  height: 48px;
+  margin-bottom: var(--space-1);
   border-radius: var(--radius-lg);
-  background: var(--surface-2);
+  background: var(--bg-inset);
   color: var(--text-muted);
 }
 
-.config-locked__icon svg {
-  width: 26px;
-  height: 26px;
-}
-
 .config-locked__title {
-  margin: 4px 0 0;
-  font-size: 16px;
-  font-weight: 600;
+  margin: 0;
+  font-size: var(--font-size-16);
+  font-weight: var(--font-weight-semibold);
   color: var(--text-primary);
 }
 
 .config-locked__body {
   margin: 0;
   max-width: 420px;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: var(--font-size-12);
+  line-height: var(--line-height-normal);
   color: var(--text-muted);
 }
 
 .config-locked__error {
-  margin: 0;
-  padding: 6px 12px;
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
-  background: var(--error-50);
-  color: var(--error-600);
-  font-size: 12px;
-}
-
-.config-locked__action {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 4px;
-  padding: 10px 18px;
-  border: 1px solid var(--primary-400);
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--primary-600);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all var(--transition-normal);
-}
-
-.config-locked__action:hover {
-  background: var(--primary-50);
-}
-
-.config-locked__action svg {
-  width: 16px;
-  height: 16px;
-}
-
-/* The connection string is shown in a monospace face, so that a ticket and an endpoint id read
-   as what they are. The stack is a raw value, and the token guard allows a raw font stack only
-   in this file, so the rule that carries it lives here and reaches the card through the page's
-   scope. */
-:deep(.connection-value) {
-  font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+  background: var(--error-subtle);
+  color: var(--error-text);
+  font-size: var(--font-size-12);
 }
 </style>

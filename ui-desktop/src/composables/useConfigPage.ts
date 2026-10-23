@@ -16,6 +16,7 @@ import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type { LoadBalancingStrategy, RelayMode } from "../types";
 import { useConfigStore } from "../stores/config";
+import { defaultConfig } from "../stores/config/schema";
 import { useCredentialGate } from "../stores/gate";
 import { useToast } from "./useToast";
 import { errorDetail, errorKey } from "../api/errors";
@@ -66,11 +67,24 @@ export function useConfigPage() {
 
   watch([localAddr, dnsAddr, upstreamDns, loadBalancing], handleUpdate);
 
-  function loadExampleConfig(): void {
-    localAddr.value = "127.0.0.1:8080";
-    dnsAddr.value = "198.18.0.254:53";
-    upstreamDns.value = "223.5.5.5:53";
-    loadBalancing.value = "round_robin";
+  /**
+   * Puts the network settings back to what a fresh installation has.
+   *
+   * These are the defaults the configuration starts from, so the button is a way back to them
+   * rather than a set of example values to copy from — which is why it used to be called
+   * "load an example" and why pressing it did nothing on a machine whose settings were
+   * already the defaults. The toast says what happened either way: a press that changes
+   * nothing still has to answer for itself.
+   *
+   * The DNS strategy is left alone. It says what happens to the machine's own name
+   * resolution, and a button labelled "defaults" should not quietly change that.
+   */
+  function restoreDefaultNetworkSettings(): void {
+    localAddr.value = defaultConfig.localAddr;
+    dnsAddr.value = defaultConfig.dnsAddr;
+    upstreamDns.value = defaultConfig.upstreamDns;
+    loadBalancing.value = defaultConfig.loadBalancing;
+    toast.success(t('config.networkDefaultsRestored'));
   }
 
   function clearConfig(): void {
@@ -144,7 +158,7 @@ export function useConfigPage() {
     dnsAddr,
     upstreamDns,
     loadBalancing,
-    loadExampleConfig,
+    restoreDefaultNetworkSettings,
     clearConfig,
     showInviteDialog,
     inviteDraft,

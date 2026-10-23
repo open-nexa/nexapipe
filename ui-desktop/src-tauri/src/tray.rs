@@ -52,10 +52,16 @@ const QUIT_ITEM_ID: &str = "nexa-tray-quit";
 ///
 /// `include_bytes!` rather than a path: the installed app's icons live inside a
 /// bundle whose layout is not the source tree's, and a tray icon that cannot be
-/// found is a tray icon that is not there. It is also the transparent swirl
-/// rather than the app icon, which has an opaque background and would show as
-/// a filled square in a menu bar.
-const ICON: &[u8] = include_bytes!("../icons/Square44x44Logo.png");
+/// found is a tray icon that is not there.
+///
+/// It is the app's own mark on a transparent ground. It used to be
+/// `Square44x44Logo.png`, which is part of Tauri's Windows Store logo set —
+/// so the app's always-on icon in the notification area was the Tauri swirl
+/// rather than this project's. The app icon the bundle carries is painted on
+/// an opaque square, which reads as a filled tile among the flat glyphs of a
+/// panel, so the mark is separated from its background instead:
+/// `scripts/gen-tray-icon.mjs` builds this one from the master art.
+const ICON: &[u8] = include_bytes!("../icons/tray.png");
 
 /// The tooltip shown when the pointer rests on the icon.
 ///
