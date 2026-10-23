@@ -15,6 +15,26 @@
 pub const SERVICE_NAME: &str = "nexa-service";
 pub const SERVICE_DISPLAY_NAME: &str = "Nexa Service";
 
+/// Where the daemon's own copy of the service binary lives.
+///
+/// Root's, and not writable by anybody else, and outside the app's own directory: the
+/// service runs as root, so a program a local account can replace is a program that
+/// account owns — and an app that is replaced under the service manager must not take the
+/// program out from under the running service.
+#[cfg(target_os = "macos")]
+pub const SERVICE_COPY_PATH: &str = "/Library/Application Support/Nexa/nexa-service";
+
+/// See the macOS note above. `/usr/libexec` is the FHS's place for the support binaries a
+/// system service runs, and it is root's on every distribution that has it.
+#[cfg(target_os = "linux")]
+pub const SERVICE_COPY_PATH: &str = "/usr/libexec/nexa-service";
+
+/// Where the daemon's program lives: the install's own copy of the service binary.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub fn service_binary_path() -> PathBuf {
+    PathBuf::from(SERVICE_COPY_PATH)
+}
+
 pub mod account;
 pub mod install_owner;
 pub mod install_version;
@@ -63,7 +83,9 @@ use crate::error::codes;
 // the one that reads it back, and it is the same child on all of them.
 use crate::service::elevate;
 #[cfg(any(windows, test))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+use std::path::PathBuf;
 
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
@@ -291,7 +313,7 @@ pub(crate) fn pick_service_binary(
 mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod service_copy;
 #[cfg(windows)]
 mod windows;
@@ -506,14 +528,15 @@ fn dispatch_stop() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        installing_account_from_args, linux_activation_args, linux_service_exec_with,
+        installing_account_from_args, linux_activation_args, linux_service_exec,
         linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
         per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-        service_binary_path, service_source_with, system_service_binary, system_service_dir,
-        ScState, SERVICE_BINARY_DIR, SERVICE_BINARY_NAME, SERVICE_NAME,
+        service_binary_path, system_service_binary, system_service_dir, ScState,
+        SERVICE_BINARY_NAME, SERVICE_NAME,
     };
     use crate::service::elevate;
     use crate::service::platform::account::AccountId;
+    use crate::service::platform::service_copy;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -538,12 +561,11 @@ mod tests {
         );
     }
 
-    /// The same, for the development build that hosts the service itself instead of a
-    /// dedicated binary beside it: the argument after the path has to survive the quoting
-    /// too, or it becomes part of the path.
+    /// The argument after the path has to survive the quoting too, or it becomes part of
+    /// the path — and the unit then fails with `status=203/EXEC`.
     #[test]
     fn the_systemd_exec_keeps_its_argument_outside_the_quotes() {
-        let exec = linux_service_exec_with("/home/me/My Apps/nexa", false);
+        let exec = linux_service_exec("/home/me/My Apps/nexa");
 
         assert_eq!(exec, "\"/home/me/My Apps/nexa\" --foreground");
     }
@@ -553,11 +575,69 @@ mod tests {
     /// backslash escapes the character after it.
     #[test]
     fn the_quoting_escapes_what_systemd_would_otherwise_take() {
-        // The packaged install points at the service binary beside the desktop
-        // executable, so the file name is replaced before the quoting.
-        let exec = linux_service_exec_with("/home/me/My \"Apps\"/nexa", true);
+        let exec = linux_service_exec("/home/me/My \"Apps\"/nexa-service");
 
-        assert_eq!(exec, "\"/home/me/My \\\"Apps\\\"/nexa-service\"");
+        assert_eq!(
+            exec,
+            "\"/home/me/My \\\"Apps\\\"/nexa-service\" --foreground"
+        );
+    }
+
+    /// The unit runs the install's own copy of the service binary, not the app's.
+    ///
+    /// The unit runs as root, and the app's own binary lives where the local accounts can
+    /// replace it — so a unit that pointed at it would be running, as root, a program
+    /// another account owns. The copy lives in a root-owned directory instead.
+    #[test]
+    fn the_unit_runs_the_copied_binary() {
+        let program = service_binary_path();
+        let unit = linux_unit_content(&program.to_string_lossy());
+
+        assert!(
+            unit.contains(&format!(
+                "ExecStart=\"{}\" --foreground",
+                program.to_string_lossy()
+            )),
+            "the unit does not run the copy: {unit}"
+        );
+        assert!(
+            !unit.contains("/home/") && !unit.contains("/Applications/"),
+            "the unit still runs a binary out of the app's own directory: {unit}"
+        );
+    }
+
+    /// The copy lives in a root-owned directory, and not in the app's own: an app that is
+    /// replaced under the service manager must not take the program out from under the
+    /// running service.
+    #[test]
+    fn the_copy_lives_in_a_system_directory() {
+        let program = service_binary_path();
+
+        assert!(
+            program.starts_with("/usr/") || program.starts_with("/Library/"),
+            "the copy is not in a system directory: {program:?}"
+        );
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            program,
+            Path::new("/Library/Application Support/Nexa/nexa-service")
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(program, Path::new("/usr/libexec/nexa-service"));
+    }
+
+    /// The dedicated service binary beside the desktop executable is what gets copied; a
+    /// development build has none, and the desktop binary is the source then.
+    #[test]
+    fn the_source_is_the_service_binary_beside_the_app() {
+        let app = Path::new("/usr/bin/nexa");
+
+        assert_eq!(
+            service_copy::service_source_with(app, |_| true),
+            Path::new("/usr/bin/nexa-service")
+        );
+        assert_eq!(service_copy::service_source_with(app, |_| false), app);
     }
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
@@ -611,24 +691,9 @@ mod tests {
         let program = service_binary_path();
 
         assert!(
-            program.starts_with("/Library/"),
-            "the copy is not in a system directory: {program:?}"
+            !program.starts_with("/Applications/") && !program.starts_with("/home/"),
+            "the copy is inside the app's own directory: {program:?}"
         );
-        assert_eq!(program.parent(), Some(Path::new(SERVICE_BINARY_DIR)));
-    }
-
-    /// The dedicated service binary beside the desktop executable is what gets copied;
-    /// a development build has none, and the desktop binary understands `--foreground`
-    /// as well.
-    #[test]
-    fn the_source_is_the_service_binary_beside_the_app() {
-        let app = Path::new("/Applications/nexa.app/Contents/MacOS/nexa");
-
-        assert_eq!(
-            service_source_with(app, |_| true),
-            Path::new("/Applications/nexa.app/Contents/MacOS/nexa-service")
-        );
-        assert_eq!(service_source_with(app, |_| false), app);
     }
 
     /// An install that only overwrote the plist installed nothing: launchd keeps running the

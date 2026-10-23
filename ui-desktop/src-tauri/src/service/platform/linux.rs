@@ -4,6 +4,44 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::service::platform::account::AccountId;
+#[cfg(target_os = "linux")]
+use crate::service::platform::service_copy;
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+/// Puts the unit's own copy of the service binary in place, and returns where it is.
+///
+/// The copy is what the unit runs: the app's own binary sits in a directory the local
+/// accounts own, and the unit runs as root, so a program they can replace is a program
+/// they own. See [`service_copy`].
+#[cfg(target_os = "linux")]
+fn install_service_binary(source: &Path) -> Result<PathBuf, AppError> {
+    let destination = service_binary_path();
+
+    // The install was started from the copy itself — which is what happens when the
+    // service binary is asked to install the service. There is nothing to copy then.
+    if source == destination {
+        return Ok(destination);
+    }
+
+    service_copy::copy_verified(source, &destination)?;
+    tracing::info!(
+        "The service runs {} (copied from {})",
+        destination.display(),
+        source.display()
+    );
+
+    Ok(destination)
+}
+
+/// Removes the unit's own copy of the service binary.
+///
+/// A service that is no longer installed has no binary to run, and a copy left behind is
+/// one nothing will ever replace.
+#[cfg(target_os = "linux")]
+fn remove_service_binary() {
+    let _ = std::fs::remove_file(service_binary_path());
+}
 
 #[cfg(target_os = "linux")]
 pub fn install_service_linux(
@@ -15,7 +53,13 @@ pub fn install_service_linux(
     use std::path::Path;
     use std::process::Command;
 
-    let unit_content = linux_unit_content(exe_path);
+    // The program the unit runs: the install's own copy of the service binary, in a
+    // root-owned directory. The app's own binary is not it — that one lives where the
+    // local accounts can replace it, and the unit runs it as root.
+    let source = service_copy::service_source(Path::new(exe_path));
+    let program = install_service_binary(&source)?;
+
+    let unit_content = linux_unit_content(&program.to_string_lossy());
 
     let unit_path = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
 
@@ -94,9 +138,9 @@ pub fn linux_activation_args() -> [&'static str; 2] {
 
 /// The command systemd should run in the foreground.
 ///
-/// A packaged install has a dedicated nexa-service binary beside the desktop executable. A
-/// development build may not, in which case the desktop binary understands --foreground and
-/// can host the same service without daemonizing.
+/// The program is the install's own copy of the service binary — see
+/// [`service_binary_path`]. The dedicated service binary runs the service when it is told
+/// to, and so does the desktop binary, which is what a development build copies instead.
 ///
 /// The path is quoted, because systemd splits the line on whitespace and an install under a
 /// directory with a space in it — a development build, or a home directory that has one — would
@@ -105,22 +149,8 @@ pub fn linux_activation_args() -> [&'static str; 2] {
 /// path correctly; this is the third spelling of the same thing, and it was the one that did
 /// not.
 #[cfg(any(target_os = "linux", test))]
-pub fn linux_service_exec(exe_path: &str) -> String {
-    let service = std::path::Path::new(exe_path).with_file_name("nexa-service");
-    linux_service_exec_with(exe_path, service.is_file())
-}
-
-#[cfg(any(target_os = "linux", test))]
-pub fn linux_service_exec_with(exe_path: &str, has_service_binary: bool) -> String {
-    if has_service_binary {
-        systemd_quote(
-            &std::path::Path::new(exe_path)
-                .with_file_name("nexa-service")
-                .to_string_lossy(),
-        )
-    } else {
-        format!("{} --foreground", systemd_quote(exe_path))
-    }
+pub fn linux_service_exec(program: &str) -> String {
+    format!("{} --foreground", systemd_quote(program))
 }
 
 /// A path as systemd's `ExecStart=` line wants it.
@@ -140,7 +170,7 @@ fn systemd_quote(path: &str) -> String {
 }
 
 #[cfg(any(target_os = "linux", test))]
-pub fn linux_unit_content(exe_path: &str) -> String {
+pub fn linux_unit_content(program: &str) -> String {
     format!(
         r#"[Unit]
 Description={}
@@ -157,7 +187,7 @@ User=root
 WantedBy=multi-user.target
 "#,
         SERVICE_DISPLAY_NAME,
-        linux_service_exec(exe_path)
+        linux_service_exec(program)
     )
 }
 
@@ -182,6 +212,11 @@ pub fn uninstall_service_linux() -> Result<(), AppError> {
 
     let unit_path = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
     let _ = fs::remove_file(unit_path);
+
+    // The unit's own copy of the service binary goes with it: a service that is no
+    // longer installed has no binary to run, and a copy left behind is one nothing
+    // will ever replace.
+    remove_service_binary();
 
     // The record of which account the service served goes with it: a service
     // that is no longer installed has no account to serve.

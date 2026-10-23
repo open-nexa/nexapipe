@@ -1108,14 +1108,17 @@ lookup, which is what a config written before the key existed does.
   there; and the Connect page says what is actually wrong rather than "install
   the service first" about a service that is installed.
 
-- **On macOS the daemon ran a program out of the app bundle, and an install
-  over a running service could leave the machine with none at all.**
+- **The daemon ran a program out of the app's own directory, and on macOS an
+  install over a running service could leave the machine with none at all.**
   The job pointed at the desktop app's own binary, in a directory the local
-  accounts own — and launchd will not run a privileged service out of a
-  program they can replace. The install now copies the service binary into a
-  root-owned directory, checks that the copy is the file it was asked to copy,
-  and points the job at that: the app can be replaced under the service manager
-  without taking the program out from under the running service.
+  accounts own — and a privileged service must not run a program they can
+  replace: launchd refuses to spawn one outright, so an install could fail
+  with "Bootstrap failed" and leave the machine with no service at all. The
+  install now copies the service binary into a root-owned directory
+  (`/Library/Application Support/Nexa` on macOS, `/usr/libexec` on Linux),
+  checks that the copy is the file it was asked to copy, and points the job at
+  that: the app can be replaced under the service manager without taking the
+  program out from under the running service.
 
   The install also waits for launchd to *release* the old job rather than for
   its process to be gone. A bootstrap issued in the window between the two is

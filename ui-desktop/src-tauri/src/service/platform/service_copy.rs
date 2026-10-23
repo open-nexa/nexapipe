@@ -15,7 +15,7 @@
 use crate::error::{codes, AppError};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether two files hold the same bytes.
 ///
@@ -54,6 +54,27 @@ fn digest(path: &Path) -> Result<[u8; 32], AppError> {
     }
 
     Ok(hasher.finalize().into())
+}
+
+/// The binary the install copies: the dedicated service binary beside the desktop
+/// executable, or the desktop executable itself when there is none.
+///
+/// A development build has no bundle and no `nexa-service` beside it, and the desktop
+/// binary understands `--foreground` as well — so either way the copy is something the
+/// service manager can run.
+pub fn service_source(exe: &Path) -> PathBuf {
+    service_source_with(exe, |path| path.is_file())
+}
+
+/// [`service_source`] over an explicit test for the candidate, so that the rule can be
+/// checked without a file on disk.
+pub fn service_source_with(exe: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let candidate = exe.with_file_name("nexa-service");
+    if exists(&candidate) {
+        candidate
+    } else {
+        exe.to_path_buf()
+    }
 }
 
 /// Copies a binary to where the service manager runs it from, and checks that the copy

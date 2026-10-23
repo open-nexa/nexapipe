@@ -8,47 +8,6 @@ use crate::service::platform::account::AccountId;
 use crate::service::platform::service_copy;
 use std::path::{Path, PathBuf};
 
-/// The directory the daemon's own copy of the service binary lives in.
-///
-/// Root's, and not writable by anybody else, and outside the app bundle: the service
-/// runs as root, so a program another account can replace is a program another account
-/// owns — and an app that is replaced under the service manager must not take the
-/// program out from under the running service.
-#[cfg(any(target_os = "macos", test))]
-pub const SERVICE_BINARY_DIR: &str = "/Library/Application Support/Nexa";
-
-/// The file name of the copy inside [`SERVICE_BINARY_DIR`].
-#[cfg(any(target_os = "macos", test))]
-pub const SERVICE_COPY_NAME: &str = "nexa-service";
-
-/// Where the daemon's program lives: the install's own copy of the service binary.
-#[cfg(any(target_os = "macos", test))]
-pub fn service_binary_path() -> PathBuf {
-    Path::new(SERVICE_BINARY_DIR).join(SERVICE_COPY_NAME)
-}
-
-/// The binary the install copies: the dedicated service binary beside the desktop
-/// executable, or the desktop executable itself when there is none.
-///
-/// A development build has no bundle and no `nexa-service` beside it, and the desktop
-/// binary understands `--foreground` as well.
-#[cfg(target_os = "macos")]
-pub fn service_source(exe: &Path) -> PathBuf {
-    service_source_with(exe, |path| path.is_file())
-}
-
-/// [`service_source`] over an explicit test for the candidate, so that the rule can be
-/// checked without a file on disk.
-#[cfg(any(target_os = "macos", test))]
-pub fn service_source_with(exe: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
-    let candidate = exe.with_file_name(SERVICE_COPY_NAME);
-    if exists(&candidate) {
-        candidate
-    } else {
-        exe.to_path_buf()
-    }
-}
-
 /// Whether the job is still registered with launchd.
 ///
 /// Not the same question as "is it running": after a bootout the process is gone long
@@ -108,14 +67,22 @@ fn install_service_binary(source: &Path) -> Result<PathBuf, AppError> {
 
     // The directory is root's, and not writable by anybody else: it holds the program a
     // privileged service runs, so an account that can write it can replace it.
-    let directory = Path::new(SERVICE_BINARY_DIR);
-    std::fs::create_dir_all(directory).map_err(|e| {
+    let directory = service_binary_path()
+        .parent()
+        .ok_or_else(|| {
+            AppError::with_detail(
+                codes::SERVICE_DEFINITION_FAILED,
+                format!("{} has no parent directory", destination.display()),
+            )
+        })?
+        .to_path_buf();
+    std::fs::create_dir_all(&directory).map_err(|e| {
         AppError::cause(
             codes::SERVICE_DEFINITION_FAILED,
             format!("cannot create {}: {e}", directory.display()),
         )
     })?;
-    service_copy::set_mode(directory, 0o755)?;
+    service_copy::set_mode(&directory, 0o755)?;
 
     service_copy::copy_verified(source, &destination)?;
     tracing::info!(
@@ -134,7 +101,9 @@ fn install_service_binary(source: &Path) -> Result<PathBuf, AppError> {
 #[cfg(target_os = "macos")]
 fn remove_service_binary() {
     let _ = std::fs::remove_file(service_binary_path());
-    let _ = std::fs::remove_dir(Path::new(SERVICE_BINARY_DIR));
+    if let Some(directory) = service_binary_path().parent() {
+        let _ = std::fs::remove_dir(directory);
+    }
 }
 
 /// The launchd job definition.
@@ -233,7 +202,7 @@ pub fn install_service_macos(
     // directory only root can write. The app's own binary is not it — that one lives
     // where the local accounts can replace it, and launchd will not run a privileged
     // service out of a directory they own.
-    let source = service_source(Path::new(exe_path));
+    let source = service_copy::service_source(Path::new(exe_path));
     let program = install_service_binary(&source)?;
 
     let plist_path =
