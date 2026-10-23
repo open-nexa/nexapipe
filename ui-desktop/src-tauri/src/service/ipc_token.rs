@@ -92,6 +92,21 @@ pub fn token_path() -> PathBuf {
     base.join(TOKEN_DIR).join(TOKEN_FILE)
 }
 
+/// A file in the app's per-user runtime directory, beside the token.
+///
+/// The single-instance guard's files live here too: the token is what the
+/// elevated service reads, and the guard is what keeps a second copy of the
+/// app from starting. Both are per-user state, and one directory keeps them
+/// together — and keeps them apart from each other, because they are
+/// different files that never touch the same bytes.
+pub fn runtime_file(name: &str) -> PathBuf {
+    let token = token_path();
+    match token.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 /// The token this desktop session uses, generating one if there is none yet.
 ///
 /// Called by the UI before its first IPC request. An existing file is reused so

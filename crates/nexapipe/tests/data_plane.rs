@@ -32,10 +32,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// The ALPN the proxy endpoint is built with; iroh refuses a connection whose
 /// ALPN does not match, so the test client has to ask for the same one.
-const ALPN: &[u8] = b"nexapipe";
+///
+/// The name lives in the crate the proxy links too: the two ends have to
+/// agree on it, and a name written down twice is a name that eventually
+/// differs.
+const ALPN: &[u8] = nexapipe_proto::ALPN_NEXAPIPE;
 
 /// The ALPN clients built before the prefix byte was dropped use.
-const ALPN_LEGACY: &[u8] = b"\x05nexapipe";
+const ALPN_LEGACY: &[u8] = nexapipe_proto::ALPN_NEXAPIPE_LEGACY;
 
 /// Ceiling for one reply. Far above anything these backends return, and it
 /// stops a test from waiting on a stream that never ends.
@@ -615,18 +619,12 @@ async fn spawn_proxy_with_auth(routes: Vec<Route>, auth: conn::AuthState) -> Pro
 
 /// The ALPNs the server accepts, in the order the binary lists them.
 ///
-/// The per-protocol names come first, because QUIC picks the first of the
+/// The list is written down once, in the crate the binary links too: the
+/// per-protocol names come first, because QUIC picks the first of the
 /// **accept side's** entries that the peer also offers — so the server's
 /// order is the preference order, and the client's offer order is not.
 fn server_alpns() -> Vec<Vec<u8>> {
-    use nexapipe_proto::protocol::Protocol;
-    vec![
-        Protocol::Http.alpn().to_vec(),
-        Protocol::L4.alpn().to_vec(),
-        Protocol::Tls.alpn().to_vec(),
-        ALPN.to_vec(),
-        ALPN_LEGACY.to_vec(),
-    ]
+    nexapipe_proto::protocol::accepted_alpns()
 }
 
 /// The proxy the binary runs: the connection is handed to `handle_connection`,

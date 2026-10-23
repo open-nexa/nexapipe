@@ -1,11 +1,172 @@
 use super::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth, TwoFactorConfig,
-    device_id_is_usable,
+    device_id_is_usable, message::read_message_bytes,
 };
 use nexapipe_proto::auth::{
-    Algorithm as ProtoAlgorithm, AuthMessage, MAX_DEVICE_ID_LEN, VERSION_BINARY,
+    Algorithm as ProtoAlgorithm, AuthMessage, Format, MAX_DEVICE_ID_LEN, VERSION_BINARY,
 };
 use nexapipe_proto::secret::SecretString;
+use tokio::io::AsyncWriteExt;
+
+/// The heap, watched.
+///
+/// The defect this fixes is a credential that survives in the heap after the
+/// message that carried it is gone, and the only way to *show* that it does
+/// not survive is to look at the memory after it is freed. The allocator is
+/// where that memory comes back from, so the allocator is where the proof is:
+/// a block on its way out that still holds the credential is a block the
+/// credential survived in.
+mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The bytes the probe is watching for.
+    ///
+    /// A string no other test uses, so a block that holds it is one this
+    /// test made.
+    pub const NEEDLE: &str = "nexapipe-heap-probe-7c1d3e";
+
+    /// Whether the probe is watching.
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the needle was seen in a block on its way out.
+    static FOUND: AtomicBool = AtomicBool::new(false);
+
+    /// The allocator that watches.
+    struct Probe;
+
+    unsafe impl GlobalAlloc for Probe {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            scan(ptr, layout.size());
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            scan(ptr, layout.size());
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static PROBE: Probe = Probe;
+
+    /// Looks for the needle in a block that is about to be freed.
+    fn scan(ptr: *mut u8, len: usize) {
+        if !WATCHING.load(Ordering::Relaxed) || len < NEEDLE.len() {
+            return;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if bytes
+            .windows(NEEDLE.len())
+            .any(|window| window == NEEDLE.as_bytes())
+        {
+            FOUND.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Runs `body` with the heap watched, and says whether the needle was
+    /// left behind in it.
+    pub fn left_behind<R>(body: impl FnOnce() -> R) -> bool {
+        WATCHING.store(true, Ordering::SeqCst);
+        FOUND.store(false, Ordering::SeqCst);
+        body();
+        WATCHING.store(false, Ordering::SeqCst);
+        FOUND.load(Ordering::SeqCst)
+    }
+}
+
+/// The credential a message hands out does not survive in the heap.
+///
+/// An `ENROLL_ISSUE` carries the secret the client is about to authenticate
+/// with — the most valuable thing this process holds. It arrives in a buffer,
+/// and the buffer used to be a plain `Vec<u8>`: the bytes of the secret were
+/// in it until it was dropped, and dropping it left them in the heap for the
+/// allocator to hand out again. A core dump, a swap file or a read of
+/// `/proc/<pid>/mem` finds them there long after the handshake that needed
+/// them.
+///
+/// This is the proof that they do not survive: the heap is watched while the
+/// buffer the message was read into is dropped, and a block on its way out
+/// that still holds the secret fails the test.
+///
+/// The secret travels over a `tokio::io::duplex` pipe rather than a real
+/// connection on purpose: a QUIC connection would carry the secret through
+/// the transport's own buffers, and those would be found by the probe for
+/// reasons that have nothing to do with this code.
+#[tokio::test]
+async fn a_received_credential_does_not_survive_in_the_heap() {
+    let needle = heap::NEEDLE;
+    let issued = AuthMessage::EnrollIssue {
+        client_id: "client-001".to_string(),
+        secret: SecretString::new(needle.to_string()),
+        algorithm: ProtoAlgorithm::Sha1,
+        digits: 6,
+        period: 30,
+        device_id: None,
+    };
+    let payload = issued
+        .to_payload(Format::Binary)
+        .expect("the message serializes");
+
+    // The peer writes the message, and the client reads it.
+    let (mut peer, mut reader) = tokio::io::duplex(4096);
+    peer.write_all(&(payload.len() as u32).to_le_bytes())
+        .await
+        .expect("the length is written");
+    peer.write_all(&payload)
+        .await
+        .expect("the message is written");
+
+    let bytes = read_message_bytes(&mut reader)
+        .await
+        .expect("the message is read");
+
+    // The parsed message holds a copy of its own: the secret is a
+    // `SecretString` built out of the bytes, so the copy in the buffer is the
+    // redundant one — which is the one that has to be wiped.
+    let (parsed, _) = AuthMessage::from_payload(&bytes[..]).expect("the message parses");
+    match &parsed {
+        AuthMessage::EnrollIssue { secret, .. } => assert_eq!(
+            secret.expose_secret(),
+            needle,
+            "the parsed message holds the credential"
+        ),
+        other => panic!("expected ENROLL_ISSUE, got {other:?}"),
+    }
+
+    // The buffer the credential was read into goes out of scope with the heap
+    // watched.
+    assert!(
+        !heap::left_behind(|| drop(bytes)),
+        "the credential survived in the heap"
+    );
+
+    // And the probe is not vacuous: a buffer that is *not* wiped leaves the
+    // credential behind, and the probe sees it.
+    assert!(
+        heap::left_behind(|| {
+            let mut plain = vec![0u8; needle.len()];
+            plain.copy_from_slice(needle.as_bytes());
+            std::hint::black_box(&plain);
+            drop(plain);
+        }),
+        "the probe does not see a credential that was not wiped"
+    );
+
+    // The copies that are meant to outlive the watched window: the parsed
+    // message, and the pipe that carried the bytes.
+    drop(parsed);
+    drop(peer);
+    drop(reader);
+}
 
 /// An algorithm nobody supports is refused, and the refusal says what was
 /// wrong.
@@ -151,7 +312,7 @@ fn enrollment_messages_keep_their_wire_names() {
         device_id: None,
         public_key: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
 
     let issue = AuthMessage::EnrollIssue {
@@ -162,13 +323,13 @@ fn enrollment_messages_keep_their_wire_names() {
         period: 30,
         device_id: None,
     };
-    let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(issue.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_ISSUE""#), "{json}");
 
     let failed = AuthMessage::EnrollFailed {
         reason: "no".to_string(),
     };
-    let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(failed.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
 }
 
@@ -186,7 +347,7 @@ fn an_enrollment_without_a_key_still_parses_on_the_wire() {
         other => panic!("expected ENROLL_START, got {other:?}"),
     }
     assert_eq!(
-        start.to_bytes().unwrap(),
+        *start.to_bytes().unwrap(),
         wire.to_vec(),
         "no public_key goes out as no public_key"
     );
@@ -205,7 +366,7 @@ fn an_enrollment_offering_a_key_round_trips_byte_exactly() {
         ),
         other => panic!("expected ENROLL_START, got {other:?}"),
     }
-    assert_eq!(start.to_bytes().unwrap(), wire.to_vec());
+    assert_eq!(*start.to_bytes().unwrap(), wire.to_vec());
 }
 
 /// The offer is made of the public half, lowercase hex — the spelling the
@@ -234,7 +395,7 @@ fn an_enrollment_can_offer_a_key_beside_its_device_name() {
             .as_ref()
             .map(|key| hex::encode(key.public().as_bytes())),
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(
         json.contains(&format!(r#""public_key":"{public_key}""#)),
         "{json}"
@@ -351,7 +512,7 @@ fn a_named_device_speaks_on_both_messages() {
         device_id: auth.device_id().map(str::to_string),
         version: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
 
     let response = AuthMessage::Response {
@@ -361,7 +522,7 @@ fn a_named_device_speaks_on_both_messages() {
         signature: vec![0u8; 32],
         device_id: auth.device_id().map(str::to_string),
     };
-    let json = String::from_utf8(response.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(response.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
 }
 
@@ -380,7 +541,7 @@ fn an_unnamed_device_leaves_the_field_off_the_wire() {
         device_id: auth.device_id().map(str::to_string),
         version: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(!json.contains("device_id"), "{json}");
 }
 
@@ -487,7 +648,7 @@ fn the_first_message_announces_the_version_the_client_speaks() {
         Some(VERSION_BINARY),
         "the client says which version it speaks"
     );
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""version":1"#), "{json}");
 }
 
