@@ -21,10 +21,15 @@ services:
       # `cp config.toml.example config/config.toml`
       # (`config.toml` is gitignored: it is the operator's live config), or
       # `mv config.toml config/config.toml` for a deployment that already has
-      # one. Start from `config.toml.2fa.example` instead for 2FA — its file mode
-      # is no longer checked, so a `0644` config starts. A missing directory
-      # makes Docker create an empty one and the server then fails to read the
-      # file.
+      # one. `config.toml.example` ships with 2FA on and no client enrolled, so
+      # the server starts and then refuses every connection until one is
+      # enrolled: `docker compose exec nexapipe /usr/local/bin/nexapipe
+      # --config /app/config/config.toml --generate-invite client-001
+      # --create-client` enrolls the first one and prints the invite.
+      # `config.toml.2fa.example` is the same file with a client that is
+      # enrolled already. Its file mode is no longer checked, so a `0644`
+      # config starts. A missing directory makes Docker create an empty one and
+      # the server then fails to read the file.
       #
       # Mounted read-write on purpose: the server writes the 2FA counters
       # (`failed_attempts`, `locked_until`, `last_used`) into `state.toml` in

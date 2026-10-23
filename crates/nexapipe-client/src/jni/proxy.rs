@@ -72,6 +72,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    // The body drives the runtime, and unwinding out of an `extern "system"`
+    // frame is a native crash on Android rather than something the JVM can
+    // turn into an exception. So the catch is around the whole body, not
+    // around the one part of it that blocks.
+    catching_panic("nativeDropConnections", drop_connections).unwrap_or(-1)
+}
+
+/// The body of `nativeDropConnections`, split out so the catch has something
+/// to wrap.
+fn drop_connections() -> jint {
     let runtime = match get_runtime() {
         Some(r) => r,
         None => {
@@ -104,20 +114,10 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDropConnections(
         }
     };
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.drop_connections().await })
-    }));
+    runtime.block_on(async move { endpoint_group.drop_connections().await });
 
-    match result {
-        Ok(()) => {
-            jni_log!("[DEBUG:jni] nativeDropConnections: dropped every cached connection");
-            0
-        }
-        Err(_) => {
-            jni_log!("[DEBUG:jni] Panic occurred during nativeDropConnections");
-            -1
-        }
-    }
+    jni_log!("[DEBUG:jni] nativeDropConnections: dropped every cached connection");
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -125,6 +125,14 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    // The teardown drives the runtime through several `block_on`s, so it is
+    // caught for the same reason as the rest: an unwind out of this frame is
+    // a native crash on Android rather than something the JVM can report.
+    catching_panic("nativeDestroy", destroy).unwrap_or(-1)
+}
+
+/// The body of `nativeDestroy`, split out so the catch has something to wrap.
+fn destroy() -> jint {
     jni_log!("[DEBUG:jni] nativeDestroy called (full teardown: endpoint + proxy)");
     // Phase 1: briefly lock ENDPOINT, bump the generation and take the endpoint out so the next
     // nativeStartIroh rebuilds it. nativeStartIroh's bind() doesn't hold the ENDPOINT lock, so this
@@ -144,7 +152,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
         }
     };
     // Phase 2+3: stop the endpoint_group / conn_pool (without touching ENDPOINT).
-    let result = Java_com_nexa_pipe_IrohProxy_nativeStopProxy(_env, _class);
+    // The same body `nativeStopProxy` runs, and stopped the same way: the
+    // catch around it is the one that entry point uses.
+    let result = catching_panic("nativeStopProxy", stop_proxy).unwrap_or(-1);
 
     // Phase 4: explicitly close the endpoint. conn_pool.close_all() now only closes the pool's own
     // endpoint (new()); the shared global endpoint is closed here.
@@ -152,7 +162,9 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
         && let Some(r) = get_runtime()
     {
         // Caught for the same reason as above: closing blocks on the
-        // runtime, and an unwind out of this frame is a crash.
+        // runtime, and an unwind out of this frame is a crash. This one is
+        // its own catch because a failure here must not cost the teardown
+        // the rest of it already did.
         let _ = catching_panic("nativeDestroy", || {
             r.block_on(async {
                 let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
@@ -517,7 +529,10 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
         }
     };
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+    // The catch here is around the work that blocks; the entry point has
+    // another one around its whole body, so a panic anywhere in here stops
+    // at one of the two rather than at the `extern "system"` boundary.
+    let result = catching_panic("nativeStartProxy", || {
         runtime.block_on(async move {
 
 
@@ -689,14 +704,14 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
 
             Ok(())
         })
-    }));
+    });
 
     match result {
-        Ok(Ok(_)) => {
+        Some(Ok(_)) => {
             jni_log!("[DEBUG:jni] nativeStartProxy returning success");
             0
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             jni_log!("[DEBUG:jni] Proxy start error: {}", e);
             let code = if e.contains("Parse error") || e.contains("No nodes or domain mappings") {
                 RESULT_CONFIG_ERROR
@@ -706,9 +721,9 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
             set_last_error(e);
             code
         }
-        Err(_) => {
+        None => {
+            // The reason was left behind by the catch that took the panic.
             jni_log!("[DEBUG:jni] Panic occurred during proxy start");
-            set_last_error("Native proxy start panicked");
             -1
         }
     }

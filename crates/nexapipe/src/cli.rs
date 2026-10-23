@@ -281,6 +281,11 @@ pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                     "last_used": client.last_used,
                     "allow_hosts": client.allow_hosts,
                     "allow_ports": client.allow_ports,
+                    // Which of the two port rules the list above is held
+                    // against. The flag is not in the name of the setting, and
+                    // the two rules refuse different requests: without this,
+                    // the list looks like the same restriction either way.
+                    "allow_ports_strict": client.allow_ports_strict,
                     "invite_outstanding": client.pending_enrollment.is_some(),
                     "failed_attempts": client.failed_attempts,
                     "locked_out": client.is_locked_out(),
@@ -345,6 +350,20 @@ pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                     .join(", ")
             };
             println!("    allow ports {ports}");
+            // Which of the two port rules that list is held against. The flag
+            // is not in the name of the setting and the two rules refuse
+            // different requests, so the list alone says nothing about how
+            // narrow it is: this line is what says it.
+            println!(
+                "    port rule   {}",
+                if client.allow_ports_strict {
+                    "allow_ports_strict = true, so the list is checked against the port the \
+                     request is served from"
+                } else {
+                    "allow_ports_strict = false, so the list is checked against the port the \
+                     client names, and a request that names no port is not checked at all"
+                }
+            );
         }
         if client.pending_enrollment.is_some() {
             println!("    invite      outstanding");
@@ -385,6 +404,23 @@ pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
                 println!("      {name:width$}  {line}");
             }
         }
+    }
+
+    // Said once, at the bottom, because it is a property of the configuration
+    // and not of one client: a port list that is held against the port a
+    // client names is a weaker restriction than it looks. The lines above say
+    // which rule each client is on; this says what the weaker one does not
+    // check.
+    if ids.iter().any(|id| {
+        let client = &auth.clients[*id];
+        client.allow_ports.is_some() && !client.allow_ports_strict
+    }) {
+        println!();
+        println!("At least one client above has a port list that is checked against the port the");
+        println!("client names rather than the port the request is served from, so a request that");
+        println!("names no port is not checked at all. Set allow_ports_strict = true on that");
+        println!("client to check the backend's own port: it refuses more, and it is the rule an");
+        println!("allow-list of ports is written for.");
     }
 
     println!();
@@ -907,6 +943,12 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     // Kept past the block below: the banner has to name the client whose
     // credential it is handing out.
     let mut enrolled_client: Option<String> = None;
+    // Whether the one-time form was the default for a client this run created
+    // rather than something `--registration` asked for.
+    let mut enrollment_is_default = false;
+    // Whether this run created the client at all. Kept past the block below
+    // because the output has to say why the one-time form was not used.
+    let mut client_created = false;
     // `--generate-invite` without a value is a valid request for an endpoint
     // share with no 2FA in it, so an empty client id skips the lookup instead
     // of looking up a client literally named "".
@@ -920,11 +962,16 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         // one created on the spot by `--create-client`. Held as a `String`
         // rather than borrowed from `auth_config` because the creation branch
         // below has no client to borrow from yet.
-        let secret = match auth_config.clients.get(client_id) {
-            Some(client) => client.secret.clone(),
-            None if cli.create_client => {
-                SecretString::new(create_client_for_invite(cli, client_id, &auth_config)?)
-            }
+        //
+        // `created` says which of the two it was, and that is what decides the
+        // form of the invite: a secret minted a moment ago is in nobody's
+        // hands.
+        let (secret, created) = match auth_config.clients.get(client_id) {
+            Some(client) => (client.secret.clone(), false),
+            None if cli.create_client => (
+                SecretString::new(create_client_for_invite(cli, client_id, &auth_config)?),
+                true,
+            ),
             None => {
                 let known = if auth_config.clients.is_empty() {
                     " (no client is configured yet)".to_string()
@@ -945,8 +992,30 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
                 )
             }
         };
+        client_created = created;
 
-        if cli.registration {
+        // Which form the invite takes: the one-time enrollment token, or the
+        // secret itself.
+        //
+        // `--registration` asks for the token, and so does a client this run
+        // creates. That client's secret was minted a moment ago and no device
+        // is enrolled with it, so trading the token for a fresh one on first
+        // connect costs nothing — and it leaves the link a credential only
+        // until it is used, which is the whole difference between the two
+        // forms.
+        //
+        // A client that exists already keeps the secret its devices are
+        // enrolled with: the token would replace that secret, and every device
+        // sharing it would have to scan again. That link is a password, and
+        // the output says so, loudly.
+        //
+        // The token is only worth anything while the server runs the 2FA
+        // handshake, so with 2FA off the secret form stands — the server would
+        // not ask for a credential at all, and the token could never be
+        // exchanged. The warning below says that too.
+        let one_time = cli.registration || (created && auth_config.enabled);
+
+        if one_time {
             // An enrollment invite has to be written down before it is printed:
             // the token is only worth anything if the server knows to accept it,
             // and generating a second one is how a link that went astray is
@@ -961,6 +1030,10 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             })?;
             let enrollment = InviteEnrollment::new(client_id, &token)?;
             enrolled_client = Some(client_id.to_string());
+            // Whether the token was asked for or is the default for a client
+            // this run created: the output says which, because the two differ
+            // in what the link does to the secret it carries.
+            enrollment_is_default = created && !cli.registration;
             invite = invite.with_enrollment(Some(enrollment));
         } else {
             let issuer = if auth_config.issuer.is_empty() {
@@ -1070,11 +1143,33 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         println!("* copies it can authenticate as \"{client}\" until that secret is");
         println!("* rotated. Hand it to one device over one channel, then let it go.");
         println!("*");
+        println!("* The one-time form: nexapipe --generate-invite {client} --registration");
+        println!("* puts an enrollment token in the link instead, and the link stops");
+        println!("* being a credential the moment the first device scans it.");
+        println!("*");
         println!("* To revoke it: nexapipe --generate-2fa {client} --force");
         println!("* That rotates the secret, and every device enrolled with the old");
         println!("* one has to scan again — there is no per-device revocation.");
         println!("*******************************************************************");
         println!();
+        // Said on stderr as well, because the usual way to keep an invite is to
+        // redirect stdout into a file — and a warning that goes into that file
+        // is a warning nobody reads before the link is shared.
+        eprintln!(
+            "warning: this invite carries the long-lived TOTP secret of client \"{client}\"; \
+             `nexapipe --generate-invite {client} --registration` prints a one-time enrollment \
+             token instead, and that link stops being a credential once it has been used"
+        );
+        // The one-time form was available and was not used, so the reason is
+        // here rather than left to be guessed at.
+        if client_created && !auth_config.enabled {
+            eprintln!(
+                "warning: the one-time enrollment form was not used for this client because \
+                 [auth] enabled is false in {}, so the server never runs the 2FA handshake and \
+                 an enrollment token could never be exchanged",
+                cli.config
+            );
+        }
     }
     if let Some(enrollment) = &invite.enrollment {
         println!("-------------------------------------------------------------------");
@@ -1091,6 +1186,13 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         println!(" and one that does not gets this client's shared secret —");
         println!(" which every device already using it has to scan again for.");
         println!();
+        if enrollment_is_default {
+            println!(" This client did not exist before this run, so the token is what");
+            println!(" the link carries: the secret it minted was in nobody's hands, and");
+            println!(" nothing is lost by the first device trading the token for a");
+            println!(" fresh one of its own.");
+            println!();
+        }
         println!(" A link you did not deliver is revoked by generating another one");
         println!(" -- this command again -- which replaces the outstanding token.");
         println!("-------------------------------------------------------------------");

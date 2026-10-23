@@ -16,6 +16,7 @@ pub(super) mod state;
 
 pub use enrollment::count_enrollment_failure;
 pub use state::AuthState;
+pub(crate) use state::persist_auth_state;
 
 pub(super) use enrollment::{AuthFailure, PeerRegistration};
 pub(super) use handshake::perform_authentication;

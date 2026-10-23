@@ -40,6 +40,19 @@ pub const RESULT_FILE_ARG: &str = "--result-file";
 /// "elevation already happened" and the operation runs inline.
 pub const ELEVATED_ARG: &str = "--elevated";
 
+/// Flag that tells the elevated copy of this binary which account it is
+/// installing the service for, as `--install-as <account>`.
+///
+/// The elevation channel does not carry the account by itself: `pkexec` and
+/// `sudo` each have an environment variable for the user who asked for the
+/// elevation, and macOS's `do shell script … with administrator privileges` has
+/// none at all. So the desktop says it on the command line, where every
+/// launcher preserves it, and the elevated child reads it back from there.
+///
+/// It comes after the verb, because the verb is what
+/// [`crate::service::cli::handle_args`] reads.
+pub const INSTALL_AS_ARG: &str = "--install-as";
+
 const OK_PREFIX: &str = "OK";
 const ERR_PREFIX: &str = "ERR";
 

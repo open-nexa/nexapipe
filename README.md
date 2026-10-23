@@ -120,8 +120,8 @@ bindings for Swift/Kotlin/Python. See
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
-| `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
-| `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
+| `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
+| `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -144,7 +144,8 @@ Three lines is a working server: one catch-all route, one backend, every other k
 left at its default. The client side is the same length — see
 [Minimal config](#minimal-config), which also lists what each omitted key
 defaults to. Start from `config.toml.example` instead when you want every
-section written out, or `config.toml.2fa.example` when you want 2FA on.
+section written out, or `config.toml.2fa.example` when you want a client that
+is enrolled already.
 
 Leave the file out entirely and the server writes a minimal `config.toml` for you
 instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is a
@@ -231,8 +232,19 @@ mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml is gitignored
 sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
 docker compose up -d --build
+# The example starts with 2FA on, so nothing can connect until a client is
+# enrolled. This one prints the invite to scan.
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --create-client
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
+
+The example ships with 2FA on and no client enrolled, so the server starts and
+then refuses every connection until a client is enrolled — the `--generate-invite
+client-001 --create-client` above is what enrolls the first one. It writes the
+client into the config file and prints a one-time enrollment token in the link;
+the first device that scans it trades the token for a secret of its own, and the
+link stops being a credential at that moment.
 
 `docker-compose.yaml` mounts a `config/` directory — the one holding your
 `config.toml` — a `secrets/` directory for the endpoint identity, and a `logs/`
@@ -390,6 +402,20 @@ sudo chmod 700 /etc/nexapipe
 # Recommended hardening; no longer required for the server to start.
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
+
+The example ships with 2FA on and no client enrolled, so the service starts and
+then refuses every connection until a client is enrolled. Enroll the first one
+before pointing a device at it:
+
+```bash
+sudo -u nexapipe nexapipe \
+    --config /etc/nexapipe/config.toml --generate-invite client-001 --create-client
+```
+
+It has to run as the account the service runs as: the config is written by
+writing a new file and renaming it over the old one, so a file written by root
+belongs to root, and a service that cannot read its own config is a service
+that is down.
 
 Then `/etc/systemd/system/nexapipe.service`:
 

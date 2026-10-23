@@ -87,6 +87,11 @@ base32 = '0.5'
 # The signing lives in `nexapipe-proto`, which both sides link, so the hash
 # itself is named there rather than here.
 qrcode = { version = "0.14.1", default-features = false }
+# The fingerprint of an enrollment token, so the state file can say which
+# token its counters were paid for without writing the token itself down.
+# The same crate `nexapipe-proto` uses for the challenge, at the same
+# version, so the tree carries one SHA-256 and not two.
+sha2 = "0.11"
 
 [dev-dependencies]
 # Spawns the built binary in the integration tests (see tests/).

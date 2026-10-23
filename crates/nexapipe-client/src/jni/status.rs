@@ -100,17 +100,7 @@ fn link_kinds(env: &mut Env<'_>) -> jstring {
         }
     };
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.link_statuses().await })
-    }));
-
-    let statuses = match result {
-        Ok(statuses) => statuses,
-        Err(_) => {
-            jni_log!("[DEBUG:jni] Panic occurred during nativeLinkKinds");
-            return std::ptr::null_mut();
-        }
-    };
+    let statuses = runtime.block_on(async move { endpoint_group.link_statuses().await });
 
     let encoded = statuses
         .iter()
@@ -147,17 +137,7 @@ fn traffic(env: &mut Env<'_>) -> jstring {
         }
     };
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move { endpoint_group.traffic_snapshot() })
-    }));
-
-    let volumes = match result {
-        Ok(volumes) => volumes,
-        Err(_) => {
-            jni_log!("[DEBUG:jni] Panic occurred during nativeTraffic");
-            return std::ptr::null_mut();
-        }
-    };
+    let volumes = runtime.block_on(async move { endpoint_group.traffic_snapshot() });
 
     let mut entries: Vec<(String, String)> = volumes
         .iter()

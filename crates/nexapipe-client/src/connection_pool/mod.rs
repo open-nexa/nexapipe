@@ -16,6 +16,7 @@ use nexapipe_proto::protocol::Protocol;
 
 mod borrow;
 mod link_status;
+mod paths;
 
 // The status of a link and the borrow of a connection are modules of their
 // own, and what they hold is still reached through `connection_pool`.
@@ -23,6 +24,7 @@ pub use borrow::{Borrow, BorrowState, BorrowedConnection};
 use link_status::measured_rtt;
 pub use link_status::{LinkKind, LinkStatus, encode_link_status};
 use nexapipe_proto::secret::SecretString;
+use paths::PathHealth;
 use std::collections::HashMap;
 
 // The ALPN this build speaks, and the one servers built before the prefix
@@ -69,6 +71,18 @@ pub fn alpns(protocol: Protocol) -> Vec<Vec<u8>> {
 /// dial each borrow it — a hundred flows on one connection are a hundred
 /// borrows, and the pool has to be able to say so.
 type DialOutcome = Result<(Connection, Arc<BorrowState>), ClientError>;
+
+/// A connection, and the credential generation it was authenticated under.
+///
+/// The generation is what says whether the connection still stands for the
+/// pool's identity: a credential change moves it, and a connection of an
+/// older generation was authenticated as an identity that is gone.
+struct Authenticated {
+    /// The connection itself.
+    conn: Connection,
+    /// The generation of the credential the handshake ran for.
+    generation: u64,
+}
 
 /// How many connections the pool keeps **per protocol**.
 ///
@@ -177,14 +191,21 @@ fn may_pool(protocol: Protocol, held: impl Iterator<Item = Protocol>) -> bool {
 
 /// Why a connection could not be put in the pool.
 ///
-/// The two are different failures and they read differently: one is a
-/// connection that was gone before it could be used, the other is a pool
-/// with no room left in it.
+/// The three are different failures and they read differently: one is a
+/// connection that was gone before it could be used, one is a pool with no
+/// room left in it, and one is a connection that belongs to an identity the
+/// operator has replaced.
 enum PoolRefusal {
     /// The connection was already closed.
     Closed,
     /// The pool holds as many connections of this protocol as it may.
     Full,
+    /// The credential was replaced while the connection was being made.
+    ///
+    /// The connection is authenticated as an identity that is gone, so it
+    /// is closed rather than pooled — and the caller is told, because
+    /// handing it out would hand out the old identity with it.
+    Replaced,
 }
 
 struct PooledConnection {
@@ -203,12 +224,30 @@ struct PooledConnection {
     /// anyone is still on it — and it has to: a connection with a flow on it
     /// is not idle, and closing it would take that flow down with it.
     state: Arc<BorrowState>,
+    /// What the path watcher knows about this connection's paths.
+    ///
+    /// The watcher is the only thing that sees the path events, so this is
+    /// where the answer to "can this connection still carry traffic?" is
+    /// kept.
+    paths: Arc<PathHealth>,
 }
 
 impl PooledConnection {
-    /// True if the underlying iroh connection is still open (not closed by either side).
+    /// True if this connection can still carry traffic.
+    ///
+    /// **Not closed is not alive.** A QUIC connection whose path died — the
+    /// network switched, the relay went away, the NAT mapping expired — is
+    /// not closed by either side: QUIC keeps the connection open, waiting
+    /// for a path to come back. So the question is not "was it closed" but
+    /// "is there still a path to send on".
+    ///
+    /// The path watcher is what knows: a connection whose paths are all gone
+    /// has nowhere left to send, and a connection that has never been seen
+    /// to have a path is not a dead one — the watcher may not have looked
+    /// at it yet, and a connection called dead before it has been looked at
+    /// is a connection the pool throws away for nothing.
     fn is_live(&self) -> bool {
-        self.conn.close_reason().is_none()
+        self.conn.close_reason().is_none() && !self.paths.all_gone()
     }
 
     /// True if this connection has been sitting in the pool unused for at least
@@ -230,8 +269,17 @@ impl PooledConnection {
 /// went away on purpose rather than one that vanished.
 fn drop_stale_connections(connections: &mut Vec<PooledConnection>) {
     let mut idle = Vec::new();
+    let mut pathless = Vec::new();
     connections.retain(|pooled| {
         if !pooled.is_live() {
+            // A connection whose paths are gone is **not** closed yet — QUIC
+            // is waiting for a path to come back — so it is closed here: a
+            // connection with nowhere to send must not sit on the network
+            // with the watcher's handle keeping it open, and the pool has
+            // let go of it either way.
+            if pooled.conn.close_reason().is_none() {
+                pathless.push(pooled.conn.clone());
+            }
             return false;
         }
         // **Idle means nobody is riding it.** The pool owns the connection
@@ -247,6 +295,9 @@ fn drop_stale_connections(connections: &mut Vec<PooledConnection>) {
     });
     for conn in idle {
         conn.close(0u32.into(), b"idle");
+    }
+    for conn in pathless {
+        conn.close(0u32.into(), b"no path");
     }
 }
 
@@ -328,6 +379,21 @@ struct IrohConnectionPoolInner {
     /// notices the generation moved stops publishing, and closes the
     /// connection on its way out.
     epoch: AtomicU64,
+    /// Which generation of the credential the pool is on.
+    ///
+    /// Moved by [`IrohConnectionPool::set_credential`], and only when the
+    /// **identity** changed: a rotated secret is the same account, and the
+    /// connections that stand for it still stand for it.
+    ///
+    /// It is the answer to "which identity is this pool on?", and a dial
+    /// takes it with the credential it authenticates: a connection whose
+    /// generation has moved on was authenticated as an identity that is
+    /// gone, and it is closed rather than pooled.
+    ///
+    /// It is not the network generation above, and it is not the same
+    /// thing: a network change closes the connections of a path that is
+    /// gone, while this says whose name is on the connection.
+    credential_generation: AtomicU64,
 }
 
 /// A recorded [`LinkStatus`] and the connection it was recorded for.
@@ -335,6 +401,12 @@ struct IrohConnectionPoolInner {
 struct CachedLinkStatus {
     /// The connection the status describes, if there is one.
     conn: Option<Connection>,
+    /// The paths that connection has, if there is one.
+    ///
+    /// The reading is about the connection, and a connection whose path is
+    /// gone describes no path at all — so the reading has to know about the
+    /// paths as well, or it goes on describing a route that is not there.
+    paths: Option<Arc<PathHealth>>,
     /// What the path watcher saw on that connection.
     status: LinkStatus,
 }
@@ -366,6 +438,7 @@ impl IrohConnectionPool {
             owns_endpoint: true,
             link_status: Mutex::new(CachedLinkStatus::default()),
             epoch: AtomicU64::new(0),
+            credential_generation: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Ok(Self { inner })
@@ -384,6 +457,7 @@ impl IrohConnectionPool {
             owns_endpoint: false,
             link_status: Mutex::new(CachedLinkStatus::default()),
             epoch: AtomicU64::new(0),
+            credential_generation: AtomicU64::new(0),
         });
         spawn_cleanup_task(Arc::downgrade(&inner));
         Self { inner }
@@ -444,13 +518,30 @@ impl IrohConnectionPool {
     /// Writes the pool's credential, and closes the connections of the
     /// identity that is gone.
     ///
-    /// Every write of the credential goes through here. A path that wrote it
-    /// directly — the enrollment writes one of its own — would change the
-    /// identity without the comparison, and the connections of the old
-    /// identity would stay in the pool.
+    /// Every write of the credential goes through here. The enrollment
+    /// writes a credential of its own — and it writes it **here**, so that
+    /// the identity comparison, the move of the generation and the drop of
+    /// the connections of the identity that is gone happen with it.
     async fn set_credential(&self, auth: Option<TwoFactorAuth>) {
         let mut slot = self.inner.two_factor.lock().await;
         let changed = identity_changed(slot.as_ref(), auth.as_ref());
+        if changed {
+            // **The identity moves with the credential.**
+            //
+            // A dial reads the generation when it takes the credential and
+            // compares it before it pools the connection: a generation that
+            // moved in between means the handshake ran for an identity that
+            // is gone.
+            //
+            // The move happens here — under the lock the credential is
+            // written under, and before the connections are dropped — so a
+            // dial that reads the credential afterwards reads the new
+            // generation with it, and a dial that read it before reads the
+            // old one.
+            self.inner
+                .credential_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
         *slot = auth;
         // Released before the connections are touched: the lock order is
         // `connections` first, and nesting the two is what makes a pool that
@@ -540,12 +631,16 @@ impl IrohConnectionPool {
     /// `timeout` is the budget for the QUIC handshake itself; see
     /// [`PRECONNECT_CONNECT_TIMEOUT`] for why a warm-up uses a tighter one than
     /// [`CONNECTION_TIMEOUT`].
+    ///
+    /// The connection comes back with the generation of the credential it
+    /// was authenticated under: the handshake takes as long as the server
+    /// takes, and the credential may be replaced while it runs.
     async fn connect_and_auth(
         &self,
         ep: &Endpoint,
         timeout: tokio::time::Duration,
         protocol: Protocol,
-    ) -> Result<Connection, ClientError> {
+    ) -> Result<Authenticated, ClientError> {
         let started = tokio::time::Instant::now();
         // **The protocol this connection is for, first**, and the two generic
         // names beside it: a server that does not know the per-protocol names
@@ -657,7 +752,20 @@ impl IrohConnectionPool {
             }
         }
 
-        let two_factor = self.inner.two_factor.lock().await.clone();
+        // **The credential, and the generation it belongs to, together.**
+        //
+        // The generation is read under the lock the credential is read
+        // under, so the two cannot be from different moments: a connection
+        // is authenticated as the identity whose generation it carries, and
+        // the pool can tell later whether that identity is still the one it
+        // is on.
+        let (two_factor, generation) = {
+            let slot = self.inner.two_factor.lock().await;
+            (
+                slot.clone(),
+                self.inner.credential_generation.load(Ordering::Acquire),
+            )
+        };
         if let Some(auth) = two_factor {
             #[cfg(feature = "tracing")]
             tracing::info!(
@@ -677,7 +785,7 @@ impl IrohConnectionPool {
             );
         }
 
-        Ok(conn)
+        Ok(Authenticated { conn, generation })
     }
 
     /// A connection to carry a flow on.
@@ -865,14 +973,22 @@ impl IrohConnectionPool {
             crate::error::ClientError::InvalidConfig("Endpoint has been closed".to_string())
         })?;
 
-        let conn = self
+        let authenticated = self
             .connect_and_auth(&ep, CONNECTION_TIMEOUT, protocol)
             .await?;
-        spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
+        let conn = authenticated.conn.clone();
+        let paths = Arc::new(PathHealth::default());
+        spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone(), paths.clone());
 
         let state = Arc::new(BorrowState::new());
         match self
-            .pool_connection(conn.clone(), state.clone(), protocol)
+            .pool_connection(
+                conn.clone(),
+                state.clone(),
+                protocol,
+                authenticated.generation,
+                paths,
+            )
             .await
         {
             Ok(()) => Ok((conn, state)),
@@ -884,6 +1000,12 @@ impl IrohConnectionPool {
             )),
             Err(PoolRefusal::Closed) => Err(ClientError::ConnectionFailed(
                 "the connection was closed as soon as it was established".to_string(),
+            )),
+            // The credential was replaced while the handshake was running:
+            // the connection is authenticated as an identity that is gone,
+            // and it was closed rather than pooled.
+            Err(PoolRefusal::Replaced) => Err(ClientError::ConnectionFailed(
+                "the credential was replaced while the connection was being made".to_string(),
             )),
         }
     }
@@ -908,10 +1030,17 @@ impl IrohConnectionPool {
 
         // The cached reading describes the connection it was recorded for: one
         // that has since died describes no path at all, and the UI would keep
-        // showing a route to a backend it cannot reach.
+        // showing a route to a backend it cannot reach. A connection whose
+        // path is gone has died in the same way a closed one has, so the
+        // reading is worth nothing there either.
         let cached = self.inner.link_status.lock().await;
         match &cached.conn {
-            Some(conn) if conn.close_reason().is_none() => cached.status,
+            Some(conn)
+                if conn.close_reason().is_none()
+                    && cached.paths.as_ref().is_none_or(|paths| !paths.all_gone()) =>
+            {
+                cached.status
+            }
             _ => LinkStatus::default(),
         }
     }
@@ -945,7 +1074,7 @@ impl IrohConnectionPool {
         let started = tokio::time::Instant::now();
         let deadline = started + PRECONNECT_TIMEOUT;
 
-        let conn = {
+        let authenticated = {
             let Some(ep) = self.endpoint().await else {
                 return false;
             };
@@ -955,7 +1084,7 @@ impl IrohConnectionPool {
             )
             .await
             {
-                Ok(Ok(conn)) => conn,
+                Ok(Ok(authenticated)) => authenticated,
                 Ok(Err(e)) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!("preconnect to {} failed: {}", self.backend_id(), e);
@@ -970,6 +1099,7 @@ impl IrohConnectionPool {
                 }
             }
         };
+        let Authenticated { conn, generation } = authenticated;
 
         // A client without credentials never opens the auth stream, so a
         // completed QUIC handshake tells it nothing: whether the connection can
@@ -993,10 +1123,17 @@ impl IrohConnectionPool {
             }
         }
 
-        spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone());
-        self.pool_connection(conn, Arc::new(BorrowState::new()), Protocol::Http)
-            .await
-            .is_ok()
+        let paths = Arc::new(PathHealth::default());
+        spawn_path_watcher(Arc::downgrade(&self.inner), conn.clone(), paths.clone());
+        self.pool_connection(
+            conn,
+            Arc::new(BorrowState::new()),
+            Protocol::Http,
+            generation,
+            paths,
+        )
+        .await
+        .is_ok()
     }
 
     /// Puts a connection in the pool.
@@ -1005,14 +1142,21 @@ impl IrohConnectionPool {
     /// pool keeps the connection and the flows borrow it, so there is nothing
     /// to give back at the end of a flow.
     ///
+    /// `generation` is the generation of the credential the connection was
+    /// authenticated under, and it is what says whether the connection still
+    /// stands for the pool's identity.
+    ///
     /// Returns why the connection could not be pooled — it was already
-    /// closed, or the pool is full. The caller has to know: handing out a
+    /// closed, the pool is full, or the credential it was authenticated
+    /// under has been replaced. The caller has to know: handing out a
     /// connection that was closed on the spot is handing out a failure.
     async fn pool_connection(
         &self,
         conn: Connection,
         state: Arc<BorrowState>,
         protocol: Protocol,
+        generation: u64,
+        paths: Arc<PathHealth>,
     ) -> Result<(), PoolRefusal> {
         // Never pool a connection that has already been closed: handing it out
         // again would just fail on the next request. The background watcher also
@@ -1022,11 +1166,33 @@ impl IrohConnectionPool {
         }
 
         let mut connections = self.inner.connections.lock().await;
+        // **Whose identity is this connection?**
+        //
+        // The generation is compared under the lock that holds the pool, so
+        // the comparison and the pooling are one step: a credential that is
+        // replaced while the connection is on its way in cannot slip
+        // between them.
+        //
+        // A connection of an older generation was authenticated as an
+        // identity that is gone — the credential was replaced while its
+        // handshake was running. It is closed rather than pooled: it would
+        // carry traffic under an identity the operator has replaced, and
+        // handing it out would hand that identity out with it.
+        if self.inner.credential_generation.load(Ordering::Acquire) != generation {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "the credential to {} was replaced while the connection was being made; closing it",
+                self.backend_id()
+            );
+            conn.close(0u32.into(), b"the credential was replaced");
+            return Err(PoolRefusal::Replaced);
+        }
         if may_pool(protocol, connections.iter().map(|pooled| pooled.protocol)) {
             connections.push(PooledConnection {
                 conn,
                 state,
                 protocol,
+                paths,
             });
             return Ok(());
         }
@@ -1213,7 +1379,16 @@ fn may_publish(current: u64, generation: u64) -> bool {
 /// (the relay one, usually) and only *later* promotes a direct one. Waiting for the first
 /// event would leave the answer at [`LinkKind::Unknown`] for as long as the connection stays
 /// on its first path — which, for a backend behind a symmetric NAT, is forever.
-fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
+///
+/// The watcher is also the only thing that sees the path **events**, so it is where the
+/// pool's answer to "can this connection still carry traffic?" is kept: a path that is
+/// gone is a path the connection cannot send on, whatever QUIC thinks of the connection
+/// itself.
+fn spawn_path_watcher(
+    inner: Weak<IrohConnectionPoolInner>,
+    conn: Connection,
+    paths: Arc<PathHealth>,
+) {
     let status = LinkStatus::of(&conn);
     // The generation this connection belongs to. A watcher that outlives its
     // generation has a reading that describes a network that is gone, so it
@@ -1229,12 +1404,17 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
     {
         *slot = CachedLinkStatus {
             conn: Some(conn.clone()),
+            paths: Some(paths.clone()),
             status,
         };
     }
 
     tokio::spawn(async move {
         let mut path_events = conn.path_events();
+        // The paths the connection has right now. The subscription is made
+        // first, so that a path which opens between the snapshot and the
+        // next poll is still seen.
+        paths.snapshot(conn.paths().len());
         // The round-trip time moves on its own: iroh re-estimates it from every
         // acknowledgement, and says nothing when it does. A path event is rare —
         // the connection may sit on one path for hours — so the latency is
@@ -1248,63 +1428,80 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                     let Some(event) = event else {
                         break;
                     };
-                    let iroh::endpoint::PathEvent::Selected { id, remote_addr, .. } = event else {
-                        continue;
-                    };
-
-                    let kind = if remote_addr.is_ip() {
-                        LinkKind::Direct
-                    } else if remote_addr.is_relay() {
-                        LinkKind::Relay
-                    } else {
-                        LinkKind::Unknown
-                    };
-
-                    let Some(inner) = inner.upgrade() else {
-                        // Pool dropped; nobody is left to tell.
-                        break;
-                    };
-                    // The pool moved to another network: this connection is
-                    // from the one that is gone, and the reading it would
-                    // publish is that network's — the round trip of a path
-                    // that no longer carries anything. The connection is
-                    // closed on the way out: the drop closes every
-                    // connection the pool still holds, and this watcher is
-                    // what closes the one it does not — a connection the
-                    // pool has let go of must not stay open on the network
-                    // that is gone. A closed connection is not pooled again.
-                    //
-                    // The check is under the lock the reading is written
-                    // with, and the drop moves the generation under that
-                    // same lock: so the two cannot interleave, and a reading
-                    // of the network that is gone cannot land after the
-                    // reading was cleared.
-                    let mut cached = inner.link_status.lock().await;
-                    if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
-                        conn.close(0u32.into(), b"network changed");
-                        break;
-                    }
-                    *cached = CachedLinkStatus {
-                        conn: Some(conn.clone()),
-                        status: LinkStatus {
-                            kind,
-                            // The round trip is read off the path the event
-                            // named, not off whichever path is selected at the
-                            // moment of the read: the two halves of a reading
-                            // describe one path, and the selection can move
-                            // between the event and the read.
-                            //
-                            // An unknown kind has no path to measure, which
-                            // is how [`LinkStatus::of`] reads it too.
-                            rtt: if kind == LinkKind::Unknown {
-                                None
+                    match event {
+                        // A path opened: there is somewhere to send.
+                        iroh::endpoint::PathEvent::Opened { .. } => paths.opened(),
+                        // A path is gone. What is left of it is the
+                        // connection's own answer: iroh has taken this path
+                        // out of its list by the time the event is delivered.
+                        iroh::endpoint::PathEvent::Closed { .. } => paths.closed(conn.paths().len()),
+                        // The stream fell behind and dropped events. The
+                        // connection's list is the truth, and the stream is
+                        // caught up with it.
+                        iroh::endpoint::PathEvent::Lagged { .. } => paths.snapshot(conn.paths().len()),
+                        iroh::endpoint::PathEvent::Selected { id, remote_addr, .. } => {
+                            let kind = if remote_addr.is_ip() {
+                                LinkKind::Direct
+                            } else if remote_addr.is_relay() {
+                                LinkKind::Relay
                             } else {
-                                conn.rtt(id).and_then(measured_rtt)
-                            },
-                        },
-                    };
+                                LinkKind::Unknown
+                            };
+
+                            let Some(inner) = inner.upgrade() else {
+                                // Pool dropped; nobody is left to tell.
+                                break;
+                            };
+                            // The pool moved to another network: this connection is
+                            // from the one that is gone, and the reading it would
+                            // publish is that network's — the round trip of a path
+                            // that no longer carries anything. The connection is
+                            // closed on the way out: the drop closes every
+                            // connection the pool still holds, and this watcher is
+                            // what closes the one it does not — a connection the
+                            // pool has let go of must not stay open on the network
+                            // that is gone. A closed connection is not pooled again.
+                            //
+                            // The check is under the lock the reading is written
+                            // with, and the drop moves the generation under that
+                            // same lock: so the two cannot interleave, and a reading
+                            // of the network that is gone cannot land after the
+                            // reading was cleared.
+                            let mut cached = inner.link_status.lock().await;
+                            if !may_publish(inner.epoch.load(Ordering::Acquire), generation) {
+                                conn.close(0u32.into(), b"network changed");
+                                break;
+                            }
+                            *cached = CachedLinkStatus {
+                                conn: Some(conn.clone()),
+                                paths: Some(paths.clone()),
+                                status: LinkStatus {
+                                    kind,
+                                    // The round trip is read off the path the event
+                                    // named, not off whichever path is selected at the
+                                    // moment of the read: the two halves of a reading
+                                    // describe one path, and the selection can move
+                                    // between the event and the read.
+                                    //
+                                    // An unknown kind has no path to measure, which
+                                    // is how [`LinkStatus::of`] reads it too.
+                                    rtt: if kind == LinkKind::Unknown {
+                                        None
+                                    } else {
+                                        conn.rtt(id).and_then(measured_rtt)
+                                    },
+                                },
+                            };
+                        }
+                        _ => {}
+                    }
                 }
                 _ = ticker.tick() => {
+                    // The paths are read again here as well: a path can go
+                    // without the watcher hearing about it — the event
+                    // stream can fall behind — and the connection's own
+                    // list is the truth.
+                    paths.snapshot(conn.paths().len());
                     let Some(inner) = inner.upgrade() else {
                         // Pool dropped; nobody is left to tell.
                         break;
@@ -1335,6 +1532,7 @@ fn spawn_path_watcher(inner: Weak<IrohConnectionPoolInner>, conn: Connection) {
                     }
                     *cached = CachedLinkStatus {
                         conn: Some(conn.clone()),
+                        paths: Some(paths.clone()),
                         status,
                     };
                 }

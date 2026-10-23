@@ -114,10 +114,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStopTunProxy(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    match catching_panic("nativeStopTunProxy", stop_tun_proxy) {
-        Some(code) => code,
-        None => -1,
-    }
+    catching_panic("nativeStopTunProxy", stop_tun_proxy).unwrap_or(-1)
 }
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
 fn virtual_block(env: &mut Env<'_>, base: JString) -> jstring {

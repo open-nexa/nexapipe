@@ -5,9 +5,10 @@ use crate::proxy::{
     ProxyNodeConfig, StartError,
 };
 use crate::service::ipc::{
-    IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, BUILD_VERSION, IPC_SOCKET_PATH,
-    MAX_IPC_LINE,
+    IpcListener, IpcMessage, IpcResponse, IpcStream, IssuedCredentialPayload, NodeInput,
+    BUILD_VERSION, IPC_SOCKET_PATH, MAX_IPC_LINE,
 };
+use crate::service::platform::account::AccountId;
 use crate::status::{ActiveFlowPage, ProxyStatus, FLOW_PAGE_LIMIT};
 use anyhow::{Context, Result};
 use std::fmt;
@@ -15,7 +16,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 
 /// The failure the last start recorded after it had already answered `Ok`.
 ///
@@ -64,6 +64,14 @@ pub async fn await_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
 
 pub struct ServiceRunner {
     proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+
+    /// The account this service was installed for, when it knows one.
+    ///
+    /// Read once, at startup: the record is written by the install and cannot
+    /// change while the service runs. `None` when there is no record, and then
+    /// the service serves the account that owns the token it reads — which is
+    /// weaker than serving one account, and says so in the log.
+    installed_by: Option<AccountId>,
 }
 
 impl Default for ServiceRunner {
@@ -74,8 +82,20 @@ impl Default for ServiceRunner {
 
 impl ServiceRunner {
     pub fn new() -> Self {
+        let installed_by = crate::service::platform::install_owner::read_installed_by();
+        match &installed_by {
+            Some(account) => {
+                tracing::info!("This service serves the account it was installed for: {account}")
+            }
+            None => tracing::warn!(
+                "No installing account is on file: this service will serve any local account that \
+                 owns the token it reads. Reinstall the service to bind it to one account."
+            ),
+        }
+
         Self {
             proxy_manager: Arc::new(tokio::sync::RwLock::new(None)),
+            installed_by,
         }
     }
 
@@ -89,7 +109,7 @@ impl ServiceRunner {
         // Clean that up before anything here needs DNS.
         crate::proxy::dns_config::cleanup_stale_hijack();
 
-        let listener = TcpListener::bind(IPC_SOCKET_PATH)
+        let listener = IpcListener::bind()
             .await
             .context("Failed to bind IPC socket")?;
 
@@ -104,16 +124,23 @@ impl ServiceRunner {
             crate::service::ipc_token::service_token_paths()
         );
 
+        // The account this service was installed for. It cannot change while the service runs,
+        // so it is read once here and every connection is checked against it.
+        let installed_by = self.installed_by.clone();
+
         loop {
-            let (mut stream, _) = listener
+            let mut stream = listener
                 .accept()
                 .await
                 .context("Failed to accept connection")?;
             tracing::debug!("Client connected");
 
             let proxy_manager = self.proxy_manager.clone();
+            let installed_by = installed_by.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(&mut stream, proxy_manager).await {
+                if let Err(e) =
+                    Self::handle_client(&mut stream, proxy_manager, installed_by.as_ref()).await
+                {
                     tracing::error!("Client handler error: {}", e);
                 }
             });
@@ -192,6 +219,11 @@ impl ServiceRunner {
     /// *taken* out — the tunnel has to be torn down (the TUN adapter outlives this process) and no
     /// late status request may be answered with "running".
     pub async fn shutdown(&self) {
+        // The socket the desktop looks for goes with the service: a socket file
+        // nobody listens on is one the desktop spends a connection failing to
+        // reach.
+        crate::service::ipc::remove_socket();
+
         let manager = self.proxy_manager.write().await.take();
         if let Some(manager) = manager {
             tracing::info!("Stopping the proxy before exiting");
@@ -200,8 +232,9 @@ impl ServiceRunner {
     }
 
     async fn handle_client(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut IpcStream,
         proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+        installed_by: Option<&AccountId>,
     ) -> Result<()> {
         // Nothing is served before the caller authenticates: this process runs
         // elevated, and a loopback socket says nothing about who dialled it.
@@ -300,10 +333,10 @@ impl ServiceRunner {
                 };
 
                 // Every published token is a candidate: the service cannot tell which account
-                // dialled it, so which one happens to be found first says nothing about which
-                // one the caller holds. The answer is bound to both nonces, so a recorded one
-                // is worth nothing on the next connection.
-                let known = crate::service::ipc_token::read_tokens()?;
+                // dialled it by looking at the socket, so it asks the kernel instead. The
+                // answer is bound to both nonces, so a recorded one is worth nothing on the
+                // next connection.
+                let known = crate::service::ipc_token::read_candidates()?;
                 let matched = crate::service::ipc_token::token_for_auth(
                     &known,
                     &service_nonce,
@@ -311,11 +344,53 @@ impl ServiceRunner {
                     &presented,
                 );
 
-                let token = match matched {
-                    Some(token) => {
+                // Who is on the other end of the socket. A loopback connection says nothing
+                // about that, and this process does root things on the caller's word, so the
+                // account has to be asked of the operating system rather than assumed.
+                let peer = match AccountId::peer_of(reader.get_mut()) {
+                    Some(account) => account,
+                    None => {
+                        tracing::warn!(
+                            "Refusing an IPC client whose account could not be identified"
+                        );
+                        let response = IpcResponse::Error(AppError::with_detail(
+                            codes::SERVICE_UNAUTHORIZED,
+                            "the account behind this connection could not be identified",
+                        ));
+                        Self::write_response(reader.get_mut(), &response).await?;
+                        break;
+                    }
+                };
+
+                let candidate = match matched {
+                    Some(candidate) => {
+                        // The token was right; the account has to be right too. This service
+                        // serves the account it was installed for and nobody else, because
+                        // what it does on the caller's word — the TUN device, the
+                        // machine-wide routes, the DNS hijack — is the machine's.
+                        let allowed = crate::service::platform::account::allows(
+                            installed_by,
+                            &peer,
+                            &candidate.owner,
+                        );
+                        if !allowed {
+                            tracing::warn!(
+                                "Refusing an IPC client that is not the account this service \
+                                 serves: the caller is {peer}, its token belongs to {}, and \
+                                 this service is installed for {installed_by:?}",
+                                candidate.owner
+                            );
+                            let response = IpcResponse::Error(AppError::with_detail(
+                                codes::SERVICE_UNAUTHORIZED,
+                                "this service is installed for another account",
+                            ));
+                            Self::write_response(reader.get_mut(), &response).await?;
+                            break;
+                        }
+
                         authenticated = true;
                         tracing::debug!("IPC client authenticated");
-                        token
+                        candidate
                     }
                     None if known.is_empty() => {
                         // No token published yet means no desktop session has asked for the
@@ -339,8 +414,11 @@ impl ServiceRunner {
 
                 // The caller proved itself; now this side proves itself back, so a caller
                 // that connected to something else on the port finds out.
-                let proof =
-                    crate::service::ipc_token::proof_mac(&token, &service_nonce, &caller_nonce);
+                let proof = crate::service::ipc_token::proof_mac(
+                    &candidate.token,
+                    &service_nonce,
+                    &caller_nonce,
+                );
                 Self::write_response(reader.get_mut(), &IpcResponse::AuthOk { mac: proof }).await?;
                 continue;
             }
@@ -448,10 +526,7 @@ impl ServiceRunner {
         }
     }
 
-    async fn write_response(
-        stream: &mut tokio::net::TcpStream,
-        response: &IpcResponse,
-    ) -> Result<()> {
+    async fn write_response(stream: &mut IpcStream, response: &IpcResponse) -> Result<()> {
         // The channel is newline-delimited in both directions, so the terminator belongs to the
         // response as much as it does to a request. Without it `IpcClient::exchange` — which
         // reads a line — waits for a byte that never comes: the answer is already in its socket
@@ -1090,18 +1165,17 @@ mod tests {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral loopback port");
-        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .expect("the client connects");
-        let (mut server, _) = listener.accept().await.expect("the service accepts");
+        // The transport the IPC really runs over, not a stand-in: the service
+        // and the desktop speak over a Unix-domain socket on Unix, and that is
+        // the socket whose peer the kernel can name.
+        let (mut client, mut server) = crate::service::ipc::connected_pair().await;
 
         let manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::ProxyManager>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
         let handler =
-            tokio::spawn(async move { ServiceRunner::handle_client(&mut server, manager).await });
+            tokio::spawn(
+                async move { ServiceRunner::handle_client(&mut server, manager, None).await },
+            );
 
         // The service speaks first. Take the challenge and then send nothing at all.
         let mut challenge = Vec::new();
@@ -1133,13 +1207,7 @@ mod tests {
     async fn a_response_ends_the_line_the_client_is_reading() {
         use crate::service::ipc::IpcResponse;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral loopback port");
-        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .expect("the client connects");
-        let (mut server, _) = listener.accept().await.expect("the service accepts");
+        let (client, mut server) = crate::service::ipc::connected_pair().await;
 
         ServiceRunner::write_response(&mut server, &IpcResponse::Ok)
             .await
