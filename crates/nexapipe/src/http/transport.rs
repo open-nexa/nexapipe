@@ -399,6 +399,12 @@ async fn backend_answering(reply: &'static str) -> u16 {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
+                // The head is read before the answer goes out. A socket that
+                // is closed with the request still unread in it is closed
+                // abortively on Windows — the peer is told to reset rather
+                // than to finish — and a request that is still going out
+                // then fails instead of getting its answer.
+                read_head(&mut stream).await;
                 let _ = stream.write_all(reply.as_bytes()).await;
                 let _ = stream.flush().await;
             });
@@ -406,6 +412,28 @@ async fn backend_answering(reply: &'static str) -> u16 {
     });
 
     port
+}
+
+/// The head of a request, up to the blank line that ends it.
+///
+/// Read and thrown away: what a test needs is that the request is out of the
+/// way before the answer goes back.
+async fn read_head(stream: &mut tokio::net::TcpStream) {
+    let mut head = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let read = match stream.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        if read == 0 {
+            return;
+        }
+        head.extend_from_slice(&buffer[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            return;
+        }
+    }
 }
 
 /// A backend that answers with the bytes it was given and records the head
