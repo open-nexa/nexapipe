@@ -291,6 +291,8 @@ pub(crate) fn pick_service_binary(
 mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod service_copy;
 #[cfg(windows)]
 mod windows;
 
@@ -507,7 +509,8 @@ mod tests {
         installing_account_from_args, linux_activation_args, linux_service_exec_with,
         linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
         per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-        system_service_binary, system_service_dir, ScState, SERVICE_BINARY_NAME, SERVICE_NAME,
+        service_binary_path, service_source_with, system_service_binary, system_service_dir,
+        ScState, SERVICE_BINARY_DIR, SERVICE_BINARY_NAME, SERVICE_NAME,
     };
     use crate::service::elevate;
     use crate::service::platform::account::AccountId;
@@ -578,6 +581,54 @@ mod tests {
             seconds > 20,
             "an ExitTimeOut of {seconds}s leaves the teardown no room to restore the system DNS"
         );
+    }
+
+    /// The job runs the install's own copy of the service binary, not the app's.
+    ///
+    /// The app's own binary sits in a directory the local accounts own, and a privileged
+    /// service must not run a program they can replace: launchd refuses to spawn one,
+    /// and an install refused that way leaves the machine with no service at all.
+    #[test]
+    fn the_job_runs_the_copied_binary() {
+        let program = service_binary_path();
+        let plist = macos_plist_content(&program.to_string_lossy());
+
+        assert!(
+            plist.contains(&program.to_string_lossy().to_string()),
+            "the job does not run the copy: {plist}"
+        );
+        assert!(
+            !plist.contains("/Applications/"),
+            "the job still runs the app's own binary: {plist}"
+        );
+    }
+
+    /// The copy lives in a system directory, and not in the app bundle: an app that is
+    /// replaced under the service manager must not take the program out from under the
+    /// running service.
+    #[test]
+    fn the_copy_lives_outside_the_app_bundle() {
+        let program = service_binary_path();
+
+        assert!(
+            program.starts_with("/Library/"),
+            "the copy is not in a system directory: {program:?}"
+        );
+        assert_eq!(program.parent(), Some(Path::new(SERVICE_BINARY_DIR)));
+    }
+
+    /// The dedicated service binary beside the desktop executable is what gets copied;
+    /// a development build has none, and the desktop binary understands `--foreground`
+    /// as well.
+    #[test]
+    fn the_source_is_the_service_binary_beside_the_app() {
+        let app = Path::new("/Applications/nexa.app/Contents/MacOS/nexa");
+
+        assert_eq!(
+            service_source_with(app, |_| true),
+            Path::new("/Applications/nexa.app/Contents/MacOS/nexa-service")
+        );
+        assert_eq!(service_source_with(app, |_| false), app);
     }
 
     /// An install that only overwrote the plist installed nothing: launchd keeps running the
