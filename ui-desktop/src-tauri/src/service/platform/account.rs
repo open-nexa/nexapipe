@@ -344,11 +344,10 @@ fn owning_pid(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Opti
 
     let local_address = ipv4_in_table_order(local.ip())?;
     let remote_address = ipv4_in_table_order(remote.ip())?;
-    // The table keeps the ports in network byte order, which is what these two
-    // conversions produce: the bytes of the port, read as a little-endian
-    // 32-bit word.
-    let local_port = u32::from_le_bytes(local.port().to_be_bytes());
-    let remote_port = u32::from_le_bytes(remote.port().to_be_bytes());
+    // The table keeps the ports in network byte order, in a 32-bit word: the
+    // two bytes of the port, followed by two zero bytes.
+    let local_port = port_in_table_order(local.port());
+    let remote_port = port_in_table_order(remote.port());
 
     let mut size: u32 = 0;
     // Safe: a null buffer asks for the size the table needs.
@@ -408,6 +407,18 @@ fn ipv4_in_table_order(address: std::net::IpAddr) -> Option<u32> {
         // The table this reads is the IPv4 one.
         std::net::IpAddr::V6(_) => None,
     }
+}
+
+/// The port as the connection table spells it.
+///
+/// The table keeps the port in network byte order, in the low two bytes of
+/// the 32-bit word it holds it in: the two bytes of the port, read as a
+/// little-endian word. The same value comes out of `ntohs` on the low half
+/// of the word the table holds.
+#[cfg(windows)]
+fn port_in_table_order(port: u16) -> u32 {
+    let bytes = port.to_be_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], 0, 0])
 }
 
 /// The account a process runs as, read off its token.

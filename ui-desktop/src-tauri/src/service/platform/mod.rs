@@ -57,7 +57,9 @@ pub fn service_state() -> ServiceState {
 
 #[cfg(not(windows))]
 use crate::error::codes;
-#[cfg(not(windows))]
+// The elevation channel is Unix's, but the argument that names the account the
+// service is installed for is read on every platform: the elevated child is
+// the one that reads it back, and it is the same child on all of them.
 use crate::service::elevate;
 
 /// Registers the service and starts it.
