@@ -1452,6 +1452,20 @@ lookup, which is what a config written before the key existed does.
 
 ### Security
 
+- **The constant-time utility crate is patched.** `ctutils` picked up an
+  advisory (RUSTSEC-2026-0385): the mask generation of `ctutils::Choice` was
+  `const fn` and so could not reuse the `asm!`-backed mask generation the
+  `cmov` crate uses, and the code it produced could include a branch on a
+  secret value on commonly used platforms. The `u128` comparisons it offers
+  branched as well on 32-bit targets. A branch on a secret is a covert channel,
+  and a covert channel is a way to read a secret.
+  Both lockfiles now pin 0.4.5, the release that carries the fix — it routes
+  the mask generation through `Choice::to_u8()`, which is an optimisation
+  barrier, and it special-cases the `u128` comparisons on 32-bit targets. The
+  crate reaches both trees through `digest` -> `curve25519-dalek` ->
+  `ed25519-dalek` -> `iroh`, and the supply chain job audits both of them.
+  Nothing else in either lockfile moves.
+
 - **The macOS bundles can be signed and notarized.** The desktop builds
   attached to GitHub releases were neither: an unsigned app is quarantined by
   Gatekeeper, and the only ways through it — "Control-click → Open" or

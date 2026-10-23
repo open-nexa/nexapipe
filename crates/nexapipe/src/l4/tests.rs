@@ -781,7 +781,7 @@ async fn the_dial_tries_the_next_address_when_the_first_refuses() {
     let refused = refusing_addr().await;
 
     let started = std::time::Instant::now();
-    let stream = connect_addrs(
+    let stream = crate::backend_conn::connect_addrs(
         &[refused, accepting],
         tokio::time::Instant::now() + Duration::from_secs(5),
     )
@@ -801,14 +801,14 @@ async fn the_dial_tries_the_next_address_when_the_first_refuses() {
 }
 
 #[tokio::test]
-async fn every_address_is_tried_under_one_deadline() {
+async fn a_spent_deadline_is_not_waited_for_once_per_address() {
     // The deadline has passed: every attempt is over before it starts, so
     // the dial gives up at once instead of waiting once per address.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let accepting = listener.local_addr().unwrap();
 
     let started = std::time::Instant::now();
-    let error = connect_addrs(
+    let error = crate::backend_conn::connect_addrs(
         &[accepting, accepting, accepting],
         tokio::time::Instant::now() - Duration::from_secs(1),
     )
@@ -821,8 +821,14 @@ async fn every_address_is_tried_under_one_deadline() {
         started.elapsed()
     );
     assert!(
-        error.to_string().contains("timed out"),
-        "the error should say the attempt ran out of time, got {error}"
+        error.to_string().contains("the connect budget was spent"),
+        "the error should say the budget was spent, got {error}"
+    );
+    // The addresses that were not reached are named too, so an operator can
+    // see which one the dial never got to.
+    assert!(
+        error.to_string().contains(&accepting.to_string()),
+        "the error should name the address that was not reached, got {error}"
     );
 }
 
@@ -830,7 +836,7 @@ async fn every_address_is_tried_under_one_deadline() {
 async fn a_dial_to_an_address_that_refuses_says_which_one() {
     let refused = refusing_addr().await;
 
-    let error = connect_addrs(
+    let error = crate::backend_conn::connect_addrs(
         &[refused],
         tokio::time::Instant::now() + Duration::from_secs(5),
     )

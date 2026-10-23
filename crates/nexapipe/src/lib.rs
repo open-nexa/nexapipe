@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub(crate) mod backend_conn;
 pub mod config;
 pub mod config_watcher;
 pub mod conn;

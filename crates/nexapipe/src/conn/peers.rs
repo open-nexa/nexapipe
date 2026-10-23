@@ -202,6 +202,22 @@ impl PeerRegistry {
         signaled
     }
 
+    /// Closes every connection that never authenticated, and reports how many.
+    ///
+    /// The registry is what tells the two apart: a connection that completed
+    /// the 2FA handshake carries the client id it authenticated as, and one
+    /// that was opened while 2FA was off carries none — no handshake ran, so
+    /// there was no identity to report. That difference is what a reload that
+    /// turns 2FA on acts on: those connections hold no credential at all, and
+    /// they are the ones that must not go on serving.
+    ///
+    /// The connections that did authenticate are left alone: they carry the
+    /// authorization they were given when they connected, and that
+    /// authorization is still valid.
+    pub fn close_unauthenticated(&self) -> usize {
+        self.close_where(|identity| identity.client_id.is_none())
+    }
+
     /// Every connection, oldest first within an endpoint id so the answer is
     /// stable between two calls that saw nothing change.
     pub fn snapshot(&self) -> Vec<PeerInfo> {
