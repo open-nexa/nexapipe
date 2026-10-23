@@ -5,8 +5,8 @@
 //! plane: the streams the connection carries, and what each of them holds.
 //!
 //! The two halves are two modules, because they are two different things:
-//! [`auth`] is the handshake and the state it authenticates against, and
-//! [`stream`] is one stream of a connection and how it is served.
+//! `auth` is the handshake and the state it authenticates against, and
+//! `stream` is one stream of a connection and how it is served.
 
 use crate::auth::ClientAcl;
 use crate::http::BackendClients;
