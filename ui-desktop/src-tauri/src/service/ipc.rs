@@ -62,8 +62,7 @@ impl IpcListener {
     /// Binds the listener.
     ///
     /// On Unix this also creates the directory the socket lives in and clears
-    /// a socket file a service that is no longer running left behind; see
-    /// [`bind_unix`].
+    /// a socket file a service that is no longer running left behind.
     pub async fn bind() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
