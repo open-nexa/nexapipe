@@ -1122,6 +1122,7 @@ mod tests {
     /// credential is a block the credential survived in.
     mod heap {
         use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         /// The bytes the probe is watching for.
@@ -1129,6 +1130,20 @@ mod tests {
         /// A string no other test uses, so a block that holds it is one this
         /// test made.
         pub const NEEDLE: &str = "nexapipe-heap-probe-4f2a9c";
+
+        /// The turn the tests that watch the heap take.
+        ///
+        /// The probe watches every block the allocator frees, in the whole
+        /// process, and the tests that use it share one needle. Two of them
+        /// watching at once would see each other's blocks: the bytes a test
+        /// reads are dropped outside its own watched window — a test that
+        /// reads a message off the wire holds those bytes for the length of
+        /// the test — and the other test, watching at that moment, finds the
+        /// needle in them and reports a leak that is not there.
+        ///
+        /// The turn is held for the whole test, so the needle-bearing data of
+        /// one test is gone before the next one starts watching.
+        pub static LOCK: Mutex<()> = Mutex::new(());
 
         /// Whether the probe is watching.
         static WATCHING: AtomicBool = AtomicBool::new(false);
@@ -1163,16 +1178,34 @@ mod tests {
         static PROBE: Probe = Probe;
 
         /// Looks for the needle in a block that is about to be freed.
+        ///
+        /// The block is read a byte at a time with `read_volatile` rather
+        /// than through a slice: the tail of a buffer past its length was
+        /// never written, and a reference to it would be a reference to
+        /// uninitialized memory.
         fn scan(ptr: *mut u8, len: usize) {
             if !WATCHING.load(Ordering::Relaxed) || len < NEEDLE.len() {
                 return;
             }
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            if bytes
-                .windows(NEEDLE.len())
-                .any(|window| window == NEEDLE.as_bytes())
-            {
-                FOUND.store(true, Ordering::SeqCst);
+            let needle = NEEDLE.as_bytes();
+            for start in 0..=(len - needle.len()) {
+                let mut matched = true;
+                for (offset, expected) in needle.iter().enumerate() {
+                    // SAFETY: `ptr` is the block that is being freed, `start`
+                    // is at most `len - needle.len()` and `offset` is at most
+                    // `needle.len() - 1`, so the byte read is inside the
+                    // block. The read is volatile, so the compiler does not
+                    // assume anything about the bytes it reads.
+                    let byte = unsafe { ptr.add(start + offset).read_volatile() };
+                    if byte != *expected {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    FOUND.store(true, Ordering::SeqCst);
+                    return;
+                }
             }
         }
 
@@ -1397,6 +1430,13 @@ mod tests {
     /// still holds the credential fails the test.
     #[test]
     fn the_serialized_credential_does_not_survive_in_the_heap() {
+        // The turn is taken before anything else, so it is given up last:
+        // the data this test holds has to be gone before another test starts
+        // watching.
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
             token: SecretString::new(heap::NEEDLE.to_string()),
@@ -1455,6 +1495,10 @@ mod tests {
     /// it is written after the token, and the length check fails on it.
     #[test]
     fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let start = AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
             token: SecretString::new(heap::NEEDLE.to_string()),
@@ -1494,6 +1538,13 @@ mod tests {
     /// wiping that is that reader's business.
     #[test]
     fn the_received_credential_does_not_survive_in_the_heap() {
+        // The turn is taken before the bytes this test reads are built, so
+        // they are dropped while this test still holds it — they hold the
+        // needle, and another test watching the heap would find it in them.
+        let _turn = heap::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let json = format!(
             r#"{{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"{secret}","algorithm":"sha1","digits":6,"period":30}}"#,
             secret = heap::NEEDLE
