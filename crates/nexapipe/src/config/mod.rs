@@ -38,8 +38,12 @@ pub(crate) use auth_file::sub_table;
 #[cfg(test)]
 pub(crate) use identity::{
     IROH_SECRET_KEY_ENV, IROH_SECRET_KEY_FILE_ENV, persistence_disabled, resolve_secret_key_source,
-    write_key_file,
 };
+// The lost-race test reads the key file back, and it is Unix-only: the file
+// mode it sets is the point of the test. The re-export follows the test, or
+// the import is unused on a host that never runs it.
+#[cfg(all(test, unix))]
+pub(crate) use identity::write_key_file;
 pub(crate) use io::{
     device_entry, parse_config, read_config_document, write_config_document, write_config_file,
 };
