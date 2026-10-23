@@ -16,7 +16,7 @@
 //! crash on Android, not a Java exception, so a panic that reaches the
 //! boundary takes the whole app down rather than the one call failing. Each
 //! entry point therefore wraps its *whole* body in exactly one barrier:
-//! [`with_env_or`] for the ones that need an `Env` first, [`catching_panic`]
+//! `with_env_or` for the ones that need an `Env` first, `catching_panic`
 //! for the ones that do not.
 
 use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
