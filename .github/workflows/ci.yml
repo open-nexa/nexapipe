@@ -143,6 +143,57 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # The links in the documentation.
+  #
+  # A rustdoc link that points at a name the crate does not have — or at one
+  # it keeps to itself — is a warning that no job in this file looked at.
+  # `cargo clippy` does not check intra-doc links, and this file had no
+  # `cargo doc` step, so a broken one was found by hand and fixed by hand:
+  # #283, #285, #286 and #296 are four of them, in three crates.
+  #
+  # Both lints are denied, and the second is the one that is easy to miss: a
+  # link to a private item resolves only when the private items are
+  # documented, so in the published documentation it points at nothing — and
+  # the warning says "public documentation for `x` links to private item `y`",
+  # which reads like a style note rather than a broken link.
+  #
+  # `--no-deps` because the dependencies' own links are not ours to fix, and
+  # `--locked` because the documentation has to be built from the tree that
+  # ships.
+  docs:
+    name: docs (rustdoc links)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: docs
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --locked
+      # The client's optional features hide code behind them — the JNI
+      # bindings, the UniFFI surface, the TUN proxy — so a build with the
+      # default features never looks at their documentation at all. One build
+      # with all of them on does.
+      #
+      # The features are not the whole story: `TunProxy::new` and the JNI
+      # bindings that call it are behind `target_os = "android"`, so this
+      # step — which runs on ubuntu — never compiles them. The Android half
+      # is documented in the `android` job, which has the NDK.
+      - name: cargo doc (the client's features)
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: cargo doc -p nexapipe-client --no-deps --locked --features "jni,local-proxy,tun-proxy,uniffi,webpki-roots"
+
   # The floor the workspace declares, built on exactly that toolchain.
   #
   # `rust-version` in the root Cargo.toml is a promise, and until this job
@@ -527,6 +578,16 @@ jobs:
         working-directory: ui-desktop/src-tauri
         run: cargo test --lib
 
+      # The desktop crate is a workspace of its own, so the `docs` job does
+      # not reach it. Its links are the same class of link, and #286 was four
+      # of them.
+      - name: cargo doc
+        if: ${{ !cancelled() }}
+        working-directory: ui-desktop/src-tauri
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: cargo doc --no-deps --locked
+
       # npm ci, not npm install: it fails outright when package-lock.json and package.json disagree.
       - name: npm ci
         if: ${{ !cancelled() }}
@@ -745,6 +806,31 @@ jobs:
               --features "jni local-proxy tun-proxy" \
               --config "target.${TRIPLE}.linker='${LINKER}'"
           done
+
+      # The documentation of the Android half of the client crate.
+      #
+      # `TunProxy::new` and the JNI bindings around it are behind
+      # `target_os = "android"`, so the `docs (rustdoc links)` job — which runs
+      # on ubuntu — never compiles them: the client's features hide the
+      # modules, and the operating system hides what the features leave. A
+      # link in that half is therefore only ever checked here.
+      #
+      # `cargo ndk` points the build at the NDK's clang, which `ring` needs to
+      # compile for the target; the check step above needs the same for the
+      # same reason.
+      - name: cargo doc (the Android target)
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: |
+          set -euo pipefail
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TRIPLE="aarch64-linux-android"
+          LINKER="${NDK_BIN}/${TRIPLE}26-clang"
+          cargo ndk --target arm64-v8a --platform 26 doc \
+            -p nexapipe-client --no-deps --locked \
+            --features "jni local-proxy tun-proxy uniffi webpki-roots" \
+            --config "target.${TRIPLE}.linker='${LINKER}'"
 
       - name: Unit tests
         if: ${{ !cancelled() }}

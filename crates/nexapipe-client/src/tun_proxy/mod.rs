@@ -553,8 +553,8 @@ impl TunProxy {
     /// - `tun_fd`: the descriptor Kotlin's `ParcelFileDescriptor.detachFd()`
     ///   handed over. **This function owns it**: it duplicates it into a
     ///   read/write pair and closes the original, on every path including the
-    ///   ones that fail. The caller must not close it again — see
-    ///   [`dup_tun_fds`].
+    ///   ones that fail. The caller must not close it again — the parameter is
+    ///   an [`OwnedFd`], so it is closed when this returns.
     /// - `endpoint_group`: the `Arc<EndpointGroup>` cloned from `ProxyState`, used for iroh connections.
     /// - `proxy_domains`: the list of domains to proxy (already split from comma-separated input).
     /// - `custom_dns_servers`: the system DNS server list (read from `CUSTOM_DNS_SERVERS`).
