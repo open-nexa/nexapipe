@@ -8,6 +8,8 @@ mod client;
 mod forward;
 mod legacy;
 mod response;
+pub mod server;
+mod websocket;
 
 #[cfg(test)]
 mod tests;

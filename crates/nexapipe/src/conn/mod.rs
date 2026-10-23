@@ -2,16 +2,13 @@ use crate::auth::{
     AuthConfig, AuthError, AuthMessage, ClientAcl, DeviceAuth, StepVerdict, TotpValidator,
     Verified, is_presentable_client_id, is_presentable_device_id,
 };
-use crate::config::{BackendProtocol, Timeouts};
 use crate::config_watcher::save_auth_state;
-use crate::http;
 use crate::http::BackendClients;
 use crate::l4;
 use crate::metrics;
 use crate::passthrough;
-use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
+use crate::routes::RoutingTable;
 use crate::shutdown::InFlightGuard;
-use ::http::Request;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, Incoming};
 use nexapipe_proto::auth::Format;
@@ -20,8 +17,7 @@ use nexapipe_proto::secret::SecretString;
 use peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::Instrument;
 
 pub mod allow_list;
@@ -184,7 +180,7 @@ impl AuthState {
 /// the bytes before it were already scanned on an earlier read, so without it
 /// every read rescanned the whole buffer, and a head delivered one segment at
 /// a time cost a full pass per segment.
-fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find_headers_end(buf: &[u8], from: usize) -> Option<usize> {
     buf.get(from..)?
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -232,123 +228,95 @@ impl StreamBudgets {
     fn head_budget(&self) -> std::time::Duration {
         self.head - self.open
     }
+
+    /// How much of the head's budget is left.
+    ///
+    /// The head is bounded from the moment the stream opened, not from the
+    /// moment the head was read: a peer that dribbles a head renews nothing.
+    /// So whatever the first bytes took is taken off the budget the codec
+    /// gets, and the two add up to the same bound the hand-written reader
+    /// applied.
+    fn head_left(&self) -> std::time::Duration {
+        self.head_budget().saturating_sub(self.open.elapsed())
+    }
 }
 
-/// What the first bytes of a stream turned out to be.
-#[derive(Debug)]
-enum StreamHead {
-    /// An HTTP request head, and the bytes that arrived with it.
-    Request { head: Vec<u8>, body: Vec<u8> },
-    /// Not an HTTP request: an L4 preface or a TLS ClientHello. The bytes are
-    /// handed on unconsumed, because the client may have sent its first
-    /// payload in the same segment.
-    Other(Vec<u8>),
-    /// The head was over the limit, and this is how large it had grown.
-    TooLarge(usize),
-    /// The peer went away before the head was finished.
-    Incomplete,
+/// What a stream turned out to carry.
+///
+/// The decision is the first byte's — unless the connection already said. A
+/// connection that named its protocol with ALPN is not asked: it said, and
+/// the server does not have to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// An L4 tunnel: the client sent the preface, and the bytes go to the
+    /// tunnel.
+    L4,
+    /// A TLS session: the client sent a ClientHello, and the bytes go to the
+    /// passthrough, which routes on SNI.
+    Tls,
+    /// A request: the bytes are a request head, and they go to the codec.
+    Request,
 }
 
-/// Reads the head of a request off a stream.
+/// What a stream carries, decided by the protocol the connection named and by
+/// the first bytes it sent.
+///
+/// The named protocols are taken at their word: an L4 connection is a tunnel, a
+/// TLS connection is a TLS session, and an HTTP connection is a request — even
+/// when the bytes say otherwise, because a connection that named its protocol
+/// is not going to be sent something else.
+///
+/// The old ALPN says nothing, so the first byte says it: `0x05` is an L4
+/// preface, `0x16` is a TLS hello, and anything else is a request.
+fn classify(protocol: Protocol, first: &[u8]) -> StreamKind {
+    match protocol {
+        Protocol::L4 => StreamKind::L4,
+        Protocol::Tls => StreamKind::Tls,
+        Protocol::Http => StreamKind::Request,
+        Protocol::Legacy => match first.first() {
+            Some(byte) if l4::is_l4_stream(*byte) => StreamKind::L4,
+            Some(byte) if passthrough::is_tls_handshake(*byte) => StreamKind::Tls,
+            _ => StreamKind::Request,
+        },
+    }
+}
+
+/// Reads the first bytes of a stream off it.
+///
+/// One read, and only one: enough to say which protocol the stream carries,
+/// and — for the protocols that carry a preface of their own — enough to
+/// hand on.
 ///
 /// Generic over the reader so that the whole path can be driven from a test
 /// with a `duplex` pair, the way the L4 preface is: the rules decided here are
 /// worth more than the I/O around them, and the I/O is the part that is hard
 /// to reproduce on demand.
 ///
-/// The rules are three, and each of them used to be a different accident:
-///
-/// * a head over the limit is **refused** — it used to be parsed anyway, with
-///   its last line truncated into a header that looked valid;
-/// * a head the peer abandoned is **not a request** — it used to be parsed and
-///   forwarded, so half a request line became a header;
-/// * a head that finished is a request, and the bytes after it are kept.
-async fn read_stream_head<R>(
+/// The bytes are **handed on**, not consumed. A request's first byte is part
+/// of the request, so the codec that reads the head has to see it — which is
+/// why the request path hands them back before the rest of the stream.
+async fn read_first_bytes<R>(
     recv: &mut R,
     budgets: &StreamBudgets,
-    protocol: Protocol,
-) -> Result<StreamHead, anyhow::Error>
+) -> Result<Option<Vec<u8>>, anyhow::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    // Doubling on demand, so a head that fits in one read never pays for a
-    // bigger buffer while a large one still gets there in a few reallocs.
-    // Pre-allocating the 64 KB limit would take that much from every stream.
-    let mut buf = Vec::with_capacity(8192);
-    let mut read_buf = [0u8; 8192];
-    let mut body_data = Vec::new();
-    // How much of `buf` has already been scanned for the end of the headers.
-    let mut searched = 0usize;
-
-    let header_secs = budgets.head_budget().as_secs();
-    let identify_secs = budgets.identify_budget().as_secs();
-
-    // The first read identifies the protocol and is bounded by the budget
-    // above; every read after it is part of the head and is bounded by the
-    // head's own deadline.
-    let mut identifying = true;
-    loop {
-        let (deadline, secs, what) = if identifying {
-            identifying = false;
-            (budgets.identify, identify_secs, "first byte")
-        } else {
-            (budgets.head, header_secs, "request head")
-        };
-        let read = tokio::time::timeout_at(deadline, recv.read(&mut read_buf)).await;
-        match read {
-            // Zero bytes is the end of the stream, which is the reader's way of
-            // saying the peer is gone.
-            Ok(Ok(0)) => return Ok(StreamHead::Incomplete),
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&read_buf[..n]);
-
-                // What the stream is, when the connection did not say at the
-                // handshake.
-                //
-                // A connection that named its protocol with ALPN already
-                // said: an L4 tunnel is an L4 tunnel, and a TLS session is
-                // not a request at all. Both are handed on with the bytes
-                // they came with.
-                //
-                // The old way is a **sniff**: the first byte is read and
-                // recognised, because the connection did not say.
-                let other = match protocol {
-                    Protocol::L4 | Protocol::Tls => true,
-                    Protocol::Http => false,
-                    Protocol::Legacy => buf
-                        .first()
-                        .is_some_and(|b| l4::is_l4_stream(*b) || passthrough::is_tls_handshake(*b)),
-                };
-                if other {
-                    return Ok(StreamHead::Other(buf));
-                }
-
-                if let Some(pos) = find_headers_end(&buf, searched) {
-                    let headers_end = pos + 4;
-                    if buf.len() > headers_end {
-                        body_data.extend_from_slice(&buf[headers_end..]);
-                    }
-                    buf.truncate(headers_end);
-                    return Ok(StreamHead::Request {
-                        head: buf,
-                        body: body_data,
-                    });
-                }
-
-                // The marker can straddle two reads, so the last three bytes
-                // are looked at again; everything before them cannot start a
-                // marker that was not already ruled out.
-                searched = buf.len().saturating_sub(3);
-
-                if buf.len() > 64 * 1024 {
-                    return Ok(StreamHead::TooLarge(buf.len()));
-                }
-            }
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Err(anyhow::anyhow!("no {} within {}s", what, secs));
-            }
+    let mut buf = vec![0u8; 8192];
+    let read = tokio::time::timeout_at(budgets.identify, recv.read(&mut buf)).await;
+    match read {
+        // Zero bytes is the end of the stream, which is the reader's way of
+        // saying the peer is gone. There is nobody to answer.
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(n)) => {
+            buf.truncate(n);
+            Ok(Some(buf))
         }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "no first byte within {}s",
+            budgets.identify_budget().as_secs()
+        )),
     }
 }
 
@@ -357,10 +325,13 @@ where
 // id is last because it is the newest thing this stream carries.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_bidi_stream(
-    mut send: iroh::endpoint::SendStream,
+    send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
-    config: &RoutingTable,
-    clients: &BackendClients,
+    // The routes and the clients are shared rather than borrowed: the HTTP
+    // path hands them to a service that runs for as long as the connection
+    // does, and the connection may carry several requests.
+    config: Arc<RoutingTable>,
+    clients: Arc<BackendClients>,
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
     acl: Option<Arc<ClientAcl>>,
@@ -382,554 +353,93 @@ pub async fn handle_bidi_stream(
     let open = tokio::time::Instant::now();
     let budgets = StreamBudgets::new(&timeouts.deadlines, open);
 
-    let (buf, body_data) = match read_stream_head(&mut recv, &budgets, protocol).await {
-        Ok(StreamHead::Request { head, body }) => (head, body),
+    // A connection that named its protocol with ALPN said what it carries:
+    // `nexapipe/http` is HTTP, and hyper serves it without the first byte
+    // being read to find out. Nothing is sniffed, nothing is read twice, and
+    // nothing is handed back.
+    if protocol == Protocol::Http {
+        let ctx = Arc::new(crate::http::server::Context {
+            config,
+            clients,
+            peer: peer.to_string(),
+            acl,
+            request_id: request_id.to_string(),
+            who,
+        });
+        return crate::http::server::serve(send, recv, Vec::new(), timeouts.deadlines.header, ctx)
+            .await;
+    }
 
-        Ok(StreamHead::Other(bytes)) => {
-            // An L4 tunnel says so in its first byte, so it is recognised
-            // rather than sniffed. This has to happen before the HTTP header
-            // loop: a preface is not a request line, and the client may send
-            // its first payload in the same segment, which the bytes already
-            // hold and must hand over intact.
-            //
-            // **The connection said which it is**, so the first byte is only
-            // read when it has to be — on a connection that named the old
-            // ALPN and is served the way it always was.
-            let is_l4 = match protocol {
-                Protocol::L4 => true,
-                Protocol::Tls => false,
-                Protocol::Http => false,
-                Protocol::Legacy => bytes.first().is_some_and(|b| l4::is_l4_stream(*b)),
-            };
-            if is_l4 {
-                return l4::handle_iroh_stream(
-                    send,
-                    recv,
-                    bytes,
-                    config,
-                    limiter,
-                    peer,
-                    acl.as_deref(),
-                    request_id,
-                    Some(&who),
-                )
-                .await;
-            }
-            // TLS is terminated by the backend, so a ClientHello is not a
-            // request: hand the raw bytes (and both halves of the stream) to
-            // the passthrough path, which routes on SNI.
-            return passthrough::handle_iroh_stream(send, recv, bytes, config, acl.as_deref())
-                .await;
-        }
-
-        Ok(StreamHead::TooLarge(size)) => {
-            // Refused, not served. This used to `break` out of the read loop
-            // with a head that was never finished, and the parser below read
-            // that as a request: every line of it became a header, the last
-            // one with a truncated value, and the request was forwarded to a
-            // backend. The log said "headers too large" and the backend was
-            // asked anyway.
-            tracing::warn!("Request headers too large: {} bytes, refusing", size);
-            let mut send = send;
-            let written = send
-                .write_all(
-                    b"HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await;
-            let _ = send.finish();
-            if written.is_ok() {
-                metrics::METRICS.record_request(431, 0);
-                crate::log::log_access(request_id, peer, "-", "-", 431, 0, 0, Some(&who));
-            }
+    // The connection did not say what it carries, so the first bytes are read
+    // to find out: `0x05` is an L4 preface, `0x16` is a TLS hello, and
+    // anything else is a request.
+    let first = match read_first_bytes(&mut recv, &budgets).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            // The peer went away before it said anything. There is nobody to
+            // answer, and what arrived is not a request.
+            tracing::debug!("Stream from {} ended before it said what it carries", peer);
             return Ok(());
         }
-
-        Ok(StreamHead::Incomplete) => {
-            // The peer went away before the head was finished. There is nobody
-            // to answer, and what arrived is not a request: the parser would
-            // read the lines of a half-written head as headers and forward
-            // them.
-            tracing::debug!(
-                "Stream from {} ended before the request head was complete",
-                peer
-            );
-            return Ok(());
-        }
-
         Err(e) => {
-            tracing::warn!("No request head from {}: {}", peer, e);
+            tracing::warn!("No first bytes from {}: {}", peer, e);
             return Err(e);
         }
     };
 
-    tracing::debug!("Iroh stream data received - bytes_read: {}", buf.len());
-
-    // A request that does not parse is refused with a status the client can
-    // read, rather than a stream that is dropped under it. A malformed
-    // request — and a request that names more than one host, which the parser
-    // refuses for the same reason — used to leave the client with a reset and
-    // nothing in the access log.
-    let request = match http::parse_http_request_legacy(&buf) {
-        Ok(request) => request,
-        Err(e) => {
-            tracing::warn!("Refusing a malformed request from {}: {}", peer, e);
-            let mut send = send;
-            let written = send
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await;
-            let _ = send.finish();
-            if written.is_ok() {
-                metrics::METRICS.record_request(400, 0);
-                crate::log::log_access(request_id, peer, "-", "-", 400, 0, 0, Some(&who));
-            }
-            return Ok(());
-        }
-    };
-
-    // Everything before the blank line is bytes the client sent, and it is the
-    // only place the request head exists as bytes: from here on it is a parsed
-    // request, and nobody downstream can say how large it was on the wire.
-    // Counted before any routing, so a request whose body never arrives still
-    // reports what did — the same trade the access log makes.
-    metrics::METRICS.record_bytes_received(buf.len() as u64);
-
-    let host = request
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(crate::routes::host_and_port);
-
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(request.uri().path());
-
-    // No `Host` header — HTTP/1.0, or a malformed request — means no route can
-    // be matched, because every route, including a `host_pattern = "*"`
-    // catch-all, is selected by host. There is nothing to serve it with.
-    // Answered, not raised: no `Host` means nothing to look up, and it is worth
-    // no less here than in `http::proxy_request`.
-    let lookup: BackendLookup<BackendInfo> = match host {
-        Some((h, port)) => {
-            config
-                .get_backend_with_acl(h, path, port, acl.as_deref())
-                .await
-        }
-        None => BackendLookup::NoRoute,
-    };
-
-    // The verdict comes **before** the body is read.
+    // An L4 tunnel says so in its first byte, so it is recognised rather than
+    // sniffed. This has to happen before the request path: a preface is not a
+    // request line, and the client may send its first payload in the same
+    // segment, which the bytes already hold and must hand over intact.
     //
-    // A request for a host no route serves has nothing to forward to, and
-    // reading its body first is work nobody asked for: up to
-    // `MAX_REQUEST_BODY` (64 MiB) per stream, held in memory, for a request
-    // that is going to be refused. The bytes that arrived with the head are
-    // dropped along with it.
-    //
-    // The plaintext listener already does it this way round — the lookup,
-    // then the body — so the two paths now agree.
-    //
-    // Which refusal it is decides the status, and nothing else — the writing
-    // and the logging below are the same either way. 404: nothing serves this
-    // name. 503: the route is there and every backend behind it is down, which
-    // is not something the client can fix by asking again for a different host.
-    let unavailable = matches!(lookup, BackendLookup::Unavailable);
-    let status = if unavailable { 503 } else { 404 };
-    let headline = if unavailable {
-        "HTTP/1.1 503 Service Unavailable"
-    } else {
-        "HTTP/1.1 404 Not Found"
-    };
-
-    let Some(backend_info) = lookup.backend() else {
-        tracing::warn!(
-            "Refusing host={:?}: {}, answering {}",
-            host,
-            if unavailable {
-                "no healthy backend behind a route that matches"
-            } else {
-                "no route matches"
-            },
-            status
-        );
-        let mut send = send;
-        let written = send
-            .write_all(
-                format!("{headline}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+    // **The connection said which it is**, so the first byte is only read
+    // when it has to be — on a connection that named the old ALPN and is
+    // served the way it always was.
+    match classify(protocol, &first) {
+        StreamKind::L4 => {
+            return l4::handle_iroh_stream(
+                send,
+                recv,
+                first,
+                &config,
+                limiter,
+                peer,
+                acl.as_deref(),
+                request_id,
+                Some(&who),
             )
             .await;
-        let _ = send.finish();
-        match written {
-            Ok(()) => {
-                // Counted and logged for either status, and only when the answer
-                // reached the client: a refusal nobody received is not a request
-                // this instance served.
-                metrics::METRICS.record_request(status, 0);
-                crate::log::log_access(
-                    request_id,
-                    peer,
-                    request.method().as_str(),
-                    request.uri().path(),
-                    status,
-                    0,
-                    0,
-                    Some(&who),
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "Refusal for host={:?} ({}) could not be written: {}",
-                    host,
-                    status,
-                    e
-                );
-            }
         }
-        return Ok(());
-    };
 
-    // The body is read once, before the first attempt: the bytes come off the
-    // client's stream, and that stream has them only once. A retry sends the
-    // same bytes again, which is only possible because they were kept — and
-    // only a body that is **whole** is kept. A body that is streamed is read
-    // as the backend asks for it, so there is no second copy of it to send:
-    // a retry is only possible while the stream has not been read at all,
-    // which is the case for a connection that was refused before the body
-    // was touched.
-    //
-    // A WebSocket upgrade has no body to read: the session starts where the
-    // head ends, and the bytes after it are frames.
-    // The stream is an `Option` because a body that is **streamed** takes it:
-    // the bytes are read from it as the backend asks for them, so it cannot
-    // also be used for anything else.
-    let mut recv = Some(recv);
-    let mut body = if http::is_websocket_request_static(&request) {
-        None
-    } else {
-        match http::read_request_body(&request, &mut recv, body_data, config.timeouts()).await {
-            Ok(body) => Some(body),
-            Err(failure) => {
-                // The request never went anywhere: there is no backend to
-                // blame and no answer to give but the refusal.
-                tracing::error!("Could not read the request body: {}", failure.error);
-                let mut send = send;
-                let _ = send.finish();
-                return Err(failure.error);
-            }
-        }
-    };
-
-    tracing::debug!(
-        "Request: host={:?}, path={} -> backend={}",
-        host,
-        path,
-        backend_info.url
-    );
-    // The access log has to be fed from here: this is the path every client
-    // takes, and the HTTP server on the plaintext listener logs its own.
-    let started = std::time::Instant::now();
-    let method = request.method().to_string();
-    let request_target = request.uri().to_string();
-
-    // The same string the access log and the span use, redacted the same way.
-    // This line reaches the general log file, which is the same file the span's
-    // fields are rendered into — so a URI logged here unredacted is a query
-    // value in that file, and redacting only the span would leave this door
-    // open next to it.
-    tracing::debug!(
-        "Received request: {} {}",
-        request.method(),
-        crate::log::uri_for_log(&request_target)
-    );
-
-    // Filled in on the span the caller opened, which was created before the
-    // head was read and so could not know these. `Span::current()` is that
-    // span because the caller instruments this future with it; when no
-    // subscriber cares, recording is a no-op rather than a cost.
-    let span = tracing::Span::current();
-    crate::log::record_request_on_span(&span, &method, &request_target);
-
-    // A WebSocket upgrade is a conversation, and half of it cannot be taken
-    // back: it is never retried, and it does not go through the loop below.
-    let outcome: Result<http::ProxySummary, http::ProxyFailure> =
-        if http::is_websocket_request_static(&request) {
-            tracing::debug!("WebSocket request detected");
-            match handle_websocket_stream(
-                send,
-                recv.expect("a WebSocket request has no body, so its stream is still here"),
-                &request,
-                clients,
-                &backend_info,
-                config.timeouts(),
-            )
-            .await
-            {
-                Ok(summary) => {
-                    // The backend answered the upgrade, so it is up.
-                    backend_info.report_success();
-                    Ok(summary)
-                }
-                Err(failure) => {
-                    // A failed dial or handshake says the backend is
-                    // unreachable; a session that dies after the upgrade says
-                    // nothing about that. This path is never retried, but the
-                    // circuit still learns from the first case.
-                    if failure.backend_is_down() {
-                        backend_info.report_failure();
-                    }
-                    Err(failure)
-                }
-            }
-        } else {
-            let body = body
-                .as_mut()
-                .expect("the body of a request that is not a WebSocket is read above");
-            let attempts = config.retry().attempts;
-            let backoff = config.retry().backoff;
-            // The backends that already failed this request. A retry asks
-            // somebody else, because the one that just failed is the one most
-            // likely to fail again.
-            let mut tried: Vec<String> = Vec::new();
-            let mut attempt = 0u32;
-            let mut backend = backend_info;
-
-            loop {
-                let result = http::proxy_to_backend_streaming(
-                    clients,
-                    config.timeouts(),
-                    &request,
-                    &backend,
-                    body,
-                    &mut send,
-                    request_id,
-                )
+        // TLS is terminated by the backend, so a ClientHello is not a request:
+        // hand the raw bytes (and both halves of the stream) to the
+        // passthrough path, which routes on SNI.
+        StreamKind::Tls => {
+            return passthrough::handle_iroh_stream(send, recv, first, &config, acl.as_deref())
                 .await;
-
-                let failure = match result {
-                    Ok(summary) => {
-                        // The backend answered, so it is up: the circuit is
-                        // told, and a backend that was out of rotation comes
-                        // back into it.
-                        backend.report_success();
-                        break Ok(summary);
-                    }
-                    Err(failure) => failure,
-                };
-
-                // Only a failure that says the backend is unreachable counts
-                // against it. A response that broke halfway is a different
-                // thing: the backend did answer.
-                if failure.backend_is_down() {
-                    backend.report_failure();
-                }
-
-                // Two questions, and the failure answers both: may this be
-                // tried again at all, and is there another backend to try it
-                // on.
-                if attempt >= attempts || !failure.retry.may_retry(request.method()) {
-                    break Err(failure);
-                }
-
-                // A body that has been **read** is gone: its bytes came off
-                // the client's stream and there is no second copy of them, so
-                // the request cannot be tried again. A body that is whole can
-                // be sent again, and is — and so can a streamed body that was
-                // never read, because the bytes are still on the client's
-                // stream: a connection that was refused never touched the
-                // body.
-                //
-                // The failure says so rather than sending an empty body to
-                // the next backend, which is what a retry without the bytes
-                // would do.
-                //
-                // Broken out of the loop rather than returned from the
-                // function, so that the refusal is recorded and logged like
-                // every other outcome.
-                if !body.may_retry() {
-                    break Err(http::ProxyFailure::from(anyhow::anyhow!(
-                        "the request has a body that cannot be read a second time, so it is not \
-                         tried again: {}",
-                        failure.error
-                    )));
-                }
-
-                attempt += 1;
-
-                tracing::warn!(
-                    "Request to {} failed ({}); trying another backend ({attempt}/{attempts})",
-                    backend.url,
-                    failure.error,
-                );
-
-                tried.push(backend.url.to_string());
-                let next = match host {
-                    Some((h, port)) => {
-                        config
-                            .get_backend_with_acl_excluding(h, path, port, acl.as_deref(), &tried)
-                            .await
-                    }
-                    None => BackendLookup::NoRoute,
-                };
-                match next.backend() {
-                    Some(info) => backend = info,
-                    // Nobody else to ask. The failure is the answer: the pool
-                    // being empty is a consequence of it, not a new fact.
-                    None => break Err(failure),
-                }
-
-                if !backoff.is_zero() {
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        };
-
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Ok(summary) => {
-            metrics::METRICS.record_request(summary.status, elapsed_ms);
-            // The same number the log line below prints, taken from the same
-            // place, rather than counted again off the wire. `crate::http`
-            // knows how much of a response reached the client — it has to, the
-            // access log says so — and it counts only what landed, including
-            // the partial answer when a stream died mid-body.
-            metrics::METRICS.record_bytes_sent(summary.bytes_sent as u64);
-            span.record("status", summary.status as u64);
-            crate::log::log_access(
-                request_id,
-                peer,
-                &method,
-                &request_target,
-                summary.status,
-                elapsed_ms,
-                summary.bytes_sent,
-                Some(&who),
-            );
-            Ok(())
         }
-        Err(failure) => {
-            // What the client was actually told, when it was told anything. A
-            // failure after the head went out is not a 502 — the backend
-            // answered and part of the answer arrived — and logging it as one
-            // sends whoever reads the log looking for a broken backend.
-            let (status, bytes_sent) = match failure.partial {
-                Some(partial) => (partial.status, partial.bytes_sent),
-                None => (502, 0),
-            };
-            metrics::METRICS.record_request(status, elapsed_ms);
-            // Same source, same reason, including that there may have been no
-            // partial answer at all: nothing was served, so nothing is counted.
-            metrics::METRICS.record_bytes_sent(bytes_sent as u64);
-            span.record("status", status as u64);
-            crate::log::log_access(
-                request_id,
-                peer,
-                &method,
-                &request_target,
-                status,
-                elapsed_ms,
-                bytes_sent,
-                Some(&who),
-            );
-            Err(failure.error)
-        }
+
+        StreamKind::Request => {}
     }
+
+    // A request. The bytes that were read are part of it, so they are handed
+    // back and hyper reads the head from the beginning — nothing is parsed
+    // twice and nothing is lost.
+    //
+    // The head's budget is what is left of it: the head is bounded from the
+    // moment the stream opened, and the first bytes have already taken some
+    // of that.
+    let head_timeout = budgets.head_left();
+    let ctx = Arc::new(crate::http::server::Context {
+        config,
+        clients,
+        peer: peer.to_string(),
+        acl,
+        request_id: request_id.to_string(),
+        who,
+    });
+    crate::http::server::serve(send, recv, first, head_timeout, ctx).await
 }
-
-// Both of these used to be constants, at exactly the values `[timeouts]`
-// defaults to. They are not the client's bytes or its own handshake, they are
-// the backend's: dialing it, and waiting for it to answer — which is what
-// `connect` and `response` already mean for a plain HTTP request. Leaving them
-// out would make the same two waits configurable for one kind of request and not
-// another, which nobody reading the config could guess.
-
-/// The upgrade request as it goes to the backend.
-///
-/// The path is the one the route rewrote it to: a route that names a
-/// `path_rewrite` means it for every request it serves, and an upgrade is a
-/// request too. The plaintext listener answers an upgrade with 426, so this
-/// is the only place a WebSocket is ever served — and it used to forward the
-/// path the client asked for, without the rewrite.
-///
-/// The headers are the client's own, minus the `Host`, which is rewritten to
-/// the one the client asked for — the backend answers on the name the client
-/// used, not on the name it is reached by.
-fn build_websocket_upgrade_request(
-    req: &Request<()>,
-    backend_info: &BackendInfo,
-    backend_host: &str,
-) -> Vec<u8> {
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(req.uri().path());
-    let path = backend_info.rewritten_path(path);
-
-    let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), path);
-
-    let original_host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| backend_host.to_string());
-
-    let mut request_buf = Vec::new();
-    request_buf.extend_from_slice(request_line.as_bytes());
-    request_buf.extend_from_slice(b"Host: ");
-    request_buf.extend_from_slice(original_host.as_bytes());
-    request_buf.extend_from_slice(b"\r\n");
-
-    for (name, value) in req.headers() {
-        if name.as_str().to_lowercase() == "host" {
-            continue;
-        }
-        if !forwards_websocket_header(name.as_str()) {
-            continue;
-        }
-        request_buf.extend_from_slice(name.as_str().as_bytes());
-        request_buf.extend_from_slice(b": ");
-        request_buf.extend_from_slice(value.as_bytes());
-        request_buf.extend_from_slice(b"\r\n");
-    }
-    request_buf.extend_from_slice(b"\r\n");
-
-    request_buf
-}
-
-/// Whether a header may be forwarded in a WebSocket upgrade request.
-///
-/// The hop-by-hop set, except for the two the upgrade is made of: switching
-/// protocols is exactly what this request is asking the backend for, so
-/// `upgrade` and `connection` have to reach it.
-///
-/// Everything else goes — the proxy authentication headers most of all,
-/// because they are a credential for *this* proxy and the backend has no
-/// business seeing them.
-fn forwards_websocket_header(name: &str) -> bool {
-    ![
-        "proxy-connection",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "keep-alive",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "expect",
-    ]
-    .iter()
-    .any(|hop| name.eq_ignore_ascii_case(hop))
-}
-
-/// How much of a WebSocket's stream is moved at a time.
-///
-/// The HTTP path coalesces into 64 KiB before it writes; the WebSocket path
-/// used to move 8 KiB at a time, which is one QUIC frame and one wake-up for
-/// every 8 KiB of the stream.
-const WS_COPY_BUFFER: usize = 64 * 1024;
 
 /// The current time in milliseconds, from a fixed base.
 ///
@@ -940,266 +450,11 @@ const WS_COPY_BUFFER: usize = 64 * 1024;
 /// interval, and the wall clock can step. A step backwards would suspend the
 /// bound — the session would never be found quiet — and a step forwards
 /// would end a session that was still carrying traffic.
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     static BASE: OnceLock<std::time::Instant> = OnceLock::new();
     let base = BASE.get_or_init(std::time::Instant::now);
     base.elapsed().as_millis() as u64
 }
-
-/// Returns the status the client was answered with: 101 once the tunnel is up,
-/// or whatever the backend answered when it refused the upgrade. Bytes are the
-/// handshake response only — once both directions are piped the session has no
-/// finite length to report.
-async fn handle_websocket_stream(
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-    req: &Request<()>,
-    clients: &BackendClients,
-    backend_info: &BackendInfo,
-    timeouts: Timeouts,
-) -> Result<http::ProxySummary, http::ProxyFailure> {
-    let backend_url = &*backend_info.url;
-    let protocol = backend_info.protocol;
-    let url =
-        url::Url::parse(backend_url).map_err(|e| anyhow::anyhow!("invalid backend URL: {}", e))?;
-
-    if protocol == BackendProtocol::H2c {
-        // A WebSocket upgrade is HTTP/1.1. A route that speaks h2c has told
-        // the server its backend starts with HTTP/2's connection preface, and
-        // there is no way to carry an HTTP/1.1 upgrade on that connection.
-        return Err(http::ProxyFailure::from(anyhow::anyhow!(
-            "backend {backend_url} is reached with backend_protocol = \"h2c\", which cannot \
-             carry a WebSocket upgrade; use an http:// or https:// backend that speaks HTTP/1.1"
-        )));
-    }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("backend URL missing host"))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-
-    // Not the pooled HTTP client: a WebSocket holds one dedicated connection
-    // for the whole session, so this dial is its own, with the same deadline.
-    // It is still the same trust store: an https:// backend is reached over a
-    // TLS session this process originates and verifies, exactly as the pooled
-    // clients do.
-    let mut backend_stream = clients
-        .connect_stream(backend_url, timeouts.connect)
-        .await
-        .map_err(|e| http::ProxyFailure::unanswered(e, http::Retryability::Always))?;
-
-    let request_buf = build_websocket_upgrade_request(req, backend_info, host);
-
-    backend_stream.write_all(&request_buf).await.map_err(|e| {
-        http::ProxyFailure::unanswered(
-            anyhow::anyhow!("failed to write the WebSocket upgrade: {e}"),
-            http::Retryability::Always,
-        )
-    })?;
-
-    let mut response_buf = Vec::with_capacity(8192);
-    let mut trailing_ws_data = Vec::new();
-    let mut read_buf = [0u8; 8192];
-    // See the request loop: the handshake response arrives in reads of its
-    // own, and the marker is only ever in the part that has not been scanned.
-    let mut searched = 0usize;
-
-    let read_handshake = async {
-        loop {
-            match backend_stream.read(&mut read_buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    response_buf.extend_from_slice(&read_buf[..n]);
-
-                    if let Some(pos) = find_headers_end(&response_buf, searched) {
-                        let headers_end = pos + 4;
-                        if response_buf.len() > headers_end {
-                            trailing_ws_data.extend_from_slice(&response_buf[headers_end..]);
-                        }
-                        response_buf.truncate(headers_end);
-                        break;
-                    }
-
-                    searched = response_buf.len().saturating_sub(3);
-
-                    if response_buf.len() > 64 * 1024 {
-                        tracing::warn!("WebSocket handshake response too large");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to read from backend stream: {}", e);
-                    return Err(anyhow::anyhow!(
-                        "failed to read the handshake response: {}",
-                        e
-                    ));
-                }
-            }
-        }
-        Ok(())
-    };
-
-    match tokio::time::timeout(timeouts.response, read_handshake).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return Err(http::ProxyFailure::unanswered(
-                e,
-                http::Retryability::Always,
-            ));
-        }
-        Err(_) => {
-            return Err(http::ProxyFailure::unanswered(
-                anyhow::anyhow!(
-                    "backend {}:{} did not answer the WebSocket handshake within {:?}",
-                    host,
-                    port,
-                    timeouts.response
-                ),
-                http::Retryability::Always,
-            ));
-        }
-    }
-
-    let response = http::parse_http_response_legacy(&response_buf)?;
-    let handshake_bytes = response_buf.len() + trailing_ws_data.len();
-    if response.status().as_u16() == 101 {
-        tracing::debug!("WebSocket handshake successful with backend");
-        send.write_all(&response_buf).await.map_err(|e| {
-            http::ProxyFailure::from(anyhow::anyhow!(
-                "failed to write the WebSocket handshake: {e}"
-            ))
-        })?;
-        if !trailing_ws_data.is_empty() {
-            tracing::debug!(
-                "WebSocket handshake response contained {} trailing bytes",
-                trailing_ws_data.len()
-            );
-            send.write_all(&trailing_ws_data).await.map_err(|e| {
-                http::ProxyFailure::from(anyhow::anyhow!(
-                    "failed to write the WebSocket handshake: {e}"
-                ))
-            })?;
-        }
-
-        let (backend_read, mut backend_write) = tokio::io::split(backend_stream);
-
-        // How long the session may be **quiet** — with both sides quiet at
-        // once. A WebSocket that is idle in one direction is still a
-        // WebSocket: a client that only listens to a feed the backend keeps
-        // pushing has nothing to say, and a gap in one direction must not end
-        // a session the other direction is still using. What ends it is the
-        // case the copy loop used to wait for for ever — neither side has
-        // moved for a whole window.
-        let idle = timeouts.deadlines.response_idle;
-
-        // When the last byte moved on this tunnel, in milliseconds since the
-        // epoch. Both directions write to it, and a direction that has been
-        // quiet for a whole window reads it to find out whether the other one
-        // is still talking.
-        let last_traffic = Arc::new(AtomicU64::new(now_millis()));
-
-        let iroh_to_backend = async {
-            // **64 KiB**, like the HTTP path's coalescing buffer: the copy
-            // loop used to move 8 KiB at a time, which is one QUIC frame and
-            // one wake-up for every 8 KiB of a stream.
-            let mut buf = vec![0u8; WS_COPY_BUFFER];
-            loop {
-                match tokio::time::timeout(idle, recv.read(&mut buf)).await {
-                    Ok(Ok(None)) => return "iroh_finished",
-                    Ok(Ok(Some(n))) => {
-                        last_traffic.store(now_millis(), Ordering::Relaxed);
-                        if let Err(e) = backend_write.write_all(&buf[..n]).await {
-                            tracing::debug!("WebSocket backend write failed: {}", e);
-                            return "backend_write_error";
-                        }
-                        crate::metrics::METRICS.record_bytes_received(n as u64);
-                    }
-                    Ok(Err(_)) => return "iroh_read_error",
-                    Err(_) => {
-                        // This direction has been quiet for a whole window. The
-                        // session ends when nothing has moved in either
-                        // direction for that long; until then the other side is
-                        // still using it.
-                        let quiet_for =
-                            now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
-                        if quiet_for >= idle.as_millis() as u64 {
-                            return "idle";
-                        }
-                        // The other side is still talking: wait for more, with
-                        // the window measured from now.
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let backend_to_iroh = async {
-            let mut buf = vec![0u8; WS_COPY_BUFFER];
-            let mut backend_read = backend_read;
-            loop {
-                match tokio::time::timeout(idle, backend_read.read(&mut buf)).await {
-                    Ok(Ok(0)) => return "backend_finished",
-                    Ok(Ok(n)) => {
-                        last_traffic.store(now_millis(), Ordering::Relaxed);
-                        if let Err(e) = send.write_all(&buf[..n]).await {
-                            tracing::debug!("WebSocket iroh write failed: {}", e);
-                            return "iroh_write_error";
-                        }
-                        crate::metrics::METRICS.record_bytes_sent(n as u64);
-                    }
-                    Ok(Err(_)) => return "backend_read_error",
-                    Err(_) => {
-                        // The same bound as the other direction, and the same
-                        // reading of it: a quiet direction does not end a
-                        // session the other one is still using.
-                        let quiet_for =
-                            now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
-                        if quiet_for >= idle.as_millis() as u64 {
-                            return "idle";
-                        }
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let (closed_direction, close_reason) = tokio::select! {
-            reason = iroh_to_backend => ("iroh_to_backend", reason),
-            reason = backend_to_iroh => ("backend_to_iroh", reason),
-        };
-        tracing::debug!(
-            "WebSocket tunnel closed first by {}, reason: {}",
-            closed_direction,
-            close_reason
-        );
-    } else {
-        tracing::debug!(
-            "WebSocket handshake failed with backend, status: {}",
-            response.status()
-        );
-        send.write_all(&response_buf).await.map_err(|e| {
-            http::ProxyFailure::from(anyhow::anyhow!(
-                "failed to write the WebSocket handshake: {e}"
-            ))
-        })?;
-        send.finish().map_err(|e| {
-            http::ProxyFailure::from(anyhow::anyhow!(
-                "failed to finish the WebSocket stream: {e}"
-            ))
-        })?;
-
-        return Ok(http::ProxySummary {
-            status: response.status().as_u16(),
-            bytes_sent: response_buf.len(),
-        });
-    }
-
-    Ok(http::ProxySummary {
-        status: 101,
-        bytes_sent: handshake_bytes,
-    })
-}
-
 fn get_connection_type(path: &iroh::endpoint::Path<'_>) -> &'static str {
     if path.is_ip() {
         "Direct"
@@ -2873,8 +2128,8 @@ pub async fn handle_connection(
                     if let Err(e) = handle_bidi_stream(
                         send,
                         recv,
-                        &config_clone,
-                        &clients_clone,
+                        config_clone,
+                        clients_clone,
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,
@@ -2972,10 +2227,10 @@ pub async fn handle_incoming(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthState, EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamHead,
-        blocking_config_write, build_websocket_upgrade_request, constant_time_eq,
-        count_enrollment_failure, enrollment_verdict, find_headers_end, issue_enrolled_secret,
-        persist_auth_state, read_stream_head, undo_enrolled_secret,
+        AuthState, EnrollmentSlot, EnrollmentVerdict, IssuedCredential, StreamBudgets, StreamKind,
+        blocking_config_write, classify, constant_time_eq, count_enrollment_failure,
+        enrollment_verdict, find_headers_end, issue_enrolled_secret, persist_auth_state,
+        read_first_bytes, undo_enrolled_secret,
     };
     use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
     use nexapipe_proto::protocol::Protocol;
@@ -3041,9 +2296,14 @@ mod tests {
         StreamBudgets::new(&deadlines, tokio::time::Instant::now())
     }
 
-    /// A head that is finished, and the bytes that came with it.
+    /// The first bytes are handed on as they came.
+    ///
+    /// They are not consumed: a request's first byte is part of the request,
+    /// and the codec that reads the head has to see it. The reader hands them
+    /// back, and the request path puts them in front of the rest of the
+    /// stream, so the head is read from the beginning.
     #[tokio::test]
-    async fn a_finished_head_is_a_request() {
+    async fn the_first_bytes_are_handed_on_as_they_came() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -3052,70 +2312,32 @@ mod tests {
                 .await;
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
+        let bytes = read_first_bytes(&mut server, &generous_budgets())
             .await
-            .expect("the head");
+            .expect("the bytes")
+            .expect("the peer said something");
 
-        match head {
-            StreamHead::Request { head, body } => {
-                assert!(head.ends_with(b"\r\n\r\n"), "the head is not finished");
-                assert_eq!(body, b"BODY", "the bytes after the head were lost");
-            }
-            other => panic!("expected a request, got {other:?}"),
-        }
+        assert_eq!(
+            bytes,
+            b"GET /x HTTP/1.1\r\nHost: a.example\r\n\r\nBODY".to_vec(),
+            "the bytes were changed"
+        );
     }
 
-    /// A head over the limit is refused, not parsed.
+    /// A peer that says nothing at all is gone.
     ///
-    /// It used to be parsed: the read loop broke out of it with a head that
-    /// was never finished, and the parser read every line of that as a header
-    /// — the last one truncated — and the request was forwarded to a backend.
-    /// The log said "headers too large" and the backend was asked anyway.
+    /// There is nobody to answer, and what arrived is not a request: it used
+    /// to be parsed as one, so half a request line became a header.
     #[tokio::test]
-    async fn a_head_over_the_limit_is_refused() {
-        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            // A request line and then headers that never end.
-            let mut bytes = b"GET /x HTTP/1.1\r\n".to_vec();
-            while bytes.len() < 128 * 1024 {
-                bytes.extend_from_slice(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
-            }
-            let _ = client.write_all(&bytes).await;
-        });
+    async fn a_peer_that_says_nothing_is_gone() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        drop(client);
 
-        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
+        let bytes = read_first_bytes(&mut server, &generous_budgets())
             .await
-            .expect("the head");
+            .expect("the bytes");
 
-        match head {
-            StreamHead::TooLarge(size) => assert!(size > 64 * 1024),
-            other => panic!("expected the head to be refused, got {other:?}"),
-        }
-    }
-
-    /// A peer that goes away before the head is finished did not send a
-    /// request. It used to be parsed and forwarded anyway, so half a request
-    /// line became a header.
-    #[tokio::test]
-    async fn a_head_the_peer_abandoned_is_not_a_request() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = client
-                .write_all(b"GET /x HTTP/1.1\r\nHost: a.example\r\n")
-                .await;
-            drop(client);
-        });
-
-        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
-            .await
-            .expect("the head");
-
-        match head {
-            StreamHead::Incomplete => {}
-            other => panic!("expected no request, got {other:?}"),
-        }
+        assert!(bytes.is_none(), "expected no bytes at all, got {bytes:?}");
     }
 
     /// The first byte says which protocol a stream carries, and it says it
@@ -3129,20 +2351,16 @@ mod tests {
             let _ = client.write_all(&[0x05, 0x01, 0x01, 0x00]).await;
         });
 
-        let head = read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
+        let bytes = read_first_bytes(&mut server, &generous_budgets())
             .await
-            .expect("the head");
+            .expect("the bytes")
+            .expect("the peer said something");
 
-        match head {
-            StreamHead::Other(bytes) => {
-                assert_eq!(
-                    bytes,
-                    vec![0x05, 0x01, 0x01, 0x00],
-                    "the bytes were changed"
-                );
-            }
-            other => panic!("expected the preface to be handed on, got {other:?}"),
-        }
+        assert_eq!(
+            bytes,
+            vec![0x05, 0x01, 0x01, 0x00],
+            "the bytes were changed"
+        );
     }
 
     /// **The protocol the connection named decides what the stream is.**
@@ -3156,91 +2374,35 @@ mod tests {
     /// This is the whole point of choosing the protocol at the handshake: the
     /// server does not have to guess, and a stream that is not what the
     /// connection said it is does not get served as if it were.
-    #[tokio::test]
-    async fn the_named_protocol_decides_what_the_stream_is() {
+    #[test]
+    fn the_named_protocol_decides_what_the_stream_is() {
         let preface = b"\x05\x01\x01\x00";
 
-        // A connection that named L4 hands the bytes on.
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = client.write_all(preface).await;
-        });
-        match read_stream_head(&mut server, &generous_budgets(), Protocol::L4)
-            .await
-            .expect("the head")
-        {
-            StreamHead::Other(bytes) => assert_eq!(
-                bytes,
-                preface.to_vec(),
-                "the bytes are handed on as they came"
-            ),
-            other => panic!("expected the bytes to be handed on, got {other:?}"),
-        }
+        // A connection that named L4 is a tunnel.
+        assert_eq!(classify(Protocol::L4, preface), StreamKind::L4);
 
-        // A connection that named HTTP reads them as a request — which they
-        // are not, and which is refused.
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = client.write_all(preface).await;
-            drop(client);
-        });
-        match read_stream_head(&mut server, &generous_budgets(), Protocol::Http)
-            .await
-            .expect("the head")
-        {
-            StreamHead::Incomplete => {}
-            StreamHead::Other(_) => {
-                panic!("a connection that named HTTP was served a tunnel anyway")
-            }
-            other => panic!("expected the preface not to be a request, got {other:?}"),
-        }
+        // A connection that named TLS is a TLS session.
+        assert_eq!(classify(Protocol::Tls, preface), StreamKind::Tls);
 
-        // A connection that named nothing is served the way it always was.
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = client.write_all(preface).await;
-        });
-        match read_stream_head(&mut server, &generous_budgets(), Protocol::Legacy)
-            .await
-            .expect("the head")
-        {
-            StreamHead::Other(bytes) => assert_eq!(
-                bytes,
-                preface.to_vec(),
-                "the first byte decides, and it says L4"
-            ),
-            other => panic!("expected the bytes to be handed on, got {other:?}"),
-        }
-    }
+        // A connection that named HTTP is a request — even when the bytes say
+        // otherwise, because that connection is not going to be sent a tunnel.
+        assert_eq!(classify(Protocol::Http, preface), StreamKind::Request);
 
-    /// A connection that named the TLS protocol is not served a request.
-    ///
-    /// A TLS session is not a request, and the ClientHello that starts it is
-    /// not a request line — on a connection that named the protocol, the
-    /// server does not have to read the first byte to find that out.
-    #[tokio::test]
-    async fn a_connection_that_named_tls_is_not_read_as_a_request() {
-        let hello = [0x16u8, 0x03, 0x01, 0x00, 0x05];
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = client.write_all(&hello).await;
-        });
+        // A connection that named nothing is served the way it always was:
+        // the first byte decides, and this first byte says L4.
+        assert_eq!(classify(Protocol::Legacy, preface), StreamKind::L4);
 
-        match read_stream_head(&mut server, &generous_budgets(), Protocol::Tls)
-            .await
-            .expect("the head")
-        {
-            StreamHead::Other(bytes) => assert_eq!(
-                bytes,
-                hello.to_vec(),
-                "the ClientHello is handed on as it came"
-            ),
-            other => panic!("expected the ClientHello to be handed on, got {other:?}"),
-        }
+        // A ClientHello is a TLS session.
+        assert_eq!(
+            classify(Protocol::Legacy, &[0x16, 0x03, 0x01]),
+            StreamKind::Tls
+        );
+
+        // And a request line is a request.
+        assert_eq!(
+            classify(Protocol::Legacy, b"GET / HTTP/1.1\r\n"),
+            StreamKind::Request
+        );
     }
 
     #[test]
@@ -3755,122 +2917,5 @@ mod tests {
             },
         );
         cfg
-    }
-
-    /// A route table whose route rewrites the paths under `pattern`.
-    ///
-    /// The rewrite is what a route pairs a `path_pattern` with: the paths
-    /// that match are served somewhere else, and `{}` in the rewrite is where
-    /// the matched part goes.
-    fn route_table_with_rewrite(
-        pattern: &str,
-        rewrite: &str,
-    ) -> std::sync::Arc<crate::routes::RoutingTable> {
-        let timeouts = crate::config::Timeouts {
-            connect: std::time::Duration::from_secs(1),
-            response: std::time::Duration::from_secs(1),
-            deadlines: crate::deadline::Deadlines::default(),
-        };
-        let route = crate::routes::Route::new(
-            "rewrite.test",
-            pattern,
-            true,
-            vec!["http://127.0.0.1:9".to_string()],
-            crate::lb::LoadBalancingStrategy::RoundRobin,
-            crate::config::RouteMode::Http,
-            Some(rewrite.to_string()),
-        );
-        std::sync::Arc::new(crate::routes::RoutingTable::with_settings(
-            vec![route],
-            timeouts,
-            crate::config::Retry {
-                attempts: 1,
-                backoff: std::time::Duration::ZERO,
-            },
-        ))
-    }
-
-    /// A WebSocket upgrade goes out with the route's rewritten path.
-    ///
-    /// The upgrade is a request like any other, and a route that names a
-    /// `path_rewrite` means it for every request it serves. The plaintext
-    /// listener answers an upgrade with 426 and never gets that far, so the
-    /// tunnel is the only place a WebSocket is served — and it used to
-    /// forward the path the client asked for, without the rewrite. A route
-    /// that named one therefore looked configured and did nothing for every
-    /// WebSocket client.
-    #[tokio::test]
-    async fn a_websocket_upgrade_goes_out_with_the_rewritten_path() {
-        let config = route_table_with_rewrite("/api", "/v2{}");
-
-        let backend_info = config
-            .get_backend_with_acl("rewrite.test", "/api/socket", None, None)
-            .await
-            .backend()
-            .expect("a route for the host");
-
-        let request = ::http::Request::builder()
-            .method("GET")
-            .uri("http://rewrite.test/api/socket")
-            .header("host", "rewrite.test")
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .body(())
-            .expect("a request");
-
-        let request_buf = build_websocket_upgrade_request(&request, &backend_info, "127.0.0.1");
-
-        let request_line = String::from_utf8_lossy(&request_buf)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(
-            request_line, "GET /v2/socket HTTP/1.1",
-            "the upgrade did not go out with the route's rewritten path"
-        );
-    }
-
-    /// The upgrade is the point of the request, so `upgrade` and `connection`
-    /// have to reach the backend — and a credential for *this* proxy must not.
-    #[tokio::test]
-    async fn a_websocket_upgrade_carries_the_upgrade_and_not_the_proxy_credential() {
-        let config = route_table_with_rewrite("/api", "/v2{}");
-
-        let backend_info = config
-            .get_backend_with_acl("rewrite.test", "/api/socket", None, None)
-            .await
-            .backend()
-            .expect("a route for the host");
-
-        let request = ::http::Request::builder()
-            .method("GET")
-            .uri("http://rewrite.test/api/socket")
-            .header("host", "rewrite.test")
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .header("proxy-authorization", "Basic c2VjcmV0")
-            .header("proxy-authenticate", "Basic")
-            .header("proxy-connection", "keep-alive")
-            .body(())
-            .expect("a request");
-
-        let request_buf = build_websocket_upgrade_request(&request, &backend_info, "127.0.0.1");
-        let sent = String::from_utf8_lossy(&request_buf).to_ascii_lowercase();
-
-        assert!(sent.contains("upgrade: websocket"), "{sent}");
-        assert!(sent.contains("connection: upgrade"), "{sent}");
-        assert!(sent.contains("sec-websocket-key:"), "{sent}");
-        for leaked in [
-            "proxy-authorization",
-            "proxy-authenticate",
-            "proxy-connection",
-        ] {
-            assert!(
-                !sent.contains(leaked),
-                "{leaked} reached the backend:\n{sent}"
-            );
-        }
     }
 }

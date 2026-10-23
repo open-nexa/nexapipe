@@ -42,6 +42,8 @@ rustls.workspace = true
 chrono = { version = '0.4.45', features = ['serde'] }
 futures-util.workspace = true
 hyper.workspace = true
+# The timer hyper measures its deadlines with, written the way hyper documents it.
+pin-project-lite = "0.2"
 hyper-util.workspace = true
 http-body-util.workspace = true
 # TLS towards the backends: a route may name an `https://` backend, and this

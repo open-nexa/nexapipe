@@ -16,22 +16,44 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use hyper::rt::ReadBufCursor;
+use hyper::rt::{Read, ReadBufCursor, Write};
+use pin_project_lite::pin_project;
+use tokio::io::AsyncRead;
 
 /// An iroh bi-stream seen as hyper's IO.
-pub struct IrohIo {
+///
+/// The read half is generic because it is not always the bare stream: a
+/// connection that did not say what it carries has its first byte read to find
+/// out, and that byte belongs to the request — so it is handed back with
+/// [`Replay`], and the codec reads the head from the beginning.
+pub struct IrohIo<R = iroh::endpoint::RecvStream> {
     send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+    recv: R,
 }
 
-impl IrohIo {
+impl IrohIo<iroh::endpoint::RecvStream> {
     /// The two halves of one bi-stream.
     pub fn new(send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream) -> Self {
         IrohIo { send, recv }
     }
 }
 
-impl hyper::rt::Read for IrohIo {
+impl<R> IrohIo<R> {
+    /// The two halves of one bi-stream, read through something else.
+    pub fn reading_through(send: iroh::endpoint::SendStream, recv: R) -> Self {
+        IrohIo { send, recv }
+    }
+}
+
+// The read half is never pinned into: it is read through `Pin::new`, which
+// needs it to be `Unpin` on its own. So the adapter is `Unpin` whatever it
+// carries.
+impl<R> Unpin for IrohIo<R> {}
+
+impl<R> hyper::rt::Read for IrohIo<R>
+where
+    R: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -68,7 +90,7 @@ impl hyper::rt::Read for IrohIo {
     }
 }
 
-impl hyper::rt::Write for IrohIo {
+impl<R> hyper::rt::Write for IrohIo<R> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -87,6 +109,168 @@ impl hyper::rt::Write for IrohIo {
 
     fn is_write_vectored(&self) -> bool {
         false
+    }
+}
+
+/// A stream that hands back the bytes that were already read, and then the rest.
+///
+/// The first byte of a tunnel stream says what the stream carries, so it has
+/// to be read before anything else can be done with it. If it turns out to be
+/// a request, that byte is **part of the request**: the codec reads the head
+/// from the beginning, and a head that starts one byte later is a different
+/// request. So the bytes are given back first, unchanged, and the stream
+/// itself is read from where it was.
+pub struct Replay<R> {
+    /// The bytes that are given back first.
+    prefix: Vec<u8>,
+    /// How much of the prefix has been given back.
+    given: usize,
+    /// The stream itself.
+    inner: R,
+}
+
+impl<R> Replay<R> {
+    /// The bytes to hand back, and the stream they came from.
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Replay {
+            prefix,
+            given: 0,
+            inner,
+        }
+    }
+}
+
+impl<R> AsyncRead for Replay<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.given < this.prefix.len() {
+            let room = buf.remaining();
+            if room == 0 {
+                // The reader asked for no bytes at all. The prefix is still
+                // there, so this is not an end of stream — but there is
+                // nowhere to put it either, and a reader that asks for nothing
+                // has to ask again.
+                return Poll::Pending;
+            }
+            let take = room.min(this.prefix.len() - this.given);
+            buf.put_slice(&this.prefix[this.given..this.given + take]);
+            this.given += take;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+/// The timer hyper's deadlines are measured against.
+///
+/// Hyper does not ship one: it says what a runtime has to provide, and
+/// tokio's is what this process has. The head's deadline is the one that
+/// matters here — a peer that opens a stream and sends nothing must not hold
+/// the slot forever — and hyper measures it with this.
+#[derive(Clone, Copy, Debug)]
+pub struct TokioTimer;
+
+impl hyper::rt::Timer for TokioTimer {
+    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: tokio::time::sleep(duration),
+        })
+    }
+
+    fn sleep_until(&self, deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: tokio::time::sleep_until(deadline.into()),
+        })
+    }
+}
+
+pin_project! {
+    struct TokioSleep {
+        #[pin]
+        inner: tokio::time::Sleep,
+    }
+}
+
+impl std::future::Future for TokioSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx)
+    }
+}
+
+impl hyper::rt::Sleep for TokioSleep {}
+
+/// The other side of an upgrade, as tokio's IO.
+///
+/// Once the `101` is written the connection stops being HTTP and becomes
+/// bytes, and hyper hands those bytes over through its own traits. The copy
+/// loop that moves them is tokio's, so the two are bridged here — the same
+/// job [`IrohIo`] does in the other direction.
+pub struct UpgradedIo {
+    inner: hyper::upgrade::Upgraded,
+}
+
+impl UpgradedIo {
+    /// The stream hyper handed over.
+    pub fn new(inner: hyper::upgrade::Upgraded) -> Self {
+        Self { inner }
+    }
+}
+
+impl tokio::io::AsyncRead for UpgradedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // Hyper's cursor is over the part of the buffer that is not filled
+        // yet, and it is told how much was read afterwards.
+        let filled = {
+            // SAFETY: the unfilled part of the buffer is exactly the memory
+            // hyper is about to fill, and the cursor is told afterwards how
+            // much of it was.
+            let unfilled = unsafe { buf.unfilled_mut() };
+            let mut hyper_buf = hyper::rt::ReadBuf::uninit(unfilled);
+            let cursor = hyper_buf.unfilled();
+            match Pin::new(&mut this.inner).poll_read(cx, cursor) {
+                Poll::Ready(Ok(())) => hyper_buf.filled().len(),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        // The bytes hyper read are in the buffer, and `filled` is how many of
+        // them there are.
+        buf.advance(filled);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for UpgradedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 

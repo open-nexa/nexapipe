@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-one things land in this cycle so far: the device credential can be a **key**
+Thirty-two things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -49,8 +49,9 @@ a name with a control byte in front of it, a UDP flow's queue is bounded by
 bytes rather than only by datagrams, the local proxy holds two buffers per
 connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
-handshake, the protocol is chosen at the handshake, and the pool's ceiling
-is counted per protocol.
+handshake, the protocol is chosen at the handshake, the pool's ceiling
+is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
+codec.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -795,6 +796,34 @@ lookup, which is what a config written before the key existed does.
   **110 KiB** of heap, both ends of it together. That is the trade for a
   server that knows what it is serving, and it is the thing the next step
   (the tunnel path using hyper's own HTTP/1 codec) is worth.
+
+- **The tunnel path runs on hyper's own HTTP/1 codec.** The path every client
+  actually uses had **two** HTTP/1 implementations: hyper's, for the
+  connections that named the HTTP protocol at the handshake, and a
+  hand-written one for everything else. The two did not agree — on framing, on
+  what a refusal looked like, on which headers reached the backend — and the
+  hand-written one was the older and the larger. It is gone: the request
+  parser, the chunked decoder, the streaming body, the response writer and the
+  WebSocket upgrade — about 1 700 lines of it. The head, the body and the
+  answer are hyper's now, so the bytes on the wire are the bytes every other
+  HTTP server sends.
+
+  Three of the rules the hand-written path had are not HTTP's, and they are
+  kept. A body that declares **no** length is read whole, and the backend is
+  sent it with a length of its own: the framing was the client's, and a
+  backend that only knows `content-length` cannot read a chunked request. A
+  body that declares a length is still **streamed**, so an upload of any size
+  costs a buffer rather than a copy of the upload. And the body is bounded
+  either way — a declared length is checked against the limit before a byte
+  of it is read.
+
+  A request that names **more than one** host is refused with a 400. Hyper
+  accepts two `Host` headers and passes them both on, while the route and
+  the access check read the first one, so the host that was authorised and
+  the host that would be served would be two different hosts.
+
+  The refusals are the codec's own now: a head over 64 KiB is a 431, a head
+  that never finishes is a 408, and a request hyper cannot parse is a 400.
 
 ### Changed
 

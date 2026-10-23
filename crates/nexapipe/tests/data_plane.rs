@@ -544,8 +544,8 @@ async fn spawn_proxy_with_timeouts(
                     let _ = conn::handle_bidi_stream(
                         send,
                         recv,
-                        &config,
-                        &clients,
+                        config.clone(),
+                        clients.clone(),
                         &limiter,
                         "data-plane-test",
                         None,
@@ -1263,6 +1263,50 @@ async fn a_tunneled_request_whose_body_was_read_is_not_tried_again() {
     );
 }
 
+/// **A WebSocket over the connection that named the HTTP protocol.**
+///
+/// The same upgrade the legacy path carries, over a connection that said what
+/// it carries: hyper's own codec hands the connection over when the `101` is
+/// written, and the session that follows is two byte streams moved either way.
+#[tokio::test]
+async fn a_websocket_over_the_named_http_protocol() {
+    use nexapipe_proto::protocol::ALPN_HTTP;
+
+    let backend = spawn_websocket_backend(Duration::from_millis(50)).await;
+    let proxy = spawn_proxy_that_reads_the_protocol(vec![http_route("ws.test", &backend)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr.clone(), ALPN_HTTP).await;
+
+    let (_send, mut recv) = tunnel
+        .upgrade_and_keep_open(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: ws.test\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    let Ok(Ok(Some(n))) = read else {
+        panic!("the upgrade never came back");
+    };
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected the backend's upgrade, got {head:?}"
+    );
+
+    // The session is what the upgrade is for: the backend keeps pushing, and
+    // the bytes have to reach the client.
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await;
+    let Ok(Ok(Some(n))) = read else {
+        panic!("the session carried nothing");
+    };
+    assert!(n > 0, "the session carried no bytes");
+}
+
 /// A WebSocket owns its connection, but an `https://` backend is still reached
 /// over a TLS session the proxy originates and verifies.
 #[tokio::test]
@@ -1637,6 +1681,72 @@ async fn a_request_with_more_than_one_host_is_refused() {
     let backend = spawn_backend("never").await;
     let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange(b"GET / HTTP/1.1\r\nHost: app.test\r\nHost: internal.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).contains("400"),
+        "a request with two hosts should be answered with 400, got {:?}",
+        status_of(&reply)
+    );
+    assert!(
+        backend.seen().is_empty(),
+        "a request that names two hosts must not reach a backend: the host that was \
+         authorised and the host that would be served are two different hosts"
+    );
+}
+
+/// **The first byte of a request is part of the request.**
+///
+/// The old ALPN does not say what a stream carries, so the server reads the
+/// first byte to find out. When it turns out to be a request, that byte is
+/// part of the request — and the codec reads the head from the beginning, so
+/// a head that started one byte later would be a different request.
+///
+/// The byte is written on its own here, so the read that finds out what the
+/// stream carries is a read of one byte and nothing else, and the rest of
+/// the head arrives after it.
+#[tokio::test]
+async fn the_first_byte_of_a_request_is_part_of_the_request() {
+    let backend = spawn_backend("done").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange_split(&[b"G", b"ET / HTTP/1.1\r\nHost: app.test\r\n\r\n"])
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "expected a 200, got {:?}",
+        status_of(&reply)
+    );
+
+    let seen = backend.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].request_line, "GET / HTTP/1.1",
+        "the request the backend saw is not the one the client sent"
+    );
+}
+
+/// A request that names more than one host is refused on the named protocol
+/// too.
+///
+/// The two listeners used to differ here: the plaintext one caught it, and
+/// the tunnel one did not — because the tunnel path parsed the head by hand
+/// and the parser was the one refusing it. With hyper's codec on both, the
+/// check is the proxy's own, and it is made in one place.
+#[tokio::test]
+async fn a_request_with_more_than_one_host_is_refused_on_the_named_protocol() {
+    use nexapipe_proto::protocol::ALPN_HTTP;
+
+    let backend = spawn_backend("never").await;
+    let proxy =
+        spawn_proxy_that_reads_the_protocol(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr, ALPN_HTTP).await;
 
     let reply = tunnel
         .exchange(b"GET / HTTP/1.1\r\nHost: app.test\r\nHost: internal.test\r\n\r\n")
