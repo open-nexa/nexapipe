@@ -435,7 +435,7 @@ async fn upgrade(
 
 /// The retry loop, and the answer it produced.
 #[allow(clippy::too_many_arguments)]
-async fn forward(
+pub(super) async fn forward(
     ctx: &Arc<Context>,
     request: &Request<()>,
     request_target: &str,
@@ -474,18 +474,31 @@ async fn forward(
                 let status = answer.status().as_u16();
                 crate::metrics::METRICS
                     .record_request(status, started.elapsed().as_millis() as u64);
+                // **The lease moves out of the backend info and into the
+                // answer's body.** The work against that backend is not over
+                // when the response head arrives: a body that is still
+                // streaming is a backend that is still busy, and the balancer
+                // counts a backend as busy until the flow releases its lease.
+                // The backend info is dropped when this function returns, so a
+                // lease left in it would be released with the head — and
+                // `least_conn` would see an idle backend while it was still
+                // working. The plaintext path has always kept the lease with
+                // the body; see `LeasedBody`.
+                let lease = backend.take_lease();
                 // The access line is written by the answer's body, when the
                 // answer is over: the bytes it reports are the bytes that
                 // reached the client, and they are not known until then.
-                return Ok(answer.with_report(crate::http::server::AccessReport {
-                    request_id: ctx.request_id.clone(),
-                    peer: ctx.peer.clone(),
-                    method: method.as_str().to_string(),
-                    request_target: request_target.to_string(),
-                    status,
-                    started,
-                    who: ctx.who.clone(),
-                }));
+                return Ok(answer.with_lease(lease).with_report(
+                    crate::http::server::AccessReport {
+                        request_id: ctx.request_id.clone(),
+                        peer: ctx.peer.clone(),
+                        method: method.as_str().to_string(),
+                        request_target: request_target.to_string(),
+                        status,
+                        started,
+                        who: ctx.who.clone(),
+                    },
+                ));
             }
             Err(failure) => failure,
         };
