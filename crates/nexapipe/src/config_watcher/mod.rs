@@ -2,6 +2,7 @@ use crate::auth::{AuthConfig, ClientAuth};
 use crate::config::ProxyConfig;
 use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
+use crate::conn::persist_auth_state;
 use crate::health::HealthProbes;
 use crate::proxy::{BackendClients, sync_health_checks};
 use crate::routes::RoutingTable;
@@ -511,7 +512,7 @@ impl ConfigWatcher {
                 );
             }
 
-            let (added, removed) = merge_auth_clients(&mut live, &new_auth);
+            let (added, removed, rotated) = merge_auth_clients(&mut live, &new_auth);
 
             for id in &added {
                 tracing::info!("2FA client '{id}' added by config reload");
@@ -525,6 +526,12 @@ impl ConfigWatcher {
                     live.clients.len(),
                     added.len(),
                     removed.len()
+                );
+            }
+            for id in &rotated {
+                tracing::info!(
+                    "2FA client '{id}' has a new enrollment token: the guesses at the old one do \
+                     not count against it"
                 );
             }
 
@@ -597,6 +604,25 @@ impl ConfigWatcher {
                         closed
                     );
                 }
+            }
+
+            // The state file is the file the next start reads, and the counters
+            // the merge just zeroed are not in it yet: it still holds what the
+            // guesses at the **old** token cost, and a restart would hand that
+            // count to the invite that replaced it. The file is written with
+            // the lock released — a disk write under the 2FA lock stalls every
+            // connection that is authenticating, and the path to the client is
+            // one a stranger can name — and it goes through the same writer the
+            // handshake uses, so the two cannot overlap on the file.
+            drop(live);
+            if !rotated.is_empty()
+                && let Err(e) = persist_auth_state(state).await
+            {
+                tracing::warn!(
+                    "2FA: failed to persist the reset enrollment counters to {}: {}",
+                    state.state_path(),
+                    e
+                );
             }
 
             return true;
@@ -746,7 +772,8 @@ pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
 /// Folds the freshly parsed `[auth.clients]` table into the live one.
 ///
 /// Returns the ids that were added and the ones that were removed, for the
-/// reload log. A client present on both sides keeps its in-memory counters —
+/// reload log, and the ones whose pending enrollment token the file replaced.
+/// A client present on both sides keeps its in-memory counters —
 /// [`save_auth_state`] flushes them to the state file, but a failure recorded
 /// between the last flush and this merge is newer than the file — and takes
 /// everything else (`secret`, `pending_enrollment`, `allow_hosts`) from the
@@ -769,9 +796,20 @@ fn newest_step(live: Option<u64>, from_file: Option<u64>) -> Option<u64> {
     }
 }
 
-fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<String>, Vec<String>) {
+/// Folds the freshly parsed `[auth.clients]` table into the live one.
+///
+/// Returns the ids that were added, the ones that were removed, and the ones
+/// whose pending enrollment token the file replaced. The last one matters to
+/// the caller: the merge zeroes the enrollment counters of a client whose
+/// invite was replaced, and the state file has to be told, or it keeps the old
+/// token's count and hands it back on the next start.
+fn merge_auth_clients(
+    live: &mut AuthConfig,
+    incoming: &AuthConfig,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut added = Vec::new();
     let mut removed = Vec::new();
+    let mut rotated = Vec::new();
 
     let mut merged = HashMap::with_capacity(incoming.clients.len());
     for (id, incoming_client) in &incoming.clients {
@@ -798,6 +836,7 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
                     // starts with nothing spent on it.
                     client.enrollment_failed_attempts = 0;
                     client.enrollment_locked_until = None;
+                    rotated.push(id.clone());
                 } else {
                     client.enrollment_failed_attempts = existing.enrollment_failed_attempts;
                     client.enrollment_locked_until = existing.enrollment_locked_until;
@@ -831,7 +870,7 @@ fn merge_auth_clients(live: &mut AuthConfig, incoming: &AuthConfig) -> (Vec<Stri
     }
 
     live.clients = merged;
-    (added, removed)
+    (added, removed, rotated)
 }
 
 /// What a client was allowed to reach, reduced to the three values that decide

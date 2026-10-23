@@ -601,14 +601,14 @@ fn a_reload_picks_up_an_invited_client_and_drops_a_removed_one() {
         ("new", client("NEWNEWNEWNEWNEW")),
     ]);
 
-    let (added, removed) = merge_auth_clients(&mut live, &incoming);
+    let (added, removed, _rotated) = merge_auth_clients(&mut live, &incoming);
 
     assert_eq!(added, vec!["new".to_string()]);
     assert!(removed.is_empty());
     assert_eq!(live.clients.len(), 2);
     assert_eq!(live.clients["new"].secret.as_str(), "NEWNEWNEWNEWNEW");
 
-    let (added, removed) = merge_auth_clients(&mut live, &config_with(&[]));
+    let (added, removed, _rotated) = merge_auth_clients(&mut live, &config_with(&[]));
 
     assert!(added.is_empty());
     // HashMap order is per-process, so compare the removed set, not a sequence.
@@ -635,7 +635,7 @@ fn a_surviving_client_keeps_its_counters_and_takes_the_files_secret() {
     incoming_client.pending_enrollment = Some(SecretString::new("token".to_string()));
     let incoming = config_with(&[("client-001", incoming_client)]);
 
-    let (added, removed) = merge_auth_clients(&mut live, &incoming);
+    let (added, removed, _rotated) = merge_auth_clients(&mut live, &incoming);
 
     assert!(added.is_empty() && removed.is_empty());
     let client = &live.clients["client-001"];
@@ -671,7 +671,7 @@ fn a_new_invite_starts_with_its_own_budget() {
     incoming_client.pending_enrollment = Some(SecretString::new("new-token".to_string()));
     let incoming = config_with(&[("client-001", incoming_client)]);
 
-    let (added, removed) = merge_auth_clients(&mut live, &incoming);
+    let (added, removed, _rotated) = merge_auth_clients(&mut live, &incoming);
 
     assert!(added.is_empty() && removed.is_empty());
     let client = &live.clients["client-001"];
@@ -706,21 +706,25 @@ fn config_with_pending_token(path: &std::path::Path, token: &str) {
 /// token cost.
 ///
 /// Written through the server's own writer, so the file is the one a running
-/// server would have left behind: the count of the guesses and the lockout
-/// window they earned. It is put where the server looks for it — the path
-/// the state itself names — rather than at a name spelled out here.
-fn state_file_with_enrollment_counters(config_path: &str, attempts: u32, locked_until: u64) {
-    let mut clients = HashMap::new();
-    clients.insert(
-        "client-001".to_string(),
-        crate::auth::state::ClientState {
-            enrollment_failed_attempts: attempts,
-            enrollment_locked_until: Some(locked_until),
-            ..Default::default()
-        },
-    );
+/// server would have left behind: the count of the guesses, the lockout
+/// window they earned, and the fingerprint of the token they were paid for.
+/// It is put where the server looks for it — the path the state itself
+/// names — rather than at a name spelled out here.
+fn state_file_with_enrollment_counters(
+    config_path: &str,
+    token: &str,
+    attempts: u32,
+    locked_until: u64,
+) {
+    let mut config = crate::auth::AuthConfig::default();
+    let mut client = client("JBSWY3DPEHPK3PXP");
+    client.pending_enrollment = Some(SecretString::new(token.to_string()));
+    client.enrollment_failed_attempts = attempts;
+    client.enrollment_locked_until = Some(locked_until);
+    config.clients.insert("client-001".to_string(), client);
+
     let path = crate::auth::state::path_for(config_path);
-    crate::auth::state::save(&path, &crate::auth::state::RuntimeState { clients })
+    crate::config_watcher::save_auth_state(&path.to_string_lossy(), &config)
         .expect("the state file is written");
 }
 
@@ -751,7 +755,7 @@ async fn a_rotated_invite_starts_with_its_own_budget() {
     let path_str = path.to_str().unwrap().to_string();
 
     config_with_pending_token(&path, "old-token");
-    state_file_with_enrollment_counters(&path_str, 3, a_live_lockout_window());
+    state_file_with_enrollment_counters(&path_str, "old-token", 3, a_live_lockout_window());
 
     // The live state the server started with: the old token, and the counters
     // the state file carries for it.
@@ -788,6 +792,62 @@ async fn a_rotated_invite_starts_with_its_own_budget() {
     );
 }
 
+/// The reset reaches the file the next start reads.
+///
+/// The merge zeroes the counters in memory, but the file beside the
+/// configuration is what a restart reads — and it still held what the guesses
+/// at the **old** token cost. The count came back with the next start, handed
+/// to the invite that had replaced the one it was paid for.
+///
+/// So the reload writes the file, and the startup path — the loader that
+/// applies the state file onto the configuration — finds nothing to hand
+/// back.
+#[tokio::test]
+async fn a_rotated_invite_leaves_nothing_for_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let path_str = path.to_str().unwrap().to_string();
+
+    config_with_pending_token(&path, "old-token");
+    state_file_with_enrollment_counters(&path_str, "old-token", 3, a_live_lockout_window());
+
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let state = AuthState::new(
+        auth.expect("the config declares an [auth] section"),
+        &path_str,
+    );
+    let watcher = watcher_for(state.clone(), &path_str);
+
+    // The operator rotates the invite: the file carries a new token.
+    config_with_pending_token(&path, "new-token");
+
+    watcher.reload_config().await;
+
+    // The file the next start reads.
+    let on_disk = crate::auth::state::load(&crate::auth::state::path_for(&path_str))
+        .expect("the state file reads back");
+    let carried = on_disk.clients.get("client-001");
+    assert!(
+        carried.is_none_or(|client| client.enrollment_failed_attempts == 0),
+        "the file does not carry the old token's count: {carried:?}"
+    );
+
+    // And the startup path itself: the loader that applies the file onto the
+    // configuration.
+    let (_, auth) =
+        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+    let client = &auth.expect("the config declares an [auth] section").clients["client-001"];
+    assert_eq!(
+        client.enrollment_failed_attempts, 0,
+        "the count did not come back with the next start"
+    );
+    assert_eq!(
+        client.enrollment_locked_until, None,
+        "and neither did the lockout the old token earned"
+    );
+}
+
 /// An unchanged token keeps the counters that are live.
 ///
 /// The live counter is the newer one — a failure counted since the last flush
@@ -801,7 +861,7 @@ async fn an_unchanged_token_keeps_its_live_counters() {
 
     config_with_pending_token(&path, "token");
     let window = a_live_lockout_window();
-    state_file_with_enrollment_counters(&path_str, 3, window);
+    state_file_with_enrollment_counters(&path_str, "token", 3, window);
 
     let (_, auth) =
         crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
@@ -846,7 +906,7 @@ async fn the_state_file_counters_are_honoured_for_an_unchanged_token() {
 
     config_with_pending_token(&path, "token");
     let window = a_live_lockout_window();
-    state_file_with_enrollment_counters(&path_str, 3, window);
+    state_file_with_enrollment_counters(&path_str, "token", 3, window);
 
     let (_, auth) =
         crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
