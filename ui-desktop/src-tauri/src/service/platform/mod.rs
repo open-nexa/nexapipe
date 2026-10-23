@@ -569,9 +569,12 @@ mod tests {
         installing_account_from_args, linux_activation_args, linux_service_exec,
         linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
         per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-        service_binary_path, system_service_binary, system_service_dir, ScState,
-        SERVICE_BINARY_NAME, SERVICE_NAME,
+        system_service_binary, system_service_dir, ScState, SERVICE_BINARY_NAME, SERVICE_NAME,
     };
+    // The copy's path only exists where the install makes one — Windows keeps its own,
+    // under Program Files.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::service_binary_path;
     use crate::service::elevate;
     use crate::service::platform::account::AccountId;
     use crate::service::platform::service_copy;
