@@ -119,7 +119,7 @@ impl AuthState {
 /// holding the write lock and waiting for the gate, and neither ever letting
 /// go. The read guard is dropped before the disk write, so the lock is held
 /// for the snapshot and not for the write.
-pub(in crate::conn) async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
+pub(crate) async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
     let path = auth.state_path().to_string();
     let config = auth.config().clone();
     let (done, wait) = tokio::sync::oneshot::channel();
