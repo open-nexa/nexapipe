@@ -237,6 +237,12 @@ Var /GLOBAL NEXAPIPE_SERVICE_WAS_RUNNING
 ; note was left behind, so the entry itself is what decides whether there is
 ; something to replace.
 Var /GLOBAL NEXAPIPE_SERVICE_IS_REGISTERED
+; Whether the state of the service could be established at all.
+;
+; "Could not ask" is not the same answer as "not running", and the upgrade turns on the
+; difference: an upgrade that goes on as if a running service were stopped would leave
+; the user with a service that is down and nothing that says so.
+Var /GLOBAL NEXAPIPE_SERVICE_STATE_UNKNOWN
 ; Whether the entry is still pointed at the copy of the binary in this directory, which the
 ; ordinary user can replace - see NEXAPIPE_ENTRY_IS_USER_WRITABLE.
 Var /GLOBAL NEXAPIPE_SERVICE_IS_USER_WRITABLE
@@ -412,6 +418,7 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 0
   StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 0
   StrCpy $NEXAPIPE_SERVICE_IS_REGISTERED 0
+  StrCpy $NEXAPIPE_SERVICE_STATE_UNKNOWN 0
 
   !insertmacro NEXAPIPE_READ_IMAGE_PATH
   !insertmacro NEXAPIPE_PARSE_IMAGE_PATH
@@ -423,16 +430,19 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     StrCpy $NEXAPIPE_SERVICE_IS_REGISTERED 1
   ${EndIf}
 
+  ; The control manager is asked first, because it is the only one that knows: the
+  ; service runs the system-wide copy of the binary, so whether the copy in this
+  ; directory can be deleted says nothing about whether the service is up.
+  !insertmacro NEXAPIPE_QUERY_STATE
+
   ; The note an install-driven uninstall left behind is read in any case: the
   ; entry is still there in that case, but the note is the only thing that says
   ; the service was running before the upgrade. See NEXAPIPE_RECALL_SERVICE for
   ; why it keeps one.
+  ;
+  ; It is read after the question, because it is the answer to it when the control
+  ; manager could not be asked at all.
   !insertmacro NEXAPIPE_RECALL_SERVICE
-
-  ; Then ask the control manager, which is the only one that knows: the service
-  ; runs the system-wide copy of the binary, so whether the copy in this
-  ; directory can be deleted says nothing about whether the service is up.
-  !insertmacro NEXAPIPE_QUERY_STATE
 
   Pop $2
   Pop $1
@@ -442,6 +452,10 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
 ; Asks the control manager whether the service is running, and raises
 ; $NEXAPIPE_SERVICE_WAS_RUNNING when it is. The flag is only ever raised here: what the
 ; answer is when there is none is the caller's business.
+;
+; When the question cannot be asked at all - there was nowhere to put the batch file that
+; asks it - the state of the service is unknown rather than stopped, and the flag that
+; says so is raised instead.
 ;
 ; `sc query` is the honest question. The service runs the system-wide copy of the binary, so
 ; whether the copy in this directory can be deleted says nothing about it any more - that
@@ -477,6 +491,15 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
     ${If} $1 == 1
       StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1
     ${EndIf}
+  ${Else}
+    ; The question could not be asked at all, because there was nowhere to ask it. That is
+    ; not the same answer as "the service is stopped": an upgrade that went on as if it
+    ; were stopped would leave the user with a service that is down and nothing that
+    ; says so.
+    ;
+    ; The note an install-driven uninstall left behind is read after this, and it clears
+    ; this flag when it answers the question - see NEXAPIPE_INSPECT_SERVICE.
+    StrCpy $NEXAPIPE_SERVICE_STATE_UNKNOWN 1
   ${EndIf}
 
   ; Neither scratch file outlives the question.
@@ -562,6 +585,10 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   Push $0
   ReadRegStr $0 SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasInstalled"
   ${If} $0 == "1"
+    ; The note answers the question the control manager could not answer: the
+    ; uninstaller that ran as part of this upgrade wrote down what it found, so the
+    ; state of the service is known even when it could not be asked about.
+    StrCpy $NEXAPIPE_SERVICE_STATE_UNKNOWN 0
     StrCpy $NEXAPIPE_SERVICE_WAS_INSTALLED 1
     ReadRegStr $0 SHCTX "${NEXAPIPE_SERVICE_STATE_KEY}" "WasRunning"
     ${IfThen} $0 == "1" ${|} StrCpy $NEXAPIPE_SERVICE_WAS_RUNNING 1 ${|}
@@ -1326,6 +1353,18 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   ; What is registered, and whether it is running, is asked before anything is
   ; touched: the answer decides whether there is a service to replace at all.
   !insertmacro NEXAPIPE_INSPECT_SERVICE
+
+  ${If} $NEXAPIPE_SERVICE_IS_REGISTERED = 1
+  ${AndIf} $NEXAPIPE_SERVICE_STATE_UNKNOWN = 1
+    ; The control manager could not be asked whether the service is running, and
+    ; "could not ask" is not the same answer as "not running": an upgrade that went
+    ; on as if the service were stopped would leave the user with a service that is
+    ; down and nothing that says so. Nothing has been changed yet, so the machine is
+    ; still the way it was.
+    MessageBox MB_OK|MB_ICONSTOP "The installer could not ask the control manager whether the ${NEXAPIPE_SERVICE_NAME} is running.$\r$\n$\r$\nNothing has been changed. Please run the installer again." /SD IDOK
+    SetErrorLevel 1
+    Quit
+  ${EndIf}
 
   ${If} $NEXAPIPE_SERVICE_IS_REGISTERED = 1
     ; The files this upgrade is about to replace are copied aside first, so that
