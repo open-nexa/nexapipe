@@ -1603,14 +1603,26 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let json = format!(
-            r#"{{"type":"ENROLL_ISSUE","client_id":"client-001","secret":"{secret}","algorithm":"sha1","digits":6,"period":30}}"#,
-            secret = heap::NEEDLE
-        );
+        // The credential this test reads is a credential in the heap like any
+        // other, and it is wiped when it goes out of scope. A block that
+        // still holds it would be handed back by the allocator with the
+        // credential in it, and the next test's probe would find it there
+        // and report a leak that is not one.
+        //
+        // The buffers are given the room they need up front, so that they do
+        // not grow: a buffer that grows hands the block it outgrows back to
+        // the allocator, and that block holds the credential too.
+        let mut json = Zeroizing::new(String::with_capacity(160));
+        json.push_str(r#"{"type":"ENROLL_ISSUE","client_id":"client-001","secret":""#);
+        json.push_str(heap::NEEDLE);
+        json.push_str(r#"","algorithm":"sha1","digits":6,"period":30}"#);
 
         // The binary form, written out by hand: an ENROLL_ISSUE, the client
         // id, the secret, the algorithm, the digits and the period.
-        let mut binary = vec![VERSION_BINARY, kind::ENROLL_ISSUE, 0x00];
+        let mut binary = Zeroizing::new(Vec::with_capacity(64));
+        binary.push(VERSION_BINARY);
+        binary.push(kind::ENROLL_ISSUE);
+        binary.push(0x00);
         binary.extend_from_slice(&10u16.to_le_bytes());
         binary.extend_from_slice(b"client-001");
         binary.extend_from_slice(&(heap::NEEDLE.len() as u16).to_le_bytes());
@@ -1618,6 +1630,14 @@ mod tests {
         binary.push(Algorithm::Sha1.to_byte());
         binary.extend_from_slice(&6u32.to_le_bytes());
         binary.extend_from_slice(&30u64.to_le_bytes());
+
+        // Neither buffer grew. A buffer that grew has handed the block it
+        // outgrew back to the allocator, and that block holds the credential,
+        // and the allocator hands the block out again to whoever asks for
+        // one of that size — so the credential is in the heap for as long as
+        // the process lives, and the next test's probe finds it there.
+        assert_eq!(json.capacity(), 160, "the JSON buffer grew");
+        assert_eq!(binary.capacity(), 64, "the binary buffer grew");
 
         let residue = heap::watched(|| {
             drop(AuthMessage::from_bytes(json.as_bytes()).expect("the JSON form parses"));
