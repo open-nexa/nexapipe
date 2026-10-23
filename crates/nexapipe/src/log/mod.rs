@@ -888,6 +888,12 @@ fn access_identity(who: Option<&PeerIdentity>) -> String {
 /// Generated where the request enters, not where it is logged: the id is
 /// carried by the tracing span as well, and a span opened after the request
 /// has been parsed would miss the part where it was routed.
+///
+/// **One request, one id.** A connection may carry several requests — hyper
+/// serves keep-alive requests on one stream — so the id is minted per
+/// request, where the request enters, and never per connection. An id that
+/// belonged to the connection would belong to every request on it, and a
+/// client quoting it could not be matched to one log line.
 pub fn next_request_id() -> String {
     let hi: u64 = rand::random();
     let lo: u64 = rand::random();
@@ -1024,6 +1030,11 @@ fn write_access_line(
             &detail,
         );
 
+        // A test that watches the lines sees them here, before they go
+        // wherever they are headed.
+        #[cfg(test)]
+        capture_line(&line);
+
         match target {
             AccessTarget::Stdout => println!("{}", line),
             // Queued for the writer thread. Anything still queued when the
@@ -1080,6 +1091,74 @@ fn write_access_line(
 /// the access log has the line, and a file that has it twice is a file with
 /// every request in it twice.
 const ACCESS_TARGET: &str = "access";
+
+/// The access lines a test is watching, if a test is watching any.
+///
+/// The access log goes to a file or to stdout, and neither can be read back
+/// from a test: the file is written on a thread of its own, and the console
+/// belongs to the test harness. This is where the lines go instead, while a
+/// test holds the handle.
+#[cfg(test)]
+static CAPTURED_ACCESS_LINES: Mutex<Option<Arc<Mutex<Vec<String>>>>> = Mutex::new(None);
+
+/// The lines the watching test collects.
+#[cfg(test)]
+fn captured_access_lines() -> &'static Mutex<Option<Arc<Mutex<Vec<String>>>>> {
+    &CAPTURED_ACCESS_LINES
+}
+
+/// Watches the access lines, and hands them to the test that watches them.
+///
+/// The watching stops when the handle is dropped: the lines belong to the
+/// test, and a test that is over should not be collecting them.
+#[cfg(test)]
+pub(crate) fn capture_access_lines() -> AccessLineCapture {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    *captured_access_lines()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lines.clone());
+    AccessLineCapture { lines }
+}
+
+/// Hands a line to the test that is watching, if there is one.
+#[cfg(test)]
+fn capture_line(line: &str) {
+    let watching = captured_access_lines()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lines) = watching.as_ref() {
+        lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
+    }
+}
+
+/// The handle a test holds while it watches the access lines.
+#[cfg(test)]
+pub(crate) struct AccessLineCapture {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl AccessLineCapture {
+    /// The lines seen so far, in the order they were written.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for AccessLineCapture {
+    fn drop(&mut self) {
+        *captured_access_lines()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
 
 #[cfg(test)]
 mod tests {
