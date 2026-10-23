@@ -51,6 +51,11 @@ android_logger = { version = "0.15", optional = true }
 once_cell = "1.19"
 fastrand = "2.1"
 nexapipe-proto.workspace = true
+# `zeroize` for the buffer a received message is read into: a message may
+# carry a credential — the secret an enrollment hands out — and the buffer
+# wipes itself when it goes out of scope, so the credential does not stay in
+# the heap. See `src/auth/message.rs`.
+zeroize.workspace = true
 netstack-smoltcp = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support
