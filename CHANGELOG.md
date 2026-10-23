@@ -1095,6 +1095,16 @@ lookup, which is what a config written before the key existed does.
   The file is watched now, the way the error-code check beside it already
   watches its own inputs.
 
+- **A TLS `ClientHello` that arrives in pieces is read until it is whole.** The
+  record's length is in its first five bytes, so a hello whose first read
+  carried fewer than five had nothing to measure — and the reading stopped
+  there, because the loop that reads the rest was inside the check. The
+  truncated hello was then parsed as if it were the whole one, which is a
+  hello with no name in it: the session was closed with no retry and no
+  tunnel, and the client saw a TLS handshake failure.
+
+  The head is read first now, and the hello is read until it is whole.
+
 - **The client and the server read the name inside a TLS `ClientHello` the
   same way now.** They each had a reader of their own, and the two did not
   agree. The server's walked the whole `server_name` list and took the entry
