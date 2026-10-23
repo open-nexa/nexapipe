@@ -1,15 +1,19 @@
+//! The endpoint group: the pools that serve a name, and the backends behind them.
+//!
+//! A group holds one pool of connections per domain, and every pool reaches a
+//! backend. Which pool serves a host is the one rule the proxy uses, and the
+//! parts of that — the pools, the index that answers for a name, the probe
+//! that watches the backends — are modules of their own.
+
 use crate::ClientError;
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
-use crate::connection_pool::{
-    Borrow, IrohConnectionPool, LinkKind, LinkStatus, PRECONNECT_TIMEOUT,
-};
-use crate::flow::{FlowId, FlowMeta, FlowRegistry, FlowView};
+use crate::connection_pool::{IrohConnectionPool, PRECONNECT_TIMEOUT};
+use crate::flow::{FlowId, FlowRegistry, FlowView};
 use crate::lb::LoadBalancingStrategy;
-use crate::traffic::{self, Flow, NodeTraffic, NodeVolume, TrafficTable};
-use iroh::endpoint::Connection;
+use crate::traffic::{self, NodeVolume, TrafficTable};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use nexapipe_proto::normalize_pattern;
 use nexapipe_proto::protocol::Protocol;
-use nexapipe_proto::{normalize_host, normalize_pattern};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -33,176 +37,23 @@ macro_rules! jni_log {
     };
 }
 
+mod connection;
 mod domain_pools;
 mod health;
+mod index;
+mod links;
+mod node;
+mod probe;
 
-// The pools of one domain and what the panel says about a node are modules
-// of their own, and what they hold is still reached through `endpoint_group`.
+// The connection the group hands out, the pools of one domain, what the
+// panel says about a node, the index that answers for a name, the links to
+// the backends and the node the group is configured with are modules of
+// their own, and what they hold is still reached through `endpoint_group`.
+pub use connection::PooledConnection;
 pub use domain_pools::DomainPools;
-use domain_pools::record_outcome;
 pub use health::{HealthSnapshot, NodeHealth, PreconnectReport};
-
-/// A connection the group handed out, and the borrow it was handed out under.
-///
-/// Not `Clone`: a copy would be a second handle on the **same** borrow, and
-/// the pool's count of the flows on the connection would then be wrong —
-/// the connection would look busy after the flow that held it was gone.
-#[derive(Debug)]
-pub struct PooledConnection {
-    conn: Connection,
-    pool_index: usize,
-    /// The backend this connection reaches, when somebody is keeping health for
-    /// it.
-    ///
-    /// `None` for a connection nobody is keeping health for, which is a pool
-    /// standing on its own rather than one inside an [`EndpointGroup`].
-    ///
-    /// Carried by the connection so that the caller which spent its attempts on
-    /// it can name whose health those attempts were about. Asking the group
-    /// afterwards would be asking again, and by then it may have handed somebody
-    /// else out; naming the backend at every failure path instead would mean
-    /// every one of them knowing how health is recorded.
-    node: Option<EndpointId>,
-    /// Where to count what this connection carries. Also `None` for a pool
-    /// standing on its own — the two are set together and absent together,
-    /// because neither means anything about a node nobody is tracking.
-    traffic: Option<Arc<NodeTraffic>>,
-    /// Where the flows opened through this connection are listed. Set and absent
-    /// together with `traffic`, for the same reason: neither means anything about
-    /// a node nobody is tracking, and a flow that is counted but not listed is a
-    /// list with a hole in it.
-    flows: Option<Arc<FlowRegistry>>,
-    /// The borrow this connection is held under.
-    ///
-    /// The pool owns the connection and the flows **borrow** it, so the pool
-    /// cannot tell from the handle alone whether anyone is still on it — and
-    /// it has to: a connection with a flow on it is not idle, and closing it
-    /// would take that flow down with it.
-    ///
-    /// `None` for a connection that was not borrowed from a pool.
-    borrow: Option<Borrow>,
-}
-
-impl PooledConnection {
-    pub fn new(conn: Connection, pool_index: usize) -> Self {
-        Self {
-            conn,
-            pool_index,
-            node: None,
-            traffic: None,
-            flows: None,
-            borrow: None,
-        }
-    }
-
-    /// A connection whose volume and backend the group keeps track of.
-    pub(crate) fn tracked(
-        conn: Connection,
-        pool_index: usize,
-        node: EndpointId,
-        traffic: TrafficTable,
-        flows: Arc<FlowRegistry>,
-        borrow: Borrow,
-    ) -> Self {
-        Self {
-            conn,
-            pool_index,
-            node: Some(node),
-            traffic: Some(traffic::of(&traffic, node)),
-            flows: Some(flows),
-            borrow: Some(borrow),
-        }
-    }
-
-    /// Counts `bytes` leaving this machine towards the node this connection
-    /// reaches.
-    ///
-    /// Nothing happens when nothing is being tracked: a pool standing on its
-    /// own has no node to charge, and a copy loop should not need to know
-    /// whether it is inside a group to count correctly. This is the one call a
-    /// copy site makes, and it cannot be pointed at the wrong place: the
-    /// connection decided where its bytes go.
-    pub fn record_sent(&self, bytes: u64) {
-        if let Some(traffic) = &self.traffic {
-            traffic.record_sent(bytes);
-        }
-    }
-
-    /// Counts `bytes` arriving back from that node.
-    pub fn record_received(&self, bytes: u64) {
-        if let Some(traffic) = &self.traffic {
-            traffic.record_received(bytes);
-        }
-    }
-
-    /// Holds one flow through this connection open until the guard is dropped.
-    ///
-    /// `meta` is what the caller knows about the flow and this connection does
-    /// not: which door the bytes came in by, and — having read the client's
-    /// request far enough to know — where they are going. It is read once here
-    /// and never again, which is why it is not something the copy loop carries.
-    ///
-    /// The guard is why this returns a value at all: a flow ends on EOF, on any
-    /// of several errors, on being cancelled because the proxy stopped, and on
-    /// being asked to end, and only `Drop` covers all of them. See [`Flow`].
-    ///
-    /// A flow on a connection nobody is tracking is still returned, and still
-    /// counts itself out on drop — the caller cannot tell, and does not have to:
-    /// recording through a guard with nothing behind it already does nothing,
-    /// exactly as [`Self::record_sent`] does for an untracked connection.
-    pub fn enter_flow(&self, meta: FlowMeta) -> Flow {
-        match (&self.traffic, &self.flows, self.node) {
-            (Some(traffic), Some(flows), Some(node)) => {
-                Flow::listed(traffic.clone(), flows, node, meta)
-            }
-            _ => Flow::open(self.traffic.clone().unwrap_or_default()),
-        }
-    }
-
-    /// The node this connection reaches, when somebody is tracking it.
-    pub fn node(&self) -> Option<EndpointId> {
-        self.node
-    }
-
-    pub fn conn(&self) -> &Connection {
-        &self.conn
-    }
-
-    /// Closes the connection instead of just letting go of it.
-    ///
-    /// Dropping one handle does not close a connection: it closes when the
-    /// last one goes, and a path watcher holds one for as long as it lives, so
-    /// a caller that has decided the connection is dead has to say so or it
-    /// stays open — still in the pool's address space, still counted, and
-    /// still handed to whatever asks next.
-    ///
-    /// Says nothing about the backend's health, and that is the point. Most of
-    /// what reaches here is a connection the peer closed while nothing was
-    /// using it — the ordinary case these retry loops exist for, and one that
-    /// says nothing about whether the backend itself answers. Condemning it
-    /// here would take a healthy backend out of rotation for as long as the
-    /// next probe is away, and on the paths with no probe at all, permanently.
-    /// The failure worth recording is the one no attempt outlived: see
-    /// [`EndpointGroup::record_request_failures`].
-    pub fn discard(self, reason: &'static [u8]) {
-        self.conn.close(0u32.into(), reason);
-    }
-
-    /// Marks the connection as carrying as many flows as the server allows.
-    ///
-    /// The server refused a flow with `TooManyFlows`, which says something
-    /// about the connection rather than about the flow: the pool must stop
-    /// handing this connection out, or the next flow is refused the same way.
-    pub fn saturate(&self) {
-        if let Some(borrow) = &self.borrow {
-            borrow.saturate();
-        }
-    }
-
-    pub fn pool_index(&self) -> usize {
-        self.pool_index
-    }
-}
+use index::wildcards_of;
+pub use node::{DomainMapping, NodeConfig};
 
 pub struct EndpointGroup {
     domains: HashMap<String, Arc<DomainPools>>,
@@ -264,57 +115,6 @@ pub struct EndpointGroup {
     /// tunnel would be left in: idle, and quietly reconnecting.
     probe_stopped: AtomicBool,
 }
-
-/// The wildcard patterns of a set of domains, keyed by the name they cover.
-///
-/// `*.example.com` is keyed by `example.com`, and the catch-all `*` by the
-/// empty string. A pattern that is not a wildcard is left out: the lookup
-/// finds an exactly-named domain in the map itself, and a pattern that is not
-/// a wildcard cannot cover a name that map did not find.
-///
-/// A pattern that matches nothing is left out too — `*.` is the catch-all in
-/// another spelling, and the rule in `nexapipe-proto` refuses it and matches
-/// it with nothing. It must not be given the catch-all's own key, which is
-/// what it would otherwise be indexed under.
-fn wildcards_of(domains: &HashMap<String, Arc<DomainPools>>) -> HashMap<String, Arc<DomainPools>> {
-    let mut wildcards = HashMap::new();
-    for (pattern, pools) in domains {
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            // A pattern with an **empty** suffix — `*.` — is the catch-all in
-            // another spelling, and the rule in `nexapipe-proto` refuses it
-            // and matches it with nothing: a configuration that was never
-            // meant to be loaded cannot widen what a client proxies.
-            //
-            // It is not a wildcard here either, so it is not indexed: the
-            // catch-all is keyed by the empty name, and a pattern that
-            // matches nothing must not be given that key — it would answer
-            // for every host, and it would do so by whichever of the two the
-            // map happened to be walked in first.
-            if !suffix.is_empty() {
-                wildcards.insert(suffix.to_string(), pools.clone());
-            }
-        } else if pattern == "*" {
-            wildcards.insert(String::new(), pools.clone());
-        }
-    }
-    wildcards
-}
-
-/// How often each backend is asked whether it still answers.
-///
-/// Under the pool's own idle timeout (60 s) on purpose. A pool that goes quiet
-/// has its connections dropped, so the probe is also what keeps one warm to a
-/// backend nobody has talked to for a minute; and it is what finds out a
-/// backend died half a minute after it happened instead of at the next request,
-/// which is the whole of what this buys.
-const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// How far the first probe (and every following one) may be pushed back.
-///
-/// Every client of one server that started at the same moment would otherwise
-/// probe on the same second, which is a thundering herd for no reason — and
-/// without it the probe also runs in lockstep with the pool's 5 s cleanup.
-const PROBE_JITTER: Duration = Duration::from_secs(5);
 
 /// Ceiling for a whole preconnect phase, across every pool at once.
 ///
@@ -629,44 +429,6 @@ impl EndpointGroup {
         None
     }
 
-    /// The mapping that serves `host`, by the one rule the proxy uses.
-    ///
-    /// The same question the membership check asks, asked the same way: the
-    /// client tunnels `www.example.com` because `*.example.com` covers it, and
-    /// the backend it is sent to is named by that same list. A lookup that
-    /// knew only exact names and parent labels would not find the
-    /// `*.example.com` mapping at all — the request would go to the default
-    /// backend or to none: the two halves of one client disagreeing about a
-    /// pattern the configuration spells once.
-    ///
-    /// The exact name comes first, and a wildcard only after it: a bare
-    /// pattern is that name and nothing else, so `example.com` never answers
-    /// for `www.example.com`. Where more than one wildcard covers the host,
-    /// the most specific one answers — the longest suffix, the way DNS reads
-    /// a name.
-    fn pools_for(&self, host: &str) -> Option<&Arc<DomainPools>> {
-        let host = normalize_host(host);
-
-        if let Some(pools) = self.domains.get(host.as_ref()) {
-            return Some(pools);
-        }
-
-        // The name's **label-aligned** suffixes, longest first. A pattern
-        // `*.example.com` covers the names that end with `example.com` at a
-        // label boundary, and those are exactly the suffixes below — so the
-        // first one that is in the index is the longest pattern that covers
-        // the name, which is the answer the scan gave.
-        let mut suffix = host.as_ref();
-        while let Some((_, rest)) = suffix.split_once('.') {
-            suffix = rest;
-            if let Some(pools) = self.wildcards.get(suffix) {
-                return Some(pools);
-            }
-        }
-        // The catch-all, `*`, covers everything, and is keyed by nothing.
-        self.wildcards.get("")
-    }
-
     pub async fn get_connection(
         &self,
         domain: &str,
@@ -701,286 +463,6 @@ impl EndpointGroup {
             "No endpoint configured for domain: {}",
             domain
         )))
-    }
-
-    /// Test iroh-level connectivity to each unique backend node, in parallel.
-    ///
-    /// Unlike the old sequential preconnect, this:
-    /// - Deduplicates pools by *backend* node ID (same backend serving several
-    ///   domains is tested once) — deliberately not by the pool's local endpoint
-    ///   ID, which is identical for every pool when the group shares one
-    ///   caller-owned endpoint, and would collapse all backends into a single
-    ///   probe
-    /// - Runs all connectivity tests in parallel via `JoinSet`
-    /// - Applies a per-pool budget of `PRECONNECT_TIMEOUT`, which covers the
-    ///   connect and the wait for a 2FA refusal together
-    /// - Caps the whole phase at `PRECONNECT_PHASE_CAP`
-    ///
-    /// This ensures that a single unreachable backend node does not block the
-    /// entire connection flow.
-    ///
-    /// Returns how many nodes answered. Call [`Self::preconnect_report`] when the
-    /// caller also needs to name the ones that did not.
-    pub async fn preconnect_all(&self) -> usize {
-        self.preconnect_report().await.reachable.len()
-    }
-
-    /// Probe every unique backend node in parallel and report which answered.
-    ///
-    /// This is the availability check every entry point shares. Because no setup
-    /// call ever dials, a config pointing at a node that does not exist looks
-    /// perfectly valid until something connects; callers therefore treat
-    /// [`PreconnectReport::any_reachable`] being false as a failed start rather
-    /// than reporting a connection that was never established.
-    pub async fn preconnect_report(&self) -> PreconnectReport {
-        // Collect unique pools by backend node ID. Multiple domains pointing to
-        // the same backend share a single connection pool, so we only need to
-        // test each backend once.
-        let unique_pools = self.unique_pools();
-        let seen_nodes: Vec<EndpointId> = unique_pools.iter().map(|(id, _)| *id).collect();
-
-        jni_log!(
-            "[preconnect] Testing connectivity to {} unique node(s) in parallel",
-            unique_pools.len()
-        );
-
-        let mut report = PreconnectReport::default();
-        if unique_pools.is_empty() {
-            return report;
-        }
-
-        // Run connectivity tests in parallel, each capped at PRECONNECT_TIMEOUT.
-        let mut join_set = tokio::task::JoinSet::new();
-        for (backend_id, pool) in &unique_pools {
-            let backend_id = *backend_id;
-            let pool = pool.clone();
-            join_set.spawn(async move {
-                let answered =
-                    match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
-                        Ok(true) => true,
-                        Ok(false) => {
-                            jni_log!("[preconnect] Node unreachable (preconnect returned false)");
-                            // `jni_log` only reaches logcat; the desktop and the service need
-                            // this in their own log — the pool's warning says why.
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!("preconnect: node {} is unreachable", backend_id);
-                            false
-                        }
-                        Err(_) => {
-                            jni_log!(
-                                "[preconnect] Node timed out after {}s",
-                                PRECONNECT_TIMEOUT.as_secs()
-                            );
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(
-                                "preconnect: node {} gave no answer within {}s",
-                                backend_id,
-                                PRECONNECT_TIMEOUT.as_secs()
-                            );
-                            false
-                        }
-                    };
-                (backend_id, answered)
-            });
-        }
-
-        // Overall cap: the per-pool budget plus a little slack, so a pool that
-        // used its whole budget is still what decided the answer.
-        let overall_deadline = tokio::time::Instant::now() + PRECONNECT_PHASE_CAP;
-        let mut probed = 0usize;
-        while let Ok(result) = tokio::time::timeout_at(overall_deadline, join_set.join_next()).await
-        {
-            match result {
-                Some(Ok((backend_id, true))) => {
-                    probed += 1;
-                    report.reachable.push(backend_id);
-                }
-                Some(Ok((backend_id, false))) => {
-                    probed += 1;
-                    report.unreachable.push(backend_id);
-                }
-                Some(Err(_e)) => {
-                    jni_log!("[preconnect] Task failed");
-                }
-                None => break, // JoinSet empty
-            }
-        }
-
-        // A task the overall cap cut off never reported. Count it as unreachable:
-        // a backend may only be called usable when it actually answered, and
-        // `total()` must still equal the number of configured backends.
-        if probed < seen_nodes.len() {
-            let mut classified = report.reachable.clone();
-            classified.extend(report.unreachable.iter().copied());
-            let missing = seen_nodes
-                .iter()
-                .copied()
-                .filter(|id| !classified.contains(id));
-            report.unreachable.extend(missing);
-        }
-
-        // A backend that answered and then refused the connection leaves the
-        // reason on its pool. Collect it so the caller can report "this server
-        // wants 2FA" instead of an "unreachable" that hides the real cause.
-        for (backend_id, pool) in &unique_pools {
-            if let Some(reason) = pool.take_auth_required().await {
-                jni_log!("[preconnect] Node {} requires 2FA: {}", backend_id, reason);
-                report.auth_required.push(*backend_id);
-            }
-        }
-
-        // What the probe would have recorded, written now: startup has just
-        // dialled every backend, so the group knows which of them answer from
-        // the first request instead of from the first probe round, which is up
-        // to a whole interval later. A backend that answered the handshake and
-        // then asked for 2FA counts as answering — it is reachable, and what it
-        // wants is a credential, which is a different thing to go and fix.
-        for backend_id in report.reachable.iter().chain(report.auth_required.iter()) {
-            self.record_probe(*backend_id, true);
-        }
-        for backend_id in report
-            .unreachable
-            .iter()
-            .filter(|id| !report.auth_required.contains(id))
-        {
-            self.record_probe(*backend_id, false);
-        }
-
-        jni_log!(
-            "[preconnect] Connectivity test done: {}/{} node(s) reachable",
-            report.reachable.len(),
-            seen_nodes.len()
-        );
-        report
-    }
-
-    /// Starts the periodic health probe.
-    ///
-    /// One task per group, holding only a [`std::sync::Weak`] reference, so it
-    /// ends when the group does — a stopped proxy is not kept alive by the
-    /// thing that is watching it. Nothing else stops it; a group that outlives
-    /// the probe simply stops being probed, which is the same state as before
-    /// it started.
-    ///
-    /// Not started by the constructors: those return a bare `Self`, and the
-    /// probe needs the `Arc` the caller is about to wrap it in. Every long-lived
-    /// owner therefore has to call this once, right after building the group.
-    pub fn start_health_probe(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            // A full interval before the first round, not the jitter alone.
-            // Whoever starts the group probes it once at startup, and a round
-            // that landed 0–5 s in would dial the same backends while that one
-            // was still dialling them, so both would find the pool empty and
-            // each would open a connection the other did not know about.
-            let first = tokio::time::Instant::now()
-                + PROBE_INTERVAL
-                + Duration::from_millis(fastrand::u64(0..PROBE_JITTER.as_millis() as u64));
-            let mut interval = tokio::time::interval_at(first, PROBE_INTERVAL);
-            // A round that ran long (a backend timing out costs up to
-            // PRECONNECT_TIMEOUT) must not queue up a burst of make-up rounds.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                interval.tick().await;
-                let Some(group) = weak.upgrade() else {
-                    break;
-                };
-                if group.probe_stopped.load(Ordering::SeqCst) {
-                    break;
-                }
-                group.probe_round().await;
-                // Dropped here, at the end of the iteration: the strong
-                // reference must not survive into the sleep, or the group would
-                // never be dropped and this loop never ends.
-            }
-        });
-    }
-
-    /// Asks every backend once, in parallel, and records what each answered.
-    ///
-    /// In parallel because a dead backend costs the whole probe timeout, and
-    /// four of them would then take longer than the interval between rounds.
-    async fn probe_round(&self) {
-        if self.probe_stopped.load(Ordering::SeqCst) {
-            return;
-        }
-        let mut probing = tokio::task::JoinSet::new();
-        for (backend_id, pool) in self.unique_pools() {
-            probing.spawn(async move {
-                let answered =
-                    match tokio::time::timeout(PRECONNECT_TIMEOUT, pool.preconnect()).await {
-                        Ok(true) => true,
-                        Ok(false) => false,
-                        Err(_) => false,
-                    };
-                (backend_id, answered)
-            });
-        }
-        while let Some(result) = probing.join_next().await {
-            // Checked here as well as at the top: a round that is already
-            // dialling when the group closes has to stop dialling, and letting
-            // the set drop is what aborts the members still in flight.
-            if self.probe_stopped.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok((backend_id, answered)) = result {
-                self.record_probe(backend_id, answered);
-            }
-        }
-    }
-
-    /// Folds one probe result into the group's health.
-    fn record_probe(&self, backend_id: EndpointId, answered: bool) {
-        record_outcome(&self.health, backend_id, answered);
-    }
-
-    /// Says that a request spent every attempt it had on `backends` without
-    /// being served by any of them.
-    ///
-    /// The counterpart to a probe: same table, same one meaning of "down", but
-    /// the evidence is stronger, because somebody asked for real and waited.
-    ///
-    /// Takes the list rather than one backend so that a backend is counted once
-    /// however many attempts landed on it: one request that failed is one
-    /// failure, not three, and a counter someone reads has to mean one thing.
-    ///
-    /// Callers reach this through [`PooledConnection::node`] only once every
-    /// attempt has failed — never per attempt. That boundary is what keeps an
-    /// ordinary stale connection from taking its backend out of rotation: the
-    /// retry loops exist precisely because the first attempt often draws a
-    /// connection the peer closed while nothing was using it, and the second
-    /// one usually succeeds.
-    pub fn record_request_failures(&self, backends: &[EndpointId]) {
-        let mut counted: Vec<EndpointId> = Vec::with_capacity(backends.len());
-        for backend in backends.iter().copied() {
-            if counted.contains(&backend) {
-                continue;
-            }
-            record_outcome(&self.health, backend, false);
-            counted.push(backend);
-        }
-    }
-
-    /// Every backend's health as the last probe left it.
-    ///
-    /// Empty until the first probe has run, which is up to
-    /// `PROBE_INTERVAL` plus `PROBE_JITTER` after [`Self::start_health_probe`].
-    /// A caller that needs an answer before then wants
-    /// [`Self::preconnect_report`], which probes on the spot.
-    ///
-    /// Sorted by node ID so a UI polling it does not see the entries change
-    /// places between two polls.
-    pub fn health_snapshot(&self) -> HealthSnapshot {
-        let mut nodes: Vec<NodeHealth> = self
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        nodes.sort_by_key(|n| n.node.to_string());
-        HealthSnapshot { nodes }
     }
 
     /// What each backend has carried since this group was built, and how many
@@ -1049,50 +531,6 @@ impl EndpointGroup {
         asked
     }
 
-    /// How traffic is currently reaching each backend, and how far away it is.
-    ///
-    /// One entry per *distinct backend*, because that is what a link describes — two domains
-    /// served by the same node share one connection pool and therefore one answer.
-    ///
-    /// A backend that has never connected reports [`LinkKind::Unknown`]; the caller decides
-    /// whether that means "not connected yet" or "not connected at all". The round-trip time
-    /// is `None` until iroh has a sample, which is not the same as zero.
-    pub async fn link_statuses(&self) -> Vec<(EndpointId, LinkStatus)> {
-        let mut statuses = Vec::new();
-        for (backend_id, pool) in self.unique_pools() {
-            statuses.push((backend_id, pool.link_status().await));
-        }
-        statuses
-    }
-
-    /// How traffic is currently reaching each backend: direct, or via a relay.
-    ///
-    /// The kind on its own, for the callers that only draw an icon.
-    pub async fn link_kinds(&self) -> Vec<(EndpointId, LinkKind)> {
-        self.link_statuses()
-            .await
-            .into_iter()
-            .map(|(id, status)| (id, status.kind))
-            .collect()
-    }
-
-    /// Closes and forgets every cached connection to every backend, keeping the endpoints.
-    ///
-    /// Called when the device switched networks: the tunnel itself stays up, but the
-    /// connections inside it were opened on the old network and are dead while still looking
-    /// open. See [`IrohConnectionPool::drop_connections`] for why they have to be closed
-    /// explicitly instead of waiting for QUIC to notice.
-    pub async fn drop_connections(&self) {
-        let pools = self.unique_pools();
-        for (backend_id, pool) in pools {
-            pool.drop_connections().await;
-            jni_log!(
-                "[drop-connections] dropped cached connections to {}",
-                backend_id
-            );
-        }
-    }
-
     /// Every distinct backend in this group, with its pool.
     ///
     /// Deduplicated by *backend* node ID, not by the pool's local endpoint ID: when the group
@@ -1156,69 +594,6 @@ impl EndpointGroup {
                 pool.close_all().await;
             }
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DomainMapping {
-    pub domain: String,
-    pub server_node_id: Option<String>,
-    pub server_ticket: Option<String>,
-}
-
-impl DomainMapping {
-    pub fn to_endpoint_addr(&self) -> Result<EndpointAddr, ClientError> {
-        crate::connection_pool::parse_endpoint_addr(
-            self.server_node_id.as_deref(),
-            self.server_ticket.as_deref(),
-        )
-    }
-
-    pub fn key(&self) -> String {
-        if let Some(id) = &self.server_node_id {
-            format!("node_id:{}", id)
-        } else if let Some(ticket) = &self.server_ticket {
-            format!("ticket:{}", ticket)
-        } else {
-            "unknown".to_string()
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NodeConfig {
-    pub server_node_id: Option<String>,
-    pub server_ticket: Option<String>,
-    pub domains: Vec<String>,
-}
-
-impl NodeConfig {
-    pub fn to_endpoint_addr(&self) -> Result<EndpointAddr, ClientError> {
-        crate::connection_pool::parse_endpoint_addr(
-            self.server_node_id.as_deref(),
-            self.server_ticket.as_deref(),
-        )
-    }
-
-    pub fn key(&self) -> String {
-        if let Some(id) = &self.server_node_id {
-            format!("node_id:{}", id)
-        } else if let Some(ticket) = &self.server_ticket {
-            format!("ticket:{}", ticket)
-        } else {
-            "unknown".to_string()
-        }
-    }
-
-    pub fn to_domain_mappings(&self) -> Vec<DomainMapping> {
-        self.domains
-            .iter()
-            .map(|domain| DomainMapping {
-                domain: domain.clone(),
-                server_node_id: self.server_node_id.clone(),
-                server_ticket: self.server_ticket.clone(),
-            })
-            .collect()
     }
 }
 
