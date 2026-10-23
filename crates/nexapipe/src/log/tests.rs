@@ -1,3 +1,6 @@
+//! The tests of the log: the layers it installs, the file a line is written to,
+//! and the access line that is built and redacted.
+
 use super::access::{REDACT_QUERY, access_identity, access_line, flow_detail_suffix, redact_query};
 use super::sink::sink_with;
 

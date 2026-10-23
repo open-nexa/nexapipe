@@ -368,6 +368,12 @@ pub fn next_request_id() -> String {
     out
 }
 
+/// `who` is who the request came from, when anybody asked: `None` for the
+/// plaintext listener and for a deployment with 2FA off, which never learn it.
+// One field of the line per argument, which is the shape a log call has had
+// since it was written; bundling them into a struct would move the list into a
+// builder without making any of the dozen call sites shorter. `who` is last
+// because it is the newest thing the line carries.
 #[allow(clippy::too_many_arguments)]
 pub fn log_access(
     request_id: &str,
