@@ -662,6 +662,44 @@ impl EndpointGroup {
         default_endpoint_addr: Option<EndpointAddr>,
         default_strategy: LoadBalancingStrategy,
     ) -> Result<Self, ClientError> {
+        Self::build(
+            domain_mappings,
+            default_endpoint_addr,
+            default_strategy,
+            None,
+        )
+        .await
+    }
+
+    /// Builds a group whose pools share one endpoint.
+    pub async fn new_with_domain_mappings_and_endpoint(
+        domain_mappings: Vec<DomainMapping>,
+        default_endpoint_addr: Option<EndpointAddr>,
+        default_strategy: LoadBalancingStrategy,
+        ep: Endpoint,
+    ) -> Result<Self, ClientError> {
+        Self::build(
+            domain_mappings,
+            default_endpoint_addr,
+            default_strategy,
+            Some(ep),
+        )
+        .await
+    }
+
+    /// The one body both doors open onto.
+    ///
+    /// The two constructors used to be a copy of each other — a hundred lines
+    /// apart, differing in the two lines that make a pool and in the wording of
+    /// two log lines. A change to the mapping had to be made twice, and the
+    /// two copies were free to drift: which is what happened to the pool, which
+    /// one of them made with the caller's endpoint and the other without.
+    async fn build(
+        domain_mappings: Vec<DomainMapping>,
+        default_endpoint_addr: Option<EndpointAddr>,
+        default_strategy: LoadBalancingStrategy,
+        ep: Option<Endpoint>,
+    ) -> Result<Self, ClientError> {
         let mut pool_by_key: HashMap<String, Arc<IrohConnectionPool>> = HashMap::new();
         let mut domain_to_keys: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -681,7 +719,10 @@ impl EndpointGroup {
 
             if !pool_by_key.contains_key(&key) {
                 let endpoint_addr = mapping.to_endpoint_addr()?;
-                let pool = IrohConnectionPool::new(endpoint_addr).await?;
+                let pool = match &ep {
+                    Some(ep) => IrohConnectionPool::new_with_endpoint(ep.clone(), endpoint_addr),
+                    None => IrohConnectionPool::new(endpoint_addr).await?,
+                };
                 pool_by_key.insert(key.clone(), Arc::new(pool));
                 jni_log!(
                     "[DEBUG:endpoint-group] Created connection pool for key: {}",
@@ -739,7 +780,10 @@ impl EndpointGroup {
         );
 
         let default_pools = if let Some(addr) = default_endpoint_addr {
-            let pool = IrohConnectionPool::new(addr).await?;
+            let pool = match ep {
+                Some(ep) => IrohConnectionPool::new_with_endpoint(ep, addr),
+                None => IrohConnectionPool::new(addr).await?,
+            };
             Some(Arc::new(DomainPools::new(
                 vec![Arc::new(pool)],
                 default_strategy,
@@ -781,113 +825,6 @@ impl EndpointGroup {
             ep,
         )
         .await
-    }
-
-    pub async fn new_with_domain_mappings_and_endpoint(
-        domain_mappings: Vec<DomainMapping>,
-        default_endpoint_addr: Option<EndpointAddr>,
-        default_strategy: LoadBalancingStrategy,
-        ep: Endpoint,
-    ) -> Result<Self, ClientError> {
-        let mut pool_by_key: HashMap<String, Arc<IrohConnectionPool>> = HashMap::new();
-        let mut domain_to_keys: HashMap<String, Vec<String>> = HashMap::new();
-
-        jni_log!(
-            "[DEBUG:endpoint-group] Creating EndpointGroup (with endpoint) with {} domain mappings",
-            domain_mappings.len()
-        );
-        for (i, mapping) in domain_mappings.iter().enumerate() {
-            let key = mapping.key();
-            let domain_key = normalize_pattern(&mapping.domain).into_owned();
-            jni_log!(
-                "[DEBUG:endpoint-group] Mapping {}: domain='{}', key='{}'",
-                i,
-                domain_key,
-                key
-            );
-
-            if !pool_by_key.contains_key(&key) {
-                let endpoint_addr = mapping.to_endpoint_addr()?;
-                let pool = IrohConnectionPool::new_with_endpoint(ep.clone(), endpoint_addr);
-                pool_by_key.insert(key.clone(), Arc::new(pool));
-                jni_log!(
-                    "[DEBUG:endpoint-group] Created connection pool for key: {}",
-                    key
-                );
-            }
-
-            domain_to_keys
-                .entry(domain_key.clone())
-                .or_default()
-                .push(key.clone());
-            jni_log!(
-                "[DEBUG:endpoint-group] Mapping domain '{}' to backend '{}'",
-                domain_key,
-                key
-            );
-        }
-
-        // Built here and shared with every pool: the health table is one fact
-        // per backend, not one per domain, so it cannot live inside a pool.
-        let health = Arc::new(Mutex::new(HashMap::new()));
-        let traffic = traffic::table();
-        let flows = traffic::flow_registry();
-
-        let mut domains = HashMap::new();
-        for (domain, keys) in domain_to_keys {
-            jni_log!(
-                "[DEBUG:endpoint-group] Domain '{}' maps to backends: {:?}",
-                domain,
-                keys
-            );
-            let pools: Vec<Arc<IrohConnectionPool>> = keys
-                .into_iter()
-                .filter_map(|k| pool_by_key.get(&k).cloned())
-                .collect();
-            if !pools.is_empty() {
-                let domain_pools = Arc::new(DomainPools::new(
-                    pools,
-                    default_strategy,
-                    health.clone(),
-                    traffic.clone(),
-                    flows.clone(),
-                ));
-                domains.insert(domain.clone(), domain_pools);
-                jni_log!(
-                    "[DEBUG:endpoint-group] Created DomainPools for domain '{}'",
-                    domain
-                );
-            }
-        }
-
-        jni_log!(
-            "[DEBUG:endpoint-group] Final domain map (with endpoint): {:?}",
-            domains.keys()
-        );
-
-        let default_pools = if let Some(addr) = default_endpoint_addr {
-            let pool = IrohConnectionPool::new_with_endpoint(ep, addr);
-            Some(Arc::new(DomainPools::new(
-                vec![Arc::new(pool)],
-                default_strategy,
-                health.clone(),
-                traffic.clone(),
-                flows.clone(),
-            )))
-        } else {
-            None
-        };
-
-        let wildcards = wildcards_of(&domains);
-        Ok(Self {
-            domains,
-            wildcards,
-            default_pools,
-            health,
-            traffic,
-            flows,
-            probe_stopped: AtomicBool::new(false),
-        })
     }
 
     pub async fn new_with_single_pool(conn_pool: IrohConnectionPool) -> Self {

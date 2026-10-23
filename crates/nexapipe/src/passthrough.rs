@@ -19,26 +19,18 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-/// TLS record content type: handshake (a `ClientHello` starts with this).
-pub const TLS_HANDSHAKE: u8 = 0x16;
-
-/// Handshake message type: `ClientHello`.
-const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
-
-/// Extension type: `server_name` (RFC 6066).
-const EXT_SERVER_NAME: u16 = 0x0000;
-
-/// SNI name type: `host_name`.
-const NAME_TYPE_HOST: u8 = 0x00;
-
 /// A `ClientHello` is a few hundred bytes; anything this large is not one, and
 /// the cap keeps a hostile peer from making the proxy buffer without bound.
 const MAX_HANDSHAKE_LEN: usize = 16 * 1024;
 
-/// True when `first_byte` starts a TLS handshake record.
-pub fn is_tls_handshake(first_byte: u8) -> bool {
-    first_byte == TLS_HANDSHAKE
-}
+// The name inside the `ClientHello`, and the record it arrives in, are read by
+// the client as well: it picks the route before the bytes reach the server.
+// The reader is the protocol crate's, so the two cannot answer differently
+// about the same hello.
+pub use nexapipe_proto::tls::{
+    HANDSHAKE_CLIENT_HELLO, MAX_HOST_NAME_LEN, NAME_TYPE_HOST, TLS_HANDSHAKE, extract_sni,
+    is_tls_handshake,
+};
 
 /// Serve a TLS connection that arrived over an iroh bi-stream.
 ///
@@ -392,158 +384,6 @@ pub fn parse_backend_addr(backend: &str) -> Option<(String, u16)> {
 /// backend ever is. The L4 path already did this.
 fn strip_ipv6_brackets(host: &str) -> &str {
     host.trim_matches(['[', ']'])
-}
-
-/// The longest name a `host_name` may carry.
-///
-/// 253 is the DNS limit for a presentation-format name; a longer one cannot
-/// have been meant as a host, and nothing here needs to reason about it.
-const MAX_HOST_NAME_LEN: usize = 253;
-
-/// Whether `name` is a host name this proxy is willing to act on.
-///
-/// Printable ASCII, and nothing else. RFC 6066 sends `host_name` as ASCII, so
-/// an internationalised name arrives as its A-label and a name with non-ASCII
-/// bytes in it is malformed rather than an IDN in need of normalising — which
-/// also means there is no case where two different spellings of the same name
-/// could reach a route as two different hosts.
-///
-/// Control characters are the point of the check: a host name is written to
-/// the log on every path through [`resolve_backend`], and `\r\n` in it lets a
-/// client append lines of its own to the server's log.
-fn is_presentable_host_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_HOST_NAME_LEN
-        && name.bytes().all(|b| (0x21..=0x7e).contains(&b))
-}
-
-/// Extract the SNI host name from a TLS `ClientHello`.
-///
-/// Layout (RFC 8446 / RFC 6066), all lengths big-endian:
-///
-/// ```text
-/// record:   type(1) version(2) length(2)
-/// handshake: type(1) length(3)
-///   client_version(2) random(32)
-///   session_id:   length(1) + data
-///   cipher_suites: length(2) + data
-///   compression:  length(1) + data
-///   extensions:   length(2) + data
-///     extension: type(2) length(2) data
-///       server_name: list_length(2) name_type(1) name_length(2) host_name
-/// ```
-///
-/// Returns `None` for anything that does not fit that shape, including a
-/// `ClientHello` that carries no `server_name` extension.
-pub fn extract_sni(data: &[u8]) -> Option<String> {
-    let mut record = Cursor::new(data);
-    if record.u8()? != TLS_HANDSHAKE {
-        return None;
-    }
-    record.skip(2)?; // legacy record version
-    let record_len = record.u16()? as usize;
-    if data.len() < 5 + record_len {
-        return None;
-    }
-
-    // Handshake header. Its own length is redundant with the record length, so
-    // only the type is checked.
-    if record.u8()? != HANDSHAKE_CLIENT_HELLO {
-        return None;
-    }
-    record.skip(3)?;
-
-    record.skip(2)?; // client_version
-    record.skip(32)?; // random
-
-    let session_id_len = record.u8()? as usize;
-    record.skip(session_id_len)?;
-
-    let cipher_suites_len = record.u16()? as usize;
-    record.skip(cipher_suites_len)?;
-
-    let compression_len = record.u8()? as usize;
-    record.skip(compression_len)?;
-
-    let extensions_len = record.u16()? as usize;
-    let mut extensions = Cursor::new(record.take(extensions_len)?);
-
-    while extensions.remaining() >= 4 {
-        let ext_type = extensions.u16()?;
-        let ext_len = extensions.u16()? as usize;
-        let ext_data = extensions.take(ext_len)?;
-
-        if ext_type == EXT_SERVER_NAME {
-            let mut list = Cursor::new(ext_data);
-            list.skip(2)?; // server_name_list length
-
-            // Every entry, not the first one: RFC 6066 allows a list, and a
-            // client that puts an entry of another type first still has its
-            // host name behind it. Stopping at a type this proxy does not
-            // read turned such a hello into "no SNI".
-            while list.remaining() >= 3 {
-                let name_type = list.u8()?;
-                let name_len = list.u16()? as usize;
-                let name = list.take(name_len)?;
-
-                if name_type != NAME_TYPE_HOST {
-                    continue;
-                }
-
-                let name = String::from_utf8(name.to_vec()).ok()?;
-                // Nothing downstream — the allow list, the route match, the
-                // log lines — can say anything useful about a name that is not
-                // a name, and a log line is the one place it could do real
-                // damage: a `\r\n` in here appends whatever the client likes
-                // to the server's log. Refusing is what "no SNI" already
-                // means, so it costs a client nothing but a hang-up — and no
-                // later entry is taken as a second guess.
-                return is_presentable_host_name(&name).then_some(name);
-            }
-        }
-    }
-
-    None
-}
-
-/// Bounds-checked reader over a byte slice; every getter yields `None` on
-/// overrun so the parser is a single chain of `?` with no index arithmetic.
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Cursor { data, pos: 0 }
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        let value = *self.data.get(self.pos)?;
-        self.pos += 1;
-        Some(value)
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        let high = self.u8()? as u16;
-        let low = self.u8()? as u16;
-        Some((high << 8) | low)
-    }
-
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(len)?;
-        let slice = self.data.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
-    }
-
-    fn skip(&mut self, len: usize) -> Option<()> {
-        self.take(len).map(|_| ())
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
-    }
 }
 
 #[cfg(test)]
