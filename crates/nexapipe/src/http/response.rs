@@ -52,7 +52,11 @@ pub enum BodyError {
 /// The list is the RFC's, which is not the request direction's list: a request
 /// carries `expect` and `proxy-connection`, which are not response headers,
 /// and the two directions carry the proxy authentication headers, which are.
-pub(super) fn forwards_response_header(name: &str) -> bool {
+///
+/// The third group is what the response's own `Connection` header names — the
+/// response's, not the request's: the two are read apart, as RFC 9110 §7.6.1
+/// treats them.
+pub(super) fn forwards_response_header(name: &str, connection: &ConnectionNamed) -> bool {
     ![
         "connection",
         "keep-alive",
@@ -65,6 +69,29 @@ pub(super) fn forwards_response_header(name: &str) -> bool {
     ]
     .iter()
     .any(|hop| name.eq_ignore_ascii_case(hop))
+        && !connection.names(name)
+}
+
+/// The headers of a backend's answer that the client may see.
+///
+/// The hop-by-hop ones are dropped — the fixed list of RFC 9110 §7.6.1 and
+/// every header the answer's own `Connection` header names — and the rest are
+/// kept as they are, duplicates and all.
+///
+/// One place, so that both paths hand the client the same headers for the
+/// same answer: the plaintext listener and the tunnel path forward the same
+/// backend answers, and a header that one of them drops and the other does not
+/// is a header whose presence depends on the path the request took.
+pub(super) fn forwarded_response_headers(headers: &::http::HeaderMap) -> ::http::HeaderMap {
+    let connection = ConnectionNamed::of(headers);
+    let mut forwarded = ::http::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if !forwards_response_header(name.as_str(), &connection) {
+            continue;
+        }
+        forwarded.append(name.clone(), value.clone());
+    }
+    forwarded
 }
 
 /// A message with its first letter capitalised.
