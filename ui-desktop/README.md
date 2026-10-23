@@ -169,6 +169,16 @@ the UI can say exactly why TUN could not start.
   connection around 50 Mbps at 200 ms RTT. Overrides without a rebuild:
   `NEXAPIPE_QUIC_STREAM_WINDOW`, `NEXAPIPE_QUIC_SEND_WINDOW`,
   `NEXAPIPE_QUIC_INITIAL_MTU`, `NEXAPIPE_QUIC_KEEPALIVE_MS`.
+- **The service runs a different binary than the app shows.** The app installs
+  per user into `%LOCALAPPDATA%\nexa`, and the service — which runs as
+  LocalSystem — runs a copy of `nexa-service.exe` that the app's own
+  registration put under `C:\Program Files\Nexa\Service`. An upgrade replaces
+  the app's files; the system-wide copy is replaced when the service is
+  registered again, so the two can be out of step and the traffic then goes
+  through the previous build. Compare the two files'
+  `Get-FileHash` and register the service again from the Settings page when
+  they differ — [When a client cannot connect](../../docs/client-troubleshooting.md)
+  has the check and the fix.
 - **Logs**: `%APPDATA%/nexa/logs` on Windows and `$XDG_STATE_HOME/nexa/logs`
   (or `~/.local/state/nexa/logs`) for the desktop app on Unix; the service writes
   to `/var/log/nexa-service`. Files rotate daily; `RUST_LOG` controls the level.

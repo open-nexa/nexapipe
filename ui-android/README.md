@@ -229,6 +229,7 @@ powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
 | `UnsatisfiedLinkError: nativeStartTunProxy` | The `.so` was built without the `tun-proxy` feature. |
 | `UnsatisfiedLinkError` on `System.loadLibrary` | The `.so` is missing from `jniLibs/<abi>/` for the ABI the device runs, or the APK you installed was built for the other ABI. |
 | Tunnel connects then drops after a few seconds | Usually the smoltcp sequence-number underflow panic — make sure the workspace `[patch.crates-io]` for `third_party/smoltcp` is in effect. |
+| The 2FA switch reads off right after a scan | The enrollment is pending — the node holds a one-time token, not a credential. Let it connect once; a token that was already spent needs a new invite. |
 | iroh never connects / `dns.iroh.link` timeouts | Set a relay override, or inject DNS servers (both are exposed in the UI). |
 | Poor throughput over long RTT links | Raise `NEXAPIPE_QUIC_STREAM_WINDOW` (see the root README). |
 

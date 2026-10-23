@@ -72,6 +72,15 @@ lookup, which is what a config written before the key existed does.
 
 ### Added
 
+- **There is a page to point at when a client will not connect.** Three failures
+  look alike from the outside — the server holds a credential the client does not
+  present, an enrollment the server has not answered yet, and a Windows service
+  still running the build from before the last upgrade — and each of them was
+  diagnosed from scratch.
+  [`docs/client-troubleshooting.md`](docs/client-troubleshooting.md) says which
+  check to run first, spells out what a device's identity is (the key belongs to
+  the device, not to the endpoint it talks to), and says how to recover from a
+  token that has already been spent.
 - **What a second connection costs is measured now.** The protocol a stream
   carries was chosen by its first byte, so **one** connection carried both the
   HTTP requests and the L4 tunnels a client made to the same endpoint.
