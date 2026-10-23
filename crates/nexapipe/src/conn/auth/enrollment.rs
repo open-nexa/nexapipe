@@ -78,11 +78,24 @@ impl EnrollmentVerdict {
 /// every log line and the peer list go on showing the real device's name.
 /// Rotating one device's credential is the operator's move and has its own
 /// `--force`; an enrollment is for a device that is not there yet.
+///
+/// **With one exception: the device that still holds the key the table already
+/// records.** That is the same device coming back for a credential it lost —
+/// the answer it was given was never written down — and not somebody taking
+/// the name over. The key is not proof of possession: the public half is
+/// public, and anybody who has seen a device's key can name it. What makes it
+/// safe is what the enrollment does with it. It records the same key under the
+/// same name, so the device holding the private half keeps working and the one
+/// that does not gains nothing; and a key enrollment writes the device row and
+/// nothing else, so the client's own shared secret is not rotated and no other
+/// device of it is locked out. A different key, or no key at all, is refused as
+/// before.
 pub(in crate::conn) fn enrollment_verdict(
     cfg: &AuthConfig,
     client_id: &str,
     token: &str,
     device: Option<&str>,
+    public_key: Option<&str>,
 ) -> EnrollmentVerdict {
     let Some(client) = cfg.clients.get(client_id) else {
         return EnrollmentVerdict::Refuse { counted: false };
@@ -120,11 +133,36 @@ pub(in crate::conn) fn enrollment_verdict(
     // one. Whoever is holding it is about to be told the same thing every other
     // refusal says.
     if let Some(name) = device
-        && client.devices.contains_key(name)
+        && let Some(entry) = client.devices.get(name)
+        && !holds_the_key_on_file(entry, public_key)
     {
         return EnrollmentVerdict::Refuse { counted: false };
     }
     EnrollmentVerdict::Accept
+}
+
+/// Whether the credential this enrollment offers is the one the device's row
+/// already holds.
+///
+/// The comparison is on the canonical spelling — lowercase hex — because that
+/// is what the table stores, and a key that arrives in another spelling is the
+/// same key.
+///
+/// A row that holds a secret rather than a key never matches: a device that
+/// proves itself with a code is not the device that offered a key, and a
+/// keyless enrollment is not a device coming back.
+fn holds_the_key_on_file(entry: &DeviceAuth, offered: Option<&str>) -> bool {
+    let Some(offered) = offered else {
+        return false;
+    };
+    let Some(stored) = entry.public_key.as_deref() else {
+        return false;
+    };
+    let Ok(offered) = crate::auth::parse_public_key(offered) else {
+        return false;
+    };
+    let offered = crate::auth::public_key_hex(&offered);
+    constant_time_eq(stored.as_bytes(), offered.as_bytes())
 }
 
 /// What a successful handshake established.
@@ -355,6 +393,27 @@ pub fn count_enrollment_failure(
     }
 }
 
+/// What an operator has to do about a device that is already enrolled.
+///
+/// The command that unblocks the enrollment is the one that **removes** the
+/// device's row. The refusal is about the name being taken, and
+/// `client add --device --force` replaces the credential filed under that
+/// name without giving the name back — so the next enrollment is refused the
+/// same way. Naming `--force` first, which is what this hint used to do, sent
+/// the operator down the one path that does not work.
+///
+/// The revoke is the operator's own move either way: a device that is already
+/// enrolled keeps its credential until somebody says otherwise.
+pub(in crate::conn) fn device_taken_hint(client_id: &str, device: &str) -> String {
+    format!(
+        "2FA: enrollment for '{client_id}' refused, device '{device}' already has a credential; \
+         `nexapipe client revoke {client_id} --device {device}` removes it so that device can \
+         enroll again — `nexapipe client add {client_id} --device {device} --force` replaces \
+         the credential filed under that name but leaves the name taken, so the enrollment is \
+         refused the same way"
+    )
+}
+
 /// Issues a credential against an enrollment token: a freshly generated secret,
 /// or the device key the client offered.
 ///
@@ -394,7 +453,7 @@ pub(super) async fn enroll_client(
         client.refresh_enrollment_lockout();
     }
 
-    let verdict = enrollment_verdict(&cfg, client_id, token, device);
+    let verdict = enrollment_verdict(&cfg, client_id, token, device, public_key);
     if !matches!(verdict, EnrollmentVerdict::Accept) {
         // The refusal sent on the wire is one string for every reason, so the
         // only place this one is legible is the log — and it is the one an
@@ -406,11 +465,7 @@ pub(super) async fn enroll_client(
                 .get(client_id)
                 .is_some_and(|client| client.devices.contains_key(name))
         {
-            tracing::warn!(
-                "2FA: enrollment for '{client_id}' refused, device '{name}' already has a \
-                 credential; replace it with `nexapipe client add {client_id} --device {name} \
-                 --force`"
-            );
+            tracing::warn!("{}", device_taken_hint(client_id, name));
         }
         // Whether the counters have moved and the state file has to be
         // written. The write itself happens after the lock is released.

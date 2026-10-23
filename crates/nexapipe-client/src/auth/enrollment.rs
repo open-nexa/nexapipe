@@ -113,6 +113,36 @@ impl std::fmt::Debug for Enrollment {
     }
 }
 
+/// What a client says when the server refuses an enrollment.
+///
+/// The server sends one string for every way it can refuse — whether the token
+/// was unknown, already spent or the device was already enrolled is not
+/// information a stranger is owed — so the refusal on its own says nothing
+/// about what to do next. What the client does know is which client id and
+/// which device name it offered, and those are what an operator needs: the
+/// server's log names the device, and this names it on the client's side too,
+/// so the two can be put together without guessing.
+///
+/// The device name is what makes the refusal actionable, because it is what a
+/// device that is already enrolled on the server has to be freed under — and
+/// the most common reason for a refusal is exactly that: the answer the
+/// server gave was never written down, so the device asked again and the name
+/// it asked under was taken.
+pub(crate) fn refused_enrollment_message(
+    reason: &str,
+    client_id: &str,
+    device: Option<&str>,
+) -> String {
+    match device {
+        Some(device) => format!(
+            "{reason} (client '{client_id}', device '{device}'; if that device is already \
+             enrolled on the server, an operator can free it with `nexapipe client revoke \
+             {client_id} --device {device}`)"
+        ),
+        None => format!("{reason} (client '{client_id}')"),
+    }
+}
+
 impl Enrollment {
     pub fn new(client_id: &str, token: &str) -> Self {
         Self {
@@ -291,7 +321,9 @@ impl Enrollment {
             // either right or it is not, and saying which would only help
             // someone who is guessing.
             AuthMessage::EnrollFailed { reason } => {
-                return Err(ClientError::AuthenticationFailed(reason));
+                return Err(ClientError::AuthenticationFailed(
+                    refused_enrollment_message(&reason, self.client_id(), self.device_id()),
+                ));
             }
             other => {
                 return Err(ClientError::Other(format!(

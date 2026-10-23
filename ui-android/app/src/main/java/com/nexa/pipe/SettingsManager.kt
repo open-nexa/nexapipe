@@ -7,6 +7,7 @@ import android.util.Log
 import androidx.core.content.edit
 import com.nexa.pipe.ui.NodeConfig
 import com.nexa.pipe.ui.NodeTwoFactor
+import com.nexa.pipe.ui.hasCredential
 import com.nexa.pipe.vpn.VpnTakeoverChoice
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -73,12 +74,16 @@ class SettingsManager internal constructor(
         // the only one there is. It never appears in the backed-up endpoint
         // list, and it never leaves the device.
         const val DEVICE_KEY_PREFIX = "device_key_"
-        // Read once by `migrateLegacyTwoFactor` and then deleted: 2FA used to
-        // be one app-wide setting, it now belongs to an endpoint.
+        // The app-wide 2FA setting an older version kept: one pair for the
+        // whole app, where 2FA now belongs to an endpoint. Read by
+        // `migrateLegacyTwoFactor` and then deleted.
         const val KEY_2FA_ENABLED = "two_factor_enabled"
         const val KEY_2FA_CLIENT_ID = "two_factor_client_id"
         const val KEY_2FA_SECRET = "two_factor_secret"
         const val KEY_2FA_ALGORITHM = "two_factor_algorithm"
+        // Written by `migrateLegacyTwoFactor`, and no longer what decides
+        // anything: the migration runs on what is left to move, not on this
+        // flag. It stays because the older versions look for it.
         const val KEY_2FA_MIGRATED = "two_factor_migrated"
 
         /**
@@ -157,68 +162,96 @@ class SettingsManager internal constructor(
      *
      * Such a pair authenticated *every* connection, so the faithful migration
      * is the same credentials on every configured endpoint — from there each
-     * one is edited on its own page. Runs at most once. With no endpoint yet
-     * there is nothing to attach the credentials to, and they are dropped
-     * rather than quietly kept as a setting that still applies to everything.
+     * one is edited on its own page. With no endpoint yet there is nothing to
+     * attach the credentials to, and they are dropped rather than quietly kept
+     * as a setting that still applies to everything.
+     *
+     * **What triggers it is the setting still being there, not the flag.**
+     * The flag says the migration ran; the setting being present says there is
+     * something left to move. A device where the flag was written but the
+     * setting was not cleared — what an interrupted migration leaves behind —
+     * used to skip the migration for good: the setting stayed in the clear,
+     * attached to nothing, and no endpoint could use it. The flag is still
+     * written, because it is what the older versions look for; it is simply no
+     * longer what decides.
      */
     private fun migrateLegacyTwoFactor() {
-        if (secretPrefs.getBoolean(KEY_2FA_MIGRATED, false)) {
-            return
-        }
-        val legacy = takeLegacyTwoFactor()
+        val source = legacyTwoFactorSource() ?: return
+        val legacy = readLegacyTwoFactor(source)
         secretPrefs.edit().putBoolean(KEY_2FA_MIGRATED, true).apply()
-        if (legacy == null || !legacy.enabled || legacy.clientId.isBlank() || legacy.secret.isBlank()) {
+        if (!legacy.enabled || legacy.clientId.isBlank() || legacy.secret.isBlank()) {
+            // Nothing here authenticates anything: the setting was off, or it
+            // was never filled in. The keys go anyway — a file holding a key
+            // that looks like a credential reads like one.
+            clearLegacyTwoFactor(source)
             return
         }
-        val nodes = decodeNodes()
+        // Loaded rather than decoded: the endpoints come back with their
+        // credentials attached, and whether an endpoint already has one is the
+        // question that decides whether the app-wide pair belongs on it.
+        val nodes = loadNodes()
         if (nodes.isEmpty()) {
             Log.w(TAG, "Dropped the app-wide 2FA setting: there is no endpoint to attach it to")
+            clearLegacyTwoFactor(source)
             return
         }
-        val otp = NodeTwoFactor(
-            enabled = true,
-            clientId = legacy.clientId,
-            secret = legacy.secret,
-            algorithm = legacy.algorithm
-        )
-        saveNodes(nodes.map { node -> node.copy(twoFactor = otp) })
-        Log.i(TAG, "Moved the app-wide 2FA setting onto ${nodes.size} endpoint(s)")
+        val move = legacyTwoFactorTargets(nodes, legacy)
+        saveNodes(move.nodes)
+        // The credential is on the endpoints now, so the app-wide copy goes: it
+        // is the same secret in two places, and one of them is a file the
+        // backup excludes.
+        clearLegacyTwoFactor(source)
+        Log.i(TAG, "Moved the app-wide 2FA setting onto ${move.attached} endpoint(s)")
     }
 
     /**
-     * Reads the pre-endpoint 2FA setting and deletes it.
+     * The file the app-wide 2FA setting is in, if it is in one at all.
      *
      * The oldest versions wrote it to [prefs]; a later migration moved it to
      * [secretPrefs]. Both are checked so an app that skipped a version still
      * gets its credentials migrated.
+     *
+     * The secret counts as the setting being there on its own: it is the
+     * credential, and a copy of it that nothing can reach is exactly what this
+     * migration exists to clean up.
      */
-    private fun takeLegacyTwoFactor(): LegacyTwoFactor? {
-        val source = when {
-            secretPrefs.contains(KEY_2FA_ENABLED) -> secretPrefs
-            prefs.contains(KEY_2FA_ENABLED) -> prefs
-            else -> return null
-        }
-        val legacy = LegacyTwoFactor(
-            enabled = source.getBoolean(KEY_2FA_ENABLED, false),
-            clientId = source.getString(KEY_2FA_CLIENT_ID, "") ?: "",
-            secret = source.getString(KEY_2FA_SECRET, "") ?: "",
+    private fun legacyTwoFactorSource(): SharedPreferences? = when {
+        secretPrefs.contains(KEY_2FA_ENABLED) || secretPrefs.contains(KEY_2FA_SECRET) -> secretPrefs
+        prefs.contains(KEY_2FA_ENABLED) || prefs.contains(KEY_2FA_SECRET) -> prefs
+        else -> null
+    }
+
+    /**
+     * Reads the app-wide 2FA setting, sealed or not.
+     *
+     * A value that carries the sealed marker is opened; one that does not is
+     * taken as it stands, because that is what the older versions wrote and
+     * it is the user's only copy.
+     */
+    private fun readLegacyTwoFactor(source: SharedPreferences): LegacyTwoFactor {
+        val secret = secrets.unseal(source.getString(KEY_2FA_SECRET, "") ?: "")
+        return LegacyTwoFactor(
+            // A setting that was off says so. One that has a secret and no
+            // flag to say otherwise is on: the secret is the credential, and
+            // the flag is only the switch.
+            enabled = source.getBoolean(KEY_2FA_ENABLED, !secret.isBlank()),
+            clientId = secrets.unseal(source.getString(KEY_2FA_CLIENT_ID, "") ?: ""),
+            secret = secret,
             algorithm = source.getString(KEY_2FA_ALGORITHM, "sha1") ?: "sha1"
         )
+    }
+
+    /**
+     * Takes the app-wide 2FA setting off the disk.
+     */
+    private fun clearLegacyTwoFactor(source: SharedPreferences) {
         source.edit()
             .remove(KEY_2FA_ENABLED)
             .remove(KEY_2FA_CLIENT_ID)
             .remove(KEY_2FA_SECRET)
             .remove(KEY_2FA_ALGORITHM)
             .apply()
-        return legacy
     }
-
-    private data class LegacyTwoFactor(
-        val enabled: Boolean,
-        val clientId: String,
-        val secret: String,
-        val algorithm: String
-    )
 
     /**
      * Persists the endpoints. The 2FA secret — and any enrollment token — of
@@ -502,17 +535,6 @@ class SettingsManager internal constructor(
         }
     }
 
-    /**
-     * Whether [key] names a credential in [secretPrefs].
-     *
-     * The file also holds non-credentials — the migration flag, for one — and
-     * those must stay readable as they are.
-     */
-    private fun isCredentialKey(key: String): Boolean =
-        key == KEY_RELAY_AUTH_TOKEN ||
-            key.startsWith(SECRET_PREFIX) ||
-            key.startsWith(ENROLLMENT_PREFIX)
-
     private fun decodeNodes(): List<NodeConfig> {
         val jsonStr = prefs.getString(KEY_NODES, "")
         if (jsonStr.isNullOrEmpty()) {
@@ -661,6 +683,91 @@ class SettingsManager internal constructor(
     fun saveVpnConsentMissing(missing: Boolean) {
         prefs.edit { putBoolean(KEY_VPN_CONSENT_MISSING, missing) }
     }
+}
+
+/**
+ * Whether [key] names a credential in the secrets file.
+ *
+ * The file also holds non-credentials — the migration flag, for one — and
+ * those must stay readable as they are.
+ *
+ * The app-wide 2FA setting is in the list because it *is* one: the seed is a
+ * TOTP secret and the client id is half of the pair that authenticates with
+ * it. A device that still had the setting was carrying both in the clear, in
+ * the one file whose whole point is that it holds ciphertext — and the
+ * migration that was supposed to take them away was skipped by the very flag
+ * that said it had run.
+ */
+internal fun isCredentialKey(key: String): Boolean =
+    key == SettingsManager.KEY_RELAY_AUTH_TOKEN ||
+        key == SettingsManager.KEY_2FA_SECRET ||
+        key == SettingsManager.KEY_2FA_CLIENT_ID ||
+        key.startsWith(SettingsManager.SECRET_PREFIX) ||
+        key.startsWith(SettingsManager.ENROLLMENT_PREFIX)
+
+/**
+ * The app-wide 2FA setting an older version kept.
+ *
+ * One pair for the whole app: it authenticated every connection, and the
+ * endpoints it belonged to are the ones it is moved onto.
+ */
+internal data class LegacyTwoFactor(
+    val enabled: Boolean,
+    val clientId: String,
+    val secret: String,
+    val algorithm: String
+)
+
+/**
+ * Where the app-wide 2FA setting went.
+ */
+internal data class LegacyTwoFactorMove(
+    /** The endpoints, with the pair on the ones that took it. */
+    val nodes: List<NodeConfig>,
+    /** How many endpoints took it. */
+    val attached: Int
+)
+
+/**
+ * Which endpoints the app-wide 2FA setting belongs on.
+ *
+ * A pair like this authenticated *every* connection, so the faithful migration
+ * is the same pair on every endpoint that can take it — but only on those:
+ *
+ * - An endpoint that has a credential of its own keeps it. The app-wide pair
+ *   is older than the per-endpoint ones, so putting it on top of them would
+ *   replace a credential that works with one that is on its way out.
+ * - An endpoint that is waiting to enroll is left alone as well: its
+ *   enrollment is about to issue a credential of its own, on the client id the
+ *   invite named. The app-wide pair is on a client id that has nothing to do
+ *   with it, and putting it there would stop the enrollment from being armed
+ *   at all — the endpoint would answer with a credential the server never
+ *   issued to it.
+ *
+ * What is left over is a pair nothing uses, and the caller drops it.
+ */
+internal fun legacyTwoFactorTargets(
+    nodes: List<NodeConfig>,
+    legacy: LegacyTwoFactor
+): LegacyTwoFactorMove {
+    val otp = NodeTwoFactor(
+        enabled = true,
+        clientId = legacy.clientId,
+        secret = legacy.secret,
+        algorithm = legacy.algorithm
+    )
+    var attached = 0
+    val moved = nodes.map { node ->
+        val takes = node.twoFactor?.hasCredential() != true &&
+            node.enrollment?.token.isNullOrBlank()
+        if (takes) {
+            attached++
+            node.copy(twoFactor = otp)
+        } else {
+            node
+        }
+    }
+    return LegacyTwoFactorMove(moved, attached)
 }
 
 /**
