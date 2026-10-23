@@ -391,6 +391,15 @@ pub struct Answer {
     idle: Duration,
     /// What the access log says, once the answer is over.
     report: Option<crate::http::server::AccessReport>,
+    /// The backend's lease, held until the answer's body is done.
+    ///
+    /// The work against a backend is not over when the response head is in:
+    /// the body may still be streaming, and a backend that is still streaming
+    /// is still busy. The balancer counts a backend as busy until the flow
+    /// that is using it releases the lease, so the lease belongs with the
+    /// body rather than with the head. The plaintext path has always kept it
+    /// there; see [`LeasedBody`].
+    lease: Option<crate::lb::BackendLease>,
 }
 
 impl Answer {
@@ -414,6 +423,16 @@ impl Answer {
         self
     }
 
+    /// The answer, and the backend's lease.
+    ///
+    /// The lease is what the balancer counts, and it is released when the
+    /// body is dropped — which is when the work against that backend is
+    /// really over.
+    pub fn with_lease(mut self, lease: Option<crate::lb::BackendLease>) -> Self {
+        self.lease = lease;
+        self
+    }
+
     /// The answer, as hyper writes it.
     pub fn into_response(self) -> Response<crate::http::body::ProxyBody> {
         let Answer {
@@ -421,11 +440,18 @@ impl Answer {
             bytes_sent,
             idle,
             report,
+            lease,
         } = self;
         let (parts, body) = response.into_parts();
         let body = UnsyncBoxBody::new(crate::http::server::CountedBody::new(
             body, bytes_sent, idle, report,
         ));
+        // The lease rides with the body: the backend is busy until the body
+        // is done, and not one moment longer.
+        let body = http_body_util::BodyExt::boxed_unsync(LeasedBody {
+            inner: body,
+            _lease: lease,
+        });
         Response::from_parts(parts, body)
     }
 }
@@ -587,6 +613,7 @@ pub async fn proxy_to_backend(
         bytes_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         idle: timeouts.deadlines.response_idle,
         report: None,
+        lease: None,
     })
 }
 
