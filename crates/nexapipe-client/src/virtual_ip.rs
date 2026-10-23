@@ -46,12 +46,30 @@
 //! domain holds one address per family, and a pool is per family: handing an
 //! IPv4 address out of the IPv6 pool (or the other way round) is not possible,
 //! and neither is evicting an address of one family to make room in the other.
+//!
+//! # Recycling
+//!
+//! The pool is finite, so once it is full an address is handed to a new
+//! domain. Which address that is matters: the DNS answer that named it may
+//! still be cached, and an answer that changed hands under a cached resolver
+//! sends the old domain's next connection to the new domain's route — the
+//! tunnel answers it to the new domain.
+//!
+//! So an address is only taken once the answer that named it has expired —
+//! [`ADDRESS_TTL`], the TTL the answers carry — and among the addresses that
+//! are free the quietest wins. The two rules are not the same rule, and the
+//! difference is the whole point: an idle flow is the *quietest* address there
+//! is (nothing arrives on it, so it looks unused), so "take the quietest" is
+//! what hands a live connection's address to another domain. The age of the
+//! answer is what says whether an address may be taken at all.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::time::Duration;
+use std::time::Instant;
 
 /// First address handed out.
 ///
@@ -69,6 +87,19 @@ fn virtual_ip_last() -> Ipv4Addr {
 
 /// Size of the address pool (`.16` … `.254` inclusive).
 pub const VIRTUAL_IP_COUNT: usize = 239;
+
+/// How long an address stays bound to the domain it was handed out for.
+///
+/// This is the TTL of the DNS answers the TUN hands out (see [`crate::dns`]):
+/// a resolver may hold the answer for that long, and the answer is what says
+/// "this address is this domain". An address is therefore not handed to
+/// another domain before the answer that named it has expired — otherwise the
+/// old domain's next connection is opened on the new domain's route.
+///
+/// The number lives here and the answer's own TTL lives in the DNS module, so
+/// a test pins the two together: they have to be the same, or the address may
+/// change hands while a resolver still holds the answer that named it.
+pub const ADDRESS_TTL: Duration = Duration::from_secs(60);
 
 /// Which domain an address belongs to, and back again.
 ///
@@ -90,6 +121,23 @@ struct Inner {
     v6: Option<Pool>,
 }
 
+/// What the pool knows about one address it has handed out.
+#[derive(Debug)]
+struct Address {
+    /// The domain the address was handed out for.
+    domain: Arc<str>,
+    /// The clock of the last use.
+    ///
+    /// The quietest address is the one used least recently — which is not the
+    /// same as the one no flow is on: an idle flow is the quietest there is.
+    used: u64,
+    /// When the DNS answer that named this address expires.
+    ///
+    /// The answer may be cached for that long, and the address belongs to the
+    /// domain it names for as long as the answer may be held.
+    expires_at: Instant,
+}
+
 /// One family's addresses.
 ///
 /// The addresses are held as the integers they are, widened to `u128`: that is
@@ -98,14 +146,15 @@ struct Inner {
 #[derive(Debug)]
 struct Pool {
     /// The direction the packet path needs: the domain an address was handed
-    /// out for, and when it was last used.
+    /// out for, when it was last used, and when the answer that named it
+    /// expires.
     ///
     /// **One map, not two.** The clock used to live in a map of its own, and
     /// the eviction scan then had to look every address up in it — a hash
     /// lookup per address, for a scan that runs on every allocation once the
     /// pool is full. With the clock beside the name, the scan is a walk over
     /// values that are already in hand.
-    ip_to_domain: HashMap<u128, (Arc<str>, u64)>,
+    ip_to_domain: HashMap<u128, Address>,
     /// The direction that keeps a domain's address stable across queries.
     domain_to_ip: HashMap<Arc<str>, u128>,
     /// The clock behind the "last used" in [`Self::ip_to_domain`]. Per pool: it
@@ -140,55 +189,95 @@ impl Pool {
     /// Records that `ip` is being used right now.
     fn touch(&mut self, ip: u128) {
         self.clock += 1;
-        if let Some(entry) = self.ip_to_domain.get_mut(&ip) {
-            entry.1 = self.clock;
+        if let Some(address) = self.ip_to_domain.get_mut(&ip) {
+            address.used = self.clock;
         }
     }
 
-    /// The address that has been quiet for the longest.
+    /// Records that `ip` was handed out in a DNS answer just now.
     ///
-    /// Only asked for when the pool is full, which is a few hundred (or a few
-    /// tens of thousand) addresses at most, so the scan is cheaper than keeping
-    /// the addresses sorted.
-    fn quietest_address(&self) -> u128 {
-        self.ip_to_domain
-            .iter()
-            .min_by_key(|(_, (_, used))| *used)
-            .map(|(ip, _)| *ip)
-            .unwrap_or(self.first)
+    /// The answer is what the application — and every resolver between it and
+    /// us — holds: it says "this address is this domain". For as long as it
+    /// may be cached, the address belongs to the domain it names.
+    fn answer(&mut self, ip: u128, now: Instant) {
+        if let Some(address) = self.ip_to_domain.get_mut(&ip) {
+            address.expires_at = now + ADDRESS_TTL;
+        }
+    }
+
+    /// The address that may be handed to a new domain.
+    ///
+    /// An address whose answer has not expired yet is not a candidate at all:
+    /// a resolver may still be holding that answer, and the old domain's next
+    /// connection would then be opened on the new domain's route.
+    ///
+    /// Among the addresses that are free, the quietest wins — the one whose
+    /// flows have been the least busy. The address breaks a tie, so the same
+    /// pool always recycles the same one.
+    ///
+    /// When no answer has expired — the pool filled inside one TTL — the
+    /// quietest address is taken anyway: the pool has to serve the name, and
+    /// that is the address with the least traffic on it.
+    fn recyclable_address(&self, now: Instant) -> u128 {
+        let mut quietest: Option<(u64, u128)> = None;
+        let mut free: Option<(u64, u128)> = None;
+
+        for (ip, address) in &self.ip_to_domain {
+            if quietest.is_none_or(|(used, held)| (address.used, *ip) < (used, held)) {
+                quietest = Some((address.used, *ip));
+            }
+            if address.expires_at > now {
+                continue;
+            }
+            if free.is_none_or(|(used, held)| (address.used, *ip) < (used, held)) {
+                free = Some((address.used, *ip));
+            }
+        }
+
+        free.or(quietest).map(|(_, ip)| ip).unwrap_or(self.first)
     }
 
     /// The address for `domain`, allocating one on first use.
     fn alloc(&mut self, domain: &str) -> u128 {
         let key = crate::domains::fold_domain(domain);
+        let now = Instant::now();
 
         // A domain that already has an address keeps it: the application may be
         // holding a connection open against it, and moving the address would
         // break that connection's replies.
         if let Some(&ip) = self.domain_to_ip.get(key.as_str()) {
             self.touch(ip);
+            // The answer is being handed out again, so the hold starts again.
+            self.answer(ip, now);
             return ip;
         }
 
         // Before the pool is full the cursor always points at a free address,
-        // because it only ever moves forward. Once it is full, take the
-        // quietest address rather than whatever the cursor happens to have
-        // reached: evicting a name that still has flows on the address is what
-        // makes those flows' packets answer to the new name — traffic from one
-        // domain arriving on another's route.
+        // because it only ever moves forward. Once it is full, take an address
+        // that may be taken — one whose answer has expired. Evicting a name
+        // that still has flows on the address is what makes those flows'
+        // packets answer to the new name — traffic from one domain arriving
+        // on another's route.
         let ip = if (self.ip_to_domain.len() as u128) < self.pool_len() {
             let ip = self.next;
             self.next = if ip >= self.last { self.first } else { ip + 1 };
             ip
         } else {
-            self.quietest_address()
+            self.recyclable_address(now)
         };
 
         // The name is shared rather than copied: a lookup hands out a reference
         // to it, and the reference count is what the copy used to be.
         let key: Arc<str> = Arc::from(key.as_str());
-        if let Some((previous, _)) = self.ip_to_domain.insert(ip, (key.clone(), 0)) {
-            self.domain_to_ip.remove(&previous);
+        if let Some(previous) = self.ip_to_domain.insert(
+            ip,
+            Address {
+                domain: key.clone(),
+                used: 0,
+                expires_at: now + ADDRESS_TTL,
+            },
+        ) {
+            self.domain_to_ip.remove(&previous.domain);
         }
         self.domain_to_ip.insert(key, ip);
         self.touch(ip);
@@ -199,10 +288,10 @@ impl Pool {
     /// The domain `ip` was handed out for, or `None` for an address this pool
     /// never issued.
     fn lookup(&mut self, ip: u128) -> Option<Arc<str>> {
-        let (domain, used) = self.ip_to_domain.get_mut(&ip)?;
+        let address = self.ip_to_domain.get_mut(&ip)?;
         self.clock += 1;
-        *used = self.clock;
-        Some(domain.clone())
+        address.used = self.clock;
+        Some(address.domain.clone())
     }
 
     fn len(&self) -> usize {
@@ -258,6 +347,9 @@ impl IpMapping {
     /// A domain that already has an address keeps it: the application may be
     /// holding a connection open against it, and moving the address would break
     /// that connection's replies.
+    ///
+    /// The answer this address comes with may be cached for [`ADDRESS_TTL`],
+    /// and the address is not handed to another domain before it expires.
     pub fn allocate(&self, domain: &str) -> Ipv4Addr {
         Ipv4Addr::from(self.locked().v4.alloc(domain) as u32)
     }
@@ -274,9 +366,12 @@ impl IpMapping {
     /// this mapping never issued (which includes `.1`/`.2`/`.3`, the fixed
     /// ones).
     ///
-    /// Also what marks the address as still in use: every flow has to look its
-    /// destination up here, so an address that keeps being asked for is not one
-    /// to hand to somebody else.
+    /// Also what marks the address as busy: every flow has to look its
+    /// destination up here, so an address that keeps being asked for is not
+    /// one to hand to somebody else. That is the traffic signal, though, and
+    /// traffic is not what says whether the address may be handed out — an
+    /// idle flow looks idle. That is the answer's expiry
+    /// ([`ADDRESS_TTL`]), and it is what the recycling follows.
     ///
     /// **The name is shared, not copied.** A lookup happens for every datagram
     /// a flow sends, and a copy of the name is a heap allocation each time.
@@ -318,6 +413,48 @@ impl IpMapping {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    impl IpMapping {
+        /// Makes the answer that named `ip` look as if it had expired.
+        ///
+        /// The rule the recycling follows is a wall-clock one, and a test
+        /// cannot wait a minute to watch it happen: the answer is moved back
+        /// rather than the clock moved forward.
+        fn expire(&self, ip: Ipv4Addr) {
+            let mut inner = self.locked();
+            let address = inner
+                .v4
+                .ip_to_domain
+                .get_mut(&(u32::from(ip) as u128))
+                .expect("the address was handed out");
+            // A monotonic clock that cannot go back a second is a clock that
+            // started less than a second ago: the answer is then already in
+            // the past, which is what the test wanted anyway.
+            address.expires_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// A DNS question for `name`, as it goes on the wire.
+    fn question_for(name: &str) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0x1234u16.to_be_bytes()); // ID
+        packet.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: recursion desired
+        packet.extend_from_slice(&1u16.to_be_bytes()); // one question
+        packet.extend_from_slice(&0u16.to_be_bytes()); // no answers
+        packet.extend_from_slice(&0u16.to_be_bytes()); // no authority records
+        packet.extend_from_slice(&0u16.to_be_bytes()); // no additional records
+        for label in name.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0); // the name ends here
+        packet.extend_from_slice(&crate::dns::DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&crate::dns::DNS_CLASS_IN.to_be_bytes());
+        packet
+    }
 
     #[test]
     fn the_same_name_always_gets_the_same_address() {
@@ -458,6 +595,122 @@ mod tests {
         let third = mapping.allocate("third.test");
         assert_eq!(third, quiet, "the quiet address is the one recycled");
         assert_eq!(mapping.lookup_domain(&busy).as_deref(), Some("busy.test"));
+    }
+
+    /// An address whose answer may still be cached keeps its domain.
+    ///
+    /// The answer is what the application holds: it says "this address is
+    /// this domain". An address that changes hands while that answer is
+    /// cached sends the old domain's next connection to the new domain's
+    /// route — the tunnel answers it to the new domain.
+    #[test]
+    fn an_address_within_its_ttl_is_not_recycled() {
+        let mapping =
+            IpMapping::with_range(Ipv4Addr::new(10, 0, 1, 16), Ipv4Addr::new(10, 0, 1, 17));
+        let held = mapping.allocate("held.test");
+        let free = mapping.allocate("free.test");
+
+        // The answer that named `free` has expired; the one that named `held`
+        // has not, so a resolver may still be holding it.
+        mapping.expire(free);
+
+        // The pool is full now, so the next name takes an address — and it
+        // takes the one whose answer expired, not the quieter one whose
+        // answer a resolver may still be holding.
+        let third = mapping.allocate("third.test");
+        assert_eq!(third, free, "the address whose answer expired is recycled");
+        assert_eq!(
+            mapping.lookup_domain(&held).as_deref(),
+            Some("held.test"),
+            "the address whose answer is still cached keeps its domain"
+        );
+    }
+
+    /// The quietest address is not the one to take while its answer is
+    /// cached.
+    ///
+    /// An idle flow is the quietest address there is — nothing arrives on it,
+    /// so it looks unused — so "take the quietest" is what hands a live
+    /// connection's address to another domain. Whether the answer that named
+    /// the address has expired is what says whether it may be taken at all.
+    #[test]
+    fn a_busy_address_whose_answer_expired_is_taken_before_a_quiet_one() {
+        let mapping =
+            IpMapping::with_range(Ipv4Addr::new(10, 0, 1, 16), Ipv4Addr::new(10, 0, 1, 17));
+        let quiet = mapping.allocate("quiet.test");
+        let busy = mapping.allocate("busy.test");
+
+        // `busy.test` keeps opening flows; `quiet.test` resolved once and has
+        // not been heard from since.
+        for _ in 0..3 {
+            assert_eq!(mapping.lookup_domain(&busy).as_deref(), Some("busy.test"));
+        }
+        // The answer that named `busy` has expired; the one that named
+        // `quiet` has not.
+        mapping.expire(busy);
+
+        let third = mapping.allocate("third.test");
+        assert_eq!(third, busy, "the address whose answer expired is recycled");
+        assert_eq!(
+            mapping.lookup_domain(&quiet).as_deref(),
+            Some("quiet.test"),
+            "the address whose answer is still cached keeps its domain"
+        );
+    }
+
+    /// An answer handed out again holds the address for another TTL.
+    ///
+    /// The answer is what a resolver caches, so the hold follows the answer
+    /// and not the address: a domain that is resolved over and over keeps its
+    /// address for as long as it keeps being resolved.
+    #[test]
+    fn an_address_answered_again_is_held_for_another_ttl() {
+        let mapping =
+            IpMapping::with_range(Ipv4Addr::new(10, 0, 1, 16), Ipv4Addr::new(10, 0, 1, 17));
+        let first = mapping.allocate("first.test");
+        mapping.allocate("second.test");
+        // The answer that named `first` has expired, so the address may be
+        // taken.
+        mapping.expire(first);
+
+        // But the domain is resolved again, and the answer is handed out
+        // again: the hold starts again.
+        assert_eq!(mapping.allocate("first.test"), first);
+
+        // The pool is full, so the next name takes an address — and it may not
+        // take this one, whose answer was just handed out.
+        let third = mapping.allocate("third.test");
+        assert_ne!(
+            third, first,
+            "the address was answered again, so it is held"
+        );
+        assert_eq!(
+            mapping.lookup_domain(&first).as_deref(),
+            Some("first.test"),
+            "the address keeps its domain"
+        );
+    }
+
+    /// The address is held for as long as the answer that named it may be
+    /// cached — so the two have to be the same number.
+    ///
+    /// The TTL is written into the answer by the DNS module and the hold time
+    /// is written down here; this test is what keeps the two copies in step.
+    #[test]
+    fn the_address_is_held_for_as_long_as_the_answer_may_be_cached() {
+        let query = question_for("held.test");
+        let parsed = crate::dns::parse_query(&query).expect("the question parses");
+        let answer = crate::dns::build_response(&parsed, IpAddr::V4(Ipv4Addr::new(10, 0, 1, 16)));
+
+        // The answer repeats the question and then the record: a name
+        // pointer, the type, the class, and the TTL.
+        let ttl_at = 12 + (query.len() - 12) + 2 + 2 + 2;
+        let ttl = u32::from_be_bytes(
+            answer[ttl_at..ttl_at + 4]
+                .try_into()
+                .expect("the TTL is four bytes"),
+        );
+        assert_eq!(ttl, ADDRESS_TTL.as_secs() as u32);
     }
 
     #[test]

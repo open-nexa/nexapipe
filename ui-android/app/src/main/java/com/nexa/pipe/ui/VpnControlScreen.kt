@@ -1,7 +1,6 @@
 package com.nexa.pipe.ui
 
 import android.app.Activity
-import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.widget.Toast
@@ -27,14 +26,12 @@ import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.R
 import com.nexa.pipe.formatByteCount
 import com.nexa.pipe.nodeTrafficOf
@@ -75,12 +72,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
     val discoveryMode by viewModel.discoveryMode.collectAsState()
-    val relayAuthToken by viewModel.relayAuthToken.collectAsState()
+    // The token as it stands, and the relay it was issued for.
+    val relayToken by viewModel.relayToken.collectAsState()
+    val relayAuthToken = relayToken.token
     val credentialProtection by viewModel.credentialProtection.collectAsState()
     val plaintextConsentPending by viewModel.plaintextConsentPending.collectAsState()
     val vpnTakeoverChoice by viewModel.vpnTakeoverChoice.collectAsState()
     val autoConnectOnBoot by viewModel.autoConnectOnBoot.collectAsState()
     val vpnConsentMissing by viewModel.vpnConsentMissing.collectAsState()
+    val notice by viewModel.notice.collectAsState()
     // For the VPN-slot question asked before a connect: the check reads the
     // platform's VPN state off the main thread.
     val screenScope = rememberCoroutineScope()
@@ -143,6 +143,18 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // user may have scrolled down into the settings when a connect attempt fails.
     LaunchedEffect(errorMessage) {
         errorMessage?.let { Toast.makeText(context, it, Toast.LENGTH_LONG).show() }
+    }
+
+    // What the settings did to a credential, rather than what went wrong: a
+    // relay change that dropped the token is something the user has to act
+    // on, and the settings they were looking at may be a screen away.
+    LaunchedEffect(notice) {
+        notice?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            // Taken away once shown, so the same message is shown again the
+            // next time it is raised.
+            viewModel.clearNotice()
+        }
     }
 
     /**
@@ -245,7 +257,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         // change is listed by `inviteConflicts`, which is what puts the
         // confirmation dialog in front of it — a relay that would actually be
         // overwritten is never applied silently.
-        invite.relay?.let { relay -> viewModel.updateRelayConfig("custom", relay) }
+        //
+        // The invite carries no token for the relay it names, so the token
+        // this phone holds goes with the import rather than travelling to a
+        // relay of the invite's choosing.
+        invite.relay?.let { relay ->
+            viewModel.updateRelayConfig("custom", relay, RelayTokenChange.Drop)
+        }
         invite.totp?.let { otp ->
             viewModel.updateNodeTwoFactor(
                 nodeId,
@@ -311,7 +329,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      */
     fun inviteConflicts(invite: EndpointInvite): List<String> {
         val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }
-        return inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
+        val conflicts = inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
             when (kind) {
                 InviteConflict.TwoFactor -> {
                     val client = current?.twoFactor?.clientId?.ifBlank {
@@ -326,7 +344,16 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 InviteConflict.Relay ->
                     localizedContext.getString(R.string.invite_conflict_relay)
             }
+        }.toMutableList()
+        // An invite names a relay and carries no token for it, so the token
+        // this phone holds goes with the import. The confirmation says so:
+        // the user is the one who has to enter the token the relay asks for,
+        // and a credential that quietly travels to another relay is exactly
+        // what this rule exists to stop.
+        if (invite.relay != null && relayAuthToken.isNotBlank()) {
+            conflicts.add(localizedContext.getString(R.string.invite_conflict_relay_token))
         }
+        return conflicts
     }
 
     /** One line per field, so the confirmation reads like the invite itself. */
@@ -901,10 +928,18 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                                         R.string.credential_lock_relay_subtitle
                                                     )
                                                 ) {
-                                                    viewModel.updateRelayConfig(mode, relayUrl)
+                                                    viewModel.updateRelayConfig(
+                                                        mode,
+                                                        relayUrl,
+                                                        RelayTokenChange.Bound
+                                                    )
                                                 }
                                             } else {
-                                                viewModel.updateRelayConfig(mode, relayUrl)
+                                                viewModel.updateRelayConfig(
+                                                    mode,
+                                                    relayUrl,
+                                                    RelayTokenChange.Bound
+                                                )
                                             }
                                         }
                                     )
@@ -956,7 +991,16 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayUrl,
                                     onValueChange = { newUrl ->
-                                        if (!relayLocked) viewModel.updateRelayConfig(relayMode, newUrl)
+                                        // The token stays with the relay it was
+                                        // issued for: a URL that names another
+                                        // relay takes it with it.
+                                        if (!relayLocked) {
+                                            viewModel.updateRelayConfig(
+                                                relayMode,
+                                                newUrl,
+                                                RelayTokenChange.Bound
+                                            )
+                                        }
                                     },
                                     label = { Text(stringResource(R.string.relay_url_label)) },
                                     placeholder = {
@@ -970,8 +1014,14 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayAuthToken,
                                     onValueChange = { newToken ->
+                                        // The token the user types belongs to the
+                                        // relay this screen is configuring.
                                         if (!relayLocked) {
-                                            viewModel.updateRelayConfig(relayMode, relayUrl, newToken)
+                                            viewModel.updateRelayConfig(
+                                                relayMode,
+                                                relayUrl,
+                                                RelayTokenChange.Set(newToken)
+                                            )
                                         }
                                     },
                                     label = { Text(stringResource(R.string.relay_token_label)) },
@@ -1146,490 +1196,5 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             )
         }
 
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Configurations > Endpoints
-//
-// Modelled on a directory: one row per endpoint (monogram + id + domain
-// count + chevron); tapping a row opens the endpoint's own page where its
-// domains are managed. Keeping management off the list makes every row a
-// single touch target and keeps the section compact.
-//
-// The list itself is a plain Column rather than a nested LazyColumn: it lives
-// inside the screen's vertical scroll, and a fixed-height LazyColumn trapped
-// scrolling inside a small box while competing with the outer scroll for the
-// same gesture.
-// ---------------------------------------------------------------------------
-
-/** iroh node IDs are long; keep both ends so the tail stays recognisable. */
-internal fun shortenNodeId(nodeId: String): String =
-    if (nodeId.length <= 24) nodeId else "${nodeId.take(14)}\u2026${nodeId.takeLast(6)}"
-
-@Composable
-private fun EndpointsSection(
-    nodes: List<NodeConfig>,
-    onScanInvite: () -> Unit,
-    onPasteInvite: () -> Unit,
-    onOpenEndpoint: (String) -> Unit
-) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    stringResource(R.string.endpoints_title),
-                    style = MaterialTheme.typography.titleSmall
-                )
-                Text(
-                    text = stringResource(R.string.endpoints_subtitle),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Surface(
-                shape = RoundedCornerShape(50),
-                color = MaterialTheme.colorScheme.surfaceContainerHighest
-            ) {
-                Text(
-                    text = nodes.size.toString(),
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(Dimens.Space2)
-        ) {
-            NexaTonalButton(
-                text = stringResource(R.string.endpoints_scan_invite),
-                onClick = onScanInvite,
-                // `Search` is the wrong glyph for "scan", but the camera icons
-                // live in `material-icons-extended`, which cannot be added
-                // while the release build has R8 off.
-                icon = Icons.Default.Search,
-                modifier = Modifier.weight(1f),
-            )
-            NexaTonalButton(
-                text = stringResource(R.string.endpoints_paste_link),
-                onClick = onPasteInvite,
-                // `ContentPaste` / `ContentCopy` are not in the core icon set
-                // either, so this stays on the generic add glyph.
-                icon = Icons.Default.Add,
-                modifier = Modifier.weight(1f),
-            )
-        }
-
-        Spacer(modifier = Modifier.height(Dimens.Space3))
-
-        if (nodes.isEmpty()) {
-            EmptyNodesHint()
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                nodes.forEach { node ->
-                    EndpointRow(
-                        node = node,
-                        onClick = { onOpenEndpoint(node.nodeId) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * One endpoint in the configuration directory: its id and the domains routed through it.
- *
- * Purely configuration — no live state. How a connected endpoint is currently reached is shown
- * on the "Connected endpoints" card at the top of the screen, which is only there while a
- * session exists; putting a runtime reading in this list meant state that is usually invisible
- * (the panel starts collapsed) and easy to mistake for something you configured.
- */
-@Composable
-private fun EndpointRow(
-    node: NodeConfig,
-    onClick: () -> Unit
-) {
-    val domainCount = node.domains.size
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = shortenNodeId(node.nodeId),
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = if (domainCount == 0) {
-                        stringResource(R.string.endpoint_domains_none)
-                    } else {
-                        pluralStringResource(
-                            R.plurals.endpoint_domains_count,
-                            domainCount,
-                            domainCount
-                        )
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (domainCount == 0) MaterialTheme.colorScheme.error
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            // 2FA is per endpoint now, so the list says which ones have it.
-            if (node.twoFactor?.enabled == true) {
-                Icon(
-                    Icons.Default.Lock,
-                    contentDescription = stringResource(R.string.endpoint_2fa_enabled),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-            }
-            Icon(
-                Icons.Default.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
-private fun EmptyNodesHint() {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 20.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Icon(
-            Icons.Default.Add,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(36.dp)
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            stringResource(R.string.endpoints_empty_title),
-            style = MaterialTheme.typography.titleSmall
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = stringResource(R.string.endpoints_empty_body),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center
-        )
-    }
-}
-
-/**
- * Paste-an-invite-link entry point, the keyboard equivalent of the scanner.
- *
- * [onImport] returns null when the invite was accepted — the dialog closes — or
- * a message that is shown in place and keeps the dialog open, exactly like the
- * scanner's `(String) -> String?` contract: an invite that was rejected (a
- * ticket invite, a link that will not parse) must not make the user start over.
- */
-@Composable
-private fun InviteLinkDialog(
-    onDismiss: () -> Unit,
-    onImport: (String) -> String?
-) {
-    val context = LocalContext.current
-    val localizedContext = rememberLocalizedContext()
-    var link by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.invite_paste_title)) },
-        text = {
-            OutlinedTextField(
-                value = link,
-                onValueChange = {
-                    link = it
-                    error = null
-                },
-                label = { Text(stringResource(R.string.invite_paste_label)) },
-                placeholder = { Text(stringResource(R.string.invite_paste_placeholder)) },
-                isError = error != null,
-                supportingText = error?.let { message -> { Text(message) } },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
-        },
-        confirmButton = {
-            NexaPrimaryButton(
-                text = stringResource(R.string.action_import),
-                onClick = {
-                    val value = link.trim()
-                    if (value.isEmpty()) {
-                        error = localizedContext.getString(R.string.invite_paste_empty)
-                        return@NexaPrimaryButton
-                    }
-                    val failure = onImport(value)
-                    if (failure != null) error = failure else onDismiss()
-                }
-            )
-        },
-        dismissButton = {
-            NexaTextButton(text = stringResource(R.string.action_cancel), onClick = onDismiss)
-        }
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Configurations > Language
-//
-// The picker is where the switch is: the language is a setting of this app,
-// not of a session, so it belongs next to the endpoints rather than behind a
-// menu item. Picking one rebuilds the Activity (see `applyLanguage`).
-// ---------------------------------------------------------------------------
-
-/**
- * The language the UI is in, and the way to change it.
- *
- * The current one is re-read on every composition instead of being remembered:
- * the row is only drawn while the settings panel is expanded, and a change
- * comes back as a new Activity anyway.
- */
-@Composable
-private fun LanguageSection(
-    onLanguagePicked: (AppLanguage) -> Unit
-) {
-    val context = LocalContext.current
-    var showPicker by remember { mutableStateOf(false) }
-    val current = AppLocale.selected(context)
-
-    // No leading icon: `material-icons-core` (all the app can use with R8 off)
-    // has no glyph for "language", and a wrong one is worse than none. The row
-    // matches the endpoints section above it — title, subtitle, chevron.
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { showPicker = true },
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = stringResource(R.string.language_title),
-                style = MaterialTheme.typography.titleSmall
-            )
-            Text(
-                text = current.label(),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Icon(
-            Icons.Default.KeyboardArrowRight,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-
-    if (showPicker) {
-        AlertDialog(
-            onDismissRequest = { showPicker = false },
-            title = { Text(stringResource(R.string.language_title)) },
-            text = {
-                Column {
-                    AppLanguage.all().forEach { language ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    showPicker = false
-                                    if (language != current) onLanguagePicked(language)
-                                }
-                                .padding(vertical = 2.dp)
-                        ) {
-                            RadioButton(
-                                selected = language == current,
-                                onClick = {
-                                    showPicker = false
-                                    if (language != current) onLanguagePicked(language)
-                                }
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(language.label(), style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                NexaTextButton(
-                    text = stringResource(R.string.action_close),
-                    onClick = { showPicker = false }
-                )
-            }
-        )
-    }
-}
-
-/**
- * Asks before Nexa takes the VPN slot from another VPN app.
- *
- * Android allows one VpnService TUN per user and revokes the other app
- * silently, so the question has to be asked before establish() — and the only
- * place that can ask it is the UI.
- */
-@Composable
-private fun VpnTakeoverDialog(
-    rememberChoice: Boolean,
-    onRememberChoiceChanged: (Boolean) -> Unit,
-    onConfirm: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.vpn_takeover_title)) },
-        text = {
-            Column {
-                Text(
-                    text = stringResource(R.string.vpn_takeover_body),
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Spacer(modifier = Modifier.height(Dimens.Space2))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onRememberChoiceChanged(!rememberChoice) }
-                ) {
-                    Checkbox(
-                        checked = rememberChoice,
-                        onCheckedChange = onRememberChoiceChanged
-                    )
-                    Spacer(modifier = Modifier.width(Dimens.Space2))
-                    Text(
-                        text = stringResource(R.string.vpn_takeover_remember),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            }
-        },
-        // Destructive weight on purpose: this is the button that disconnects
-        // the other app, and it must not look like the ordinary "continue".
-        confirmButton = {
-            NexaDangerButton(
-                text = stringResource(R.string.vpn_takeover_confirm),
-                onClick = onConfirm
-            )
-        },
-        dismissButton = {
-            NexaTextButton(
-                text = stringResource(R.string.action_cancel),
-                onClick = onDismiss
-            )
-        }
-    )
-}
-
-/**
- * Whether the tunnel should come back on its own after a restart.
- *
- * The switch is the user's answer to "should the proxy be running when this
- * phone is switched on", and it is off until they say so — a proxy that
- * reconnects without being asked forwards traffic without being asked.
- *
- * [consentMissing] says that the last time the app looked, the VPN permission
- * was gone. Android does not promise that the permission survives a restart,
- * so the boot path checks rather than assumes; when the check fails, the
- * tunnel does not come back, and the user is told why instead of finding a
- * switch that is on and nothing that happened.
- */
-@Composable
-private fun AutoConnectSection(
-    enabled: Boolean,
-    consentMissing: Boolean,
-    onChange: (Boolean) -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = stringResource(R.string.auto_connect_on_boot_title),
-                style = MaterialTheme.typography.titleSmall
-            )
-            Text(
-                text = stringResource(
-                    if (consentMissing) {
-                        R.string.auto_connect_on_boot_consent_missing
-                    } else {
-                        R.string.auto_connect_on_boot_subtitle
-                    }
-                ),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Switch(
-            checked = enabled,
-            onCheckedChange = onChange
-        )
-    }
-}
-
-/**
- * The way back from a remembered takeover choice.
- *
- * A stored Cancel means Nexa never connects while another VPN is up, which is
- * not an answer the user should have to reinstall the app to change.
- */
-@Composable
-private fun VpnTakeoverSection(
-    choice: VpnTakeoverChoice,
-    onReset: () -> Unit,
-) {
-    val remembered = when (choice) {
-        VpnTakeoverChoice.TakeOver -> stringResource(R.string.vpn_takeover_choice_take_over)
-        VpnTakeoverChoice.Cancel -> stringResource(R.string.vpn_takeover_choice_cancel)
-        // Nothing to take back: the section is not drawn in the first place.
-        VpnTakeoverChoice.Ask -> return
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onReset() },
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = stringResource(R.string.vpn_takeover_reset_title),
-                style = MaterialTheme.typography.titleSmall
-            )
-            Text(
-                text = stringResource(R.string.vpn_takeover_reset_subtitle, remembered),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
     }
 }

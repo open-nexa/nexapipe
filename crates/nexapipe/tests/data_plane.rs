@@ -2522,8 +2522,8 @@ async fn a_spent_token_takes_its_guesses_with_it() {
     );
     drop(config);
 
-    let state =
-        std::fs::read_to_string(dir.path().join("state.toml")).expect("the state file is written");
+    let state = std::fs::read_to_string(dir.path().join("config.state.toml"))
+        .expect("the state file is written");
     assert!(
         !state.contains("enrollment_failed_attempts"),
         "the spent guess is not carried into the state file: {state}"
