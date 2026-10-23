@@ -711,7 +711,15 @@ async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConfig> {
 
     const token = stored?.enrollment ?? null;
     if (token) {
-      node.enrollment = { clientId: node.enrollment?.clientId ?? '', token };
+      node.enrollment = {
+        clientId: node.enrollment?.clientId ?? '',
+        token,
+        // The device the enrollment names travels with it. Dropping it here
+        // enrolls without a name, and enrolling without a name answers with
+        // the client's own secret — which is what makes a revocation rotate
+        // every other device that shares it.
+        ...(node.enrollment?.device ? { device: node.enrollment.device } : {}),
+      };
     } else if (node.enrollment?.token.trim()) {
       await putCredential('enrollment', node.enrollment.token, node.id);
     }
@@ -1114,7 +1122,14 @@ export function useConfigStore() {
     const enrollment = accepted.enrollment
       ? {
           clientId: accepted.enrollment.clientId,
-          token: '',
+          // The token the backend filed, read back from the store. It has to
+          // cross this boundary for the same reason the device key does: the
+          // proxy is what spends it, and in the service mode the proxy is
+          // another process with no credential store of its own. Left here,
+          // the token stayed in the store and the node opened no auth stream
+          // at all — the server answered every connection with "2FA
+          // required" and nothing was proxied.
+          token: stored.enrollment ?? '',
           device,
           // The public half of the key the backend minted for this enrollment. The
           // private one never comes here — it is in the store, and the enrollment
