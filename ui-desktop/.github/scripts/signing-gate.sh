@@ -101,7 +101,7 @@ if [ "${#missing[@]}" -eq 0 ]; then
     echo "the $platform signing material is complete"
 elif [ "$opted_out" = true ]; then
     unsigned=true
-    echo "::warning::$platform is published UNSIGNED on purpose, because allow_unsigned lists it. The missing material is: ${missing[*]}"
+    echo "::warning::$platform would be published UNSIGNED on purpose, because allow_unsigned lists it. The missing material is: ${missing[*]}"
 else
     echo "::error::the $platform signing material is incomplete, so this release would publish an unsigned artifact. Missing: ${missing[*]}"
     echo "::error::configure the value(s) named above, or re-run this workflow with allow_unsigned=$platform to publish $platform unsigned on purpose."
