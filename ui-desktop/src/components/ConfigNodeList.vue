@@ -9,14 +9,16 @@ import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import ConfigSection from "./ConfigSection.vue";
 import ConfigNodeCard from "./ConfigNodeCard.vue";
+import AppButton from "./base/AppButton.vue";
+import AppIcon from "./base/AppIcon.vue";
 import { useConfigStore } from "../stores/config";
+import { confirm } from "../composables/useConfirm";
+import { useToast } from "../composables/useToast";
 import type { NodeConfig } from "../types";
 
 const props = defineProps<{
   /** Every node the store holds. */
   nodes: NodeConfig[];
-  /** The two colours a node's badge is drawn in. */
-  typeColors: { ticket: string; endpoint: string };
 }>();
 
 const emit = defineEmits<{
@@ -28,6 +30,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 const { removeNode } = useConfigStore();
+const toast = useToast();
 
 /**
  * Nodes with no connection string are not shown at all.
@@ -40,28 +43,57 @@ const { removeNode } = useConfigStore();
 const visibleNodes = computed(() =>
   props.nodes.filter((node) => node.ticket.trim() !== "" || node.endpointId.trim() !== ""),
 );
+
+/** What a node is called in the dialog that removes it. */
+function labelFor(node: NodeConfig): string {
+  const index = visibleNodes.value.findIndex((candidate) => candidate.id === node.id);
+  return node.name || t("config.nodeFallback", { index: index + 1 });
+}
+
+/**
+ * Takes a node off the list.
+ *
+ * Every removal is confirmed, and the reason is that a node cannot be typed back in: it comes
+ * from an invite, so a removal that was a mis-click costs the user that invite and leaves the
+ * machine without the server it was dialing until they have it again. The dialog says what the
+ * removal costs, because the list is the only place that cost can be said.
+ *
+ * The last node is the one that costs the most: without it the proxy has nothing to dial, and
+ * it cannot start until another invite has been imported.
+ */
+async function requestRemove(node: NodeConfig): Promise<void> {
+  const isLast = visibleNodes.value.length === 1;
+  const ok = await confirm({
+    title: isLast ? t("config.removeLastNodeTitle") : t("config.removeNodeTitle"),
+    message: isLast
+      ? t("config.removeLastNodeMessage")
+      : t("config.removeNodeMessage", { name: labelFor(node) }),
+    tone: "danger",
+    confirmText: t("config.removeNode"),
+  });
+  if (!ok) return;
+
+  removeNode(node.id);
+  toast.success(t("config.nodeRemoved", { name: labelFor(node) }));
+}
 </script>
 
 <template>
   <ConfigSection :title="t('config.nodeConfiguration')">
     <template #actions>
-      <button @click="emit('import-invite')" class="import-invite-btn">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="8" y="3" width="8" height="4" rx="1"/>
-          <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
-        </svg>
-        {{ t('invite.import') }}
-      </button>
+      <AppButton size="sm" tone="secondary" icon="clipboard" @click="emit('import-invite')">
+        {{ t("invite.import") }}
+      </AppButton>
     </template>
 
     <div class="nodes-container">
       <div v-if="visibleNodes.length === 0" class="nodes-empty">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="8" y="3" width="8" height="4" rx="1"/>
-          <path d="M16 5h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
-        </svg>
-        <span class="nodes-empty-title">{{ t('config.noNodes') }}</span>
-        <span class="nodes-empty-hint">{{ t('config.noNodesHint') }}</span>
+        <AppIcon name="clipboard" :size="28" />
+        <span class="nodes-empty__title">{{ t("config.noNodes") }}</span>
+        <span class="nodes-empty__hint">{{ t("config.noNodesHint") }}</span>
+        <AppButton tone="primary" icon="clipboard" @click="emit('import-invite')">
+          {{ t("invite.import") }}
+        </AppButton>
       </div>
 
       <ConfigNodeCard
@@ -69,78 +101,49 @@ const visibleNodes = computed(() =>
         :key="node.id"
         :node="node"
         :index="index"
-        :can-remove="visibleNodes.length > 1"
-        :type-color="node.connectionType === 'ticket' ? typeColors.ticket : typeColors.endpoint"
-        @remove="removeNode"
+        @remove="requestRemove"
         @reenroll="emit('reenroll')"
       />
     </div>
-    <p v-if="visibleNodes.length > 1" class="hint">{{ t('config.multipleNodesHint') }}</p>
+
+    <p v-if="visibleNodes.length > 1" class="hint">{{ t("config.multipleNodesHint") }}</p>
   </ConfigSection>
 </template>
 
 <style scoped>
-/* Solid border, no dashed "add" affordance left anywhere: importing an invite is now the only
-   way a node appears, so this button is the one entry point rather than one of two. */
-.import-invite-btn {
-  padding: 6px 12px;
-  border: 1px solid var(--primary-400);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--primary-600);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  transition: all var(--transition-normal);
-}
-
-.import-invite-btn:hover {
-  background: var(--primary-50);
-}
-
-.import-invite-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
 .nodes-container {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
-/* Shown instead of a blank card when there is nothing configured: an empty node row used to be
-   the placeholder, and there is no longer any way to fill one in. */
+/*
+ * Shown instead of a blank card when there is nothing configured.
+ *
+ * It carries the way in as well as the explanation: an empty state that only says "there is
+ * nothing here" leaves the reader to find the button that changes that.
+ */
 .nodes-empty {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 32px 16px;
-  background: var(--surface-2);
-  border: 1px dashed var(--border-light);
+  gap: var(--space-2);
+  padding: var(--space-10) var(--space-4);
+  background: var(--bg-inset);
+  border: 1px dashed var(--border-default);
   border-radius: var(--radius-md);
   color: var(--text-muted);
   text-align: center;
 }
 
-.nodes-empty svg {
-  width: 28px;
-  height: 28px;
-  opacity: 0.6;
-}
-
-.nodes-empty-title {
-  font-size: 13px;
-  font-weight: 500;
+.nodes-empty__title {
+  font-size: var(--font-size-13);
+  font-weight: var(--font-weight-medium);
   color: var(--text-secondary);
 }
 
-.nodes-empty-hint {
-  font-size: 12px;
-  opacity: 0.75;
+.nodes-empty__hint {
+  font-size: var(--font-size-12);
+  margin-bottom: var(--space-2);
 }
 </style>

@@ -46,74 +46,54 @@ const { t } = useI18n();
   <ConfigSection :title="t('config.relay')">
     <div class="form-grid">
       <div class="form-group">
-        <label for="relayMode" class="form-label">{{ t('config.relayMode') }}</label>
-        <!-- No leading icon, unlike the fields beside it. A native select
-             paints its own control, so an icon laid over one sits on top of
-             it — and takes the click that was meant to open it. The 2FA
-             algorithm select further up is drawn the same way. -->
+        <label for="relayMode" class="form-label">{{ t("config.relayMode") }}</label>
         <select
           id="relayMode"
           :value="relayMode"
           class="form-select"
           @change="emit('update:relayMode', ($event.target as HTMLSelectElement).value as RelayMode)"
         >
-          <option value="pinned">{{ t('config.relayPinned') }}</option>
-          <option value="default">{{ t('config.relayDefault') }}</option>
-          <option value="disabled">{{ t('config.relayDisabled') }}</option>
-          <option value="custom">{{ t('config.relayCustom') }}</option>
+          <option value="pinned">{{ t("config.relayPinned") }}</option>
+          <option value="default">{{ t("config.relayDefault") }}</option>
+          <option value="disabled">{{ t("config.relayDisabled") }}</option>
+          <option value="custom">{{ t("config.relayCustom") }}</option>
         </select>
-        <p class="hint">{{ t('config.relayModeHint') }}</p>
+        <p class="hint">{{ t("config.relayModeHint") }}</p>
       </div>
 
       <div v-if="relayMode === 'custom'" class="form-group">
-        <label for="relayUrl" class="form-label">{{ t('config.relayUrl') }}</label>
-        <div class="input-wrapper">
-          <div class="input-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-            </svg>
-          </div>
-          <input
-            id="relayUrl"
-            :value="relayUrl"
-            type="text"
-            placeholder="https://relay.example.com"
-            class="form-input"
-            @input="emit('update:relayUrl', ($event.target as HTMLInputElement).value)"
-            @change="emit('commit:relayUrl')"
-          />
-        </div>
-        <p class="hint">{{ t('config.relayUrlHint') }}</p>
+        <label for="relayUrl" class="form-label">{{ t("config.relayUrl") }}</label>
+        <input
+          id="relayUrl"
+          :value="relayUrl"
+          type="text"
+          placeholder="https://relay.example.com"
+          class="form-input"
+          @input="emit('update:relayUrl', ($event.target as HTMLInputElement).value)"
+          @change="emit('commit:relayUrl')"
+        />
+        <p class="hint">{{ t("config.relayUrlHint") }}</p>
       </div>
 
       <div v-if="relayMode === 'custom'" class="form-group">
-        <label for="relayAuthToken" class="form-label">{{ t('config.relayAuthToken') }}</label>
-        <div class="input-wrapper">
-          <div class="input-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="11" width="18" height="11" rx="2"/>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-            </svg>
-          </div>
-          <!-- Typed but never echoed: a custom relay's bearer token is a credential, which is
-               the other reason this section is behind the door. -->
-          <input
-            id="relayAuthToken"
-            :value="relayAuthToken"
-            type="password"
-            :placeholder="t('common.optional')"
-            class="form-input"
-            @input="emit('update:relayAuthToken', ($event.target as HTMLInputElement).value)"
-            @change="emit('commit:relayAuthToken')"
-          />
-        </div>
-        <p class="hint">{{ t('config.relayAuthTokenHint') }}</p>
+        <label for="relayAuthToken" class="form-label">{{ t("config.relayAuthToken") }}</label>
+        <!-- Typed but never echoed: a custom relay's bearer token is a credential, which is
+             the other reason this section is behind the door. -->
+        <input
+          id="relayAuthToken"
+          :value="relayAuthToken"
+          type="password"
+          :placeholder="t('common.optional')"
+          class="form-input"
+          @input="emit('update:relayAuthToken', ($event.target as HTMLInputElement).value)"
+          @change="emit('commit:relayAuthToken')"
+        />
+        <p class="hint">{{ t("config.relayAuthTokenHint") }}</p>
         <!-- Which relay the stored token was issued for, so the pairing is
              visible: a token belongs to one relay, and the field says
              which. Empty when there is no token to pair it with. -->
         <p v-if="relayAuthTokenRelay" class="hint">
-          {{ t('config.relayAuthTokenBoundTo', { relay: relayAuthTokenRelay }) }}
+          {{ t("config.relayAuthTokenBoundTo", { relay: relayAuthTokenRelay }) }}
         </p>
       </div>
     </div>

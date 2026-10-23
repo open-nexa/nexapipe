@@ -15,87 +15,57 @@ const dnsAddr = defineModel<string>("dnsAddr", { required: true });
 const upstreamDns = defineModel<string>("upstreamDns", { required: true });
 
 const { t } = useI18n();
-const { config, updateConfig } = useConfigStore();
+const { config } = useConfigStore();
 </script>
 
 <template>
   <ConfigSection :title="t('config.network')">
     <div class="form-grid">
       <div class="form-group">
-        <label for="localAddr" class="form-label">{{ t('config.localAddr') }}</label>
-        <div class="input-wrapper">
-          <div class="input-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2a10 10 0 0 0-10 10c0 4.42 2.87 8.17 6.84 9.49"/>
-              <path d="M12 2a10 10 0 0 1 10 10c0 4.42-2.87 8.17-6.84 9.49"/>
-              <path d="M12 12l4 4"/>
-              <path d="M12 12l-4 4"/>
-              <path d="M12 12l4-4"/>
-              <path d="M12 12l-4-4"/>
-            </svg>
-          </div>
-          <input
-            id="localAddr"
-            v-model="localAddr"
-            type="text"
-            placeholder="127.0.0.1:8080"
-            class="form-input"
-          />
-        </div>
+        <label for="localAddr" class="form-label">{{ t("config.localAddr") }}</label>
+        <input
+          id="localAddr"
+          v-model="localAddr"
+          type="text"
+          placeholder="127.0.0.1:8080"
+          class="form-input"
+        />
       </div>
 
       <div class="form-group">
-        <label for="dnsAddr" class="form-label">{{ t('config.dnsAddr') }}</label>
-        <div class="input-wrapper">
-          <div class="input-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"/>
-              <polyline points="12 6 12 12 16 14"/>
-            </svg>
-          </div>
-          <input
-            id="dnsAddr"
-            v-model="dnsAddr"
-            type="text"
-            placeholder="198.18.0.254:53"
-            class="form-input"
-          />
-        </div>
+        <label for="dnsAddr" class="form-label">{{ t("config.dnsAddr") }}</label>
+        <input
+          id="dnsAddr"
+          v-model="dnsAddr"
+          type="text"
+          placeholder="198.18.0.254:53"
+          class="form-input"
+        />
       </div>
 
       <div class="form-group">
-        <label for="upstreamDns" class="form-label">{{ t('config.upstreamDns') }}</label>
-        <div class="input-wrapper">
-          <div class="input-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-            </svg>
-          </div>
-          <input
-            id="upstreamDns"
-            v-model="upstreamDns"
-            type="text"
-            placeholder="223.5.5.5:53"
-            class="form-input"
-          />
-        </div>
+        <label for="upstreamDns" class="form-label">{{ t("config.upstreamDns") }}</label>
+        <input
+          id="upstreamDns"
+          v-model="upstreamDns"
+          type="text"
+          placeholder="223.5.5.5:53"
+          class="form-input"
+        />
       </div>
 
-      <div class="form-group">
-        <label for="dnsStrategy" class="form-label">{{ t('config.dnsStrategy') }}</label>
-        <!-- No leading icon, like the relay select: a native select paints its own
-             control, so an icon laid over one sits on top of it. -->
-        <select
-          id="dnsStrategy"
-          v-model="config.dnsStrategy"
-          class="form-select"
-          @change="updateConfig({ dnsStrategy: config.dnsStrategy })"
-        >
-          <option value="scoped">{{ t('config.dnsStrategyScoped') }}</option>
-          <option value="global">{{ t('config.dnsStrategyGlobal') }}</option>
-          <option value="none">{{ t('config.dnsStrategyNone') }}</option>
+      <div class="form-group form-group--wide">
+        <label for="dnsStrategy" class="form-label">{{ t("config.dnsStrategy") }}</label>
+        <!-- No second write on change: `v-model` has already put the choice into the
+             configuration, and the store watches it. A second write through `updateConfig`
+             would write whatever the field happened to hold at that moment, which is not
+             the same thing when the browser fires a change of its own. -->
+        <select id="dnsStrategy" v-model="config.dnsStrategy" class="form-select">
+          <option value="scoped">{{ t("config.dnsStrategyScoped") }}</option>
+          <option value="global">{{ t("config.dnsStrategyGlobal") }}</option>
+          <option value="none">{{ t("config.dnsStrategyNone") }}</option>
         </select>
-        <p class="hint">{{ t('config.dnsStrategyHint') }}</p>
+        <p class="hint">{{ t("config.dnsStrategyHint") }}</p>
       </div>
     </div>
   </ConfigSection>
