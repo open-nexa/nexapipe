@@ -388,9 +388,13 @@ fn dispatch_stop() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVICE_NAME, ScState, linux_activation_args, linux_service_exec_with, linux_unit_content,
-        macos_install_commands, macos_job_target, macos_plist_content, sc_state,
+        installing_account_from_args, linux_activation_args, linux_service_exec_with,
+        linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
+        sc_state, ScState, SERVICE_NAME,
     };
+    use crate::service::elevate;
+    use crate::service::platform::account::AccountId;
+    use std::ffi::OsString;
 
     /// systemd splits the `ExecStart=` line on whitespace, so a path with a space in it
     /// arrives as two arguments and the unit fails to start — with `status=203/EXEC`,
@@ -620,5 +624,91 @@ SERVICE_NAME: nexa-service
 
         assert!(plist.contains(&format!("<string>{path}</string>")));
         assert!(plist.contains(&format!("com.nexa.{SERVICE_NAME}")));
+    }
+
+    /// The account the elevated copy is told about comes back off the command
+    /// line.
+    ///
+    /// The flag is the only channel macOS has: `do shell script … with
+    /// administrator privileges` carries no `PKEXEC_UID` and no `SUDO_UID`, so
+    /// a silent parse failure here installs the service for nobody — and a
+    /// service with no account is one that serves every local account that
+    /// owns a token.
+    ///
+    /// The flag comes after the verb, which is what the elevated child is
+    /// started with.
+    #[test]
+    fn the_install_as_flag_names_the_account() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from("1000"),
+        ]);
+
+        #[cfg(unix)]
+        assert_eq!(account, Some(AccountId::Unix(1000)));
+        #[cfg(windows)]
+        assert_eq!(account, Some(AccountId::Windows("1000".to_string())));
+    }
+
+    /// A flag with no value behind it names nobody.
+    ///
+    /// The value is what says which account; a flag on its own is a flag
+    /// somebody typed, and the install it starts has no account to serve.
+    #[test]
+    fn the_install_as_flag_with_no_value_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// An empty value names nobody either.
+    ///
+    /// Empty is the one value that is not an account on either platform: a
+    /// Unix account is a number and a Windows account is a non-empty string.
+    #[test]
+    fn the_install_as_flag_with_an_empty_value_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from(""),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// A value that is not an account at all names nobody.
+    ///
+    /// This is the Unix half of the rule: a uid is a number, and a string that
+    /// is not one is not an account. Every non-empty string is a spelling of a
+    /// SID on Windows, so there the equivalent is the empty value above.
+    #[cfg(unix)]
+    #[test]
+    fn the_install_as_flag_that_is_not_a_uid_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from(elevate::INSTALL_AS_ARG),
+            OsString::from("not-a-uid"),
+        ]);
+
+        assert_eq!(account, None);
+    }
+
+    /// A command line without the flag names nobody.
+    ///
+    /// The install that falls back to the environment variables is the Unix
+    /// one; the flag is what carries the account where there is no
+    /// environment variable to carry it.
+    #[test]
+    fn the_install_as_flag_that_is_not_there_names_nobody() {
+        let account = installing_account_from_args([
+            OsString::from("--install"),
+            OsString::from("--elevated"),
+        ]);
+
+        assert_eq!(account, None);
     }
 }

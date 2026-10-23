@@ -27,6 +27,15 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
 
     match verb {
         "--install" => {
+            // The install says things that only a log can carry — whether the
+            // service was installed for an account, or in the degraded mode
+            // that serves every local account. The elevated child is the
+            // desktop binary, and it installs no subscriber of its own, so a
+            // `tracing::warn!` from the install would go nowhere without this.
+            //
+            // The guard is held to the end of the arm, so the message is
+            // flushed before the process reports its outcome and exits.
+            let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
             elevate::report_result(result_file.as_deref(), &platform::install_service());
             true
         }

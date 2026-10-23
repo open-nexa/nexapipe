@@ -88,8 +88,7 @@ pub fn read_installed_by() -> Option<AccountId> {
 #[cfg(unix)]
 pub fn record_installed_by(account: &AccountId) -> Result<(), crate::error::AppError> {
     use crate::error::{codes, AppError};
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     let path = owner_file_path(Path::new(STATE_ROOT));
     let directory = path.parent().ok_or_else(|| {
@@ -114,29 +113,70 @@ pub fn record_installed_by(account: &AccountId) -> Result<(), crate::error::AppE
         )
     })?;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o644);
-    let mut file = options.open(&path).map_err(|e| {
-        AppError::cause(
+    write_record_atomically(&path, directory, account.to_text().as_bytes())
+}
+
+/// Writes the record, and leaves no half-written one behind.
+///
+/// The file used to be opened with `truncate(true)`, which empties it at the
+/// open — before a single byte of the new account is written. A write that
+/// then failed, or an install that was interrupted, left an **empty** record
+/// on disk; an empty record reads as "no record at all", and "no record" is
+/// the degraded mode the record exists to prevent: the service falls back to
+/// serving every local account that owns a token.
+///
+/// So the record is written to a temporary file in the same directory, the
+/// bytes are flushed to the disk, and the temporary file is renamed over the
+/// target. The rename is atomic, so a reader sees either the old record or
+/// the new one and never an empty file; the directory is flushed afterwards,
+/// so the replacement survives a crash.
+#[cfg(unix)]
+fn write_record_atomically(
+    path: &Path,
+    directory: &Path,
+    bytes: &[u8],
+) -> Result<(), crate::error::AppError> {
+    use crate::error::{codes, AppError};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // The name carries the process id, so two installs that overlap cannot
+    // write over each other's temporary file.
+    let temporary = directory.join(format!(".{OWNER_FILE}.{}.new", std::process::id()));
+
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o644);
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        // The bytes are on the disk before the name moves: a rename that
+        // landed before the write did would publish a file full of nothing.
+        file.sync_all()?;
+        drop(file);
+        // The mode is set on the temporary file, before the rename: a file
+        // that is renamed into place keeps the mode it had, and the mode is
+        // what says the record cannot be changed by anybody but root.
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    };
+
+    if let Err(e) = write() {
+        // The temporary file is not the record, and a leftover one is a file
+        // nobody asked for.
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AppError::cause(
             codes::SERVICE_DEFINITION_FAILED,
             format!("cannot write {}: {e}", path.display()),
-        )
-    })?;
-    file.write_all(account.to_text().as_bytes()).map_err(|e| {
-        AppError::cause(
-            codes::SERVICE_DEFINITION_FAILED,
-            format!("cannot write {}: {e}", path.display()),
-        )
-    })?;
-    // Set rather than assumed: `create(true)` on a file that is already there
-    // keeps that file's mode, and the mode is what says the record cannot be
-    // changed by anybody but root.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
-        AppError::cause(
-            codes::SERVICE_DEFINITION_FAILED,
-            format!("cannot set the mode of {}: {e}", path.display()),
-        )
-    })?;
+        ));
+    }
+
+    // The directory is flushed too: the rename is what a reader sees, and
+    // without the flush a crash could undo the replacement and leave the old
+    // contents under the new name.
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
 
     Ok(())
 }
