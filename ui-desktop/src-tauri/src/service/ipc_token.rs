@@ -23,8 +23,23 @@
 //!
 //! The service therefore only ever *reads* it, and does so per connection so a
 //! regenerated token takes effect without a restart.
+//!
+//! # Who may present it
+//!
+//! A token on its own says who *knows* it, not who may *use* it: the service
+//! finds token files in every account's profile, so a token that is found says
+//! nothing about the account that presented it. Every candidate therefore
+//! carries the account that owns the file it came from, and the service serves
+//! the account it was installed for and nobody else — see
+//! [`crate::service::platform::account::allows`].
+//!
+//! A candidate is only read at all when the directory holding it is one a
+//! secret may be read from: a directory another account can write into is a
+//! directory it can put a token of its own into, and `/tmp` — where a service
+//! with neither `HOME` nor `XDG_RUNTIME_DIR` ends up — is world-writable.
 
 use crate::error::{codes, AppError};
+use crate::service::platform::account::{self, AccountId};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -92,7 +107,13 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
             "token path has no parent directory",
         )
     })?;
-    std::fs::create_dir_all(parent).map_err(|e| {
+    // The directory that holds the token must not be writable by group or
+    // other, whatever the umask says: `create_dir_all` would leave it at 0777
+    // minus the umask, which is 0775 under a umask of 002 — and a
+    // group-writable directory is one the service refuses to read a token
+    // from, so the desktop would be locked out of its own service. The mode
+    // is asked for instead, and the umask can only take bits away from it.
+    create_private_dir(parent).map_err(|e| {
         AppError::cause(
             codes::SERVICE_IPC_TOKEN,
             format!("cannot create {parent:?}: {e}"),
@@ -128,24 +149,112 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
     }
 }
 
+/// Creates the directory that holds the token, private to its owner.
+///
+/// The umask cannot make a directory more private than it was asked to be,
+/// but it can leave it less private than the service insists on — so the mode
+/// is asked for rather than inherited.
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // The parents are made with the mode the system would give them; only the
+    // directory that holds the secret is asked to be private.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        // It was already there. Whether that directory is private enough is
+        // the service's rule to refuse, not this one's to change.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The token's directory on Windows is the account's own, and its access is
+/// the file's own ACL rather than a mode bit.
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// A token the service found, with the account that owns the file it came from.
+///
+/// The owner is part of the candidate rather than something looked up later,
+/// because the whole question is which account a caller belongs to: a token
+/// file found in another account's profile says nothing about the account that
+/// presented it, and the service serves one account only.
+#[derive(Debug, Clone)]
+pub struct TokenCandidate {
+    /// The token's value.
+    pub token: String,
+    /// The account that owns the file the token came from.
+    pub owner: AccountId,
+    /// Where it came from, for the log line that says which file answered.
+    pub path: PathBuf,
+}
+
 /// Every token that has been published, in the order [`service_token_paths`] finds them.
 ///
 /// All of them, not just the first: on Windows the service scans every profile on the machine
 /// because a loopback socket says nothing about which account dialled it, so which candidate
 /// happens to come first tells it nothing about which token the caller holds. A caller is
-/// legitimate when it presents any one of them — see [`token_for_auth`].
-pub fn read_tokens() -> Result<Vec<String>, AppError> {
-    let mut tokens = Vec::new();
+/// legitimate when it presents one of them *and* it is the account the service was installed
+/// for — see [`token_for_auth`] and
+/// [`crate::service::platform::account::allows`].
+pub fn read_candidates() -> Result<Vec<TokenCandidate>, AppError> {
+    let mut candidates = Vec::new();
     for candidate in service_token_paths() {
         // A root service scans every desktop session candidate. One inaccessible profile must
         // not make every other session's valid token unusable.
-        match read_token_at(&candidate) {
-            Ok(Some(token)) => tokens.push(token),
+        match read_candidate_at(&candidate) {
+            Ok(Some(token)) => candidates.push(token),
             Ok(None) => {}
-            Err(_) => continue,
+            Err(e) => {
+                // A token file that is readable by other accounts is refused
+                // rather than trusted, and the refusal is worth saying out
+                // loud: the fix is to delete the file.
+                tracing::warn!("Ignoring {candidate:?}: {e}");
+            }
         }
     }
-    Ok(tokens)
+    Ok(candidates)
+}
+
+/// The token at `path` together with the account that owns it, when the file is
+/// one the service is willing to read a secret from.
+///
+/// A file that cannot be attributed to an account is not a candidate: the
+/// service would have no way to tell whose token it is holding, and a token
+/// nobody can be attributed to is a token anybody may present.
+pub fn read_candidate_at(path: &Path) -> Result<Option<TokenCandidate>, AppError> {
+    let Some(token) = read_token_at(path)? else {
+        return Ok(None);
+    };
+
+    let Some(owner) = AccountId::owner_of(path) else {
+        tracing::warn!(
+            "Ignoring {path:?}: its owner could not be read, so it cannot be attributed to an \
+             account"
+        );
+        return Ok(None);
+    };
+
+    if !account::token_directory_is_trusted(path, &owner) {
+        tracing::warn!(
+            "Ignoring {path:?}: it is not in a directory a token may be read from, so another \
+             account could have put it there"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(TokenCandidate {
+        token,
+        owner,
+        path: path.to_path_buf(),
+    }))
 }
 
 /// Every place the service looks for a token, in order.
@@ -394,21 +503,24 @@ pub fn proof_mac(token: &str, service_nonce: &str, caller_nonce: &str) -> String
 }
 
 /// Whether `presented` is what [`auth_mac`] produces for the caller's nonce
-/// under any published token, and which token it was.
+/// under any published token, and which candidate it was.
 ///
-/// The token itself is returned because [`proof_mac`] has to be computed under
-/// the same one: the service may have several candidates on file (one per
-/// desktop session) and only the matching one proves anything.
-pub fn token_for_auth(
-    tokens: &[String],
+/// The candidate is returned rather than the bare token, because the service
+/// has to know *whose* token answered: it computes its own proof under the
+/// same one, and it refuses a caller that is not the account the token belongs
+/// to.
+pub fn token_for_auth<'a>(
+    candidates: &'a [TokenCandidate],
     service_nonce: &str,
     caller_nonce: &str,
     presented: &str,
-) -> Option<String> {
-    tokens
-        .iter()
-        .find(|token| constant_time_eq(&auth_mac(token, service_nonce, caller_nonce), presented))
-        .cloned()
+) -> Option<&'a TokenCandidate> {
+    candidates.iter().find(|candidate| {
+        constant_time_eq(
+            &auth_mac(&candidate.token, service_nonce, caller_nonce),
+            presented,
+        )
+    })
 }
 
 /// Whether `presented` is what [`proof_mac`] produces under `token`.
@@ -599,10 +711,11 @@ mod tests {
     use super::profile_roots_from;
     use super::{
         auth_mac, ensure_token_at, generate_token, proof_mac, proof_matches, random_nonce,
-        read_token_at, service_token_paths, token_for_auth,
+        read_token_at, service_token_paths, token_for_auth, TokenCandidate,
     };
     #[cfg(not(windows))]
     use super::{unix_home_roots, unix_service_token_paths_from};
+    use crate::service::platform::account::AccountId;
     use std::path::PathBuf;
 
     /// A token for a test to authenticate with, minted the way the real one is.
@@ -619,6 +732,32 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nexapipe-ipc-{}-{}", name, fastrand::u64(..)));
         dir.join("ipc.token")
+    }
+
+    /// A scratch path for a test whose token the *service* has to accept.
+    ///
+    /// Not the temporary directory: that one is world-writable on Linux, and a
+    /// token in a world-writable directory is exactly what the service refuses
+    /// to read. A test that wants the service to accept its token has to put
+    /// it somewhere the service would really look — under the package
+    /// directory, whose chain no other account can write into.
+    fn trusted_scratch(name: &str) -> PathBuf {
+        let root = std::env::current_dir()
+            .expect("the package directory")
+            .join("target")
+            .join("nexapipe-ipc-tests");
+        std::fs::create_dir_all(&root).expect("the scratch root is created");
+        root.join(format!("{}-{}", name, fastrand::u64(..)))
+            .join("ipc.token")
+    }
+
+    /// A candidate holding `token`, owned by the account this test runs as.
+    fn candidate(token: String) -> TokenCandidate {
+        TokenCandidate {
+            token,
+            owner: AccountId::current().expect("this process has an account"),
+            path: PathBuf::from("ipc.token"),
+        }
     }
 
     #[test]
@@ -655,7 +794,7 @@ mod tests {
     /// generated token on a machine where it runs as the installing account.
     #[test]
     fn the_desktop_session_path_is_a_service_candidate() {
-        let path = scratch("candidates");
+        let path = trusted_scratch("candidates");
         let token = ensure_token_at(&path).unwrap();
         std::env::set_var(super::TOKEN_PATH_ENV, &path);
 
@@ -665,11 +804,55 @@ mod tests {
             Some(path.as_path())
         );
         assert_eq!(
-            super::read_tokens().unwrap().first().map(String::as_str),
+            super::read_candidates()
+                .unwrap()
+                .first()
+                .map(|candidate| candidate.token.as_str()),
             Some(token.as_str())
         );
 
         std::env::remove_var(super::TOKEN_PATH_ENV);
+    }
+
+    /// A token the service reads comes with the account that owns the file it
+    /// was read from — that account is what the service compares against the
+    /// one on the other end of the socket.
+    #[test]
+    fn a_candidate_carries_the_owner_of_its_file() {
+        let path = trusted_scratch("owner");
+        let token = ensure_token_at(&path).unwrap();
+
+        let candidate = super::read_candidate_at(&path)
+            .unwrap()
+            .expect("the token is a candidate");
+
+        assert_eq!(candidate.token, token);
+        assert_eq!(candidate.owner, AccountId::current().unwrap());
+        assert_eq!(candidate.path, path);
+    }
+
+    /// A token in a directory another account can write into is not a
+    /// candidate at all: the service would be reading a file that account
+    /// could have put there.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_in_a_world_writable_directory_is_not_a_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nexapipe-open-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The mode the service refuses: writable by group and other.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let path = dir.join("ipc.token");
+        ensure_token_at(&path).unwrap();
+
+        assert!(
+            super::read_candidate_at(&path).unwrap().is_none(),
+            "a token in a directory anybody may write into is not a candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The two directions of the handshake must never produce the same value: a
@@ -691,16 +874,16 @@ mod tests {
     fn an_answer_is_found_under_the_token_that_produced_it() {
         let first = fresh_token();
         let second = fresh_token();
-        let tokens = vec![first, second.clone()];
+        let candidates = vec![candidate(first), candidate(second.clone())];
 
         assert_eq!(
             token_for_auth(
-                &tokens,
+                &candidates,
                 "server",
                 "caller",
                 &auth_mac(&second, "server", "caller")
             )
-            .as_deref(),
+            .map(|candidate| candidate.token.as_str()),
             Some(second.as_str())
         );
     }
@@ -712,14 +895,14 @@ mod tests {
     fn an_answer_does_not_carry_to_another_challenge() {
         let token = fresh_token();
         let other = fresh_token();
-        let tokens = vec![token.clone()];
+        let candidates = vec![candidate(token.clone())];
         let answered = auth_mac(&token, "server", "caller");
 
-        assert!(token_for_auth(&tokens, "server", "caller", &answered).is_some());
-        assert!(token_for_auth(&tokens, "server", "other-caller", &answered).is_none());
-        assert!(token_for_auth(&tokens, "other-server", "caller", &answered).is_none());
+        assert!(token_for_auth(&candidates, "server", "caller", &answered).is_some());
+        assert!(token_for_auth(&candidates, "server", "other-caller", &answered).is_none());
+        assert!(token_for_auth(&candidates, "other-server", "caller", &answered).is_none());
         assert!(token_for_auth(
-            &tokens,
+            &candidates,
             "server",
             "caller",
             &auth_mac(&other, "server", "caller")

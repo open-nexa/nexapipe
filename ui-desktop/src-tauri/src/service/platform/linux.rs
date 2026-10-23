@@ -2,9 +2,14 @@
 //! process and handed to `systemctl`.
 
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::service::platform::account::AccountId;
 
 #[cfg(target_os = "linux")]
-pub fn install_service_linux(exe_path: &str) -> Result<(), AppError> {
+pub fn install_service_linux(
+    exe_path: &str,
+    installing_by: Option<&AccountId>,
+) -> Result<(), AppError> {
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::Path;
@@ -22,6 +27,19 @@ pub fn install_service_linux(exe_path: &str) -> Result<(), AppError> {
 
     file.write_all(unit_content.as_bytes())
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
+
+    // Which account this service is installed for, written where the
+    // unprivileged desktop cannot change it: the service runs as root, so it
+    // serves that account and refuses every other one. Written before the
+    // service starts, because the service reads it as it comes up.
+    if let Some(account) = installing_by {
+        install_owner::record_installed_by(account)?;
+    } else {
+        tracing::warn!(
+            "Installing the service without naming the account it is for: it will serve any local \
+             account that owns the token it reads"
+        );
+    }
 
     let output = Command::new("systemctl")
         .args(["daemon-reload"])
@@ -158,6 +176,10 @@ pub fn uninstall_service_linux() -> Result<(), AppError> {
 
     let unit_path = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
     let _ = fs::remove_file(unit_path);
+
+    // The record of which account the service served goes with it: a service
+    // that is no longer installed has no account to serve.
+    install_owner::forget_installed_by();
 
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 
