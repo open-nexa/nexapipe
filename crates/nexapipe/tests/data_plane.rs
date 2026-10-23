@@ -544,8 +544,8 @@ async fn spawn_proxy_with_timeouts(
                     let _ = conn::handle_bidi_stream(
                         send,
                         recv,
-                        &config,
-                        &clients,
+                        config.clone(),
+                        clients.clone(),
                         &limiter,
                         "data-plane-test",
                         None,

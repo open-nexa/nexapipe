@@ -337,18 +337,18 @@ pub struct BodyState {
 
 impl BodyState {
     /// Records that a byte has come off the client's stream.
-    fn mark_read(&self) {
+    pub(crate) fn mark_read(&self) {
         self.read.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records that the body's deadline expired.
-    fn mark_timed_out(&self) {
+    pub(crate) fn mark_timed_out(&self) {
         self.timed_out
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records that the body is over.
-    fn mark_sent(&self) {
+    pub(crate) fn mark_sent(&self) {
         self.sent.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 

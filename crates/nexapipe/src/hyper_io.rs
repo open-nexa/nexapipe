@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use hyper::rt::ReadBufCursor;
+use pin_project_lite::pin_project;
 
 /// An iroh bi-stream seen as hyper's IO.
 pub struct IrohIo {
@@ -89,6 +90,46 @@ impl hyper::rt::Write for IrohIo {
         false
     }
 }
+
+/// The timer hyper's deadlines are measured against.
+///
+/// Hyper does not ship one: it says what a runtime has to provide, and
+/// tokio's is what this process has. The head's deadline is the one that
+/// matters here — a peer that opens a stream and sends nothing must not hold
+/// the slot forever — and hyper measures it with this.
+#[derive(Clone, Copy, Debug)]
+pub struct TokioTimer;
+
+impl hyper::rt::Timer for TokioTimer {
+    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: tokio::time::sleep(duration),
+        })
+    }
+
+    fn sleep_until(&self, deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(TokioSleep {
+            inner: tokio::time::sleep_until(deadline.into()),
+        })
+    }
+}
+
+pin_project! {
+    struct TokioSleep {
+        #[pin]
+        inner: tokio::time::Sleep,
+    }
+}
+
+impl std::future::Future for TokioSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx)
+    }
+}
+
+impl hyper::rt::Sleep for TokioSleep {}
 
 #[cfg(test)]
 mod tests {

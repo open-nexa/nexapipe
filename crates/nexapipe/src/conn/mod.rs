@@ -359,8 +359,11 @@ where
 pub async fn handle_bidi_stream(
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
-    config: &RoutingTable,
-    clients: &BackendClients,
+    // The routes and the clients are shared rather than borrowed: the HTTP
+    // path hands them to a service that runs for as long as the connection
+    // does, and the connection may carry several requests.
+    config: Arc<RoutingTable>,
+    clients: Arc<BackendClients>,
     limiter: &Arc<l4::FlowLimiter>,
     peer: &str,
     acl: Option<Arc<ClientAcl>>,
@@ -374,6 +377,22 @@ pub async fn handle_bidi_stream(
     protocol: Protocol,
 ) -> anyhow::Result<()> {
     let mut recv = recv;
+
+    // A connection that named its protocol with ALPN said what it carries:
+    // `nexapipe/http` is HTTP, and hyper serves it without the first byte
+    // being read to find out. Nothing is sniffed, nothing is read twice, and
+    // nothing is handed back.
+    if protocol == Protocol::Http {
+        let ctx = Arc::new(crate::http::server::Context {
+            config,
+            clients,
+            peer: peer.to_string(),
+            acl,
+            request_id: request_id.to_string(),
+            who,
+        });
+        return crate::http::server::serve(send, recv, ctx).await;
+    }
 
     // A phase deadline over the whole head, taken once and never renewed: a
     // peer that drips one byte before each expiry renews nothing. The bound is
@@ -406,7 +425,7 @@ pub async fn handle_bidi_stream(
                     send,
                     recv,
                     bytes,
-                    config,
+                    &config,
                     limiter,
                     peer,
                     acl.as_deref(),
@@ -418,7 +437,7 @@ pub async fn handle_bidi_stream(
             // TLS is terminated by the backend, so a ClientHello is not a
             // request: hand the raw bytes (and both halves of the stream) to
             // the passthrough path, which routes on SNI.
-            return passthrough::handle_iroh_stream(send, recv, bytes, config, acl.as_deref())
+            return passthrough::handle_iroh_stream(send, recv, bytes, &config, acl.as_deref())
                 .await;
         }
 
@@ -661,7 +680,7 @@ pub async fn handle_bidi_stream(
                 send,
                 recv.expect("a WebSocket request has no body, so its stream is still here"),
                 &request,
-                clients,
+                &clients,
                 &backend_info,
                 config.timeouts(),
             )
@@ -698,7 +717,7 @@ pub async fn handle_bidi_stream(
 
             loop {
                 let result = http::proxy_to_backend_streaming(
-                    clients,
+                    &clients,
                     config.timeouts(),
                     &request,
                     &backend,
@@ -2873,8 +2892,8 @@ pub async fn handle_connection(
                     if let Err(e) = handle_bidi_stream(
                         send,
                         recv,
-                        &config_clone,
-                        &clients_clone,
+                        config_clone,
+                        clients_clone,
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,

@@ -6,6 +6,7 @@
 
 use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 
+use ::http::header::{HeaderMap, HeaderValue};
 use ::http::{Method, Request, Response, StatusCode};
 
 use http_body_util::combinators::UnsyncBoxBody;
@@ -13,6 +14,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::BodyExt;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 
@@ -314,12 +316,16 @@ pub(super) async fn attempt_backend(
 ///
 /// The headers are the client's own, minus the ones that only meant something
 /// for the hop from the client to here.
-pub(super) fn build_backend_request(
+/// The head of the request that goes to the backend.
+///
+/// The backend's own origin, the rewritten path, and the client's headers that
+/// may be forwarded — and the length the proxy declares for the body it
+/// carries, which is the truth rather than the client's own header.
+fn backend_request_builder(
     req: &Request<()>,
     backend_info: &BackendInfo,
-    body: &mut RequestBody,
-    body_deadline: tokio::time::Instant,
-) -> Result<Request<HttpBody>, anyhow::Error> {
+    content_length: Option<usize>,
+) -> Result<http::request::Builder, anyhow::Error> {
     // The origin was parsed when the pool was built, so this is a borrow of
     // it rather than a `Url::parse` per request.
     let origin: &str = match &backend_info.origin {
@@ -348,7 +354,7 @@ pub(super) fn build_backend_request(
     // could read is forwarded with the header it arrived with — and a body
     // that is still being read carries the length the client gave, so the
     // proxy states it again rather than passing the client's own header on.
-    let declares_own_length = body.content_length().is_some();
+    let declares_own_length = content_length.is_some();
 
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
@@ -370,9 +376,20 @@ pub(super) fn build_backend_request(
 
     // The length the proxy declares for the body it carries. The client's own
     // `content-length` is dropped above, because this one is the truth.
-    if let Some(content_length) = body.content_length() {
+    if let Some(content_length) = content_length {
         builder = builder.header("content-length", content_length);
     }
+
+    Ok(builder)
+}
+
+pub(super) fn build_backend_request(
+    req: &Request<()>,
+    backend_info: &BackendInfo,
+    body: &mut RequestBody,
+    body_deadline: tokio::time::Instant,
+) -> Result<Request<HttpBody>, anyhow::Error> {
+    let builder = backend_request_builder(req, backend_info, body.content_length())?;
 
     // The body is **lent** to the request that carries it, not given away: a
     // request that fails before the body was read has to be able to send it
@@ -745,4 +762,208 @@ pub async fn proxy_to_backend_streaming(
         status: status.as_u16(),
         bytes_sent,
     })
+}
+
+/// The answer a backend gave, before hyper writes it.
+///
+/// The bytes that reached the client are counted as they go out, so the access
+/// log reports what was delivered rather than what was intended.
+pub struct Answer {
+    response: Response<hyper::body::Incoming>,
+    bytes_sent: Arc<std::sync::atomic::AtomicUsize>,
+    idle: Duration,
+}
+
+impl Answer {
+    /// The status the client is getting.
+    pub fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    /// How many bytes reached the client.
+    pub fn bytes_sent(&self) -> usize {
+        self.bytes_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The answer, as hyper writes it.
+    pub fn into_response(self) -> Response<crate::http::body::ProxyBody> {
+        let Answer {
+            response,
+            bytes_sent,
+            idle,
+        } = self;
+        let (parts, body) = response.into_parts();
+        let body = UnsyncBoxBody::new(crate::http::server::CountedBody::new(
+            body, bytes_sent, idle,
+        ));
+        Response::from_parts(parts, body)
+    }
+}
+
+/// Forward a request to a backend and hand the answer back.
+///
+/// The answer is **returned**, not written: hyper writes it, which is the
+/// point of the tunnel path running on hyper's codec — the status line, the
+/// headers and the framing are hyper's, and they are the ones every other
+/// HTTP server sends.
+pub async fn proxy_to_backend(
+    clients: &BackendClients,
+    timeouts: crate::config::Timeouts,
+    req: &Request<()>,
+    backend_info: &BackendInfo,
+    body: &crate::http::server::IncomingBody,
+    request_id: &str,
+) -> Result<Answer, ProxyFailure> {
+    let client = clients.for_protocol(backend_info.protocol);
+
+    // When the body has to be finished by. It is the same deadline the
+    // hand-written path had for the same phase — the client's own `[timeouts]
+    // body_secs` — and it is taken once per attempt, because an attempt is an
+    // attempt.
+    let body_deadline_at = tokio::time::Instant::now() + timeouts.deadlines.body;
+
+    let proxied_req = build_backend_request_from(req, backend_info, body)?;
+
+    tracing::debug!(
+        "Proxying request via client (streaming): {} {}",
+        proxied_req.method(),
+        proxied_req.uri()
+    );
+
+    // The **body** has its own deadline (`[timeouts] body_secs`): the client
+    // may take that long to send the body. The **response** has its own
+    // (`[timeouts] response_secs`): the backend may take that long to answer,
+    // and that clock runs from the moment the body was sent, because a backend
+    // cannot answer before it has the body.
+    let answer_deadline_at = body_deadline_at + timeouts.response;
+
+    let mut request = Box::pin(client.request(proxied_req));
+    let mut upload_deadline = Box::pin(tokio::time::sleep_until(body_deadline_at));
+    let mut answer_deadline = Box::pin(tokio::time::sleep_until(answer_deadline_at));
+    let mut answer_armed = false;
+
+    let response = futures_util::future::poll_fn(|cx| {
+        use std::task::Poll;
+
+        // The request itself.
+        if let Poll::Ready(result) = request.as_mut().poll(cx) {
+            return Poll::Ready(match result {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    tracing::error!("Failed to send request: {:?}", e);
+                    // A body that ran out of time is not a backend that
+                    // failed, and the error says so.
+                    if body.did_time_out() {
+                        Err(ProxyFailure::unanswered(
+                            anyhow::anyhow!(
+                                "the request body did not finish in time (the body's deadline \
+                                 is {:?})",
+                                timeouts.deadlines.body
+                            ),
+                            Retryability::IfIdempotent,
+                        ))
+                    } else {
+                        // A connect error means the request was never carried;
+                        // anything else means it went out and the answer did
+                        // not come.
+                        let retry = if e.is_connect() {
+                            Retryability::Always
+                        } else {
+                            Retryability::IfIdempotent
+                        };
+                        Err(ProxyFailure::unanswered(
+                            anyhow::anyhow!("failed to send request: {e:?}"),
+                            retry,
+                        ))
+                    }
+                }
+            });
+        }
+
+        // The body may have gone out while the request was being polled: the
+        // answer's deadline runs from that moment, not from the start.
+        if !answer_armed && body.has_been_sent() {
+            answer_deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + timeouts.response);
+            answer_armed = true;
+        }
+
+        // The upload's own deadline: the body has to be finished by then.
+        if upload_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(ProxyFailure::unanswered(
+                anyhow::anyhow!(
+                    "the request body did not finish in time (the body's deadline is {:?})",
+                    timeouts.deadlines.body
+                ),
+                Retryability::IfIdempotent,
+            )));
+        }
+
+        // The answer's deadline.
+        if answer_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(ProxyFailure::unanswered(
+                anyhow::anyhow!("backend did not respond within {:?}", timeouts.response),
+                Retryability::IfIdempotent,
+            )));
+        }
+
+        Poll::Pending
+    })
+    .await;
+
+    let response = response?;
+    let (parts, body) = response.into_parts();
+
+    // The headers the client may see: the ones that describe the answer
+    // rather than the hop. `forwards_response_header` drops the hop-by-hop
+    // ones, and the id the caller gave this request is the one that goes out
+    // — a second one from the backend would leave whoever reads the response
+    // guessing which to quote.
+    let mut headers = HeaderMap::new();
+    for (name, value) in parts.headers.iter() {
+        if !forwards_response_header(name.as_str()) {
+            continue;
+        }
+        if name.as_str() == "x-request-id" {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+
+    let mut parts = parts;
+    parts.headers = headers;
+
+    Ok(Answer {
+        response: Response::from_parts(parts, body),
+        bytes_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        idle: timeouts.deadlines.response_idle,
+    })
+}
+
+/// Builds the request that goes to the backend, with the body hyper read.
+///
+/// The head is built the way the hand-written path built it — the backend's
+/// own origin, the rewritten path, the client's headers that may be forwarded
+/// — and the body is the one hyper read.
+fn build_backend_request_from(
+    req: &Request<()>,
+    backend_info: &BackendInfo,
+    body: &crate::http::server::IncomingBody,
+) -> Result<Request<HttpBody>, anyhow::Error> {
+    // The length the proxy declares: the client's own `content-length`, which
+    // hyper read the head for. It is the truth, and it is the one the client's
+    // header is replaced with.
+    let content_length = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let builder = backend_request_builder(req, backend_info, content_length)?;
+    let http_body = UnsyncBoxBody::new(body.lend());
+    Ok(builder.body(http_body)?)
 }

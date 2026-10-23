@@ -31,20 +31,21 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
-use crate::http::body::BoxError;
 use crate::http::client::BackendClients;
+use crate::http::client::BoxError;
 use crate::http::forward::Answer;
+use crate::http::response::BodyError;
 use crate::hyper_io::IrohIo;
 use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 
@@ -86,9 +87,12 @@ pub async fn serve(
     ctx: Arc<Context>,
 ) -> anyhow::Result<()> {
     let io = IrohIo::new(send, recv);
-    let service = service_fn(move |req| handle(req, ctx.clone()));
+    let service_ctx = ctx.clone();
+    let service = service_fn(move |req| handle(req, service_ctx.clone()));
 
     hyper::server::conn::http1::Builder::new()
+        // The deadline below is measured with this.
+        .timer(crate::hyper_io::TokioTimer)
         // The head has to arrive within the head budget: a peer that opens a
         // stream and sends nothing must not hold the slot forever. The same
         // bound the hand-written reader applied, and hyper applies it to the
@@ -96,8 +100,15 @@ pub async fn serve(
         .header_read_timeout(ctx.config.timeouts().deadlines.header)
         // A head over this is not a request.
         .max_buf_size(MAX_HEAD)
+        // The client finishes its half of the stream once the request is out
+        // and waits for the answer, which is what a tunnel client does and what
+        // a browser does over a connection it will not reuse. Hyper reads the
+        // end of the write half as the end of the connection unless it is told
+        // that a half-close is a thing.
+        .half_close(true)
         .serve_connection(io, service)
         .await
+        .map_err(|e| anyhow::anyhow!("the connection ended in error: {e}"))
 }
 
 /// The service: one request, one answer.
@@ -182,7 +193,7 @@ async fn handle(
     let method = request.method().clone();
     let request_target = request.uri().to_string();
     let span = tracing::Span::current();
-    crate::log::record_request_on_span(&span, &method.to_string(), &request_target);
+    crate::log::record_request_on_span(&span, method.as_ref(), &request_target);
 
     // The body is hyper's own stream, with the accounting the hand-written
     // path had: the bytes are charged to the process-wide budget as they
@@ -204,18 +215,30 @@ async fn handle(
     {
         Ok(answer) => Ok(answer.into_response()),
         Err(failure) => {
-            crate::metrics::METRICS.record_request(failure.status, 0);
+            // What the client was actually told, when it was told anything: a
+            // failure that broke halfway still put a status line and part of a
+            // body on the wire, and the log has to say so.
+            let status = failure
+                .partial
+                .as_ref()
+                .map(|p| p.status)
+                .unwrap_or(StatusCode::BAD_GATEWAY.as_u16());
+            let bytes_sent = failure.partial.as_ref().map(|p| p.bytes_sent).unwrap_or(0);
+            crate::metrics::METRICS.record_request(status, 0);
             crate::log::log_access(
                 &ctx.request_id,
                 &ctx.peer,
                 method.as_str(),
                 &request_target,
-                failure.status,
+                status,
                 started.elapsed().as_millis() as u64,
-                failure.bytes_sent,
+                bytes_sent,
                 Some(&ctx.who),
             );
-            Ok(failure.into_response())
+            Ok(crate::http::response::create_error_response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                "502 Bad Gateway",
+            ))
         }
     }
 }
@@ -227,10 +250,10 @@ async fn forward(
     request: &Request<()>,
     request_target: &str,
     method: &Method,
-    host: Option<(String, u16)>,
+    host: Option<(&str, Option<u16>)>,
     path: &str,
     backend_info: BackendInfo,
-    mut body: IncomingBody,
+    body: IncomingBody,
     started: std::time::Instant,
 ) -> Result<Answer, crate::http::body::ProxyFailure> {
     let attempts = ctx.config.retry().attempts;
@@ -248,7 +271,8 @@ async fn forward(
             ctx.config.timeouts(),
             request,
             &backend,
-            &mut body,
+            &body,
+            &ctx.request_id,
         )
         .await;
 
@@ -258,13 +282,13 @@ async fn forward(
                 // backend that was out of rotation comes back into it.
                 backend.report_success();
                 let elapsed_ms = started.elapsed().as_millis() as u64;
-                crate::metrics::METRICS.record_request(answer.status.as_u16(), elapsed_ms);
+                crate::metrics::METRICS.record_request(answer.status().as_u16(), elapsed_ms);
                 crate::log::log_access(
                     &ctx.request_id,
                     &ctx.peer,
                     method.as_str(),
                     request_target,
-                    answer.status.as_u16(),
+                    answer.status().as_u16(),
                     elapsed_ms,
                     answer.bytes_sent(),
                     Some(&ctx.who),
@@ -335,7 +359,7 @@ fn refusal(status: StatusCode) -> Response<crate::http::body::ProxyBody> {
         StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable",
         _ => "400 Bad Request",
     };
-    crate::http::response::error_response(status, message)
+    crate::http::response::create_error_response(status, message)
 }
 
 /// The size of the head on the wire, as far as the proxy can tell.
@@ -359,18 +383,72 @@ fn head_size(request: &Request<()>) -> usize {
 /// the hand-written path had — the bytes are charged to the process-wide
 /// budget as they arrive, and counted for the access log.
 ///
-/// The head's bytes are not charged here: hyper read them into its own
-/// buffer, and that buffer is bounded by the head limit the server sets.
+/// The stream is **shared** with the copy the request carries, for the same
+/// reason the hand-written path shared its reader: a request that fails
+/// before the body was read has to be able to send the body again, and the
+/// client's bytes are the only place they are. The lock is held for the
+/// length of one poll and for nothing else.
 pub struct IncomingBody {
-    /// Hyper's stream.
-    inner: Incoming,
-    /// What the process budget holds for the bytes this body is reading.
+    /// Hyper's stream, shared with the copy the request carries.
+    reader: Arc<std::sync::Mutex<Incoming>>,
+    /// What the owner of the request needs to know about this body.
+    state: Arc<crate::http::body::BodyState>,
+    /// When the body has to be finished by.
+    deadline: tokio::time::Instant,
+}
+
+impl IncomingBody {
+    /// The body, and the deadline it is held to.
+    pub fn new(inner: Incoming, body_deadline: Duration) -> Self {
+        Self {
+            reader: Arc::new(std::sync::Mutex::new(inner)),
+            state: Arc::new(crate::http::body::BodyState::default()),
+            deadline: tokio::time::Instant::now() + body_deadline,
+        }
+    }
+
+    /// Whether the request may be tried again: a body that has been read is
+    /// gone, and one that has not is still there.
+    pub fn may_retry(&self) -> bool {
+        !self.state.was_read()
+    }
+
+    /// Whether the body's deadline expired while it was being read.
+    pub fn did_time_out(&self) -> bool {
+        self.state.did_time_out()
+    }
+
+    /// Whether the body is over: everything the client promised has been
+    /// read, or the client stopped sending.
+    pub fn has_been_sent(&self) -> bool {
+        self.state.has_been_sent()
+    }
+
+    /// The copy the request carries.
     ///
-    /// Grown as the bytes arrive rather than taken for the whole length up
-    /// front: a client that promises a large body and sends nothing holds
-    /// nothing, which is what the buffered path did as well. A promise is not
-    /// a reservation.
-    reservation: crate::conn::limits::ByteReservation,
+    /// The body is **lent** rather than given away: the request that fails
+    /// before the body was read has to be able to send it again.
+    pub fn lend(&self) -> LentBody {
+        LentBody {
+            reader: self.reader.clone(),
+            state: self.state.clone(),
+            deadline: self.deadline,
+            timer: None,
+            reservation: crate::conn::limits::ByteReservation::empty(),
+        }
+    }
+}
+
+/// The copy of the request body that the request carries.
+///
+/// It reads the shared stream, charges the bytes it reads to the process-wide
+/// budget, and records that they were read — which is what the retry rule
+/// asks, and what the access log's byte count is made of.
+pub struct LentBody {
+    /// Hyper's stream, shared with the owner of the request.
+    reader: Arc<std::sync::Mutex<Incoming>>,
+    /// What the owner of the request needs to know about this body.
+    state: Arc<crate::http::body::BodyState>,
     /// When the body has to be finished by.
     deadline: tokio::time::Instant,
     /// The timer that ends the body when the deadline passes.
@@ -379,42 +457,16 @@ pub struct IncomingBody {
     /// body that is only checked when it is polled is never given up on while
     /// the client is silent, which is exactly when it should be.
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// Whether a byte has come off the client's stream.
+    /// What the process budget holds for the bytes this body is reading.
     ///
-    /// A body that has been read cannot be sent a second time, and one that
-    /// has not can — which is what the retry rule asks.
-    read: bool,
-    /// Whether the body's deadline expired while it was being read.
-    timed_out: bool,
+    /// Grown as the bytes arrive rather than taken for the whole length up
+    /// front: a client that promises a large body and sends nothing holds
+    /// nothing, which is what the buffered path did as well. A promise is not
+    /// a reservation.
+    reservation: crate::conn::limits::ByteReservation,
 }
 
-impl IncomingBody {
-    /// The body, and the deadline it is held to.
-    pub fn new(inner: Incoming, body_deadline: Duration) -> Self {
-        Self {
-            inner,
-            reservation: crate::conn::limits::ByteReservation::take(0)
-                .expect("an empty reservation always fits"),
-            deadline: tokio::time::Instant::now() + body_deadline,
-            timer: None,
-            read: false,
-            timed_out: false,
-        }
-    }
-
-    /// Whether the request may be tried again: a body that has been read is
-    /// gone, and one that has not is still there.
-    pub fn may_retry(&self) -> bool {
-        !self.read
-    }
-
-    /// Whether the body's deadline expired while it was being read.
-    pub fn did_time_out(&self) -> bool {
-        self.timed_out
-    }
-}
-
-impl hyper::body::Body for IncomingBody {
+impl hyper::body::Body for LentBody {
     type Data = bytes::Bytes;
     type Error = BoxError;
 
@@ -430,7 +482,7 @@ impl hyper::body::Body for IncomingBody {
             .timer
             .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(this.deadline)));
         if timer.as_mut().poll(cx).is_ready() {
-            this.timed_out = true;
+            this.state.mark_timed_out();
             return Poll::Ready(Some(Err(anyhow::anyhow!(
                 "the request body did not finish in time (the body's deadline is {:?})",
                 this.deadline
@@ -438,17 +490,24 @@ impl hyper::body::Body for IncomingBody {
             .into())));
         }
 
-        match Pin::new(&mut this.inner).poll_frame(cx) {
+        let mut reader = this
+            .reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match Pin::new(&mut *reader).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.read = true;
+                    this.state.mark_read();
                     this.reservation.grow(data.len())?;
                     crate::metrics::METRICS.record_bytes_received(data.len() as u64);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BoxError::from(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                this.state.mark_sent();
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -478,11 +537,7 @@ pub struct CountedBody {
 
 impl CountedBody {
     /// The answer, and where the count is kept.
-    pub fn new(
-        inner: Incoming,
-        bytes_sent: Arc<AtomicUsize>,
-        idle: Duration,
-    ) -> Self {
+    pub fn new(inner: Incoming, bytes_sent: Arc<AtomicUsize>, idle: Duration) -> Self {
         Self {
             inner,
             bytes_sent,
@@ -494,7 +549,7 @@ impl CountedBody {
 
 impl hyper::body::Body for CountedBody {
     type Data = bytes::Bytes;
-    type Error = BoxError;
+    type Error = BodyError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -506,13 +561,11 @@ impl hyper::body::Body for CountedBody {
         // without the timer the check below would run only when the backend
         // sends something, so a backend that goes quiet would never be given
         // up on.
-        this.timer.as_mut().reset(tokio::time::Instant::now() + this.idle);
+        this.timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + this.idle);
         if this.timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Some(Err(anyhow::anyhow!(
-                "the backend sent nothing for {:?} mid-body",
-                this.idle
-            )
-            .into())));
+            return Poll::Ready(Some(Err(BodyError::Idle(this.idle))));
         }
 
         match Pin::new(&mut this.inner).poll_frame(cx) {
@@ -522,7 +575,7 @@ impl hyper::body::Body for CountedBody {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BoxError::from(e)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BodyError::from(e)))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
