@@ -162,7 +162,17 @@ impl IrohConnectionPool {
                     // place that writes it: the identity comparison and the
                     // drop of the connections of the identity that is gone
                     // have to happen with it.
-                    self.set_credential(Some(issued.clone())).await;
+                    //
+                    // The generation comes back with the write. It is the one
+                    // the issued credential is filed under, read under the lock
+                    // the credential is written under, so the two cannot come
+                    // from different moments. Reading it here instead — after
+                    // the lock is released — would read it a moment later, and
+                    // a write that landed in between would have moved it: the
+                    // connection would carry the generation of a credential it
+                    // never authenticated with, and the pool would take it for
+                    // the identity that replaced this one.
+                    let generation = self.set_credential(Some(issued.clone())).await;
                     *self.inner.enrollment.lock().await = None;
                     *self.inner.issued.lock().await = Some(issued);
                     // **The enrollment authenticated this connection already.**
@@ -183,12 +193,7 @@ impl IrohConnectionPool {
                     // that had just enrolled without a working connection.
                     //
                     // The generation is the one the issued credential is filed
-                    // under, read under the lock the credential is written
                     // under, so the two cannot come from different moments.
-                    let generation = {
-                        let _slot = self.inner.two_factor.lock().await;
-                        self.inner.credential_generation.load(Ordering::Acquire)
-                    };
                     return Ok(Authenticated { conn, generation });
                 }
                 Err(e) => {

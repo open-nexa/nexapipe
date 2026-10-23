@@ -709,6 +709,81 @@ async fn a_dial_that_finishes_with_the_credential_unchanged_is_pooled() {
     drop(borrowed);
 }
 
+/// **The connection of an enrollment whose credential has been replaced does
+/// not come back to the pool.**
+///
+/// The enrollment writes the credential the server issued, and the
+/// generation of that write comes back with it: the connection was
+/// authenticated as the identity the credential is filed under, and the pool
+/// compares the two before it pools it.
+///
+/// So a credential that is replaced after the enrollment wrote it, and before
+/// the connection was pooled, leaves a connection that was authenticated as an
+/// identity that is gone. It is closed rather than pooled: handing it out
+/// would hand out the identity that was replaced.
+///
+/// The replacement is made to land in that window on purpose. The test holds
+/// the slot the issued credential goes into — the dial fills it on its way out
+/// of the enrollment — so the dial is held exactly there, between the write of
+/// the credential and the pooling of the connection.
+#[tokio::test]
+async fn an_enrollment_connection_of_a_replaced_credential_does_not_come_back_to_the_pool() {
+    let pool = auth_pool_harness().await;
+
+    // The dial is held here: the enrollment writes its credential, and then
+    // it puts the issued one in this slot — which it cannot do while the
+    // test holds it.
+    let issued_slot = pool.inner.issued.lock().await;
+
+    pool.set_enrollment(Some(Enrollment::new("client-002", "enrollment-token")))
+        .await;
+
+    let dialing = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.get_connection(Protocol::Http).await })
+    };
+
+    // The enrollment wrote its credential: the generation moved with it.
+    for _ in 0..250 {
+        if pool.inner.credential_generation.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        pool.inner.credential_generation.load(Ordering::Acquire),
+        1,
+        "the enrollment did not write its credential"
+    );
+
+    // The credential is replaced while the dial is still on its way out of
+    // the enrollment: the connection that comes out of it was authenticated as
+    // the identity that is gone.
+    pool.set_two_factor(Some(credential(
+        "client-003",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+        None,
+    )))
+    .await;
+
+    // The dial goes on.
+    drop(issued_slot);
+
+    // The dial does not get a connection: the one it made belongs to an
+    // identity that is gone.
+    let outcome = dialing.await.expect("the dial is not cancelled");
+    assert!(
+        outcome.is_err(),
+        "the connection of the identity that is gone was handed out"
+    );
+
+    // And the pool does not keep it.
+    assert!(
+        pool.inner.connections.lock().await.is_empty(),
+        "the connection of the identity that is gone came back to the pool"
+    );
+}
+
 /// The two ends of a tunnel, and the count the far side keeps.
 #[cfg(feature = "local-proxy")]
 async fn harness() -> (Arc<EndpointGroup>, Arc<AtomicUsize>) {
