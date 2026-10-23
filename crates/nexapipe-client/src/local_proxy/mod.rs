@@ -130,6 +130,17 @@ const REJECTED_LOG_EVERY: usize = 100;
 /// moment.
 const RESPONSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(120);
 
+/// How many bytes are read and thrown away when a client sends more than its
+/// request.
+///
+/// The connection carries one request, so the bytes that came after it are
+/// not part of the exchange — but they are still in the socket, and a socket
+/// that is closed with unread data in it is reset rather than closed, and a
+/// reset costs the client the answer it was already sent. The bytes are read
+/// away so the socket closes with nothing left in it; the ceiling is what
+/// stops a client that keeps sending from being read forever.
+const TRAILING_BYTES_CEILING: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
@@ -1182,6 +1193,33 @@ where
         // serves the request on ends with the answer, and the connection
         // this handler holds ends with it: one request, one connection.
         let _ = send.finish();
+
+        // **What the client sent after its request is read and thrown away.**
+        //
+        // The connection carries one request, so the bytes that came after
+        // it are not part of the exchange — but they are still in the socket,
+        // and the socket is closed when the answer is on its way.
+        //
+        // A socket that is closed with unread data in it is reset rather
+        // than closed, and a reset costs the client the answer it was
+        // already sent: Windows throws away the data that was received and
+        // not yet read when the reset arrives. The request was served, and
+        // the client is entitled to the answer — so the bytes are read away
+        // here, before the answer is written, and the socket closes with
+        // nothing left in it.
+        //
+        // The reading stops at the end of the stream or at the ceiling; a
+        // client that keeps sending is not read forever. The handler aborts
+        // this task when the answer has been relayed, which is what ends a
+        // reading that is still waiting for a client that will not close.
+        let mut thrown_away = 0usize;
+        while thrown_away < TRAILING_BYTES_CEILING {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => thrown_away += n,
+                Err(_) => break,
+            }
+        }
     };
 
     let backend_to_client = async move {
