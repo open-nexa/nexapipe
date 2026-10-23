@@ -2662,6 +2662,7 @@ dependencies = [
  "uniffi",
  "url",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
