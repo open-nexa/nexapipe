@@ -652,8 +652,6 @@ impl PreconnectReport {
 impl EndpointGroup {
     /// Builds a group that binds its **own** iroh endpoints, one per distinct backend.
     ///
-    /// Builds a group whose pools make their own endpoints.
-    ///
     /// Nothing in this workspace calls it: both UIs build the endpoint themselves (so it can
     /// carry the relay mode and the QUIC tuning) and pass it to
     /// [`Self::new_with_domain_mappings_and_endpoint`]. Prefer that one — an endpoint created

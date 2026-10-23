@@ -1047,6 +1047,24 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The client and the server read the name inside a TLS `ClientHello` the
+  same way now.** They each had a reader of their own, and the two did not
+  agree. The server's walked the whole `server_name` list and took the entry
+  of type `host_name` wherever it was; the client's took the first entry and
+  gave up if it was not of that type — so a hello that put another type first
+  resolved to no name on the client and to the real one on the server, and
+  the client closed a connection the server would have served. The server's
+  also refused a name carrying a control character, because the name is
+  written to the log and a `\r\n` in it lets a client append lines of its own
+  to it; the client's did not, and the name it read went straight into the
+  log.
+
+  The reader is the protocol crate's now, and both sides link it: one that
+  walks the whole list, and one that refuses a name that is not a name. A
+  hello whose host name sits behind another entry type is proxied rather than
+  dropped, and a hello whose name carries a control character is closed
+  rather than logged.
+
 - **The client's own documentation builds without a warning.** `cargo doc -p
   nexapipe-client` reported sixteen. Fifteen of them were links that pointed at
   nothing: five named a thing the crate does not have — `Secret::expose_secret`,

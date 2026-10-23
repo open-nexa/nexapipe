@@ -1,9 +1,12 @@
 //! The wire formats the nexapipe client and the server share.
 //!
-//! Two of them live here: the L4 tunnel's, and the authentication handshake's.
-//! The second one used to be written down twice — once in the server and once
-//! in the client — which is the kind of duplication that costs a handshake
-//! when one side grows a field and the other does not. See [`auth`].
+//! Three of them live here: the L4 tunnel's, the authentication handshake's,
+//! and the name inside a TLS `ClientHello`. The second one used to be written
+//! down twice — once in the server and once in the client — which is the kind
+//! of duplication that costs a handshake when one side grows a field and the
+//! other does not. See [`auth`]. The third one used to be written down twice
+//! as well, and the two copies did not agree: the client and the server read
+//! the same hello and could come away with different names. See [`tls`].
 //!
 //! # Where this fits
 //!
@@ -25,6 +28,12 @@
 //! Unlike the TLS path, the L4 path is **not** sniffed: the client is our own code, so it
 //! states what it wants in a fixed preface instead of the server guessing from payload
 //! bytes. That is what makes UDP possible at all — a datagram has no `Host` header.
+//!
+//! The TLS path is sniffed, and the name it carries is read by **both** sides:
+//! the client picks the route before the bytes reach the server, and the
+//! server picks the route when they arrive. Two readers would be two answers
+//! to the same hello, so there is one — [`tls::extract_sni`] — and the two
+//! sides link it.
 //!
 //! # Preface
 //!

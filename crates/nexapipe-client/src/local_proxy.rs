@@ -929,8 +929,11 @@ where
 
     request_buf.extend_from_slice(&temp_buf[..n]);
 
-    // Check if this is a TLS connection (ClientHello starts with 0x16 = Handshake content type)
-    if !request_buf.is_empty() && request_buf[0] == 0x16 {
+    // Check if this is a TLS connection. The predicate is the protocol
+    // crate's, the same one the server asks: a hello is a hello on both
+    // sides, and a client that spelled the byte out itself would be free to
+    // disagree with the server about what a TLS connection is.
+    if !request_buf.is_empty() && nexapipe_proto::tls::is_tls_handshake(request_buf[0]) {
         jni_log!("[DEBUG:local-proxy] Detected TLS ClientHello, handling as raw tunnel via SNI");
         let header_buf = std::mem::take(&mut temp_buf);
         return handle_tls_tunnel(
@@ -2808,6 +2811,245 @@ mod tests {
             .expect("the client read never returned")
             .expect("the client read failed");
         assert_eq!(read, 0, "the handler kept its socket open after stop()");
+    }
+
+    /// The ALPN a TLS tunnel is spoken with. The same bytes the server
+    /// offers for it.
+    const TLS_ALPN: &[u8] = b"nexapipe/tls";
+
+    /// A TLS `ClientHello` carrying the given `server_name` entries.
+    ///
+    /// Each entry is a name type and the name itself. The reader takes the
+    /// entry of type `host_name` wherever it is in the list: RFC 6066 allows
+    /// a list, and a hello that puts another type first still has its host
+    /// name behind it.
+    fn hello_with_server_names(entries: &[(u8, &str)]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for (name_type, name) in entries {
+            let bytes = name.as_bytes();
+            list.push(*name_type);
+            list.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            list.extend_from_slice(bytes);
+        }
+
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&0u16.to_be_bytes()); // extension type: server_name
+        extension.extend_from_slice(&((2 + list.len()) as u16).to_be_bytes()); // extension length
+        extension.extend_from_slice(&(list.len() as u16).to_be_bytes()); // list length
+        extension.extend_from_slice(&list);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // client_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session_id length
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites length
+        body.extend_from_slice(&[0x13, 0x01]); // one cipher suite
+        body.push(1); // compression_methods length
+        body.push(0); // null compression
+        body.extend_from_slice(&(extension.len() as u16).to_be_bytes()); // extensions length
+        body.extend_from_slice(&extension);
+
+        let mut handshake = vec![0x01]; // ClientHello
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]); // 3-byte length
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x01, 0x00]; // a handshake record
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// The far side of a TLS tunnel: it accepts the connection and reads the
+    /// `ClientHello` the client forwards.
+    ///
+    /// A TLS tunnel carries the hello itself — there is no preface in front
+    /// of it — so what the far side reads is the hello, and the bytes it
+    /// collected are what the test looks at.
+    async fn serve_a_tunnel_that_reads_the_hello(
+        endpoint: Endpoint,
+        seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        while let Some(incoming) = endpoint.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                let Ok((_send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+
+                let mut buf = vec![0u8; 4096];
+                // The hello may arrive in more than one read: a QUIC stream
+                // hands over what it has, and a helper that read once saw a
+                // truncated hello — which passed under one feature set and
+                // failed under another, where the timing was different.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while let Ok(Ok(Some(n))) =
+                    tokio::time::timeout_at(deadline, recv.read(&mut buf)).await
+                {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.lock()
+                        .expect("the lock is not held")
+                        .extend_from_slice(&buf[..n]);
+                }
+
+                // Held open for a moment: a close discards whatever the peer
+                // has not read yet.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+        }
+    }
+
+    /// A hello whose host name is behind another entry type is proxied.
+    ///
+    /// The client used to read the first entry of the `server_name` list and
+    /// give up if it was not of the type it reads, so a hello that put
+    /// another type first resolved to no name on the client — while the
+    /// server, which walks the whole list, found the host name behind it.
+    /// The client closed a connection the server would have served.
+    ///
+    /// The far side here reads what the client forwards, and the hello is
+    /// what it must find: a client that read no name at all forwards
+    /// nothing, because it closes the connection before it opens the tunnel.
+    #[tokio::test]
+    async fn a_tls_hello_whose_host_name_is_behind_another_entry_type_is_proxied() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // The far side.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![TLS_ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_a_tunnel_that_reads_the_hello(server, seen.clone()));
+
+        // This side: an endpoint, a pool over it, and the proxy.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![TLS_ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+            .await
+            .expect("the proxy binds");
+        let proxy_addr = proxy.local_addr().expect("the proxy's address");
+        let runner = spawn_run(&proxy);
+
+        // The application: a hello whose host name is behind another type.
+        let hello = hello_with_server_names(&[(0x01, "not-a-host-name"), (0x00, HOST)]);
+        let mut stream = TcpStream::connect(proxy_addr)
+            .await
+            .expect("the proxy accepts");
+        stream.write_all(&hello).await.expect("the hello goes out");
+
+        // The far side must see the hello: the client read the name, matched
+        // it against the domains it proxies, and forwarded the hello. Every
+        // byte of it, because the hello may arrive in more than one read.
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let bytes = seen.lock().expect("the lock is not held").clone();
+                if bytes.len() >= hello.len() {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hello never reached the far side");
+        assert_eq!(
+            forwarded, hello,
+            "the far side did not get the hello the client was given"
+        );
+
+        proxy.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    }
+
+    /// A hello whose name is not a name is closed, not logged.
+    ///
+    /// The name is written to the log on every path that names it, and a
+    /// `\r\n` in it lets a client append lines of its own to the log. The
+    /// server refused such a name; the client read it and carried on, so the
+    /// name it read went straight into the log.
+    ///
+    /// The client proxies **every** host here — the catch-all is what makes
+    /// the test about the name and not about the list: a name that is not a
+    /// name is refused whatever the operator asked for, and a name the
+    /// operator did ask for is not what saves it.
+    ///
+    /// The far side must see nothing: a client that refused the hello opens
+    /// no tunnel at all.
+    #[tokio::test]
+    async fn a_tls_hello_whose_name_is_not_a_name_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // The far side.
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![TLS_ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_a_tunnel_that_reads_the_hello(server, seen.clone()));
+
+        // This side: an endpoint, a pool over it, and the proxy. Every host
+        // is proxied, so nothing but the name itself can refuse the hello.
+        let client = Endpoint::builder(presets::N0)
+            .alpns(vec![TLS_ALPN.to_vec()])
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec!["*".to_string()], pool)
+            .await
+            .expect("the proxy binds");
+        let proxy_addr = proxy.local_addr().expect("the proxy's address");
+        let runner = spawn_run(&proxy);
+
+        // The application: a hello whose name carries a line break.
+        let hello = hello_with_server_names(&[(0x00, "evil\r\nInjected: yes")]);
+        let mut stream = TcpStream::connect(proxy_addr)
+            .await
+            .expect("the proxy accepts");
+        stream.write_all(&hello).await.expect("the hello goes out");
+
+        // The connection is closed, and nothing was forwarded.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("the client was never closed")
+            .expect("the client read failed");
+        assert_eq!(read, 0, "the client was left waiting on a refused hello");
+
+        assert!(
+            seen.lock().expect("the lock is not held").is_empty(),
+            "a hello with a name that is not a name was forwarded"
+        );
+
+        proxy.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     }
 
     /// The cap is on the header, not on the whole request: a short header
