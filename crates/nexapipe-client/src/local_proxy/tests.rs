@@ -532,6 +532,300 @@ async fn a_hello_that_arrives_in_pieces_is_still_proxied() {
     writer.abort();
 }
 
+/// The far side of a tunnel that records what the client forwards.
+///
+/// The tunnel carries a preface and then the bytes, so the preface is read
+/// and what comes after it is recorded. The status byte the client waits for
+/// is written first, or the client never opens the tunnel.
+async fn serve_a_tunnel_that_records_the_payload(
+    endpoint: Endpoint,
+    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let Ok(accepting) = incoming.accept() else {
+                return;
+            };
+            let Ok(connection) = accepting.await else {
+                return;
+            };
+            let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                return;
+            };
+
+            // The L4 preface, then the status byte the client waits for.
+            let mut header = [0u8; 4];
+            if recv.read_exact(&mut header).await.is_err() {
+                return;
+            }
+            let mut rest = vec![0u8; usize::from(header[3]) + 2];
+            if recv.read_exact(&mut rest).await.is_err() {
+                return;
+            }
+            if send.write_all(&[0x00]).await.is_err() {
+                return;
+            }
+
+            // Everything after the preface is the payload.
+            let mut buf = vec![0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(Ok(Some(n))) = tokio::time::timeout_at(deadline, recv.read(&mut buf)).await
+            {
+                if n == 0 {
+                    break;
+                }
+                seen.lock()
+                    .expect("the lock is not held")
+                    .extend_from_slice(&buf[..n]);
+            }
+
+            // Held open for a moment: a close discards whatever the peer has
+            // not read yet.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+    }
+}
+
+/// The bytes that came with the CONNECT head reach the tunnel.
+///
+/// The head reader keeps everything it read, so a client that wrote the
+/// CONNECT head and the first bytes of the tunnel in one go has both in the
+/// buffer by the time the head is complete. The CONNECT branch used to read
+/// the socket again from there and drop them — the copy loop starts at the
+/// socket, and the socket had already given these up.
+///
+/// The ordinary HTTP path forwards them; this branch did not, and the
+/// difference was a tunnel that began in the middle of whatever the client
+/// had sent. A TLS client that pipelined its first record into the CONNECT
+/// got a stream the far side could not read.
+#[tokio::test]
+async fn the_bytes_that_came_with_the_connect_head_reach_the_tunnel() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    /// What the client sends with the head.
+    const PAYLOAD: &[u8] = b"PAYLOAD-AFTER-THE-HEAD";
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The far side.
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_a_tunnel_that_records_the_payload(
+        server,
+        seen.clone(),
+    ));
+
+    // This side: an endpoint, a pool over it, and the proxy.
+    let client = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("this side binds");
+    let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+    let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+        .await
+        .expect("the proxy binds");
+    let proxy_addr = proxy.local_addr().expect("the proxy's address");
+    let runner = spawn_run(&proxy);
+
+    // The head and the payload, in one write: what a client that pipelines
+    // its first record into the CONNECT does.
+    let mut request = format!("CONNECT {HOST}:{PORT} HTTP/1.1\r\n\r\n").into_bytes();
+    request.extend_from_slice(PAYLOAD);
+
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("the proxy accepts");
+    stream
+        .write_all(&request)
+        .await
+        .expect("the CONNECT goes out");
+
+    // The far side records what the proxy forwarded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if seen
+            .lock()
+            .expect("the lock is not held")
+            .windows(PAYLOAD.len())
+            .any(|w| w == PAYLOAD)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let seen = seen.lock().expect("the lock is not held").clone();
+    assert!(
+        seen.windows(PAYLOAD.len()).any(|w| w == PAYLOAD),
+        "the bytes that came with the CONNECT head never reached the tunnel: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    proxy.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+}
+
+/// The far side of a WebSocket tunnel: it records what the client forwarded
+/// and answers the upgrade.
+///
+/// A WebSocket tunnel carries the request and then the frames, so what the
+/// far side reads is the request and whatever came with it. The upgrade is
+/// answered as soon as the head is complete, so the client is not left
+/// waiting for an answer that was never going to come.
+async fn serve_a_tunnel_that_answers_an_upgrade(
+    endpoint: Endpoint,
+    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let Ok(accepting) = incoming.accept() else {
+                return;
+            };
+            let Ok(connection) = accepting.await else {
+                return;
+            };
+            let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                return;
+            };
+
+            let mut buf = vec![0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut recorded: Vec<u8> = Vec::new();
+            while let Ok(Ok(Some(n))) = tokio::time::timeout_at(deadline, recv.read(&mut buf)).await
+            {
+                if n == 0 {
+                    break;
+                }
+                recorded.extend_from_slice(&buf[..n]);
+                if recorded.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let _ = send
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\n\
+                              Upgrade: websocket\r\n\
+                              Connection: Upgrade\r\n\r\n",
+                        )
+                        .await;
+                    // One more read: the bytes that came with the head may be
+                    // in a read of their own.
+                    let mut more = vec![0u8; 4096];
+                    if let Ok(Ok(Some(n))) =
+                        tokio::time::timeout(Duration::from_secs(1), recv.read(&mut more)).await
+                    {
+                        recorded.extend_from_slice(&more[..n]);
+                    }
+                    break;
+                }
+            }
+            seen.lock()
+                .expect("the lock is not held")
+                .extend_from_slice(&recorded);
+
+            // Held open for a moment: a close discards whatever the peer has
+            // not read yet.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+    }
+}
+
+/// The bytes that came with the upgrade head reach the tunnel.
+///
+/// The head reader keeps everything it read, so a client that wrote the
+/// upgrade request and its first frame in one go has both in the buffer by
+/// the time the head is complete. The WebSocket branch used to send only the
+/// head and then read the socket again — so the first frame was gone, and a
+/// browser that coalesced the two lost it.
+#[tokio::test]
+async fn the_bytes_that_came_with_the_websocket_head_reach_the_tunnel() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    /// What the client sends with the head.
+    const PAYLOAD: &[u8] = b"FIRST-FRAME";
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The far side.
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![nexapipe_proto::protocol::ALPN_HTTP.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_a_tunnel_that_answers_an_upgrade(server, seen.clone()));
+
+    // This side: an endpoint, a pool over it, and the proxy.
+    let client = Endpoint::builder(presets::N0)
+        .alpns(vec![nexapipe_proto::protocol::ALPN_HTTP.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("this side binds");
+    let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+    let proxy = LocalProxy::new_with_single_pool("127.0.0.1:0", vec![HOST.to_string()], pool)
+        .await
+        .expect("the proxy binds");
+    let proxy_addr = proxy.local_addr().expect("the proxy's address");
+    let runner = spawn_run(&proxy);
+
+    // The upgrade and the first frame, in one write.
+    let mut request = format!(
+        "GET /chat HTTP/1.1\r\nHost: {HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    )
+    .into_bytes();
+    request.extend_from_slice(PAYLOAD);
+
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("the proxy accepts");
+    stream
+        .write_all(&request)
+        .await
+        .expect("the upgrade goes out");
+
+    // The far side records what the proxy forwarded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if seen
+            .lock()
+            .expect("the lock is not held")
+            .windows(PAYLOAD.len())
+            .any(|w| w == PAYLOAD)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let seen = seen.lock().expect("the lock is not held").clone();
+    assert!(
+        seen.windows(PAYLOAD.len()).any(|w| w == PAYLOAD),
+        "the bytes that came with the upgrade head never reached the tunnel: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    proxy.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+}
+
 /// A tunnel the server closes is closed for the client too.
 ///
 /// The other half of the half-close: a server that ends the conversation
