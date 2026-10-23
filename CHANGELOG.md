@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-four things land in this cycle so far: the device credential can be a **key**
+Thirty-five things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -52,7 +52,8 @@ refused, the price of a second connection is measured now — it comes to a
 handshake, the protocol is chosen at the handshake, the pool's ceiling
 is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
 codec, and a TLS hello that arrives in pieces is read until it is whole, and
-the TLS tunnel half-closes in both directions.
+the TLS tunnel half-closes in both directions, and the elevated service names
+the account that dialled it.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1079,6 +1080,22 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **The elevated service names the account that dialled it.** The IPC ran on a
+  loopback TCP port, and a loopback port says nothing about who connected:
+  `SO_PEERCRED` on a TCP socket succeeds and fills the uid in with `-1`, and
+  `getpeereid` fails on one outright. The service read that answer as an
+  account, compared it with the account it was installed for, and refused —
+  every caller, on every Unix. The peer of a **Unix-domain socket** is named
+  by the kernel, so the IPC runs over one now: the desktop and the service
+  talk over `/var/run/nexapipe/ipc.sock`, in a directory root owns, and the
+  account behind a connection is the one the kernel says it is.
+
+  The two halves have to be the same build for this: a desktop that speaks
+  the old port cannot reach a service that listens on the socket, and the
+  service has to be reinstalled for the socket to exist. The Windows half is
+  unchanged — it has no socket credential, so the peer is found in the
+  connection table there — and it keeps the loopback port.
 
 - **The TLS tunnel half-closes in both directions.** The tunnel's two
   directions were raced against each other with a `select!`, and `select!`

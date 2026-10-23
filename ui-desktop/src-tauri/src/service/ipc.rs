@@ -6,7 +6,216 @@ use crate::{
     status::{ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus},
 };
 
+/// Where the service listens, and where the desktop connects.
+///
+/// The two platforms answer the same question differently, and the question is
+/// the one this whole channel exists for: **who is on the other end of this
+/// connection?**
+///
+/// * **Unix** — a Unix-domain socket. The kernel attributes a connection on
+///   one to the process that made it and says so: `SO_PEERCRED` on Linux,
+///   `getpeereid` on macOS. A loopback TCP port cannot answer it at all — the
+///   kernel has no way to say who dialled — so a service on one could only
+///   trust every caller, which is the hole this channel was built to close.
+/// * **Windows** — a loopback TCP port. Windows has no socket credential of
+///   its own, so the peer is found in the connection table instead; see
+///   [`crate::service::platform::account::AccountId::peer_of`].
+///
+/// The Unix socket lives in a directory root owns, so that no local account
+/// can put a socket of its own where the service is to listen. The socket file
+/// itself is open to every account — `connect()` on a Unix-domain socket asks
+/// for write permission on it — because the account *behind* a connection is
+/// what the service checks, and the kernel is what tells it.
+#[cfg(unix)]
+pub const IPC_SOCKET_PATH: &str = "/var/run/nexapipe/ipc.sock";
+
+/// See the Unix note above: Windows has no socket credential, so the peer is
+/// found in the connection table and the port is a loopback one.
+#[cfg(windows)]
 pub const IPC_SOCKET_PATH: &str = "127.0.0.1:12345";
+
+/// The stream the IPC runs over.
+///
+/// One name for the channel, so that everything above it — the handshake, the
+/// messages, the responses — is written once rather than once per platform.
+#[cfg(unix)]
+pub type IpcStream = tokio::net::UnixStream;
+
+/// See [`IpcStream`].
+#[cfg(windows)]
+pub type IpcStream = tokio::net::TcpStream;
+
+/// The listener the service accepts IPC connections on.
+///
+/// One name for the two platforms' listeners, so that the accept loop above
+/// them is written once.
+pub enum IpcListener {
+    /// A Unix-domain socket — see [`IPC_SOCKET_PATH`].
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+    /// A loopback TCP port.
+    #[cfg(windows)]
+    Tcp(tokio::net::TcpListener),
+}
+
+impl IpcListener {
+    /// Binds the listener.
+    ///
+    /// On Unix this also creates the directory the socket lives in and clears
+    /// a socket file a service that is no longer running left behind; see
+    /// [`bind_unix`].
+    pub async fn bind() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            bind_unix().await
+        }
+        #[cfg(windows)]
+        {
+            Ok(IpcListener::Tcp(
+                tokio::net::TcpListener::bind(IPC_SOCKET_PATH).await?,
+            ))
+        }
+    }
+
+    /// Accepts the next connection.
+    pub async fn accept(&self) -> std::io::Result<IpcStream> {
+        match self {
+            #[cfg(unix)]
+            IpcListener::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(stream)
+            }
+            #[cfg(windows)]
+            IpcListener::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(stream)
+            }
+        }
+    }
+}
+
+/// Binds the Unix-domain socket the service listens on.
+///
+/// The directory is created here, by the service, because the service is the
+/// privileged process: it is the only one that may put a socket where the
+/// desktop will look for it. It is root's, and not writable by anybody else,
+/// so no local account can put a socket of its own in place of the service's.
+///
+/// A socket file that is already there is one a service that is no longer
+/// running left behind — the file outlives the process wherever the directory
+/// is not a memory-backed one — and it is removed, because a bind over it
+/// would fail forever. A socket that *answers* is a service that is still
+/// running, and that is not this one's to take over.
+#[cfg(unix)]
+async fn bind_unix() -> std::io::Result<IpcListener> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::path::Path::new(IPC_SOCKET_PATH);
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the IPC socket path has no parent directory",
+        )
+    })?;
+
+    std::fs::create_dir_all(directory)?;
+    // Root's, and not writable by anybody else: a directory another account
+    // owns is a directory the socket in it can be replaced in.
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))?;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            if tokio::net::UnixStream::connect(path).await.is_ok() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AddrInUse,
+                    "another instance of the service is already serving this socket",
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)?;
+    // Every local account may connect: `connect()` on a Unix-domain socket
+    // asks for write permission on the socket file, and the account behind a
+    // connection is what the service checks — with the kernel's own answer to
+    // who that is, not with the socket's mode.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+
+    Ok(IpcListener::Unix(listener))
+}
+
+/// Connects to the service.
+pub async fn connect() -> std::io::Result<IpcStream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(IPC_SOCKET_PATH).await
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::TcpStream::connect(IPC_SOCKET_PATH).await
+    }
+}
+
+/// Removes the socket the service listens on.
+///
+/// The file outlives the process wherever the directory is not a memory-backed
+/// one, and a socket file nobody listens on is one the desktop spends a
+/// connection failing to reach. The next start clears it as well; this is so
+/// that a service that stops leaves nothing behind.
+#[cfg(unix)]
+pub fn remove_socket() {
+    let _ = std::fs::remove_file(std::path::Path::new(IPC_SOCKET_PATH));
+}
+
+/// See [`remove_socket`]: Windows listens on a port, and a port leaves nothing
+/// behind.
+#[cfg(windows)]
+pub fn remove_socket() {}
+
+/// A connected pair on the transport the IPC runs over.
+///
+/// For the tests. The service and the desktop speak over a Unix-domain socket
+/// on Unix and a loopback TCP port on Windows, and the two are not
+/// interchangeable: only the socket the kernel can name is one whose peer can
+/// be identified at all. The tests drive the real transport, so a change to it
+/// is exercised here rather than in production.
+#[cfg(test)]
+pub(crate) async fn connected_pair() -> (IpcStream, IpcStream) {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "nexapipe-ipc-test-{}-{}.sock",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).expect("a socket for the test");
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("the client connects");
+        let (server, _) = listener.accept().await.expect("the service accepts");
+        let _ = std::fs::remove_file(&path);
+        (client, server)
+    }
+    #[cfg(windows)]
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("the client connects");
+        let (server, _) = listener.accept().await.expect("the service accepts");
+        (client, server)
+    }
+}
 
 /// What a credential looks like in a `Debug` output.
 ///

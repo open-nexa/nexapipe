@@ -56,7 +56,12 @@ impl AccountId {
     /// `None` when the operating system would not say, and that is a refusal
     /// rather than a shrug: a service that cannot name its caller does not
     /// serve it.
-    pub fn peer_of(stream: &tokio::net::TcpStream) -> Option<AccountId> {
+    ///
+    /// The socket this is asked about is the one the IPC runs over — a
+    /// Unix-domain socket on Unix, a loopback TCP port on Windows — because
+    /// that is the only kind of socket whose peer the kernel can name. See
+    /// [`crate::service::ipc::IPC_SOCKET_PATH`].
+    pub fn peer_of(stream: &crate::service::ipc::IpcStream) -> Option<AccountId> {
         #[cfg(unix)]
         {
             peer_uid(stream).map(AccountId::Unix)
@@ -265,8 +270,18 @@ fn directory_is_private(directory: &Path) -> bool {
 /// Linux answers this with `SO_PEERCRED`, which the kernel fills in from the
 /// credentials of the process that connected. macOS has `getpeereid`, which
 /// asks the same question.
+///
+/// Both of them answer it for a **Unix-domain socket**. On a TCP socket the
+/// question has no answer at all: `SO_PEERCRED` succeeds on one and fills the
+/// uid in with `-1`, because a TCP connection carries no credentials, and
+/// `getpeereid` fails outright — neither is a uid anybody can be compared
+/// with. A uid of `-1` is not a caller either: it is the absence of one, and
+/// reading it as an identity would make the service refuse every caller while
+/// looking, in the log, as though it had named one. That is why the IPC runs
+/// over a Unix-domain socket on Unix; see
+/// [`crate::service::ipc::IPC_SOCKET_PATH`].
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &tokio::net::TcpStream) -> Option<u32> {
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
     /// The kernel's `struct ucred`, which `SO_PEERCRED` fills in.
@@ -300,13 +315,21 @@ fn peer_uid(stream: &tokio::net::TcpStream) -> Option<u32> {
         )
     };
 
-    (result == 0).then_some(credentials.uid)
+    if result != 0 {
+        return None;
+    }
+    // The kernel fills the uid in with `-1` when the socket carries no
+    // credentials, and a uid of `-1` is not an account: it is the absence of
+    // one, and a caller cannot be the absence of one.
+    (credentials.uid != u32::MAX).then_some(credentials.uid)
 }
 
 /// The user id on the other end of a connected socket, on the platforms that
 /// answer with `getpeereid`.
+///
+/// A Unix-domain socket, for the reason the Linux half gives above.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn peer_uid(stream: &tokio::net::TcpStream) -> Option<u32> {
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
     let mut effective_uid: libc::uid_t = 0;
@@ -371,20 +394,41 @@ fn owning_pid(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Opti
         return None;
     }
 
-    let mut buffer = vec![0u8; size as usize];
-    // Safe: the buffer is `size` bytes long, which is what the call asks for.
-    let result = unsafe {
-        GetExtendedTcpTable(
-            buffer.as_mut_ptr() as *mut std::ffi::c_void,
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if result != 0 {
-        return None;
+    // The table is read into `u32`s rather than into bytes: its header and
+    // its rows are 32-bit fields, and a buffer of bytes carries no promise
+    // about being aligned for them.
+    //
+    // The first call measures the table and the second one fills it, and a
+    // connection that opens in between makes the second one say the buffer
+    // is too small — with the size the table needs *now* in `size`. So the
+    // call is repeated with the size it reports, a few times over, before
+    // the answer is taken as no: this runs for every IPC connection, and a
+    // machine with ordinary connection churn would otherwise refuse a
+    // legitimate client now and then.
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    let mut buffer: Vec<u32> = Vec::new();
+    let mut attempts = 0;
+    loop {
+        buffer = vec![0u32; (size as usize).div_ceil(std::mem::size_of::<u32>())];
+        // Safe: the buffer is at least `size` bytes long, which is what the
+        // call asks for, and it is aligned for the 32-bit fields it fills in.
+        let result = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
+        };
+        match result {
+            0 => break,
+            // The table grew: `size` holds the size it needs now.
+            ERROR_INSUFFICIENT_BUFFER if attempts < 4 => attempts += 1,
+            _ => return None,
+        }
     }
 
     // Safe: the call filled the buffer with a table of `dwNumEntries` rows.
@@ -578,7 +622,6 @@ fn owner_sid(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{allows, chain_is_trusted, mode_is_private, AccountId};
-
     /// An account for a test, spelled the way this platform spells accounts.
     fn account(n: u32) -> AccountId {
         #[cfg(unix)]
@@ -680,5 +723,27 @@ mod tests {
         assert!(!chain_is_trusted(&[0o755, 0o1777]));
         assert!(!chain_is_trusted(&[0o1777]));
         assert!(!chain_is_trusted(&[0o755, 0o777]));
+    }
+
+    /// The peer of the IPC socket is the account that connected to it.
+    ///
+    /// This is the answer the whole policy rests on, so it is checked against
+    /// the transport the IPC really runs over rather than against a
+    /// stand-in. A loopback TCP port cannot answer it at all: `SO_PEERCRED`
+    /// succeeds on one and fills the uid in with `-1`, and `getpeereid` fails
+    /// on one outright. A helper that had only ever been exercised against a
+    /// stand-in would look right while refusing every caller in production.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_peer_of_the_ipc_socket_is_the_account_that_connected() {
+        let (_client, server) = crate::service::ipc::connected_pair().await;
+
+        let peer = AccountId::peer_of(&server).expect("the kernel names the peer");
+
+        assert_eq!(
+            peer,
+            AccountId::current().expect("this process runs as an account"),
+            "the peer of the IPC socket must be the account that connected to it"
+        );
     }
 }
